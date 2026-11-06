@@ -510,8 +510,9 @@ type a2aDispatchConfig struct {
 	RenewSeconds         int    `json:"renewSeconds"`
 	RestartGraceSeconds  int    `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int    `json:"acceptTimeoutSeconds"`
-	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS'
-	// max age, from the constant the provision script renders it from.
+	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS' max
+	// age, the longer of the constant the provision script creates it with
+	// and the live stream's as its Job reports it (dispatchSubmitRetentionSeconds).
 	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
 	Profiles               []a2aDispatchProfile `json:"profiles"`
 }
@@ -540,6 +541,32 @@ func profileDurableName(profile, tier, kind string) string {
 	return fmt.Sprintf("profile-%s-%s-%s", profile, tier, kind)
 }
 
+// a2aMaxSubmitRetention is lib.MaxSubmitRetention, the longest retention a
+// dispatch config may carry (the operator can't import lib; the dispatcher's
+// Validate refuses a longer one and keeps its last good config).
+const a2aMaxSubmitRetention = 365 * 24 * time.Hour
+
+// dispatchSubmitRetentionSeconds is the submit retention the dispatch config
+// carries: the longer of this operator's a2aProfileSubmitMaxAge and the live
+// stream's, as the provision Job last reported it (#4948), capped at
+// a2aMaxSubmitRetention. A stream with no age limit, or one longer than the
+// cap, gets the cap, and its tombstones are kept that long, not as long as
+// the stream (the dispatcher refuses a longer retention). With no report yet
+// it is the constant, as before. The comparison is in seconds, so a value
+// no Duration can hold still lands on the cap.
+func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	render, ceiling := int64(a2aProfileSubmitMaxAge/time.Second), int64(a2aMaxSubmitRetention/time.Second)
+	retention := render
+	if live := agent.Status.ProfileSubmitMaxAgeSeconds; live != nil {
+		if *live == 0 || *live > ceiling {
+			retention = ceiling
+		} else {
+			retention = max(retention, *live)
+		}
+	}
+	return int(retention)
+}
+
 // desiredDispatchConfig is what the dispatcher reads for this agent: every
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
@@ -556,7 +583,7 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 		RenewSeconds:           resolveProfileRenewSeconds(agent),
 		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
 		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: int(a2aProfileSubmitMaxAge / time.Second),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
 		Profiles:               []a2aDispatchProfile{},
 	}
 	resolved := resolveAgentProfileIdentities(agent, profiles)

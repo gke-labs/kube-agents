@@ -93,7 +93,7 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 // TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults is the case the
 // field exists for (#2324): a CR raises limits.memory and nothing else, and the
 // CPU request Autopilot sizes the pod by, the CPU limit and the
-// ephemeral-storage limit that bounds the content workspace all survive.
+// ephemeral-storage limit that bounds the vcs scratch all survive.
 func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	container := buildCredentialProxyContainer(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
@@ -477,8 +477,8 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	// GKE Autopilot without bursting sets a container's limits equal to its
 	// requests, so there the broker reads the request as its limit: the
 	// Autopilot request, or the Standard one on a cluster discovery could not
-	// classify. Each request therefore has to clear the floor on its own, or
-	// the budget is off and the broker admits by slot alone, with the
+	// classify and no running proxy shows as Autopilot. Each request therefore
+	// has to clear the floor on its own, or the budget is off and the broker admits by slot alone, with the
 	// out-of-memory exposure the budget exists to remove.
 	autopilotRequest := resource.MustParse(credentialProxyAutopilotMemoryRequest)
 	if got := credentialProxyAdmittedRequests(autopilotRequest.Value(), credentialProxyOutputCapBytes); got != 9 {
@@ -543,9 +543,9 @@ func TestCredentialProxyRefusalKeepsTheCountWithinTheBudget(t *testing.T) {
 	}
 }
 
-// TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer: the reconciler renders
-// the Autopilot requests on an Autopilot cluster, the Standard ones while
-// discovery cannot say, and asks again until it can.
+// TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer: clusterAutopilot
+// reports an Autopilot cluster as determined, reports (false, false) without
+// caching while discovery cannot say, and asks again until it can.
 func TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer(t *testing.T) {
 	autopilotGroups := &metav1.APIGroupList{Groups: []metav1.APIGroup{{
 		Name:     "auto.gke.io",
@@ -556,17 +556,17 @@ func TestClusterAutopilotCachesOnlyAnAuthoritativeAnswer(t *testing.T) {
 		resourcesErr:     map[string]error{"auto.gke.io/v1": fmt.Errorf("503 Service Unavailable")},
 	}
 	r := &PlatformAgentReconciler{DiscoveryClient: dc}
-	if r.clusterAutopilot() || r.autopilotResolved {
+	if autopilot, determined := r.clusterAutopilot(); autopilot || determined || r.autopilotResolved {
 		t.Fatal("an undetermined probe was read as Autopilot or cached")
 	}
 	dc.resourcesErr = nil
 	dc.resourcesList = map[string]*metav1.APIResourceList{"auto.gke.io/v1": {
 		GroupVersion: "auto.gke.io/v1", APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
 	}}
-	if !r.clusterAutopilot() || !r.autopilotResolved {
+	if autopilot, determined := r.clusterAutopilot(); !autopilot || !determined || !r.autopilotResolved {
 		t.Fatal("an Autopilot cluster was not recognised once discovery answered")
 	}
-	container := buildCredentialProxyDeploymentForPlugins(proxyAgentWithResources(nil), "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, r.clusterAutopilot()).Spec.Template.Spec.Containers[0]
+	container := buildCredentialProxyDeploymentForPlugins(proxyAgentWithResources(nil), "hash", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, true).Spec.Template.Spec.Containers[0]
 	assertQuantity(t, container.Resources.Requests, corev1.ResourceCPU, "2")
 	assertQuantity(t, container.Resources.Requests, corev1.ResourceMemory, "2Gi")
 }

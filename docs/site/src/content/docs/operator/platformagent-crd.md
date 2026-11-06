@@ -871,7 +871,7 @@ Default image: derived dynamically from the operator's container image at runtim
 
 ### `spec.deployment.credentialProxy.resources`
 
-`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
+`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the broker's scratch clones. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
 
 The default requests are 500m CPU and 1Gi of memory, and on GKE Autopilot 2 CPU and 2Gi, because Autopilot without bursting clamps the limits to the requests. A `cpu` or `memory` limit set without its request, below the default request, lowers that request to the limit. On Autopilot a CPU request the CR does not set is held to at most one CPU per GiB of the memory request, so the pair does not fall under the band's 1 GiB per vCPU floor.
 
@@ -1350,7 +1350,7 @@ Any other, an empty string, a JSON `null` or a value that is not a string (a num
 
 The credential broker's repository gate reads every typed entry, keyed by its `type`, host and path, so an entry counts only for the forge whose provider it names.
 
-Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's content-mode clone, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by the broker's `commit` and `push`.
+Each same-organization `context_repos` entry gets a read-only (`contents: read`) token minter policy, so a private context repository is readable through the credential broker's `snapshot` read, provided the GitHub App is installed on it — see [Read-only tokens for context repositories](/kube-agents/deploy/token-minter/#read-only-tokens-for-context-repositories). On a `gitlab` forge, a private context repository is readable the same way when the forge's Secret holds `read-token` — see [Private context repositories](/kube-agents/install/gitlab/#private-context-repositories). Nothing that writes consults the key: a context repository stays refused by every version-control verb but `capabilities` and `snapshot`.
 
 ### `spec.integration.repositories[].baseBranch`
 
@@ -1372,7 +1372,7 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges, the six proposal readings and the two people readings are produced by the operator, on the leader and off the reconcile path. Every five
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -1389,7 +1389,7 @@ operator cannot reach; the CR's events name the pod. It advances on any brokered
 those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
 default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is.
 
-The six proposal fields and the two people fields are readings, not totals. A reading's source is the credential broker or the A2A gateway. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
+The six proposal fields, the two people fields and the nine origin fields are readings, not totals. A reading's source is the credential broker, the A2A gateway or the chat plugin. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
 repository and the human events on them. The operator projects the latest poll's values as they
 stand, outside the ConfigMap.
 
@@ -1428,6 +1428,20 @@ and the second poll in a row that cannot read the broker clears it. It moves nei
 summary script and the chat gateway's `/feedback summary` print it as the
 `tools (top 5, since broker start)` block.
 
+The origins reading (`proposalsFromChat`, `proposalsFromConsole`, `proposalsFromApi`,
+`proposalsFromEvent`, `proposalsFromDrift`, `proposalsFromAudit`, `proposalsFromScheduled`,
+`proposalsFromIssue`, `proposalsFromOther`) comes from the chat plugin's proposals ledger: the pull
+requests the agent opened and the forge confirmed, counted by the origin of the work that started
+each. The operator reads it on the gateway pod's chat metrics listener, summed over the chat
+platform. The reading is present when all nine origins resolve; the plugin serves every origin,
+zero included, from its first ledger read. Until then, and while the served CRD predates them, the
+nine fields are absent.
+
+A poll that reads no body with all nine is a miss, and the second miss in a row clears them. A 0 is
+a reading, and none of the nine moves `lastActiveTime` or `lastHumanActiveTime`. A proposal the
+agent did not see itself open is not counted, so the nine usually sum to at most
+`remediationsProposedTotal`.
+
 The operator also serves every counter, cluster gauge, scalar reading and time of this block (the two lists, `activeInterfaces` and `topTools`, aside), and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
@@ -1459,11 +1473,24 @@ install, at once when the Ready status update next writes for any other reason. 
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
 `inference` follows the same rule under a served CRD that predates it.
 
+`profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
+provision Job last read it, when it is longer than this release creates the stream with (`0` is no
+age limit). Provisioning never edits an existing stream, so a stream created by an older release
+with a longer max age, or edited by hand, keeps its own. The dispatch config's submit retention is
+the longer of the two, so a finished task's tombstone outlives its submission, up to a year: a
+stream with no age limit, or one longer than a year, gets a year.
+
+The value is read once per provision Job run, and the Job runs again a day after it finishes, so
+a stream edited by hand is picked up within a day. A Job that fails records nothing. The field is
+absent when the stream is no longer than this release's, and before the first report. Only a report
+the operator can read changes it. Under a served CRD that predates the field the write is dropped
+and the retention stays this release's own until the CRD is applied.
+
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
-later (the two cluster gauges, the proposal readings, the people readings, `chatMessagesInboundTotal`,
+later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
 `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this

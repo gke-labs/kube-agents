@@ -1183,7 +1183,8 @@ class PreflightDecisionTest(unittest.TestCase):
         actually renders in the release namespace, and their surge pods, read from the
         manifests. Every Deployment and StatefulSet the chart renders there counts at its
         replicas; Helm hooks (the uninstall cleanup Job) are not standing. A Deployment that
-        runs a pod and doesn't roll Recreate sizes one surge pod; a StatefulSet sizes none."""
+        runs a pod and doesn't roll Recreate sizes the surge pods its rendered maxSurge
+        allows; a StatefulSet sizes none."""
         res = self._render({"probe": {}}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         chart_pods, pods, surges, names = None, 0, 0, []
@@ -1206,8 +1207,14 @@ class PreflightDecisionTest(unittest.TestCase):
             pods += replicas
             names.append(f"{doc['kind']}/{meta['name']}={replicas}")
             if doc["kind"] == "Deployment" and replicas > 0:
-                if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
-                    surges += 1
+                strategy = doc["spec"].get("strategy") or {}
+                if strategy.get("type") != "Recreate":
+                    # The surge pods the controller can add: maxSurge as rendered (Kubernetes'
+                    # 25% when the template sets none), a percentage rounded up (#4876).
+                    raw = str((strategy.get("rollingUpdate") or {}).get("maxSurge", "25%")).strip()
+                    n = math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
+                    # The controller never scales the new ReplicaSet past the desired count.
+                    surges += min(n, replicas)
         self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
         return chart_pods, pods + surges, names
 
@@ -1234,14 +1241,88 @@ class PreflightDecisionTest(unittest.TestCase):
              "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
              "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
+            # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
+            # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
+            ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
+            ["operator.replicaCount=4", "operator.rollingUpdate.maxSurge=50%"],
+            ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
+            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
+            # The Hindsight API runs one replica, so only maxSurge 0 tells its list entry apart
+            # from one pinned to 1 or reading the wrong key.
+            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=0",
+             "hindsight.api.rollingUpdate.maxUnavailable=1"],
+            ["litellm.rollingUpdate.maxSurge=0"],
+            # Past the replicas: a rollout still adds at most the replicas.
+            ["operator.rollingUpdate.maxSurge=100"],
+            # An empty maxSurge takes the template's default, and the replay proxy reads its
+            # own key, not LiteLLM's (each list entry repeats its template's fencepost call).
+            ["litellm.rollingUpdate.maxSurge="],
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+             "litellm.replayShadow.rollingUpdate.maxSurge=2"],
         ):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
 
+    def test_the_session_quota_counts_every_surge_pod_and_the_patch_room_stays_one(self) -> None:
+        """chartSurgePods totals each rollout's surge pods (#4876), and the patch's surge room
+        stays one pod of the largest surging workload, enough for a rollout to progress."""
+        base = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4"])
+        three = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4",
+                                    "litellm.rollingUpdate.maxSurge=3"])
+        self.assertEqual(three["chartSurgePods"], base["chartSurgePods"] + 2)
+        for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
+            self.assertEqual(three[key], base[key], key)
+
+    def test_a_max_surge_too_large_to_convert_counts_as_the_replicas(self) -> None:
+        """A Deployment's replicas are an int32, so a maxSurge of 1000% or more, or of 10 or
+        more digits, counts as the replicas outright, never through a conversion (#4876's
+        review). Covers the values a conversion got wrong: a 20-digit integer, which the YAML
+        parse makes a float past int64; 20- and 309-digit strings, which float64 reads as 0
+        or wraps; and a 23-digit percentage. Leading zeros don't count as digits."""
+        # maxUnavailable 1: main's both-zero guard (rollingUpdateFenceposts) reads a 309-digit
+        # value as 0 and would refuse the render before the count is reached.
+        sets = ["platformAgent.mode=next", "operator.replicaCount=3", "operator.rollingUpdate.maxUnavailable=1"]
+        base = self._requirements(sets)
+        for huge in ("99999999999999999999", "1000000000000000000000%", "1" + "0" * 309 + "%",
+                     "1" + "0" * 309, "1000%", "10000000000"):
+            with self.subTest(huge=huge[:12] + ("..." if len(huge) > 12 else "")):
+                req = self._requirements(sets, extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={huge}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+        for huge in (99999999999999999999, 10000000000, 1.0e300):
+            with self.subTest(numeric=huge):
+                # Through the values file, so the value reaches the template as a number.
+                req = self._requirements(sets, values={"operator": {"rollingUpdate": {"maxSurge": huge}}})
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+        for small, extra in (("000000000002", 1), ("000034%", 1), ("999", 2), ("9999999999", 2)):
+            with self.subTest(small=small):
+                req = self._requirements(sets, extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={small}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + extra)
+
+    def test_a_replica_count_near_int64_does_not_wrap_the_stamped_count(self) -> None:
+        """The chart-pods sums saturate rather than wrap (#4876's review): a replica count of
+        2^62 at maxSurge 100% would carry a plain int64 add past 2^63 and stamp a negative
+        count, which skips the 64-pod cap. Saturated, it stays past the cap and is refused."""
+        res = self._render({"probe": {}}, ["platformAgent.mode=next", "operator.replicaCount=4611686018427387904",
+                                           "operator.rollingUpdate.maxSurge=100%"])
+        self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", res.stderr)
+
+    def test_a_max_surge_that_is_not_a_whole_number_or_percentage_counts_as_the_replicas(self) -> None:
+        """The schema admits any string, and validate.yml requires such a value to render
+        (it must not be refused), so the count bounds it from above: as many surge pods as
+        the workload has replicas, the most a rollout can add."""
+        base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
+        for bad in ("abc", "1.5", "50 %", "-1", "%"):
+            with self.subTest(bad=bad):
+                req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3",
+                                          f"operator.rollingUpdate.maxSurge={bad}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
-        uninstall-only cleanup hook, and a surge pod for each that surges (#4893)."""
+        uninstall-only cleanup hook, and the surge pods each rollout can add (#4893, #4876)."""
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
         operator_pods = (
             op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]

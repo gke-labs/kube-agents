@@ -129,6 +129,10 @@ def test_the_declared_line_passes_its_objective(objective: str, tmp_path: Path) 
             "report-attributes-node-pool-skew",
             "first-zone-sponge: cause is node-pool; primary evidence: single-zone node pool; blast-radius zone: europe-west10-a; running there: 6/6",
         ),
+        (
+            "report-attributes-node-pool-skew",
+            "first-zone-sponge: cause is node-pool; primary evidence: selector_confined (confines placement to 1 of 2 usable domains); blast-radius zone: europe-west10-a; running there: 6/6",
+        ),
     ],
 )
 def test_leeway_cause_words_and_two_digit_regions_pass_their_objectives(
