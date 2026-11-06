@@ -130,6 +130,15 @@ class ArgoTest(unittest.TestCase):
         obj = argo(sync_status="OutOfSync", operationState={"phase": "Failed", "syncResult": {"revision": BEFORE}})
         self.assertEqual(rs.read_sync(obj, MERGE).state, rs.PENDING)
 
+    def test_a_failed_sync_that_names_no_revision_is_an_error(self):
+        for operation in ({}, {"operation": {"sync": {"revision": "HEAD"}}}):
+            with self.subTest(operation=operation):
+                obj = argo(sync_status="OutOfSync", revision=BEFORE,
+                           operationState={"phase": "Failed", "message": "rpc error", **operation})
+                reading = rs.read_sync(obj, MERGE, ancestry(False))
+                self.assertEqual(reading.state, rs.ERROR)
+                self.assertIn("names no revision", reading.detail)
+
     def test_a_comparison_error_condition_is_an_error_and_a_warning_is_not(self):
         err = argo(sync_status="Unknown", conditions=[{"type": "ComparisonError", "message": "repo not found"}])
         self.assertEqual(rs.read_sync(err, MERGE).state, rs.ERROR)
@@ -231,6 +240,17 @@ class FluxTest(unittest.TestCase):
         cond = {"type": "Ready", "status": "False", "reason": "Progressing"}
         self.assertEqual(rs.read_sync(flux(f"main@sha1:{BEFORE}", [cond]), MERGE, ancestry(False)).state, rs.PENDING)
 
+    def test_a_reconcile_of_the_merge_in_flight_is_pending_with_or_without_ancestry(self):
+        cond = {"type": "Ready", "status": "Unknown", "reason": "Progressing"}
+        obj = flux(f"main@sha1:{BEFORE}", [cond])
+        obj["status"]["lastAttemptedRevision"] = f"main@sha1:{MERGE}"
+        for check in (None, ancestry(False)):
+            with self.subTest(ancestry=check):
+                reading = rs.read_sync(obj, MERGE, check)
+                self.assertEqual(reading.state, rs.PENDING)
+                self.assertIn("reconcile", reading.detail)
+                self.assertIn("running", reading.detail)
+
     def test_stalled_is_an_error(self):
         cond = {"type": "Stalled", "status": "True", "reason": "InvalidPath", "message": "path not found"}
         self.assertEqual(rs.read_sync(flux("", [cond]), MERGE).state, rs.ERROR)
@@ -289,6 +309,14 @@ class ConfigSyncTest(unittest.TestCase):
         obj["spec"] = {"sourceType": "helm"}
         self.assertEqual(rs.read_sync(obj, MERGE).state, rs.UNKNOWN)
         self.assertEqual(rs.read_sync(configsync("1.2.3"), MERGE).state, rs.UNKNOWN)
+
+    def test_a_sync_of_the_merge_in_flight_is_pending_with_or_without_ancestry(self):
+        cond = {"type": "Syncing", "status": "True", "commit": MERGE}
+        for check in (None, ancestry(False)):
+            with self.subTest(ancestry=check):
+                reading = rs.read_sync(configsync(BEFORE, [cond]), MERGE, check)
+                self.assertEqual(reading.state, rs.PENDING)
+                self.assertIn("is running", reading.detail)
 
     def test_never_synced_is_pending(self):
         cond = {"type": "Syncing", "status": "True", "reason": "Source"}

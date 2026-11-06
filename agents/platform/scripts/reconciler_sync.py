@@ -242,8 +242,11 @@ def _read_argo(obj: Mapping, merge: str, is_ancestor: IsAncestor | None) -> Sync
     if phase in ARGO_RUNNING_PHASES:
         target = next(iter(op_revisions), "")
         return SyncReading(PENDING, ARGOCD, "", f"a sync to {_short(target)} is running", health)
-    if phase in ARGO_FAILED_PHASES and any(_reaches(r, merge, is_ancestor) is True for r in op_revisions):
-        return SyncReading(ERROR, ARGOCD, "", f"the sync of {_short(merge)} {phase.lower()}: {_clip(op.get('message'))}", health)
+    # A failure that names no revision is the merge's, as _merges_error rules
+    # for Flux and Config Sync.
+    if phase in ARGO_FAILED_PHASES and (not op_revisions or any(_reaches(r, merge, is_ancestor) is True for r in op_revisions)):
+        what = f"the sync of {_short(merge)}" if op_revisions else "the last sync, which names no revision,"
+        return SyncReading(ERROR, ARGOCD, "", f"{what} {phase.lower()}: {_clip(op.get('message'))}", health)
     # Argo's error conditions name no structured revision, and ComparisonError
     # means it cannot compare any commit, the merge included.
     for cond in _list(status.get("conditions")):
@@ -297,6 +300,8 @@ def _read_flux(obj: Mapping, merge: str, is_ancestor: IsAncestor | None) -> Sync
                 f"applied {_short(attempted)}; Flux reports its health check failing: {_clip(ready.get('message'))}",
             )
         return SyncReading(ERROR, FLUX, applied, f"Ready=False: {_clip(ready.get('reason'))}: {_clip(ready.get('message'))}")
+    if (ready is None or ready.get("status") != "True") and _reaches(attempted, merge, is_ancestor) is True:
+        return SyncReading(PENDING, FLUX, applied, f"a reconcile of {_short(attempted)} is running")
     return settled or SyncReading(PENDING, FLUX, "", "the Kustomization has not applied a revision yet")
 
 
@@ -335,6 +340,9 @@ def _read_configsync(obj: Mapping, merge: str, is_ancestor: IsAncestor | None) -
         if real or not errors:
             first = next((e.get("errorMessage") for e in real if e.get("errorMessage")), syncing.get("message"))
             return SyncReading(ERROR, CONFIGSYNC, synced, f"errors in {', '.join(refs)}: {_clip(first)}")
+    syncing_commit = _commit((syncing or {}).get("commit"))
+    if syncing is not None and syncing.get("status") == "True" and _reaches(syncing_commit, merge, is_ancestor) is True:
+        return SyncReading(PENDING, CONFIGSYNC, synced, f"a sync of {_short(syncing_commit)} is running")
     return settled or SyncReading(PENDING, CONFIGSYNC, "", f"the {kind} has not synced a commit yet")
 
 
