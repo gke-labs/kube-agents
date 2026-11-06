@@ -345,7 +345,8 @@ to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
-`/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
+`/var/run/secrets/kubeagents/serviceaccount/token` in the stateful broker's credential
+runtime (the exec tier does not mount it). A token
 for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
 read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
