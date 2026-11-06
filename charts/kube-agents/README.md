@@ -1200,7 +1200,10 @@ held to at most one CPU per GiB of the memory request. A cpu or memory limit set
 request lowers the counted request to that limit, as the operator does. An override setting only
 `limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit. The shell sandbox is counted the same way with
+the API server defaults it to the limit. A proxy override the operator refuses against the row
+the preflight counts (a zero limit, a request above that row's limit) is counted at the row; under
+`auto` that is a request set alone between the small row's limit and the fleet row's, which the
+CR template admits and the small latch refuses. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
 ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
 override the operator refuses (a zero limit, a request above its limit) is counted at the defaults

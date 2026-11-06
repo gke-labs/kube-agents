@@ -1327,7 +1327,8 @@ platformAgent:
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
     # when the proxy is OOM-killed under a large fleet. The quota preflight
-    # counts the override, and on Autopilot the Autopilot requests. A cpu or
+    # counts the override, at the sizing profile's row when the operator would
+    # refuse it against that row, and on Autopilot the Autopilot requests. A cpu or
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
