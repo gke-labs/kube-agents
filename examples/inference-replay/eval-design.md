@@ -1,15 +1,16 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; shadow mode on by default in CI; the replay lane's record and
-> replay modes built, not deployed.** A prototype proxy was run against a dev install on 2026-10-31
+> **STATUS — proposal; measured; shadow mode on by default in CI; the replay lane wired into CI,
+> waiting on its bucket and its Prow job.** A prototype proxy was run against a dev install on 2026-10-31
 > to 2026-11-02, and the replay lane's modes on 2026-11-04 and 05 (see "Replay lane trials").
 > [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the proxy with its shadow, record
 > and replay modes, its fingerprint log, the scrubbed request store, the hit-rate script, the lane's
 > report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
 > `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh` deploy it in shadow mode on every Prow presubmit and
 > nightly and copy its output to a private bucket in `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false`
-> turns it off); nothing deploys record or replay mode yet. The join with run verdicts and the
-> collision report (Rollout step 1) are not built yet. Shadow mode changes no verdict.
+> turns it off). A nightly running as `eval-baseline-recorder` deploys it in record mode, and the
+> replay lane (`EVAL_REPLAY_LANE=true`) in replay mode: Rollout step 2 below says what is built. The
+> collision report (Rollout step 1) is not built yet. Shadow and record mode change no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -762,7 +763,18 @@ before stage 3 of the rollout (turning replay on):
    actually save.
 
    Run it on a dev install first, with a few cases recorded and replayed several times, to check the
-   mechanics; then as the periodic job for the measurement week. The estimate the decision rests on
+   mechanics; then as the periodic job for the measurement week.
+
+   **Built:** the dev-install runs ("Replay lane trials") and the CI wiring
+   ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
+   A nightly running as `eval-baseline-recorder` records, and uploads the answers whose runs passed
+   to a bucket only that account can write. It works out which run each answer came from after the
+   fact, from the cards each request and each run's results name ("Telling the runs in a build
+   apart"). A periodic on `main` replays the last night's selection, gating nothing. It reports
+   what was served before each first miss, the miss causes, and each case's verdicts beside the
+   nightly's. **Not built:** the bucket and its grants
+   ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)) and the periodic's Prow job,
+   both outside this repository; the merge copy job and a pull request's own saved answers. The estimate the decision rests on
    combines both: what replay saves per conversation (this lane) times how often pull request
    conversations start on a saved recording (shadow mode).
 

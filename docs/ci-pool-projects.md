@@ -206,6 +206,41 @@ Every registered project was provisioned before the script ran this step. Measur
 
 - **The shadow replay bucket.** Evals run the inference-replay shadow proxy by default ([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#in-ci)), and its collector uploads to `gs://kube-agents-replay-shadow` in `kube-agents-prow`, not to the pool project: one bucket for the whole pool, `us-west1`, uniform access, public access prevention enforced, objects deleted after 90 days. The Prow runner holds `roles/storage.objectCreator` only on objects under `replay-shadow/presubmit/`, and the nightly runner only under `replay-shadow/nightly/` (IAM conditions on `resource.name`); both hold `roles/storage.objectViewer`, which the collector's no-overwrite copy needs. Neither can delete or overwrite, so a run can't change what an earlier run uploaded. Onboarding a pool project needs nothing here.
 
+- **The replay cache bucket.** A trusted nightly records model answers and the replay lane replays them ([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)). The answers go to `gs://kube-agents-replay-cache` in `kube-agents-prow`: one bucket for the whole pool, `us-west1`, uniform access, public access prevention enforced, objects deleted after 30 days, since an answer recorded under an old prompt can never be hit again. Only the nightly runner (`eval-baseline-recorder`) holds `roles/storage.objectCreator`, plus `roles/storage.objectViewer` for the no-overwrite copy, so no account pull-request code runs as can put an answer there ([who can write to the cache](../examples/inference-replay/eval-design.md#who-can-write-to-the-cache)). Nothing can overwrite or delete an object, so the first night to record a key keeps it. The Prow runner holds nothing on this bucket. The replay lane runs as the nightly runner, which reads the cache with the same grant, and needs one more: `roles/storage.objectCreator` on objects under `replay-shadow/replay-lane/` in the shadow bucket. None of this exists yet, and until it does a trusted nightly's publishes and the lane's fetch fail and are counted in `replay-shadow-collector.log`; the nightly's verdict is unaffected. To create it, as an owner of `kube-agents-prow`:
+
+  ```bash
+  PROJECT=kube-agents-prow
+  BUCKET=kube-agents-replay-cache
+  SHADOW_BUCKET=kube-agents-replay-shadow
+  RECORDER="eval-baseline-recorder@${PROJECT}.iam.gserviceaccount.com"
+
+  gcloud storage buckets create "gs://${BUCKET}" --project="${PROJECT}" --location=us-west1 \
+    --default-storage-class=STANDARD --uniform-bucket-level-access --public-access-prevention
+  printf '%s\n' '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 30}}]}' > replay-cache-lifecycle.json
+  gcloud storage buckets update "gs://${BUCKET}" --lifecycle-file=replay-cache-lifecycle.json
+
+  gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+    --member="serviceAccount:${RECORDER}" --role=roles/storage.objectCreator
+  gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+    --member="serviceAccount:${RECORDER}" --role=roles/storage.objectViewer
+
+  # The replay lane's lines and report, beside the shadow data.
+  gcloud storage buckets add-iam-policy-binding "gs://${SHADOW_BUCKET}" \
+    --member="serviceAccount:${RECORDER}" --role=roles/storage.objectCreator \
+    --condition="title=replay-lane-prefix-only,expression=resource.name.startsWith(\"projects/_/buckets/${SHADOW_BUCKET}/objects/replay-shadow/replay-lane/\")"
+  ```
+
+  Then check that the Prow runner appears nowhere in the cache bucket's policy and that an overwrite is refused (GCS needs `storage.objects.delete` for one, which neither role grants):
+
+  ```bash
+  gcloud storage buckets get-iam-policy "gs://${BUCKET}" --format=json
+  echo probe | gcloud storage cp - "gs://${BUCKET}/replay-cache/probe.json" --impersonate-service-account="${RECORDER}"
+  echo again | gcloud storage cp - "gs://${BUCKET}/replay-cache/probe.json" --impersonate-service-account="${RECORDER}"
+  # expected: the second copy is refused for want of storage.objects.delete
+  ```
+
+  The two impersonated copies need `roles/iam.serviceAccountTokenCreator` on the recorder for whoever runs them, and the probe object stays until the lifecycle rule removes it.
+
 - **The drift detector's audit ingress.** The eval installs run `k8s-operator/cmd/drift-detector`, and it reads one Pub/Sub subscription. [`terraform/modules/drift-pubsub`](../terraform/modules/drift-pubsub/) owns the whole of it — the `platform-agent-drift-audit-sink` Log Router sink over the project's GKE clusters, the `platform-agent-drift-audit` topic, the `platform-agent-drift-audit-sub` pull subscription, and `roles/pubsub.subscriber` plus `roles/pubsub.viewer` for `kubeagents-platform-gsa` on that subscription. `scripts/provision_ci_pool_project.sh` turns the module on with `enable_drift_pubsub = true` in the full-install tfvars; `hack/ci-deploy.sh` creates nothing and only points the detector at the subscription on each lease.
 
   Both grants are on the subscription rather than the project, which is why they are not in `PLATFORM_GSA_ROLES` above: that set is closed in both directions and read from the project policy, so a project-scoped grant here would fail every project as over-privileged. `roles/pubsub.viewer` is not redundant with subscriber — subscriber carries `subscriptions.consume` but not `subscriptions.get`, and the detector makes exactly that call at startup to read the ack deadline.
