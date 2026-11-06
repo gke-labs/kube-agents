@@ -1214,7 +1214,8 @@ ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
 another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
-change the install's GitHub host.
+change the install's GitHub host. While the `PlatformAgent` has a forge the operator
+refuses, the console may not add, remove or reorder forges until an administrator fixes it.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
