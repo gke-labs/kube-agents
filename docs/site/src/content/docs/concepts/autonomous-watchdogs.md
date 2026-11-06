@@ -180,9 +180,31 @@ A watchdog therefore fires through the same execute → deliver → record path 
 
   Overlap is held per job rather than per profile: a job takes `cron/.job-<id>.lock` for as long as it runs, so a second dispatch will not start the same job twice, but it will start a _different_ one. That distinction matters here because each platform tick is a separate `hermes cron tick` process. Holding the profile lock across execution — the upstream default — would make a fleet audit block every other dispatch for its whole run.
 
-- **A broken ticker is loud.** Dispatches are silent on a quiet minute, but a tick that fails is recorded as a failed `profile-cron-tick` run with the subprocess output in `<profile-home>/cron/tick.log` — the one failure mode this job must not have is the silence it exists to end. Individual watchdog runs stay where every other run is: the profile's own execution ledger, and `cronjob(action='history')`.
+- **A broken ticker is loud.** Dispatches are silent on a quiet minute, unless the idle policy below held or released a job, but a tick that fails is recorded as a failed `profile-cron-tick` run with the subprocess output in `<profile-home>/cron/tick.log` — the one failure mode this job must not have is the silence it exists to end. Individual watchdog runs stay where every other run is: the profile's own execution ledger, and `cronjob(action='history')`.
 
   That ledger is pruned per job rather than per board — 1000 rows each (`MAX_TERMINAL_EXECUTIONS_PER_JOB`), then a 5000-row sweep across the board that may never take a job's newest 50, so the floor outranks the ceiling and the real bound is 5000 plus 50 per job id. The distinction is the difference between a usable history and none: pruning to the newest 1000 rows across all jobs let the minute-ly ticker evict a daily watchdog's only row inside seventeen hours, so the history of the job you would actually go looking at was always empty.
+
+### Idle installs
+
+An install nobody talks to keeps its schedule only for a week. Before it looks for due work, the dispatcher reads when a person last messaged the install: `status.usage.lastHumanActiveTime` on the `PlatformAgent`, or the resource's creation time while the install counts no chat message. It then holds the model-run jobs on every named profile's store back in two stages. It runs inside `profile-cron-tick`, so under the experimental `platformFrontDoor` flag, where that job never fires, nothing is held:
+
+| Idle for              | Model-run jobs                                                  | `no_agent` jobs |
+| --------------------- | --------------------------------------------------------------- | --------------- |
+| under 7 days          | run on schedule                                                 | run on schedule |
+| 7 days (`throttle`)   | run at most once every 7 days, counted from each job's last run | run on schedule |
+| 14 days (`hibernate`) | do not run                                                      | run on schedule |
+
+A hold is a rewrite of the job's `next_run_at` in the profile's store, under the same lock Hermes takes. The new value is the job's own next slot at or after the hold ends, so a held audit still fires at its usual hour. A job marked due by hand with `hermes cron run` is not held: that command stamps the same timestamp into the job's `manual_run_at`, the mark Hermes itself reads as a request, and the dispatcher reads it too. The dispatcher's run output names each hold and each change of stage; `<profile-home>/cron/cron_idle_policy.json` records the stage, the last reading and the held jobs.
+
+A chat message ends the hold within about ten minutes: the operator reads the counter every five, and the dispatcher caches the field for five. Each held job then moves to its next natural occurrence rather than to now, so a returning operator gets the roster back on its schedule rather than every audit at once. A held slot that has already arrived stays and fires on that tick, since it is the job's own occurrence. A job someone ran by hand meanwhile is left where Hermes put it.
+
+Two environment variables on the agent container tune it, through `spec.deployment.env`: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. The two are independent: raising the throttle alone leaves hibernation at its own threshold. Turning the policy off releases whatever it held.
+
+The field counts every chat message the gateway accepts, the agent API's included. Turns through the A2A inject door do not count, so an install driven only through that door, an evaluation install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there.
+
+While the field is absent but `status.usage.chatMessagesInboundTotal` counts messages, the signal is unknown: an operator upgraded, or rolled back and returned, since the last message, or a served CRD predates the field. That reading replaces the cached one, so within about ten minutes of the message nothing new is held. A job already held runs at the slot it was pushed to, since no reading says when the person wrote. A served CRD that predates the counter too leaves the install idling from its creation time; the supported upgrade path refreshes the CRDs, a hand `helm upgrade` may not.
+
+When the field cannot be read (the sandbox is off, or the agent's Role no longer reaches the resource) the last reading stands for a day and then nothing new is held; the dispatcher says so once in its output. A held occurrence leaves no row in the job's history: the hold moves the slot rather than skipping it.
 
 ## Job shape
 

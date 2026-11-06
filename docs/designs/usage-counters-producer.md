@@ -61,8 +61,9 @@ These are the facts the design rests on.
 
 A `UsageCounterPoller`, a manager `Runnable` beside the RBAC self-check, with
 `NeedLeaderElection` returning true: the counters are per cluster, so exactly one operator
-replica advances them. One interval after the leader's election, by which time the first
-reconcile pass has rendered the rules that admit the operator, and then every
+replica advances them. Thirty seconds after the leader's election
+(`usageCountersFirstPollDelay`), by which time on a running install the first reconcile pass
+has rendered the rules that admit the operator, and then every
 `usageCountersPollInterval` (five minutes, the
 interval the controller already uses for the RBAC re-probe and the pruned-status re-probe, on
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
@@ -610,8 +611,10 @@ The schema has no field for an error, by design: static enums and integer counts
 install that switched the watcher off is not a failure: the poller reads the same switch the
 reconciler does, scrapes no gateway pod while it is off, moves no counter, and writes once to
 clear the two cluster gauges if they were set. The first poll after a start
-runs one interval after election, after the initial reconcile pass has rendered the rules
-admitting the operator; a CR the poll reaches before its rules are applied costs one failed
+runs thirty seconds after election (`usageCountersFirstPollDelay`), after the initial reconcile
+pass on a running install has rendered the rules admitting the operator, and early enough that a
+CR under `spec.deployment.sizingProfile: auto` has its cluster count, and so its tier, within a
+minute of an operator restart; a CR the poll reaches before its rules are applied costs one failed
 poll, and a streak shorter than two polls records no event, so an upgrade leaves no Warning on a
 healthy CR.
 Listeners from a release before this one are not a failure either: the operator moves before the harness on an

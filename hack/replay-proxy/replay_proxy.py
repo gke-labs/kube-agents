@@ -187,9 +187,10 @@ class Config:
     store_dir: str = DEFAULT_STORE_DIR
     redactor_path: str = DEFAULT_REDACTOR_PATH
     transcript_rules_path: str = DEFAULT_TRANSCRIPT_RULES_PATH
-    # Set at deploy time from the LiteLLM Deployment's `checksum/config`
-    # pod annotation and its container image.
-    litellm_config_checksum: str = UNSET
+    # Set at deploy time by the chart: a checksum of the LiteLLM config that
+    # treats the Gemini API and Vertex AI routes as one
+    # (REPLAY_MODEL_BEHAVIOUR_CHECKSUM), and the LiteLLM container image.
+    model_behaviour_checksum: str = UNSET
     litellm_image: str = UNSET
     # Which job this proxy serves, stamped on every line for the analysis.
     job_kind: str = UNSET
@@ -217,7 +218,7 @@ class Config:
             store_dir=env.get("REPLAY_STORE_DIR", DEFAULT_STORE_DIR),
             redactor_path=env.get("REPLAY_REDACTOR_PATH", DEFAULT_REDACTOR_PATH),
             transcript_rules_path=env.get("REPLAY_TRANSCRIPT_RULES_PATH", DEFAULT_TRANSCRIPT_RULES_PATH),
-            litellm_config_checksum=env.get("REPLAY_LITELLM_CONFIG_CHECKSUM", UNSET),
+            model_behaviour_checksum=env.get("REPLAY_MODEL_BEHAVIOUR_CHECKSUM", UNSET),
             litellm_image=env.get("REPLAY_LITELLM_IMAGE", UNSET),
             job_kind=env.get("REPLAY_JOB_KIND", UNSET),
             job_project=env.get("REPLAY_JOB_PROJECT", UNSET),
@@ -535,7 +536,7 @@ class ShadowProxy:
         # Replay reads a cache another job recorded; its index is built once, at start.
         self.index = replay_cache.PrefixIndex(self.cache.entries()) if config.mode == F.MODE_REPLAY else None
         self.index_empty = not (self.index and self.index.by_prefix)
-        self.key_context = normalizer.KeyContext(config.litellm_config_checksum, config.litellm_image)
+        self.key_context = normalizer.KeyContext(config.model_behaviour_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
         if config.data_max_bytes > 0:
@@ -907,7 +908,7 @@ class ShadowProxy:
             F.SCHEMA: F.LOG_SCHEMA_VERSION,
             F.JOB: self.job(),
             F.NORMALIZER_VERSION: normalizer.NORMALIZER_VERSION,
-            F.LITELLM_CONFIG_CHECKSUM: self.config.litellm_config_checksum,
+            F.MODEL_BEHAVIOUR_CHECKSUM: self.config.model_behaviour_checksum,
             F.LITELLM_IMAGE: self.config.litellm_image,
             F.SCRUBBERS_LOADED: self.scrubber.available,
             F.SCRUBBERS_ERROR: self.scrubber.error,
@@ -933,7 +934,7 @@ class ShadowProxy:
             F.MODEL: body.get(F.MODEL),
             F.STREAM: bool(body.get(F.STREAM)),
             F.NORMALIZER_VERSION: self.key_context.normalizer_version,
-            F.LITELLM_CONFIG_CHECKSUM: self.key_context.litellm_config_checksum,
+            F.MODEL_BEHAVIOUR_CHECKSUM: self.key_context.model_behaviour_checksum,
             F.LITELLM_IMAGE: self.key_context.litellm_image,
             F.STATUS: upstream["status"],
             F.LATENCY_MS: upstream["latency_ms"],

@@ -5,6 +5,7 @@ import http.client
 import io
 import json
 import logging
+import math
 import os
 from dataclasses import replace
 import queue
@@ -179,11 +180,12 @@ class AgentAPIProxyTest(unittest.TestCase):
                     self.wfile.write(f"{len(second):x}\r\n".encode("ascii") + second + b"\r\n0\r\n\r\n")
                     self.wfile.flush()
                     return
-                body = b"proxied"
+                body = b"a" * _UNREAD_RESPONSE_BYTES if self.path == "/big" else b"proxied"
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                with contextlib.suppress(OSError):  # the cut-response test's door closes mid-body
+                    self.wfile.write(body)
 
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("Content-Length", "0"))
@@ -212,6 +214,109 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.proxy.server_close()
         self.upstream.server_close()
         self.workspace_dir.cleanup()
+
+    def test_a_silent_connection_to_the_door_is_closed_at_the_idle_timeout_and_frees_its_slot(self):
+        # The door shares the capped server classes: a peer that connects and
+        # sends nothing must give its thread, and its slot under the cap,
+        # back at KEEPALIVE_IDLE_SECONDS rather than hold them for as long as
+        # it keeps the connection open. The window is _DOOR_IDLE_SECONDS, not
+        # _SHORT_IDLE_SECONDS: the refused peer below connects after a settle,
+        # and must do so while the silent one is still inside its window.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _DOOR_IDLE_SECONDS):
+            door = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler, max_threads=1)
+            threading.Thread(target=door.serve_forever, daemon=True).start()
+            self.addCleanup(door.server_close)
+            self.addCleanup(door.shutdown)
+            silent = socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(silent.close)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # The one slot is held: the next connection is refused with the cap's 503.
+            with socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS) as refused:
+                response = http.client.HTTPResponse(refused)
+                response.begin()
+                self.assertEqual(503, response.status)
+            self.assertEqual(b"", silent.recv(1), "the silent connection was not closed")
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # The slot is back: a request is served.
+            connection = http.client.HTTPConnection("127.0.0.1", door.server_port, timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(connection.close)
+            connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
+            self.assertEqual(200, connection.getresponse().status)
+
+    def test_a_peer_that_drips_its_request_head_is_closed_at_the_window_and_frees_its_slot(self):
+        # The window bounds the whole request head, not each read of it: a
+        # peer that sends one byte of its request line inside every per-read
+        # timeout would otherwise hold its thread, and its slot under the
+        # cap, for as long as it kept dripping, and enough of them lock the
+        # door for every other pod in the namespace.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _DOOR_IDLE_SECONDS):
+            door = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler, max_threads=1)
+            threading.Thread(target=door.serve_forever, daemon=True).start()
+            self.addCleanup(door.server_close)
+            self.addCleanup(door.shutdown)
+            dripping = socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(dripping.close)
+            stop = threading.Event()
+            self.addCleanup(stop.set)
+            _drip(dripping, b"GET /" + b"a" * _DRIPPED_HEAD_BYTES, stop)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Inside the window the one slot is held: the next connection is refused.
+            with socket.create_connection(("127.0.0.1", door.server_port), timeout=_CLOSE_WAIT_SECONDS) as refused:
+                response = http.client.HTTPResponse(refused)
+                response.begin()
+                self.assertEqual(503, response.status)
+            # At the window the dripping connection is closed, still dripping
+            # (EOF, or a reset for the bytes the close left unread), and the
+            # slot is back.
+            started = time.monotonic()
+            try:
+                self.assertEqual(b"", dripping.recv(1), "the dripping connection was not closed")
+            except ConnectionResetError:
+                pass
+            self.assertLess(time.monotonic() - started, _CLOSE_WAIT_SECONDS)
+            time.sleep(_RESET_SETTLE_SECONDS)
+            connection = http.client.HTTPConnection("127.0.0.1", door.server_port, timeout=_CLOSE_WAIT_SECONDS)
+            self.addCleanup(connection.close)
+            connection.request("GET", "/health", headers={"Authorization": "Bearer external-secret"})
+            self.assertEqual(200, connection.getresponse().status)
+
+    def test_an_idle_door_connection_is_a_debug_line_not_an_access_log_line(self):
+        # The stdlib reports the idle timeout through log_error, which on
+        # the door went to log_message: an INFO line shaped like an access
+        # log entry for every peer that connected and sent nothing.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.proxy.server_port), timeout=_CLOSE_WAIT_SECONDS) as silent:
+                    self.assertEqual(b"", silent.recv(1), "the silent connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+        self.assertFalse(any(line.startswith("INFO:") for line in logs.output), logs.output)
+        self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
+
+    def test_a_peer_that_stops_reading_a_proxied_body_is_logged_as_a_cut_response_not_an_upstream_failure(self):
+        # The door's connection carries the same socket timeout as the
+        # credentialed handler's, so a peer that stops reading a proxied body
+        # for the window ends the write with a TimeoutError. That is the
+        # downstream side, not "PlatformAgent API upstream request failed"
+        # with a traceback, which the one catch around the relay loop would
+        # otherwise say of it; the upstream here answers in full.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.proxy.server_port), timeout=_CLOSE_WAIT_SECONDS) as unread:
+                    unread.sendall(b"GET /big HTTP/1.1\r\nHost: door\r\nAuthorization: Bearer external-secret\r\n\r\n")
+                    deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                    while not any("not read by the peer" in line for line in logs.output):
+                        if time.monotonic() > deadline:
+                            self.fail(f"the cut response was not logged: {logs.output}")
+                        time.sleep(0.1)
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "not read by the peer" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:") and "type=TimeoutError" in cut[0], cut[0])
+        self.assertFalse(any("upstream request failed" in line for line in logs.output), logs.output)
+        self.assertFalse(any("Traceback" in line for line in logs.output), logs.output)
 
     def _seed_state_db_sessions(self, rows, profile=None):
         import sqlite3
@@ -2998,12 +3103,15 @@ class ResourcePressureRouteTest(unittest.TestCase):
             self.assertEqual(200, status)
 
     def test_a_workspace_write_refused_at_the_hard_watermark_still_delivers_its_429_under_a_large_body(self):
-        # The refusal is written before the body is read. A commit body larger
-        # than the socket buffers is still being sent when the handler closes,
-        # and closing on it resets the connection, which swallows the 429 and
-        # its Retry-After unless the body is drained first (the vcs route's
-        # refusal drains for the same reason). Read after the close has landed
-        # rather than into the race, as the agent API proxy's drain test does.
+        # The refusal is decided before the body is read. A commit body larger
+        # than the socket buffers is still being sent when the answer is
+        # written, and a response over unread body bytes closes the
+        # connection, which resets it and swallows the 429 and its Retry-After
+        # unless the body is drained first (the vcs route's refusal drains for
+        # the same reason). Drained, the body counts as read, so the 429 is
+        # framed on a connection kept open, and the next request on it is
+        # answered: proof the drain left no body byte to be parsed as that
+        # request's line.
         self.as_role(credential_proxy.CALLER_ROLE_SHELL)
         routed = []
         body = json.dumps({"handle": "h", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
@@ -3018,23 +3126,126 @@ class ResourcePressureRouteTest(unittest.TestCase):
                 b"Content-Type: application/json\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
             )
-            received = b""
             with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
                 try:
                     client.sendall(request)
-                    time.sleep(_RESET_SETTLE_SECONDS)
-                    while chunk := client.recv(65536):
-                        received += chunk
+                    refusal = http.client.HTTPResponse(client)
+                    refusal.begin()
+                    payload = refusal.read()
                 except OSError as exc:
                     self.fail(
                         "the broker abandoned the connection instead of delivering its 429, "
                         f"which reads to a caller as a dead broker: {exc}"
                     )
-        head, _, payload = received.partition(b"\r\n\r\n")
-        self.assertIn(b" 429 ", head.split(b"\r\n", 1)[0])
-        self.assertIn(b"Retry-After: 11", head)
-        self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+                self.assertEqual(429, refusal.status)
+                self.assertEqual("11", refusal.getheader("Retry-After"))
+                self.assertNotEqual("close", (refusal.getheader("Connection") or "").lower())
+                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
         self.assertEqual([], routed)
+
+    def test_a_vcs_request_refused_after_its_slot_wait_still_delivers_its_503_under_a_large_body(self):
+        # The queue refusal takes the same branch as the gate's, after a wait:
+        # the vcs route enters its slot before reading the body, and a wait
+        # that runs the whole of COMMAND_SLOT_WAIT_SECONDS ends after the
+        # request's own read deadline, counted from its first byte, has
+        # passed. The drain must then still read the body, under a deadline
+        # of its own, or its first read fails before any byte, the 503 is
+        # written over an unread body and the close resets a caller still
+        # sending the bundle. Drained, the 503 is framed on a connection kept
+        # open, and the next request on it is answered.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        body = json.dumps({"repository": "acme/fleet", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
+
+        def wait_out_the_queue():
+            time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
+            raise credential_proxy.CommandSlotUnavailable("every slot is taken")
+
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "vcs", mock.Mock()),
+            mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=wait_out_the_queue),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING"),
+        ):
+            request = (
+                b"POST /v1/vcs/publish HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    refusal = http.client.HTTPResponse(client)
+                    refusal.begin()
+                    payload = refusal.read()
+                except OSError as exc:
+                    self.fail(
+                        "the broker abandoned the connection instead of delivering its 503, "
+                        f"which reads to a caller as a dead broker: {exc}"
+                    )
+                self.assertEqual(503, refusal.status)
+                self.assertNotEqual("close", (refusal.getheader("Connection") or "").lower())
+                self.assertEqual("CREDENTIAL_PROXY_BUSY", json.loads(payload)["code"])
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
+
+    def test_a_vcs_request_admitted_after_its_slot_wait_reads_its_body_and_keeps_the_connection(self):
+        # The refusal above, admitted instead: the slot wait ends after the
+        # connection's window, counted from the request's first byte, has
+        # passed, and the body is then read under the route's own deadline,
+        # which runs from admission. Were the connection's deadline left
+        # armed, the first read would fail before any byte and the request
+        # would go unanswered. The body read is counted, so the answer is
+        # framed with no announced close, and the next request on the same
+        # connection is answered.
+        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
+        pad = "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS
+        body = json.dumps({"repository": "acme/fleet", "pad": pad}).encode("utf-8")
+
+        @contextlib.contextmanager
+        def admitted_after_the_window(*_args):
+            time.sleep(_SLOT_WAIT_PAST_THE_WINDOW_SECONDS)
+            yield
+
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "vcs", mock.Mock()),
+            mock.patch.object(CredentialProxyHandler, "max_request_bytes", 2 * len(body)),
+            mock.patch.object(CredentialProxyHandler, "_request_slot", admitted_after_the_window),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"publish": lambda payload: {"padded": len(payload["pad"])}},
+            ),
+            mock.patch.object(credential_proxy.vcs_broker, "UNGATED_VERBS", frozenset({"publish"})),
+        ):
+            request = (
+                b"POST /v1/vcs/publish HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
+                try:
+                    client.sendall(request)
+                    answer = http.client.HTTPResponse(client)
+                    answer.begin()
+                    payload = answer.read()
+                except OSError as exc:
+                    self.fail(f"the admitted request went unanswered: {exc}")
+                self.assertEqual(200, answer.status)
+                self.assertEqual({"padded": len(pad)}, json.loads(payload))
+                self.assertNotEqual("close", (answer.getheader("Connection") or "").lower())
+                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                probe = http.client.HTTPResponse(client)
+                probe.begin()
+                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
 
     def test_a_watcher_list_at_the_hard_watermark_is_refused_and_a_watch_passes(self):
         listing = self._watcher_handler("/v1/k8s/kagents-dev/us-central1/prod/api/v1/events?limit=500")
@@ -10128,20 +10339,32 @@ class GracefulDrainTest(unittest.TestCase):
                 handler._leave_in_flight()  # what handle_one_request does once answered
                 self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
 
-    def test_a_request_is_in_flight_until_it_is_answered(self):
+    def test_a_request_is_in_flight_from_its_request_line_until_it_is_answered(self):
+        # Counted once the request line has arrived (parse_request), not from
+        # handle_one_request's entry, where a kept-open connection waits for
+        # its next request line; left once the answer is written, a reset
+        # mid-answer included.
         in_flight = CredentialProxyHandler.in_flight
         seen = []
         handler, _ = self._handler("/v1/exec")
         for raised in (None, OSError("reset")):
             with self.subTest(raised=raised):
                 def answer(_self, raised=raised):
-                    seen.append(in_flight.wait_idle(time.monotonic()))
+                    # What the stdlib does before it dispatches to a route:
+                    # the request line read, then parsed with its headers.
+                    seen.append(("before the request line", in_flight.wait_idle(time.monotonic())))
+                    _self.raw_requestline = b"POST /v1/exec HTTP/1.1\r\n"
+                    _self.rfile = credential_proxy._CountingReader(io.BytesIO(b"Host: broker\r\n\r\n"))
+                    self.assertTrue(_self.parse_request())
+                    seen.append(("after the request line", in_flight.wait_idle(time.monotonic())))
                     if raised:
                         raise raised
 
                 with mock.patch.object(credential_proxy.BaseHTTPRequestHandler, "handle_one_request", answer):
                     handler.handle_one_request()
-                self.assertEqual(1, seen[-1])
+                self.assertEqual(
+                    [("before the request line", 0), ("after the request line", 1)], seen[-2:]
+                )
                 self.assertEqual(0, in_flight.wait_idle(time.monotonic()))
 
     def test_in_flight_wakes_the_waiter_when_the_last_request_leaves(self):
@@ -10963,6 +11186,51 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             credential_proxy.serve(types.SimpleNamespace())
         proxy.serve_forever.assert_called_once_with()
         start.assert_not_called()
+
+    def test_the_door_takes_the_environments_cap_or_the_fallback_and_derives_none(self):
+        # No Envoy fronts the agent API door, so the derivation's argument
+        # (Envoy's breaker refuses before the cap) does not hold there: the
+        # door is built with MAX_THREADS_ENV, else 1024, and the Envoy config
+        # is not read in the api-proxy role. In the combined role the
+        # listener behind Envoy takes the derived cap and the door its own.
+        not_derived = mock.patch.object(
+            credential_proxy, "default_max_threads", side_effect=AssertionError("the Envoy config was read for the door")
+        )
+        for value, expected in ((None, 1024), ("12", 12), ("many", 1024), ("0", 1024)):
+            proxy = mock.MagicMock()
+            with self.subTest(value=value), not_derived, mock.patch.dict(os.environ), \
+                    mock.patch.object(credential_proxy, "resolve_role", return_value="api-proxy"), \
+                    mock.patch.object(credential_proxy, "start_agent_api_proxy", return_value=proxy) as started:
+                os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+                if value is not None:
+                    os.environ[credential_proxy.MAX_THREADS_ENV] = value
+                credential_proxy.serve(types.SimpleNamespace())
+                started.assert_called_once_with(max_threads=expected)
+                proxy.serve_forever.assert_called_once_with()
+        # Under a clean environment, not the invoking shell's: a host that
+        # exports the variable would otherwise fail this line with the code right.
+        with mock.patch.dict(os.environ):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.door_thread_cap_from_env())
+        self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
+        with mock.patch.object(credential_proxy, "resolve_role", return_value="combined"), \
+                mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=4160), \
+                mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()) as started:
+            self._serve_with(None)
+        started.assert_called_once_with(max_threads=1024)
+        self.assertEqual(4160, credential_proxy.ThreadCap.max_threads)
+
+    def test_the_door_is_built_with_the_cap_it_is_given(self):
+        names = ("external_key", "upstream_key", "workspace_root")
+        for name in names:
+            self.addCleanup(setattr, AgentAPIProxyHandler, name, AgentAPIProxyHandler.__dict__.get(name))
+        with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external", "AGENT_API_PROXY_PORT": "0"}), \
+                self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            server = credential_proxy.start_agent_api_proxy(max_threads=3)
+        self.addCleanup(server.server_close)
+        self.assertIsInstance(server, credential_proxy.ThreadingTCPHTTPServer)
+        self.assertEqual(3, server.connection_cap)
+        self.assertTrue(any("3 connections at once" in line and credential_proxy.MAX_THREADS_ENV in line for line in logs.output), logs.output)
 
     def test_the_sweep_env_turns_it_off_and_nothing_else_does(self):
         # Installs sharing one App installation (the eval lanes, #4611) turn
@@ -15577,7 +15845,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
             pass
 
         class FakeServer:
-            def __init__(self, address, handler):
+            def __init__(self, address, handler, max_threads=None):
                 self.address = address
 
             def serve_forever(self):
@@ -15839,14 +16107,15 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
 class ListenBacklogTest(unittest.TestCase):
     """A burst of connections waits in the listener's queue; none is refused.
 
-    Envoy opens one upstream connection per request, because the handler
-    speaks HTTP/1.0 and closes after every response, so every brokered call,
-    every event-pull iteration and every readiness probe is a fresh connect()
-    on the broker's Unix socket. The kernel holds the connections the accept
-    loop has not reached yet in the listen backlog; one past it is refused
-    with EAGAIN at once, which Envoy answers with a 503 before any handler
-    thread exists. The stdlib's backlog is 5. The accept loop is left stopped
-    here so that the queue, and nothing else, decides.
+    Envoy reuses an upstream connection across requests (the handler speaks
+    HTTP/1.1, KeepAliveTest), so a connect() on the broker's Unix socket is
+    Envoy's pool growing: a burst of brokered calls, event-pull iterations
+    and readiness probes past the connections it already holds open. The
+    kernel holds the connections the accept loop has not reached yet in the
+    listen backlog; one past it is refused with EAGAIN at once, which Envoy
+    answers with a 503 before any handler thread exists. The stdlib's backlog
+    is 5. The accept loop is left stopped here so that the queue, and nothing
+    else, decides.
     """
 
     # Well past the stdlib's 5 and well under any file-descriptor limit a CI
@@ -15911,6 +16180,1576 @@ class ListenBacklogTest(unittest.TestCase):
         ceilings = {threshold["max_connections"] for threshold in runtime["circuit_breakers"]["thresholds"]}
         self.assertEqual(1, len(ceilings), f"credential_runtime's priorities disagree on max_connections: {ceilings}")
         self.assertGreaterEqual(credential_proxy.LISTEN_BACKLOG, ceilings.pop())
+
+
+# How long a test waits for a close the server owes it; a server that keeps the
+# connection open past this fails the test rather than hanging it.
+_CLOSE_WAIT_SECONDS = 5
+# The idle keep-alive timeout a test arms, short enough to observe.
+_SHORT_IDLE_SECONDS = 0.5
+# The idle timeout the door's slot test arms. That test connects a second peer
+# only after _RESET_SETTLE_SECONDS, so its window has to outlast the settle by
+# a wide margin: at an idle equal to the settle, the silent connection could be
+# closed first and the second peer admitted in its place, held for a request
+# it never sends, and closed unanswered, where the test expects the cap's 503.
+_DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
+# The bound on the health listener's answer under saturation. What the test
+# rules out is the answer waiting behind the four holders, parked for the idle
+# timeout (seconds); an order of magnitude under that, and not the issue's 50 ms,
+# which pins scheduler noise on a loaded runner rather than the property.
+_HEALTH_ANSWER_SECONDS = 1
+# Refusals made in quick succession, to show the cap writes one line for them.
+_REFUSAL_BURST = 3
+# The small cap the saturation test builds its server with.
+_SMALL_THREAD_CAP = 4
+_KEEPALIVE_REQUESTS = 5
+# A _json body a caller that never reads cannot be written in full: wider than
+# a Unix socket's buffers, so the write blocks and the deadline ends it.
+_UNREAD_RESPONSE_BYTES = 8 << 20
+# How much of an announced body the stalled-request test sends before stopping.
+_STALLED_BODY_LENGTH = 100
+# A refusal drain made longer than the close wait: a test that reads a
+# second refusal inside the close wait while a first drain is parked for this
+# long shows the accept loop was not the thread doing the waiting.
+_LONG_REFUSAL_DRAIN_SECONDS = 2 * _CLOSE_WAIT_SECONDS
+# How often a dripping peer sends its next byte: well inside every per-read
+# timeout the tests arm, so a handler that bounded each read rather than the
+# whole request head would never close on it.
+_DRIP_INTERVAL_SECONDS = _SHORT_IDLE_SECONDS / 5
+# A request line, header or body long enough that, dripped at that interval,
+# it is still incomplete when every window the tests arm has passed.
+_DRIPPED_HEAD_BYTES = 400
+# The start of a request line that never finishes, sent on a connection that
+# has already served a request.
+_PARTIAL_REQUEST_LINE = b"GET /"
+# A slot wait that outlasts the short idle window, as the shipped wait and
+# window do (COMMAND_SLOT_WAIT_SECONDS and KEEPALIVE_IDLE_SECONDS, 60 s each,
+# the wait counted from admission and the window from the request's first
+# byte): a queue refusal always lands after the request's read deadline.
+_SLOT_WAIT_PAST_THE_WINDOW_SECONDS = 2 * _SHORT_IDLE_SECONDS
+
+
+def _drip(sock, data, stop):
+    """Send `data` to `sock` a byte at a time, every _DRIP_INTERVAL_SECONDS, on a thread until `stop` is set or the send fails."""
+
+    def dripper():
+        for byte in data:
+            if stop.is_set():
+                return
+            try:
+                sock.send(bytes([byte]))
+            except OSError:
+                return
+            time.sleep(_DRIP_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=dripper, daemon=True)
+    thread.start()
+    return thread
+
+
+class _CredentialedUnixServer(unittest.TestCase):
+    """A credentialed listener on a Unix socket, with the watcher test's fake authenticator.
+
+    Three tokens, three roles, and a bounded request size, so the refusals a
+    kept-open connection has to close on (401, 403, 413) are all reachable.
+    """
+
+    SHELL = "shell-token"
+    WATCHER = "watcher-token"
+    CALLER = "system:serviceaccount:kubeagents-system:kubeagents-platform-agent"
+    MAX_REQUEST_BYTES = 1024
+
+    def setUp(self):
+        for attribute in ("authenticator", "max_request_bytes", "policy"):
+            self.addCleanup(
+                self._restore, attribute, attribute in CredentialProxyHandler.__dict__,
+                CredentialProxyHandler.__dict__.get(attribute),
+            )
+        roles = {
+            self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+            self.WATCHER: credential_proxy.CALLER_ROLE_WATCHER,
+        }
+        authenticator = credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                "kubeagents-credential-proxy": credential_proxy.CALLER_ROLE_SHELL,
+                "kubeagents-credential-proxy-watcher": credential_proxy.CALLER_ROLE_WATCHER,
+            },
+            allowed_callers=frozenset({self.CALLER}),
+            api_host="10.0.0.1", api_port="443", ca_file="", token_file="/nonexistent", cache_seconds=0.0,
+        )
+
+        def fake_review(token):
+            if token not in roles:
+                raise credential_proxy.AuthenticationError("not our token")
+            return credential_proxy.Principal(workload=self.CALLER, uid="sa-uid", role=roles[token])
+
+        authenticator._review = fake_review
+        CredentialProxyHandler.authenticator = authenticator
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = self.MAX_REQUEST_BYTES
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.socket_path = os.path.join(self.directory.name, "backend.sock")
+        self.server = credential_proxy.ThreadingUnixHTTPServer(
+            self.socket_path, CredentialProxyHandler, max_threads=self.max_threads()
+        )
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.opened = []
+        self.addCleanup(lambda: [sock.close() for sock in self.opened])
+
+    def max_threads(self):
+        return None
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(_CLOSE_WAIT_SECONDS)
+        sock.connect(self.socket_path)
+        self.opened.append(sock)
+        return sock
+
+    @staticmethod
+    def send(sock, method, path, token=None, headers=(), body=b""):
+        lines = [f"{method} {path} HTTP/1.1", "Host: broker"]
+        if token:
+            lines.append(f"Authorization: Bearer {token}")
+        lines.extend(headers)
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body)
+
+    @staticmethod
+    def response(sock):
+        response = http.client.HTTPResponse(sock)
+        response.begin()
+        body = response.read()
+        return response.status, {name.lower(): value for name, value in response.getheaders()}, body
+
+    @staticmethod
+    def closed_by_server(sock):
+        """True once the server has closed: a read returns EOF or fails; a timeout is a failure."""
+        try:
+            return sock.recv(1) == b""
+        except TimeoutError:
+            raise
+        except OSError:
+            return True
+
+
+class KeepAliveTest(_CredentialedUnixServer):
+    """The credentialed handler speaks HTTP/1.1: one connection carries request
+    after request, every response is framed, and a response written over an
+    unread body closes the connection rather than leaving the body to be read
+    as the next request line."""
+
+    def test_sequential_requests_are_answered_on_one_connection(self):
+        sock = self.connect()
+        for ordinal in range(_KEEPALIVE_REQUESTS):
+            self.send(sock, "GET", "/healthz")
+            status, headers, body = self.response(sock)
+            self.assertEqual((200, {"status": "ok"}), (status, json.loads(body)), f"request {ordinal + 1}")
+            self.assertNotEqual("close", headers.get("connection", "").lower(), f"request {ordinal + 1}")
+            self.assertEqual(str(len(body)), headers.get("content-length"))
+        # Still open: the next request is answered on the same socket too.
+        self.send(sock, "GET", "/healthz")
+        self.assertEqual(200, self.response(sock)[0])
+
+    def test_a_kept_open_connection_waiting_for_a_request_is_not_in_flight(self):
+        # The broker's drain waits on the in-flight count
+        # (install_shutdown_handler). A kept-open connection idle between
+        # requests sits in handle_one_request waiting for a request line, for
+        # up to KEEPALIVE_IDLE_SECONDS; counted from there, every drain would
+        # wait its whole window for a request that never came. The count
+        # starts at the request line and ends with the answer.
+        in_flight = credential_proxy.InFlight()
+        with mock.patch.object(CredentialProxyHandler, "in_flight", in_flight):
+            answered = self.connect()
+            self.send(answered, "GET", "/healthz")
+            self.assertEqual(200, self.response(answered)[0])
+            silent = self.connect()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Both connections are open, neither is in flight: one answered
+            # and waiting for its next request, one that has sent nothing.
+            self.assertEqual(0, in_flight.wait_idle(time.monotonic() + _CLOSE_WAIT_SECONDS))
+            # A request line with its headers still to come is in flight.
+            answered.sendall(b"GET /healthz HTTP/1.1\r\n")
+            deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+            while in_flight.wait_idle(time.monotonic()) == 0 and time.monotonic() < deadline:
+                time.sleep(_DRIP_INTERVAL_SECONDS)
+            self.assertEqual(1, in_flight.wait_idle(time.monotonic()))
+            answered.sendall(b"Host: broker\r\n\r\n")
+            self.assertEqual(200, self.response(answered)[0])
+            self.assertEqual(0, in_flight.wait_idle(time.monotonic() + _CLOSE_WAIT_SECONDS))
+
+    def test_an_http_1_0_client_is_answered_and_closed(self):
+        sock = self.connect()
+        sock.sendall(b"GET /healthz HTTP/1.0\r\n\r\n")
+        status, _, _ = self.response(sock)
+        self.assertEqual(200, status)
+        self.assertTrue(self.closed_by_server(sock))
+
+    def test_a_refusal_written_before_the_body_was_read_closes_the_connection(self):
+        body = b'{"argv":["kubectl","get","pods"]}'
+        cases = {
+            "401 unknown token": ("POST", "/v1/exec", "not-a-token", body),
+            "403 wrong role": ("POST", "/v1/exec", self.WATCHER, body),
+            "413 over the cap": ("POST", "/v1/exec", self.SHELL, b"x" * (self.MAX_REQUEST_BYTES + 1)),
+            "200 GET carrying a body": ("GET", "/healthz", None, body),
+        }
+        for label, (method, path, token, sent) in cases.items():
+            with self.subTest(label):
+                sock = self.connect()
+                self.send(sock, method, path, token, [f"Content-Length: {len(sent)}"], sent)
+                status, headers, _ = self.response(sock)
+                self.assertEqual(int(label.split()[0]), status)
+                self.assertEqual("close", headers.get("connection", "").lower(), headers)
+                self.assertTrue(self.closed_by_server(sock), f"{label}: the connection stayed open")
+
+    def test_a_body_the_route_read_leaves_the_connection_open(self):
+        # The same POST, admitted: the body is consumed, the answer is framed,
+        # and the connection carries the next request.
+        sock = self.connect()
+        body = b'{"argv":["true"]}'
+        self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {len(body)}"], body)
+        status, headers, _ = self.response(sock)
+        self.assertEqual(403, status, "an empty policy blocks the command; the body was read first")
+        self.assertNotEqual("close", headers.get("connection", "").lower(), headers)
+        self.send(sock, "GET", "/healthz")
+        self.assertEqual(200, self.response(sock)[0])
+
+    def test_a_chunked_request_body_closes_the_connection(self):
+        # No route reads a chunked body, so it can never be framed as read.
+        sock = self.connect()
+        self.send(sock, "POST", "/v1/exec", self.SHELL, ["Transfer-Encoding: chunked"], b"0\r\n\r\n")
+        status, headers, _ = self.response(sock)
+        self.assertEqual("close", headers.get("connection", "").lower(), (status, headers))
+        self.assertTrue(self.closed_by_server(sock))
+
+    def test_a_content_length_that_cannot_frame_the_body_closes_the_connection(self):
+        # A negative length, or two Content-Length headers that disagree, is
+        # a body no route can read to its end (RFC 9112 section 6.3), so the
+        # answer closes the connection whatever the route did with the first
+        # value it read: a 413 on the negative length without a read, a 413
+        # on the zero of a disagreeing pair with the body left on the wire,
+        # a 403 after reading the body when the pair's first value was its
+        # length. The bytes behind the pair are never read as the next
+        # request line.
+        body = b'{"argv":["kubectl","get","pods"]}'
+        cases = {
+            "413 negative": (["Content-Length: -5"], b""),
+            "413 two lengths, the first zero": (["Content-Length: 0", f"Content-Length: {len(body)}"], body),
+            "403 two lengths, the first the body's": ([f"Content-Length: {len(body)}", "Content-Length: 0"], body),
+        }
+        for label, (sent_headers, sent) in cases.items():
+            with self.subTest(label):
+                sock = self.connect()
+                self.send(sock, "POST", "/v1/exec", self.SHELL, sent_headers, sent)
+                status, headers, _ = self.response(sock)
+                self.assertEqual(int(label.split()[0]), status)
+                self.assertEqual("close", headers.get("connection", "").lower(), (status, headers))
+                self.assertTrue(self.closed_by_server(sock), f"{label}: the connection stayed open")
+        # Two that agree frame the body as one does: the route reads it and
+        # the connection carries the next request.
+        sock = self.connect()
+        self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {len(body)}"] * 2, body)
+        status, headers, _ = self.response(sock)
+        self.assertEqual(403, status, "an empty policy blocks the command; the body was read first")
+        self.assertNotEqual("close", headers.get("connection", "").lower(), headers)
+        self.send(sock, "GET", "/healthz")
+        self.assertEqual(200, self.response(sock)[0])
+
+    def test_a_rejected_request_line_on_a_kept_open_connection_counts_under_other(self):
+        # The stdlib resets the command and never the path on a parse failure,
+        # so without the handler clearing it a bad second request line would
+        # be counted under the first request's route.
+        metrics = credential_proxy.ProxyMetrics()
+        with mock.patch.object(CredentialProxyHandler, "metrics", metrics):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            self.assertEqual(200, self.response(sock)[0])
+            # Four words with a version the stdlib accepts, so the 400 is a
+            # framed HTTP/1.1 response (a line it reads as HTTP/0.9 is
+            # answered body-only, with no status line to read back).
+            sock.sendall(b"GET /healthz extra HTTP/1.1\r\n\r\n")
+            status, headers, _ = self.response(sock)
+        self.assertEqual(400, status)
+        self.assertEqual("close", headers.get("connection", "").lower(), headers)
+        self.assertTrue(self.closed_by_server(sock))
+        self.assertEqual(
+            {(credential_proxy.HEALTHZ_PATH, "200"): 1, (credential_proxy.LABEL_OTHER, "400"): 1},
+            metrics._requests,
+        )
+
+    def test_an_idle_connection_is_closed_at_the_timeout(self):
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.assertEqual(200, self.response(sock)[0])
+                started = time.monotonic()
+                self.assertTrue(self.closed_by_server(sock))
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+            self.assertGreaterEqual(time.monotonic() - started, _SHORT_IDLE_SECONDS * 0.5)
+        # An idle close is a debug line, as a peer's EOF is: never the
+        # stdlib's "Request timed out" on the access log, one per connection.
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+        self.assertTrue(any(line.startswith("DEBUG:") and "closed idle" in line for line in logs.output), logs.output)
+
+    def test_the_timeout_report_is_read_off_the_exception_not_the_stdlibs_wording(self):
+        # handle_one_request passes the TimeoutError it caught as log_error's
+        # one argument; that, not the message's text, says it was a socket
+        # timeout, so a reworded stdlib message is still sorted into the idle
+        # close and the stalled request, and never reaches the access log.
+        idle = types.SimpleNamespace(raw_requestline=b"", requestline="", _request_stream=None)
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(idle, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("closed idle" in line for line in logs.output), logs.output)
+        stalled = types.SimpleNamespace(raw_requestline=b"GET /h", requestline="", _request_stream=None)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(stalled, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("request stalled" in line for line in logs.output), logs.output)
+        # With the response's headers flushed, the same report is the peer
+        # that stopped reading the body: the response was cut, not stalled
+        # before it was written.
+        cut = types.SimpleNamespace(raw_requestline=b"GET /h", requestline="GET /h HTTP/1.1", _request_stream=None, _response_started=True)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertTrue(credential_proxy._log_socket_timeout(cut, "Socket timed out: %r", (TimeoutError(),)))
+        self.assertTrue(any("response stalled" in line and "requestline=GET /h HTTP/1.1" in line for line in logs.output), logs.output)
+        self.assertFalse(any("request stalled" in line for line in logs.output), logs.output)
+        # send_error's report, the stdlib's other log_error call, is not one.
+        self.assertFalse(credential_proxy._log_socket_timeout(idle, "code %d, message %s", (404, "Not Found")))
+        self.assertFalse(credential_proxy._log_socket_timeout(idle, credential_proxy.IDLE_CLOSE_LOG_PREFIX + ": %r", ()))
+
+    def test_a_peer_that_stops_reading_a_relayed_body_is_logged_as_a_cut_response_not_a_stalled_request(self):
+        # The relay routes write their body after _end_headers with no
+        # handler of their own, under the socket timeout the request read
+        # deadline set, so a peer that stops reading for the window ends the
+        # write with the TimeoutError the stdlib reports through log_error.
+        # That is the response cut mid-body, and the line says so and names
+        # the request, rather than the "request stalled before its response"
+        # the same report is sorted into when nothing was written; and the
+        # next request on the connection, were there one, starts clean. The
+        # upstream is stubbed at _relay_fetch with a body wider than the
+        # socket's buffers; the peer sends its request and reads nothing.
+        relayed = credential_proxy.ApiRelayResponse(status=200, content_type="application/octet-stream", body=b"a" * _UNREAD_RESPONSE_BYTES)
+        allowed = credential_proxy.command_policy.Decision(allowed=True, rule_id="test.relay", message="")
+        with (
+            mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS),
+            mock.patch.object(CredentialProxyHandler, "api_relay", object()),
+            mock.patch.object(CredentialProxyHandler, "_relay_authorization", return_value="Bearer broker"),
+            mock.patch.object(CredentialProxyHandler, "_relay_fetch", return_value=relayed),
+            mock.patch.object(credential_proxy.api_policy, "evaluate", return_value=allowed),
+            mock.patch.object(credential_proxy.api_policy, "response_projection", return_value=None),
+        ):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "GET", "/v1/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters", self.SHELL)
+                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                while not any("response stalled" in line for line in logs.output):
+                    if time.monotonic() > deadline:
+                        self.fail(f"the cut response was not logged: {logs.output}")
+                    time.sleep(0.1)
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "response stalled" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:"), cut[0])
+        self.assertIn("requestline=GET /v1/gcp/container.googleapis.com/v1/projects/p/locations/l/clusters HTTP/1.1", cut[0])
+        self.assertFalse(any("request stalled" in line for line in logs.output), logs.output)
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+        self.assertTrue(any("api forwarded" in line for line in logs.output), logs.output)
+        self.assertFalse(any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output)
+
+    def test_a_request_that_stalls_mid_body_is_logged_as_stalled_not_idle(self):
+        # The same socket timeout ends the idle wait and a body that stops
+        # arriving; the stdlib reports both the same way. A request that
+        # arrived and went unanswered is a warning naming it, never the
+        # idle close's debug line.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {_STALLED_BODY_LENGTH}"], b'{"argv":')
+                self.assertTrue(self.closed_by_server(sock))
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+        self.assertIn("POST /v1/exec HTTP/1.1", stalled[0])
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+        self.assertFalse(
+            any(credential_proxy.IDLE_CLOSE_LOG_PREFIX in line for line in logs.output), logs.output
+        )
+
+    def test_a_body_that_stalls_after_expect_100_continue_is_logged_as_stalled_not_as_a_cut_response(self):
+        # Under HTTP/1.1 the stdlib answers `Expect: 100-continue` with an
+        # interim 100 from parse_request, through end_headers, before the
+        # route runs and before a body byte is read. That interim write is
+        # not the response: a body that then never comes is a request that
+        # stalled before its response, named with the bytes that arrived,
+        # not "response stalled: the peer stopped reading it", which would
+        # send an operator to the wrong side of the connection.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                self.send(sock, "POST", "/v1/exec", self.SHELL, [f"Content-Length: {_STALLED_BODY_LENGTH}", "Expect: 100-continue"])
+                interim = b""
+                while not interim.endswith(b"\r\n\r\n"):
+                    byte = sock.recv(1)
+                    self.assertNotEqual(b"", byte, "closed before the interim response")
+                    interim += byte
+                self.assertEqual(b"HTTP/1.1 100 Continue\r\n\r\n", interim)
+                self.assertTrue(self.closed_by_server(sock), "the stalled connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+        self.assertIn("requestline=POST /v1/exec HTTP/1.1 ", stalled[0])
+        self.assertGreater(int(re.search(r"received_bytes=(\d+)", stalled[0]).group(1)), 0, stalled[0])
+        self.assertFalse(any("response stalled" in line for line in logs.output), logs.output)
+        self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+
+    def test_a_peer_that_drips_its_request_head_is_closed_at_the_window_and_logged_as_stalled(self):
+        # One deadline for the request line, the headers and the body
+        # together, so a peer that sends a byte inside every per-read timeout
+        # is closed at the window all the same, and logged as a request that
+        # stalled (with the bytes of it that arrived), never as the idle
+        # close: an idle connection sent nothing, this one did.
+        exec_head = (
+            f"POST /v1/exec HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer {self.SHELL}\r\n"
+            f"Content-Length: {_DRIPPED_HEAD_BYTES}\r\n\r\n"
+        ).encode("ascii")
+        shapes = (
+            ("request line", b"", b"GET /" + b"a" * _DRIPPED_HEAD_BYTES, "requestline= "),
+            ("headers", b"GET /healthz HTTP/1.1\r\n", b"Host: broker\r\nX-Padding: " + b"a" * _DRIPPED_HEAD_BYTES, "requestline=GET /healthz HTTP/1.1 "),
+            ("body", exec_head, b'{"argv": "' + b"a" * _DRIPPED_HEAD_BYTES, "requestline=POST /v1/exec HTTP/1.1 "),
+        )
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            for shape, sent_whole, dripped, named in shapes:
+                with self.subTest(shape=shape):
+                    sock = self.connect()
+                    stop = threading.Event()
+                    self.addCleanup(stop.set)
+                    with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                        if sent_whole:
+                            sock.sendall(sent_whole)
+                        _drip(sock, dripped, stop)
+                        started = time.monotonic()
+                        self.assertTrue(self.closed_by_server(sock), "the dripping connection was not closed")
+                        self.assertLess(time.monotonic() - started, _CLOSE_WAIT_SECONDS)
+                        stop.set()
+                        time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+                    stalled = [line for line in logs.output if "request stalled" in line]
+                    self.assertEqual(1, len(stalled), logs.output)
+                    self.assertTrue(stalled[0].startswith("WARNING:"), stalled[0])
+                    self.assertIn(named, stalled[0])
+                    received = int(re.search(r"received_bytes=(\d+)", stalled[0]).group(1))
+                    self.assertGreater(received, len(sent_whole), stalled[0])
+                    self.assertFalse(any("closed idle" in line for line in logs.output), logs.output)
+
+    def test_a_request_line_that_stalls_on_a_kept_open_connection_is_not_logged_under_the_previous_one(self):
+        # The stdlib assigns requestline inside parse_request and never resets
+        # it, so unless the handler clears it before each request line is
+        # read, a second request that stalls inside its line is logged under
+        # the first request's line, and the operator chasing the stall is sent
+        # to a request that was answered.
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", _SHORT_IDLE_SECONDS):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            self.assertEqual(200, self.response(sock)[0])
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                sock.sendall(_PARTIAL_REQUEST_LINE)
+                self.assertTrue(self.closed_by_server(sock), "the stalled connection was not closed")
+                time.sleep(_RESET_SETTLE_SECONDS)  # the handler thread logs after the close
+        stalled = [line for line in logs.output if "request stalled" in line]
+        self.assertEqual(1, len(stalled), logs.output)
+        self.assertIn(f"requestline= received_bytes={len(_PARTIAL_REQUEST_LINE)} ", stalled[0])
+        self.assertNotIn("/healthz", stalled[0])
+
+    def test_a_caller_that_stops_reading_a_response_has_its_connection_closed(self):
+        # _json gives the write up at RESPONSE_WRITE_TIMEOUT_SECONDS. The
+        # response is then incomplete on the wire, so the connection cannot
+        # carry another request: it must close, not loop into the idle wait
+        # holding its thread and slot with a truncated response on it.
+        payload = {"status": "ok", "padding": "a" * _UNREAD_RESPONSE_BYTES}
+        with (
+            mock.patch.object(credential_proxy, "HEALTHZ_PAYLOAD", payload),
+            mock.patch.object(credential_proxy, "RESPONSE_WRITE_TIMEOUT_SECONDS", _SHORT_IDLE_SECONDS),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            sock = self.connect()
+            self.send(sock, "GET", "/healthz")
+            deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+            while not any("response not delivered" in line for line in logs.output):
+                self.assertLess(time.monotonic(), deadline, "the write to a caller that never reads was not given up on")
+                time.sleep(0.1)
+        # What was written is drained; EOF follows it on a closed connection,
+        # and the recv times out on one kept open for its next request.
+        try:
+            while sock.recv(1 << 16):
+                pass
+        except TimeoutError:
+            self.fail("the connection was kept open after the response write was given up on")
+
+    def test_the_idle_timeout_is_under_envoys(self):
+        # Envoy, the only client, must close an idle connection first, or it
+        # would send on one the broker just closed. Every cluster to the
+        # broker's socket is held to it, read from the parsed config, so a
+        # second cluster cannot hide behind the first's value and a comment
+        # or a timeout on the connection manager above is never the one read.
+        import yaml
+        _assert_every_broker_cluster_idles_under(self, yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+
+    def test_the_idle_timeout_pin_holds_every_broker_cluster(self):
+        # The pin against #4652's shape: two clusters to the socket, the
+        # first in the file carrying a timeout under the broker's and the
+        # second none (Envoy's default is an hour), or 0s, which disables the
+        # close; each fails, and both under the broker's passes.
+        import yaml
+        timeout = (
+            "      typed_extension_protocol_options:\n"
+            "        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:\n"
+            "          common_http_protocol_options:\n"
+            "            idle_timeout: {}\n"
+        )
+        runtime, health = "    - name: credential_runtime\n", "    - name: credential_health\n"
+        base = _TWO_CLUSTER_ENVOY_CONFIG.replace(health, health + timeout.format("30s"))
+        for runtime_timeout in (None, "0s", "3600s"):
+            with self.subTest(runtime_timeout=runtime_timeout), self.assertRaises(AssertionError):
+                text = base if runtime_timeout is None else base.replace(runtime, runtime + timeout.format(runtime_timeout))
+                _assert_every_broker_cluster_idles_under(self, yaml.safe_load(text))
+        _assert_every_broker_cluster_idles_under(self, yaml.safe_load(base.replace(runtime, runtime + timeout.format("30s"))))
+
+
+class ThreadCapTest(_CredentialedUnixServer):
+    """Connections past CREDENTIAL_PROXY_MAX_THREADS are answered a 503 on a
+    short-lived thread of their own and closed; none spends a handler thread
+    or holds the accept loop, and the health-only listener answers meanwhile."""
+
+    def max_threads(self):
+        return _SMALL_THREAD_CAP
+
+    def _refused(self):
+        """Connect past the cap and return what the connection read."""
+        extra = self.connect()
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.send(extra, "GET", "/healthz")
+        status, headers, body = self.response(extra)
+        self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
+        extra.close()  # as Envoy does on reading the answer; the drain returns at once
+        return status, headers, body
+
+    def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
+        health = credential_proxy.start_health_listener("127.0.0.1", 0)
+        self.addCleanup(health.server_close)
+        self.addCleanup(health.shutdown)
+        # Four handlers blocked: each holds its thread waiting for a request
+        # line that never comes.
+        holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
+        time.sleep(_RESET_SETTLE_SECONDS)
+        # A burst inside one interval is one line; then, with the interval
+        # shortened, a holder closing after a quiet interval ends the episode.
+        with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _CLOSE_WAIT_SECONDS):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                for _ in range(_REFUSAL_BURST):
+                    status, headers, body = self._refused()
+                    self.assertEqual(
+                        (503, str(credential_proxy.THREAD_CAP_RETRY_AFTER_SECONDS), "0", "close", b""),
+                        (status, headers.get("retry-after"), headers.get("content-length"), headers.get("connection"), body),
+                    )
+            alerts = [line for line in logs.output if "ALERT" in line and credential_proxy.MAX_THREADS_ENV in line]
+            self.assertEqual(1, len(alerts), f"one line for a burst of {_REFUSAL_BURST} refusals, not one each: {logs.output}")
+            self.assertEqual(len(alerts), len(logs.output), logs.output)
+
+            started = time.monotonic()
+            with urllib.request.urlopen(f"http://127.0.0.1:{health.server_port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
+                self.assertEqual((200, {"status": "ok"}), (response.status, json.loads(response.read())))
+            self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
+
+        # A slot comes back when a holder goes; the episode is reported
+        # over only once an interval has passed with no refusal.
+        with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
+            time.sleep(_RESET_SETTLE_SECONDS)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                holders[0].close()
+                time.sleep(_RESET_SETTLE_SECONDS)
+            released = [line for line in logs.output if "thread cap released" in line]
+            self.assertEqual(1, len(released), logs.output)
+            self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
+        served = self.connect()
+        self.send(served, "GET", "/healthz")
+        self.assertEqual(200, self.response(served)[0])
+
+    def test_a_refused_peer_that_holds_its_connection_does_not_hold_the_accept_loop(self):
+        holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
+        time.sleep(_RESET_SETTLE_SECONDS)
+        with mock.patch.object(credential_proxy, "THREAD_CAP_REFUSAL_SECONDS", _LONG_REFUSAL_DRAIN_SECONDS):
+            # Refused peers that read their answer and neither close nor send:
+            # each drain is parked for longer than any read below may wait.
+            parked = []
+            for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS):
+                sock = self.connect()
+                self.assertEqual(503, self.response(sock)[0])
+                parked.append(sock)
+            # The accept loop is free: a holder's slot comes back and the next
+            # connection is served, inside the close wait, with every drain
+            # still parked.
+            holders[0].close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            served = self.connect()
+            self.send(served, "GET", "/healthz")
+            self.assertEqual(200, self.response(served)[0])
+            served.close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            holders[0] = self.connect()  # the slot is held again
+            time.sleep(_RESET_SETTLE_SECONDS)
+            # Past THREAD_CAP_REFUSAL_THREADS parked drains, a refused
+            # connection is closed at once and unanswered rather than queued
+            # behind a peer that will not close; reading it is EOF or a reset.
+            unanswered = self.connect()
+            with self.assertRaises((http.client.HTTPException, OSError)):
+                self.response(unanswered)
+            self.assertTrue(self.closed_by_server(unanswered))
+            # A parked peer closing frees its refusal thread; the next refusal
+            # is answered again.
+            parked[0].close()
+            time.sleep(_RESET_SETTLE_SECONDS)
+            self.assertEqual(503, self._refused()[0])
+
+    def test_the_line_counts_the_refusals_closed_unanswered(self):
+        # The line says how the refusals since the last one ended: answered
+        # 503 on a refusal thread, or closed unanswered because
+        # THREAD_CAP_REFUSAL_THREADS refusals were already waiting on their
+        # peers. Driven on the server directly over socket pairs, with all
+        # but one refusal slot held by the test and the drain held open by a
+        # peer that neither reads nor closes: the first refusal is answered,
+        # the two behind it find no slot, and with the interval at zero every
+        # refusal writes its own line, so each line counts one.
+        server = self.server
+        pairs = [socket.socketpair() for _ in range(3)]
+        for ours, peer in pairs:
+            self.addCleanup(peer.close)
+            self.addCleanup(ours.close)
+        for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS - 1):
+            self.assertTrue(server._refusal_slots.acquire(blocking=False))
+            self.addCleanup(server._refusal_slots.release)
+        with mock.patch.object(credential_proxy, "THREAD_CAP_REFUSAL_SECONDS", _LONG_REFUSAL_DRAIN_SECONDS), \
+                mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", 0):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                for ours, _ in pairs:
+                    server.refuse_connection(ours)
+                server.connection_released()
+            pairs[0][1].settimeout(_CLOSE_WAIT_SECONDS)
+            self.assertTrue(pairs[0][1].recv(len(credential_proxy.THREAD_CAP_REFUSAL)).startswith(b"HTTP/1.1 503 "))
+            for _, peer in pairs[1:]:
+                peer.settimeout(_CLOSE_WAIT_SECONDS)
+                self.assertEqual(b"", peer.recv(1), "an unanswered refusal is closed at once")
+        alerts = [line for line in logs.output if "ALERT connection refused" in line]
+        self.assertEqual(3, len(alerts), logs.output)
+        self.assertIn("1 refused since the last line, 1 answered 503 with Retry-After on a refusal thread and 0 closed unanswered", alerts[0])
+        for line in alerts[1:]:
+            self.assertIn(
+                "1 refused since the last line, 0 answered 503 with Retry-After on a refusal thread and 1 closed unanswered "
+                f"with {credential_proxy.THREAD_CAP_REFUSAL_THREADS} refusals already waiting on their peers",
+                line,
+            )
+        released = [line for line in logs.output if "thread cap released" in line]
+        self.assertEqual(1, len(released), logs.output)
+        self.assertIn("0 refused since the last line, 0 answered 503 with Retry-After and 0 closed unanswered", released[0])
+        pairs[0][1].close()  # the parked drain reads EOF and gives its slot back
+
+    def test_a_refusal_whose_thread_cannot_start_is_counted_unanswered_on_its_own_line(self):
+        # The line that counts a refusal is written once the refusal thread
+        # has started, or failed to: a start that fails (RuntimeError: can't
+        # start new thread, the regime the cap sits beside) is counted as
+        # closed unanswered on that line. Counted before the start, the first
+        # refusal of an episode would be flushed as answered and then added
+        # to the next line as unanswered, which with no further refusals
+        # reads `0 refused, -1 answered, 1 closed unanswered` on the release.
+        server = self.server
+        ours, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        self.addCleanup(ours.close)
+        real_start = threading.Thread.start
+
+        def failing_start(thread):
+            if thread.name == "thread-cap-refusal":
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", failing_start), \
+                mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", 0):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                server.refuse_connection(ours)
+                server.connection_released()
+        peer.settimeout(_CLOSE_WAIT_SECONDS)
+        self.assertEqual(b"", peer.recv(1), "a refusal with no thread to answer on is closed at once")
+        self.assertTrue(any("closed unanswered type=RuntimeError" in line for line in logs.output), logs.output)
+        alerts = [line for line in logs.output if "ALERT connection refused" in line]
+        self.assertEqual(1, len(alerts), logs.output)
+        self.assertIn("1 refused since the last line, 0 answered 503 with Retry-After on a refusal thread and 1 closed unanswered", alerts[0])
+        released = [line for line in logs.output if "thread cap released" in line]
+        self.assertEqual(1, len(released), logs.output)
+        self.assertIn("0 refused since the last line, 0 answered 503 with Retry-After and 0 closed unanswered", released[0])
+        # The refusal slot the failed start took is back: every one of them can be taken.
+        taken = [server._refusal_slots.acquire(blocking=False) for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS)]
+        for was_taken in taken:
+            if was_taken:
+                server._refusal_slots.release()
+        self.assertTrue(all(taken), taken)
+
+    def test_a_slot_is_given_back_when_the_handler_thread_fails_to_start(self):
+        # The slot is taken on the accept loop before the handler thread is
+        # started; a start that fails (RuntimeError: can't start new thread)
+        # must give it back, or every such failure shrinks the cap by one for
+        # the life of the process.
+        real_start = threading.Thread.start
+        failed = threading.Event()
+        server = self.server
+
+        def failing_start(thread):
+            if thread._target == server.process_request_thread and not failed.is_set():
+                failed.set()
+                raise RuntimeError("can't start new thread")
+            return real_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", failing_start):
+            with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+                dropped = self.connect()
+                self.assertTrue(failed.wait(_CLOSE_WAIT_SECONDS), "the handler thread's start was not reached")
+                self.assertTrue(self.closed_by_server(dropped))
+        self.assertTrue(any("request handler failed" in line and "RuntimeError" in line for line in logs.output), logs.output)
+        # Every slot is still there: a full cap of holders is admitted, and
+        # the last of them is served rather than refused.
+        holders = [self.connect() for _ in range(_SMALL_THREAD_CAP)]
+        time.sleep(_RESET_SETTLE_SECONDS)
+        self.send(holders[-1], "GET", "/healthz")
+        self.assertEqual(200, self.response(holders[-1])[0])
+        self.assertEqual(503, self._refused()[0])
+
+    def test_the_refusal_is_one_complete_response(self):
+        refusal = credential_proxy.THREAD_CAP_REFUSAL
+        self.assertTrue(refusal.startswith(b"HTTP/1.1 503 "), refusal)
+        self.assertTrue(refusal.endswith(b"\r\n\r\n"), refusal)
+        self.assertIn(b"\r\nContent-Length: 0\r\n", refusal)
+        self.assertIn(b"\r\nConnection: close\r\n", refusal)
+
+    def test_both_credentialed_server_classes_carry_the_cap_and_its_fallback(self):
+        for server_class in (credential_proxy.ThreadingUnixHTTPServer, credential_proxy.ThreadingTCPHTTPServer):
+            self.assertTrue(issubclass(server_class, credential_proxy.ThreadCap), server_class)
+        # With no Envoy config readable, the cap is Envoy's own default for
+        # one cluster; the shipped config, which declares its ceilings,
+        # derives more (ThreadCapDefaultTest).
+        self.assertEqual(1024, credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS)
+        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS, credential_proxy.FALLBACK_MAX_THREADS)
+        self.assertEqual(_SMALL_THREAD_CAP, self.server.connection_cap)
+
+    def test_the_cap_comes_from_the_environment_and_a_bad_value_keeps_the_default(self):
+        # The default is stood in for here; ThreadCapDefaultTest derives it.
+        cases = {None: 1024, "": 1024, "4": 4, "0": 1024, "-3": 1024, "many": 1024}
+        for value, expected in cases.items():
+            with self.subTest(value=value), mock.patch.dict(os.environ), \
+                    mock.patch.object(credential_proxy, "default_max_threads", return_value=1024):
+                os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+                if value is not None:
+                    os.environ[credential_proxy.MAX_THREADS_ENV] = value
+                self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_ENVOY_CONFIG = _REPO_ROOT / "deploy" / "shared" / "envoy-credential-proxy.yaml"
+_DOCKERFILE = _REPO_ROOT / "deploy" / "docker" / "Dockerfile"
+# A config of #4652's shape: a runtime cluster at 4096 and a health cluster at
+# 64, both to the broker's socket, and a cluster elsewhere that must not
+# count. The cap it derives leaves the health route 64 slots when the runtime
+# cluster holds every connection its breaker allows.
+_TWO_CLUSTER_ENVOY_CONFIG = """
+static_resources:
+  clusters:
+    - name: credential_runtime
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 4096
+          - priority: HIGH
+            max_connections: 4096
+      load_assignment:
+        cluster_name: credential_runtime
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe:
+                      path: /var/run/credential-proxy/backend.sock
+    - name: credential_health
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - priority: DEFAULT
+            max_connections: 64
+          - priority: HIGH
+            max_connections: 64
+      load_assignment:
+        cluster_name: credential_health
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe:
+                      path: /var/run/credential-proxy/backend.sock
+    - name: metadata_server
+      type: STATIC
+      circuit_breakers:
+        thresholds:
+          - max_connections: 7
+      load_assignment:
+        cluster_name: metadata_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 169.254.169.254
+                      port_value: 80
+"""
+_TWO_CLUSTER_CEILING = 4096 + 64
+
+
+def yaml_value(text):
+    """The Python value pyyaml reads a scalar as, so a test says what the walk was handed."""
+    return yaml.safe_load(text)
+
+
+# proto-JSON's reading of the two fields a threshold carries, written from
+# protobuf's rules rather than from the walk under test. An enum field takes
+# its value's name, its number, or a string spelling its number; a value
+# outside the enum fails Envoy's validation, and any other shape fails the
+# load. A UInt32Value takes a JSON number with no fraction or a string
+# spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
+# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# integers are Envoy's: yaml-cpp converts a scalar with the base left to its
+# prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
+# shows.
+_PROTO_ENUM_NAMES = {"DEFAULT": 0, "HIGH": 1}
+_UINT32_MAX = 2**32 - 1
+_UNREADABLE = object()
+_DECIMAL_DIGITS = re.compile(r"[0-9]+\Z")
+
+
+def _proto_json_enum(value):
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return _UNREADABLE
+    if isinstance(value, str):
+        if value in _PROTO_ENUM_NAMES:
+            return _PROTO_ENUM_NAMES[value]
+        if not _DECIMAL_DIGITS.match(value):
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, int) and value in _PROTO_ENUM_NAMES.values():
+        return value
+    return _UNREADABLE
+
+
+def _proto_json_uint32(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return _UNREADABLE
+    if isinstance(value, str):
+        if not _DECIMAL_DIGITS.match(value):
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value) or int(value) != value:
+            return _UNREADABLE
+        value = int(value)
+    if isinstance(value, int) and 0 <= value <= _UINT32_MAX:
+        return value
+    return _UNREADABLE
+
+
+def _as_the_kernel_resolves(path):
+    """A pipe path with every doubled slash and `.` segment collapsed, the
+    leading run included (normpath keeps exactly two there; Linux does not)."""
+    return "/" + os.path.normpath(path).lstrip("/") if path.startswith("/") else os.path.normpath(path)
+
+
+def _ceiling_summed_by_hand(config):
+    """The rule the broker derives its cap by, written out: per cluster whose
+    pipe is the broker's socket (the path normalised, as the kernel reads
+    it), the breaker Envoy runs at the DEFAULT priority: the count of the
+    first threshold whose priority proto-JSON reads as DEFAULT, 1024 when it
+    sets none or there is none. When any threshold in the list has a
+    priority or a count proto-JSON would not read, the cluster is read in
+    the direction that never refuses a connection Envoy carries: the largest
+    count readable anywhere in the list, or 1024, when that is above the
+    DEFAULT reading. Summed."""
+    total = 0
+    for cluster in config["static_resources"]["clusters"]:
+        paths = [
+            _as_the_kernel_resolves(str(endpoint["endpoint"]["address"].get("pipe", {}).get("path")))
+            for locality in cluster["load_assignment"]["endpoints"]
+            for endpoint in locality["lb_endpoints"]
+        ]
+        if "/var/run/credential-proxy/backend.sock" not in paths:
+            continue
+        thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or []
+        readings = [
+            (_proto_json_enum(t.get("priority")), _proto_json_uint32(t.get("max_connections")))
+            for t in thresholds
+        ]
+        at_default = [count for priority, count in readings if priority == 0]
+        envoy = at_default[0] if at_default and isinstance(at_default[0], int) else 1024
+        if any(priority is _UNREADABLE or count is _UNREADABLE for priority, count in readings):
+            envoy = max([envoy, 1024] + [count for _, count in readings if isinstance(count, int)])
+        total += envoy
+    return total
+
+
+_ENVOY_HTTP_PROTOCOL_OPTIONS = "envoy.extensions.upstreams.http.v3.HttpProtocolOptions"
+_ENVOY_DURATION_SECONDS = re.compile(r"^(\d+(?:\.\d+)?)s$")
+# Deep enough for pyyaml's composer to raise RecursionError on the default
+# recursion limit (it does at a tenth of this); yaml-cpp, which Envoy reads
+# the same file with, has no such limit.
+_NESTED_PAST_THE_RECURSION_LIMIT = 10000
+
+
+def _assert_every_broker_cluster_idles_under(case, config):
+    """Every cluster to the broker's socket sets an upstream idle_timeout
+    above 0s (which disables Envoy's idle close) and under the broker's."""
+    clusters = [
+        cluster
+        for cluster in config["static_resources"]["clusters"]
+        if credential_proxy._cluster_forwards_to_broker(cluster)
+    ]
+    case.assertTrue(clusters, "no cluster to the broker's socket")
+    for cluster in clusters:
+        options = cluster.get("typed_extension_protocol_options", {}).get(_ENVOY_HTTP_PROTOCOL_OPTIONS, {})
+        value = options.get("common_http_protocol_options", {}).get("idle_timeout")
+        case.assertIsNotNone(value, f"cluster {cluster.get('name')} sets no idle_timeout; Envoy's default is an hour")
+        match = _ENVOY_DURATION_SECONDS.match(str(value))
+        case.assertIsNotNone(match, f"cluster {cluster.get('name')} idle_timeout {value!r} is not a seconds duration")
+        seconds = float(match.group(1))
+        case.assertGreater(seconds, 0, f"cluster {cluster.get('name')}: 0s disables Envoy's idle timeout")
+        case.assertLess(seconds, credential_proxy.KEEPALIVE_IDLE_SECONDS, f"cluster {cluster.get('name')}")
+
+
+class ThreadCapDefaultTest(unittest.TestCase):
+    """With CREDENTIAL_PROXY_MAX_THREADS unset, the cap is the sum of Envoy's
+    connection ceilings to the broker's socket, read from Envoy's config, so
+    the breaker refuses before the cap and a second cluster to the socket
+    keeps slots of its own."""
+
+    def _derived(self, text):
+        import yaml
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "envoy.yaml"
+        path.write_text(text, encoding="utf-8")
+        try:
+            config = yaml.safe_load(text)
+        except yaml.YAMLError:
+            config = None
+        return path, credential_proxy.default_max_threads(paths=(path,)), config
+
+    def test_the_default_is_the_sum_of_envoys_ceilings_in_the_shipped_config(self):
+        import yaml
+        config = yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8"))
+        # The shipped config names a cluster to the socket the broker serves:
+        # otherwise the derivation and the sum below would both fall back to
+        # 1024 and agree about nothing.
+        self.assertIsNotNone(credential_proxy.envoy_broker_connection_ceiling(config))
+        expected = _ceiling_summed_by_hand(config)
+        self.assertEqual(expected, credential_proxy.default_max_threads(paths=(_ENVOY_CONFIG,)))
+        # serve()'s reader takes the same path when the environment names no cap.
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+        # A cluster without circuit_breakers is at Envoy's default ceiling, so
+        # the derived cap is never under the breaker, whatever the config sets.
+        self.assertGreaterEqual(expected, credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS)
+
+    def test_a_runtime_and_a_health_cluster_to_the_socket_sum_and_a_cluster_elsewhere_does_not(self):
+        path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG)
+        self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+        self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        # Per cluster the priorities are not summed: one route runs at one
+        # priority, and the shipped routes set none.
+        self.assertEqual(4096 + 64, credential_proxy.envoy_broker_connection_ceiling(config))
+
+    def test_a_threshold_or_a_cluster_that_sets_no_ceiling_counts_envoys_default(self):
+        text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", "")
+        path, derived, config = self._derived(text)
+        self.assertEqual(1024 + 64, derived)
+        health_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 64\n          - priority: HIGH\n            max_connections: 64\n"
+        )
+        self.assertIn(health_breaker, text)
+        path, derived, config = self._derived(text.replace(health_breaker, ""))
+        self.assertEqual(1024 + 1024, derived)
+
+    def test_no_readable_config_falls_back_to_envoys_default_with_a_warning(self):
+        missing = Path(tempfile.gettempdir()) / "no-such-envoy-config.yaml"
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(missing,)))
+        self.assertTrue(any("thread cap default is 1024" in line for line in logs.output), logs.output)
+        # A config that does not parse, or names no cluster to the socket, is
+        # passed over for the next path, and the fallback stands when none is left.
+        for text in ("static_resources: [\n", "static_resources:\n  clusters: []\n", "clusters:\n  - name: x\n"):
+            with self.subTest(text=text), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                _, derived, _ = self._derived(text)
+                self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, derived)
+                self.assertTrue(any("not read for the thread cap" in line for line in logs.output), logs.output)
+        import yaml
+        passed_over = Path(tempfile.mkdtemp()) / "no-broker-cluster.yaml"
+        passed_over.write_text("static_resources:\n  clusters: []\n", encoding="utf-8")
+        self.assertEqual(
+            _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8"))),
+            credential_proxy.default_max_threads(paths=(passed_over, _ENVOY_CONFIG)),
+        )
+
+    def test_a_config_that_is_not_utf8_is_passed_over_and_does_not_stop_the_start(self):
+        # Readable and not UTF-8 (a CP1252 em dash pasted into a comment when
+        # an operator raises the breaker) is passed over for the next path,
+        # as an unreadable file is, and the fallback stands when none is
+        # left; the start takes the documented fallback, not a crash loop.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        not_utf8 = Path(tmp.name) / "envoy.yaml"
+        not_utf8.write_bytes(b"# raised \x97 for the fleet\n" + _ENVOY_CONFIG.read_bytes())
+        with self.assertRaises(UnicodeDecodeError):
+            not_utf8.read_text(encoding="utf-8")
+        import yaml
+        expected = _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        self.assertEqual(expected, credential_proxy.default_max_threads(paths=(not_utf8, _ENVOY_CONFIG)))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(not_utf8,)))
+        self.assertTrue(any("thread cap default is 1024" in line for line in logs.output), logs.output)
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (not_utf8,)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.thread_cap_from_env())
+
+    def test_a_config_the_parser_or_the_walk_cannot_read_is_passed_over_not_a_crash(self):
+        # The derivation is fail-safe: whatever the parse or the walk raises,
+        # the path is passed over for the next and the start takes the
+        # fallback, never a crash loop. Two shapes the YAMLError guard did not
+        # cover: a document nested past pyyaml's recursion limit, and a
+        # superscript in a quoted count, which str.isdigit admits and int
+        # refuses (Envoy reads neither as a count; the broker reads its
+        # default of 1024 for the superscript and passes the document over).
+        import yaml
+        nested = "[" * _NESTED_PAST_THE_RECURSION_LIMIT + "]" * _NESTED_PAST_THE_RECURSION_LIMIT + "\n"
+        with self.assertRaises(RecursionError):
+            yaml.safe_load(nested)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        unparsable = Path(tmp.name) / "nested.yaml"
+        unparsable.write_text(nested, encoding="utf-8")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(unparsable,)))
+        self.assertTrue(any("RecursionError" in line and "not read for the thread cap" in line for line in logs.output), logs.output)
+        expected = _ceiling_summed_by_hand(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        with mock.patch.dict(os.environ), mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (unparsable, _ENVOY_CONFIG)):
+            os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(expected, credential_proxy.thread_cap_from_env())
+        superscript = "\u00b2"
+        self.assertTrue(superscript.isdigit() and not superscript.isdecimal())
+        self.assertIsNone(credential_proxy._connection_count(superscript))
+        text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f'            max_connections: "{superscript}"\n', 1)
+        path, derived, config = self._derived(text)
+        # Not a count, so the cluster is read as the largest count declared
+        # beside it, the HIGH threshold's 4096 (the fail-toward-larger rule).
+        self.assertEqual(4096 + 64, derived)
+        self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        # Nothing the walk raises leaves the derivation either.
+        with (
+            mock.patch.object(credential_proxy, "envoy_broker_connection_ceiling", side_effect=TypeError("unforeseen shape")),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.default_max_threads(paths=(path,)))
+        self.assertTrue(any("TypeError" in line and "not read for the thread cap" in line for line in logs.output), logs.output)
+
+    def test_the_default_priority_threshold_is_the_ceiling_not_the_largest_listed(self):
+        # Envoy keeps a breaker per priority and applies its default to a
+        # priority no threshold names; the routes run at DEFAULT. So a list
+        # naming only HIGH leaves the DEFAULT pool at 1024, whatever HIGH
+        # says, a HIGH threshold above DEFAULT's does not raise it, a
+        # threshold that names no priority is DEFAULT's, and of two at
+        # DEFAULT the first is the one Envoy reads.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        self.assertIn(runtime_breaker, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = {
+            "      circuit_breakers:\n        thresholds:\n          - priority: HIGH\n            max_connections: 64\n": 1024,
+            "      circuit_breakers:\n        thresholds:\n          - priority: HIGH\n            max_connections: 8192\n"
+            "          - priority: DEFAULT\n            max_connections: 2048\n": 2048,
+            "      circuit_breakers:\n        thresholds:\n          - max_connections: 512\n": 512,
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 256\n"
+            "          - priority: DEFAULT\n            max_connections: 4096\n": 256,
+        }
+        for breaker, runtime_ceiling in cases.items():
+            with self.subTest(breaker=breaker):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, breaker))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+
+    def test_a_quoted_max_connections_is_a_count_and_a_word_is_not(self):
+        # Envoy's proto-JSON reading of a UInt32Value accepts "4096", so the
+        # breaker runs at it and the cap has to as well; a value that is not
+        # a count is warned about and the cluster read as the largest count
+        # declared beside it (the HIGH threshold's 4096 here), or Envoy's
+        # default when the unreadable threshold is alone.
+        for value, expected in (('"4096"', 4096), ("'64'", 64), ('"lots"', 4096), ('"-1"', 4096), ("true", 4096)):
+            with self.subTest(value=value):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        alone = "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: lots\n"
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, alone))
+        self.assertEqual(1024 + 64, derived)
+
+    def test_a_numeric_or_null_priority_is_the_priority_envoy_reads(self):
+        # proto-JSON, which Envoy reads the config through, takes an enum by
+        # its name or its number: `priority: 0` is DEFAULT and `priority: 1`
+        # is HIGH, and an explicit null is the unset field, DEFAULT. So the
+        # runtime threshold spelt either way is the ceiling Envoy runs at,
+        # and the cap has to read it as such rather than fall to 1024 and
+        # refuse connections Envoy's breaker would have carried.
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        self.assertIn(runtime_default, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = {
+            "          - priority: 0\n            max_connections: 4096\n": 4096,
+            "          - priority: null\n            max_connections: 4096\n": 4096,
+            "          - priority: ~\n            max_connections: 4096\n": 4096,
+            "          - priority: 1\n            max_connections: 4096\n": 1024,
+            "          - priority: 1\n            max_connections: 8192\n          - priority: 0\n            max_connections: 2048\n": 2048,
+        }
+        for threshold, runtime_ceiling in cases.items():
+            with self.subTest(threshold=threshold):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, threshold))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        for value in (None, "DEFAULT", 0):
+            self.assertEqual(0, credential_proxy._routing_priority(value), value)
+        for value in ("HIGH", 1):
+            self.assertEqual(1, credential_proxy._routing_priority(value), value)
+
+    def test_a_priority_or_a_count_envoy_would_not_read_is_a_warning_naming_the_cluster(self):
+        # A spelling that is neither a RoutingPriority's name nor its number
+        # (a lower-case name, a bool, a float, a number past the enum) is a
+        # config Envoy would not load, as is a max_connections that is not
+        # a count (a word, a fraction, a bool, a negative, one past UInt32).
+        # Each is a WARNING naming the cluster and the value, so the
+        # divergence from Envoy's reading is visible at startup, and the
+        # cluster is then read in the direction that costs nothing: the
+        # largest count declared in its list when that is above the DEFAULT
+        # reading (here the HIGH threshold's 4096 beside the unread one, or
+        # the unread threshold's own readable count), else Envoy's default.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        for priority in ("default", "true", "0.0", "2"):
+            with self.subTest(priority=priority), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, f"          - priority: {priority}\n            max_connections: 4096\n")
+                path, derived, config = self._derived(text)
+                self.assertEqual(4096 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertTrue(
+                any("credential_runtime" in line and "priority" in line and "not a RoutingPriority" in line for line in logs.output),
+                logs.output,
+            )
+            self.assertTrue(any("largest count declared, 4096, is read for the thread cap rather than 1024" in line for line in logs.output), logs.output)
+            self.assertIsNone(credential_proxy._routing_priority(yaml_value(priority)))
+        for count in ("lots", "4096.5", "true", "-1", '"-1"', "4294967296"):
+            with self.subTest(count=count, beside="HIGH at 4096"), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {count}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(4096 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertTrue(
+                any("credential_runtime" in line and "max_connections" in line and "not a count" in line for line in logs.output),
+                logs.output,
+            )
+            with self.subTest(count=count, beside="nothing"), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                alone = f"      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: {count}\n"
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, alone))
+                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertFalse(any("largest count declared" in line for line in logs.output), logs.output)
+        # A threshold that sets no count is Envoy's default without a
+        # warning: that is a config Envoy loads, and the reading agrees.
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", ""))
+        self.assertEqual(1024 + 64, derived)
+
+    def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
+        # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
+        # loader; proto-JSON, given a string that is not an enum value's
+        # name, reads the number it spells. Envoy 1.39.1 loads
+        # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
+        # that threshold's count, so the cap has to read it the same way
+        # rather than fall to 1024 under a breaker of 4096; `"2"` fails
+        # Envoy's enum validation and is not a priority here either.
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        cases = {
+            '          - priority: "0"\n            max_connections: 4096\n': 4096,
+            "          - priority: '1'\n            max_connections: 4096\n": 1024,
+            '          - priority: HIGH\n            max_connections: 64\n          - priority: "0"\n            max_connections: 2048\n': 2048,
+        }
+        for threshold, runtime_ceiling in cases.items():
+            with self.subTest(threshold=threshold), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, threshold))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(0, credential_proxy._routing_priority("0"))
+        self.assertEqual(1, credential_proxy._routing_priority("1"))
+        for value in ("2", "-0", "0.0", "", " 0"):
+            self.assertIsNone(credential_proxy._routing_priority(value), value)
+
+    def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
+        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # 4294967296 (`integer out of range`) and loads 4294967295, so the
+        # first is not a count and the second is. An integer pyyaml read
+        # from the file needs no re-reading: yaml-cpp converts a scalar with
+        # the base left to its prefix, so Envoy's /clusters page shows 010 as
+        # a breaker of 8, 0x10 as 16 and 08 (a string to pyyaml, a decimal
+        # to proto-JSON) as 8, each as the walk reads it.
+        cases = (("4294967295", 4294967295), ("010", 8), ("0x10", 16), ("08", 8))
+        for value, expected in cases:
+            with self.subTest(value=value), self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(2**32 - 1, credential_proxy._connection_count(2**32 - 1))
+        self.assertEqual(2**32 - 1, credential_proxy._connection_count(str(2**32 - 1)))
+        for value in (2**32, str(2**32), float(2**32)):
+            self.assertIsNone(credential_proxy._connection_count(value), value)
+
+    def test_a_threshold_the_walk_cannot_read_errs_above_envoys_breaker_not_below(self):
+        # The two ways of being wrong are not alike: a cap above Envoy's
+        # breaker never fires, since Envoy refuses first, while a cap below
+        # it refuses with the broker's own 503 connections Envoy would have
+        # carried. So a threshold whose priority or count the walk cannot
+        # read makes the cluster's ceiling the largest count declared in its
+        # list, or 1024, whichever is larger, and the warning says which
+        # reading was taken; a spelling the walk did not foresee then costs
+        # a cap that does nothing rather than a 503 storm.
+        runtime_breaker = (
+            "      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n"
+            "            max_connections: 4096\n          - priority: HIGH\n            max_connections: 4096\n"
+        )
+        self.assertIn(runtime_breaker, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = (
+            ("      circuit_breakers:\n        thresholds:\n          - priority: bogus\n            max_connections: 4096\n", 4096, "largest count declared, 4096, is read for the thread cap rather than 1024"),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 2048\n"
+             "          - priority: bogus\n            max_connections: 8192\n", 8192, "largest count declared, 8192, is read for the thread cap rather than 2048"),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: 2048\n"
+             "          - priority: bogus\n            max_connections: 1\n", 2048, None),
+            ("      circuit_breakers:\n        thresholds:\n          - priority: DEFAULT\n            max_connections: lots\n"
+             "          - priority: HIGH\n            max_connections: 512\n", 1024, None),
+        )
+        for breaker, runtime_ceiling, taken in cases:
+            with self.subTest(breaker=breaker), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_breaker, breaker))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            if taken is None:
+                self.assertFalse(any("largest count declared" in line for line in logs.output), logs.output)
+            else:
+                self.assertTrue(any("credential_runtime" in line and taken in line for line in logs.output), logs.output)
+
+    def test_a_whole_number_float_count_is_the_count_envoy_reads(self):
+        # proto-JSON reads 4096.0 into a UInt32Value as 4096, so the breaker
+        # runs at it; the cap reads it the same way, and a fraction is not a
+        # count: the cluster is then read as the largest count declared
+        # beside it, the HIGH threshold's 4096.
+        for value, expected in (("4096.0", 4096), ("64.0", 64), ("4096.5", 4096)):
+            with self.subTest(value=value):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(4096, credential_proxy._connection_count(4096.0))
+        for value in (4096.5, float("inf"), float("nan"), -1.0, True):
+            self.assertIsNone(credential_proxy._connection_count(value), value)
+
+    def test_the_brokers_socket_path_is_compared_normalised(self):
+        # A doubled slash or a `.` segment names the same socket to the
+        # kernel, so Envoy connects to the broker through it; the cluster
+        # counts, where a string comparison would read 1024 for the runtime
+        # cluster against a breaker of 4096.
+        # The leading run too: normpath keeps a path that begins with exactly
+        # two slashes, and Linux reads it as the root all the same, so the
+        # runtime cluster spelt that way counts (where it was passed over
+        # without a line, the probe's cluster having matched).
+        spellings = (
+            "/var/run/credential-proxy//backend.sock",
+            "/var/run/credential-proxy/./backend.sock",
+            "//var/run/credential-proxy/backend.sock",
+            "///var/run/credential-proxy/backend.sock",
+        )
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("path: /var/run/credential-proxy/backend.sock\n", f"path: {spelling}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            with self.subTest(spelling=spelling, clusters="both"):
+                # As the only spelling of the socket: read, with no
+                # "names no cluster" warning and no fallback to 1024.
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("path: /var/run/credential-proxy/backend.sock\n", f"path: {spelling}\n")
+                with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                    path, derived, config = self._derived(text)
+                self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual("/var/run/credential-proxy/backend.sock", credential_proxy._normalised_pipe_path("//var/run/credential-proxy/./backend.sock"))
+        self.assertEqual("relative/backend.sock", credential_proxy._normalised_pipe_path("relative//backend.sock"))
+        self.assertFalse(credential_proxy._cluster_forwards_to_broker(
+            {"load_assignment": {"endpoints": [{"lb_endpoints": [{"endpoint": {"address": {"pipe": {"path": "/var/run/credential-proxy/other.sock"}}}}]}]}}
+        ))
+
+    def test_a_pinned_cap_reads_no_config_and_logs_no_derivation(self):
+        # The environment is read first: a pinned cap derives nothing, so an
+        # operator who pins it on a layout with no config at either path gets
+        # no warning about a default that is not in force.
+        with (
+            mock.patch.dict(os.environ, {credential_proxy.MAX_THREADS_ENV: "7"}),
+            mock.patch.object(credential_proxy, "default_max_threads", side_effect=AssertionError("derived under a pinned cap")),
+            self.assertNoLogs(credential_proxy.LOGGER),
+        ):
+            self.assertEqual(7, credential_proxy.thread_cap_from_env())
+        # A value that is not a count still takes the derived default, with the grammar's warning.
+        with (
+            mock.patch.dict(os.environ, {credential_proxy.MAX_THREADS_ENV: "many"}),
+            mock.patch.object(credential_proxy, "default_max_threads", return_value=4160),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.assertEqual(4160, credential_proxy.thread_cap_from_env())
+        self.assertTrue(any("not a positive integer" in line for line in logs.output), logs.output)
+
+    def test_the_images_copy_of_the_config_is_read_first_and_the_dockerfile_puts_it_there(self):
+        self.assertEqual(credential_proxy.ENVOY_CONFIG_PATH, credential_proxy.ENVOY_CONFIG_PATHS[0])
+        self.assertEqual(_ENVOY_CONFIG, credential_proxy.ENVOY_CONFIG_PATHS[1])
+        self.assertIn(
+            f"deploy/shared/envoy-credential-proxy.yaml {credential_proxy.ENVOY_CONFIG_PATH}",
+            _DOCKERFILE.read_text(encoding="utf-8"),
+        )
+
+
+
+_LISTENER_PORTS_ENVOY_CONFIG = """
+static_resources:
+  listeners:
+    - name: quoted
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: "8770"
+    - address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 8771
+    - name: whole_float
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 8772.0
+    - name: on_a_pipe
+      address:
+        pipe:
+          path: /var/run/envoy/admin.sock
+    - name: ephemeral
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 0
+    - name: past_the_range
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 70000
+    - name: a_bool
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: true
+    - name: a_word
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: eight
+    - name: second_on_8771
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8771
+"""
+
+
+class EnvoyListenerPortsTest(unittest.TestCase):
+    """The ports Envoy's listeners bind, read from its config so the metrics
+    and health listeners can be refused them by name: Envoy runs in the
+    broker's container after the broker, and a port the broker took first is
+    one Envoy's bind fails on."""
+
+    def _written(self, text, encoding="utf-8"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "envoy.yaml"
+        if isinstance(text, bytes):
+            path.write_bytes(text)
+        else:
+            path.write_text(text, encoding=encoding)
+        return path
+
+    def test_the_shipped_config_names_the_credentialed_and_the_health_listener(self):
+        import yaml
+        ports = credential_proxy.envoy_listener_ports_in(yaml.safe_load(_ENVOY_CONFIG.read_text(encoding="utf-8")))
+        self.assertEqual({8765: "credential_proxy", 8768: "credential_health"}, ports)
+        # The credentialed listener's port is the broker's own default, so
+        # the two refusals (by args.port and by Envoy's list) agree on it.
+        with mock.patch.dict(os.environ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            os.environ.pop("CREDENTIAL_PROXY_PORT", None)
+            self.assertIn(credential_proxy.parse_args().port, ports)
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.assertEqual(ports, credential_proxy.envoy_listener_ports(paths=(_ENVOY_CONFIG,)))
+        self.assertTrue(any("8768 (credential_health)" in line and str(_ENVOY_CONFIG) in line for line in logs.output), logs.output)
+
+    def test_a_port_is_read_as_envoy_reads_a_uint32_and_nothing_else_is_a_port(self):
+        import yaml
+        ports = credential_proxy.envoy_listener_ports_in(yaml.safe_load(_LISTENER_PORTS_ENVOY_CONFIG))
+        # A quoted digit string and a whole float are the integer; an unnamed
+        # listener maps to ""; a pipe, port 0, a value past 65535, a bool and
+        # a word bind no TCP port Envoy would load; the first listener on a
+        # port keeps its name.
+        self.assertEqual({8770: "quoted", 8771: "", 8772: "whole_float"}, ports)
+        for shape in (None, [], "listeners", {"static_resources": {"listeners": "none"}}, {"static_resources": {"listeners": [None, 3]}}):
+            with self.subTest(shape=shape):
+                self.assertEqual({}, credential_proxy.envoy_listener_ports_in(shape))
+
+    def test_the_first_readable_config_decides_and_none_readable_is_empty_with_a_warning(self):
+        missing = self._written("").parent / "absent.yaml"
+        broken = self._written("static_resources: [")
+        not_utf8 = self._written(b"\xff\xfe static_resources: {}")
+        first = self._written("static_resources:\n  listeners:\n    - name: first\n      address:\n        socket_address:\n          port_value: 8780\n")
+        second = self._written("static_resources:\n  listeners:\n    - name: second\n      address:\n        socket_address:\n          port_value: 8781\n")
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({8780: "first"}, dict(credential_proxy.envoy_listener_ports((missing, broken, not_utf8, first, second))))
+        self.assertTrue(any("does not parse as YAML" in line and "the listener ports" in line for line in logs.output), logs.output)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({}, dict(credential_proxy.envoy_listener_ports((missing, broken, not_utf8))))
+        self.assertTrue(any("no Envoy config is readable" in line and str(missing) in line for line in logs.output), logs.output)
+        self.assertEqual({}, dict(credential_proxy.envoy_listener_ports(())))
+
+    def test_a_walk_that_raises_costs_the_ports_not_the_start(self):
+        path = self._written("static_resources: {}")
+        with mock.patch.object(credential_proxy, "envoy_listener_ports_in", side_effect=TypeError("unforeseen")), \
+                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual({}, dict(credential_proxy.envoy_listener_ports((path,))))
+        self.assertTrue(any("could not be walked" in line and "TypeError" in line for line in logs.output), logs.output)
+
+
+class HealthListenerTest(unittest.TestCase):
+    """GET /healthz on a port of its own, bounded as the metrics listener is."""
+
+    def _listener(self):
+        server = credential_proxy.start_health_listener("127.0.0.1", 0)
+        self.assertIsInstance(server, credential_proxy.HealthServer)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def test_healthz_is_answered_and_nothing_else_is(self):
+        port = self._listener()
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=_CLOSE_WAIT_SECONDS) as response:
+            self.assertEqual(200, response.status)
+            self.assertEqual({"status": "ok"}, json.loads(response.read()))
+            self.assertEqual(credential_proxy.HEALTH_SERVER_HEADER, response.headers.get("Server", "").strip())
+        for path in ("/metrics", "/v1/exec", "/"):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=_CLOSE_WAIT_SECONDS)
+            self.assertEqual(404, refused.exception.code)
+
+    def test_the_listener_carries_the_metrics_listeners_bounds(self):
+        self.assertTrue(issubclass(credential_proxy.HealthServer, credential_proxy.MetricsServer))
+        self.assertTrue(issubclass(credential_proxy.HealthHandler, credential_proxy.MetricsHandler))
+        # The cap is read when the server is built, from the metrics constant.
+        with mock.patch.object(credential_proxy, "METRICS_MAX_CONNECTIONS", 3):
+            server = credential_proxy.HealthServer(("127.0.0.1", 0), credential_proxy.HealthHandler)
+        self.addCleanup(server.server_close)
+        self.assertEqual(3, server.connection_cap)
+        self.assertEqual(credential_proxy.METRICS_CONNECTION_DEADLINE_SECONDS, credential_proxy.HealthHandler.timeout)
+
+    def test_the_port_is_opt_in_and_zero_or_a_bad_value_opens_none(self):
+        # Opt-in, as the metrics port: the operator's readiness probe reads
+        # /healthz through Envoy, so an unset port opens nothing.
+        cases = {None: 0, "": 0, "0": 0, "8770": 8770, "none": 0}
+        for value, expected in cases.items():
+            with self.subTest(value=value), mock.patch.dict(os.environ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+                os.environ.pop(credential_proxy.HEALTH_PORT_ENV, None)
+                if value is not None:
+                    os.environ[credential_proxy.HEALTH_PORT_ENV] = value
+                if value == "none":
+                    with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+                        parsed = credential_proxy.parse_args().health_port
+                    self.assertTrue(any("ALERT" in line and credential_proxy.HEALTH_PORT_ENV in line for line in logs.output))
+                else:
+                    parsed = credential_proxy.parse_args().health_port
+                self.assertEqual(expected, parsed)
+        self.assertEqual(0, credential_proxy.DEFAULT_HEALTH_PORT)
+
+    def test_the_other_listeners_ports_and_a_non_port_are_refused_by_name(self):
+        args = types.SimpleNamespace(port=8765, unix_socket="/run/backend.sock")
+        # Envoy's listeners as the shipped config declares them: the
+        # credentialed one on the broker's port and the readiness probe's.
+        envoy = {8765: "credential_proxy", 8768: "credential_health"}
+        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 8766, envoy))
+        self.assertIn("credentialed", credential_proxy._health_port_refusal(8765, args, 8766, envoy))
+        self.assertIn("metrics", credential_proxy._health_port_refusal(8766, args, 8766, envoy))
+        self.assertIn("1-65535", credential_proxy._health_port_refusal(70000, args, 8766, envoy))
+        # Envoy's health listener: the broker starts first in the container,
+        # so a broker that took 8768 would be the one Envoy's bind fails on.
+        refusal = credential_proxy._health_port_refusal(8768, args, 8766, envoy)
+        self.assertIn("Envoy", refusal)
+        self.assertIn("credential_health", refusal)
+        self.assertIn("8768", refusal)
+        # A listener the config left unnamed is still Envoy's port.
+        self.assertIn("Envoy", credential_proxy._health_port_refusal(8769, args, 8766, {8769: ""}))
+        # No metrics listener (port 0): nothing to collide with there; and
+        # with no Envoy port known (no config readable), 8768 is any port.
+        self.assertIsNone(credential_proxy._health_port_refusal(8767, args, 0, envoy))
+        self.assertIsNone(credential_proxy._health_port_refusal(8768, args, 8766, {}))
+
+    def test_an_occupied_port_is_logged_not_raised(self):
+        with socket.socket() as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            port = holder.getsockname()[1]
+            with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+                self.assertIsNone(credential_proxy.start_health_listener("127.0.0.1", port))
+        self.assertTrue(any("ALERT health listener" in line for line in logs.output), logs.output)
 
 
 class ScopedServiceAccountPathTest(unittest.TestCase):
@@ -17364,6 +19203,36 @@ class SweepTransportTest(unittest.TestCase):
                     self.assertIn("static", request.get_header(header))
                     self.assertEqual([], executor.minted)
 
+    def test_the_sweep_transport_keeps_the_quota_the_forge_reports(self):
+        # #4615: the sweep paces step 2 on this reading, on either kind of forge.
+        from test_providers_http_transport import _Response
+
+        github = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        opener = self._opener(
+            _Response(
+                b"[]",
+                headers={
+                    "X-RateLimit-Limit": "5000",
+                    "X-RateLimit-Remaining": "250",
+                    "X-RateLimit-Reset": "1767225600",
+                    "X-RateLimit-Resource": "core",
+                },
+            )
+        )
+        transport = credential_proxy.sweep_transport_for(_SweepExecutor(), github, "acme/gitops", opener=opener)
+        self.assertIsNone(transport.quota())
+        transport.api("GET", "repos/acme/gitops/pulls/1/reviews")
+        self.assertEqual(providers.QuotaReading(5000, 250, 1767225600.0), transport.quota())
+
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / "token"
+            token.write_text("glpat-static\n")
+            gitlab = _forge_class("gitlab")("gitlab.example.test", str(token))
+            opener = self._opener(_Response(b"[]", headers={"RateLimit-Remaining": "40", "RateLimit-Limit": "600"}))
+            transport = credential_proxy.sweep_transport_for(_SweepExecutor(), gitlab, "acme/gitops", opener=opener)
+            transport.api("GET", "projects/1/merge_requests")
+            self.assertEqual(providers.QuotaReading(600, 40, None), transport.quota())
+
     def test_a_minted_or_brokered_github_credential_is_an_app_installation(self):
         with tempfile.TemporaryDirectory() as temp:
             token = Path(temp) / "token"
@@ -17679,6 +19548,32 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
     def _json_request(self, *args, **kwargs):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
+
+    def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
+        # The passthrough and the MCP 405 write their response without _json.
+        # A GET drains nothing, so a body on it is unread when the response is
+        # written; the response itself must say `Connection: close`, as the
+        # close is otherwise found by the peer after it has taken the framed
+        # response as a reusable connection.
+        body = b'{"unread":true}'
+        for label, target, token in (
+            ("passthrough", self.ALLOWED.encode("ascii"), b"shell-token"),
+            ("mcp 405", b"/v1/mcp/some-server", b"chat-token"),
+        ):
+            with self.subTest(label), socket.create_connection(
+                ("127.0.0.1", self.server.server_address[1]), timeout=_CLOSE_WAIT_SECONDS
+            ) as sock:
+                sock.sendall(
+                    b"GET " + target + b" HTTP/1.1\r\nHost: broker\r\n"
+                    b"Authorization: Bearer " + token + b"\r\n"
+                    b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+                )
+                response = http.client.HTTPResponse(sock)
+                response.begin()
+                response.read()
+                self.assertEqual(200 if label == "passthrough" else 405, response.status)
+                self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+                self.assertEqual(b"", sock.recv(1), "the connection stayed open")
 
     # -- the happy path --------------------------------------------------
 

@@ -18,7 +18,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context. An `apply` among them is also recorded for the recurrence hold ([below](#holding-a-recurrence-while-its-fix-waits-for-review)).
-5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap. Events an alert-exclude rule held back in the watcher arrive on `POST /v1/excluded-events` with no session, as rows marked `excluded = 1` (one per object and reason per hour, with later records added to its `occurrences`), and the recap counts them on a line of their own that names the five noisiest workloads. `GET /v1/intercepted-events` lists them with the status `excluded`. They count toward `LEDGER_MAX_ROWS` like every other row.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
 7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
@@ -36,6 +36,12 @@ Two more things travel in that prompt since #656. The call is made without `goal
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
 The session id is therefore the thread key, and `session_metadata` records the `platform` alongside the `thread_id`: a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright.
+
+#### Limiting the open triage pull requests
+
+With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge from the managed repository itself (a fork's, whose `sourceRepo` names another repository, does not count) (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The forge is read before the lock, and the reservations are read and written under it, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts `TRIAGE_PR_CAP_NOTE` is posted where `_triage_not_started` posts its notice: in the alert's thread, or under the alert's quoted first line when it has no thread. With no chat platform the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
+
+There is one reservation per triage and branch. It is released when its branch shows an open proposal (it then counts as open), when that triage's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived` and opened no pull request after the forge was read (a later one is not in that read, so the reservation still counts it), when the triage does not start (`_triage_not_started`), and after `TRIAGE_PR_RESERVATION_MAX_S` (24 h). The last covers a card never filed, and a card that is `blocked` or held in `todo` behind a blocked triage card: such a card can still open its pull request, so it keeps counting until it settles or the 24 hours pass. Under the watcher's `--mode=shared`, where every incident shares one session, the first settled card, or one triage that does not start, releases every reservation. A daemon start also releases each reservation whose triage never reached `started` (a process that died between the claim and the start), beside the fold anchors. The count goes by the branch prefix alone: a pull request opened by a reply's `apply` counts when the branch `submit-suggestion` names for it (`platform-agent/<change_type>-<target_id>`) takes the prefix, and not otherwise.
 
 ### Daily Alert Ceiling
 
@@ -489,7 +495,8 @@ CREATE TABLE intercepted_events(
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
   fold_key    TEXT NOT NULL DEFAULT '',    -- what the row folds on: the workload of a pod named like a Deployment's, or a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
   workload_key TEXT NOT NULL DEFAULT '',   -- the workload an incident's fix belongs to (_incident_branch_workload); never cleared
-  pull_request TEXT NOT NULL DEFAULT ''    -- the open fix pull request a recurrence was held for; '' otherwise
+  pull_request TEXT NOT NULL DEFAULT '',   -- the open fix pull request a recurrence was held for; '' otherwise
+  excluded    INTEGER NOT NULL DEFAULT 0   -- 1 on a row an alert-exclude rule held back in the watcher (POST /v1/excluded-events); 0 otherwise
 );
 CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
   ON intercepted_events (session_id);
@@ -553,9 +560,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key` and `pull_request` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `excluded` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request`, `excluded` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
@@ -614,6 +621,21 @@ The column is named `severity` and three of its four values are one, but the key
 `Warning`. `GET /v1/alert-quota` reports the row as it finds it, so a reader sees four buckets.
 
 Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata`, `incidents` and `incident_applies`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+#### `triage_pr_reservations`
+
+The branches triages were routed to open a pull request on, which count against `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` ([above](#limiting-the-open-triage-pull-requests)):
+
+```sql
+CREATE TABLE triage_pr_reservations(
+  branch TEXT NOT NULL,           -- platform-agent/incident-<incident>
+  session_id TEXT NOT NULL,       -- the triage that reserved it
+  reserved_at REAL NOT NULL,      -- epoch seconds
+  PRIMARY KEY (branch, session_id)
+);
+```
+
+Not swept by the TTL: each claim releases the rows that no longer count.
 
 The same database also holds `findings` and `queue_publications`, the findings queue's tables. They are exempt from the TTL sweep — a backlog item disappears when its state says it is finished, not when it gets old. [`docs/designs/inventory-findings-queue.md`](../../../docs/designs/inventory-findings-queue.md) §3.1 is the canonical description of both.
 

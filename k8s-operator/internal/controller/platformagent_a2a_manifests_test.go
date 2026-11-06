@@ -1586,6 +1586,12 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
 		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
 	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	}
 }
 
 // The chart's standing pods come from the annotation the chart stamps on the
@@ -1677,6 +1683,7 @@ func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
 	if got := a2aStandingPods(agent); got != rendered {
 		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
 	}
+
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:
@@ -8509,6 +8516,41 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
 		}
 	})
+}
+
+// One parse decides both the count and the discard (#4893): a value is used
+// exactly when no reason is given, an absent annotation takes the default
+// without one, and every discarded value takes the default with one.
+func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
+	absent := a2aTestAgent()
+	if n, why := a2aChartPodsCount(absent); n != a2aDefaultChartPods || why != "" {
+		t.Fatalf("absent: (%d, %q), want the default and no reason", n, why)
+	}
+	for _, c := range []struct {
+		raw  string
+		want int64
+		used bool
+	}{
+		{"0", 0, true},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{fmt.Sprint(a2aMaxChartPods), a2aMaxChartPods, true},
+		{fmt.Sprint(a2aMaxChartPods + 1), a2aDefaultChartPods, false},
+		{"-1", a2aDefaultChartPods, false},
+		{"", a2aDefaultChartPods, false},
+		{"seven", a2aDefaultChartPods, false},
+		{"99999999999999999999", a2aDefaultChartPods, false},
+	} {
+		agent := a2aTestAgent()
+		agent.SetAnnotations(map[string]string{a2aChartPodsAnnotation: c.raw})
+		n, why := a2aChartPodsCount(agent)
+		if n != c.want || (why == "") != c.used {
+			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
+		}
+		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
+			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		}
+	}
 }
 
 // A chart-pods annotation the operator discards is reported, once per spec
