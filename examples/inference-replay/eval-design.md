@@ -134,8 +134,16 @@ The rules that keep this safe:
   05, 2026" line Hermes puts in the system prompt, becomes how many calendar days it is from the
   request's own day instead ("today", "yesterday", "days ago", ...), counted in the time zone
   written after it, so a nightly recorded on Wednesday still matches a presubmit on Thursday. A
-  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. An answer that
-  names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
+  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. Any of these
+  with a time of day beside it stays as written, since counting days would drop the time and give
+  two moments a day apart one key: a time on the same line, within 30 characters across a line
+  break (real or a JSON-escaped `\n`), or anywhere in another value or key of a JSON object or
+  list that encloses the date, at any depth and inside strings that are JSON documents. Only what
+  the key keeps is read: a time inside a timestamp that is itself turned into a how-far-from-now
+  token doesn't count, since that token keeps its hour, and neither does one in a value the key
+  drops or replaces with a placeholder. Dotted and compact times (`10.42.01`, `1042Z`) aren't
+  read, since they look like version numbers. An answer that names one of these dates isn't
+  saved, since replayed the next day it would carry the wrong date.
   The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
   `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its
   weekday ("findings for November 04"). In the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
@@ -407,9 +415,23 @@ Agents don't ask for a specific model. They send the name
 `model-default`, and LiteLLM decides which model that means and how hard it thinks. LiteLLM also
 edits requests with a few plugins (for example, one that strips old thinking text). So a pull
 request that changes any of that sends exactly the same requests as before, and without extra care
-it would get answers from the old setup. To stop that, the key also includes LiteLLM's config
-fingerprint (the chart already keeps one, in the `checksum/config` annotation), the LiteLLM image
-version, and the normalizer's version hash.
+it would get answers from the old setup. To stop that, the key also includes a fingerprint of
+LiteLLM's config, the LiteLLM image version, and the normalizer's version hash.
+
+The config fingerprint covers what changes the answer and leaves out how the request gets to the
+model. It covers the model name, the settings sent with each request (maximum tokens, thinking or
+reasoning effort, the backup model, which parameters are dropped), and the plugins that change what
+the model is sent or what comes back (the thinking-text and cache-marker strippers, and redaction
+with its rules). It treats LiteLLM's two routes to Google's Gemini models as one, so
+`vertex_ai/gemini-4-argon` and `gemini/gemini-4-argon` count as the same model; any other provider,
+and the server address of an OpenAI-compatible endpoint, stay in. It leaves out the gateway's
+timeout and retry settings and the plugins that only export telemetry, fetch a credential or pick a
+serving replica. The nightlies reach Gemini through the Gemini Developer API and the presubmits
+through Vertex AI; with the provider in the fingerprint, no presubmit could ever find a nightly's
+answer. Once both call the model through one API, the key goes back to the whole config, the
+`checksum/config` annotation that rolls the LiteLLM pods. The chart computes the fingerprint
+(`kube-agents.replayModelBehaviourChecksum` in `charts/kube-agents/templates/_helpers.tpl`) and
+gives it to the proxy as `REPLAY_MODEL_BEHAVIOUR_CHECKSUM`.
 
 **Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
 model fails. The backup is the same model with less thinking, so the model name in the reply looks

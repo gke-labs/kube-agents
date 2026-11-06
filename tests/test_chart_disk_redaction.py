@@ -38,8 +38,13 @@ _CONFIG_MAP = "litellm-config"
 _KEY = "redaction.yaml"
 
 
+# The fold window renders an env entry of its own by default; nulled so "no env"
+# below means none of the redaction's.
+_NO_FOLD_WINDOW = "platformAgent.deployment.incidentWorkloadDedupSeconds=null"
+
+
 def _render(*overrides: str) -> dict:
-    args = [_HELM, "template", "ka", str(_CHART), "--show-only", _CR_TEMPLATE, *_REQUIRED]
+    args = [_HELM, "template", "ka", str(_CHART), "--show-only", _CR_TEMPLATE, *_REQUIRED, "--set", _NO_FOLD_WINDOW]
     for override in overrides:
         args += ["--set", override]
     out = subprocess.run(args, check=True, capture_output=True, text=True).stdout

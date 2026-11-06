@@ -168,6 +168,9 @@ var (
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
+	// metricsRatedPlatforms are the backends that draw rating controls, each
+	// given a zero answer_feedback_total series per rating.
+	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
 	metricsBackendPlatforms = map[string]string{
@@ -310,8 +313,10 @@ func NewMetrics() *Metrics {
 	for _, outcome := range metricsGchatOutcomes {
 		m.gchatPulls.WithLabelValues(outcome)
 	}
-	for _, rating := range metricsRatings {
-		m.answerFeedback.WithLabelValues(platformSlack, rating)
+	for _, platform := range metricsRatedPlatforms {
+		for _, rating := range metricsRatings {
+			m.answerFeedback.WithLabelValues(platform, rating)
+		}
 	}
 	return m
 }

@@ -726,6 +726,11 @@ WATCHER_WATCH_MAX_S = 3600
 # Forwarded from the caller when it has this shape: client-go negotiates JSON or
 # protobuf with it.
 WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+# The most of a named Pod's metadata the broker reads before projecting it
+# (watcher_policy.project_pod_metadata). An ObjectMeta is a few KiB; one with a
+# large last-applied annotation can be more, and anything past this is refused
+# rather than relayed in part.
+WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
@@ -1325,6 +1330,17 @@ AUDIT_STATUS_BUSY = "busy"
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
+# Appended to the executable refusal (this rule, or executable.allowlist once
+# kubectl leaves the exec route) when the shell sends kubectl. The current sandbox
+# image runs stock kubectl against kube-proxy and never sends it here, so the
+# usual sender is a sandbox image older than the agent, typically one pinned by
+# spec.harness.experimental.shellSandbox.image through an upgrade (#4966).
+SHELL_KUBECTL_REFUSAL_HINT = (
+    " The shell sandbox runs kubectl against kube-proxy, so a sandbox sending kubectl here is "
+    "likely running an image older than the agent's: check spec.harness.experimental.shellSandbox.image "
+    "on the PlatformAgent (its ShellSandboxPinned condition, when present, names the operator's image) "
+    "and the operator's AGENT_SANDBOX_IMAGE."
+)
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
@@ -2178,6 +2194,19 @@ def executable_permitted(role: str, executable: str) -> bool:
     """Whether ``role`` may run ``executable`` through /v1/exec."""
     narrowed = ROLE_EXECUTABLES.get(role)
     return narrowed is None or executable in narrowed
+
+
+def shell_kubectl_hint(role: str, executable: str) -> str:
+    """SHELL_KUBECTL_REFUSAL_HINT when the shell sent kubectl, else ""."""
+    return SHELL_KUBECTL_REFUSAL_HINT if role == CALLER_ROLE_SHELL and executable == "kubectl" else ""
+
+
+def executable_refusal_message(role: str, executable: str) -> str:
+    """The message refusing ``role`` the ``executable`` it may not run."""
+    return (
+        f"The {role} caller may run only "
+        f"{', '.join(sorted(ROLE_EXECUTABLES[role]))} through the credential proxy."
+    ) + shell_kubectl_hint(role, executable)
 
 
 # Which `POST /v1/vcs/<verb>` verbs a role may reach, checked on the verb after
@@ -13871,7 +13900,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_EXECUTABLE_ALLOWLIST,
-                    "message": "Executable is not supported by the credential proxy.",
+                    "message": "Executable is not supported by the credential proxy."
+                    + shell_kubectl_hint(principal.role, argv[0]),
                 },
             )
             return
@@ -13890,10 +13920,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_CALLER_EXECUTABLE,
-                    "message": (
-                        f"The {principal.role} caller may run only "
-                        f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
-                    ),
+                    "message": executable_refusal_message(principal.role, argv[0]),
                 },
             )
             return
@@ -14966,11 +14993,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_watcher_k8s(self) -> None:
         """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
 
-        The event watcher's list and watch of events and its one-item
-        metadata-only count lists, and the drift detector's read of one named
-        object, on the broker's credential. `watcher_policy.evaluate_k8s` is
-        the table. A watch is streamed through as the API server sends it;
-        everything else is streamed too, with the Cloud API relay's deadline
+        The event watcher's list and watch of events, its one-item
+        metadata-only count lists and its read of one named Pod's metadata,
+        and the drift detector's read of one named object, on the broker's
+        credential. `watcher_policy.evaluate_k8s` is the table. A watch is
+        streamed through as the API server sends it. A Pod's metadata is read
+        whole and relayed as its projection (`project_pod_metadata`).
+        Everything else is streamed too, with the Cloud API relay's deadline
         on each read.
         """
         request_id = str(uuid.uuid4())
@@ -15062,6 +15091,46 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
+                return
+            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                # Read whole and projected: the Pod's ObjectMeta carries every
+                # annotation and managedFields, and only the owner lookup's
+                # fields leave the broker. A non-200 answer is the API server's
+                # Status, which carries no Pod data, and is relayed as it is.
+                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
+                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
+                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                    )
+                    return
+                if response.status == HTTPStatus.OK:
+                    projected = watcher_policy.project_pod_metadata(body)
+                    if projected is None:
+                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                        self._json(
+                            HTTPStatus.BAD_GATEWAY,
+                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                        )
+                        return
+                    body = projected
+                LOGGER.info(
+                    "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
+                    request_id,
+                    decision.rule_id,
+                    response.status,
+                    len(body),
+                )
+                self.send_response(response.status)
+                answered = True
+                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                # Framed by its length, so the connection stays reusable, and
+                # closed with the answer when the request's body went unread.
+                self.send_header("Content-Length", str(len(body)))
+                self._end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
                 return
             LOGGER.info(
                 "watcher k8s forwarded request_id=%s rule=%s status=%d watch=%s",

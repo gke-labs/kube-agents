@@ -468,12 +468,28 @@ func preferProtobuf(cfg *rest.Config) {
 // newClusterClient builds the clientset every watched cluster is read with,
 // from a config preferring protobuf (see preferProtobuf).
 func newClusterClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	client, _, err := newClusterClients(cfg)
+	return client, err
+}
+
+// newClusterClients is newClusterClient plus the client the Events watch is
+// opened with, whose connections are never reused (see watchConfig). Where cfg
+// doesn't qualify for that, the second is the first.
+func newClusterClients(cfg *rest.Config) (client, watchClient kubernetes.Interface, err error) {
 	preferProtobuf(cfg)
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err = kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes client: %w", err)
+		return nil, nil, fmt.Errorf("kubernetes client: %w", err)
 	}
-	return client, nil
+	watchCfg, separate := watchConfig(cfg)
+	if !separate {
+		return client, client, nil
+	}
+	watchClient, err = kubernetes.NewForConfig(watchCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("kubernetes watch client: %w", err)
+	}
+	return client, watchClient, nil
 }
 
 // targetCluster is one cluster the watcher should monitor, discovered from a
@@ -498,6 +514,11 @@ type targetCluster struct {
 	// order, which boot need not have chosen (a refused describe skips it).
 	Source string
 	Client kubernetes.Interface
+	// WatchClient is the client the Events watch is opened with: Client's
+	// twin with no pooled connections where Client shares the process's
+	// default transport (see watchConfig), else Client itself. Nil means
+	// Client, which is what a test's fake and the direct cluster leave.
+	WatchClient kubernetes.Interface
 	// Autopilot says this is a GKE Autopilot cluster, read off the describe
 	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
 	// FailedScheduling gate is the only reader: an Autopilot cluster with no
@@ -587,17 +608,18 @@ func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics,
 		if c.Profile == directProfile {
 			return targetCluster{}, fmt.Errorf("the profile directory name %q is reserved for the directly reached cluster; rename the profile", directProfile)
 		}
-		client, err := newClusterClient(c.Config)
+		client, watchClient, err := newClusterClients(c.Config)
 		if err != nil {
 			return targetCluster{}, err
 		}
 		return targetCluster{
-			Name:      c.Identity.Cluster,
-			ProjectID: c.Identity.Project,
-			Location:  c.Identity.Location,
-			Profile:   c.Profile,
-			Client:    client,
-			Autopilot: c.Autopilot,
+			Name:        c.Identity.Cluster,
+			ProjectID:   c.Identity.Project,
+			Location:    c.Identity.Location,
+			Profile:     c.Profile,
+			Client:      client,
+			WatchClient: watchClient,
+			Autopilot:   c.Autopilot,
 		}, nil
 	})
 	if err != nil {
@@ -639,8 +661,11 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	settles   *settleMemo
+	scaleUps *scaleUpMemo
+	settles  *settleMemo
+	// owners fills an admitted Pod event's controller_ref from the Pod's
+	// owner (ownerResolver); nil sends the field empty, as before.
+	owners    *ownerResolver
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -841,8 +866,8 @@ var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0
 // named workloads held, whoever creates objects on the watched cluster. The
 // daemon keys every non-Pod object by its exact name because its row is a
 // database row, not a series; the label departs from it there and nowhere
-// else. The watcher sets no controller reference on its events (watcher.go),
-// so the name is what there is to fold.
+// else. The label is set before the owner lookup (ownerResolver), so it
+// folds by name only.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
@@ -996,6 +1021,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
 	}
+	// Looked up only for an event the filter and dedup admitted, so a
+	// cluster's event stream costs one Pod read per incident, not per event.
+	if ev.ControllerRef == "" && ev.KindOfObject == kindPod {
+		ev.ControllerRef = d.owners.ControllerRef(ctx, ev.Namespace, ev.Name, ev.Key.UID)
+	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
 		Reason:       ev.Key.Reason,
@@ -1102,8 +1132,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the alert's thread and onto its card, the card alone where no thread is
 // routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
-// since the broker's watcher route serves no pods, and a deleted pod and a
-// recovered one both go quiet. One per incident, held on the dedup entry so
+// since the broker's watcher route serves of a pod only its owner, never its
+// state, and a deleted pod and a recovered one both go quiet. One per incident, held on the dedup entry so
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
