@@ -68,6 +68,8 @@ TEXT_ENCODING = "utf-8"
 SKIP_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 SKIP_SCRUB_FAILED = "scrub_failed"
 SKIP_WRITE_FAILED = "write_failed"
+# The data volume's budget is spent (spool.DataBudget): nothing more is written.
+SKIP_BUDGET_SPENT = "budget_spent"
 
 WITHHELD = "[WITHHELD: scrubber unavailable]"
 WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
@@ -237,9 +239,11 @@ class Scrubber:
 class RequestStore:
     """Writes scrubbed requests under `root`, each distinct message once."""
 
-    def __init__(self, root: str, scrubber: Scrubber):
+    def __init__(self, root: str, scrubber: Scrubber, budget: Any = None):
         self.root = root
         self.scrubber = scrubber
+        # A spool.DataBudget, or None for no limit.
+        self.budget = budget
         self._lock = threading.Lock()
 
     def _blob(self, value: Any) -> str:
@@ -250,14 +254,15 @@ class RequestStore:
             self._write(path, data)
         return digest
 
-    @staticmethod
-    def _write(path: str, data: str) -> None:
+    def _write(self, path: str, data: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
                 handle.write(data)
             os.replace(tmp, path)
+            if self.budget is not None:
+                self.budget.note(len(data))
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -277,6 +282,8 @@ class RequestStore:
     def write(self, request_id: str, fingerprint: str, scrubbed: Scrubbed) -> Optional[str]:
         """Write one scrubbed request; returns None when written, else why not."""
         messages, tools, settings = scrubbed
+        if self.budget is not None and not self.budget.allows():
+            return SKIP_BUDGET_SPENT
         try:
             with self._lock:
                 manifest = {

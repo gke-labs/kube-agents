@@ -917,8 +917,8 @@ class Fold:
         """The answer this task produced, as a customer would have read it.
 
         Ordinarily that is everything the conversation received for the task
-        that nothing rewrote, reassembled. The window is decided here rather
-        than while folding: whether a post belongs to this task is only
+        that nothing rewrote, reassembled. The window (:attr:`window_posts`)
+        is decided when read rather than while folding: whether a post belongs to this task is only
         answerable once it is known whether this task's marker appeared at
         all, and a fold reading a bounded transcript may never see one. With a
         marker, the posts between it and the next task's; without, every post,
@@ -934,10 +934,15 @@ class Fold:
         """
         if self.stream_result:
             return self.stream_result
+        return "".join(post["text"] for post in self.window_posts if post["messageId"] not in self.edited)
+
+    @property
+    def window_posts(self) -> list[dict[str, Any]]:
+        """The messages this task posted: its window when its marker appeared,
+        every post otherwise. A post a later edit rewrote (the status
+        placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
-        if not windowed:
-            windowed = self.posts
-        return "".join(post["text"] for post in windowed if post["messageId"] not in self.edited)
+        return windowed or self.posts
 
     @property
     def gateway_declared(self) -> bool:

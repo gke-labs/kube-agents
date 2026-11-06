@@ -156,12 +156,23 @@ RECORD_SEPARATORS = (",", ":")
 #: staged, as ``vcs_client`` finds its siblings there.
 SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 
-#: A GitHub-shaped pull request url (``…/pull/<n>``) or a merge request url
-#: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
-#: Read only for a record with no ``repo`` (one an older client wrote), and for
-#: the card event's number when the broker's answer has none. The Session KV
-#: server pins its own pattern equal to this one.
-PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+#: A pull request url on every forge the broker serves
+#: (``providers/registry.py`` ``AVAILABLE``): the repository url the broker
+#: resolves to that forge, then the number. GitHub ``…/pull/<n>``, GitLab
+#: ``…/-/merge_requests/<n>``, Gitea ``…/pulls/<n>``, and Bitbucket Cloud and
+#: Data Center ``…/pull-requests/<n>`` (Data Center's repository is
+#: ``…/projects/KEY/repos/slug``). A trailing page (``/overview``,
+#: ``/_/diff``), query or fragment is allowed; an issue url is not a match.
+#: ``http`` is a forge the broker serves too: an in-cluster Gitea (a ``.svc``
+#: host). The repository is greedy, so a GitLab subgroup named ``pulls`` or
+#: ``pull-requests`` before a numeric subgroup stays in the repository and
+#: the last marker before the number is the pull request. The tail after the
+#: number carries no further marker, ``/-/`` or ``/issues/``, so an issue under
+#: such a subgroup is not a pull request either. Read only for a
+#: record with no ``repo`` (one an older client wrote), and for the card
+#: event's number when the broker's answer has none. The Session KV server
+#: pins its own pattern equal to this one.
+PROPOSAL_URL = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 
 #: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
 #: does not parse as a whole line (one ``2>&1`` merged after other text). Its

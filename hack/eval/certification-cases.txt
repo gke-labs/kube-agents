@@ -20,7 +20,7 @@
 # bench/README.md.
 #
 # WHO APPROVES. The normal approvers (root OWNERS), like nightly-cases.txt:
-# this file changes what one Rerun-only lane records, never what can red a
+# this file changes what one weekly lane records, never what can red a
 # pull request.
 
 # part 1

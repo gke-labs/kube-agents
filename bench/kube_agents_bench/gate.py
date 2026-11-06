@@ -71,6 +71,7 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench import chat_shape
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
     MODE_NEXT,
@@ -562,8 +563,16 @@ def _cmd_case(args: argparse.Namespace) -> int:
         if counts:
             partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
             print(f"  rep {rep.index} tokens: {counts}{partial}")
+        # The delivered reply's shape under chat_shape.KEYS, a flag as 1 or
+        # 0, for the eval dashboard to collect. Reported, never scored; no line
+        # for a run that delivered nothing.
+        if rep.shape:
+            shape = " ".join(
+                f"{key}={int(rep.shape[key])}" for key in chat_shape.KEYS if key in rep.shape
+            )
+            print(f"  rep {rep.index} shape: {shape}")
         # The agent's own words, one line under the grading line (after the
-        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
+        # timing, tokens and shape lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing

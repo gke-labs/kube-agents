@@ -128,6 +128,9 @@ readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
 readonly EVAL_TIMING_FILE="timing.json"
+# The delivered reply's shape beside results.json, where
+# bench/kube_agents_bench/scoring.py (_SHAPE_FILE) reads it. Reported, never scored.
+readonly EVAL_SHAPE_FILE="shape.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 # Where each unit writes a repetition's log (run_one_unit) and grading reads it
@@ -872,12 +875,16 @@ report_partial_verdict() {
 profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
+  # First, so the shadow proxy collector's last pass runs alongside the
+  # captures below; waited for after them (hack/ci-env.sh). No-ops without one.
+  signal_replay_shadow_collector
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
   collect_litellm_log
   collect_credential_proxy_evidence
+  wait_replay_shadow_collector
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
@@ -1147,6 +1154,9 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
+# to the private bucket from here on, while the eval runs (hack/ci-env.sh).
+start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -5100,6 +5110,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lease is never copied in for this repetition.
   local timing="${STATE_DIR}/${name}.rep${rep}.${EVAL_TIMING_FILE}"
   rm -f "${timing}"
+  # The same for the delivered reply's shape (harness.py, KUBE_AGENTS_SHAPE_FILE).
+  local shape="${STATE_DIR}/${name}.rep${rep}.${EVAL_SHAPE_FILE}"
+  rm -f "${shape}"
   # A stack that writes to the leased GitOps repository gets its own write
   # token, minted here, after the waits, as the grading token is above, and
   # renewed until devops-bench returns, which is after the stack's destroy
@@ -5124,7 +5137,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
   if [ -n "${gitops_writer}" ]; then
@@ -5140,6 +5153,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # missing timing never fails the repetition.
   if [ -n "${dir}" ] && [ -f "${timing}" ]; then
     cp "${timing}" "${dir}/${EVAL_TIMING_FILE}" 2>/dev/null || true
+  fi
+  if [ -n "${dir}" ] && [ -f "${shape}" ]; then
+    cp "${shape}" "${dir}/${EVAL_SHAPE_FILE}" 2>/dev/null || true
   fi
   # A gated judged score the judge failed to return is asked for once more
   # from the saved answer (kube_agents_bench/rejudge.py), before the .dir

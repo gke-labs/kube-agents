@@ -262,6 +262,9 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.replayShadow` is an eval-only fixture, off by default: CI turns it on to put the
+inference-replay shadow proxy in front of LiteLLM ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md)).
+
 `litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
 replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
 where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
@@ -1117,7 +1120,7 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
 `ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
@@ -1134,6 +1137,13 @@ access, Pod Security "restricted", and exactly the session labels. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The fourth, `kube-agents-web-console-cr`, is generated from
+`k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
+web console and its environment page are on. It holds the console's
+ServiceAccount to its own annotations and `spec.integration.forges`,
+`repositories` and `github` on the PlatformAgent, and refuses any other change it
+makes.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
