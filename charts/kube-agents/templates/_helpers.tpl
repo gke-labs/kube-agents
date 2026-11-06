@@ -2935,6 +2935,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $transientFile := .Files.Get "files/transient-pods.yaml" | fromYaml -}}
     {{- $sp := index $transientFile "scopePublisher" -}}
     {{- $spOK := and (kindIs "map" $sp) (kindIs "slice" (index $sp "scopeMembers")) -}}
+    {{- range $field := (ternary (index ($sp | default dict) "scopeMembers") list $spOK) -}}
+      {{- $spOK = and $spOK (kindIs "string" $field) -}}
+    {{- end -}}
     {{- range $key := list "pods" "cpuMillisRequest" "cpuMillisLimit" "memoryBytesRequest" "memoryBytesLimit" "ephemeralStorageBytesRequest" "ephemeralStorageBytesLimit" -}}
       {{- $spOK = and $spOK (or (kindIs "float64" (index ($sp | default dict) $key)) (kindIs "int64" (index ($sp | default dict) $key)) (kindIs "int" (index ($sp | default dict) $key))) -}}
     {{- end -}}

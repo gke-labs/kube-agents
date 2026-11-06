@@ -1276,7 +1276,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`, `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, or under `platformAgent.mode: next` a damaged `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
