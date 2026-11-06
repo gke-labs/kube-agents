@@ -97,6 +97,9 @@ def _selects(selector, labels):
 class TemplateTextTest(unittest.TestCase):
     """What the template says, without rendering it."""
 
+    def test_callbacks_are_registered_only_through_their_classified_names(self):
+        self.assertNotRegex(_TEMPLATE.read_text(), r"proxy_handler_instance|\"otel\"|\"prometheus\"")
+
     def test_proxy_container_is_never_the_name_the_litellm_log_collector_reads(self):
         text = _TEMPLATE.read_text()
         self.assertIn(f"- name: {_PROXY_CONTAINER}", text)
@@ -255,6 +258,35 @@ _EVAL_LITELLM_TYPED = (
 )
 _VERTEX = ("litellm.modelProvider=vertex_ai", *_EVAL_LITELLM)
 _GEMINI_API = ("litellm.modelProvider=gemini", *_EVAL_LITELLM)
+# Not a Gemini thinking model, so the gemini render carries no thinking key and
+# only the route tells it from an openai_compatible one.
+_PLAIN_MODEL = "litellm.modelDefaultName=gemma-3-27b"
+_SERVER_A = "litellm.openaiCompatible.apiBase=https://llm-a.example.com/v1"
+_SERVER_B = "litellm.openaiCompatible.apiBase=https://llm-b.example.com/v1"
+
+_CALLBACKS_PROBE = """
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: probe-callbacks
+data:
+  callbacks: |
+    {{ include "kube-agents.litellmCallbacks" . }}
+"""
+# Every provider and flag combination that turns a callback on.
+_CALLBACK_RENDERS = (
+    (),
+    ("litellm.otel=true",),
+    ("litellm.modelProvider=anthropic",),
+    ("litellm.modelProvider=vertex_ai", "litellm.modelDefaultName=claude-opus-5"),
+    ("litellm.modelProvider=vertex_ai", f"litellm.modelDefaultName={_EVAL_MODEL}",
+     "litellm.vertex.sessionAffinity.enabled=true"),
+    ("litellm.redaction.enabled=true",),
+    ("litellm.traceLogEnabled=true",),
+    ("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A, "litellm.envFromSecret=ai-gateway-oauth"),
+    ("litellm.modelProvider=vertex_ai", f"litellm.modelDefaultName={_EVAL_MODEL}", "litellm.otel=true",
+     "litellm.vertex.sessionAffinity.enabled=true", "litellm.redaction.enabled=true", "litellm.traceLogEnabled=true"),
+)
 
 
 class ReplayKeyTest(unittest.TestCase):
@@ -279,6 +311,16 @@ class ReplayKeyTest(unittest.TestCase):
         _, vertex_rollout = self.render(_VERTEX)
         _, gemini_rollout = self.render(_GEMINI_API)
         self.assertNotEqual(vertex_rollout, gemini_rollout)
+
+    def test_openai_compatible_and_gemini_api_serving_one_model_name_keep_apart(self):
+        gemini_key, _ = self.render(("litellm.modelProvider=gemini", _PLAIN_MODEL))
+        server_key, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A))
+        self.assertNotEqual(gemini_key, server_key)
+
+    def test_two_openai_compatible_servers_keep_apart(self):
+        server_a, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A))
+        server_b, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_B))
+        self.assertNotEqual(server_a, server_b)
 
     def test_retry_settings_leave_the_key_alone(self):
         base, _ = self.render(_VERTEX)
@@ -318,6 +360,44 @@ class ReplayKeyTest(unittest.TestCase):
             hook.write_text(hook.read_text() + "\n# edited\n")
             changed, _ = self.render(_VERTEX, chart=chart)
         self.assertEqual(base, changed)
+
+
+class CallbackClassesTest(unittest.TestCase):
+    """Every rendered callback is classified as in the replay key or out of it."""
+
+    @classmethod
+    def setUpClass(cls):
+        _helm()
+        cls.tmp = tempfile.mkdtemp()
+        cls.chart = pathlib.Path(cls.tmp) / "kube-agents"
+        shutil.copytree(_CHART, cls.chart)
+        (cls.chart / "templates" / "zz-probe.yaml").write_text(_CALLBACKS_PROBE)
+        res = _render(chart=cls.chart, show_only="templates/zz-probe.yaml")
+        if res.returncode != 0:
+            raise AssertionError(res.stderr)
+        classes = json.loads(_docs(res.stdout)[0]["data"]["callbacks"])
+        cls.keyed = set(classes["replayKeyed"].values())
+        cls.unkeyed = set(classes["replayUnkeyed"].values())
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_no_callback_is_in_both_sets(self):
+        self.assertEqual(self.keyed & self.unkeyed, set())
+
+    def test_every_rendered_callback_is_classified(self):
+        seen = set()
+        for sets in _CALLBACK_RENDERS:
+            with self.subTest(sets=sets):
+                res = _render(sets, chart=self.chart, show_only="templates/litellm.yaml")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                config = yaml.safe_load(_find(_docs(res.stdout), "ConfigMap", "litellm-config")["data"]["config.yaml"])
+                callbacks = config["litellm_settings"]["callbacks"]
+                self.assertEqual(set(callbacks) - self.keyed - self.unkeyed, set())
+                seen.update(callbacks)
+        # The renders above reach every classified callback, so none is a dead name.
+        self.assertEqual(seen, self.keyed | self.unkeyed)
 
 
 class PdbTest(unittest.TestCase):

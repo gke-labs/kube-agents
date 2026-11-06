@@ -153,9 +153,9 @@ class Config:
     store_dir: str = DEFAULT_STORE_DIR
     redactor_path: str = DEFAULT_REDACTOR_PATH
     transcript_rules_path: str = DEFAULT_TRANSCRIPT_RULES_PATH
-    # Set at deploy time by the chart: a checksum of the LiteLLM config
-    # without its provider route (REPLAY_MODEL_BEHAVIOUR_CHECKSUM), and the
-    # LiteLLM container image.
+    # Set at deploy time by the chart: a checksum of the LiteLLM config that
+    # treats the Gemini API and Vertex AI routes as one
+    # (REPLAY_MODEL_BEHAVIOUR_CHECKSUM), and the LiteLLM container image.
     model_behaviour_checksum: str = UNSET
     litellm_image: str = UNSET
     # Which job this proxy serves, stamped on every line for the analysis.

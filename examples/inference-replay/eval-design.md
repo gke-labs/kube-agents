@@ -414,10 +414,11 @@ The config fingerprint covers what changes the answer and leaves out how the req
 model. It covers the model name, the settings sent with each request (maximum tokens, thinking or
 reasoning effort, the backup model, which parameters are dropped), and the plugins that change what
 the model is sent or what comes back (the thinking-text and cache-marker strippers, and redaction
-with its rules). It leaves out the provider in front of the model name, so `vertex_ai/gemini-4-argon`
-and `gemini/gemini-4-argon` count as the same model, the endpoint and credentials, the gateway's
-timeout and retry settings, and the plugins that only export telemetry, fetch a credential or pick
-a serving replica. The nightlies reach Gemini through the Gemini Developer API and the presubmits
+with its rules). It treats LiteLLM's two routes to Google's Gemini models as one, so
+`vertex_ai/gemini-4-argon` and `gemini/gemini-4-argon` count as the same model; any other provider,
+and the server address of an OpenAI-compatible endpoint, stay in. It leaves out the gateway's
+timeout and retry settings and the plugins that only export telemetry, fetch a credential or pick a
+serving replica. The nightlies reach Gemini through the Gemini Developer API and the presubmits
 through Vertex AI; with the provider in the fingerprint, no presubmit could ever find a nightly's
 answer. Once both call the model through one API, the key goes back to the whole config, the
 `checksum/config` annotation that rolls the LiteLLM pods. The chart computes the fingerprint
