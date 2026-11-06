@@ -64,11 +64,18 @@ const (
 	// and, when a total moved, writes the status: the interval the controller
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
 	// the same reasoning that one status write per interval is a cost nobody
-	// notices. The first poll runs one interval after the manager elects this
-	// replica, by which time the initial reconcile pass has rendered the
-	// policies admitting the operator; a CR it reaches before that costs one
-	// failed poll, under the streak that records no event.
+	// notices.
 	usageCountersPollInterval = 5 * time.Minute
+	// usageCountersFirstPollDelay is how long after the manager elects this
+	// replica the first poll runs, the later polls following at the interval
+	// above. Long enough on a warm install for the initial reconcile pass to
+	// have rendered the policies admitting the operator, and short enough
+	// that a CR under spec.deployment.sizingProfile auto has its cluster
+	// count, and so its tier, within a minute of an operator start rather
+	// than a full interval later. A CR the first poll reaches before its
+	// policies admit the operator costs one failed poll, under the streak
+	// that records no event.
+	usageCountersFirstPollDelay = 30 * time.Second
 	// usageCountersConfigMapSuffix names the ConfigMap that holds the
 	// document, in the CR's namespace: <name>-usage-counters.
 	usageCountersConfigMapSuffix = "-usage-counters"
@@ -139,6 +146,11 @@ type UsageCounterPoller struct {
 	// past it, so an unreachable listener holding a dial open does not freeze
 	// the CRs behind it. A seam so a test need not wait a real interval.
 	pollBudget func() time.Duration
+	// firstPollDelay and pollInterval are Start's schedule,
+	// usageCountersFirstPollDelay and usageCountersPollInterval from the
+	// constructor; seams so a test of Start need not wait either.
+	firstPollDelay time.Duration
+	pollInterval   time.Duration
 
 	// streaks is the in-memory failure record per listener (pod and port), for the one log line
 	// when a listener first fails, the one when it recovers, and the Warning
@@ -217,20 +229,31 @@ type usageTarget struct {
 // the pods' listeners over the pod network.
 func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 	return &UsageCounterPoller{
-		r:          r,
-		source:     newPodUsageSource(),
-		now:        time.Now,
-		pollBudget: func() time.Duration { return usageCountersPollInterval },
-		streaks:    map[usageStreakKey]*usageScrapeStreak{},
-		sweepSeen:  map[string]bool{},
-		sweptKeys:  map[string]bool{},
+		r:              r,
+		source:         newPodUsageSource(),
+		now:            time.Now,
+		pollBudget:     func() time.Duration { return usageCountersPollInterval },
+		firstPollDelay: usageCountersFirstPollDelay,
+		pollInterval:   usageCountersPollInterval,
+		streaks:        map[usageStreakKey]*usageScrapeStreak{},
+		sweepSeen:      map[string]bool{},
+		sweptKeys:      map[string]bool{},
 	}
 }
 
-// Start polls every interval until ctx is cancelled. It satisfies
-// manager.Runnable; main.go adds the poller to the manager.
+// Start polls once after firstPollDelay and then every pollInterval until
+// ctx is cancelled. It satisfies manager.Runnable; main.go adds the poller to
+// the manager, which starts it on election.
 func (p *UsageCounterPoller) Start(ctx context.Context) error {
-	ticker := time.NewTicker(usageCountersPollInterval)
+	first := time.NewTimer(p.firstPollDelay)
+	defer first.Stop()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-first.C:
+		p.pollOnce(ctx)
+	}
+	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {

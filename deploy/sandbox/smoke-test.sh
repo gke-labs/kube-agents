@@ -935,7 +935,8 @@ check "leeway report dispatches cluster reads through stock kubectl" "kubectl ge
 # The kube-proxy kubeconfigs name the cluster in the server URL's path
 # (entrypoint.sh: `server: ${KUBE_PROXY_URL}/clusters/<ctx>`), and before
 # kubectl 1.34 `get --raw` replaced that path with the raw path, so every paged
-# collection read landed on the proxy's default cluster and nothing failed.
+# collection read reached the proxy with no cluster in it (#4739): it landed on
+# the host and nothing failed, and the proxy now refuses such a request.
 # Proved against the installed binary rather than its version string: a server
 # inside the container records the path it receives from a `--raw` read sent
 # through a kubeconfig whose server carries `/clusters/seeded-a`.

@@ -129,6 +129,9 @@ CHECK_GITOPS_DECLARATION = "gitops_declaration"
 CHECK_GITOPS_WORKLOAD_MANIFEST = "gitops_workload_manifest"
 CHECK_GITLAB_WORKLOAD_MANIFEST = "gitlab_workload_manifest"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
+# The eval nightlies' Gemini Developer API key, its secret and the secret's
+# grants (scripts/provision_ci_pool_gemini_key.sh), read as metadata and IAM.
+CHECK_GEMINI_KEY = "gemini_api_key"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
 # the minter GSA's signing right and its Workload Identity binding, read with
@@ -151,6 +154,7 @@ CHECK_IDS = (
     CHECK_GITOPS_WORKLOAD_MANIFEST,
     CHECK_GITLAB_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
+    CHECK_GEMINI_KEY,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
 )
@@ -180,6 +184,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITOPS_WORKLOAD_MANIFEST: "GitOps Workload Declaration",
     CHECK_GITLAB_WORKLOAD_MANIFEST: "GitLab Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
+    CHECK_GEMINI_KEY: "Gemini Developer API Key",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
 }
@@ -209,10 +214,12 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
-# read is in another project the bot holds nothing on. The GitOps
-# default-branch read is in: one metadata call the job makes with whatever
-# GitHub credential it carries (GITOPS_READ_TOKEN_ENV), and records as not
-# checked when it carries none.
+# read is in another project the bot holds nothing on. Not the Gemini key
+# check yet: the registered projects get the key after it lands, and until
+# then it would report drift on every one. The GitOps default-branch read is
+# in: one metadata call the job makes with whatever GitHub credential it
+# carries (GITOPS_READ_TOKEN_ENV), and records as not checked when it carries
+# none.
 POOL_STATE_CHECKS = (CHECK_PROJECT_AND_APIS, CHECK_IAM, CHECK_ARTIFACT_REGISTRY, CHECK_GKE_AND_STATE, CHECK_FORGE_PIECES, CHECK_GITOPS_DEFAULT_BRANCH, CHECK_TOKEN_MINTER_KMS)
 # --report's document (docs/ci-health.md, "The pool-state scan").
 REPORT_SCHEMA_VERSION = 1
@@ -466,6 +473,42 @@ FORGE_FINDINGS = frozenset(
 # position as the pieces: nothing on the public lanes resolves eval.internal.
 FINDING_DNS_API = "apis/dns.googleapis.com"
 LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | FORGE_FINDINGS | {FINDING_DNS_API}
+
+# ─── The eval nightlies' Gemini Developer API key ────────────────────────────
+# scripts/provision_ci_pool_gemini_key.sh mints the key and keeps its string as
+# the latest version of a secret in the same project; the nightly reads that
+# secret as a runner. The verifier reads the key's restriction, the secret's
+# latest version state and the secret's policy -- never the key string or the
+# secret's value. Kept equal to the script's constants by the tests.
+GEMINI_KEY_SCRIPT = "scripts/provision_ci_pool_gemini_key.sh"
+GEMINI_KEY_DISPLAY_NAME = "kube-agents-eval-gemini"
+GEMINI_KEY_SECRET_NAME = "kube-agents-eval-gemini-api-key"
+GEMINI_KEY_API_TARGET = "generativelanguage.googleapis.com"
+GEMINI_KEY_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
+# How much of a failed gcloud read's stderr a warning quotes.
+GEMINI_KEY_ERR_EXCERPT = 200
+# The state of a secret version the nightly's `versions access latest` reads.
+GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# Client restrictions on an API key: a key that carries any of them accepts
+# calls only from that browser, server address or app, so the agent pod's
+# calls are refused.
+GEMINI_KEY_CLIENT_RESTRICTIONS = (
+    "browserKeyRestrictions",
+    "serverKeyRestrictions",
+    "androidKeyRestrictions",
+    "iosKeyRestrictions",
+)
+# The key script enables the API Keys and Secret Manager APIs, and nothing else
+# in the pool does, so on a project it never ran against both reads answer
+# PERMISSION_DENIED with reason SERVICE_DISABLED. The general classifier keeps
+# that a refusal; check_gemini_api_key alone reads it as the key absent.
+GEMINI_KEY_SERVICE_DISABLED = re.compile(
+    r"\bSERVICE_DISABLED\b|API has not been used in project \S+ before or it is disabled"
+)
+FINDING_GEMINI_KEY_MISSING = "apikeys/gemini/missing"
+FINDING_GEMINI_KEY_RESTRICTION = "apikeys/gemini/restriction"
+FINDING_GEMINI_KEY_SECRET_MISSING = "secrets/gemini-api-key/missing"
+FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX = "secrets/gemini-api-key/accessor/"
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -755,6 +798,19 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The two runners read the eval nightlies' Gemini key secret, so each holds
+# GEMINI_KEY_ACCESSOR_ROLE on it.
+GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
+# Lease-silent while the registered projects are repaired: the key script runs
+# against each of them after this check lands, so until then every project
+# carries these findings and the pool-drift advice would blame the pool. A
+# later change makes them blocking, tracked in #4850.
+GEMINI_KEY_FINDINGS = frozenset(
+    {FINDING_GEMINI_KEY_MISSING, FINDING_GEMINI_KEY_RESTRICTION, FINDING_GEMINI_KEY_SECRET_MISSING}
+    | {FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member for member in GEMINI_KEY_SECRET_ACCESSORS}
+)
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | GEMINI_KEY_FINDINGS
+
 # The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
 # ci-kube-agents-pull-sweep on main) signs the agent's App through each
 # project's copy of the key, so it needs signer on that key and nothing on the
@@ -866,6 +922,10 @@ POOL_STATE_READER_ROLES = {
 # store, not the project. `projects describe` needs projects.get, which
 # securityReviewer lacks and clusterViewer carries. The `kms` surface also
 # covers the KMS sign in check_ledger_read_credential, which the scan does not run.
+# securityReviewer also carries the three reads check_gemini_api_key makes
+# beside the service listing (apikeys.keys.list, secretmanager.versions.list,
+# secretmanager.secrets.getIamPolicy). roles/serviceusage.apiKeysViewer is not
+# used: it carries apikeys.keys.getKeyString, which reads the key string.
 GCLOUD_SURFACE_READ_ROLES = {
     "artifacts": ("roles/artifactregistry.reader",),
     "auth": (),
@@ -875,6 +935,7 @@ GCLOUD_SURFACE_READ_ROLES = {
     "iam": ("roles/iam.securityReviewer",),
     "kms": ("roles/cloudkms.viewer",),
     "projects": ("roles/iam.securityReviewer", "roles/container.clusterViewer"),
+    "secrets": ("roles/iam.securityReviewer",),
     "services": ("roles/iam.securityReviewer",),
     "storage": ("roles/storage.bucketViewer",),
 }
@@ -4166,6 +4227,179 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
     return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
 
 
+def check_gemini_api_key(project_id: str) -> CheckResult:
+    """The eval nightlies' Gemini Developer API key in this project: one key
+    named GEMINI_KEY_DISPLAY_NAME restricted to GEMINI_KEY_API_TARGET alone with
+    no client restriction, that API enabled, an enabled latest version of
+    GEMINI_KEY_SECRET_NAME, and the runners' accessor
+    grant on that secret. Metadata and IAM only: no read here returns the key
+    string or the secret's value.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GEMINI_KEY]
+    details: List[str] = []
+    warnings: List[str] = []
+    findings: List[Finding] = []
+    passed = True
+    read_any = False
+    repair = f"{GEMINI_KEY_SCRIPT} {project_id}"
+
+    def read(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
+        """(parsed JSON, read): None with read True when the resource is absent
+        (its API disabled included); read False when the command could not tell."""
+        nonlocal read_any
+        rc, out, err = run_cmd(cmd)
+        if rc != 0:
+            if GEMINI_KEY_SERVICE_DISABLED.search(err or ""):
+                read_any = True
+                details.append(f"{what} absent: its API is disabled in {project_id}")
+                return None, True
+            if _record_unreadable(err, f"{what} absent: {err.strip()[:GEMINI_KEY_ERR_EXCERPT]}", f"Could not read {what} in {project_id}", details, warnings):
+                return None, False
+            read_any = True
+            return None, True
+        try:
+            parsed = json.loads(out or "null")
+        except ValueError as exc:
+            warnings.append(Unread(f"Could not read {what} in {project_id}: gcloud printed no JSON ({exc})"))
+            return None, False
+        read_any = True
+        return parsed, True
+
+    def drift(finding_id: str, observed: str, fix: str = repair) -> None:
+        nonlocal passed
+        passed = False
+        _drift(details, findings, finding_id, observed, fix)
+
+    # Unfiltered: gcloud's --filter is not an exact match, so the display name
+    # is compared here and a key such as kube-agents-eval-gemini-probe is not taken.
+    keys, keys_checked = read(
+        ["gcloud", "services", "api-keys", "list", f"--project={project_id}", "--format=json"],
+        f"the API key {GEMINI_KEY_DISPLAY_NAME}",
+    )
+    missing: List[str] = []
+    if keys_checked:
+        keys = [key for key in (keys or []) if key.get("displayName") == GEMINI_KEY_DISPLAY_NAME]
+        if not keys:
+            missing.append(f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
+        if len(keys) > 1:
+            warnings.append(
+                f"{len(keys)} API keys are named {GEMINI_KEY_DISPLAY_NAME} in {project_id}: "
+                f"{', '.join(k.get('name', '?') for k in keys)}. {GEMINI_KEY_SCRIPT} refuses to run until one is left"
+            )
+        for key in keys:
+            key_name = key.get("name", "?")
+            restrictions = key.get("restrictions") or {}
+            targets = sorted(t.get("service", "") for t in (restrictions.get("apiTargets") or []))
+            clients = [field for field in GEMINI_KEY_CLIENT_RESTRICTIONS if field in restrictions]
+            set_target = f"gcloud services api-keys update {key_name} --project={project_id} --api-target=service={GEMINI_KEY_API_TARGET}"
+            if clients:
+                # gcloud refuses --clear-restrictions beside --api-target, so
+                # the repair is two commands: clear, then set the API target.
+                drift(
+                    FINDING_GEMINI_KEY_RESTRICTION,
+                    f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} carries client restrictions "
+                    f"({', '.join(clients)}), so the agent pod's calls are refused",
+                    f"gcloud services api-keys update {key_name} --project={project_id} --clear-restrictions && {set_target}",
+                )
+            elif targets != [GEMINI_KEY_API_TARGET]:
+                drift(
+                    FINDING_GEMINI_KEY_RESTRICTION,
+                    f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} is restricted to "
+                    f"{', '.join(targets) or 'no API at all (unrestricted)'}, not {GEMINI_KEY_API_TARGET} alone",
+                    set_target,
+                )
+            else:
+                details.append(f"✓ API key {key_name} restricted to {GEMINI_KEY_API_TARGET}")
+
+    # The key script enables the Generative Language API with the other two;
+    # a key on a project without it answers every call SERVICE_DISABLED.
+    rc, out, err = run_cmd(
+        ["gcloud", "services", "list", "--enabled", f"--project={project_id}", f"--filter=config.name={GEMINI_KEY_API_TARGET}", "--format=value(config.name)"]
+    )
+    api_checked = rc == 0
+    if not api_checked:
+        # A failed listing says nothing about the API, refused or not.
+        reason = _unread_reason(err) or (err or "").strip()[:GEMINI_KEY_ERR_EXCERPT]
+        warnings.append(Unread(f"Could not read whether {GEMINI_KEY_API_TARGET} is enabled in {project_id}: {reason}"))
+    else:
+        read_any = True
+        if GEMINI_KEY_API_TARGET in out.split():
+            details.append(f"✓ {GEMINI_KEY_API_TARGET} is enabled")
+        else:
+            missing.append(f"{GEMINI_KEY_API_TARGET} is not enabled in {project_id}, so the Gemini key there serves no call")
+    if missing:
+        drift(FINDING_GEMINI_KEY_MISSING, "; ".join(missing))
+
+    secret = GEMINI_KEY_SECRET_NAME
+    versions, versions_checked = read(
+        ["gcloud", "secrets", "versions", "list", secret, f"--project={project_id}", "--limit=1", "--format=json"],
+        f"the latest version of secret {secret}",
+    )
+    secret_exists = versions_checked and versions is not None
+    if versions_checked:
+        latest = (versions or [{}])[0].get("state", "")
+        if versions is None:
+            drift(FINDING_GEMINI_KEY_SECRET_MISSING, f"Secret {secret} is missing in {project_id}; the eval nightly cannot read its Gemini key")
+        elif latest != GEMINI_KEY_VERSION_ENABLED:
+            drift(
+                FINDING_GEMINI_KEY_SECRET_MISSING,
+                f"Secret {secret} in {project_id} has no enabled latest version ({latest or 'no version at all'}); "
+                "the eval nightly reads `latest` and gets nothing",
+            )
+        else:
+            details.append(f"✓ Secret {secret} has an enabled latest version")
+
+    grants_checked = False
+    if secret_exists or not versions_checked:
+        policy, grants_checked = read(
+            ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
+            f"the IAM policy of secret {secret}",
+        )
+        if grants_checked and policy is None:
+            # A failure that was neither a refusal nor a transient: the
+            # policy was not read, so the accessors are not verified.
+            grants_checked = False
+            warnings.append(Unread(f"Could not read the IAM policy of secret {secret} in {project_id}, so its accessors are unverified"))
+        if grants_checked and policy is not None:
+            held = {
+                member
+                for binding in (policy or {}).get("bindings", [])
+                if binding.get("role") == GEMINI_KEY_ACCESSOR_ROLE
+                for member in binding.get("members", [])
+            }
+            for member in GEMINI_KEY_SECRET_ACCESSORS:
+                if member in held:
+                    details.append(f"✓ {member.split(':', 1)[1]} holds {GEMINI_KEY_ACCESSOR_ROLE} on {secret}")
+                else:
+                    drift(
+                        FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member,
+                        f"{member.split(':', 1)[1]} lacks {GEMINI_KEY_ACCESSOR_ROLE} on secret {secret} in {project_id}; "
+                        "a run as it cannot read the Gemini key",
+                    )
+    else:
+        # The secret is absent: its policy has nothing to say, and the
+        # missing finding's repair grants the accessors with the secret.
+        grants_checked = True
+
+    if not read_any:
+        return CheckResult(name, True, "Not checked", details, warnings, findings, read=False)
+    partial = _partial_summary(
+        [
+            ("the API key", keys_checked),
+            (f"the {GEMINI_KEY_API_TARGET} API", api_checked),
+            ("the secret's latest version", versions_checked),
+            ("the secret's accessors", grants_checked),
+        ]
+    )
+    if not passed:
+        message = f"{len(findings)} Gemini key piece(s) missing or wrong (run {repair})"
+    elif partial:
+        message = partial
+    else:
+        message = "Key restricted, secret has an enabled version, runners granted"
+    return CheckResult(name, passed, message, details, warnings, findings, read=True)
+
+
 def _probe_github_app_identity(
     project_id: str, location: str, version: str, app_id: int, timeout: int = 15
 ) -> Tuple[str, str]:
@@ -4746,6 +4980,7 @@ def run_checks(
     run(CHECK_GITOPS_WORKLOAD_MANIFEST, lambda: check_gitops_workload_manifest(project_id))
     run(CHECK_GITLAB_WORKLOAD_MANIFEST, lambda: check_gitlab_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
+    run(CHECK_GEMINI_KEY, lambda: check_gemini_api_key(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))
     elif CHECK_TOKEN_MINTER_KMS in wanted:

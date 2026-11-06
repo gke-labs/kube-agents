@@ -781,7 +781,9 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed: the agent is told
 // to route Slack's proactive posts through chat.notify exactly when the
-// gateway holds Slack AND the home channel is a channel id, and the kanban
+// gateway holds Slack AND the home channel is a channel id or unset (Slack is
+// then the only chat platform, and the gateway keeps the refused posts for
+// the digest), and the kanban
 // notifier to send a card's report back to its conversation whenever the
 // gateway arms Slack's route (home channel unset or a channel id). Otherwise
 // posts would go to a subject nobody answers. Chat holding the gateway routes
@@ -800,7 +802,7 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), false, false},
 		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), true, true},
 		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), true, true},
-		{"next with slack, no home channel", slackTestAgent("next", true), false, true},
+		{"next with slack, no home channel", slackTestAgent("next", true), true, true},
 		{"next with slack, a DM", withSlackHome(slackTestAgent("next", true), "D0DM"), false, false},
 		{"next with slack, a name", withSlackHome(slackTestAgent("next", true), "#ops"), false, false},
 		{"next without slack", withSlackHome(slackTestAgent("next", false), "C0HOME"), false, false},
@@ -821,9 +823,13 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 				t.Error("the notify route and the legacy Hermes slack platform both render")
 			}
 			// The audit relay reads the home channel from the agent's env; under
-			// next it rides with the home route, trimmed and validated.
-			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
+			// next it rides with the home route, trimmed and validated, and is
+			// absent rather than empty when the CR names none.
+			crHome := strings.TrimSpace(tc.agent.Spec.Integration.Slack.HomeChannel)
+			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && crHome != "" && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
 				t.Errorf("SLACK_HOME_CHANNEL = %q (present=%v), want the home channel id beside %s", home.Value, ok, a2aNotifyPlatformEnvVar)
+			} else if ok && crHome == "" {
+				t.Errorf("SLACK_HOME_CHANNEL = %q rendered with no channel in the CR", home.Value)
 			}
 		})
 	}

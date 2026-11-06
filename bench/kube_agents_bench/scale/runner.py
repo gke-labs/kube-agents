@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import itertools
 import json
 import logging
@@ -24,8 +25,11 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
+import _thread
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -50,22 +54,58 @@ WATCHER_START_SECONDS = 180
 WATCHER_POLL_SECONDS = 30
 # How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
 TRIGGER_DRAIN_SECONDS = 1800
+# The commands that change the test clusters or the install, and so hold the live-test lease.
+MUTATING_COMMANDS = ("run", "apply", "teardown")
+# A plan that measures the broker at limits set by hand names them under this settings key
+# (resource -> quantity, as in a pod spec); `run` and `apply` refuse to start while the live broker
+# pods carry other limits, and `run --dry-run` says whether they match.
+EXPECTED_PROXY_LIMITS_KEY = "expect_proxy_limits"
+LIMIT_FIELDS = {"cpu": "cpu_cores", "memory": "memory_bytes"}
+LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
+LEASE_ENVS_VAR = "KUBE_AGENTS_LIVE_TEST_ENVS"
+LEASE_SESSION_VAR = "KUBE_AGENTS_LEASE_SESSION"
+LEASE_SESSION_PREFIX = "harness-scale-"
+LEASE_ENV_NAME = "harness-scale-host"
+LEASE_ENVS_NAME = "live-test-envs.json"
+LEASE_DIRECTORY_PREFIX = "harness-scale-lease-"
+# Short, and renewed while the runner works: a runner that dies without releasing holds the lease
+# this long at most, and a run of any length stays leased.
+LEASE_TTL_MINUTES = 60
+# Renewals per TTL, so one failed renewal still leaves time for the next.
+LEASE_RENEWALS_PER_TTL = 3
+# Consecutive failed renewals after which the run stops: the lease then has a third of its TTL left.
+LEASE_RENEWAL_FAILURES_TO_STOP = 2
+# The lease script discovers a checkout's install.env from this variable or its working directory.
+LEASE_CWD_VAR = "CLAUDE_CWD"
+# Operation kinds whose runs make model calls of their own: prompts, triggered jobs, an onboarding.
+MODEL_CALL_KINDS = ("prompt", "trigger_soak", "reset_soak")
 DRAIN_POLL_SECONDS = 60
 # The fits a run leaves out when work other than its own loaded the harness during it.
 RESOURCE_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
                  "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
+# The readings that split a total in RESOURCE_FITS, left out wherever that total is: the per-tool
+# proxy counts with `proxy_commands`; the throttling and the slots-in-use peak, which the same
+# broker's load sets, with `cpu_seconds`.
+PER_TOOL_PREFIXES = ("proxy_commands_", "proxy_command_seconds_")
+BROKER_LOAD_FITS = ("cpu_throttled_seconds", "cpu_throttled_period_share", collect.PROXY_SLOTS_PEAK)
 # A proxy load run that shared the broker also leaves out its throughput and command times.
 PROXY_LOAD_FITS = ("proxy_load_per_second", "proxy_load_p50_seconds", "proxy_load_p95_seconds", "proxy_load_max_seconds")
 # A prompt answered without its operation measures none of the operation's cost.
 TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_input", "run_tokens_output",
               "run_tokens_cached")
 # The Platform Agent's Stall Watch reads every cluster through the broker, one at a time, at
-# :00 and :30 (agents/platform/cron/jobs.json). How long a tick keeps the broker busy, from the
-# stored prompt runs: the ones that started 2 to 6 minutes after a tick at 2 to 16 clusters show
-# its commands and shell CPU, and the ones 4 to 8 minutes after it at 2 to 8 clusters do not.
+# :00 and :30 (agents/platform/cron/jobs.json), and stops at its budget (TICK_BUDGET_SECONDS in
+# agents/platform/scripts/stall_watch.py), which it checks only between reads, so a pass can run
+# past it: Phase 4's 32-cluster pass was still running 1,753 s after its tick. How long a tick keeps
+# the broker busy: Phase 4 measured passes of 120 s at 2 clusters and 418 s at 8 (job_seconds),
+# about 50 s per cluster, with no cap; the base is kept from the earlier rule, so the window is
+# never narrower than before.
 STALL_WATCH_PERIOD_SECONDS = 1800
 STALL_WATCH_BASE_SECONDS = 120
-STALL_WATCH_SECONDS_PER_CLUSTER = 30
+STALL_WATCH_SECONDS_PER_CLUSTER = 50
+# A trigger_soak's jobs: the slowest one's run time and how many completed, both read after the drain.
+JOB_SECONDS_METRIC = "job_seconds"
+JOBS_COMPLETED_METRIC = "jobs_completed"
 STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
 # The operation kinds whose windows are shorter than the period; an hour-long soak holds two ticks every time.
 STALL_WATCH_KINDS = ("prompt", "restart_soak")
@@ -88,7 +128,17 @@ TERMINATED_EXIT_CODE = 143
 STOPPED_EXIT_CODE = 2
 PEAK_METRIC = "memory_peak_bytes"
 # What add_peaks reads from Cloud Monitoring; remonitor replaces exactly these.
-MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds")
+MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds", collect.PROXY_SLOTS_PEAK)
+# Recorded when a run that read the broker's slot cap got no slots-in-use series: the cluster runs no
+# Managed Prometheus collection for the gauge. Not a monitoring error, so fits and backfill ignore it.
+SLOTS_UNKNOWN_NOTE = "proxy slots peak unknown: no Managed Prometheus series for the slots gauge"
+# The same unknown peak when the slots query itself failed: the container peaks still stand.
+SLOTS_FAILED_NOTE = "proxy slots peak unknown: the slots query failed"
+# A record stored before `operations.answer_preview` cut at a word can end inside the project ID.
+# scrub_answer, which reclassify runs on stored answers only, redacts a last word that starts the
+# ID when it is at least this long, or when it follows "project" or "the `", where the ID would stand.
+MIN_PROJECT_PREFIX_CHARS = 6
+CUT_WORD = re.compile(r"(?P<lead>\bproject `?|\bthe `)?(?<![A-Za-z0-9-])(?P<word>[A-Za-z0-9-]+)$")
 PROJECT_PLACEHOLDER = "<project>"
 MONITORING_ERROR = "monitoring:"
 REVISION_LENGTH = 12
@@ -204,10 +254,11 @@ class Runner:
                 jobs += [pool.submit(kube.delete_cluster, self.project, self.zone, name) for name in extra]
                 for job in jobs:
                     job.result()
-        # One at a time: gcloud writes the kubeconfig without a lock.
+        # One at a time: gcloud writes the kubeconfig without a lock. Every cluster, not only one
+        # without a context: a cluster deleted and created again under its name has a new endpoint,
+        # and the old context would keep dialling the address the deleted cluster had.
         for name in wanted:
-            if not kube.has_context(kube.context_name(self.project, self.zone, name)):
-                kube.get_credentials(self.project, self.zone, name)
+            kube.get_credentials(self.project, self.zone, name)
         self.wait_registered(count)
 
     def _create_cluster(self, name: str) -> None:
@@ -385,6 +436,21 @@ class Runner:
         """Replace the target project's ID in recorded text, so the committed data names no project."""
         return text.replace(self.project, PROJECT_PLACEHOLDER)
 
+    def fresh_answers(self, previews: list[str]) -> list[str]:
+        """A new run's answer previews, scrubbed. A preview never ends inside a word
+        (`operations.answer_preview`), so the whole-ID scrub is all it needs: the cut-off scrub
+        would only rewrite a complete last word that happens to start the ID."""
+        return [self.scrub(preview) for preview in previews]
+
+    def scrub_answer(self, text: str) -> str:
+        """scrub an answer preview, and the start of the project ID where the cut fell inside it."""
+        text = self.scrub(text)
+        match = CUT_WORD.search(text)
+        word = match.group("word") if match else ""
+        if word and self.project.startswith(word) and (len(word) >= MIN_PROJECT_PREFIX_CHARS or match.group("lead")):
+            return text[:match.start("word")] + PROJECT_PLACEHOLDER
+        return text
+
     @staticmethod
     def mark_shared(record: records.Record, kind: str) -> None:
         """Leave a short run out of the fits that work other than its own loaded.
@@ -408,6 +474,14 @@ class Runner:
             record.errors.append(note)
         record.excluded_from += [fit for fit in fits if fit not in record.excluded_from]
 
+    @staticmethod
+    def cover_split_fits(record: records.Record) -> None:
+        """Leave out the per-tool, throttle and slots-peak readings of a run whose proxy or CPU totals are left out."""
+        split = [m.name for m in record.metrics
+                 if ("proxy_commands" in record.excluded_from and m.name.startswith(PER_TOOL_PREFIXES))
+                 or ("cpu_seconds" in record.excluded_from and m.name in BROKER_LOAD_FITS)]
+        record.excluded_from += sorted({name for name in split if name not in record.excluded_from})
+
     def reclassify(self) -> int:
         """Apply the current rules to every stored record; returns how many changed.
 
@@ -422,8 +496,9 @@ class Runner:
         for raw in data["records"]:
             record = records.Record.from_dict(raw)
             before = json.dumps(record.to_dict(), sort_keys=True)
+            record.image = self.scrub(record.image)
             record.errors = [self.scrub(e) for e in record.errors]
-            record.answers = [self.scrub(a) for a in record.answers]
+            record.answers = [self.scrub_answer(a) for a in record.answers]
             profiles = next((m.value for m in record.metrics if m.name == PROFILES_METRIC), None)
             clusters = record.totals.get(CLUSTERS_TOTAL)
             if profiles is not None and clusters and profiles > clusters:
@@ -459,6 +534,7 @@ class Runner:
                     record.excluded_from += [f for f in RESOURCE_FITS + TOKEN_FITS if f not in record.excluded_from]
             if operation:
                 self.mark_shared(record, operation.kind)
+            self.cover_split_fits(record)
             if json.dumps(record.to_dict(), sort_keys=True) != before:
                 changed.append(record)
         if unnamed:
@@ -573,17 +649,20 @@ class Runner:
         record = records.Record(
             commit=commit, mode=mode, phase=self.plan.phase, runner=RUNNER_REVISION,
             factor=spec.factor, level=spec.level, operation=op.name, run=spec.run,
-            started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
+            started=started_iso, ended=ended_iso, image=self.scrub(image), values=values, totals=totals,
             limits=limits, requests=requests, replicas=replicas, metrics=metrics,
-            provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
+            provider_429s=provider_429s, answers=self.fresh_answers(outcome.previews),
             excluded_from=list(excluded) + [f for f in carried_fits if f not in excluded], errors=errors,
         )
         self.mark_shared(record, op.kind)
+        self.cover_split_fits(record)
         return record
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
         """The runs whose key is not in the data file yet, for the build the install runs now."""
-        done = {record["key"]: record.get("values", {}) for record in records.load(self.data_file)["records"]}
+        stored = records.load(self.data_file)["records"]
+        done = {record["key"]: record.get("values", {}) for record in stored}
+        phases = {record["key"]: record.get("phase", "") for record in stored}
         operations.wait_gateway_ready(self.install.context, self.install.namespace)
         image = self.install.image()
         commit = commit_of(image) or image.rsplit(":", 1)[-1] or "unknown"
@@ -591,8 +670,16 @@ class Runner:
         pending = []
         for spec in specs:
             key = records.record_key(commit, mode, spec.factor, spec.level, spec.operation.name, spec.run)
+            if key in done and not self.same_point(done[key], spec) and phases[key] != self.plan.phase:
+                # Another plan's point under the same key: running would replace its record in the file.
+                raise SystemExit(f"{key} holds {phases[key]}'s record of another point; give this plan's "
+                                 "combined point a new level, or run with --force to replace it")
             if key not in done or not self.same_point(done[key], spec):
                 pending.append(spec)
+            elif phases[key] != self.plan.phase:
+                # A key carries the operation's name, not the plan's phase: say when another phase's
+                # record stands for this run, so a reused name does not skip it unnoticed.
+                LOG.warning("%s is already recorded by %s; not running it again", key, phases[key])
         return pending
 
     def same_point(self, stored: dict[str, float], spec: RunSpec) -> bool:
@@ -641,6 +728,9 @@ class Runner:
                     records.merge(self.data_file, [record])
                     if spec.operation.kind == TRIGGER_SOAK_KIND:
                         self.drain_jobs(spec.operation, record.started)
+                        record.metrics += self.job_metrics(spec.operation, record.started)
+                        # Written now: the Monitoring wait below can outlast the process.
+                        records.merge(self.data_file, [record])
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
                     self.backfill_peaks(skip={pending.key for _, pending in awaiting})
@@ -649,6 +739,57 @@ class Runner:
             relay.stop()
             self.flush_peaks(awaiting, wait=True)
         return not stopped
+
+    def limit_mismatches(self) -> list[str]:
+        """How the live broker's limits differ from the plan's ``expect_proxy_limits``; empty when they match or none is named."""
+        expected = self.plan.settings.get(EXPECTED_PROXY_LIMITS_KEY) or {}
+        if not expected:
+            return []
+        live = self.install.limits().get(collect.PROXY_CONTAINER, {})
+        problems = []
+        for resource, quantity in expected.items():
+            if resource not in LIMIT_FIELDS:
+                problems.append(f"{resource}: not a limit this check reads ({', '.join(LIMIT_FIELDS)})")
+                continue
+            have = live.get(LIMIT_FIELDS[resource])
+            if have is None or abs(have - collect.parse_quantity(str(quantity))) > 1e-9:
+                problems.append(f"{resource}: the plan expects {quantity}, the broker has {'none' if have is None else f'{have:g}'}")
+        return problems
+
+    def check_limits(self) -> None:
+        """Refuse to go on while the broker's limits are not the plan's ``expect_proxy_limits``."""
+        problems = self.limit_mismatches()
+        if problems:
+            raise SystemExit(
+                f"the broker's limits are not this plan's {EXPECTED_PROXY_LIMITS_KEY}: {'; '.join(problems)}. "
+                "Set them on the PlatformAgent, wait for the broker to roll, then run again."
+            )
+
+    def dry_run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> list[str]:
+        """What ``run`` would do, as lines: each level's cluster creates and deletes, and each run.
+
+        Reads the project's clusters and, unless ``force``, the data file and the install's build to
+        leave out runs already recorded; changes nothing.
+        """
+        pending = specs if force else self.pending(specs)
+        todo = pending[:limit] if limit else pending
+        current = set(kube.clusters_with_prefix(self.project, self.zone, self.prefix, self.label))
+        lines = [f"{len(todo)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
+        if self.plan.settings.get(EXPECTED_PROXY_LIMITS_KEY):
+            problems = self.limit_mismatches()
+            lines.append(f"{EXPECTED_PROXY_LIMITS_KEY}: {'; '.join(problems) if problems else 'the broker matches'}")
+        for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
+            values = self.plan.level_values(factor, level)
+            wanted = set(self.cluster_names(int(values[CLUSTERS_TOTAL])))
+            create, delete = sorted(wanted - current), sorted(current - wanted)
+            lines.append(f"level {factor}={level:g}: {dict(values)}")
+            lines.append(f"  create {len(create)} clusters: {' '.join(create) or '-'}")
+            lines.append(f"  delete {len(delete)} clusters: {' '.join(delete) or '-'}")
+            for spec in group:
+                calls = "model calls" if spec.operation.kind in MODEL_CALL_KINDS else "no model call of its own"
+                lines.append(f"  run {spec.operation.name} #{spec.run} ({spec.operation.kind}, {calls})")
+            current = wanted
+        return lines
 
     def drain_jobs(self, op: Operation, since: str) -> None:
         """Wait up to ``trigger_drain_seconds`` for the jobs a trigger_soak started, so they do not load the next run.
@@ -668,6 +809,19 @@ class Runner:
                 return
             LOG.info("waiting for %s to finish before the next run", ", ".join(active))
             time.sleep(DRAIN_POLL_SECONDS)
+
+    def job_metrics(self, op: Operation, since: str) -> list[records.Metric]:
+        """How long the slowest job the run started took, and how many completed, read after the drain."""
+        try:
+            durations = operations.job_seconds(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except (kube.CommandError, ValueError, TypeError) as exc:
+            # A run log the read cannot parse costs this run its job metrics, not the whole campaign.
+            LOG.warning("could not read how long the jobs took: %s", exc)
+            return []
+        metrics = [records.Metric(JOBS_COMPLETED_METRIC, float(len(durations)))]
+        if durations:
+            metrics.append(records.Metric(JOB_SECONDS_METRIC, max(durations.values())))
+        return metrics
 
     def carried_work(self) -> tuple[list[str], list[str]]:
         """Notes and fit exclusions for a run that jobs the latest trigger_soak started are still loading.
@@ -748,6 +902,18 @@ class Runner:
         for container, values in peaks.items():
             for name, value in values.items():
                 record.metrics.append(records.Metric(name, value, container))
+        self.note_slots(record, getattr(self.install, "slots_query_error", None))
+
+    @staticmethod
+    def note_slots(record: records.Record, failure: str | None = None) -> None:
+        """Say so when a record from a runner that reads the slot cap has no slots-in-use peak,
+        and why: no series stored, or `failure`, the slots query's own error."""
+        names = {m.name for m in record.metrics}
+        record.errors = [
+            e for e in record.errors if e != SLOTS_UNKNOWN_NOTE and not e.startswith(SLOTS_FAILED_NOTE)
+        ]
+        if collect.PROXY_SLOT_CAP_METRIC in names and collect.PROXY_SLOTS_PEAK not in names:
+            record.errors.append(f"{SLOTS_FAILED_NOTE} ({failure})" if failure else SLOTS_UNKNOWN_NOTE)
 
     def remonitor(self) -> int:
         """Read every stored record's Cloud Monitoring metrics again, with the current queries.
@@ -772,6 +938,7 @@ class Runner:
                 for container, values in peaks.items() for name, value in values.items()
             ]
             record.errors = [e for e in record.errors if not e.startswith(MONITORING_ERROR)]
+            self.note_slots(record, getattr(self.install, "slots_query_error", None))
             record.remonitored = RUNNER_REVISION
             changed.append(record)
         records.merge(self.data_file, changed)
@@ -800,6 +967,68 @@ class Runner:
                                       self.settings["fixture_machine_type"], 0)
 
 
+@contextlib.contextmanager
+def hold_lease(plan: Plan, note: str):
+    """Hold the experiment install's live-test lease for as long as the block runs.
+
+    The lease is the repository's (scripts/live_test_lease.py, docs/designs/live-test-lease.md): a
+    ConfigMap in the install's namespace that another runner, an agent's live validation or a
+    person's work also takes before changing the install, so two of them cannot apply at once.
+    A lease another holder has refuses the run.
+    """
+    target = plan.target
+    with tempfile.TemporaryDirectory(prefix=LEASE_DIRECTORY_PREFIX) as directory:
+        envs = Path(directory) / LEASE_ENVS_NAME
+        envs.write_text(json.dumps({"installs": [
+            {"name": LEASE_ENV_NAME, "context": target["host_context"], "namespace": target["namespace"]}
+        ]}))
+        # Run the script from the empty directory with no checkout named, so it finds no install.env:
+        # a checkout's own install.env naming the same host would replace this entry and its name.
+        env = {key: value for key, value in os.environ.items() if key != LEASE_CWD_VAR}
+        env.update({LEASE_ENVS_VAR: str(envs), LEASE_SESSION_VAR: f"{LEASE_SESSION_PREFIX}{os.getpid()}"})
+        ttl = str(int(plan.settings.get("lease_ttl_minutes", LEASE_TTL_MINUTES)))
+
+        def lease(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run([sys.executable, str(LEASE_SCRIPT), *args, "--env", LEASE_ENV_NAME],
+                                  env=env, cwd=directory, capture_output=True, text=True, check=False)
+
+        acquired = lease("acquire", "--ttl", ttl, "--note", note)
+        if acquired.returncode != 0:
+            # Held by another holder, or not resolvable at all (a checkout's install.env naming the same
+            # context, a kubectl failure): the script's own output says which.
+            raise SystemExit(f"could not take the install's live-test lease (exit {acquired.returncode}); "
+                             f"not running:\n{acquired.stdout}{acquired.stderr}")
+        LOG.info("holding the live-test lease on %s, renewed every %s minutes", target["host_cluster"],
+                 int(ttl) // LEASE_RENEWALS_PER_TTL)
+        stop = threading.Event()
+
+        def renew() -> None:
+            # A soak sleeps for hours inside one run, so the renewal runs beside the work, not between runs.
+            failures = 0
+            while not stop.wait(int(ttl) * SECONDS_PER_MINUTE / LEASE_RENEWALS_PER_TTL):
+                renewed = lease("renew", "--ttl", ttl)
+                failures = 0 if renewed.returncode == 0 else failures + 1
+                if failures:
+                    LOG.warning("could not renew the live-test lease: %s", renewed.stdout + renewed.stderr)
+                if failures >= LEASE_RENEWAL_FAILURES_TO_STOP:
+                    # Stop the run before the lease lapses, so it never changes the install unleased.
+                    LOG.error("stopping: the live-test lease could not be renewed %s times", failures)
+                    _thread.interrupt_main()
+                    return
+
+        renewer = threading.Thread(target=renew, name="lease-renewer", daemon=True)
+        renewer.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            renewer.join()
+            released = lease("release")
+            if released.returncode != 0:
+                LOG.warning("could not release the live-test lease; it expires on its own after %s minutes: %s",
+                            ttl, released.stdout + released.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify", "remonitor"])
@@ -811,7 +1040,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many runs (0: all)")
     parser.add_argument("--delete-fleet", action="store_true", help="teardown: delete the test clusters")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run: print each level's cluster creates and deletes and each run, and change nothing")
     args = parser.parse_args(argv)
+    if args.dry_run and args.command != "run":
+        parser.error("--dry-run applies to run only")
     # SIGTERM ends the run like Ctrl-C does, so the churner, the relay and pending peaks are cleaned up.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(TERMINATED_EXIT_CODE))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -837,21 +1070,33 @@ def main(argv: list[str] | None = None) -> int:
     kube.use_private_kubeconfig(private)
     atexit.register(private.unlink, missing_ok=True)
     runner = Runner(plan, data_file)
-    if args.command == "run":
-        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
-        if not runner.run(specs, args.force, args.limit):
-            return STOPPED_EXIT_CODE
-    elif args.command == "reclassify":
+    if args.command == "run" and args.dry_run:
+        print("\n".join(runner.dry_run(specs, args.force, args.limit)))
+        return 0
+    if args.command in MUTATING_COMMANDS:
+        with hold_lease(plan, f"harness scale {args.command} {args.config.name}"):
+            return _mutate(runner, args, specs)
+    if args.command == "reclassify":
         print(f"{runner.reclassify()} records changed")
     elif args.command == "remonitor":
         print(f"{runner.remonitor()} records changed")
-    elif args.command == "apply":
+    return 0
+
+
+def _mutate(runner: Runner, args: argparse.Namespace, specs: list[RunSpec]) -> int:
+    """The commands that change the test clusters or the install, run under the lease."""
+    if args.command in ("run", "apply"):
+        runner.check_limits()
+    if args.command == "run":
+        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
+        return 0 if runner.run(specs, args.force, args.limit) else STOPPED_EXIT_CODE
+    if args.command == "apply":
         try:
             runner.apply_level(args.factor, args.level)
         finally:
             runner.stop_churn()
-    else:
-        runner.teardown(args.delete_fleet)
+        return 0
+    runner.teardown(args.delete_fleet)
     return 0
 
 

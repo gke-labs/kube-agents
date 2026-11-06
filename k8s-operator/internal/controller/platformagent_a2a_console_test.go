@@ -98,6 +98,14 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	if cpu := c.Resources.Requests.Cpu(); cpu.Cmp(resource.MustParse("50m")) < 0 {
 		t.Errorf("cpu request = %s, want at least 50m (GKE Autopilot raises anything lower on every apply)", cpu)
 	}
+	// Both limits, because a namespace ResourceQuota on limits.cpu or
+	// limits.memory refuses a pod with a container that declares neither (#3847).
+	if lim := c.Resources.Limits.Cpu(); lim.IsZero() || lim.Cmp(resource.MustParse(a2aConsoleCPULimit)) != 0 {
+		t.Errorf("cpu limit = %s, want %s (a limits.cpu quota refuses a container with none)", lim, a2aConsoleCPULimit)
+	}
+	if lim := c.Resources.Limits.Memory(); lim.IsZero() {
+		t.Errorf("memory limit unset; a limits.memory quota refuses a container with none")
+	}
 
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 8080 || c.Ports[0].Name != "http" {
 		t.Errorf("ports = %+v, want one http port 8080", c.Ports)

@@ -8,5 +8,10 @@
     "address": "terraform_data.scaled_zero_status",
     "why": "the scaled-zero-gateway fixture's status writer (defects-a.tf) is replaced whenever gateway_status.py changes or its GatewayClass, Gateway or HTTPRoute is created or replaced, so a re-created object gets the controller status no controller writes; the resource holds no state of its own, and the replace re-runs gateway_status.py",
     "standing": true
+  },
+  {
+    "address": "terraform_data.config_connector",
+    "why": "seeded-a's ConfigConnector writer (config-connector.tf) is replaced whenever config_connector.py or the object's spec changes, seeded-a is re-created (its CA certificate is a trigger), or a failed run taints it; the resource holds no state of its own, and the replace re-runs config_connector.py, a server-side apply that is safe to repeat",
+    "standing": true
   }
 ]

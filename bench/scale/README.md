@@ -21,6 +21,22 @@ console's Harness limits page reads `harness-limits.json`.
 - `phase3-proxy-raised.yaml`: Phase 3's two windows at 2 and 16 clusters with the credential proxy's
   limits raised, so its CPU peak shows what it needs; set the limits before the runs and remove them
   after.
+- `phase4.yaml`: the Phase 4 plan: an onboarded install's daily work (Stall Watch, one daily audit,
+  fan-out questions) from 40 clusters down. Its test clusters are created before the run, outside
+  the runner, each with its own subnet and small Pod and Service ranges, so the project's default
+  network does not cap their number.
+- [`real-install-test-plan.md`](real-install-test-plan.md) and its plan files: `real-install.yaml`
+  (the fleet point, first-run flow, questions, restart, churn, soak and S-size red test),
+  `real-install-concurrent.yaml` (questions at once), `real-install-failing.yaml` (20 failing Pods),
+  `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use),
+  `real-install-scaling.yaml` (token cost at 80 and 20 clusters). Run each
+  with `--only-factor combined`. [`real-install-results.md`](real-install-results.md) holds the
+  results, and [`real-install-evidence.md`](real-install-evidence.md) the data behind them.
+- `broker.yaml`: the credential broker's load for its exec-tier design: the first-run audits at 2 and
+  8 clusters, the command path with kubectl and with gcloud, and 8 to 15 questions at once at 8
+  clusters.
+- `broker-proxy-raised.yaml`: the 8-cluster audit window with the credential proxy's CPU limit at 2
+  cores; set the limit before the run and remove it after.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
@@ -59,6 +75,18 @@ python3 -m kube_agents_bench.scale.runner teardown <plan>             # remove f
 python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 ```
 
+`run --dry-run` prints what a run would do and changes nothing: each level's cluster creates and
+deletes, and each run, marked where it makes model calls of its own. `run`, `apply` and `teardown`
+hold the experiment install's live-test lease while they work
+([`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)), so a second runner or
+an agent's live validation cannot change the install at the same time; a lease another holder has
+refuses the command. The lease lasts `lease_ttl_minutes` (default 60) and the runner renews it
+every third of that while it works. After two failed renewals in a row it stops the run, so it never
+changes the install unleased; a runner that dies frees the lease within the TTL. A plan that
+measures the broker at limits set by hand names them in `expect_proxy_limits`; `run` and `apply`
+refuse to start while the live broker carries other limits, and `run --dry-run` says whether they
+match.
+
 An operation's `kind` says what a run does:
 
 - `prompt` sends the operation's `prompt` through the agent API, and at a `concurrent` value of N
@@ -93,6 +121,9 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
+- `lease_ttl_minutes`: the live-test lease's TTL; the runner renews it every third of that.
+- `expect_proxy_limits`: the credential broker's container limits the plan measures at, as in a pod
+  spec (`cpu: "2"`, `memory: 2Gi`); `run` and `apply` refuse to start while the live pods differ.
 - `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
 
 The agent API is reached through the repository's `kubectl exec` relay
@@ -167,13 +198,13 @@ one. `commit` is the commit the agent image's tag pins (the tag itself when it i
 from the install. The key holds the commit's first 8 characters, or the whole tag when the tag is not a commit, so a new build is a new set of keys. A base record has `factor` `base` and `level`
 0; `values` holds every factor's planned value at the point, base records included. `totals` holds
 what the test clusters really had, summed over the fleet; fits use the totals for the factors the totals count (clusters, nodes, objects), the achieved rate for churn (`churn_achieved_per_minute`), and `values` for the rest. `limits`, `requests` and
-`replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
+`replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>` (the preview is cut before a word, never inside one; `reclassify` also redacts a cut-off start of the ID in records stored before that), so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
-before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics
-are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
+before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics,
+with the per-tool and throttle readings that split them, are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
 started were still running; a prompt or boot-burst run started inside a Stall Watch read (2 minutes
-plus 30 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
+plus 50 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
 workers did not send (its throughput and tokens are left out as well). A prompt answered without its
 operation is left out of those and of the token metrics. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records whose operation the plan names, and warns how many it passed over; with a data file several plans wrote, run it once per plan. `remonitor` reads every stored record's Cloud
 Monitoring metrics again with the current queries, within Monitoring's retention, and writes its own
@@ -187,7 +218,12 @@ Metric names:
   `restarts`, `oomkills`;
 - the data volume: `pvc_used_bytes`, `pvc_capacity_bytes`, `profile_bytes_max`, `profiles`;
 - the credential proxy: `proxy_wait_p50_seconds`, `proxy_wait_max_seconds`, `proxy_refusals`,
-  `proxy_commands` (brokered commands run) and `proxy_command_seconds` (the seconds they ran, summed);
+  `proxy_commands` (brokered commands run) and `proxy_command_seconds` (the seconds they ran, summed),
+  the same two per tool as `proxy_commands_<tool>` and `proxy_command_seconds_<tool>` (tool
+  kubectl, gcloud, ...), and `proxy_slot_cap`; per container `envoy-credential-proxy`,
+  `proxy_slots_in_use_peak` (from Managed Prometheus where the cluster collects the gauge, else the record's errors list says it is unknown; scraped every 30 s, so a shorter burst is
+  missed), `cpu_throttled_seconds` and `cpu_throttled_period_share` (the container's cgroup
+  `cpu.stat` over the window);
 - a proxy load run: `proxy_load_completed`, `proxy_load_errors`, `proxy_load_per_second` (commands
   completed per second), and `proxy_load_p50_seconds`, `proxy_load_p95_seconds`,
   `proxy_load_max_seconds` (each command's time as `credential-proxy-exec` saw it);
@@ -201,3 +237,5 @@ Metric names:
   reports them; `run_tokens_input` is the non-cached part of the prompt, so the run's share of the
   window is `run_tokens_input + run_tokens_cached` against `tokens_input`);
 - the fixtures: `churn_achieved_per_minute`.
+- the jobs a triggered window started, read after the drain: `job_seconds` (the slowest completed job's run
+  time) and `jobs_completed`.

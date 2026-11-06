@@ -392,10 +392,13 @@ memory:
 # The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
 # profile owns that), so the session_store / session_otel_bridge ingress plugins
 # move to the Chat Agent. Keep otel for observability parity and tool_call_audit
-# to audit this privileged specialist's tool calls. pr_opened records each pull
-# request this profile's kanban workers open on their card, which is what posts
-# the thread's PR message, and refuses submit_suggestion.py from a worker whose
-# run on its card has ended (plugins/pr_opened/__init__.py).
+# to audit this privileged specialist's tool calls. pr_opened claims each pull
+# request record line through the broker, strips its claim token and counts the
+# claimed pull request in the proposals ledger by origin; in a kanban worker it
+# also records the pull request on the card, which is what posts the thread's PR
+# message. The Cluster Agent and TSE profiles enable it too. It also refuses
+# submit_suggestion.py from a worker whose run on its card has ended
+# (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel

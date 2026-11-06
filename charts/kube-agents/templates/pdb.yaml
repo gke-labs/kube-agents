@@ -17,8 +17,9 @@ time an operator runs `kubectl scale --replicas=1`, or an autoscaler does.
 
 Selectors reuse the Deployments' own selector labels. The audit's §3.3 matches
 a PDB to a workload by selector, never by name, so these must stay in step
-with the pod templates in operator-deployment.yaml, litellm.yaml,
-hindsight.yaml, and github-minter.yaml.
+with the pod templates in operator-deployment.yaml, litellm.yaml (LiteLLM and,
+with litellm.replayShadow on, the replay proxy), hindsight.yaml, and
+github-minter.yaml.
 */}}
 {{- if and .Values.operator.enabled .Values.operator.podDisruptionBudget.enabled }}
 apiVersion: policy/v1
@@ -50,6 +51,29 @@ spec:
   selector:
     matchLabels:
       app: litellm
+      {{- if (.Values.litellm.replayShadow | default dict).enabled }}
+      kubeagents.x-k8s.io/inference-role: litellm
+      {{- end }}
+{{- if (.Values.litellm.replayShadow | default dict).enabled }}
+---
+# The shadow-mode replay proxy (litellm.replayShadow) also carries
+# app: litellm, so the LiteLLM budget above narrows to the LiteLLM pods while
+# it is on, and the proxy gets its own: every model call goes through it, and
+# one of its two replicas keeps serving through a drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: inference-replay-shadow
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: inference-replay-shadow
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 6 }}
+{{- end }}
 {{- end }}
 {{- if and (include "kube-agents.hindsightEnabled" .) .Values.hindsight.podDisruptionBudget.enabled }}
 ---

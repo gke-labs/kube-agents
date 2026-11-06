@@ -254,8 +254,31 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
-        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the operator's default limits.memory (2Gi)", err)
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the sizing profile row's limits.memory (2Gi)", err)
         self.assertIn("set limits.memory as well", err)
+
+    def test_under_auto_a_request_alone_is_checked_against_the_fleet_row(self):
+        # The operator renders the latched tier under auto, which the chart cannot read,
+        # so a request the fleet row's limit admits renders (the webhook refuses it at a
+        # lower latch, naming that row) and one above every row's limit fails naming the
+        # fleet row; an explicit profile keeps its own row.
+        auto = "platformAgent.deployment.sizingProfile=auto"
+        cr = self._render_cr([auto, f"{_VALUE_PATH}.requests.memory=6Gi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "6Gi"}})
+        err = self._render_error([auto, f"{_VALUE_PATH}.requests.memory=9Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (9Gi) exceeds the fleet row's limits.memory (8Gi), the highest row auto reaches", err)
+        self.assertIn("set limits.memory as well", err)
+        err = self._render_error(["platformAgent.deployment.sizingProfile=medium", f"{_VALUE_PATH}.requests.memory=6Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (6Gi) exceeds the sizing profile row's limits.memory (4Gi)", err)
+
+    def test_under_auto_a_crossed_pair_set_together_still_fails(self):
+        # Both sides set: the pair is the override's own, whatever row it merges over.
+        err = self._render_error([
+            "platformAgent.deployment.sizingProfile=auto",
+            f"{_VALUE_PATH}.requests.memory=4Gi",
+            f"{_VALUE_PATH}.limits.memory=2Gi",
+        ])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
 
     def test_a_cpu_limit_alone_under_the_default_request_renders(self):
         cr = self._render_cr([f"{_VALUE_PATH}.limits.cpu=200m"])
@@ -271,11 +294,11 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
         # separates two 15-digit values one unit apart (the second case).
         cases = (
-            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the operator's default limits.cpu (2)"),
+            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the sizing profile row's limits.cpu (2)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
              "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
             ([f"{_VALUE_PATH}.requests.memory=2147483648.5"],
-             "requests.memory (2147483648.5) exceeds the operator's default limits.memory (2Gi)"),
+             "requests.memory (2147483648.5) exceeds the sizing profile row's limits.memory (2Gi)"),
             ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
              "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
         )

@@ -40,12 +40,14 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("c", "1")
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	consolePW := string(creds.Data["console-password"])
+	consoleMCPPW := string(creds.Data["console-mcp-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
 	nc, js := a2aConnectAs(t, s.ClientURL(), "console", consolePW)
+	mcpNC, _ := a2aConnectAs(t, s.ClientURL(), a2aConsoleMCPUser, consoleMCPPW)
 
 	// Allowed.
 	if err := nc.Publish("chat.console.tab-1.in", []byte(`{"messageId":"m1","text":"hi"}`)); err != nil {
@@ -124,6 +126,45 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 			err, log.publishViolations("console"), log.subscriptionViolations("gateway"))
 	} else if string(msg.Data) != `{"messageId":"m2","text":"to gateway"}` {
 		t.Fatalf("chat.console.tab-1.in delivered %q", msg.Data)
+	}
+
+	// Confirm subject: console may publish it to the gateway; console-mcp may
+	// publish chat.console.*.in but is refused on chat.console.*.confirm.
+	confirmSub, err := gw.SubscribeSync("chat.console.tab-1.confirm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Publish("chat.console.tab-1.confirm", []byte(`{"taskId":"t1","decision":"approve"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := confirmSub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("gateway did not receive on chat.console.tab-1.confirm: %v", err)
+	} else if string(msg.Data) != `{"taskId":"t1","decision":"approve"}` {
+		t.Fatalf("chat.console.tab-1.confirm delivered %q", msg.Data)
+	}
+	if err := mcpNC.Publish("chat.console.tab-1.in", []byte(`{"messageId":"m3","text":"from mcp"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := mcpNC.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if msg, err := inSub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("gateway did not receive console-mcp message on chat.console.tab-1.in: %v", err)
+	} else if string(msg.Data) != `{"messageId":"m3","text":"from mcp"}` {
+		t.Fatalf("chat.console.tab-1.in from console-mcp delivered %q", msg.Data)
+	}
+	if err := mcpNC.Publish("chat.console.tab-1.confirm", []byte(`{"taskId":"t1","decision":"approve"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = mcpNC.Flush()
+	if !log.refusedPublish(a2aConsoleMCPUser, "chat.console.tab-1.confirm") {
+		t.Error("no Publish Violation logged for console-mcp on chat.console.tab-1.confirm")
 	}
 
 	// STREAM.INFO on a KV stream is refused, both as the client library

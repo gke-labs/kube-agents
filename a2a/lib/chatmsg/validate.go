@@ -98,8 +98,8 @@ func broke(field, format string, args ...any) error {
 	return &RuleError{Field: field, Rule: fmt.Sprintf(format, args...)}
 }
 
-// Validate checks m against every rule in the Chat messages section for
-// carrier c. layout is the first broken rule outside mark, and a renderer
+// Validate checks m against every rule in the Chat messages section but
+// the wording one, which Lint checks, for carrier c. layout is the first broken rule outside mark, and a renderer
 // given one drops the whole message and posts the fallback; mark is a
 // broken mark, and drops the mark alone. On a terminal status-update only
 // the schema and the mark are read, so only they are checked.

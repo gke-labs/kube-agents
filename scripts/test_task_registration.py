@@ -98,6 +98,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "certification-cases.txt": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -604,13 +605,15 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
-            return validator.validate_case("made-up-case", path, registered=set(registered))
+            return validator.validate_case(
+                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+            )
 
     def _only(self, needle, **kwargs):
         """The one problem this mutation causes, and nothing else."""
@@ -625,6 +628,27 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
+
+    # -- the certification suite: the roster and the suite line agree --
+
+    def test_a_certification_case_with_its_line_in_the_roster_passes(self):
+        self.assertEqual(self._validate(suite="certification", certification={"made-up-case"}), [])
+
+    def test_a_rostered_certification_case_without_the_line_is_reported(self):
+        self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
+
+    def test_a_suite_line_outside_the_roster_is_reported_once(self):
+        # Registered nowhere at all: the suite finding names the right file,
+        # and the general registration finding (which would say
+        # nightly-cases.txt) stays quiet.
+        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+
+    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+
+    def test_an_unknown_suite_is_reported(self):
+        self._only("the only suite is 'certification'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 
@@ -955,6 +979,45 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["orphan-disks"]}),
         )
         self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_role(self):
+        # startup-fail-vm has cluster_slot null: the runner writes no
+        # kubeconfig for it, so a check cannot read its objects.
+        problem = self._only(
+            "a project-scoped role",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={
+                "type": "fleet_resource_property", "fixture_role": "startup-fail-vm", "kind": "deployment",
+                "resource_name": "x", "path": "spec.replicas", "op": "eq", "value": 1,
+            }),
+        )
+        self.assertIn("'fixture_role:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_roles(self):
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["startup-fail-vm"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_accepted_in_fixtures(self):
+        self.assertEqual(self._validate(fixtures=["startup-fail-vm"]), [])
+
+    def test_a_project_scoped_catalogue_role_the_overlay_omits_is_a_disagreement(self):
+        roles = {**validator._catalog_roles(), "made-up-vm": {"cluster_slot": None, "probes": ["instance/made-up-*"]}}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-vm' is project-scoped", problems[0])
+
+    def test_a_catalogue_role_that_is_not_a_mapping_is_rejected_not_project_scoped(self):
+        roles = {**validator._catalog_roles(), "made-up-broken": "cluster_slot: a"}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            self.assertNotIn("made-up-broken", validator._catalog_project_roles())
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-broken' is not a mapping", problems[0])
 
     def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
         problem = self._only(
