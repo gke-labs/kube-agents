@@ -324,13 +324,18 @@ API_RESOURCES_TIMEOUT_SECONDS = 60
 #: Discovery of a wildcard's objects on one cluster: `kubectl get` over a
 #: batch of served kinds and every namespace, one line per object with its
 #: namespace, Kind and apiVersion, which `resource_for` maps back to the
-#: api-resources name. A batch is one proxied command, so a cluster with the
-#: Config Connector add-on (some 300 kinds) is six commands, DISCOVERY_WORKERS
-#: at a time; kubectl lists the kinds in a batch one after another, so the
-#: timeout is set for a slow API server at 50 kinds, not for one kind.
+#: api-resources name. A batch is one proxied command, and kubectl lists its
+#: kinds one request after another inside it. The broker ends a one-shot
+#: kubectl at 60 s (credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS, noted
+#: with the other caps below), and the fleet-audit collector measured each
+#: list request through the proxy at more than a second on a cluster with the
+#: add-on (kcc_health.py: 230 requests outran its 240 s read). Ten kinds a
+#: batch fits that bound with each request allowed up to 6 s; the add-on's
+#: 300-odd kinds are then thirty commands, DISCOVERY_WORKERS at a time. The
+#: local timeout holds one broker admission wait and one such run.
 DISCOVERY_ARGV = ("kubectl", "get")
 DISCOVERY_FLAGS = ("--all-namespaces", "--no-headers", "-o", "custom-columns=NAMESPACE:.metadata.namespace,KIND:.kind,API:.apiVersion")
-DISCOVERY_BATCH_KINDS = 50
+DISCOVERY_BATCH_KINDS = 10
 DISCOVERY_TIMEOUT_SECONDS = 120
 DISCOVERY_COLUMNS = 3
 #: How long a cluster's discovery stands before it is redone, how soon one
@@ -957,15 +962,17 @@ def discovery_due(record: dict | None, now: str, refreshed: int) -> bool:
     return not (timedelta(0) <= age < timedelta(seconds=wait)) and refreshed < DISCOVERY_REFRESHES_PER_TICK
 
 
-def resource_for(kind: str, api_version: str, batch: list[str]) -> str:
+def resource_for(kind: str, api_version: str, batch: list[str]) -> str | None:
     """The api-resources name in `batch` for an object's Kind and apiVersion,
-    matched by group and plural; when the plural rule does not derive it, the
-    lower-case Kind in its group, which kubectl resolves as the singular."""
+    matched by group and plural, or None when the plural rule derives none of
+    them: the record then names only resources the listing served, and the
+    object is noted on stderr rather than recorded under a name the listing
+    never showed."""
     group = api_version.split("/", 1)[0]
     for resource in batch:
         if resource.endswith("." + group) and resource_names_kind(resource, kind):
             return resource
-    return f"{kind.lower()}.{group}"
+    return None
 
 
 def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None) -> dict:
@@ -973,10 +980,11 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
     namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
     the `previous` record names whose group is not among the candidates
     (`lost_kinds`) is not listed and is carried into the new record as it
-    was: the api-resources listing lost the group, and a listing gap must not
-    clear a card, on a refresh tick any more than on another. Carried as
-    known rather than unknown, so a group gone for good costs no hourly
-    retry; `wildcard_kinds_for` holds it from the listing each tick. A kind
+    was, unknown if it was unknown: the api-resources listing lost the
+    group, and a listing gap must not clear a card, on a refresh tick any
+    more than on another. A known kind is carried as known, so a group gone
+    for good costs no hourly retry; `wildcard_kinds_for` holds it from the
+    listing each tick. A kind
     that printed an object is read wherever it printed one. Every kind in a
     batch that exited 0 and was not cut is known: empty where it printed
     nothing. Every kind in any other batch is unknown as well, the ones that
@@ -1006,13 +1014,20 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
     unknown: list[str] = []
     for batch, r in results:
         seen: dict[str, set[str]] = {}
+        unmapped: set[str] = set()
         if r is not None:
             for line in r.stdout.splitlines():
                 parts = line.split()
                 if len(parts) < DISCOVERY_COLUMNS:
                     continue
                 namespace, kind, api_version = parts[:DISCOVERY_COLUMNS]
-                seen.setdefault(resource_for(kind, api_version, batch), set()).add(namespace)
+                resource = resource_for(kind, api_version, batch)
+                if resource is None:
+                    unmapped.add(f"{kind}.{api_version.split('/', 1)[0]}")
+                    continue
+                seen.setdefault(resource, set()).add(namespace)
+        if unmapped:
+            sys.stderr.write(f"stall_watch: discovery listed objects of {', '.join(sorted(unmapped))} that match no listed resource name; not read\n")
         complete = r is not None and r.returncode == 0 and PROXY_TRUNCATED_TEXT not in (r.stderr or "")
         for resource, namespaces in seen.items():
             kinds[resource] = sorted(namespaces)
@@ -1023,8 +1038,14 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
                 unknown.append(resource)
     if isinstance(previous, dict):
         before = previous.get(DISCOVERY_KINDS_KEY) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else {}
+        before_unknown = set(previous.get(DISCOVERY_UNKNOWN_KEY) or [])
         for resource in lost_kinds(previous, candidates):
+            # Carried as it was: a kind the previous record could not read
+            # stays unknown, so its rows stay held and the hourly retry
+            # re-checks it once its group is listed again.
             kinds.setdefault(resource, list(before.get(resource) or []))
+            if resource in before_unknown and resource not in unknown:
+                unknown.append(resource)
     return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
 
 
@@ -1036,15 +1057,18 @@ def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: li
     no longer shows, which is a listing gap until a discovery says otherwise);
     and the kinds held in one namespace because the cap cut them there. A
     kind the record names is read where the record saw it even when it is
-    held: held stops a row clearing, not a read."""
+    held: held stops a row clearing, not a read. A kind the record names
+    that the listing no longer serves while its group is served is neither
+    read nor held: a deleted CRD took its objects with it, and its rows
+    clear against the scan."""
     known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
     if not isinstance(known, dict):
         return {}, set(candidates), {}
     stale = lost_kinds(record, candidates)
-    held = (set(candidates) - set(known)) | set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) | stale
+    held = (set(candidates) - set(known)) | (set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) & set(candidates)) | stale
     by_namespace: dict[str, list[str]] = {}
     for resource, namespaces in sorted(known.items()):
-        if resource in stale or not any(matches_wildcard(resource, w) for w in wildcards):
+        if resource in stale or resource not in candidates or not any(matches_wildcard(resource, w) for w in wildcards):
             continue
         for namespace in namespaces or []:
             by_namespace.setdefault(str(namespace), []).append(resource)

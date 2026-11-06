@@ -374,9 +374,13 @@ health, not the health of the resources it manages. `stall_report.py` reads the 
 as a stale condition once it has been false for longer than the stall threshold, so a `SQLInstance`
 stuck on `UpdateFailed` is a stall like a Deployment past its progress deadline, event or no event.
 
+Two reasons are in progress, not stalled, at any age: `Updating` (a create or update under way) and
+`Deleting`. `DependencyNotReady`, which lasts as long as the referenced resource's own create, is a
+stall after 60 minutes rather than after the usual 15.
+
 The add-on serves about three hundred kinds, so the watch does not read each one in each
 namespace. On each cluster that serves them, it discovers once which kinds have objects and in
-which namespaces, with one `kubectl get` over every namespace for each batch of 50 kinds. It
+which namespaces, with one `kubectl get` over every namespace for each batch of 10 kinds. It
 keeps the result in its ledger and reads in a namespace only the kinds it found there, at most 20
 by name. It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
 clusters per sweep, so a fleet's refreshes spread out.

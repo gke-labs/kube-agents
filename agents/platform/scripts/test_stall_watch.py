@@ -223,7 +223,11 @@ class FakeFleet:
             if isinstance(self.discovery, Exception):
                 raise self.discovery
             batch = argv[len(stall_watch.DISCOVERY_ARGV)].split(",")
-            lines = [f"{ns}   {kind}   {api}\n" for ns, kind, api in self.objects if stall_watch.resource_for(kind, api, batch) in batch]
+            # kubectl prints every object of a kind in the batch; an object
+            # whose Kind maps to no batch name still prints when its group is
+            # in the batch, as a kind the plural rule cannot derive would.
+            groups = {stall_watch.resource_group(r) for r in batch}
+            lines = [f"{ns}   {kind}   {api}\n" for ns, kind, api in self.objects if stall_watch.resource_for(kind, api, batch) in batch or (stall_watch.resource_for(kind, api, batch) is None and api.split("/", 1)[0] in groups)]
             if self.discovery == PROXY_CUT:
                 return completed(argv, "".join(lines), stderr=stall_watch.PROXY_TRUNCATED_TEXT)
             stderr = "Error from server (Forbidden): one kind is forbidden" if self.discovery else ""
@@ -1243,7 +1247,7 @@ class Ledger(Base):
         self.assertEqual(left, ["repeating-warnings"], "the condition row cleared; the warning row waits for a scan that read events")
 
     def test_a_skipped_resource_matches_its_object_kind(self):
-        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job"), (KCC_SQL, "SQLInstance"), ("computeaddresses.compute.cnrm.cloud.google.com", "ComputeAddress"), ("computeaddress.compute.cnrm.cloud.google.com", "ComputeAddress")):
+        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job"), (KCC_SQL, "SQLInstance"), ("computeaddresses.compute.cnrm.cloud.google.com", "ComputeAddress"), ("iampolicies.iam.cnrm.cloud.google.com", "IAMPolicy")):
             self.assertTrue(stall_watch.resource_names_kind(resource, kind), (resource, kind))
         self.assertFalse(stall_watch.resource_names_kind("deployments", "Gateway"))
 
@@ -2049,6 +2053,47 @@ class ConfigConnector(Base):
         self.assertEqual(fake.discoveries(), [], "no six-command discovery after the budget is spent")
         self.assertEqual(fake.scanned(), [])
         self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+
+    def test_an_unknown_kind_stays_unknown_across_a_lost_group_refresh(self):
+        t = ["2026-11-06T00:00:00+00:00", "2026-11-06T07:00:00+00:00", "2026-11-06T08:00:00+00:00", "2026-11-06T08:30:00+00:00"]
+        self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS, now=t[0])
+        self.assertEqual(len(self.last_alerts), 1)
+        # The refresh fails and prints nothing: every kind unknown, rows held.
+        lines, _ = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], discovery=1, now=t[1])
+        self.assertEqual(lines, [])
+        # The hourly retry runs on a listing that lost the sql group.
+        no_sql = [k for k in KCC_SERVED if k != KCC_SQL]
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=no_sql, objects=[], now=t[2])
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_BUCKETS]])
+        self.assertEqual(lines, [])
+        self.assertIn(KCC_SQL, self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_UNKNOWN_KEY])
+        # The group is back before any discovery is due: still unknown, still held.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now=t[3])
+        self.assertEqual(fake.discoveries(), [])
+        self.assertNotIn(KCC_SQL, fake.kinds_asked("payments"))
+        self.assertEqual(lines, [], "the row waits for a discovery that reads its kind")
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
+
+    def test_a_kind_dropped_while_its_group_stays_is_not_asked_and_its_rows_clear(self):
+        databases = "sqldatabases.sql.cnrm.cloud.google.com"
+        objects = KCC_OBJECTS + [("payments", "SQLDatabase", "sql.cnrm.cloud.google.com/v1beta1")]
+        db_row = finding("payments", "SQLDatabase/orders", "stale-condition", "Ready=False UpdateFailed")
+        self.run_tick({"c": {"payments": [KCC_ROW, db_row]}}, served=KCC_SERVED + [databases], objects=objects, now="2026-11-06T00:00:00+00:00")
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["SQLDatabase/orders", "SQLInstance/orders-db"])
+        # The sqldatabases CRD is deleted; the sql group is still served.
+        lines, fake = self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=objects, now="2026-11-06T00:30:00+00:00")
+        self.assertEqual(fake.discoveries(), [])
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL], "a kind the listing dropped is not asked for")
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"], "its rows clear against the scan")
+        self.assertEqual(self.ledger()["unreadable"], {}, "and the namespace is not partial")
+
+    def test_an_object_whose_kind_maps_to_no_listed_resource_is_noted_and_not_recorded(self):
+        objects = KCC_OBJECTS + [("payments", "Oddity", "sql.cnrm.cloud.google.com/v1beta1")]
+        with patch.object(sys, "stderr", io.StringIO()) as err:
+            _, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=objects)
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL])
+        self.assertNotIn("oddity.sql.cnrm.cloud.google.com", self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_KINDS_KEY])
+        self.assertIn("Oddity.sql.cnrm.cloud.google.com", err.getvalue())
 
     def test_a_wildcard_never_expands_to_a_refused_kind(self):
         served = SERVED_DEFAULT + ["leases.coordination.k8s.io", "endpointslices.discovery.k8s.io", "ingresses.networking.k8s.io"]
