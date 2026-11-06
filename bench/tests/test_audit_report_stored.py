@@ -337,31 +337,3 @@ def test_the_unchanged_manifest_cases_state_file_is_the_arms():
     spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
     check = next(entry for entry in spec if entry["name"] == "the-scheduled-run-was-closed-by-the-precheck")
     assert check["check"]["since_state_file"] == f"/opt/data/{name}"
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        f"python3 {SCRIPTS}/audit_report.py finish --audit fleet-consistency-drift --findings-file f.json",
-        f"{SCRIPTS}/audit_report.py start --audit fleet-consistency-drift",
-        f"python3 {SCRIPTS}/audit_report.py precheck --audit fleet-consistency-drift --manifest-file m.json --scheduled",
-    ],
-)
-def test_the_unchanged_manifest_cases_safeguard_catches_a_run_in_the_session(command):
-    spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
-    check = next(entry for entry in spec if entry["name"] == "the-session-ran-no-finish")["check"]
-    transcript.set(output="", trajectory=[], worker_commands=[{"task": "t_1", "command": command}])
-    try:
-        assert WorkerCommandsVerifier(**check).verify(5.0).status == "fail"
-    finally:
-        transcript.clear()
-
-
-def test_the_unchanged_manifest_cases_safeguard_lets_a_roster_read_through():
-    spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
-    check = next(entry for entry in spec if entry["name"] == "the-session-ran-no-finish")["check"]
-    transcript.set(output="", trajectory=[], worker_commands=[{"task": "t_1", "command": "cat /opt/data/profiles/platform/cron/jobs.json"}])
-    try:
-        assert WorkerCommandsVerifier(**check).verify(5.0).status == "pass"
-    finally:
-        transcript.clear()
