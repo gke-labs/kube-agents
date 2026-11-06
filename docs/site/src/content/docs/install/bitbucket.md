@@ -29,7 +29,7 @@ describes both, and marks each step that applies to one of them only.
 
 ## Before you start
 
-- **The release.** Bitbucket support is in release 0.24.0 and later. The latest release is on
+- **The release.** Bitbucket support is in release 0.25.0 and later. The latest release is on
   [GitHub Releases](https://github.com/gke-labs/kube-agents/releases/latest).
 - **The Data Center version.** Tested with Bitbucket Data Center 8.19.
 - **The repository.** Create the GitOps repository first. The installer does not create it. The
