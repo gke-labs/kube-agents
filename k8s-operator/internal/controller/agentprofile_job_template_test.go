@@ -963,3 +963,60 @@ func TestAFailedParamsPassRevokesJobModeAndKeepsThePool(t *testing.T) {
 		t.Error("the dispatch config still names a Job template after a failed params pass")
 	}
 }
+
+// A profile that allows only the unattended tier has no warm pool, but its
+// Job pods mount the NATS CA bundle all the same: with Job mode on the copy
+// is in the profile namespace, and it was there before the first Job template
+// or the Jobs grant was written. With Job mode gated off, nothing mounts it
+// and it goes.
+func TestAnUnattendedOnlyProfileGetsTheCABundleForItsJobs(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	policy, binding := shippedDispatcherJobPolicy(t)
+	pns := profileNamespaceName(agent)
+	bundleKey := types.NamespacedName{Namespace: pns, Name: a2aNATSCABundleName(agent)}
+	apply := fakeServerSideApplyInterceptors()
+	var early []string
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				_, param := obj.(*agentv1alpha1.DispatchJobTemplate)
+				_, grant := obj.(*rbacv1.RoleBinding)
+				if (param || grant && obj.GetName() == a2aDispatcherJobsRoleName(agent)) && obj.GetNamespace() == pns {
+					if err := cl.Get(ctx, bundleKey, &corev1.ConfigMap{}); err != nil {
+						early = append(early, obj.GetName())
+					}
+				}
+				return apply.Patch(ctx, cl, obj, patch, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	p := unattendedProfile(agent, "nightly")
+	p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierUnattended}
+	profiles := []agentv1alpha1.AgentProfile{p}
+	for pass := 1; pass <= 2; pass++ {
+		if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+			t.Fatalf("pass %d: %v / %v", pass, err, profileErr)
+		}
+		if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); err != nil {
+			t.Fatalf("pass %d: no CA bundle in the profile namespace for the Job pods to mount: %v", pass, err)
+		}
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "nightly"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Fatalf("the unattended-only profile has no Job template: %v", err)
+	}
+	if len(early) > 0 {
+		t.Errorf("written before the CA bundle was copied: %v", early)
+	}
+
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("gate off: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the CA bundle outlived Job mode with no pool to mount it: %v", err)
+	}
+}

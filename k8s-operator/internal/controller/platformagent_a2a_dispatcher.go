@@ -692,6 +692,16 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
 			break
 		}
+		// The NATS CA bundle the Job pods mount, copied before the templates
+		// and the Jobs Role are published, so no Job is created on a bundle
+		// that isn't there.
+		if len(jobTemplates) > 0 {
+			if err := r.copyProfileCABundle(ctx, agent); err != nil {
+				jobTemplates = nil
+				jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+				break
+			}
+		}
 		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 			jobTemplates = nil
 			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
@@ -777,7 +787,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// The warm pools the dispatcher hands interactive tasks to
 	// (agentprofile_pool.go). A failure there is the profile namespace's,
 	// like the quota's.
-	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved)
+	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, len(jobTemplates) > 0)
 	// Gated off: what an earlier pass rendered goes.
 	if !signal {
 		return goerrors.Join(poolErr, r.deleteDispatcherJobResources(ctx, agent)), nil
