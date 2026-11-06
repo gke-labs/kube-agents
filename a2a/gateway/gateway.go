@@ -1159,6 +1159,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			}
 		}
 	}
+	// Google Chat's Stop button with the card stop armed: a press on the
+	// running task is the typed stop, cards and replies included, which
+	// reads a stop that names no task (cardStopWanted).
+	if stopping && isChatStopPress(msg, backend) && active != nil && active.TaskID == msg.TaskID &&
+		g.cfg.CardStop && g.cardStopRoute(rec) {
+		msg.TaskID = ""
+	}
 	switch {
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
@@ -1189,10 +1196,15 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
-	case stopping && isChatStopPress(msg, backend) && active != nil && !g.cardStopWanted(rec, msg):
-		// Google Chat's Stop button answers on the task's own line, and
-		// posts nothing (gchat_stop.go). With the card stop armed it takes
-		// the typed stop's path below, cards and replies included.
+	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
+		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// press on a task that is not the running one is a stale button,
+		// answered on its own line, and cancels nothing.
+		g.chatStopStale(rec, msg)
+	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
+		// A press on the running task answers on that task's own line, and
+		// posts nothing (chat_stop_press.go). With the card stop armed the
+		// press was made a typed stop above, and takes that path below.
 		g.chatStopPress(ctx, rec, authority)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
@@ -1552,7 +1564,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			if healedTask != nil {
 				state = healedTask.State
 			}
-			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), false)
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), "")
 		}
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
@@ -2733,7 +2745,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
 	if !lineless {
 		var err error
-		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: true})
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}
@@ -2745,7 +2757,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// this write the task is neither. Its line closes here, as the record
 	// already counts the task (MarkCanceled), with no Stop control on it.
 	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
-		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), false)
+		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
 	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the

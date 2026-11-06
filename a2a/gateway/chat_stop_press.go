@@ -11,9 +11,12 @@ import "context"
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
 // second press while the cancel is pending has no button to land on; one
 // that arrives anyway changes nothing. A press on a task already detached
-// by a typed stop is the same. With nothing running the press takes the
-// typed stop's "nothing running" replies (routeTurn), since the line it was
-// on is gone and a reply is owed somewhere.
+// by a typed stop is the same. The button names its task, so a press on a
+// task that is not the running one (a line whose closing edit failed, or
+// one from before a restart) is answered on that stale line, with
+// staleStopNotice, and cancels nothing: a press is never a cancel of a task
+// the presser did not see.
+const staleStopNotice = "ℹ️ this task has ended"
 
 // isChatStopPress reports a stop from Google Chat's Stop button rather than
 // the word: the Google Chat adapter sets IntentCancel only on a kage.stop
@@ -25,25 +28,33 @@ func isChatStopPress(msg InboundMessage, backend string) bool {
 // chatStopPress answers a Stop press on rec's active task: the quiet cancel,
 // then the line closed on cancelSentNotice. A cancel that did not reach the
 // bus is said on the line too, which keeps its control for another press.
+// With no line to answer on (the placeholder post can fail) the press speaks
+// as the typed stop does: its posts, and the relay's "canceled".
 func (g *Gateway) chatStopPress(ctx context.Context, rec *SessionRecord, authority Authority) {
 	active := rec.ActiveTask
 	if active.Detached {
 		g.log.Info("chat stop press on a task already stopping", "conversation", rec.Key, "taskId", active.TaskID)
 		return
 	}
-	if !g.cancelTaskVoiced(ctx, rec, authority, true) {
-		if active.StatusMsgID != "" {
-			g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), true)
+	quiet := active.StatusMsgID != ""
+	if !g.cancelTaskVoiced(ctx, rec, authority, quiet) {
+		if quiet {
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), active.TaskID)
 		}
 		return
 	}
-	if active.StatusMsgID == "" {
-		// No line to answer on (a backend that shows no line is not
-		// Chat, but the placeholder post can fail): the typed stop's post.
-		g.post(rec.Key, cancelSentNotice)
+	if !quiet {
 		return
 	}
-	if g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelSentNotice, active.LineNote), false) {
+	if g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelSentNotice, active.LineNote), "") {
 		active.LineClosed = true
 	}
+}
+
+// chatStopStale answers a press on a task that is not rec's running task:
+// the line the button was on is edited to staleStopNotice, control gone,
+// and nothing is cancelled. The click id names the message it was on.
+func (g *Gateway) chatStopStale(rec *SessionRecord, msg InboundMessage) {
+	g.log.Info("chat stop press on a task that is not running", "conversation", rec.Key, "taskId", msg.TaskID)
+	g.editLine(rec.Key, gchatClickMessage(msg.MessageID), staleStopNotice, "")
 }

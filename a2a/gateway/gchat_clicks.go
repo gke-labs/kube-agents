@@ -369,6 +369,13 @@ func gchatClickID(message, eventTime string) string {
 	return message + gchatClickIDSep + eventTime
 }
 
+// gchatClickMessage is the message a click id names (gchatClickID): the
+// message a stale Stop press is answered on (chatStopStale).
+func gchatClickMessage(id string) string {
+	message, _, _ := strings.Cut(id, gchatClickIDSep)
+	return message
+}
+
 // gchatMessageButtons reads a clicked message's own buttons: the link
 // buttons it shows, as links, and the label of the choice at index, or
 // fallback when no button carries that index (or the index is unknown).

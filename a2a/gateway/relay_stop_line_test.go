@@ -137,7 +137,7 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 	})
 	line := r.adapter.stopLinesCopy()[0].MessageID
 	press := func(id string) {
-		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: id, Intent: IntentCancel, Click: true}
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: id, Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
 	}
 	press("spaces/S1/messages/" + line + "#t1")
 	waitFor(t, "the line closed on cancel sent", func() bool {
@@ -171,5 +171,85 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 		if strings.Contains(p, "🛑") {
 			t.Errorf("a press posted %q; the line is the reply", p)
 		}
+	}
+}
+
+// A press on a task that is not the running one (a line whose closing edit
+// failed, or one from before a restart) is answered on the line it was
+// pressed on, and cancels nothing: the running task keeps its line and its
+// Stop, and ends as it would have.
+func TestAStalePressAnswersOnItsOwnLineAndCancelsNothing(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-stale"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+		MessageID: "spaces/S1/messages/OLD-LINE#2026-11-06T15:00:00Z", Intent: IntentCancel, TaskID: "task-gone", Click: true}
+	waitFor(t, "the stale line answered", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		for _, e := range r.adapter.edits {
+			if e.MessageID == "spaces/S1/messages/OLD-LINE" && strings.Contains(e.Text, "has ended") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "cancel sent") || strings.Contains(e, "canceled") {
+			t.Fatalf("a stale press touched the running task: %q", e)
+		}
+	}
+	for _, l := range r.adapter.stopLinesCopy() {
+		if l.MessageID == "spaces/S1/messages/OLD-LINE" {
+			t.Fatalf("the stale line kept its Stop: %+v", l)
+		}
+	}
+	completeTask(t, exec, "done")
+	waitFor(t, "the running task's terminal", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "completed")
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🛑") {
+			t.Errorf("a stale press posted %q", p)
+		}
+	}
+}
+
+// A press on a task with no status line (the placeholder post failed) has
+// no line to answer on, so it speaks as the typed stop does: the "cancel
+// sent" post, and no quiet mark, so the relay's "canceled" follows.
+func TestAPressWithNoLineSpeaksAsATypedStop(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	ctx := context.Background()
+	conv := "gchat:spaces/S1/threads/T-noline"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-noline", Kind: "group", Addressee: "platform",
+		ActiveTask: &ActiveTask{TaskID: "task-noline", CorrelationID: "corr-noline", SubmittedAt: time.Now()},
+		Tasks:      []TaskRef{{ID: "task-noline", Addressee: "platform"}}}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+		MessageID: "spaces/S1/messages/L1#2026-11-06T15:00:00Z", Intent: IntentCancel, TaskID: "task-noline", Click: true}
+	waitFor(t, "the cancel sent post", func() bool {
+		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "cancel sent") })
+	})
+	got := waitForRecord(t, r, conv, "the detached task", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	if ref, ok := got.TaskRefFor("task-noline"); !ok || ref.QuietCancel {
+		t.Fatalf("a press with no line was quiet: %+v", ref)
+	}
+	if len(r.adapter.editTexts()) != 0 {
+		t.Errorf("edits = %q; want none without a line", r.adapter.editTexts())
 	}
 }

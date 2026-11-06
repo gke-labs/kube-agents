@@ -14,10 +14,11 @@ import (
 // laid out (a progress message's links), alone under the text otherwise. The
 // terminal edit arrives without Stop and takes the button off, as Edit does.
 // A click on it sends the cancel a typed `stop` sends: it lands on the
-// gateway as IntentCancel with no text, bound to the conversation the button
-// carries, for anyone the allowlist admits, and the gateway answers it on
-// the line itself rather than with the typed stop's posts
-// (chat_stop_press.go). Slack's Stop is native to
+// gateway as IntentCancel with no text, naming the task the button carries
+// and bound to the conversation it carries, for anyone the allowlist admits,
+// and the gateway answers it on the line itself rather than with the typed
+// stop's posts, or, for a task that is not the running one, on the stale
+// line with nothing cancelled (chat_stop_press.go). Slack's Stop is native to
 // its Agent Sessions (slack_stop.go); this one is drawn, since Chat has no
 // such control, and a text line Chat refuses with it is posted or patched
 // once more without it, so the line itself never fails for the button (a
@@ -25,11 +26,14 @@ import (
 // text, which then takes the same path).
 const (
 	// gchatStopFunction is the onClick action the Stop button sends, with
-	// the conversation its line belongs to as its one parameter: the
+	// two parameters: the conversation its line belongs to, since the
 	// click's event names the surface the line is on, which is not the
-	// conversation key a DM's thread-less line was posted under.
+	// conversation key a DM's thread-less line was posted under; and the
+	// task the line is for, so a press on a line left behind (a closing
+	// edit that failed, a restart) names a task that is not running.
 	gchatStopFunction          = "kage.stop"
 	gchatStopParamConversation = "conversation"
+	gchatStopParamTask         = "task"
 	gchatStopText              = "Stop"
 	// gchatStopSeenPrefix keys a stop click in the dedupe ring, apart from a
 	// choice click on the same message at the same time.
@@ -39,18 +43,22 @@ const (
 	gchatStopNoEmail        = "stop clicker has no email"
 	gchatStopNoMessage      = "stop click names no space or no message"
 	gchatStopNoConversation = "a stop click naming no conversation"
+	gchatStopNoTask         = "a stop click naming no task"
 	gchatStopOtherSpace     = "a stop click naming a conversation outside its space"
 	gchatStopDuplicate      = "duplicate delivery of stop click "
 )
 
-// gchatStopButtons appends the Stop button, bound to conversation, after
-// every button layout carries: in its one button list, or a list of its own
-// under a text line.
-func gchatStopButtons(layout gchatChatLayout, conversation string) gchatChatLayout {
+// gchatStopButtons appends the Stop button, bound to conversation and
+// naming task, after every button layout carries: in its one button list,
+// or a list of its own under a text line.
+func gchatStopButtons(layout gchatChatLayout, conversation, task string) gchatChatLayout {
 	button := gchatChatButton(gchatStopText, false)
 	button["onClick"] = map[string]any{"action": map[string]any{
-		"function":   gchatStopFunction,
-		"parameters": []map[string]any{{"key": gchatStopParamConversation, "value": conversation}},
+		"function": gchatStopFunction,
+		"parameters": []map[string]any{
+			{"key": gchatStopParamConversation, "value": conversation},
+			{"key": gchatStopParamTask, "value": task},
+		},
 	}}
 	for _, w := range layout.Widgets {
 		if list, ok := w["buttonList"].(map[string]any); ok {
@@ -63,14 +71,14 @@ func gchatStopButtons(layout gchatChatLayout, conversation string) gchatChatLayo
 	return layout
 }
 
-// postStopLine posts a text line with the Stop button under it, and the
-// line alone when Chat refuses the button.
-func (a *GoogleChatAdapter) postStopLine(conversation, text string) (string, error) {
+// postStopLine posts a text line with the Stop button for task under it,
+// and the line alone when Chat refuses the button.
+func (a *GoogleChatAdapter) postStopLine(conversation, text, task string) (string, error) {
 	space, thread, ok := gchatSpaceThread(conversation)
 	if !ok {
 		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
-	layout := gchatStopButtons(gchatChatLayout{Text: toGchatText(text)}, conversation)
+	layout := gchatStopButtons(gchatChatLayout{Text: toGchatText(text)}, conversation, task)
 	message, _, err := a.create(space, thread, gchatLayoutBody(layout))
 	if err == nil {
 		return message, nil
@@ -82,8 +90,8 @@ func (a *GoogleChatAdapter) postStopLine(conversation, text string) (string, err
 	return a.Post(conversation, text)
 }
 
-// classifyStop reads a click on the Stop button as the conversation's
-// cancel: IntentCancel with no text, from the clicker, bound to the
+// classifyStop reads a click on the Stop button as a cancel of the task the
+// button names: IntentCancel with no text, from the clicker, bound to the
 // conversation the button carries, which must be in the space the click
 // came from. A redelivered click is dropped by its id, as a choice click
 // is.
@@ -103,6 +111,10 @@ func (a *GoogleChatAdapter) classifyStop(ev *gchatEvent) (InboundMessage, string
 	if space != ev.Space.Name {
 		return InboundMessage{}, gchatStopOtherSpace + " (" + conversation + ")"
 	}
+	task := strings.TrimSpace(click.Parameters[gchatStopParamTask])
+	if task == "" {
+		return InboundMessage{}, gchatStopNoTask
+	}
 	id := gchatClickID(ev.Message.Name, click.EventTime)
 	a.mu.Lock()
 	if click.EventTime != "" && a.seenLocked(gchatStopSeenPrefix+id) {
@@ -121,6 +133,7 @@ func (a *GoogleChatAdapter) classifyStop(ev *gchatEvent) (InboundMessage, string
 		AuthorID:     click.User.Email,
 		MessageID:    id,
 		Intent:       IntentCancel,
+		TaskID:       task,
 		Click:        true,
 	}, ""
 }

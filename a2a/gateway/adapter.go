@@ -227,12 +227,12 @@ type OutMessage struct {
 	// feedback, feedback.go). A backend that draws rating controls draws
 	// them on this message; every other backend ignores it.
 	Feedback string
-	// Stop marks a task's live message while the task runs: the status
-	// line the gateway posts for a task and edits as it moves (relay.go).
-	// A backend that draws a Stop control draws it on this message, and
-	// an edit without Stop takes it off, which is the terminal edit; every
-	// other backend ignores it.
-	Stop bool
+	// Stop, when set, is the id of the running task whose live message
+	// this is: the status line the gateway posts for a task and edits as
+	// it moves (relay.go). A backend that draws a Stop control draws it on
+	// this message, naming that task, and an edit without Stop takes it
+	// off, which is the terminal edit; every other backend ignores it.
+	Stop string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

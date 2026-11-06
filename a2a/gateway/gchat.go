@@ -526,8 +526,8 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 // refuses, is ErrLayoutRefused, so the gateway posts the text instead
 // (Gateway.chatOutcome); a failed call is returned as it is.
 func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	if m.Chat == nil && m.Stop {
-		return a.postStopLine(conversation, m.Text)
+	if m.Chat == nil && m.Stop != "" {
+		return a.postStopLine(conversation, m.Text, m.Stop)
 	}
 	if m.Chat == nil {
 		return a.Post(conversation, m.Text)
@@ -642,8 +642,8 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 		}
 	}
 	layout = a.answeredLayout(messageID, m, layout)
-	if m.Stop {
-		layout = gchatStopButtons(layout, conversation)
+	if m.Stop != "" {
+		layout = gchatStopButtons(layout, conversation, m.Stop)
 	}
 	arguments := map[string]any{
 		"name":       messageID,
@@ -652,9 +652,9 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 	}
 	if err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil); err != nil {
 		err = gchatLayoutError(err, true)
-		if m.Stop && m.Chat == nil && errors.Is(err, ErrLayoutRefused) {
+		if m.Stop != "" && m.Chat == nil && errors.Is(err, ErrLayoutRefused) {
 			a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
-			m.Stop = false
+			m.Stop = ""
 			return a.editLaidOut(conversation, messageID, m)
 		}
 		if asks && errors.Is(err, ErrLayoutRefused) {

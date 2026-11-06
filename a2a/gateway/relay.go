@@ -809,7 +809,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, false)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
@@ -841,7 +841,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if g.cfg.DisplayMode == displayModeDefault {
 			progress = ""
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, false)
+		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -1097,17 +1097,17 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, true) {
+	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, taskID) {
 		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }
 
 // editLine edits one status message and reports whether the edit landed.
-// running marks the line of a task still running, which keeps the Stop
-// control a backend draws on it (OutMessage.Stop); the terminal edit takes
-// it off.
-func (g *Gateway) editLine(conversation, messageID, line string, running bool) bool {
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: running}); err != nil {
+// stop names the task when its line is still a running task's, which keeps
+// the Stop control a backend draws on it (OutMessage.Stop); the terminal
+// edit passes none and takes it off.
+func (g *Gateway) editLine(conversation, messageID, line, stop string) bool {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}

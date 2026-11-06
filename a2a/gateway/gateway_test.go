@@ -274,7 +274,7 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 	}
 	if m.Chat == nil {
 		id, err := a.Post(conversation, m.Text)
-		if err == nil && m.Stop {
+		if err == nil && m.Stop != "" {
 			a.mu.Lock()
 			a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
 			a.mu.Unlock()
@@ -294,7 +294,7 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 	a.mu.Lock()
 	a.chatPosts = append(a.chatPosts, m.Chat)
 	a.setLaidOutLocked(id, true)
-	if m.Stop {
+	if m.Stop != "" {
 		a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
 	}
 	a.mu.Unlock()
@@ -339,7 +339,7 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 		a.chatEdits = append(a.chatEdits, m.Chat)
 	}
 	a.setLaidOutLocked(messageID, m.Chat != nil)
-	if m.Stop {
+	if m.Stop != "" {
 		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
 	}
 	a.mu.Unlock()
