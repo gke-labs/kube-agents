@@ -340,9 +340,11 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (its submission aged off the stream). A record
-  nobody can read counts as a running one: its task is treated as started, and the sweep
-  waits as long from the record's last write. Answers a pod
+  long expired that no held submission has (its submission aged off the stream), reading the
+  bucket in one pass and logging a pass cut short. A record nobody can read (or of another
+  shape) has one meaning for every reader: a started task, last seen alive at the entry's
+  write, so it expires a lease after that like any record. A renewal from the pod its key
+  names has the dispatcher, the bucket's one writer, write it back readable. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
 - **Task credentials.** With a task-signing key (a cluster seed, read from the file
   `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
@@ -409,7 +411,10 @@ leave open:
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
-  admission, and `lease-expired` and `deadline-exceeded` while it holds.
+  admission, and `lease-expired` and `deadline-exceeded` while it holds. A terminal is retried
+  until it lands, except for a profile that has left the install config: its `.supervisor`
+  grant goes at the next reconnect, so after `DroppedTerminalGiveUp` (two minutes) the task is
+  settled without one and the miss logged as an error.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. While it is open, for
   `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
