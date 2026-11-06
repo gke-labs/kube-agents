@@ -470,16 +470,16 @@ func addResourceDelta(total, from, to corev1.ResourceList) {
 // container, so never BestEffort; no activeDeadlineSeconds, so never
 // Terminating; no cross-namespace affinity term; and VolumeAttributesClass
 // tracks claims, never a pod's cpu or memory. PriorityClass is read against
-// classes, the priorityClassName values the live sized pods carry
-// (sizedPodPriorityClasses): the controller sets none, but the API server's
-// Priority admission fills in the cluster's globalDefault PriorityClass when
-// one exists, and the quota plugin, which runs after it, matches the scope
-// against the filled-in name, so a fixed answer would skip a quota scoped
-// `In` that default, which binds the pods, and read a `DoesNotExist` one,
-// which does not. The requirement selects the pods when it selects any class
-// they carry; with no pod to read (classes empty) it is read as selecting
-// them, as is a scope this operator does not know: the side that holds the
-// tier rather than promotes past a quota that binds.
+// classes, the priorityClassName values the live pods in the namespace carry
+// (namespacePodPriorityClasses): the controller sets none, but the API
+// server's Priority admission fills in the cluster's globalDefault
+// PriorityClass when one exists, and the quota plugin, which runs after it,
+// matches the scope against the filled-in name, so a fixed answer would skip
+// a quota scoped `In` that default, which binds the pods, and read a
+// `DoesNotExist` one, which does not. The requirement selects the pods when
+// it selects any class in the set; with no pod to read (classes empty) it is
+// read as selecting them, as is a scope this operator does not know: the
+// side that holds the tier rather than promotes past a quota that binds.
 func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement, classes []string) bool {
 	switch req.ScopeName {
 	case corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort:
@@ -562,36 +562,36 @@ func sizingQuotaBindsThePods(quota *corev1.ResourceQuota, classes []string) bool
 
 // namespacePodPriorityClasses is the set of spec.priorityClassName values the
 // live pods in the agent's namespace carry, "" for a pod with none, sorted;
-// nil when the namespace has no pod. The pods read are the ones this operator
-// created (commonLabels), admitted the way the three sized pods are; with
-// none of those yet, any pod in the namespace, since a globalDefault
-// PriorityClass is filled in on every pod created without one; with no pod
-// at all there is nothing to read, and the caller takes a PriorityClass
-// requirement as selecting the pods. Pods are not a cached kind here
-// (manager_cache.go), so the lists go through the API reader, as the
-// ResourceQuota list does, and only when a quota has a PriorityClass scope.
+// nil when the namespace has no pod. Every pod in the namespace is read, the
+// ones this operator created and their neighbours alike, because the Priority
+// admission plugin fills a globalDefault PriorityClass into a pod as it is
+// created and never rewrites a running one: on a cluster whose default was
+// created after the sized pods, those pods carry "" while any newer neighbour
+// carries the default, as the pod a step recreates will. A requirement that
+// selects any class in the set binds (sizingScopeSelectsThePods), so a quota
+// scoped In such a default holds the tier, a SizingCappedByQuota a raised
+// quota lifts, where a read of the operator's own pods alone would skip it
+// and admission would refuse the replacement once the running pod was gone.
+// The cost is a neighbour's class of its own binding a quota scoped In it,
+// which caps the tier visibly for pods the quota would not count; the file's
+// rule for every unknown is the side that holds the tier. With no pod at all
+// there is nothing to read, and the caller takes a PriorityClass requirement
+// as selecting the pods. Pods are not a cached kind here (manager_cache.go),
+// so the list goes through the API reader, as the ResourceQuota list does,
+// and only when a quota has a PriorityClass scope.
 func (r *PlatformAgentReconciler) namespacePodPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
-	for _, opts := range [][]client.ListOption{
-		{client.InNamespace(agent.Namespace), client.MatchingLabels(commonLabels(agent))},
-		{client.InNamespace(agent.Namespace)},
-	} {
-		pods := &corev1.PodList{}
-		if err := r.a2aReader().List(ctx, pods, opts...); err != nil {
-			return nil, fmt.Errorf("listing the namespace's pods for the quota scopes: %w", err)
-		}
-		if len(pods.Items) == 0 {
-			continue
-		}
-		var classes []string
-		for _, pod := range pods.Items {
-			if !slices.Contains(classes, pod.Spec.PriorityClassName) {
-				classes = append(classes, pod.Spec.PriorityClassName)
-			}
-		}
-		slices.Sort(classes)
-		return classes, nil
+	pods := &corev1.PodList{}
+	if err := r.a2aReader().List(ctx, pods, client.InNamespace(agent.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing the namespace's pods for the quota scopes: %w", err)
 	}
-	return nil, nil
+	var classes []string
+	for _, pod := range pods.Items {
+		if !slices.Contains(classes, pod.Spec.PriorityClassName) {
+			classes = append(classes, pod.Spec.PriorityClassName)
+		}
+	}
+	slices.Sort(classes)
+	return classes, nil
 }
 
 // sizingDeploymentSettled and sizingStatefulSetSettled report whether one

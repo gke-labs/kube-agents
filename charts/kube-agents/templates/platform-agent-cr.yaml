@@ -570,7 +570,7 @@ spec:
       {{- if and $setRequest $setLimit }}
       {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
       {{- else }}
-      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the sizing profile row's limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- end }}
       {{- end }}
       {{- end }}

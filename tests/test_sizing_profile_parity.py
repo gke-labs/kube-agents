@@ -187,7 +187,7 @@ class SizingProfileReachesTheCR(unittest.TestCase):
         self.assertEqual(fleet.returncode, 0, fleet.stderr)
         small = _run_helm(CHART, *over)
         self.assertNotEqual(small.returncode, 0)
-        self.assertIn("exceeds the operator's default limits.cpu", small.stderr)
+        self.assertIn("exceeds the sizing profile row's limits.cpu", small.stderr)
 
 
 if __name__ == "__main__":

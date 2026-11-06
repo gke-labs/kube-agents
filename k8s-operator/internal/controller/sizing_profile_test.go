@@ -936,11 +936,18 @@ func TestResolveSizingTierReadsThePriorityClassThePodsCarry(t *testing.T) {
 		t.Parallel()
 		promoted(t, run(t, noClass, sizedPodsWithClass(agent0(), "cluster-default")...), "a quota that cannot count pods carrying a class capped the tier")
 	})
-	t.Run("the operator's own pods are read over a neighbour's", func(t *testing.T) {
+	t.Run("a neighbour's class is read beside the operator's own pods", func(t *testing.T) {
 		t.Parallel()
-		// The neighbour set a class of its own; the operator's pods carry
-		// none, so the In quota does not bind them.
-		promoted(t, run(t, inDefault, append(sizedPodsWithClass(agent0(), ""), namespacePodWithClass(agent0(), "cluster-default"))...), "a neighbour's class was read over the operator's own pods")
+		// The default was created after the operator's pods, which carry
+		// none; the neighbour created since carries it, as the pod the step
+		// recreates will, so the In quota binds.
+		cappedBy(t, run(t, inDefault, append(sizedPodsWithClass(agent0(), ""), namespacePodWithClass(agent0(), "cluster-default"))...), "default-class", "a class only the neighbour's pod carries was not read beside the operator's own")
+	})
+	t.Run("a class-less neighbour is read beside the operator's own pods", func(t *testing.T) {
+		t.Parallel()
+		// The set is the union both ways: a DoesNotExist quota binds while
+		// any pod in the namespace carries no class.
+		cappedBy(t, run(t, noClass, append(sizedPodsWithClass(agent0(), "cluster-default"), namespacePodWithClass(agent0(), ""))...), "no-class", "a DoesNotExist quota was skipped with a class-less pod in the namespace")
 	})
 	t.Run("a neighbour's pod is read before the operator's own exist", func(t *testing.T) {
 		t.Parallel()

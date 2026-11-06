@@ -398,21 +398,21 @@ const (
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
-	// proxy Deployment is rendered at the operator's default resources.
+	// proxy Deployment is rendered at the sizing profile's row.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
-	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidAgentAPIAuthResources: the CR's
 	// spec.deployment.agentAPIAuth.resources fails ValidateAgentAPIAuthResources,
 	// so the override is ignored and the agent-api-auth sidecar is rendered at
-	// the operator's default resources.
+	// the sizing profile's row.
 	conditionReasonInvalidAgentAPIAuthResources = "InvalidAgentAPIAuthResources"
-	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidShellSandboxResources: the CR's
 	// spec.harness.experimental.shellSandbox.resources fails
 	// ValidateShellSandboxResources, so the override is ignored and the shell
-	// StatefulSet is rendered at the operator's default resources.
+	// StatefulSet is rendered at the sizing profile's row.
 	conditionReasonInvalidShellSandboxResources = "InvalidShellSandboxResources"
-	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -2590,7 +2590,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		r.agentAPIAuthWarningsLogged.Store(apiAuthKey, agent.Generation)
 	}
 	if apiAuthRefusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", apiAuthRefusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, apiAuthRefusal)
 		gatewayAgent = agent.DeepCopy()
@@ -2799,7 +2799,7 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 	}
 	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidShellSandboxResources, refusal)
 		rendered = agent.DeepCopy()
@@ -3209,7 +3209,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	}
 	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
 		rendered = agent.DeepCopy()

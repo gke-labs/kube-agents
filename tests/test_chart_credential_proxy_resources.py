@@ -254,7 +254,7 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=3Gi"])
-        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the operator's default limits.memory (2Gi)", err)
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (3Gi) exceeds the sizing profile row's limits.memory (2Gi)", err)
         self.assertIn("set limits.memory as well", err)
 
     def test_a_cpu_limit_alone_under_the_default_request_renders(self):
@@ -271,11 +271,11 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
         # separates two 15-digit values one unit apart (the second case).
         cases = (
-            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the operator's default limits.cpu (2)"),
+            ([f"{_VALUE_PATH}.requests.cpu=2.0004"], "requests.cpu (2.0004) exceeds the sizing profile row's limits.cpu (2)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
              "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
             ([f"{_VALUE_PATH}.requests.memory=2147483648.5"],
-             "requests.memory (2147483648.5) exceeds the operator's default limits.memory (2Gi)"),
+             "requests.memory (2147483648.5) exceeds the sizing profile row's limits.memory (2Gi)"),
             ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
              "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
         )

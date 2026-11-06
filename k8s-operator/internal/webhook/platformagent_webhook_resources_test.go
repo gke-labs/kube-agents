@@ -240,15 +240,15 @@ func TestCredentialProxyLimitEqualToTheRequestIsNotNoted(t *testing.T) {
 }
 
 // A request raised past a limit the CR never wrote: the merged result is what
-// is checked, and the error names the operator's default as the other side.
+// is checked, and the error names the sizing profile row's figure as the other side.
 func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
-	if !strings.Contains(msg, "operator's default 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
-		t.Errorf("message %q does not name the default limit it collides with", msg)
+	if !strings.Contains(msg, "sizing profile row's 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
+		t.Errorf("message %q does not name the row's limit it collides with", msg)
 	}
 }
 
