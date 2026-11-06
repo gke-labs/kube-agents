@@ -25,7 +25,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -730,56 +729,46 @@ func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendere
 // step as already charged and could promote past the quota; it measures
 // nothing until the pods have settled instead, and the workloads' status
 // updates re-enqueue the CR when they have. The reads are cache hits (both
-// kinds are Owns()'d). A workload that cannot be read has not settled; one
-// that is not there yet has nothing charged, which at small is the tier
-// settled (the first pass of a fresh install, before the steps after this one
-// create the workloads) and above small is a latch the workloads have not
-// caught up with (a pass that failed between the status write and the
-// renders, or a controller restarted between them).
+// kinds are Owns()'d). A workload that cannot be read has not settled, and
+// one that is not there is among them, at small as above it: the step is
+// measured as the difference between the running tier's row and the earned
+// one's, and a used total that charges no pod of the workload does not charge
+// the row the step is measured from, so a step measured without it would come
+// up short by the whole small footprint when the workload is recreated at the
+// earned row (the recreate path, when a template change the API server
+// refuses as an immutable-field update is answered by deleting the workload
+// and the pass ends before it is recreated; or a workload deleted by hand). The
+// hold lasts the one pass that recreates it: the steps after this one create
+// the missing workload at the running tier, its status re-enqueues the CR, and
+// the next pass measures. The first pass of a fresh install never reaches this
+// check, since it has no cluster reading to earn a step with.
 func (r *PlatformAgentReconciler) sizingTierUnsettledWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) string {
 	autopilot := r.clusterAutopilot()
-	absent := func(err error) bool { return apierrors.IsNotFound(err) && tier == sizingTierSmall }
 	proxy := &appsv1.Deployment{}
 	proxyKey := client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}
-	if err := r.Get(ctx, proxyKey, proxy); err != nil {
-		if !absent(err) {
-			return fmt.Sprintf(sizingUnsettledDeploymentFormat, proxyKey.Name)
-		}
-	} else if !sizingDeploymentSettled(proxy, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier), autopilot) {
+	if err := r.Get(ctx, proxyKey, proxy); err != nil ||
+		!sizingDeploymentSettled(proxy, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier), autopilot) {
 		return fmt.Sprintf(sizingUnsettledDeploymentFormat, proxyKey.Name)
 	}
 	shell := &appsv1.StatefulSet{}
 	shellKey := client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}
-	if err := r.Get(ctx, shellKey, shell); err != nil {
-		if !absent(err) {
-			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, shellKey.Name)
-		}
-	} else if !sizingStatefulSetSettled(shell, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier), autopilot) {
+	if err := r.Get(ctx, shellKey, shell); err != nil ||
+		!sizingStatefulSetSettled(shell, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier), autopilot) {
 		return fmt.Sprintf(sizingUnsettledStatefulSetFormat, shellKey.Name)
 	}
 	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
 	sidecar := renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier)
 	if useStatefulSet(agent) {
 		gateway := &appsv1.StatefulSet{}
-		if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-			if absent(err) {
-				return ""
-			}
-			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, gatewayKey.Name)
-		}
-		if !sizingStatefulSetSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
+		if err := r.Get(ctx, gatewayKey, gateway); err != nil ||
+			!sizingStatefulSetSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
 			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, gatewayKey.Name)
 		}
 		return ""
 	}
 	gateway := &appsv1.Deployment{}
-	if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-		if absent(err) {
-			return ""
-		}
-		return fmt.Sprintf(sizingUnsettledDeploymentFormat, gatewayKey.Name)
-	}
-	if !sizingDeploymentSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
+	if err := r.Get(ctx, gatewayKey, gateway); err != nil ||
+		!sizingDeploymentSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
 		return fmt.Sprintf(sizingUnsettledDeploymentFormat, gatewayKey.Name)
 	}
 	return ""

@@ -1077,16 +1077,83 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 		agent, _ = run(t, noClass, "", refused)
 		cappedBy(t, agent, "no-class", "a DoesNotExist quota was skipped after admission refused the dry run")
 	})
-	t.Run("with no proxy Deployment to build the Pod from a PriorityClass quota binds", func(t *testing.T) {
+	t.Run("with no proxy Deployment the step is held before admission is asked", func(t *testing.T) {
 		t.Parallel()
+		// A missing workload has not settled (sizingTierUnsettledWorkload),
+		// so the pass measures nothing and asks nothing: the latch and the
+		// condition stand, here small with no condition.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 		workloads := sizedWorkloadsAt(agent, sizingTierSmall)[1:]
 		agent, seen := run(t, inDefault, "cluster-default", nil, workloads...)
-		cappedBy(t, agent, "default-class", "an In quota was skipped with no template to ask admission about")
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: a step was measured with the proxy Deployment missing", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota set on a held pass: %+v", cond)
+		}
 		if len(seen) != 0 {
 			t.Fatalf("admission saw %d dry-run Pods with no proxy Deployment, want none", len(seen))
 		}
 	})
+}
+
+func TestResolveSizingTierHoldsTheStepWhileASizedWorkloadIsAbsent(t *testing.T) {
+	t.Parallel()
+	// Latched small at 12 clusters with one requests.memory quota, 10Gi hard
+	// and 6.5Gi used: the broker's 1Gi is not in the used total because its
+	// Deployment is gone (a recreate the pass before did not finish, or a
+	// hand delete), yet the medium step is measured from the small row, 3Gi,
+	// and 3.5Gi is free. A pass that read the missing workload as settled
+	// would latch medium and recreate the broker at 4Gi against 3.5Gi free,
+	// which admission refuses, with the latch upward-only and no cap written.
+	// The pass holds instead, logging the workload it waits on; once the
+	// workload is back at the small row, and the quota charges it, the next
+	// pass measures.
+	for _, tc := range []struct {
+		name    string
+		missing int
+		waiting string
+	}{
+		{"the proxy Deployment", 0, "Deployment/platformagent-credential-proxy"},
+		{"the gateway Deployment", 1, "Deployment/platformagent-gateway"},
+		{"the shell StatefulSet", 2, "StatefulSet/platformagent-shell"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+			quota := sizingQuota("platform-baseline-quota", "10Gi", "6656Mi")
+			workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+			present := append([]client.Object{agent, quota}, slices.Delete(slices.Clone(workloads), tc.missing, tc.missing+1)...)
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(present...).WithStatusSubresource(agent).Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+			var logged strings.Builder
+			ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+			if err := r.resolveSizingTier(ctx, agent); err != nil {
+				t.Fatalf("resolveSizingTier: %v", err)
+			}
+			if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+				t.Fatalf("status.effectiveSizingTier = %q, want small: the step was measured with %s absent and the quota charging nothing of it", agent.Status.EffectiveSizingTier, tc.name)
+			}
+			if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+				t.Fatalf("SizingCappedByQuota set on a held pass: %+v", cond)
+			}
+			if !strings.Contains(logged.String(), "sizing step held until the running tier's workloads settle") || !strings.Contains(logged.String(), `"waitingOn"="`+tc.waiting+`"`) {
+				t.Fatalf("the held pass did not log the hold naming %s:\n%s", tc.waiting, logged.String())
+			}
+			// The workload recreated at the small row: the next pass measures
+			// the 3Gi step against 3.5Gi free and takes it.
+			if err := cl.Create(ctx, workloads[tc.missing]); err != nil {
+				t.Fatalf("recreating %s: %v", tc.name, err)
+			}
+			if err := r.resolveSizingTier(ctx, agent); err != nil {
+				t.Fatalf("second pass: %v", err)
+			}
+			if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+				t.Fatalf("status.effectiveSizingTier = %q after %s was recreated, want medium", agent.Status.EffectiveSizingTier, tc.name)
+			}
+		})
+	}
 }
 
 func TestResolveSizingTierTakesTheEarnedTierWithNoQuotaBeforeTheWorkloadsSettle(t *testing.T) {
@@ -1274,10 +1341,11 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 func TestSizingTierSettled(t *testing.T) {
 	t.Parallel()
 	// The three sized workloads at a tier's render, as the fixtures leave
-	// them, and each way one of them has not settled; a workload not there
-	// yet is settled at small and not above it; the Autopilot rewrite of a
-	// template reads as settled, and a container the template does not carry
-	// is not compared.
+	// them, and each way one of them has not settled; a workload that is not
+	// there has not settled at any tier, small included, since the quota's
+	// used total charges nothing of it while the step is measured from its
+	// row; the Autopilot rewrite of a template reads as settled, and a
+	// container the template does not carry is not compared.
 	type mutate func(proxy, gateway *appsv1.Deployment, shell *appsv1.StatefulSet) []client.Object
 	all := func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g, s} }
 	cases := []struct {
@@ -1289,8 +1357,9 @@ func TestSizingTierSettled(t *testing.T) {
 	}{
 		{"all three settled at small", sizingTierSmall, false, all, true},
 		{"all three settled at medium", sizingTierMedium, false, all, true},
-		{"at small the proxy Deployment is not there yet", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, true},
-		{"at small none of the three is there yet", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return nil }, true},
+		{"at small the proxy Deployment is not there", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, false},
+		{"at small the gateway is not there", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, s} }, false},
+		{"at small none of the three is there", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return nil }, false},
 		{"at medium the proxy Deployment is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, false},
 		{"at medium the shell StatefulSet is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g} }, false},
 		{"at medium the gateway is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, s} }, false},
