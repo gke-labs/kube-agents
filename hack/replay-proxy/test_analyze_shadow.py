@@ -582,7 +582,7 @@ class LoadTest(unittest.TestCase):
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
         self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1,
-                                   "kind_mismatch": 0})
+                                   "kind_mismatch": 0, "off_layout_files": 0})
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])
@@ -620,36 +620,68 @@ class FolderKindTest(unittest.TestCase):
         records, skipped = analyze_shadow.load([write_file([line("f1", 1, "nightly", "n", "A", ["a"])], "nightly-untrusted")])
         self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
 
-    def test_the_kind_is_the_nearest_kind_folder(self):
-        path = write_file([line("n1", 1, "nightly", "n", "A", ["a"])], "nightly")
-        nested = os.path.join(TEMP_DIR, "presubmit", "copy")
-        shutil.copytree(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path)))),
-                        os.path.join(nested, "nightly"))
-        records, _ = analyze_shadow.load([nested])
-        self.assertEqual([(r.request_id, r.kind) for r in records], [("n1", "nightly")])
-
-    def test_a_directory_is_searched_for_segments(self):
-        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
-        with open(os.path.join(os.path.dirname(path), "job-1.json"), "w") as handle:
-            handle.write("{}")
-        records, skipped = analyze_shadow.load([os.path.dirname(path)])
-        self.assertEqual([r.request_id for r in records], ["p1"])
-        self.assertEqual(skipped["not_json"], 0)
-
-    def test_a_file_under_no_kind_folder_is_refused_unless_a_kind_is_given(self):
-        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
-        with handle:
-            handle.write(json.dumps(line("n1", 1, "nightly", "n", "A", ["a"])) + "\n")
+    def test_the_kind_is_the_top_level_folder_and_a_nested_kind_folder_is_skipped(self):
+        # IAM governs only the replay-shadow/<kind>/ prefix: a presubmit names everything below it,
+        # so it uploads replay-shadow/presubmit/<day>/nightly/<day>/<build>/logs/seg.jsonl tagged nightly.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        honest = os.path.join(week, "presubmit", "2026-11-05", "1790", "logs")
+        forged = os.path.join(week, "presubmit", "2026-11-05", "nightly", "2026-11-05", "1790", "logs")
+        for directory, entry in ((honest, presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                                 (forged, line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000))):
+            os.makedirs(directory)
+            with open(os.path.join(directory, "seg.jsonl"), "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        for argument in (week, os.path.join(week, "presubmit")):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                rep = analyze_shadow.summarize(records, skipped=skipped)
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertEqual(rep["health"]["off_layout_files"], 1)
+        # Named outright, the forged file is refused, not trusted.
         with self.assertRaises(ValueError):
-            analyze_shadow.load([handle.name])
-        records, _ = analyze_shadow.load([handle.name], kind="nightly")
-        self.assertEqual([r.kind for r in records], ["nightly"])
-        records, skipped = analyze_shadow.load([handle.name], kind="presubmit")
-        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
-            analyze_shadow.main([handle.name])
-        self.assertIn("--kind", err.getvalue())
+            analyze_shadow.load([os.path.join(forged, "seg.jsonl")])
+
+    def test_a_kind_folder_its_parent_or_a_file_inside_one_all_work(self):
+        path = write_file([line("n1", 1, "nightly", "n", "A", ["a"])], "nightly")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for argument in (path, kind_folder, os.path.dirname(kind_folder), os.path.dirname(os.path.dirname(kind_folder))):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("n1", "nightly")])
+                self.assertEqual(skipped["off_layout_files"], 0)
+
+    def test_a_file_off_the_layout_inside_a_kind_folder_is_skipped(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for relative in ("stray.jsonl", "2026-11-05/stray.jsonl", "not-a-day/1/logs/seg.jsonl",
+                         "2026-11-05/1/notlogs/seg.jsonl", "2026-11-05/replay-shadow/logs/seg.jsonl"):
+            with self.subTest(relative=relative):
+                stray = os.path.join(kind_folder, relative)
+                os.makedirs(os.path.dirname(stray), exist_ok=True)
+                with open(stray, "w") as handle:
+                    handle.write(json.dumps(presubmit("s1", 1, "10", "b0", "A", ["a"])) + "\n")
+                records, skipped = analyze_shadow.load([kind_folder])
+                self.assertEqual([r.request_id for r in records], ["p1"])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                os.remove(stray)
+
+    def test_a_directory_with_no_file_at_the_layout_is_refused(self):
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        with open(os.path.join(loose, "seg.jsonl"), "w") as handle:
+            handle.write(json.dumps(presubmit("p1", 2, "10", "b1", "A", ["a"])) + "\n")
+        with self.assertRaisesRegex(ValueError, "holds no log file at the bucket's layout"):
+            analyze_shadow.load([loose])
+        records, _ = analyze_shadow.load([loose], kind="presubmit")
+        self.assertEqual([r.request_id for r in records], ["p1"])
+
+    def test_a_folder_inside_a_kind_folder_keeps_that_kind(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        records, _ = analyze_shadow.load([os.path.dirname(os.path.dirname(os.path.dirname(path)))])
+        self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+
 
 
 if __name__ == "__main__":

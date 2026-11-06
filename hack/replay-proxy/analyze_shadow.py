@@ -17,14 +17,21 @@ answer" and Rollout step 1):
   under replay those answers would have been the recorded ones. It assumes the
   recorded answer's tool calls would have returned the results this run saw.
 
-A line's job kind is the bucket folder it was copied from
-(`replay-shadow/<kind>/`, kept as the nearest enclosing directory named for a
-kind, or `--kind`), never the line's own `job.kind` tag: the proxy that stamps
-the tag is built from the commit under test, while IAM decides who may write
-each folder. A line whose tag names another kind is dropped and counted. A
-`nightly-untrusted` line (a scheduled run that uploaded as an account
-presubmits can also run as, hack/ci-env.sh) is counted and never a source:
-pull-request code could have written it.
+A line's job kind is the top-level bucket folder it was copied from, never
+the line's own `job.kind` tag: the proxy that stamps the tag is built from the
+commit under test, and IAM decides who may create objects under each
+`replay-shadow/<kind>/` prefix, though not what the uploader names below it.
+So a log file counts only at the collector's layout,
+`<kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl`, with that `<kind>` the
+only directory in its whole path named for a kind: a presubmit cannot make a
+file look nightly by nesting a `nightly/` folder in its own prefix. A file
+anywhere else is skipped and counted (`off_layout_files`) rather than failing
+the run, so an object a presubmit planted cannot stop the analysis; `--kind`
+instead names the kind of every input and skips the layout check, for logs
+from outside the bucket. A line whose tag names another kind than its file is
+dropped and counted. A `nightly-untrusted` line (a scheduled run that uploaded
+as an account presubmits can also run as, hack/ci-env.sh) is counted and never
+a source: pull-request code could have written it.
 
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
@@ -74,6 +81,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -87,6 +95,16 @@ PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
 # The proxy's segment files (spool.py); a directory argument is searched for these.
 LOG_SUFFIX = ".jsonl"
+# Where collect_shadow.py files a segment under the bucket's BUCKET_ROOT:
+# <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl. The build is BUILD_ID's
+# shape (hack/ci-env.sh, REPLAY_SHADOW_BUILD_RE) and the segment name the
+# logs/ form of collect_shadow.SAFE_NAME.
+BUCKET_ROOT = "replay-shadow"
+LOGS_DIR = "logs"
+DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+BUILD_DIR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SEGMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
+FILED_DEPTH = 5
 # Requests sharing a prefix that a miss is compared against, newest first, one per distinct next message.
 MAX_PREFIX_CANDIDATES = 64
 STORE_MESSAGES_KEY = "messages"
@@ -131,8 +149,11 @@ SKIP_ANALYSIS_DROPPED = "analysis_dropped"
 SKIP_NO_FINGERPRINT = "no_fingerprint"
 # The line's job.kind tag names a kind other than the folder it was filed under.
 SKIP_KIND_MISMATCH = "kind_mismatch"
+# Files, not lines: a log file found under a directory argument but not at the
+# collector's layout (FILED_DEPTH), so its kind is not the folder IAM governs.
+SKIP_OFF_LAYOUT = "off_layout_files"
 SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT,
-                SKIP_KIND_MISMATCH)
+                SKIP_KIND_MISMATCH, SKIP_OFF_LAYOUT)
 # Labels in Miss.first_difference_role besides a message role.
 DIFF_UNHASHED = "unhashed"
 DIFF_SETTINGS = "settings"
@@ -477,39 +498,64 @@ class PrefixSources(Sources):
         return bool(seen), ranked[1], ranked[0]
 
 
-def folder_kind(path: str) -> Optional[str]:
-    """The job kind a file was filed under: its nearest enclosing directory named for one."""
-    for part in reversed(os.path.normpath(os.path.abspath(os.path.dirname(path))).split(os.sep)):
-        if part in JOB_KINDS:
-            return part
-    return None
+def filed_kind(path: str) -> Optional[str]:
+    """The kind a file was filed under, when it sits at the collector's layout, else None.
+
+    The layout is the path's last FILED_DEPTH components; its kind directory must
+    be the only component of the whole absolute path named for a kind (or the
+    bucket root), since everything below a kind prefix is the uploader's choice.
+    """
+    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
+    if len(parts) < FILED_DEPTH:
+        return None
+    kind, day, build, logs, name = parts[-FILED_DEPTH:]
+    reserved = set(JOB_KINDS) | {BUCKET_ROOT}
+    if (kind not in JOB_KINDS or not DAY_DIR.match(day) or not BUILD_DIR.match(build) or build in reserved
+            or logs != LOGS_DIR or not SEGMENT_NAME.match(name)):
+        return None
+    if any(part in JOB_KINDS for part in parts[:-FILED_DEPTH]):
+        return None
+    return kind
 
 
-def log_files(paths: Iterable[str], kind: Optional[str] = None) -> List[Tuple[str, str]]:
-    """Each log file under `paths` with its job kind: `kind` when given, else its folder's.
+def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tuple[str, str]], int]:
+    """Each log file under `paths` with its job kind, and how many were skipped off the layout.
 
-    Raises ValueError for a file with neither, rather than trusting its lines' tags.
+    With `kind`, every file found is that kind. Without it, a file's kind is
+    filed_kind's; one found under a directory but off the layout is skipped and
+    counted. Raises ValueError for a file named outright that is off the
+    layout, or a directory with log files none of
+    which is on it, each a mistake in the arguments rather than a planted file.
     """
     found: List[Tuple[str, str]] = []
+    off_layout = 0
+    layout = f"<{'|'.join(JOB_KINDS)}>/<YYYY-MM-DD>/<build>/{LOGS_DIR}/<segment>{LOG_SUFFIX}"
     for path in paths:
-        files = [path]
-        if os.path.isdir(path):
-            files = sorted(os.path.join(root, name) for root, _, names in os.walk(path)
-                           for name in names if name.endswith(LOG_SUFFIX))
-        for name in files:
-            file_kind = kind or folder_kind(name)
+        if not os.path.isdir(path):
+            file_kind = kind or filed_kind(path)
             if file_kind is None:
-                raise ValueError(f"{name} is under no {', '.join(JOB_KINDS)} folder; copy the bucket's "
-                                 "replay-shadow/<kind>/ folders as they are, or pass --kind")
-            found.append((name, file_kind))
-    return found
+                raise ValueError(f"{path} is not at the bucket's layout ({layout}, with no other directory in its "
+                                 "path named for a kind); pass --kind to name its kind")
+            found.append((path, file_kind))
+            continue
+        files = sorted(os.path.join(root, name) for root, _, names in os.walk(path)
+                       for name in names if name.endswith(LOG_SUFFIX))
+        filed = [(name, kind or filed_kind(name)) for name in files]
+        kept = [(name, file_kind) for name, file_kind in filed if file_kind is not None]
+        if files and not kept:
+            raise ValueError(f"{path} holds no log file at the bucket's layout ({layout}, with no other directory "
+                             "in its path named for a kind); pass a kind folder or its parent, or --kind")
+        found += kept
+        off_layout += len(files) - len(kept)
+    return found, off_layout
 
 
 def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record], Dict[str, int]]:
     """Read JSON lines from each path (log_files); returns the records in time order and skip counts."""
     records: List[Record] = []
     skipped = {reason: 0 for reason in SKIP_REASONS}
-    for path, file_kind in log_files(paths, kind):
+    files, skipped[SKIP_OFF_LAYOUT] = log_files(paths, kind)
+    for path, file_kind in files:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -594,6 +640,8 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
         "untagged_lines": skipped.get(SKIP_UNTAGGED, 0),
         # Tagged with a kind other than their folder's: dropped, never trusted.
         "kind_mismatch_lines": skipped.get(SKIP_KIND_MISMATCH, 0),
+        # Log files off the collector's layout: skipped whole, never trusted.
+        "off_layout_files": skipped.get(SKIP_OFF_LAYOUT, 0),
         "unstorable_lines": sum(1 for r in records if not r.storable),
         "unstorable_percent_by_reason": {
             reason: percent(count, len(records)) for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1])
@@ -725,7 +773,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("logs", nargs="+", help="JSONL files written by replay_proxy.py, or directories of them")
     parser.add_argument("--kind", choices=JOB_KINDS,
-                        help="the job kind of every input, instead of the replay-shadow/<kind>/ folder each is under")
+                        help="the job kind of every input, instead of the <kind>/<day>/<build>/logs/ folder each is under")
     parser.add_argument("--merged", help="JSON file mapping a pull request number to its merge time (epoch seconds)")
     parser.add_argument("--store", help="the copied-out REPLAY_STORE_DIR, to rank requests sharing a prefix by text")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_MISSES, help="misses to list")
