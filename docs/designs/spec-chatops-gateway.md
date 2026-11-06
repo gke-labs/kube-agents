@@ -2491,9 +2491,17 @@ and `messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) r
 a different end of the same task (a never-started heal, then its late completion) is a new frame. An
 end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
 worded as the page's notice is. A completed
-task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
-client need not wait. Its text is the deliverable for a completed task and the gateway's notice
+task that handed work to kanban cards and left them unsettled at turn end (the bridge's `handoff`
+artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
+`waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
+via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
+true`, so a client waits for the cards' notify frames; on console and MCP origins
+(`!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`), the bridge's `api` executor instead
+holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
+turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`
+so no `handoff` or `"cardsPending": true` is emitted once the cards settle in turn. Without
+`"cardsPending": true`, no unsettled handoff remains and the client need not wait. Its text is the
+deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
 carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
