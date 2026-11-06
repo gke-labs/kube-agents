@@ -818,6 +818,11 @@ class EmbeddedReadScriptTest(unittest.TestCase):
                 ),
                 ("t_pr_false", "done", None, None),
                 ("t_pr_zero", "done", None, None),
+                ("t_pr_none", "done", None, None),
+                ("t_pr_na", "done", None, None),
+                ("t_pr_issue", "done", None, None),
+                ("t_pr_new", "done", None, None),
+                ("t_pr_mixed", "done", None, None),
                 ("t_input", "blocked", "needs_input", None),
                 ("t_access", "blocked", "capability", None),
                 ("t_gave_up", "blocked", "needs_input", None),
@@ -847,6 +852,14 @@ class EmbeddedReadScriptTest(unittest.TestCase):
                     # Only a text value is a URL.
                     ("t_pr_false", '{"pr_url": false}'),
                     ("t_pr_zero", '{"pr_url": 0}'),
+                    # A text value counts only when it is a PR or MR URL, as in
+                    # the result.
+                    ("t_pr_none", '{"pr_url": "none"}'),
+                    ("t_pr_na", '{"pr_url": "n/a"}'),
+                    ("t_pr_issue", '{"pr_url": "https://github.com/acme/infra/issues/5"}'),
+                    ("t_pr_new", '{"pr_url": "https://github.com/acme/infra/pull/new/fix-branch"}'),
+                    ("t_pr_mixed", '{"pr_url": "none"}'),
+                    ("t_pr_mixed", '{"pr_url": "https://github.com/acme/infra/pull/9"}'),
                 ],
             )
             connection.executemany(
@@ -888,6 +901,11 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             "t_running_pr": (None, 0, 0),
             "t_pr_false": (None, 0, 0),
             "t_pr_zero": (None, 0, 0),
+            "t_pr_none": (None, 0, 0),
+            "t_pr_na": (None, 0, 0),
+            "t_pr_issue": (None, 0, 0),
+            "t_pr_new": (None, 0, 0),
+            "t_pr_mixed": (None, 0, 1),
             "t_input": ("needs_input", 0, 0),
             "t_access": ("capability", 0, 0),
             "t_gave_up": ("needs_input", 1, 0),
@@ -947,6 +965,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             self.assertNotIn("github.com/acme/infra/pull", text)
             self.assertNotIn("merge_requests", text)
             self.assertNotIn("pr_scan_result", text)
+            self.assertNotIn("pr_scan_metadata", text)
 
     def test_reads_tolerate_a_board_without_card_state_columns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -959,6 +978,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             (row["block_kind"], row["gave_up"], row["has_pr"]), (None, 0, 0)
         )
         self.assertNotIn("pr_scan_result", row)
+        self.assertNotIn("pr_scan_metadata", row)
 
     def test_provider_parses_card_state_from_the_real_read(self):
         with tempfile.TemporaryDirectory() as directory:
