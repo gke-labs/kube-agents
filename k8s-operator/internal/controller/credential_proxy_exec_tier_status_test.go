@@ -200,6 +200,20 @@ func TestTheStatusWriterFollowsTheTierAsItBecomesReady(t *testing.T) {
 	if c := condition(t); c == nil || c.Status != metav1.ConditionTrue || c.Message != "2 of 2 exec-tier replicas are Ready." {
 		t.Fatalf("after both replicas: %+v", c)
 	}
+	// A pass that reads the same count writes nothing: a write would wake the
+	// next pass, and so on.
+	settled := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, settled); err != nil {
+		t.Fatal(err)
+	}
+	condition(t)
+	again := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, again); err != nil {
+		t.Fatal(err)
+	}
+	if again.ResourceVersion != settled.ResourceVersion {
+		t.Fatalf("an unchanged pass wrote status: ResourceVersion %s -> %s", settled.ResourceVersion, again.ResourceVersion)
+	}
 }
 
 func TestATerminatingPodIsNotNamedAsUnschedulable(t *testing.T) {
@@ -306,6 +320,35 @@ func TestAShortTierRequeuesSoonerOnATodayInstall(t *testing.T) {
 	}
 	if res := pass(t); res.RequeueAfter != secretEnvReprobeInterval {
 		t.Fatalf("ready tier: RequeueAfter = %v, want the steady-state %v", res.RequeueAfter, secretEnvReprobeInterval)
+	}
+}
+
+// The out-of-date ClusterRole path returns before the steady-state requeue,
+// so it has to ask for the short tier's sooner pass on its own. A today
+// install, because a next install's pending gateway returns sooner still.
+func TestAShortTierRequeuesSoonerWhileTheClusterRoleIsOutOfDate(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns", Finalizers: []string{platformAgentFinalizer}},
+		Spec: agentv1alpha1.PlatformAgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+			CredentialProxy: &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(2))}},
+		}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
+	checker := NewRBACChecker(authorizer.reviews())
+	if _, err := checker.Probe(context.Background()); err != nil {
+		t.Fatalf("boot probe: %v", err)
+	}
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64), RBAC: checker}
+	res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != credentialProxyExecShortRequeue {
+		t.Fatalf("short tier with an out-of-date ClusterRole: RequeueAfter = %v, want %v", res.RequeueAfter, credentialProxyExecShortRequeue)
 	}
 }
 

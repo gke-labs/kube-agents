@@ -41,14 +41,14 @@ const (
 	// because a caller that cannot reach it falls back to the stateful broker
 	// (docs/designs/credential-broker-exec-tier.md §3.2), so the agent works
 	// while the tier is short.
-	credentialProxyExecReadyConditionType = "CredentialProxyExecReady"
+	credentialProxyExecReadyConditionType = "CredentialProxyExecReady" // #nosec G101 -- Condition type, not a credential
 	credentialProxyExecReadyReason        = "AllReplicasReady"
 	credentialProxyExecUnavailableReason  = "ReplicasUnavailable"
 	// A tier pod the scheduler could not place: the most common cause on a
 	// small node pool, where each replica needs 2 free CPU (#4536).
-	credentialProxyExecUnschedulableReason = "Unschedulable"
+	credentialProxyExecUnschedulableReason = "Unschedulable" // #nosec G101 -- Condition reason, not a credential
 	// credentialProxyExecReadyMessageFormat takes the Ready and the desired count.
-	credentialProxyExecReadyMessageFormat = "%d of %d exec-tier replicas are Ready."
+	credentialProxyExecReadyMessageFormat = "%d of %d exec-tier replicas are Ready." // #nosec G101 -- Message format, not a credential
 	// credentialProxyExecUnschedulableMessageFormat takes the Ready count, the
 	// desired count, the pod's name, the scheduler's message, and the
 	// replica's CPU request twice.
