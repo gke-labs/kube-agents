@@ -551,8 +551,8 @@ SESSION_TOOL_BUDGET_MAX_SESSIONS = 1024
 # the oldest-failed is dropped past this many, so an entry stays bounded
 # whatever the session sends, and any success clears them all.
 SESSION_LOOP_BREAKER_SIGNATURES = 8
-# The field's grammar, the shim's CALLER_LABEL_RE (and content_workspace's): a
-# body value outside it is a 400, as a malformed kubeconfigContext is.
+# The field's grammar, the shim's CALLER_LABEL_RE: a body value outside it
+# is a 400, as a malformed kubeconfigContext is.
 SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 SESSION_ID_FIELD = "sessionId"
 SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
