@@ -110,6 +110,8 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
     "ci-kube-agents-eval-nightly-gitlab-ce-next",
+    "ci-kube-agents-eval-weekly-ghes-next",
+    "ci-kube-agents-eval-weekly-gitlab-ce-next",
     "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
