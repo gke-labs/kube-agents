@@ -1240,7 +1240,7 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
-`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
+`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-cli-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
 runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
 renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
