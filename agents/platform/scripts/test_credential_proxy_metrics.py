@@ -1331,7 +1331,7 @@ class ReadingsMetricTest(_BrokerFixture):
 
     def test_the_failure_counter_carries_every_reason(self):
         metrics = CredentialProxyHandler.metrics
-        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming")
+        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming", "quota_floor")
         for reason in reasons:
             metrics.record_reading_failure(reason)
         metrics.record_reading_failure("rate_limited")

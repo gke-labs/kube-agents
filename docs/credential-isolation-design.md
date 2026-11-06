@@ -118,9 +118,10 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
-window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
-roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
+idle-install hold on model-run cron jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
@@ -345,7 +346,8 @@ to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
-`/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
+`/var/run/secrets/kubeagents/serviceaccount/token` in the stateful broker's credential
+runtime (the exec tier does not mount it). A token
 for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
 read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the

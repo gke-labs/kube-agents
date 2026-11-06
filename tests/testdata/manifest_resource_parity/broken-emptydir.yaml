@@ -1,0 +1,32 @@
+# A pod that must fail tests/test_manifest_resource_parity.py: the shape of
+# gke-labs/kube-agents#4314, a 5Gi state emptyDir mounted writable by a
+# container whose ephemeral-storage limit is 2Gi. The kubelet charges the
+# volume to the pod and evicts it once writes pass the limit, long before the
+# volume's own sizeLimit. Everything else about the pod is declared, so the
+# emptyDir rules are the only ones it breaks.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken
+spec:
+  template:
+    spec:
+      containers:
+        - name: broker
+          image: example/broker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+              ephemeral-storage: 2Gi
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/state
+      volumes:
+        - name: state
+          emptyDir:
+            sizeLimit: 5Gi

@@ -149,7 +149,18 @@
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
-{{- $callbackList := ternary (list "otel" "prometheus") (list "prometheus") .Values.litellm.otel }}
+{{- /*
+  Every callback entry, named once in kube-agents.litellmCallbacks and sorted
+  there by whether it is in the shadow replay proxy's key: $keyedHook entries
+  change what the model is sent or what comes back, $unkeyedHook entries only
+  export telemetry, fetch a credential or pick a serving replica. A keyed
+  hook's source goes in $replayBehaviourSources where it is registered.
+*/}}
+{{- $callbackClasses := include "kube-agents.litellmCallbacks" . | fromJson }}
+{{- $keyedHook := $callbackClasses.replayKeyed }}
+{{- $unkeyedHook := $callbackClasses.replayUnkeyed }}
+{{- $callbackList := ternary (list $unkeyedHook.otel $unkeyedHook.prometheus) (list $unkeyedHook.prometheus) .Values.litellm.otel }}
+{{- $replayBehaviourSources := list }}
 {{- /*
   The thinking-replay hook runs on every install: it acts only on a request
   bound for a Gemini model, and leaves every other model's request as sent.
@@ -159,7 +170,8 @@
 {{- if empty $thinkingReplaySource }}
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.thinkingReplay }}
+{{- $replayBehaviourSources = append $replayBehaviourSources $thinkingReplaySource }}
 {{- /*
   The cache-marker hook runs on every install too: it drops a caller's own
   cache_control markers from a request bound for a Gemini model, which LiteLLM
@@ -170,9 +182,11 @@
 {{- if empty $cacheControlStripSource }}
 {{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.cacheControlStrip }}
+{{- $replayBehaviourSources = append $replayBehaviourSources $cacheControlStripSource }}
 {{- if $redactionEnabled }}
-{{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.redaction }}
+{{- $replayBehaviourSources = concat $replayBehaviourSources (list $redactionConfig $redactorSource $redactionCallbackSource) }}
 {{- end }}
 {{- /*
   The OAuth2 client-credentials hook, for an openai_compatible gateway that
@@ -189,7 +203,7 @@
 {{- if empty $oauthHookSource }}
 {{- fail "the chart's files/litellm_oauth2_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $unkeyedHook.oauth2 }}
 {{- end }}
 {{- /*
   The session-affinity hook gives each Gemini conversation a Vertex session_id
@@ -210,7 +224,7 @@
 {{- if empty $sessionAffinitySource }}
 {{- fail "litellm.vertex.sessionAffinity is enabled but the chart's files/litellm_session_affinity_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_session_affinity_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $unkeyedHook.sessionAffinity }}
 {{- end }}
 {{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
 {{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
@@ -234,7 +248,7 @@
 {{- if empty $traceLogSource }}
 {{- fail "the chart's files/llm_trace_logger.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $unkeyedHook.traceLog }}
 {{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
@@ -273,6 +287,16 @@
 */}}
 {{- $replayShadow := .Values.litellm.replayShadow | default dict }}
 {{- $replayShadowEnabled := default false $replayShadow.enabled }}
+{{- $replayModelBehaviourChecksum := "" }}
+{{- if $replayShadowEnabled }}
+{{- $replayBehaviourCallbacks := list }}
+{{- range $callbackList }}
+{{- if has . (values $keyedHook) }}
+{{- $replayBehaviourCallbacks = append $replayBehaviourCallbacks . }}
+{{- end }}
+{{- end }}
+{{- $replayModelBehaviourChecksum = include "kube-agents.replayModelBehaviourChecksum" (dict "config" $config "callbacks" $replayBehaviourCallbacks "sources" $replayBehaviourSources) }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -798,10 +822,12 @@ spec:
             - name: REPLAY_DATA_MAX_BYTES
               value: {{ $replayShadowDataMaxBytes | quote }}
             # What the LiteLLM pods are running, part of every fingerprint:
-            # the same checksum their checksum/config annotation carries, and
-            # their image. A change to either rolls the proxy with them.
-            - name: REPLAY_LITELLM_CONFIG_CHECKSUM
-              value: {{ $checksumInput | sha256sum | quote }}
+            # a checksum of the config that treats the Gemini API and Vertex
+            # AI routes as one (kube-agents.replayModelBehaviourChecksum says
+            # why, and what else it leaves out), and their image. A change to
+            # either rolls the proxy.
+            - name: REPLAY_MODEL_BEHAVIOUR_CHECKSUM
+              value: {{ $replayModelBehaviourChecksum | quote }}
             - name: REPLAY_LITELLM_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
             - name: REPLAY_JOB_KIND

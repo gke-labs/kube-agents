@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -340,6 +341,15 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// BreakerThreshold lease expiries in a row on one (profile, tier) open
+	// its breaker, which holds new submissions there queued for
+	// BreakerCooldownSeconds. 0 takes the dispatcher's defaults (3 and 300).
+	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
+	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
+	// StopGraceSeconds is how long a running task's executor has to stop on
+	// its own after a stop record (contract addendum 9) before the
+	// dispatcher ends it. 0 takes the dispatcher's default (30).
+	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
 	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
 	// submission (the operator renders it from the same value as the
 	// stream's max age). A durable re-created over the stream replays
@@ -374,6 +384,10 @@ type DispatchDurable struct {
 	Name string `json:"name"`
 }
 
+// MaxDispatchSeconds bounds every second count in a DispatchConfig, so each
+// converts to a time.Duration without overflow.
+const MaxDispatchSeconds = math.MaxInt32
+
 // Validate reports the first way c can't be dispatched on, or nil. The
 // operator renders only configs that pass; the dispatcher checks again and
 // keeps its last good config rather than run on a broken one.
@@ -389,8 +403,15 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: lease %ds must be at least three renewals of %ds", c.LeaseSeconds, c.RenewSeconds)
 	case c.RestartGraceSeconds < 2*c.RenewSeconds:
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
+	case c.StopGraceSeconds < 0:
+		return fmt.Errorf("dispatch config: stop grace %ds may not be negative", c.StopGraceSeconds)
+	case c.BreakerThreshold < 0 || c.BreakerCooldownSeconds < 0:
+		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case max(c.LeaseSeconds, c.RenewSeconds, c.RestartGraceSeconds, c.AcceptTimeoutSeconds,
+		c.BreakerCooldownSeconds, c.StopGraceSeconds) > MaxDispatchSeconds:
+		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
 	case c.SubmitRetentionSeconds < 0:
 		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
 	}
@@ -400,6 +421,9 @@ func (c DispatchConfig) Validate() error {
 			return fmt.Errorf("dispatch config: profile %q is not a subject token, or is listed twice", p.Name)
 		}
 		seen[p.Name] = true
+		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
+			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
+		}
 		if p.Concurrency < 1 || len(p.Tiers) == 0 || len(p.Durables) == 0 {
 			return fmt.Errorf("dispatch config: profile %s needs a concurrency, a tier and a durable", p.Name)
 		}

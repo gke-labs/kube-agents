@@ -392,8 +392,9 @@ carries a `mean` and its `n` per metric and not the repetitions' own values. So:
 
 **Only the nightly's lines feed the trend.** The store holds what ran on `main` — only the nightly
 appends to it, a pull request's run is graded against it and never writes — so a trend read from
-the store is nightly-only by construction. The presubmit's judged scores stay on the run page: they
-are per pull request, mix in broken branches, and are not evidence about `main`.
+the store is nightly-only by construction. The presubmit's judged scores (`OutcomeValidity` and
+`OutcomeScore`; a pull request's run skips `ToolInvocation` and `ChecklistScore`) stay on the run
+page: they are per pull request, mix in broken branches, and are not evidence about `main`.
 
 **Retention covers a quarter, and more.** Nothing in the bucket is ever deleted (no lifecycle rule,
 no `storage.objects.delete` on either identity); what is bounded is the read. The reader takes the

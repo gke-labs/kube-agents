@@ -229,7 +229,9 @@ class WebConsoleChartTest(unittest.TestCase):
     def test_quota_preflight_counts_the_console(self) -> None:
         self.assertRegex(
             HELPERS.read_text(),
-            r'(?s)if \.Values\.webConsole\.enabled -\}\}(?:(?!\{\{- end).)*append \$chartWorkloads \(dict "values" \.Values\.webConsole ',
+            # kube-agents.chartWorkloads, which the preflight and the operator's chart-pods
+            # count both read (#4893).
+            r'(?s)if \.Values\.webConsole\.enabled -\}\}(?:(?!\{\{- end).)*append \$w \(dict "name" "web-console" "standing" true "values" \.Values\.webConsole ',
         )
 
     def test_off_by_default(self) -> None:
