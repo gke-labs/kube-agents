@@ -42,11 +42,29 @@ Two tiers. The issue is the only always-on object.
 
 ### Tier 1 — the ledger issue
 
-One open GitHub issue per audit stream, rewritten in place on every run.
+One open GitHub issue per audit stream per install, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The ledger is scoped to the install that writes it. `ledger_scope()` derives the scope from the
+  host cluster the operator declares on the pods (`GKE_PROJECT_ID`, `GKE_LOCATION`,
+  `GKE_CLUSTER_NAME`, which `spec.harness` sets), or from `FLEET_AUDIT_LEDGER_SCOPE` when that is
+  in the shell pod's environment; an install with neither has no scope and keeps the unscoped
+  ledger. A scope is a label, `audit-scope:<cluster slug>-<8 hex of the identity's SHA-256>`, under
+  GitHub's 50-character label limit, and a name, the cluster's, which the title carries in
+  parentheses after the stream's name. Two installs that audit different fleets into one repository
+  therefore keep one ledger per stream each, where before they rewrote one ledger in turn and a
+  clean run over one fleet closed a ledger that carried the other fleet's findings. A relative age in
+  a finding's free text ("completed 166 days ago") is dated to the run that published it ("as of
+  2026-11-06"), once, since a finding's wording is carried between runs and the body is rewritten
+  only by a run with findings. The evidence is left as written: the carry of unchanged wording
+  compares it byte for byte between runs.
 - The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
-  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  label and, on a scoped install, the scope label. When that list is empty on a scoped install, a
+  second list on the stream label alone finds the ledger from before scopes: an open issue with no
+  `audit-scope:` label at all, which the install adopts by adding its scope label, so an upgrade
+  does not open a second ledger. An open issue carrying another install's scope label is that
+  install's and is never read, rewritten or closed. When the list has more than one issue, the
+  highest number is the ledger. An empty list is
   not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
   time, usually just after a label write. `start`, `finish` and `remediate` look up the ledger, and
   each one ensures the labels just before the lookup. The forge writes a label only when its colour
@@ -83,7 +101,13 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   `resolved_because` (#1683) — or, on a run that passed `--manifest-file`, whose candidate the
   collector still emits and the document has not moved under `declared`
   ([collector design §3.3](fleet-audit-collector-manifest.md)). `start` hands the worker the
-  carried findings so it can. After the close, the run changes the title to `0 findings` and puts a
+  carried findings so it can. A previous finding on a cluster the run lists in neither
+  `scope.clusters` nor `scope.skipped` holds nothing: the run's fleet listing has no such cluster,
+  which is a cluster deleted since the finding was filed, and a ledger held open for it would never
+  close (`bench/tasks/fleet-audit-clean-close-reads-clean`). The close retires it, but the
+  all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out, the
+  JSON line lists it under `retired_unlisted`, and the run is never silent over one. After the
+  close, the run changes the title to `0 findings` and puts a
   banner above the old body, so the closed issue does not show its findings as open. After and not
   before: if the close fails, an open ledger must not show an all-clear. The old
   body stays below the banner as the record. A later run with findings opens a new ledger, because
@@ -1581,13 +1605,14 @@ reaches the channel. The ledger stays the record in both cases.
 
 `ensure_labels` gains two entries; the rest are unchanged.
 
-| Label                | Applies to  | Purpose                                      |
-| -------------------- | ----------- | -------------------------------------------- |
-| `agent:audit`        | issue + PRs | Everything this skill owns                   |
-| `audit:<audit-id>`   | issue + PRs | Stream identity; how the ledger is found     |
-| `audit:remediation`  | PRs only    | Distinguishes a fix PR from the ledger issue |
-| `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
-| `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
+| Label                | Applies to  | Purpose                                                                                                                                 |
+| -------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent:audit`        | issue + PRs | Everything this skill owns                                                                                                              |
+| `audit:<audit-id>`   | issue + PRs | Stream identity; how the ledger is found                                                                                                |
+| `audit-scope:<slug>` | issue + PRs | Install identity (§2); only on a scoped install. The ledger lookup and the remediation listing keep what carries this install's or none |
+| `audit:remediation`  | PRs only    | Distinguishes a fix PR from the ledger issue                                                                                            |
+| `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)                                                                                             |
+| `severity:*`         | issue + PRs | Highest live severity, mutually exclusive                                                                                               |
 
 A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets none of these.
 There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
