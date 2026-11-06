@@ -1119,7 +1119,7 @@ def main(argv=None):
         if reviews is None:
             reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
         approved = approved_logins(pull_request, reviews, approvers, robot_accounts(config))
-        remaining = uncovered_files(by_file, approved) if approved else {}
+        remaining = uncovered_files(by_file, approved | {author.lower()}) if approved else {}
         if remaining:
             by_file = remaining
             log(f"Already approved by {', '.join(sorted(approved))}; drawing only for the files they cannot approve")

@@ -993,6 +993,17 @@ class MainTest(_MainHarness):
             self.assertEqual(len(self.requested()), 1, seed)
             self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
 
+    def test_the_override_counts_the_authors_own_files_as_covered(self):
+        # bradhoekstra approves the doc half of his own change and lapis2002
+        # approved the replay-proxy half: nothing is still owed, so the
+        # override draws as it would with no approvals, not for his files.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        author = pull_request(user={"login": "bradhoekstra", "type": "User"})
+        self.run_main(author, [review("lapis2002", "APPROVED")], "--react-to", str(self.COMMENT_ID), files=files)
+        self.assertEqual(self.code, 0)
+        self.assertNotIn("drawing only for the files they cannot approve", self.stderr.getvalue())
+        self.assertIn(self.requested()[0], ("jayantid", "lapis2002"))
+
     def test_the_override_narrows_the_pool_too(self):
         # `/request-review` skips the verdict check, not the narrowing: the
         # person asking wants a reviewer now, and a non-approver's pull request
