@@ -635,6 +635,8 @@ The daily recap has the line "N alerts from M workloads withheld by the daily ce
 
 Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
 
+The recap line "N events from M workloads were silenced by alert-exclude rules" counts the events that the [alert-exclude rules](/kube-agents/operator/platformagent-crd/#specharnesseventwatcher) held back, and names the five workloads that sent the most. These events never reached the ceiling, and `GET /v1/intercepted-events` lists them with the status `excluded`.
+
 The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
 
 #### Sizing a bucket
