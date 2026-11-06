@@ -103,25 +103,6 @@ type Tool struct {
 	Call       func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
-type callMetaKey struct{}
-
-// WithCallMeta attaches the JSON-RPC tools/call _meta object to ctx.
-func WithCallMeta(ctx context.Context, meta map[string]any) context.Context {
-	if len(meta) == 0 {
-		return ctx
-	}
-	return context.WithValue(ctx, callMetaKey{}, meta)
-}
-
-// CallMetaFromContext returns the tools/call _meta object attached to ctx, if any.
-func CallMetaFromContext(ctx context.Context) map[string]any {
-	if ctx == nil {
-		return nil
-	}
-	m, _ := ctx.Value(callMetaKey{}).(map[string]any)
-	return m
-}
-
 // Server is the protocol core: it dispatches JSON-RPC frames to the tools it
 // was built with. It holds no transport and no bus; those are the tools' and
 // the HTTP handler's.
@@ -250,7 +231,6 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 		var params struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
-			Meta      map[string]any  `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, msgNeedsToolName)
@@ -260,7 +240,7 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 		if _, ok := s.tools[params.Name]; !ok {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, fmt.Sprintf(msgUnknownTool, params.Name))
 		}
-		return marshalRPCResult(req.ID, s.CallTool(WithCallMeta(ctx, params.Meta), params.Name, params.Arguments))
+		return marshalRPCResult(req.ID, s.CallTool(ctx, params.Name, params.Arguments))
 	// Neither is a capability this server declares; an empty list is the
 	// polite answer to a client that asks anyway.
 	case methodResourcesList:

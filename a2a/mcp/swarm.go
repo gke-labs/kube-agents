@@ -29,27 +29,20 @@ import (
 )
 
 const (
-	swarmDefaultTitle          = "kube-agents swarm"
-	swarmLedgerSchema          = 8
-	swarmManagedByTag          = "kube-agents"
-	swarmRoleCoordinator       = "coordinator"
-	swarmRoleNarrator          = "narrator"
-	swarmRoleWorker            = "worker"
-	swarmWakeMentions          = "mentions"
-	swarmWakeWorking           = "working"
-	swarmMemberCoordinator     = "coordinator"
-	swarmMemberNarrator        = "narrator"
-	swarmMemberPlatform        = "platform"
-	swarmMemberGateway         = "gateway"
-	swarmConsolePrefix         = "console:"
-	swarmSessionPrefix         = "session-"
-	swarmShortSessionPrefix    = "s-"
-	swarmDefaultAlias          = "default"
-	swarmSessionWorkerFallback = "session-worker"
-	swarmSubSuffix             = "-sub"
-	swarmEllipsis              = "…"
-	maxAliasSlugBytes          = 28
-	shortHandleCapBytes        = 8
+	swarmDefaultTitle      = "kube-agents swarm"
+	swarmLedgerSchema      = 8
+	swarmManagedByTag      = "kube-agents"
+	swarmRoleCoordinator   = "coordinator"
+	swarmRoleNarrator      = "narrator"
+	swarmRoleWorker        = "worker"
+	swarmWakeMentions      = "mentions"
+	swarmWakeWorking       = "working"
+	swarmMemberCoordinator = "coordinator"
+	swarmMemberNarrator    = "narrator"
+	swarmMemberPlatform    = "platform"
+	swarmMemberGateway     = "gateway"
+	swarmConsolePrefix     = "console:"
+	swarmEllipsis          = "…"
 
 	// Adam's text and view caps, unchanged.
 	maxBoardEventTextChars  = 240
@@ -1559,19 +1552,19 @@ func firstPositiveInt(vals ...int) int {
 // alias; an alias with no usable slug falls back to its parent's slug, then
 // to a short form of its handle.
 func deriveSessionMemberName(alias, parentSlug, handle string) string {
-	if slug := sanitizeAliasSlug(alias); slug != "" && slug != swarmDefaultAlias {
-		if strings.HasPrefix(slug, swarmSessionPrefix) || strings.HasPrefix(slug, swarmShortSessionPrefix) {
+	if slug := sanitizeAliasSlug(alias); slug != "" && slug != "default" {
+		if strings.HasPrefix(slug, "session-") || strings.HasPrefix(slug, "s-") {
 			return sanitizeMemberName(slug)
 		}
-		return sanitizeMemberName(swarmSessionPrefix + slug)
+		return sanitizeMemberName("session-" + slug)
 	}
-	if parentSlug != "" && parentSlug != swarmDefaultAlias {
-		return sanitizeMemberName(swarmSessionPrefix + parentSlug + swarmSubSuffix)
+	if parentSlug != "" && parentSlug != "default" {
+		return sanitizeMemberName("session-" + parentSlug + "-sub")
 	}
-	if short := sanitizeAliasSlug(capBytes(handle, shortHandleCapBytes)); short != "" {
-		return sanitizeMemberName(swarmSessionPrefix + short)
+	if short := sanitizeAliasSlug(capBytes(handle, 8)); short != "" {
+		return sanitizeMemberName("session-" + short)
 	}
-	return swarmSessionWorkerFallback
+	return "session-worker"
 }
 
 func uniqueMemberName(base string, used map[string]bool) string {
@@ -1640,15 +1633,8 @@ func sanitizeAliasSlug(raw string) string {
 		res = strings.TrimSuffix(res, trimWord)
 	}
 	res = strings.Trim(res, "-")
-	hasSessionPrefix := strings.HasPrefix(res, swarmSessionPrefix)
-	if hasSessionPrefix {
-		res = strings.Trim(res[len(swarmSessionPrefix):], "-")
-	}
-	if len(res) > maxAliasSlugBytes {
-		res = strings.Trim(res[:maxAliasSlugBytes], "-")
-	}
-	if hasSessionPrefix && res != "" {
-		res = swarmSessionPrefix + res
+	if len(res) > 28 {
+		res = strings.Trim(res[:28], "-")
 	}
 	return res
 }

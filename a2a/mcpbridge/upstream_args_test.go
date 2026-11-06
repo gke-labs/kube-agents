@@ -183,54 +183,6 @@ func TestCallRemoteToolMetaCarriesOnlyTheCalledConversation(t *testing.T) {
 	}
 }
 
-func TestCallRemoteToolAutoInjectsStreamStepsOnlyForConversationID(t *testing.T) {
-	forwardedArgs := make(chan map[string]any, 4)
-	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var req rpcRequest
-		_ = json.Unmarshal(body, &req)
-		var params struct {
-			Arguments map[string]any `json:"arguments"`
-		}
-		_ = json.Unmarshal(req.Params, &params)
-		forwardedArgs <- params.Arguments
-		w.Header().Set("Content-Type", contentTypeJSON)
-		_, _ = fmt.Fprintf(w, "%s\n", marshalRPCResult(req.ID, CallToolResult{
-			Content: []TextContent{{Type: contentTypeText, Text: "ok"}},
-		}))
-	}))
-	defer gw.Close()
-
-	sess := &gatewayBridgeSession{baseURL: gw.URL, httpClient: &http.Client{}}
-
-	// 1. progressToken alone (e.g. Claude Code / Cursor) must NOT auto-inject stream_steps.
-	if _, _, _, err := sess.callRemoteTool(context.Background(), ToolSendMessage, json.RawMessage(`{"text":"hi"}`), CallMeta{ProgressToken: "tok-1"}, PersistentConfig{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	args1 := <-forwardedArgs
-	if _, has := args1["stream_steps"]; has {
-		t.Fatalf("progressToken alone injected stream_steps in arguments: %v", args1)
-	}
-
-	// 2. conversation_id present (Antigravity / Jetski) auto-injects stream_steps: true.
-	if _, _, _, err := sess.callRemoteTool(context.Background(), ToolSendMessage, json.RawMessage(`{"text":"hi"}`), CallMeta{ConversationID: "conv-123"}, PersistentConfig{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	args2 := <-forwardedArgs
-	if args2["stream_steps"] != true {
-		t.Fatalf("ConversationID did not inject stream_steps=true in arguments: %v", args2)
-	}
-
-	// 3. Explicit stream_steps=false is preserved even when conversation_id is present.
-	if _, _, _, err := sess.callRemoteTool(context.Background(), ToolSendMessage, json.RawMessage(`{"text":"hi","stream_steps":false}`), CallMeta{ConversationID: "conv-123"}, PersistentConfig{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	args3 := <-forwardedArgs
-	if args3["stream_steps"] != false {
-		t.Fatalf("explicit stream_steps=false was overwritten: %v", args3)
-	}
-}
-
 func TestSendMessageForwardsTheSchemasWaitDefaultAndCeiling(t *testing.T) {
 	gw := startBlockingGateway(t, "")
 	srv := newStdioTestServer(t, gw)
