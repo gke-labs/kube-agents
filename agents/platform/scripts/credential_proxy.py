@@ -726,6 +726,11 @@ WATCHER_WATCH_MAX_S = 3600
 # Forwarded from the caller when it has this shape: client-go negotiates JSON or
 # protobuf with it.
 WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+# The most of a named Pod's metadata the broker reads before projecting it
+# (watcher_policy.project_pod_metadata). An ObjectMeta is a few KiB; one with a
+# large last-applied annotation can be more, and anything past this is refused
+# rather than relayed in part.
+WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
@@ -14988,11 +14993,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_watcher_k8s(self) -> None:
         """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
 
-        The event watcher's list and watch of events and its one-item
-        metadata-only count lists, and the drift detector's read of one named
-        object, on the broker's credential. `watcher_policy.evaluate_k8s` is
-        the table. A watch is streamed through as the API server sends it;
-        everything else is streamed too, with the Cloud API relay's deadline
+        The event watcher's list and watch of events, its one-item
+        metadata-only count lists and its read of one named Pod's metadata,
+        and the drift detector's read of one named object, on the broker's
+        credential. `watcher_policy.evaluate_k8s` is the table. A watch is
+        streamed through as the API server sends it. A Pod's metadata is read
+        whole and relayed as its projection (`project_pod_metadata`).
+        Everything else is streamed too, with the Cloud API relay's deadline
         on each read.
         """
         request_id = str(uuid.uuid4())
@@ -15084,6 +15091,46 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
+                return
+            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                # Read whole and projected: the Pod's ObjectMeta carries every
+                # annotation and managedFields, and only the owner lookup's
+                # fields leave the broker. A non-200 answer is the API server's
+                # Status, which carries no Pod data, and is relayed as it is.
+                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
+                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
+                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                    )
+                    return
+                if response.status == HTTPStatus.OK:
+                    projected = watcher_policy.project_pod_metadata(body)
+                    if projected is None:
+                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                        self._json(
+                            HTTPStatus.BAD_GATEWAY,
+                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                        )
+                        return
+                    body = projected
+                LOGGER.info(
+                    "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
+                    request_id,
+                    decision.rule_id,
+                    response.status,
+                    len(body),
+                )
+                self.send_response(response.status)
+                answered = True
+                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                # Framed by its length, so the connection stays reusable, and
+                # closed with the answer when the request's body went unread.
+                self.send_header("Content-Length", str(len(body)))
+                self._end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
                 return
             LOGGER.info(
                 "watcher k8s forwarded request_id=%s rule=%s status=%d watch=%s",

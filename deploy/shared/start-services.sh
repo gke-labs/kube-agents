@@ -556,8 +556,8 @@ normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
 # quiet: the watcher sends the Session KV server one k8s-event-followup inject
 # for it, which lands in the alert's thread saying the object has emitted
 # nothing since, so a card read hours later says what was true when. Silence,
-# not recovery: the watcher reads events only and reads no object back, and a
-# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# not recovery: the watcher reads events, and of a Pod only its owner, never
+# its state, and a deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
 # ceiling with margin, so a crash loop still going is never reported quiet
 # between two of its back-offs. Set to 0 to send none.
 readonly WATCHER_QUIET_AFTER_DEFAULT=15m

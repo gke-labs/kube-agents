@@ -2349,7 +2349,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
 
-    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning"):
+    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning",
+                controller_ref=None):
         payload = {
             "reason": reason,
             "namespace": namespace,
@@ -2360,6 +2361,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             "type": event_type,
             "cluster": cluster,
         }
+        if controller_ref is not None:
+            payload["context"] = {"controller_ref": controller_ref}
         resp = self.client.post(
             f"/sessions/sess-{pod}-{reason}/inject",
             json={"message": json.dumps(payload)},
@@ -2367,6 +2370,99 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         return resp.json()
+
+    def _rows_in(self, namespace):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT id, notified, duplicate_of FROM intercepted_events WHERE namespace = ? ORDER BY id",
+                (namespace,),
+            ).fetchall()
+
+    # --- folded by the Pod's owning workload (controller_ref) ---------------
+
+    def test_the_pods_of_one_controller_fold_into_one_incident(self):
+        # One namespace per kind, so each subtest's rows are its own.
+        cases = {
+            "StatefulSet/web": ["web-0", "web-1", "web-2"],
+            "DaemonSet/node-exporter": ["node-exporter-x7k2p", "node-exporter-q9w4z"],
+            "Job/db-migrate": ["db-migrate-abcde", "db-migrate-fghij", "db-migrate-klmno"],
+        }
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            for ref, pods in cases.items():
+                with self.subTest(ref=ref):
+                    namespace = "ctrl-" + ref.split("/")[0].lower()
+                    calls = self.trigger.call_count
+                    replies = [self._inject(pod, namespace=namespace, controller_ref=ref) for pod in pods]
+                    rows = self._rows_in(namespace)
+                    self.assertEqual(replies[0]["status"], "injected")
+                    self.assertEqual([r["status"] for r in replies[1:]], ["folded"] * (len(pods) - 1))
+                    self.assertEqual([r[2] for r in rows], [None] + [rows[0][0]] * (len(pods) - 1))
+                    self.assertEqual(self.trigger.call_count - calls, 1, "more than one investigation for one workload")
+
+    def test_pods_without_a_controller_ref_do_not_fold_by_name(self):
+        # Unchanged: a StatefulSet's ordinals are not a replica suffix the name proves.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            replies = [self._inject(pod, namespace="noref-ns") for pod in ("db-0", "db-1")]
+        self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
+
+    def test_a_malformed_controller_ref_is_ignored(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            for i, ref in enumerate(("garbage", "statefulset/web", "StatefulSet/Web_1", "StatefulSet/", 7, "Node/node-a")):
+                with self.subTest(ref=ref):
+                    namespace = f"badref-{i}"
+                    replies = [self._inject(pod, namespace=namespace, controller_ref=ref) for pod in ("web-0", "web-1")]
+                    self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
+
+    def test_kinds_of_one_name_stay_apart(self):
+        # A StatefulSet and a Deployment both named `web` are two workloads.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("web-6cfdb6b98b-aaaaa", namespace="twokinds", controller_ref="Deployment/web")
+            second = self._inject("web-0", namespace="twokinds", controller_ref="StatefulSet/web")
+        self.assertEqual([first["status"], second["status"]], ["injected", "injected"])
+
+    def test_a_deployment_pod_folds_with_or_without_its_controller_ref(self):
+        # The key is the bare Deployment name either way, so a lookup that
+        # failed for one replica, or a row from an older watcher, still folds.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("api-6cfdb6b98b-aaaaa", namespace="mixed", controller_ref="Deployment/api")
+            second = self._inject("api-6cfdb6b98b-bbbbb", namespace="mixed")
+            third = self._inject("api-6cfdb6b98b-ccccc", namespace="mixed", controller_ref="Deployment/api")
+        self.assertEqual([first["status"], second["status"], third["status"]], ["injected", "folded", "folded"])
+
+    def test_the_branch_follows_the_controller_and_keeps_its_prefix(self):
+        def branch(pod, ref=None):
+            payload = {"cluster": "c1", "namespace": "ns", "kind_of_object": "Pod", "name": pod, "reason": "BackOff"}
+            if ref is not None:
+                payload["context"] = {"controller_ref": ref}
+            return session_kv_server._incident_branch("sess", payload)
+
+        owned = {branch(pod, "StatefulSet/web") for pod in ("web-0", "web-1", "web-2")}
+        self.assertEqual(len(owned), 1, owned)
+        self.assertTrue(owned.pop().startswith(session_kv_server.INCIDENT_PR_BRANCH_PREFIX))
+        self.assertNotEqual(branch("web-0"), branch("web-1"), "pods without a controller_ref merged by name")
+        self.assertEqual(
+            branch("api-6cfdb6b98b-aaaaa", "Deployment/api"), branch("api-6cfdb6b98b-bbbbb"),
+            "a Deployment's branch moved when the watcher sent its controller_ref",
+        )
+
+    def test_fold_key_reads_controller_ref_only_for_pods(self):
+        fold = session_kv_server._fold_key
+        self.assertEqual(fold("Pod", "web-0", "StatefulSet/web"), "StatefulSet/web")
+        self.assertEqual(fold("Pod", "api-6cfdb6b98b-aaaaa", "Deployment/api"), "api")
+        self.assertEqual(fold("Pod", "x-1", "Job/x"), "Job/x")
+        self.assertEqual(fold("Node", "node-1", "StatefulSet/web"), "node-1")
+        self.assertEqual(fold("Pod", "web-0"), "")
+
+    def test_a_static_pods_node_is_not_a_workload(self):
+        # A mirror Pod's controller is its Node: two static Pods on one node
+        # are two workloads, so a Node controller_ref is ignored.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            replies = [
+                self._inject(pod, namespace="static-ns", controller_ref="Node/node-a")
+                for pod in ("etcd-node-a", "kube-apiserver-node-a")
+            ]
+        self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
 
     def _rows(self, workload):
         import sqlite3
