@@ -96,16 +96,19 @@ PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
 # The proxy's segment files (spool.py); a directory argument is searched for these.
 LOG_SUFFIX = ".jsonl"
-# Where collect_shadow.py files a segment under the bucket's BUCKET_ROOT:
-# <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl. The build is BUILD_ID's
-# shape (hack/ci-env.sh, REPLAY_SHADOW_BUILD_RE) and the segment name the
-# logs/ form of collect_shadow.SAFE_NAME.
+# Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
+# <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl and the job manifest at
+# <kind>/<YYYY-MM-DD>/<build>/job-<ms>.json. The build is BUILD_ID's shape
+# (hack/ci-env.sh, REPLAY_SHADOW_BUILD_RE), the segment name the logs/ form of
+# collect_shadow.SAFE_NAME, and the manifest collect_shadow.write_manifest's.
 BUCKET_ROOT = "replay-shadow"
 LOGS_DIR = "logs"
 DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 BUILD_DIR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SEGMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
+MANIFEST_NAME = re.compile(r"^job-\d+\.json$")
 FILED_DEPTH = 5
+MANIFEST_DEPTH = 4
 # Requests sharing a prefix that a miss is compared against, newest first, one per distinct next message.
 MAX_PREFIX_CANDIDATES = 64
 STORE_MESSAGES_KEY = "messages"
@@ -504,21 +507,28 @@ class PrefixSources(Sources):
 
 
 def filed_kind(path: str) -> Optional[str]:
-    """The kind a file was filed under, when it sits at the collector's layout, else None.
+    """The kind a segment or job manifest was filed under, when it sits at the collector's layout, else None.
 
-    The layout is the path's last FILED_DEPTH components; its kind directory must
-    be the only component of the whole absolute path named for a kind (or the
-    bucket root), since everything below a kind prefix is the uploader's choice.
+    The kind directory must be the only component of the whole absolute path
+    named for a kind, since everything below a kind prefix is the uploader's
+    choice; the build directory may not be named for a kind or the bucket root.
     """
     parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
-    if len(parts) < FILED_DEPTH:
+    name = parts[-1]
+    if SEGMENT_NAME.match(name):
+        depth = FILED_DEPTH
+        if len(parts) < depth or parts[-2] != LOGS_DIR:
+            return None
+    elif MANIFEST_NAME.match(name):
+        depth = MANIFEST_DEPTH
+        if len(parts) < depth:
+            return None
+    else:
         return None
-    kind, day, build, logs, name = parts[-FILED_DEPTH:]
-    reserved = set(JOB_KINDS) | {BUCKET_ROOT}
-    if (kind not in JOB_KINDS or not DAY_DIR.match(day) or not BUILD_DIR.match(build) or build in reserved
-            or logs != LOGS_DIR or not SEGMENT_NAME.match(name)):
+    kind, day, build = parts[-depth:][:3]
+    if kind not in JOB_KINDS or not DAY_DIR.match(day) or not BUILD_DIR.match(build) or build in (*JOB_KINDS, BUCKET_ROOT):
         return None
-    if any(part in JOB_KINDS for part in parts[:-FILED_DEPTH]):
+    if any(part in JOB_KINDS for part in parts[:-depth]):
         return None
     return kind
 

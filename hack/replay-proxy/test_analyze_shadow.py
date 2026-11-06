@@ -692,6 +692,24 @@ class FolderKindTest(unittest.TestCase):
         records, _ = analyze_shadow.load([os.path.dirname(os.path.dirname(os.path.dirname(path)))])
         self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
 
+    def test_filed_kind_reads_segments_and_job_manifests_at_the_layout_only(self):
+        top = os.path.join(os.sep, "data", "week")
+        cases = {
+            "presubmit/2026-11-05/1790/logs/p-1-000001.jsonl": "presubmit",
+            "nightly-untrusted/2026-11-05/1790/job-1762300000000.json": "nightly-untrusted",
+            "replay-shadow/nightly/2026-11-05/1790/job-1762300000000.json": "nightly",
+            "presubmit/2026-11-05/1790/logs/job-1762300000000.json": None,
+            "presubmit/2026-11-05/1790/job-1.jsonl": None,
+            "presubmit/2026-11-05/1790/job-x.json": None,
+            "presubmit/2026-11-05/nightly/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/logs/seg.jsonl": None,
+            "presubmit/2026-11-05/replay-shadow/logs/seg.jsonl": None,
+        }
+        for relative, kind in cases.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(analyze_shadow.filed_kind(os.path.join(top, relative)), kind)
+
     def test_a_missing_path_is_named_with_or_without_a_kind(self):
         missing = os.path.join(TEMP_DIR, "no-such", "presubmit")
         for kind in (None, "presubmit"):
