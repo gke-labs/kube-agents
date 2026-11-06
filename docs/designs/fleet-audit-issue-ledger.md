@@ -888,8 +888,9 @@ two declarations. It keeps each other file that declares the same object, whole,
 `KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
 ambiguous. A `gcloud` fix's note is its command, so
 its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
-strip-and-rewrite pattern covers every first sentence: each starts "**Config Connector is not
-applying " (`KCC_STALLED_MARK_PREFIX`).
+strip-and-rewrite pattern covers every form: an exact first sentence (`KCC_STALLED_NOTE_PATTERN`)
+followed by " When the audit ran, Config Connector reported " (`KCC_STALLED_CONTINUATION`), which
+every paragraph `finish` writes goes on with. A worker sentence that only starts the same way stays.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
