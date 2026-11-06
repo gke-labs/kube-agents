@@ -985,6 +985,45 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _guardrail_blocked_cards(
+    awaited: Sequence[str],
+    on_board: dict[str, board.BoardCard] | None,
+    captured: worker_trajectory.WorkerCapture | None,
+    with_artifact: set[str],
+) -> list[str]:
+    """The awaited cards when EVERY one is the rate-limit guardrail's block, else ``[]``.
+
+    A card counts when the board holds it blocked with the guardrail's kind
+    and its newest run summary opens on the guardrail's prefix with a
+    rate-limit or billing reason, no artifact was produced for it, and the
+    captured worker trajectory (present, or nothing counts) holds no
+    ``kanban_block`` or ``kanban_complete`` call for it. One card that reads
+    otherwise is a delivery, and the run is graded on it.
+    """
+    if not awaited or on_board is None or captured is None:
+        return []
+    closed_by_worker = {
+        str(e.get("task"))
+        for e in captured.entries
+        if isinstance(e, dict)
+        and ({e.get("name")} | worker_trajectory.wrapped_tool_names(e)) & _WORKER_CARD_VERBS
+    }
+    blocked: list[str] = []
+    for tid in awaited:
+        card = on_board.get(tid)
+        if (
+            card is None
+            or card.status != _GUARDRAIL_BLOCK_STATUS
+            or card.block_kind != _GUARDRAIL_BLOCK_KIND
+            or not _extract_infra_failure_reason(card.summary or "")
+            or tid in with_artifact
+            or tid in closed_by_worker
+        ):
+            return []
+        blocked.append(tid)
+    return blocked
+
+
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
@@ -1055,6 +1094,15 @@ def _canonical_session_tokens(
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
+# The block kind the worker's rate-limit guardrail files
+# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
+# test_harness.py holds the two equal) and the status it leaves the card in.
+_GUARDRAIL_BLOCK_KIND = "transient"
+_GUARDRAIL_BLOCK_STATUS = "blocked"
+# The verbs by which a worker closes or blocks its own card. The guardrail
+# blocks from the exit path with no tool call, so a card whose worker made
+# one of these calls was closed by the model, whatever text it carries.
+_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
 
 
 def _is_rate_limited_triage(
@@ -1170,8 +1218,9 @@ def _artifact_paths(task_ids: list[str], timeout: float) -> list[str]:
     return paths[:_MAX_ARTIFACTS]
 
 
-def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> None:
+def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> set[str]:
     """Append the files the delegated cards produced to the graded answer.
+    Returns the ids of the cards that produced one.
 
     On a task whose deliverable is a written report, the worker's card result is
     a summary *of* the report and the report is a file the judge never sees --
@@ -1179,17 +1228,20 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     work is done and correct. Reading it back makes the deliverable part of the
     answer, the same way :func:`_append_delivered` does for the card result.
     """
+    produced: set[str] = set()
     if not task_ids:
-        return
+        return produced
     sections = []
     for path in _artifact_paths(task_ids, timeout):
         text = _agent_shell(f"head -c {_MAX_ARTIFACT_BYTES} {_shell_quote(path)}", timeout)
         if text.strip():
             tid, _, name = path[len(_ATTACHMENTS_DIR) + 1 :].partition("/")
             sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
+            produced.add(tid)
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
     _append_final(result, sections)
+    return produced
 
 
 _LOG_PRESENT = "__WORKER_LOG__"
@@ -4637,7 +4689,10 @@ class KubeAgentsHarness(AgentHarness):
         buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
-        _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        with_artifact = _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        # The cards as the board holds them, read before the purge below
+        # deletes them: the guardrail block's key is their status and kind.
+        on_board = board.read_board_cards(_agent_shell, awaited, _EXEC_TIMEOUT) if awaited else None
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
@@ -4762,6 +4817,37 @@ class KubeAgentsHarness(AgentHarness):
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+            )
+            return
+
+        # The guardrail's own block, whether or not the worker acted first
+        # (#4998). A worker that spent its model-call retries on 429s is
+        # blocked by kanban_guardrail_exit from the exit path: status blocked,
+        # kind transient, the provider's text as the newest run summary, and
+        # no kanban_block or kanban_complete call of its own, which is the one
+        # board-visible difference from a model that typed the same words and
+        # blocked its card itself. Every awaited card has to read so, with no
+        # artifact, for the run to hold no answer; a worker that acted and then
+        # died is still set aside, because the answer it never gave is not
+        # evidence of the agent under test, and rung 1 grades what it did
+        # before that above this mark. On the inject lane the worker-blind
+        # safeguards are set aside, so there a worker that acted stays graded:
+        # the lane cannot see the damage rung 1 would have caught.
+        inject_lane = any(
+            isinstance(e, dict) and e.get("name") == inject.EVENT_ENTRY_TASK for e in result.trajectory
+        )
+        guardrail_blocked = _guardrail_blocked_cards(awaited, on_board, captured, with_artifact)
+        if (
+            guardrail_blocked
+            and trajectory_clean
+            and logs_clean
+            and not (inject_lane and worker_acted)
+        ):
+            _mark_result_infra_failure(
+                result,
+                "delegated worker hit infrastructure failure (rate_limit): the rate-limit "
+                f"guardrail blocked {', '.join(guardrail_blocked)} with no completion or block "
+                "call of the worker's own and no artifact, so the run holds no answer",
             )
 
     @staticmethod
