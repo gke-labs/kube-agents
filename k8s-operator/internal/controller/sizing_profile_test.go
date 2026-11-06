@@ -848,6 +848,51 @@ func TestRenderedSizingTier(t *testing.T) {
 	}
 }
 
+// TestSizedContainersFollowTheRenderedTier reads the three sized containers
+// off the objects the builders write, the proxy Deployment, the gateway
+// Deployment and the shell StatefulSet, under every profile and latch: each
+// builder's one call of renderedSizingTier puts the latched row into the pod
+// under auto, and the spec's row under an explicit profile whatever the
+// status holds. A builder reading specSizingTier instead renders the small
+// row under auto at every latch, which no golden carries.
+func TestSizedContainersFollowTheRenderedTier(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, profile, latched               string
+		proxyLimit, sidecarLimit, shellLimit string
+	}{
+		{"auto with no latch yet renders the small row", sizingProfileAuto, "", credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
+		{"auto latched at medium renders the medium row", sizingProfileAuto, sizingProfileMedium, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
+		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
+		{"an explicit medium profile renders the medium row", sizingProfileMedium, "", credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
+		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", credentialProxyFleetMemoryLimit, agentAPIAuthFleetMemoryLimit, shellSandboxFleetMemoryLimit},
+		{"an explicit medium profile renders its row over a fleet latch", sizingProfileMedium, sizingProfileFleet, credentialProxyMediumMemoryLimit, agentAPIAuthMediumMemoryLimit, shellSandboxMemoryLimit},
+		{"an explicit small profile renders the small row over a fleet latch", sizingProfileSmall, sizingProfileFleet, credentialProxyMemoryLimit, agentAPIAuthMemoryLimit, shellSandboxMemoryLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agent := sizingAgent(tc.profile, tc.latched, nil, nil)
+			proxy := buildCredentialProxyDeployment(agent, "hash")
+			assertQuantity(t, sizedContainerNamed(t, proxy.Spec.Template.Spec.Containers, credentialProxyContainerName).Resources.Limits, corev1.ResourceMemory, tc.proxyLimit)
+			gateway := buildDeployment(agent, "", "", "", "", nil, renderOptions{})
+			assertQuantity(t, sizedContainerNamed(t, gateway.Spec.Template.Spec.InitContainers, agentAPIAuthContainerName).Resources.Limits, corev1.ResourceMemory, tc.sidecarLimit)
+			assertQuantity(t, shellContainerOf(t, agent).Resources.Limits, corev1.ResourceMemory, tc.shellLimit)
+		})
+	}
+}
+
+// sizedContainerNamed is the container called name among containers.
+func sizedContainerNamed(t *testing.T, containers []corev1.Container, name string) corev1.Container {
+	t.Helper()
+	for _, c := range containers {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("no container named %s among %d", name, len(containers))
+	return corev1.Container{}
+}
+
 func TestSizingValidationFollowsTheRenderedTier(t *testing.T) {
 	t.Parallel()
 	// A 3 CPU request crosses the small row's 2 CPU limit and sits under the
