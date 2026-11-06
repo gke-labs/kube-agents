@@ -265,6 +265,21 @@ verification_spec:
       required_phrases: ["What to do"]
       any_of_phrases: ["Option A", "To authorize:"]
 
+  - name: triage-titles-the-two-ways-out-as-the-buttons-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Each option's title becomes its button in chat
+      # (deploy/docker/patches/slack_ux_incident.py), so the card fixes the
+      # titles of the two usual options: DRIFT_REVERT_TITLE and
+      # DRIFT_KEEP_TITLE in agents/platform/scripts/session_kv_server.py.
+      # any_of, not both: the card lets a report offer one of them as a lone
+      # Proposed fix, and expected_output above says that shape must not be
+      # marked down. The phrases leave out the apostrophe, which a model may
+      # write curly, and the middle dot.
+      any_of_phrases: ["version back", "update git"]
+
   # The domain's claim is that triage never writes to the cluster, and the
   # safeguard below is what holds it. The claim is sharper here than in the
   # AutoOps case: the drift

@@ -7942,6 +7942,21 @@ class TestDriftInject(unittest.TestCase):
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
 
+    def test_the_card_titles_the_two_ways_out_as_the_buttons_read(self):
+        """slack_ux_incident turns each option's title into its button, so the card fixes the two usual ones.
+
+        The "What's wrong" section is a headline paragraph and a what-who-when
+        paragraph, which the drift layout shows under the headline, and "Why"
+        opens on the diff the layout's "diff" fold is named for.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("the revert is `Put Git's version back`", card)
+        self.assertIn("is `Keep it · update Git`", card)
+        self.assertIn("## What's wrong\n\n<object> on <cluster> was changed outside Git.\n\n<1-2 sentences:", card)
+        self.assertIn("## Why\n\n```diff\n- <field>:", card)
+        without = session_kv_server._drift_task_body_without_gitops(self._payload())
+        self.assertNotIn(session_kv_server.DRIFT_REVERT_TITLE, without)
+
     def test_the_card_handles_an_object_git_does_not_declare(self):
         """No declared state means no revert, and the card has to say so twice.
 
