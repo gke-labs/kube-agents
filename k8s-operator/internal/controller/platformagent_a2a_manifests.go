@@ -5793,7 +5793,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, r.dispatchDraining(ctx, agent, profiles))
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}

@@ -483,8 +483,8 @@ func dispatchReservesShortfall0(agent *agentv1alpha1.PlatformAgent, ceiling, chi
 // dispatcherGrantNames are the profiles the dispatch config lists and every
 // durable under them, in its order: the names the dispatcher's grants
 // enumerate.
-func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (names, durables []string) {
-	cfg, err := desiredDispatchConfig(agent, profiles)
+func dispatcherGrantNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (names, durables []string) {
+	cfg, err := desiredDispatchConfigDraining(agent, profiles, draining)
 	if err != nil {
 		return nil, nil
 	}
@@ -524,6 +524,9 @@ type a2aDispatchProfile struct {
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
 	Parameters            []a2aCardParameter   `json:"parameters,omitempty"`
 	Durables              []a2aDispatchDurable `json:"durables"`
+	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
+	// has left the install, which is listed with no durables until then.
+	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 }
 
 type a2aDispatchDurable struct {
@@ -544,6 +547,15 @@ func profileDurableName(profile, tier, kind string) string {
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
 func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aDispatchConfig, error) {
+	return desiredDispatchConfigDraining(agent, profiles, nil)
+}
+
+// desiredDispatchConfigDraining is desiredDispatchConfig with the profiles
+// still draining (drainingDispatchProfiles) listed after the live ones: no
+// durables, so nothing new is dispatched for them, but listed, so the
+// dispatcher keeps their .supervisor grant (dispatcherGrantNames) and the
+// terminals of the tasks they still hold reach their requesters.
+func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
 	ceiling := resolveProfileCeiling(agent)
 	child, interactive := dispatchReserves(agent, ceiling)
 	cfg := a2aDispatchConfig{
@@ -583,6 +595,15 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 		}
 		cfg.Profiles = append(cfg.Profiles, dp)
 	}
+	live := map[string]bool{}
+	for _, p := range cfg.Profiles {
+		live[p.Name] = true
+	}
+	for _, p := range draining {
+		if !live[p.Name] {
+			cfg.Profiles = append(cfg.Profiles, p)
+		}
+	}
 	slices.SortFunc(cfg.Profiles, func(a, b a2aDispatchProfile) int { return strings.Compare(a.Name, b.Name) })
 	body, err := json.Marshal(cfg)
 	if err != nil {
@@ -593,8 +614,63 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 	return cfg, nil
 }
 
-func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, error) {
+// a2aDrainingMargin is how long past its active deadline a profile that has
+// left the install stays draining: the dispatcher fails a task still held at
+// its deadline and retries that terminal, which needs the grant (#5074).
+const a2aDrainingMargin = 15 * time.Minute
+
+// drainingDispatchProfiles is the profiles the applied dispatch config lists
+// that the render no longer does (live names it), still draining at now: a
+// profile listed live there drains from now for its active deadline plus
+// a2aDrainingMargin; one already draining keeps its DrainingUntil, so the
+// render is stable, until that passes. A draining profile has no durables.
+// The applied config is the state: with none, nothing drains.
+func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
+	if applied == nil {
+		return nil
+	}
+	var out []a2aDispatchProfile
+	for _, p := range applied.Profiles {
+		if live[p.Name] {
+			continue
+		}
+		if p.DrainingUntil.IsZero() {
+			p.DrainingUntil = now.Add(time.Duration(p.ActiveDeadlineSeconds)*time.Second + a2aDrainingMargin).Truncate(time.Second).UTC()
+		} else if !now.Before(p.DrainingUntil) {
+			continue
+		}
+		p.Durables = []a2aDispatchDurable{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// dispatchDraining reads the applied dispatch config and returns the
+// profiles of it still draining against this render. An applied config the
+// operator can't read drains nothing: the render is then what it was before
+// draining existed, and the next pass tries again.
+func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) []a2aDispatchProfile {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		return nil
+	}
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		return nil
+	}
 	cfg, err := desiredDispatchConfig(agent, profiles)
+	if err != nil {
+		return nil
+	}
+	live := map[string]bool{}
+	for _, p := range cfg.Profiles {
+		live[p.Name] = true
+	}
+	return drainingDispatchProfiles(&applied, live, time.Now())
+}
+
+func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
+	cfg, err := desiredDispatchConfigDraining(agent, profiles, draining)
 	if err != nil {
 		return nil, err
 	}
@@ -619,7 +695,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	if !a2aDispatcherEnabled() {
 		return r.removeA2ADispatcher(ctx, agent)
 	}
-	cm, err := buildA2ADispatchConfigMap(agent, profiles)
+	cm, err := buildA2ADispatchConfigMap(agent, profiles, r.dispatchDraining(ctx, agent, profiles))
 	if err != nil {
 		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}
