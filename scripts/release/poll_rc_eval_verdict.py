@@ -142,12 +142,21 @@ RC_VERDICT_JSON_FILE = "eval-verdict.json"
 VERDICT_CASES_FIELD = "cases"
 VERDICT_PARTIAL_FIELD = "partial"
 CASE_BLOCKING_FIELD = "blocking"
-# What the red-cases line carries per case, in the roll-up's own names.
+# What the red-cases line carries per case, in the roll-up's own names, and
+# the vocabulary each value is accepted in: bench-gate's, the roll-up's one
+# producer. A case id is the shape a `bench/tasks/<id>` directory name takes
+# (`scripts/case_owner.py` requires the same; `scripts/
+# test_notify_release_stage_broken.py` holds the two patterns equal), a rung
+# is an int, a rung name is spelled as `Rung.name` is. An entry outside it
+# is never printed, here into the step summary or by the notifier into the
+# issue: the whole line is withheld with a warning, so nothing from the
+# archive reaches Markdown unchecked.
 RED_CASE_NAME_KEY = "case"
-RED_CASE_DOMAIN_KEY = "domain"
 RED_CASE_RUNG_KEY = "rung"
 RED_CASE_RUNG_NAME_KEY = "rung_name"
-RED_CASE_KEYS = (RED_CASE_NAME_KEY, RED_CASE_DOMAIN_KEY, RED_CASE_RUNG_KEY, RED_CASE_RUNG_NAME_KEY)
+RED_CASE_KEYS = (RED_CASE_NAME_KEY, RED_CASE_RUNG_KEY, RED_CASE_RUNG_NAME_KEY)
+CASE_ID_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+RUNG_NAME_RE = re.compile(r"[A-Z_]+")
 
 # started.json's scalar commit fields. `repos` is handled separately: its values
 # are `<ref>:<sha>` for a tag-push postsubmit and a bare sha otherwise.
@@ -736,10 +745,27 @@ _SETTLED = {
 }
 
 
+def is_red_case(case):
+    """True when the entry is one bench-gate could have written: a case id,
+    an integer rung, a rung name. `bool` is an int in Python and is refused."""
+    if not isinstance(case, dict):
+        return False
+    name, rung, rung_name = case.get(RED_CASE_NAME_KEY), case.get(RED_CASE_RUNG_KEY), case.get(RED_CASE_RUNG_NAME_KEY)
+    return (
+        isinstance(name, str)
+        and CASE_ID_RE.fullmatch(name) is not None
+        and isinstance(rung, int)
+        and not isinstance(rung, bool)
+        and isinstance(rung_name, str)
+        and RUNG_NAME_RE.fullmatch(rung_name) is not None
+    )
+
+
 def red_cases(verdict_text):
     """The blocking cases of one build's eval-verdict.json, as
     `{"cases": [...], "partial": bool}`, or None when the text is not a
-    roll-up (absent, unreadable, not JSON, no `cases` list).
+    roll-up (absent, unreadable, not JSON, no `cases` list) or a blocking
+    entry is outside the vocabulary above.
 
     Blocking, not "any rung below GREEN": the roll-up also lists cases on
     the two non-rungs INFRA and NOT_GRADED_ON_TRANSPORT, which never block
@@ -757,8 +783,11 @@ def red_cases(verdict_text):
     cases = data.get(VERDICT_CASES_FIELD) if isinstance(data, dict) else None
     if not isinstance(cases, list):
         return None
+    blocking = [case for case in cases if isinstance(case, dict) and case.get(CASE_BLOCKING_FIELD) is True]
+    if not all(is_red_case(case) for case in blocking):
+        return None
     return {
-        RED_CASES_CASES_KEY: [{key: case.get(key) for key in RED_CASE_KEYS} for case in cases if isinstance(case, dict) and case.get(CASE_BLOCKING_FIELD) is True],
+        RED_CASES_CASES_KEY: [{key: case[key] for key in RED_CASE_KEYS} for case in blocking],
         RED_CASES_PARTIAL_KEY: data.get(VERDICT_PARTIAL_FIELD) is True,
     }
 
@@ -783,7 +812,7 @@ def report_red_cases(base, read_file):
         print(f"warning: reading {RC_VERDICT_JSON_FILE} failed ({exc!r}); the red cases are not reported", file=sys.stderr, flush=True)
         return None
     if cases is None:
-        print(f"warning: {base}{ARTIFACTS_DIR}{RC_VERDICT_JSON_FILE} is absent or not a case roll-up; the red cases are not reported", file=sys.stderr, flush=True)
+        print(f"warning: {base}{ARTIFACTS_DIR}{RC_VERDICT_JSON_FILE} is absent, not a case roll-up, or names a blocking case outside bench-gate's vocabulary; the red cases are not reported", file=sys.stderr, flush=True)
         return None
     print(red_cases_line(cases), flush=True)
     return cases
@@ -915,7 +944,7 @@ def main(argv=None):
     if url:
         lines += ["", f"[Eval build {build_id}]({url})"]
     if cases and cases[RED_CASES_CASES_KEY]:
-        lines += ["", "Red cases: " + ", ".join(f"`{case[RED_CASE_NAME_KEY]}` (rung {case[RED_CASE_RUNG_KEY]} {case[RED_CASE_RUNG_NAME_KEY]})" for case in cases[RED_CASES_CASES_KEY])]
+        lines += ["", "Red cases: " + ", ".join(f"`{case[RED_CASE_NAME_KEY]}` (rung `{case[RED_CASE_RUNG_KEY]} {case[RED_CASE_RUNG_NAME_KEY]}`)" for case in cases[RED_CASES_CASES_KEY])]
     _write_summary(os.environ.get("GITHUB_STEP_SUMMARY"), lines)
 
     return _EXIT[verdict]

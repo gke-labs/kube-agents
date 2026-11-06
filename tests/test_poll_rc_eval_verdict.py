@@ -52,7 +52,7 @@ ROLL_UP_1104 = json.dumps(
     }
 )
 # The literal line the notifier reads back; a change here is a change there.
-RED_CASES_LINE_1104 = 'red_cases={"cases":[{"case":"compliance-rbac-overgrant","domain":"fleet-audits","rung":4,"rung_name":"COLLAPSE"}],"partial":false}'
+RED_CASES_LINE_1104 = 'red_cases={"cases":[{"case":"compliance-rbac-overgrant","rung":4,"rung_name":"COLLAPSE"}],"partial":false}'
 
 # The `timestamp` from that same real started.json, and a nomination pushed a
 # day later. Two attempts at ONE commit is the shape the `--not-before` floor
@@ -859,6 +859,25 @@ class RedCasesTest(unittest.TestCase):
         self.assertTrue(cases["partial"])
         self.assertEqual([case["case"] for case in cases["cases"]], ["b", "a"])
 
+    def test_a_blocking_entry_outside_bench_gates_vocabulary_withholds_the_whole_line(self):
+        """The one shape check sits here, at the producer, so neither the
+        step summary nor the notifier renders a value the archive made up."""
+        good = {"case": "compliance-rbac-overgrant", "rung": 4, "rung_name": "COLLAPSE", "blocking": True}
+        for bad in (
+            dict(good, case="bad`name"),
+            dict(good, case="#4821"),
+            dict(good, case=None),
+            {"rung": 4, "rung_name": "COLLAPSE", "blocking": True},
+            dict(good, rung="4"),
+            dict(good, rung=True),
+            dict(good, rung_name="[x](https://example.invalid)"),
+            dict(good, rung_name="COLLAPSE\u2028x"),
+        ):
+            with self.subTest(bad=bad):
+                self.assertIsNone(poller.red_cases(json.dumps({"cases": [good, bad]})))
+        # A non-blocking entry outside the vocabulary is not the line's concern.
+        self.assertEqual([c["case"] for c in poller.red_cases(json.dumps({"cases": [good, dict(good, case="x`y", blocking=False)]}))["cases"]], ["compliance-rbac-overgrant"])
+
     def test_anything_but_a_roll_up_reads_as_none(self):
         for text in (None, poller.UNREADABLE, "", "not json", "[]", json.dumps({"outcome": "red"}), json.dumps({"cases": "x"})):
             self.assertIsNone(poller.red_cases(text), text)
@@ -973,7 +992,7 @@ class MainTest(unittest.TestCase):
         verdict_at = next(i for i, line in enumerate(lines) if line.startswith("verdict=red settled=true build_id=100 "))
         self.assertEqual(lines[verdict_at + 1], RED_CASES_LINE_1104)
         self.assertIn("settled=true", written)
-        self.assertIn("Red cases: `compliance-rbac-overgrant` (rung 4 COLLAPSE)", rendered)
+        self.assertIn("Red cases: `compliance-rbac-overgrant` (rung `4 COLLAPSE`)", rendered)
 
     def test_a_red_verdict_without_a_roll_up_keeps_its_verdict_outputs_and_exit(self):
         """The line is best-effort: an absent roll-up is a warning, and the

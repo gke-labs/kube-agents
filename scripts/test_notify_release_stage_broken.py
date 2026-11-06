@@ -938,9 +938,9 @@ STALL_FOOTER = "A case's owner is its `owner:` in `bench/tasks/<case>/task.yaml`
 # as bench-gate's roll-up listed their blocking case, and the owners the
 # checkout resolved them to on 2026-11-05. The tests patch the owner lookup
 # with this map so a later change of hands in domains.yaml does not move them.
-CASE_1101 = [{"case": "consistency-drift-outlier", "domain": "consistency", "rung": 4, "rung_name": "COLLAPSE"}]
-CASE_1102 = [{"case": "pdb-remediation-pr", "domain": "remediation", "rung": 1, "rung_name": "FORBIDDEN_ACTION"}]
-CASE_1104 = [{"case": "compliance-rbac-overgrant", "domain": "fleet-audits", "rung": 4, "rung_name": "COLLAPSE"}]
+CASE_1101 = [{"case": "consistency-drift-outlier", "rung": 4, "rung_name": "COLLAPSE"}]
+CASE_1102 = [{"case": "pdb-remediation-pr", "rung": 1, "rung_name": "FORBIDDEN_ACTION"}]
+CASE_1104 = [{"case": "compliance-rbac-overgrant", "rung": 4, "rung_name": "COLLAPSE"}]
 OWNERS = {"consistency-drift-outlier": "lapis2002", "pdb-remediation-pr": "Fuxiao-Gao", "compliance-rbac-overgrant": "toshiowang"}
 CELL_1101 = "`consistency-drift-outlier` (rung `4 COLLAPSE`, @lapis2002)"
 CELL_1102 = "`pdb-remediation-pr` (rung `1 FORBIDDEN_ACTION`, @Fuxiao-Gao)"
@@ -1347,7 +1347,7 @@ class StalledChainTest(unittest.TestCase):
         `splitlines()`), a pipe, a backtick, a mention, a link or a nameless
         entry would otherwise reach the table or Markdown. One bad entry
         makes the night unavailable, never a partial or a prettied row."""
-        good = {"case": "consistency-drift-outlier", "domain": "consistency", "rung": 4, "rung_name": "COLLAPSE"}
+        good = {"case": "consistency-drift-outlier", "rung": 4, "rung_name": "COLLAPSE"}
         bad_entries = [
             dict(good, rung_name="COLLAPSE\u2028x"),
             dict(good, rung_name="COLLAPSE\x85x"),
@@ -1387,7 +1387,14 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(github.writes[1][2]["title"], "🔴 release chain stalled: the RC eval has returned RED 4 nights in a row")
         self.assertEqual(len(rows_of(github.writes[1][2]["body"])), 4)
 
-    def test_is_red_case_accepts_bench_gates_shapes_only(self):
+    def test_the_vocabulary_is_the_pollers_and_its_case_id_rule_is_case_owners(self):
+        """One shape check, the poller's, on both sides of the log line; and
+        its case-id pattern is the one `scripts/case_owner.py` requires of a
+        task directory, so a case the notifier renders is one it can look up."""
+        import case_owner
+
+        self.assertIs(notifier.is_red_case, poller.is_red_case)
+        self.assertEqual(poller.CASE_ID_RE.pattern, case_owner._CASE_NAME.pattern)
         self.assertTrue(notifier.is_red_case(CASE_1104[0]))
         self.assertTrue(notifier.is_red_case({"case": "a.b_c-1", "rung": 1, "rung_name": "FORBIDDEN_ACTION", "domain": "d"}))
         for bad in ({"case": "a", "rung": "4", "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4, "rung_name": "collapse"}, {"case": "", "rung": 4, "rung_name": "COLLAPSE"}, {"case": ".a", "rung": 4, "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4.0, "rung_name": "COLLAPSE"}, []):
