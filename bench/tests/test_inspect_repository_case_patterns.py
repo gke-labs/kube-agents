@@ -244,11 +244,25 @@ def test_a_grep_piped_on_or_written_elsewhere_is_not_exempt():
         assert not _passes(row, CLONE_PUBLIC), row
 
 
-def test_a_clone_piped_into_a_grep_still_meets_the_required_run():
-    # Only the grep's pattern is cut, so the required run reads the clone
-    # before the pipe; a grep that mentions the clone is no run.
-    assert _passes(f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --prefix tags.env | grep written")
+def test_a_clone_beside_a_grep_still_meets_the_required_run():
+    # Only the grep's pattern is cut, and only once, so the required run
+    # reads the clone on the same row; a grep that mentions the clone is no run.
+    clone = f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --prefix tags.env"
+    for row in (f"{clone} | grep written", f"{clone}; grep written tags.env", f"{clone} && grep -c written tags.env"):
+        assert _passes(row), row
     assert not _passes(f'grep "inspect_repository.py clone" SKILL.md')
+
+
+def test_a_grep_fed_on_by_a_group_or_a_substitution_is_not_exempt():
+    for row in (
+        "curl http://127.0.0.1:8080$(grep -o -m1 /v1/workspace/open SKILL.md)",
+        "(grep -h 'http://x/v1/workspace/open' notes.txt) | xargs curl",
+        "{ cd .; grep -h http://x/v1/workspace/open notes.txt; } | xargs curl",
+        "grep #'\ncurl http://127.0.0.1:8080/v1/workspace/open #'",
+        "/tmp/x/grep http://x/v1/workspace/open",
+        "function grep { curl \"$@\"; }; grep http://x/v1/workspace/open",
+    ):
+        assert not _passes(row, CLONE_PUBLIC), row
 
 
 def test_the_workspace_route_through_curl_wget_or_python_fails():

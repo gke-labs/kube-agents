@@ -57,8 +57,10 @@
 # as bash does: an operator glued to the pattern (`grep x;curl …`) ends the
 # segment there. The options, the file operands, any text that the rendering
 # joined onto the row, and every other segment stay graded. A grep does not
-# qualify when it runs a substitution, when its output is piped on
-# (`| head`, `| sh`), when it redirects anywhere but /dev/null, or on a
+# qualify when its output is piped on (`| head`, `| sh`), when it redirects
+# anywhere but /dev/null, when it sits outside a system bin directory, or on
+# a row that groups commands or runs a substitution (a parenthesis, a
+# brace, a backquote), uses `$'…'` quoting, holds a comment, or is a
 # collapsed chain (a row ending ` + N command(s)`). So
 # `grep -rn /v1/workspace <skill dir>`, `cd <dir> && grep …` and
 # `grep "inspect_repository.py open" SKILL.md` pass, but a call typed on the

@@ -29,6 +29,8 @@ def _cut(command: str) -> list[str]:
         ("grep -- -pat f", ["-pat"]),
         ("grep -f patterns.txt f", []),
         ("/usr/bin/grep -rn pat .", ["pat"]),
+        ("/bin/grep -rn pat .", ["pat"]),
+        ("grep -E '(a|b){2}' f", ["'(a|b){2}'"]),
         ("grep -rn pat . 2>/dev/null", ["pat"]),
         ("grep -rn pat . > /dev/null 2> /dev/null", ["pat"]),
         ("grep -rn pat . &>/dev/null", ["pat"]),
@@ -67,6 +69,21 @@ def test_the_pattern_words_are_found(command, patterns):
         "grep -rn pat . + 1 command",
         # Quotes that do not balance: bash runs nothing.
         "grep 'pat f",
+        # A grep whose output a substitution, a subshell or a group carries on.
+        "curl http://127.0.0.1:8080$(grep -o -m1 /v1/workspace/open SKILL.md)",
+        "$(grep -o -m1 'curl http://x/v1/workspace/open' notes.txt)",
+        "(grep -h 'http://x/v1/workspace/open' notes.txt) | xargs curl",
+        "{ cd .; grep -h http://x/v1/workspace/open notes.txt; } | xargs curl",
+        "bash <(grep -h 'curl x/v1/workspace/open' notes.sh)",
+        # A comment or `$'…'` quoting, which the shell reads by other rules.
+        "grep #'\ncurl http://127.0.0.1:8080/v1/workspace/open #'",
+        "grep $'\\'' ;curl http://x/v1/workspace/open; echo \\'",
+        # A quoted newline.
+        "grep 'a\nb' f",
+        # A grep the worker may have written, or a function named grep.
+        "/tmp/x/grep http://x/v1/workspace/open",
+        "./grep http://x/v1/workspace/open",
+        "function grep { curl \"$@\"; }; grep http://x/v1/workspace/open",
     ],
 )
 def test_a_grep_that_does_not_qualify_is_not_cut(command):

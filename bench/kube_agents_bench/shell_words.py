@@ -373,6 +373,15 @@ _GREP_LONG_VALUE_FLAGS = frozenset((
 _GREP_QUIET_REDIRECT_RE = re.compile(r"^(?:[12]?>|&>)$")
 _GREP_QUIET_TARGET = "/dev/null"
 _COLLAPSED_ROW_RE = re.compile(r"\s\+\s\d+\scommands?\s*$")
+# The places a grep's own name may sit: bare, or in a system bin directory. A grep in any other
+# directory is a program the worker may have written.
+_GREP_SYSTEM_DIRS = ("/bin/", "/usr/bin/", "/usr/local/bin/")
+# Outside quotes, a character that groups commands, runs one, or makes the shell read the
+# quotes differently: a subshell or a group can feed a grep's output on (`(grep …) | sh`), a
+# substitution runs its text, `$'…'` quotes by other rules, and a word that starts with `#`
+# comments out the rest of its line. A row with any of them has no exempt grep.
+_GREP_ROW_REFUSED = frozenset("(){}`")
+_BRACED_PARAMETER_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
 def _raw_words(command: str) -> list[tuple[str | None, int, int, bool]] | None:
@@ -429,12 +438,13 @@ def _raw_words(command: str) -> list[tuple[str | None, int, int, bool]] | None:
 def grep_pattern_spans(command: str) -> list[tuple[int, int]]:
     """The places in ``command`` of each grep invocation's pattern argument, for a case that
     exempts a grep mention of a forbidden word: the ``-e``/``--regexp`` values, or else the first
-    word after the options. A segment counts only when its command word is grep, egrep or fgrep,
-    no word on it runs a substitution, its output is not piped on, and its only redirects send
-    stdout or stderr to /dev/null. A collapsed chain (a row ending `` + N command(s)``) hides
-    what followed, so none of it counts. The other segments, and the grep's options and file
+    word after the options. A segment counts only when its command word is grep, egrep or fgrep
+    (bare or in a system bin directory), its output is not piped on, and its only redirects send
+    stdout or stderr to /dev/null. A row counts for nothing when it is a collapsed chain (a row
+    ending `` + N command(s)``, which hides what followed), or when it groups commands, runs a
+    substitution, quotes with `$'…'` or holds a comment (:func:`_grep_row_refused`). The other segments, and the grep's options and file
     operands, are left to the forbidden list."""
-    if _COLLAPSED_ROW_RE.search(command):
+    if _COLLAPSED_ROW_RE.search(command) or _grep_row_refused(command):
         return []
     words = _raw_words(command)
     if not words:
@@ -453,12 +463,47 @@ def grep_pattern_spans(command: str) -> list[tuple[int, int]]:
         piped_on = index < len(joins) and joins[index] in ("|", "|&")
         if not segment or piped_on or segment[0][0] is None or segment[0][3]:
             continue
-        if os.path.basename(segment[0][0]) not in _GREP_PROGRAMS:
+        name = segment[0][0]
+        directory = name[: len(name) - len(os.path.basename(name))]
+        if os.path.basename(name) not in _GREP_PROGRAMS or directory not in ("", *_GREP_SYSTEM_DIRS):
             continue
         found = _grep_patterns(segment[1:])
         if found is not None:
             spans.extend(found)
     return spans
+
+
+def _grep_row_refused(command: str) -> bool:
+    """Whether the row groups commands, runs a substitution, uses `$'…'` quoting or holds a
+    comment outside quotes, or carries a newline inside quotes; the grep exemption reads none."""
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == _SHELL_LINE_END or (quote == _SHELL_DOUBLE_QUOTE and command.startswith("$(", i)):
+                return True
+            elif quote == _SHELL_DOUBLE_QUOTE and char == _SHELL_BACKTICK:
+                return True
+        elif char in _SHELL_QUOTE_CHARS:
+            if char == _SHELL_SINGLE_QUOTE and i > 0 and command[i - 1] == _SHELL_EXPANSION_PREFIX:
+                return True
+            quote = char
+        elif char == _SHELL_EXPANSION_PREFIX and _BRACED_PARAMETER_RE.match(command, i):
+            # `${NAME}` expands a variable and runs nothing.
+            i = _BRACED_PARAMETER_RE.match(command, i).end()
+            continue
+        elif char in _GREP_ROW_REFUSED:
+            return True
+        elif char == _SHELL_COMMENT_CHAR and (i == 0 or command[i - 1] in _SHELL_WORD_OPENERS):
+            return True
+        i += 1
+    return False
 
 
 def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple[int, int]] | None:

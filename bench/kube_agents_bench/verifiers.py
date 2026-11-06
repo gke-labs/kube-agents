@@ -2757,11 +2757,13 @@ class WorkerCommandsVerifier(BaseVerifier):
     decides on the line's shell segments, not a regex over the row, so an
     operator glued to the pattern (``grep x;curl …``) ends the segment as it
     does in bash, and a call joined onto the row stays a graded operand. A
-    grep does not qualify when a word on it runs a substitution, when its
-    output is piped on, or when it redirects anywhere but /dev/null; nor does
-    any grep on a collapsed chain. The required list reads the rest of that
-    command (a clone piped into a grep still runs the clone), and the reason
-    counts the command as exempted.
+    grep does not qualify when its output is piped on, when it redirects
+    anywhere but /dev/null, or when it sits outside a system bin directory;
+    nor does any grep on a row that groups commands, runs a substitution,
+    quotes with ``$'…'``, holds a comment or is a collapsed chain. The pattern
+    exemptions read the row first, and the grep cut reads what they left. The
+    required list reads the rest of a grep-cut command (a clone beside a grep
+    still runs the clone), and the reason counts the command as exempted.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2893,11 +2895,15 @@ class WorkerCommandsVerifier(BaseVerifier):
                 command = command[:start] + command[end:]
         return command
 
-    def _without_exempt_text(self, command: str) -> str:
-        command = self._without_grep_patterns(command)
+    def _without_pattern_exemptions(self, command: str) -> str:
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
+
+    def _without_exempt_text(self, command: str) -> str:
+        # The pattern exemptions read the row as written, then the grep cut
+        # reads what they left.
+        return self._without_grep_patterns(self._without_pattern_exemptions(command))
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -3054,8 +3060,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         # grep still runs the clone); a command a pattern exemption touched is
         # out of it.
         with_calls = typed + beside_rows
-        without_grep = [self._without_grep_patterns(c) for c in with_calls]
-        commands = [g for g in without_grep if self._without_exempt_text(g) == g]
+        commands = [self._without_grep_patterns(c) for c in with_calls if self._without_pattern_exemptions(c) == c]
         touched = sum(1 for c in with_calls if self._without_exempt_text(c) != c)
         exempted = f" ({touched} exempted)" if touched else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
