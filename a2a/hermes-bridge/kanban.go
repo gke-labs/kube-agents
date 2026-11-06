@@ -829,8 +829,14 @@ poll:
 						}
 					}
 					if len(parts) > 0 {
+						synthAck := ""
+						if turnFiledCards && !sawUnsettled {
+							synthAck = ackText
+						}
 						run.mu.Lock()
-						if act != nil {
+						// Only a synthesis that runs is announced: one card, or
+						// an answer of the turn's own, stands in as it is.
+						if act != nil && cardSynthesisRuns(run, turn, synthAck, relevant) {
 							b.publishSteps(run, act, []stepmsg.Step{{
 								Kind:    stepmsg.KindSynthesis,
 								Title:   fmt.Sprintf("Synthesizing findings across %d specialist card(s).", len(relevant)),
@@ -843,7 +849,10 @@ poll:
 							if act != nil {
 								act.cardsFiled.Store(false)
 							}
-							if taskCtx.Err() != nil {
+							// A deadline or a shutdown during the synthesis keeps
+							// the answers in hand (the joined reports when the
+							// synthesis did not finish); a cancel ends canceled.
+							if taskCtx.Err() != nil && run.canceled.Load() {
 								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 								return "", false
 							}
@@ -857,15 +866,11 @@ poll:
 								ackText = cardReport
 							}
 						} else {
-							synthAck := ackText
-							if sawUnsettled {
-								synthAck = ""
-							}
 							ackText = b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, synthAck, relevant, parts)
 							if act != nil {
 								act.cardsFiled.Store(false)
 							}
-							if taskCtx.Err() != nil {
+							if taskCtx.Err() != nil && run.canceled.Load() {
 								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 								return "", false
 							}
@@ -926,13 +931,31 @@ poll:
 	return ackText, true
 }
 
+// cardSynthesisRuns reports whether synthesizeCardAnswer will run a
+// synthesis turn for these cards, rather than answer with the turn's own
+// answer or a single card's.
+func cardSynthesisRuns(run *taskRun, turn int, ackText string, cards []kanbanCardRow) bool {
+	return len(cards) > 1 && !answersWithAck(run, turn, ackText)
+}
+
+// answersWithAck reports whether a substantive answer of the turn's own
+// stands in for its cards.
+func answersWithAck(run *taskRun, turn int, ackText string) bool {
+	trimmedAck := strings.TrimSpace(ackText)
+	return !cardsCarriedOver(run, turn, trimmedAck) && len(trimmedAck) >= cardAnswerSubstantiveChars && !isSilentAnswer(ackText)
+}
+
+func cardsCarriedOver(run *taskRun, turn int, trimmedAck string) bool {
+	return turn > 1 && trimmedAck != "" && !isSilentAnswer(trimmedAck) &&
+		(run == nil || run.act.Load() == nil || !run.act.Load().cardsFiled.Load())
+}
+
 func (b *Bridge) synthesizeCardAnswer(run *taskRun, taskCtx context.Context, sessionID string, turn int, ackText string, cards []kanbanCardRow, parts []string) string {
 	joined := strings.Join(parts, "\n\n")
 	trimmedAck := strings.TrimSpace(ackText)
-	carriedOver := turn > 1 && trimmedAck != "" && !isSilentAnswer(trimmedAck) &&
-		(run == nil || run.act.Load() == nil || !run.act.Load().cardsFiled.Load())
+	carriedOver := cardsCarriedOver(run, turn, trimmedAck)
 
-	if !carriedOver && len(trimmedAck) >= cardAnswerSubstantiveChars && !isSilentAnswer(ackText) {
+	if answersWithAck(run, turn, ackText) {
 		return ackText
 	}
 	if len(cards) == 1 {
@@ -1023,6 +1046,23 @@ func (b *Bridge) apiSynthesisTurn(run *taskRun, taskCtx context.Context, session
 	}
 	ctx, cancel := context.WithTimeout(taskCtx, cardSynthesisTimeout)
 	defer cancel()
+	// A shutdown leaves this run to its worker (its answer is held), so the
+	// synthesis ends on closing rather than holding Run for its timeout.
+	go func() {
+		t := time.NewTicker(kanbanPollInterval / 4)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if b.closing.Load() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.cfg.APIURL, bytes.NewReader(body))
 	if err != nil {
 		return "", false

@@ -27,11 +27,14 @@ var (
 	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*`)
 	inlineAuthHeaderPattern       = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
 	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
-	inlineURLCredPattern          = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/'"]+(@)`)
-	cliUserPassPattern            = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+))(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern        = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
-	cliSpacedPassPattern          = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliLongSecretFlagPattern      = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	// The password runs to the userinfo's closing @ and may hold a path
+	// character, as base64-style passwords do; a URL with an @ in its path
+	// after a port is over-redacted, the safe side.
+	inlineURLCredPattern     = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s'"]+(@)`)
+	cliUserPassPattern       = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+))(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
+	cliAttachedPassPattern   = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
+	cliSpacedPassPattern     = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliLongSecretFlagPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the token was abc", "the password is now hunter2",
 	// "the secret is set to abc". The verb may be followed by a qualifier
@@ -252,7 +255,8 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 		}
 	}
 	if strings.HasPrefix(effectiveTool, "kanban_") && sessID != "" && sessID != a.sessionID {
-		if cid := capBytes(extractArgStr(parsed, "card_id", "task_id", "id"), maxSubtaskIDBytes); cid != "" {
+		// A card id or nothing: the worker model chose this string.
+		if cid := strings.TrimSpace(extractArgStr(parsed, "card_id", "task_id", "id")); kanbanCardIDExact.MatchString(cid) {
 			a.trace.sessionCards[sessID] = cid
 			a.trace.claimedSessions[sessID] = true
 		}
@@ -1227,7 +1231,7 @@ func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
 	}
 	isCardID := func(s string) bool {
 		s = strings.TrimSpace(s)
-		return strings.HasPrefix(s, "t_") && kanbanCardIDPattern.FindString(s) == s
+		return kanbanCardIDExact.MatchString(s)
 	}
 	var decoded any
 	dec := json.NewDecoder(strings.NewReader(trimmed))

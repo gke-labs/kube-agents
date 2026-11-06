@@ -1139,3 +1139,38 @@ func TestAWorkersCardIDIsCapped(t *testing.T) {
 		t.Errorf("card id %d bytes, worker %q (%d bytes), want each within %d", len(e.CardID), e.Worker, len(e.Worker), maxSubtaskIDBytes)
 	}
 }
+
+// A URL's password may hold a path character and is still scrubbed.
+func TestScrubCatchesAURLPasswordWithAPathCharacter(t *testing.T) {
+	got := scrubInlineSecrets("connect postgres://app:ab/cd+ef==@db-1:5432/prod failed")
+	if strings.Contains(got, "ab/cd") || !strings.Contains(got, "db-1:5432/prod") || !strings.Contains(got, "postgres://app:") {
+		t.Errorf("scrubbed = %q, want the password gone and the host kept", got)
+	}
+	if got := scrubInlineSecrets("see https://example.com/docs/page"); got != "see https://example.com/docs/page" {
+		t.Errorf("a URL with no credentials changed: %q", got)
+	}
+}
+
+// A card id is one grammar everywhere: an id ending in "-" is whole.
+func TestACreatedCardIDKeepsItsWholeShape(t *testing.T) {
+	if got := createdKanbanCardID(kanbanCreateTool, json.RawMessage(`{"id":"t_ab-"}`)); got != "t_ab-" {
+		t.Errorf("createdKanbanCardID = %q, want t_ab-", got)
+	}
+}
+
+// A worker's kanban_* argument names a card only when it is a card id.
+func TestAWorkersArgumentNamesACardOnlyWhenItIsOne(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-arg-test"
+	pre := hookDelivery{Event: hookPreToolCall, SessionID: "worker-arg", DeliveryID: "pre-arg", ToolName: "kanban_show",
+		ToolInput: json.RawMessage(`{"card_id":"the prod-a rotation it meant"}`)}
+	pre.Extra.ToolCallID = "arg-1"
+	a.observe(pre)
+	post := pre
+	post.Event, post.DeliveryID = hookPostToolCall, "post-arg"
+	post.Extra.Status = hookStatusOK
+	e, _, _ := a.observe(post)
+	if e.CardID != "" || strings.Contains(e.Worker, "rotation") {
+		t.Errorf("card id %q, worker %q: want no card from a free-text argument", e.CardID, e.Worker)
+	}
+}
