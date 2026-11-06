@@ -601,9 +601,9 @@ type ShellSandboxSpec struct {
 	// request above its limit, a negative quantity, a zero limit, an
 	// unrepresentable byte or CPU count and claims, because the sandbox pod
 	// declares no resourceClaims. A refused override, including an edit of one
-	// that was valid, renders the shell at the operator's defaults until it is
-	// corrected, and the operator reports Degraded with reason
-	// InvalidShellSandboxResources when no higher-ranked Degraded cause is
+	// that was valid, renders the shell at the sizing profile's row (the
+	// operator's defaults under small) until it is corrected, and the
+	// operator reports Degraded with reason InvalidShellSandboxResources when no higher-ranked Degraded cause is
 	// present, the agent staying Ready, whether or not the validating webhook
 	// is enabled. Where the webhook is on, it refuses the edit at apply. The
 	// webhook warns when memory per CPU on the requests pair leaves the band
@@ -1313,6 +1313,49 @@ type DeploymentSpec struct {
 	// +optional
 	AgentAPIAuth *AgentAPIAuthSpec `json:"agentAPIAuth,omitempty"`
 
+	// SizingProfile picks the preset requests and limits the credential-proxy
+	// container, the agent-api-auth sidecar and the shell container start
+	// from, before the per-key overrides under credentialProxy.resources,
+	// agentAPIAuth.resources and spec.harness.experimental.shellSandbox.resources
+	// are applied over them; an explicit key always wins over the preset.
+	// "small", the default and the value an absent field means, is the
+	// operator's defaults as they were before the field existed. "medium"
+	// raises the broker to 1 CPU and 4Gi requests (2 CPU and 4Gi on GKE
+	// Autopilot) with 2 CPU and 4Gi limits, and the sidecar's memory limit to
+	// 4Gi. "fleet" raises the broker to 4 CPU and 8Gi requests with 8 CPU and
+	// 8Gi limits and the 8Gi ephemeral-storage limit, the sidecar's memory
+	// limit to 8Gi and the shell's to 4Gi. "auto" promotes the tier from the
+	// cluster count the operator polls into status.usage, the larger of
+	// clustersRegistered and clustersMonitored: medium at 10 clusters, fleet
+	// at 25. It continues from the tier status.effectiveSizingTier holds,
+	// which is small on a CR that never named a tier and the explicit tier
+	// on one that did; set small first to restart it from small. A promotion
+	// is upward only, latched in that status field, so a count that falls
+	// never lowers the tier; and before each step up the operator checks
+	// every ResourceQuota in the namespace that counts these pods for the
+	// cpu, memory and ephemeral-storage the step adds, and every LimitRange
+	// max, min and maxLimitRequestRatio in the namespace against the three
+	// containers' figures at the higher row, per container and summed per
+	// pod, takes the highest tier both admit (the running one when they
+	// admit none) and sets the
+	// SizingCappedByQuota condition for the step refused, naming the quota
+	// or the LimitRange, rather than rolling out pods admission would refuse.
+	// A pod the namespace admits between that check and the recreated
+	// broker's admission can take the room the check found; a step whose
+	// pod a quota then refuses is stepped back one tier, the condition
+	// naming the quota and admission's message.
+	// The check reads namespaced admission, not node capacity: on GKE
+	// Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
+	// to fit on one node before the recreated broker can start, so a Standard
+	// pool needs nodes that fit the fleet row's 4 CPU request (e2-standard-8
+	// or larger) before the count reaches 25 under auto. An
+	// explicit tier is applied as written, without either check. The agent
+	// container's own resources are not part of a profile. A change of tier
+	// recreates the proxy pod once and rolls the gateway and the shell pod.
+	// +kubebuilder:validation:Enum=small;medium;fleet;auto
+	// +optional
+	SizingProfile string `json:"sizingProfile,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -1337,9 +1380,9 @@ type CredentialProxySpec struct {
 	// below the default request, lowers that request to the limit. On
 	// Autopilot a CPU request the CR does not set is held to at most one CPU
 	// per GiB of the memory request. The broker sizes how many commands it
-	// admits at once from the memory limit, so raising the limit is the one
-	// knob for an install whose
-	// fleet outgrows the default; the ephemeral-storage limit bounds the content
+	// admits at once from the memory limit, so raising the limit, or picking
+	// a spec.deployment.sizingProfile row that raises it, is the knob for an
+	// install whose fleet outgrows the default; the ephemeral-storage limit bounds the content
 	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
 	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
 	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
@@ -1357,8 +1400,9 @@ type CredentialProxySpec struct {
 	// refuses a memory limit below what admits two commands at once, a request
 	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
 	// pod declares no resourceClaims. A refused override, including an edit of
-	// one that was valid, renders the proxy Deployment at the operator's
-	// defaults, not at the last accepted override, until it is corrected,
+	// one that was valid, renders the proxy Deployment at the sizing
+	// profile's row (the operator's defaults under small), not at the last
+	// accepted override, until it is corrected,
 	// which on the proxy's Recreate Deployment restarts the proxy once; the
 	// operator reports Degraded with reason InvalidCredentialProxyResources
 	// when no higher-ranked Degraded cause is present, the agent staying
@@ -1421,7 +1465,8 @@ type AgentAPIAuthSpec struct {
 	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
 	// claims, because the gateway pod declares no resourceClaims. A refused
 	// override, including an edit of one that was valid, renders the sidecar at
-	// the operator's defaults until it is corrected, and the operator reports
+	// the sizing profile's row (the operator's defaults under small) until it
+	// is corrected, and the operator reports
 	// Degraded with reason InvalidAgentAPIAuthResources when no higher-ranked
 	// Degraded cause is present, the agent staying Ready, whether or not the
 	// validating webhook is enabled. Where the webhook is on, it refuses the
@@ -2521,6 +2566,18 @@ type AgentStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// EffectiveSizingTier is the sizing tier the operator last rendered the
+	// credential proxy, the agent-api-auth sidecar and the shell container at:
+	// "small", "medium" or "fleet". Under spec.deployment.sizingProfile "auto"
+	// it is also the latch: the tier rises from the value here with the
+	// cluster count, is stepped back one tier when admission refuses the pod
+	// a step recreated (the SizingCappedByQuota condition beside it says
+	// which quota), and a recreated CR starts again at small. Under an
+	// explicit profile it repeats that profile. Absent before the first pass
+	// that resolved it.
+	// +optional
+	EffectiveSizingTier string `json:"effectiveSizingTier,omitempty"`
 
 	// DeploymentStatus tracks the state of the underlying compute.
 	// +optional

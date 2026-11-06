@@ -58,7 +58,7 @@ logger = logging.getLogger("session_kv_server")
 # `spec.deployment.env` (the operator renders them on the container). The PVC
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
-_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS")
 # The home channel a today-era `/sethome` or first chat mirrored into that
 # `.env` (Hermes' persist_home_channel). Under `next` with the operator's
 # projection mounted, the projected file is the channel the gateway posts
@@ -388,13 +388,53 @@ TRIAGE_NOTICE_BY_SOURCE = {
 # The opt-in that has an event triage open the pull request for its recommended
 # fix instead of waiting for a human `apply`. An install opts in with a
 # `spec.deployment.env` entry (chart: `platformAgent.deployment.env`), which the
-# operator's allowlist (`safeSandboxEnvOverrides`) passes to this container, the
-# same path INCIDENT_WORKLOAD_DEDUP_SECONDS takes; an install that never sets it
+# operator's allowlist (`safeSandboxEnvOverrides`) passes to this container, as
+# it passes INCIDENT_WORKLOAD_DEDUP_SECONDS; unlike that window, which the
+# operator renders at its default on every pod, an install that never sets this
 # renders the same pod as before. Read per call rather than at import, so a
 # test can flip it.
 INCIDENT_TRIAGE_OPEN_PR_ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
 # The value the operator writes. Anything else, unset included, is off.
 INCIDENT_TRIAGE_OPEN_PR_ON = "true"
+# The most triage pull requests open or being opened at once, with the opt-in
+# above on. At the limit a triage still runs, but the front door gets the
+# default query, whose report asks for an `apply`, and the alert's thread gets
+# TRIAGE_PR_CAP_NOTE. Set like the opt-in (chart:
+# `platformAgent.deployment.incidentMaxOpenPullRequests`). 0, unset, negative or not a
+# number is no limit. Read per call, so a test can change it.
+INCIDENT_TRIAGE_MAX_OPEN_PR_ENV = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
+# A triage pull request is one whose source branch starts with
+# INCIDENT_PR_BRANCH_PREFIX. Counted with the forge's open list, a page of
+# TRIAGE_PR_LIST_PAGE_SIZE at a time, up to TRIAGE_PR_LIST_MAX_PAGES pages per
+# managed repository, within TRIAGE_PR_COUNT_TIMEOUT_S for the whole count.
+TRIAGE_PR_LIST_PAGE_SIZE = 100
+TRIAGE_PR_LIST_MAX_PAGES = 10
+TRIAGE_PR_COUNT_TIMEOUT_S = 10.0
+# A branch a triage was routed to open counts from the routing on, before its
+# pull request exists: a node failure breaks many pods at once, and their
+# diagnoses finish minutes later. One reservation per triage and branch. It
+# ends when the branch shows an open pull request (counted as open from then),
+# when the triage's pull-request card (title TRIAGE_PR_CARD_TITLE_PREFIX) is
+# done or archived, when the triage does not start, or after
+# TRIAGE_PR_RESERVATION_MAX_S: for a card never filed, and for a card blocked,
+# or held behind a blocked triage card, that long.
+TRIAGE_PR_RESERVATION_MAX_S = 86400
+TRIAGE_PR_CARD_TITLE_PREFIX = "Open GitOps PR for "
+TRIAGE_PR_CARD_SETTLED_STATUSES = ("done", "archived")
+# When the open list cannot be read (a forge error, the timeout, more pages
+# than TRIAGE_PR_LIST_MAX_PAGES), the count is unknown. True treats it as at
+# the limit: a limit a forge outage could lift does not hold in an outage, and
+# a human can still `apply`.
+TRIAGE_PR_UNCOUNTED_AT_LIMIT = True
+# Posted in the alert's thread when the limit holds a triage's pull request back.
+TRIAGE_PR_CAP_NOTE = (
+    "ℹ️ **No automatic Pull Request for this incident.** This install already has {count} triage Pull Requests "
+    "open or being opened, and its limit is {limit}. The triage report proposes the fix and says how to open it."
+)
+TRIAGE_PR_UNCOUNTED_NOTE = (
+    "ℹ️ **No automatic Pull Request for this incident.** The open triage Pull Requests could not be counted "
+    "against this install's limit of {limit}. The triage report proposes the fix and says how to open it."
+)
 # The profile that holds the GitOps write path. The triage card goes to a
 # Cluster Agent, whose persona forbids `submit-suggestion`, so the pull request
 # is a second card for this profile, queued behind the triage card.
@@ -920,12 +960,17 @@ ALERT_DAILY_LIMITS = {
 # every replacement pod and every reason in a cascade opens a triage of its own.
 # The window runs from the anchor, not from the latest duplicate, so a new pod
 # or reason from a workload that keeps failing is announced again once the
-# window has passed. 0, the default, turns
-# folding off; a negative or unparseable value reads as the default, the same
-# parse the daily ceilings use. Capped at a day, the watcher's own dedup window.
+# window has passed. On by default at an hour, which the operator also renders
+# into the container's env (platformagent_manifests.go) and the chart exposes
+# as platformAgent.deployment.incidentWorkloadDedupSeconds; 0 turns folding
+# off. A negative value reads as 0 and an unparseable one as the default, the
+# same parse the daily ceilings use. Capped at a day, the watcher's own dedup
+# window.
+INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS = 3600
 INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
 INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
-    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
+    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS),
+    INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS,
 )
 # A pod named like a Deployment's for display: 8-10 hex characters, then the
 # pod's own suffix (`checkout-6cfdb6b98b-zwv24` -> `checkout`). clean_workload_name
@@ -962,6 +1007,14 @@ INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
 # arriving together cannot both find no anchor and both open a triage. The
 # route is a sync def served on a threadpool, so they can.
 _WORKLOAD_FOLD_LOCK = threading.Lock()
+# The WHERE terms of the fold's two partial indexes (init_db). The anchor and
+# open-fix lookups spell them verbatim beside their bound parameters, since
+# SQLite matches a partial index against the query's text; init_db replaces an
+# index of the same name whose SQL lacks the term.
+FOLD_ANCHOR_INDEX_TERM = "fold_key != '' AND (notified != 0 OR delivery_error != '')"
+WORKLOAD_INCIDENT_INDEX_TERM = (
+    "workload_key != '' AND duplicate_of IS NULL AND session_id != '' AND (notified != 0 OR delivery_error != '')"
+)
 # A workload that breaks again while the fix for its last incident waits for
 # review (_open_fix_pull_request): the event is recorded against that incident
 # with the pull request's URL instead of opening a second investigation. A pull
@@ -980,6 +1033,24 @@ FIX_PR_INCIDENTS_SCANNED = 5
 # The forge lookup's budget for the whole search; past it the event is
 # announced as a new incident, the same answer as no fix at all.
 FIX_PR_LOOKUP_TIMEOUT_S = 8.0
+# The forge calls run on this many daemon workers (_FixPullRequestLookupPool)
+# rather than on a thread per call: a burst of events for workloads with a
+# fix in review would otherwise start one thread each. A worker's read is
+# bounded by FIX_PR_LOOKUP_TIMEOUT_S as well (forge.call's `timeout_s`, which
+# shortens the sandbox hop and skips the retry once the budget is spent), so a
+# forge that hangs holds a worker for the search budget rather than for the
+# hop's own FORWARD_TIMEOUT_S, and four workers clear a burst of hung reads at
+# the same pace their callers give up on them.
+FIX_PR_LOOKUP_WORKERS = 4
+# How many lookups may wait for a worker. A call that finds the queue full
+# answers None, which announces the event: the same fail-open answer as a
+# forge that is slow.
+FIX_PR_LOOKUP_QUEUE_MAX = 64
+# How long a pull request's state is reused for. Every replica of a workload
+# whose fix is in review asks about the same URL within seconds of each
+# other, so one forge call answers the burst; the cost is that a pull request
+# merged within the last minute can still hold one recurrence.
+FIX_PR_STATE_CACHE_TTL_S = 60.0
 # session_metadata key on the held incident's session: when its thread was last
 # reminded that the fix is waiting, so it is reminded at most once per window.
 FIX_PR_REMINDED_AT_KEY = "fix_pr_reminded_at"
@@ -1602,6 +1673,57 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id "
                 "ON intercepted_events (session_id)"
             )
+            # The workload fold's lookups, both on the inject route and the
+            # first under _WORKLOAD_FOLD_LOCK, so every event waited on them.
+            # Without these the open-fix lookup and the start-up clear below
+            # scanned the whole ledger, and the anchor lookup ranged over the
+            # window's rows through idx_intercepted_events_created_at and
+            # sorted them, growing with the hour's event rate; the route's
+            # latency grew with the table until the watcher's inject timed out.
+            # Partial, so each holds only the rows that can answer, and nothing
+            # else is walked on a miss: an anchor has a fold_key and was
+            # admitted (`notified` non-zero or a `delivery_error`; the start-up
+            # clear below empties the first index again), an incident with a
+            # fix has a workload_key, is no duplicate, has a session and was
+            # admitted, and only a folded row has a duplicate_of. The admission
+            # term is in both because every forwarded event writes a row with
+            # both keys and the inject's session set whatever became of it: a
+            # workload refused all day by its severity's ceiling writes one
+            # row per sighting, none of which answers either lookup, and an
+            # index without the term would make each later sighting walk all
+            # of them, newest first, before concluding there is no anchor and
+            # no incident. The queries spell the WHERE
+            # terms as literals (`fold_key != ''`, `(notified != 0 OR
+            # delivery_error != '')`, `workload_key != ''`, `duplicate_of IS
+            # NULL`, `session_id != ''`, `duplicate_of > 0`) next to their
+            # bound parameters, because SQLite matches a partial index's WHERE
+            # against the query's text. `id DESC` serves the `ORDER BY id DESC
+            # LIMIT` without a sort.
+            # An index of either name that an earlier build created on the
+            # key alone is dropped first, since CREATE INDEX IF NOT EXISTS
+            # would keep it, terms and all.
+            for name, columns, term in (
+                (
+                    "idx_intercepted_events_fold_anchor",
+                    "(cluster, namespace, object_kind, fold_key, id DESC)",
+                    FOLD_ANCHOR_INDEX_TERM,
+                ),
+                (
+                    "idx_intercepted_events_workload_incident",
+                    "(cluster, namespace, object_kind, workload_key, id DESC)",
+                    WORKLOAD_INCIDENT_INDEX_TERM,
+                ),
+            ):
+                existing = conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?", (name,)
+                ).fetchone()
+                if existing and term not in (existing[0] or ""):
+                    conn.execute(f"DROP INDEX {name}")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON intercepted_events {columns} WHERE {term}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_duplicate_reason "
+                "ON intercepted_events (duplicate_of, reason) WHERE duplicate_of > 0"
+            )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
             # the session server goes down with its container, and an in-memory
@@ -1662,6 +1784,29 @@ def init_db() -> None:
                 )
                 """
             )
+            # The branches triages were routed to open a pull request on, which
+            # count against INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS until their
+            # pull request is open or their card settles (_claim_triage_pull_request).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS triage_pr_reservations (
+                    branch      TEXT NOT NULL,
+                    session_id  TEXT NOT NULL,
+                    reserved_at REAL NOT NULL,
+                    PRIMARY KEY (branch, session_id)
+                )
+                """
+            )
+            # A reservation is written before its triage starts, and a process
+            # that died in between leaves it with no turn behind it and nothing
+            # else to release it, as the fold anchors below. A triage that
+            # started keeps its reservation: its card may still open the pull
+            # request.
+            conn.execute(
+                "DELETE FROM triage_pr_reservations WHERE session_id NOT IN "
+                "(SELECT session_id FROM intercepted_events WHERE triage_state = ?)",
+                (TRIAGE_STATE_STARTED,),
+            )
             # The origin each cron job id was created or last changed under,
             # written from trusted context by the `cronjob` tool's handler
             # (docs/designs/proposal-origin.md §2.1), and the ledger of
@@ -1707,8 +1852,15 @@ def init_db() -> None:
             # all: a workload whose triage did start loses its window, which
             # costs one more triage (per severity: a Critical folds only into a
             # Critical) for a sibling that arrives after
-            # the restart, and is noise rather than silence.
-            conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
+            # the restart, and is noise rather than silence. The WHERE is the
+            # fold-anchor index's own term, so the clear walks that index and
+            # not the table; a row the index leaves out (refused, or folded)
+            # keeps its fold_key, and never anchors because it was never
+            # admitted, which is the same term.
+            conn.execute(
+                "UPDATE intercepted_events SET fold_key = '' "
+                "WHERE fold_key != '' AND (notified != 0 OR delivery_error != '')"
+            )
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -2037,37 +2189,167 @@ def _incident_pull_request_urls(session_id: str) -> list[str]:
     return urls
 
 
-def _proposal_state(url: str, timeout: float) -> Optional[str]:
-    """The forge's state for the pull request at `url`, or None when it cannot say in time."""
-    match = PROPOSAL_URL_RE.match(url)
-    if match is None or timeout <= 0:
-        return None
-    # A daemon thread, not a ThreadPoolExecutor: a forge call that outlives the
-    # budget is abandoned, and an executor's worker would hold a restart until
-    # it ends (forge's own hop allows FORWARD_TIMEOUT_S an attempt).
-    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+class _FixPullRequestLookup:
+    """One pull request's state read in flight: whoever asks for the URL waits on it.
 
-    def _view() -> None:
+    `waiters` and `queued_at` are guarded by the pool's lock: a lookup still
+    queued when its last waiter has given up and FIX_PR_LOOKUP_TIMEOUT_S has
+    passed is dropped unread, so a forge brownout does not leave the workers
+    draining stale reads ahead of fresh callers.
+    """
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.state: Optional[str] = None
+        self.waiters = 0
+        self.queued_at = time.monotonic()
+
+
+class _FixPullRequestLookupPool:
+    """`FIX_PR_LOOKUP_WORKERS` daemon threads reading pull request states, with a per-URL cache.
+
+    Daemon threads, not a ThreadPoolExecutor: a forge call that outlives a
+    caller's budget is abandoned by that caller, and an executor's worker would
+    hold a restart until it ends. The worker's own read is bounded by
+    FIX_PR_LOOKUP_TIMEOUT_S (_read_proposal_state passes it to forge.call,
+    which shortens the sandbox hop from FORWARD_TIMEOUT_S and does not retry a
+    transient failure once that budget is spent), so a forge that hangs frees
+    its worker when its callers' budget ends rather than ninety seconds later;
+    with the sandbox off the direct broker request is bounded by the broker
+    client's connect timeout alone. The queue is bounded
+    (FIX_PR_LOOKUP_QUEUE_MAX), so a forge that stops answering cannot pile up
+    lookups behind the four workers.
+
+    A URL is asked of the forge once per FIX_PR_STATE_CACHE_TTL_S: a state read
+    within the window is answered from the cache, and callers that arrive while
+    a read is in flight wait on that read rather than starting their own. Only
+    a state the forge gave is cached; a failed or abandoned read leaves nothing
+    behind, so the next caller asks again. A read that has started when its
+    callers give up still lands in the cache; one still queued once every
+    caller has gone and the search budget has passed is dropped unread.
+    """
+
+    def __init__(self, workers: int, queue_max: int, ttl_s: float):
+        self._queue: "queue.Queue[tuple[str, _FixPullRequestLookup]]" = queue.Queue(maxsize=queue_max)
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        # url -> (monotonic expiry, state)
+        self._cache: Dict[str, tuple[float, str]] = {}
+        self._in_flight: Dict[str, _FixPullRequestLookup] = {}
+        self.threads = [
+            threading.Thread(target=self._work, name=f"fix-pr-lookup-{i}", daemon=True) for i in range(workers)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def state(self, url: str, timeout: float) -> Optional[str]:
+        """The cached or freshly read state of `url`, or None when it is not known within `timeout`."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(url)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            lookup = self._in_flight.get(url)
+            if lookup is None:
+                lookup = _FixPullRequestLookup()
+                try:
+                    self._queue.put_nowait((url, lookup))
+                except queue.Full:
+                    logger.warning(f"Could not read the state of {url}: {self._queue.maxsize} lookups already waiting")
+                    return None
+                self._in_flight[url] = lookup
+            lookup.waiters += 1
         try:
-            import forge
+            answered = lookup.done.wait(timeout)
+        finally:
+            with self._lock:
+                lookup.waiters -= 1
+        if not answered:
+            logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+            return None
+        return lookup.state
 
-            view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
-            answer.put((True, view))
-        except Exception as exc:
-            answer.put((False, exc))
+    def forget(self) -> None:
+        """Drop every cached state (tests, between cases)."""
+        with self._lock:
+            self._cache.clear()
 
-    threading.Thread(target=_view, name="fix-pr-lookup", daemon=True).start()
+    def _work(self) -> None:
+        while True:
+            url, lookup = self._queue.get()
+            with self._lock:
+                stale = lookup.waiters == 0 and time.monotonic() - lookup.queued_at > FIX_PR_LOOKUP_TIMEOUT_S
+                if stale and self._in_flight.get(url) is lookup:
+                    del self._in_flight[url]
+            if stale:
+                lookup.done.set()
+                continue
+            state = None
+            try:
+                state = _read_proposal_state(url)
+            except Exception:
+                logger.exception(f"Pull request lookup worker raised on {url}")
+            with self._lock:
+                if state is not None:
+                    self._cache[url] = (time.monotonic() + self._ttl_s, state)
+                if self._in_flight.get(url) is lookup:
+                    del self._in_flight[url]
+            lookup.state = state
+            lookup.done.set()
+
+
+_FIX_PR_LOOKUP_POOL: Optional[_FixPullRequestLookupPool] = None
+_FIX_PR_LOOKUP_POOL_LOCK = threading.Lock()
+
+
+def _fix_pr_lookup_pool() -> _FixPullRequestLookupPool:
+    global _FIX_PR_LOOKUP_POOL
+    with _FIX_PR_LOOKUP_POOL_LOCK:
+        if _FIX_PR_LOOKUP_POOL is None:
+            _FIX_PR_LOOKUP_POOL = _FixPullRequestLookupPool(
+                FIX_PR_LOOKUP_WORKERS, FIX_PR_LOOKUP_QUEUE_MAX, FIX_PR_STATE_CACHE_TTL_S
+            )
+        return _FIX_PR_LOOKUP_POOL
+
+
+def _read_proposal_state(url: str) -> Optional[str]:
+    """Ask the forge for the state of the pull request at `url`; None when it has none to give.
+
+    Bounded by FIX_PR_LOOKUP_TIMEOUT_S for the call as a whole, retry
+    included: the pool's worker is held no longer than the callers it answers.
+    """
+    match = PROPOSAL_URL_RE.match(url)
+    if match is None:
+        return None
     try:
-        ok, result = answer.get(timeout=timeout)
-    except queue.Empty:
-        logger.warning(f"Could not read the state of {url} within {timeout:.1f}s")
+        import forge
+
+        view = forge.call(
+            "proposal-view",
+            {"number": int(match.group(2))},
+            match.group(1),
+            retry_transient=True,
+            timeout_s=FIX_PR_LOOKUP_TIMEOUT_S,
+        )
+    except Exception as exc:
+        logger.warning(f"Could not read the state of {url}: {exc!r}")
         return None
-    if not ok:
-        logger.warning(f"Could not read the state of {url}: {result!r}")
-        return None
-    proposal = (result.get("proposal") if isinstance(result, dict) else None) or {}
+    proposal = (view.get("proposal") if isinstance(view, dict) else None) or {}
     state = proposal.get("state") if isinstance(proposal, dict) else None
     return state if isinstance(state, str) else None
+
+
+def _proposal_state(url: str, timeout: float) -> Optional[str]:
+    """The forge's state for the pull request at `url`, or None when it cannot say in time.
+
+    Read through _FixPullRequestLookupPool: at most FIX_PR_LOOKUP_WORKERS forge
+    calls at once, one per URL per FIX_PR_STATE_CACHE_TTL_S. The caller waits
+    only its own `timeout`; a read that outlives it still lands in the cache
+    for the next caller.
+    """
+    if PROPOSAL_URL_RE.match(url) is None or timeout <= 0:
+        return None
+    return _fix_pr_lookup_pool().state(url, timeout)
 
 
 def _open_fix_pull_request(
@@ -2094,13 +2376,21 @@ def _open_fix_pull_request(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            # `workload_key != ''`, `duplicate_of IS NULL`, `session_id != ''`
+            # and `(notified != 0 OR delivery_error != '')` are the
+            # workload-incident index's terms and `duplicate_of > 0` the
+            # duplicate index's (init_db); the correlated EXISTS reads the
+            # duplicate index once per candidate incident rather than
+            # materialising every folded row's anchor.
             incidents = conn.execute(
-                "SELECT id, session_id FROM intercepted_events "
-                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND workload_key = ? "
-                "AND (reason = ? OR id IN (SELECT duplicate_of FROM intercepted_events WHERE reason = ? AND duplicate_of > 0)) "
-                "AND (? != ? OR severity = ?) "
-                "AND duplicate_of IS NULL AND (notified != 0 OR delivery_error != '') AND session_id != '' "
-                "ORDER BY id DESC LIMIT ?",
+                "SELECT e.id, e.session_id FROM intercepted_events AS e "
+                "WHERE e.cluster = ? AND e.namespace = ? AND e.object_kind = ? "
+                "AND e.workload_key = ? AND e.workload_key != '' "
+                "AND (e.reason = ? OR EXISTS (SELECT 1 FROM intercepted_events AS d "
+                "WHERE d.duplicate_of = e.id AND d.duplicate_of > 0 AND d.reason = ?)) "
+                "AND (? != ? OR e.severity = ?) "
+                "AND e.duplicate_of IS NULL AND (e.notified != 0 OR e.delivery_error != '') AND e.session_id != '' "
+                "ORDER BY e.id DESC LIMIT ?",
                 (
                     cluster,
                     namespace,
@@ -2239,9 +2529,11 @@ def _workload_incident_anchor(
         return None
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            # `fold_key != ''` and `(notified != 0 OR delivery_error != '')`
+            # are the fold-anchor index's terms (init_db).
             row = conn.execute(
                 "SELECT id FROM intercepted_events "
-                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? AND fold_key != '' "
                 "AND (? != ? OR severity = ?) "
                 "AND (notified != 0 OR delivery_error != '') "
                 "AND created_at >= datetime('now', ?) "
@@ -3349,6 +3641,215 @@ def _incident_triage_opens_pull_request() -> bool:
     return os.environ.get(INCIDENT_TRIAGE_OPEN_PR_ENV, "").strip().lower() == INCIDENT_TRIAGE_OPEN_PR_ON
 
 
+def _incident_triage_pull_request_limit() -> int:
+    """INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, or 0 for no limit."""
+    return _alert_daily_limit(INCIDENT_TRIAGE_MAX_OPEN_PR_ENV, 0)
+
+
+# Held from the count to the reservation, so triages that start together
+# (TRIAGE_START_WORKERS) count each other.
+_TRIAGE_PR_CLAIM_LOCK = threading.Lock()
+# The forge count's thread, at most one at a time: a count abandoned at its
+# deadline keeps its thread until the forge answers, and a count that finds one
+# still running is uncounted rather than starting another.
+_TRIAGE_PR_COUNT_THREAD: Optional[threading.Thread] = None
+_TRIAGE_PR_COUNT_THREAD_LOCK = threading.Lock()
+
+
+def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
+    """The source branches of the open triage pull requests in the managed repositories, or None when unknown.
+
+    Unknown is any forge error, no answer within ``timeout``, a repository
+    with more than TRIAGE_PR_LIST_MAX_PAGES pages of open proposals, or an
+    earlier count still waiting on the forge. Read on a daemon thread, so a
+    forge call past the timeout is abandoned rather than waited on, and only
+    one such thread runs at a time (_TRIAGE_PR_COUNT_THREAD).
+    """
+    global _TRIAGE_PR_COUNT_THREAD
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _list() -> None:
+        try:
+            import forge
+
+            branches: Set[str] = set()
+            for repo in gitops_workspace.get_managed_repos():
+                # A fork's proposal names its own repository in `sourceRepo`;
+                # only a branch on this repository is the install's.
+                here = "/".join(repo.casefold().split("/")[-2:])
+                for page in range(1, TRIAGE_PR_LIST_MAX_PAGES + 1):
+                    listing = forge.call(
+                        "proposal-list",
+                        {"state": PROPOSAL_OPEN_STATE, "limit": TRIAGE_PR_LIST_PAGE_SIZE, "page": page},
+                        repo,
+                        retry_transient=True,
+                    )
+                    for proposal in listing.get("proposals") or []:
+                        if not isinstance(proposal, dict):
+                            continue
+                        source = proposal.get("source")
+                        source_repo = str(proposal.get("sourceRepo") or "").casefold()
+                        if source_repo and "/".join(source_repo.split("/")[-2:]) != here:
+                            continue
+                        if isinstance(source, str) and source.startswith(INCIDENT_PR_BRANCH_PREFIX):
+                            branches.add(source)
+                    if not listing.get("truncated"):
+                        break
+                else:
+                    raise RuntimeError(f"{repo} has more than {TRIAGE_PR_LIST_MAX_PAGES} pages of open proposals")
+            answer.put((True, branches))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    with _TRIAGE_PR_COUNT_THREAD_LOCK:
+        if _TRIAGE_PR_COUNT_THREAD is not None and _TRIAGE_PR_COUNT_THREAD.is_alive():
+            logger.warning("Could not count the open triage pull requests: an earlier count is still waiting on the forge")
+            return None
+        _TRIAGE_PR_COUNT_THREAD = threading.Thread(target=_list, name="triage-pr-count", daemon=True)
+        _TRIAGE_PR_COUNT_THREAD.start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not count the open triage pull requests within {timeout:.1f}s")
+        return None
+    if not ok:
+        logger.warning(f"Could not count the open triage pull requests: {result!r}")
+        return None
+    return result
+
+
+def _settled_triage_pull_request_sessions(session_ids: Sequence[str], listed_at: float) -> Set[str]:
+    """Those of ``session_ids`` whose pull-request card is done or archived, and
+    opened no pull request after ``listed_at``, when the forge list was read.
+
+    A card that opened one after that read keeps its reservation: the read did
+    not see the pull request, so the reservation is what still counts it.
+    Best-effort: a board that cannot be read settles none, so their
+    reservations hold until the backstop.
+    """
+    if not session_ids:
+        return set()
+    marks = ",".join("?" * len(session_ids))
+    statuses = ",".join("?" * len(TRIAGE_PR_CARD_SETTLED_STATUSES))
+    try:
+        with closing(_read_only(_kanban_db_path())) as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT t.session_id FROM tasks t WHERE t.session_id IN ({marks}) "
+                f"AND t.assignee = ? AND t.title LIKE ? AND t.status IN ({statuses}) "
+                "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ? AND e.created_at >= ?)",
+                (
+                    *session_ids,
+                    INCIDENT_PR_ASSIGNEE,
+                    f"{TRIAGE_PR_CARD_TITLE_PREFIX}%",
+                    *TRIAGE_PR_CARD_SETTLED_STATUSES,
+                    PR_OPENED_EVENT_KIND,
+                    listed_at,
+                ),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning(f"Could not read the board for the triage pull-request cards: {exc!r}")
+        return set()
+    return {row[0] for row in rows}
+
+
+def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: int) -> Optional[str]:
+    """Reserve the incident's branch against ``limit``; None when reserved, else the note for its thread.
+
+    The count is the branches with an open triage pull request plus the
+    branches reserved and not yet released (TRIAGE_PR_RESERVATION_MAX_S says
+    when a reservation ends). An incident whose branch is already among them
+    adds nothing, because its card revises that pull request, so it is always
+    reserved.
+    """
+    branch = _incident_branch(session_id, payload)
+    # Read before the lock, so a slow forge does not hold the other starts.
+    # A pull request that opens after this read is still counted, through
+    # the reservation that routed it (_settled_triage_pull_request_sessions).
+    listed_at = time.time()
+    open_branches = _open_triage_pull_request_branches(TRIAGE_PR_COUNT_TIMEOUT_S)
+    if open_branches is None and TRIAGE_PR_UNCOUNTED_AT_LIMIT:
+        logger.warning(f"Triage {session_id} files no pull-request card: the open triage pull requests could not be counted")
+        return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
+    with _TRIAGE_PR_CLAIM_LOCK:
+        try:
+            with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
+                now = time.time()
+                rows = conn.execute("SELECT branch, session_id, reserved_at FROM triage_pr_reservations").fetchall()
+                settled = _settled_triage_pull_request_sessions([row[1] for row in rows], listed_at)
+                released = [
+                    (row[0], row[1])
+                    for row in rows
+                    if (open_branches is not None and row[0] in open_branches)
+                    or row[1] in settled
+                    or now - float(row[2]) >= TRIAGE_PR_RESERVATION_MAX_S
+                ]
+                conn.executemany("DELETE FROM triage_pr_reservations WHERE branch = ? AND session_id = ?", released)
+                counted = set(open_branches or ()) | {row[0] for row in rows if (row[0], row[1]) not in released}
+                if branch not in counted and len(counted) >= limit:
+                    conn.commit()
+                    logger.info(
+                        f"Triage {session_id} files no pull-request card: {len(counted)} triage pull requests "
+                        f"open or reserved, limit {limit}"
+                    )
+                    return TRIAGE_PR_CAP_NOTE.format(count=len(counted), limit=limit)
+                conn.execute(
+                    "INSERT INTO triage_pr_reservations (branch, session_id, reserved_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(branch, session_id) DO UPDATE SET reserved_at = excluded.reserved_at",
+                    (branch, session_id, now),
+                )
+                conn.commit()
+        except Exception as exc:
+            # The ledger is the daemon's own; a write it refuses is reported and
+            # read as the uncounted case.
+            logger.error(f"Could not reserve {branch} for triage {session_id}: {exc!r}")
+            if TRIAGE_PR_UNCOUNTED_AT_LIMIT:
+                return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
+    return None
+
+
+def _release_triage_pull_request(session_id: str) -> None:
+    """Drop the session's reservations; for a triage that did not start. Best-effort."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
+            conn.execute("DELETE FROM triage_pr_reservations WHERE session_id = ?", (session_id,))
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"Could not release triage {session_id}'s pull-request reservation: {exc!r}")
+
+
+def _triage_pull_request_decision(start: _TriageStart) -> tuple[Optional[bool], Optional[str]]:
+    """``open_pull_request`` for _build_agent_query, and the note to post once the turn starts.
+
+    (None, None) unless this is an event triage on an install that opens the
+    pull request with a limit set: _build_agent_query then decides as before.
+    """
+    if start.payload.get("kind") in (INJECT_KIND_DRIFT, INJECT_KIND_STALL) or not _incident_triage_opens_pull_request():
+        return None, None
+    limit = _incident_triage_pull_request_limit()
+    if limit <= 0:
+        return None, None
+    note = _claim_triage_pull_request(start.session_id, start.payload, limit)
+    return note is None, note
+
+
+def _post_triage_pull_request_note(start: _TriageStart, note: str) -> None:
+    """Post ``note`` where _triage_not_started posts its notice: in the alert's
+    thread, or with no thread under the alert's first line, quoted. With no
+    chat platform, log it."""
+    notice = start.notice
+    if notice is None:
+        logger.info(f"Triage {start.session_id} has no chat for its pull-request limit note: {note}")
+        return
+    if notice.thread_id:
+        chat_id = _thread_chat_id(notice.platform, notice.thread_id)
+        sent = _send_to_chat(notice.platform, note, chat_id, notice.thread_id)
+    else:
+        quoted = notice.alert.splitlines()[0] if notice.alert else ""
+        sent = _send_to_chat(notice.platform, f"{note}\n> {quoted}" if quoted else note)
+    if not sent:
+        logger.error(f"Pull-request limit note for {start.session_id} was not delivered to '{notice.platform}'")
+
+
 def _incident_branch_workload(kind: str, raw_name: str) -> str:
     """The workload name an incident's pull-request branch is keyed on.
 
@@ -3460,7 +3961,7 @@ def _triage_pr_task_body(payload: Dict[str, Any], session_id: str) -> str:
     )
 
 
-def _build_agent_query(payload: Dict[str, Any], session_id: str = "") -> str:
+def _build_agent_query(payload: Dict[str, Any], session_id: str = "", open_pull_request: Optional[bool] = None) -> str:
     """The turn sent to the gateway, which is always the Planning Agent's.
 
     `_create_gateway_session` cannot choose a profile, so the reader is the
@@ -3497,13 +3998,15 @@ def _build_agent_query(payload: Dict[str, Any], session_id: str = "") -> str:
     An install that set INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true takes
     `_build_agent_query_with_pull_request`, which files the same triage card
     and a second one that opens the pull request. The text below is the
-    default and stays as it was.
+    default and stays as it was. ``open_pull_request``, when given, replaces
+    that setting: False is how the open pull-request limit
+    (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS) sends a triage the default.
     """
     if payload.get("kind") == INJECT_KIND_DRIFT:
         return _drift_agent_query(payload)
     if payload.get("kind") == INJECT_KIND_STALL:
         return _stall_agent_query(payload)
-    if _incident_triage_opens_pull_request():
+    if _incident_triage_opens_pull_request() if open_pull_request is None else open_pull_request:
         return _build_agent_query_with_pull_request(payload, session_id)
 
     event_reason = payload.get("reason") or "Unknown"
@@ -4388,7 +4891,8 @@ def _attempt_triage_start(start: _TriageStart) -> None:
     api_url = os.environ.get("PLATFORM_API_URL", PLATFORM_API_URL_DEFAULT)
     # The session lands on the default profile — the front door — which
     # delegates it to the failing cluster's own agent; see _build_agent_query.
-    agent_query = _build_agent_query(start.payload, session_id)
+    open_pull_request, limit_note = _triage_pull_request_decision(start)
+    agent_query = _build_agent_query(start.payload, session_id, open_pull_request=open_pull_request)
     need_session = True
     recreated = False
     answered = 0
@@ -4409,6 +4913,8 @@ def _attempt_triage_start(start: _TriageStart) -> None:
                 # running, so it is neither retried nor reported as not started.
                 mark_triage_state(start.event_row_id, TRIAGE_STATE_STARTED)
                 logger.info(f"TRIAGE_STARTED session={session_id} answer={attempt.outcome} {attempt.detail}".rstrip())
+                if limit_note:
+                    _post_triage_pull_request_note(start, limit_note)
                 return
             if attempt.detail == GATEWAY_SESSION_LOST:
                 if recreated:
@@ -4451,6 +4957,7 @@ def _triage_not_started(start: _TriageStart, reason: str) -> None:
     mark_triage_state(start.event_row_id, TRIAGE_STATE_ABORTED)
     # Nobody is working on this alert now: let the next sibling start a triage.
     mark_triage_not_started(start.event_row_id)
+    _release_triage_pull_request(start.session_id)
     notice = start.notice
     if notice is None:
         return

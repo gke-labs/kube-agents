@@ -18,15 +18,18 @@ package controller
 
 import (
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 func bridgeTestPod(agent *agentv1alpha1.PlatformAgent) corev1.PodTemplateSpec {
@@ -448,8 +451,9 @@ func TestARefusedExecutorSettingIsLoggedOnce(t *testing.T) {
 
 // The rendered bridge no longer copies the agent container's resources: that
 // doubled a next pod's requests and left it unschedulable on a cluster sized
-// for today (gke-labs#2748). With the defaults its requests are an eighth of
-// the agent container's or less.
+// for today (gke-labs#2748). With the defaults its requests are a quarter of
+// the agent container's or less (an eighth before the request was raised to
+// be livable under an Autopilot clamp).
 func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
 	pod := bridgeTestPod(provisionedAgent())
 	b := containersNamed(pod, a2aBridgeContainerName)[0]
@@ -459,8 +463,8 @@ func TestTheRenderedBridgeDoesNotDoubleThePodsRequests(t *testing.T) {
 		if agent.IsZero() {
 			t.Fatalf("the agent container requests no %s; the comparison is vacuous", name)
 		}
-		if bridge.MilliValue()*8 > agent.MilliValue() {
-			t.Errorf("the bridge requests %s %s, more than an eighth of the agent container's %s", bridge.String(), name, agent.String())
+		if bridge.MilliValue()*4 > agent.MilliValue() {
+			t.Errorf("the bridge requests %s %s, more than a quarter of the agent container's %s", bridge.String(), name, agent.String())
 		}
 	}
 	if err := a2aBridgeResourcesRefusal(a2aRenderedBridgeDefaultResources()); err != nil {
@@ -635,5 +639,86 @@ func TestTheBusyNoticeThresholdIsTheBridgeWorkerCount(t *testing.T) {
 		if got := rendered(declared); got != "3" {
 			t.Errorf("threshold with override %q = %q, want the worker count 3", bad, got)
 		}
+	}
+}
+
+// The rendered bridge is sized for GKE Autopilot without Pod bursting, which
+// sets each limit to its request: the pinned pair, the requests inside the 1
+// to 6.5 GiB per vCPU band Autopilot admits unchanged, and the memory limit
+// handed to the binary through the Downward API from the container's own
+// limits.memory, so the bridge's Go soft limit follows whichever figure the
+// cluster admitted. The reference names no container, so it reads the
+// bridge's limit and not the agent container's.
+func TestTheRenderedBridgeIsSizedForAnAutopilotClamp(t *testing.T) {
+	b := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("250m"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("1"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+	}
+	if !reflect.DeepEqual(b.Resources, want) {
+		t.Errorf("resources = %+v, want %+v", b.Resources, want)
+	}
+	if err := autopilotRequestsBandCheck(b.Resources); err != nil {
+		t.Error(err)
+	}
+
+	var refs []*corev1.ResourceFieldSelector
+	for _, e := range b.Env {
+		if e.Name == a2aBridgeMemoryLimitEnvVar {
+			if e.ValueFrom == nil {
+				t.Fatalf("%s = %q, want a resourceFieldRef", e.Name, e.Value)
+			}
+			refs = append(refs, e.ValueFrom.ResourceFieldRef)
+		}
+	}
+	if len(refs) != 1 || refs[0] == nil || refs[0].Resource != "limits.memory" || refs[0].ContainerName != "" {
+		t.Errorf("%s = %+v, want exactly one resourceFieldRef to this container's limits.memory", a2aBridgeMemoryLimitEnvVar, refs)
+	}
+}
+
+// An agent container that carries BRIDGE_MEMORY_LIMIT_BYTES of its own (a
+// plugin's env, a hand-set value) does not reach the bridge: the bridge's
+// own Downward API reference is the one entry, so the soft limit is read from
+// the bridge's container and not from a number someone wrote.
+func TestAnAgentsMemoryLimitVariableDoesNotReachTheBridge(t *testing.T) {
+	agentC := containersNamed(bridgeTestPod(provisionedAgent()), a2aAgentContainerName)[0]
+	agentC.Env = append(agentC.Env, corev1.EnvVar{Name: a2aBridgeMemoryLimitEnvVar, Value: "1"})
+	b := buildA2ABridgeContainer(provisionedAgent(), agentC)
+	var got []corev1.EnvVar
+	for _, e := range b.Env {
+		if e.Name == a2aBridgeMemoryLimitEnvVar {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 || got[0].ValueFrom == nil || got[0].ValueFrom.ResourceFieldRef == nil {
+		t.Errorf("the bridge's %s = %+v, want the bridge's own resourceFieldRef once", a2aBridgeMemoryLimitEnvVar, got)
+	}
+	if slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool { return e.Name == a2aBridgeMemoryLimitEnvVar && e.Value == "1" }) {
+		t.Error("the agent's hand-set value reached the bridge")
+	}
+}
+
+// GOMEMLIMIT is applied by the Go runtime before main, ahead of the limit the
+// bridge derives from its own container, and the agent container's env is
+// assembled from the plugins' spec.Env: a plugin's GOMEMLIMIT on the Python
+// agent must not become the bridge's soft limit. Only the env channel is
+// filtered by name; EnvFrom is copied as the agent's.
+func TestAnAgentsGoMemLimitDoesNotReachTheBridge(t *testing.T) {
+	agentC := containersNamed(bridgeTestPod(provisionedAgent()), a2aAgentContainerName)[0]
+	agentC.Env = append(agentC.Env, corev1.EnvVar{Name: memlimit.GoMemLimitEnv, Value: "1"})
+	b := buildA2ABridgeContainer(provisionedAgent(), agentC)
+	if slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool { return e.Name == memlimit.GoMemLimitEnv }) {
+		t.Errorf("the agent's %s reached the bridge, where the runtime would apply it over the derived limit", memlimit.GoMemLimitEnv)
+	}
+	if !slices.ContainsFunc(b.Env, func(e corev1.EnvVar) bool {
+		return e.Name == a2aBridgeMemoryLimitEnvVar && e.ValueFrom != nil && e.ValueFrom.ResourceFieldRef != nil
+	}) {
+		t.Errorf("the bridge's %s resourceFieldRef is missing; the derived limit has nothing to read", a2aBridgeMemoryLimitEnvVar)
 	}
 }

@@ -33,15 +33,15 @@ const (
 	// readMaxBytes is the most one read passes to its caller, counted per
 	// message as payload, subject and header keys and values (msgBytes): a
 	// drain, a task watch (over its whole life, since the watch keeps what
-	// it folds) and a DIRECTORY read each stop at it. The pod has 128 MiB
+	// it folds) and a DIRECTORY read each stop at it. The pod has 256 MiB
 	// (a2aMCPMemoryLimit in the operator), with GOMEMLIMIT at 85% of it,
-	// about 108 MiB. A reader has one Fetch in flight at a time and hands
+	// about 217 MiB. A reader has one Fetch in flight at a time and hands
 	// its messages out before it sends the next, so it holds at worst one
 	// pull's pullMaxBytes, 1.1 MiB, plus what it passed on, 4 MiB, plus a
 	// task watch's parsed copy of that, 4 MiB more: about 9.1 MiB. The
 	// eight reader slots (maxTaskReaders) and the one DIRECTORY read the
 	// status cache keeps in flight, all at their worst at once, come to
-	// about 82 MiB, leaving some 26 MiB of the GOMEMLIMIT for the server
+	// about 82 MiB, leaving some 135 MiB of the GOMEMLIMIT for the server
 	// itself. That leaves out per-message overhead (msgBytes counts
 	// content only), the cached status the next refresh replaces, and each
 	// response's encoding; a read's raw messages can be collected once

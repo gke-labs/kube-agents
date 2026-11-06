@@ -96,17 +96,31 @@ const (
 	a2aConsoleEnvUser         = "CONSOLE_USER"
 	a2aConsoleEnvPasswordFile = "CONSOLE_PASSWORD_FILE"
 	a2aConsoleEnvAllowedHosts = "CONSOLE_ALLOWED_HOSTS"
+	// a2aConsoleMemoryLimitEnvVar carries the container's memory limit in
+	// bytes, written by the Downward API from its own limits.memory
+	// (a2aConsoleMemoryLimitResource), which the console turns into the Go
+	// runtime's soft memory limit (nine tenths of it; an explicit GOMEMLIMIT
+	// wins). The same name the chart's web console reads, so the two console
+	// binaries share one contract. Read from the container itself so that
+	// on Autopilot it is the limit the cluster admitted, a clamp to the
+	// request included, rather than a2aConsoleMemoryLimit.
+	a2aConsoleMemoryLimitEnvVar   = "WEB_CONSOLE_MEMORY_LIMIT_BYTES"
+	a2aConsoleMemoryLimitResource = "limits.memory"
 
 	a2aConsoleReadinessPeriod  = 5
 	a2aConsoleReadinessFailure = 3
 	a2aConsoleLivenessPeriod   = 10
 	a2aConsoleLivenessFailure  = 6
-	// GKE Autopilot raises any CPU request under 50m on admission, so a
-	// smaller one is rewritten on every apply and the stored Deployment
-	// never matches the render. Sized like the gateway and the verifier.
-	a2aConsoleCPURequest    = "50m"
-	a2aConsoleMemoryRequest = "64Mi"
-	a2aConsoleMemoryLimit   = "128Mi"
+	// Sized for GKE Autopilot without Pod bursting, which sets each limit
+	// to its request: the request is what the console then runs under, so
+	// it is the figure that has to hold a page served with the bus proxy
+	// behind it, and the limit is the room it gets where bursting is on.
+	// The requests pair sits in the 1 to 6.5 GiB per vCPU band Autopilot
+	// admits unchanged (and above the 50m it raises smaller CPU requests
+	// to), so the stored Deployment matches the render on every apply.
+	a2aConsoleCPURequest    = "100m"
+	a2aConsoleMemoryRequest = "128Mi"
+	a2aConsoleMemoryLimit   = "256Mi"
 	// A namespace ResourceQuota on limits.cpu refuses a pod with a container
 	// that declares no CPU limit, so the console needs one (#3847). Measured
 	// over seven days on the dev installs (2026-10-30, 1-minute rates, five
@@ -229,6 +243,9 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							{Name: a2aConsoleEnvPasswordFile, Value: path.Join(a2aConsoleMountDir, a2aConsolePasswordKey)},
 							{Name: a2aConsoleEnvAllowedHosts, Value: strings.Join(a2aConsoleHosts(), a2aConsoleHostSep)},
 							a2aNATSCAFileEnvVar(),
+							{Name: a2aConsoleMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+								Resource: a2aConsoleMemoryLimitResource,
+							}}},
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aConsolePortName, ContainerPort: a2aConsolePort}},
 						VolumeMounts: []corev1.VolumeMount{{

@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterable
@@ -62,10 +63,11 @@ PROFILES_DIR = "/opt/data/profiles"
 PROFILE_PREFIX = "cluster-"
 LOCATION_SUFFIX_RE = re.compile(r"-[a-z]+-[a-z]+[0-9]+(?:-[a-z])?$")
 WATCHER_CLUSTER_UP = "k8s_event_watcher_cluster_up"
+PROXY_CONTAINER = "envoy-credential-proxy"
 # (snapshot attribute, label selector, container, env var naming the port or None for its first port)
 SCRAPE_TARGETS = (
     ("watcher", GATEWAY_SELECTOR, "agent-api-auth", "EVENT_WATCHER_METRICS_PORT"),
-    ("proxy", "app=platform-agent-credential-proxy", "envoy-credential-proxy", "CREDENTIAL_PROXY_METRICS_PORT"),
+    ("proxy", "app=platform-agent-credential-proxy", PROXY_CONTAINER, "CREDENTIAL_PROXY_METRICS_PORT"),
     ("litellm", "app=litellm", "litellm-container", None),
 )
 OOM_REASON = "OOMKilled"
@@ -95,6 +97,25 @@ PROXY_REFUSALS = "kubeagents_credential_proxy_admission_refusals_total"
 PROXY_COMMANDS = "kubeagents_tool_execution_duration_seconds_count"
 PROXY_COMMAND_SECONDS = "kubeagents_tool_execution_duration_seconds_sum"
 PROXY_WAIT = "kubeagents_credential_proxy_admission_wait_seconds"
+# The commands' label naming the binary (kubectl, gcloud, git, ...): the split a broker design
+# needs, because a kubectl path off the broker takes one share of the load and leaves the rest.
+PROXY_TOOL_LABEL = "tool"
+PROXY_SLOT_CAP = "kubeagents_credential_proxy_slot_cap"
+# The broker's slots in use, as Managed Prometheus stores the gauge the chart's PodMonitoring scrapes.
+# The scrape runs every 30 s, so the peak misses a burst shorter than that.
+PROXY_SLOTS_METRIC = "prometheus.googleapis.com/kubeagents_credential_proxy_slots_in_use/gauge"
+PROMETHEUS_RESOURCE = "prometheus_target"
+PROXY_SLOTS_PEAK = "proxy_slots_in_use_peak"
+# The record metric for the broker's slot cap, read from its /metrics at the end of a run.
+PROXY_SLOT_CAP_METRIC = "proxy_slot_cap"
+HTTP_NOT_FOUND = 404
+# The proxy container's own cgroup CPU accounting: v2 first, then v1. The throttled time is what a
+# CPU limit costs the commands, which neither the CPU peak nor the CPU-seconds show.
+CPU_STAT_SCRIPT = "cat /sys/fs/cgroup/cpu.stat 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.stat"
+CGROUP_V2_THROTTLED = "throttled_usec"
+CGROUP_V1_THROTTLED = "throttled_time"
+USEC_PER_SECOND = 1_000_000
+NSEC_PER_SECOND = 1_000_000_000
 PROXY_WAIT_QUANTILES = (("proxy_wait_p50_seconds", 0.5), ("proxy_wait_max_seconds", 1.0))
 TOKEN_FAMILIES = {
     "tokens_input": re.compile(r"^litellm_input_tokens(_metric)?(_total)?$"),
@@ -175,6 +196,24 @@ def scrape(context: str, namespace: str, pod: str, container: str, port: int) ->
     return parse_prometheus(out)
 
 
+def parse_cpu_stat(text: str) -> dict[str, float]:
+    """A cgroup ``cpu.stat`` as periods, throttled periods and throttled seconds, v2 or v1."""
+    raw: dict[str, float] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            try:
+                raw[parts[0]] = float(parts[1])
+            except ValueError:
+                continue
+    stat = {"nr_periods": raw.get("nr_periods", 0.0), "nr_throttled": raw.get("nr_throttled", 0.0)}
+    if CGROUP_V2_THROTTLED in raw:
+        stat["throttled_seconds"] = raw[CGROUP_V2_THROTTLED] / USEC_PER_SECOND
+    elif CGROUP_V1_THROTTLED in raw:
+        stat["throttled_seconds"] = raw[CGROUP_V1_THROTTLED] / NSEC_PER_SECOND
+    return stat
+
+
 def parse_quantity(text: str) -> float:
     for suffix in sorted(QUANTITY_SUFFIXES, key=len, reverse=True):
         if text.endswith(suffix):
@@ -197,6 +236,10 @@ class Snapshot:
     scraped: dict[str, dict[str, list[Sample]]] = field(default_factory=dict)
     # pod UIDs that were running but could not be scraped; their growth is unknown, not their whole count
     unread: set[str] = field(default_factory=set)
+    # proxy pod UID -> cgroup CPU counters (periods, throttled periods, throttled seconds)
+    cpu_stat: dict[str, dict[str, float]] = field(default_factory=dict)
+    # proxy pod UIDs whose cpu.stat could not be read; their growth is unknown, as for `unread`
+    cpu_unread: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
 
     def samples(self, target: str) -> list[Sample]:
@@ -212,6 +255,8 @@ class Install:
         self.namespace = namespace
         self.cluster = cluster
         self.location = location
+        # The last slots query's failure, other than a 404 (`container_peaks`), for the record's note.
+        self.slots_query_error: str | None = None
 
     def pods(self, selector: str | None = None) -> list[dict[str, Any]]:
         args = ["get", "pods", "-n", self.namespace] + (["-l", selector] if selector else [])
@@ -301,6 +346,14 @@ class Install:
                 except kube.CommandError as exc:
                     snap.errors.append(f"scrape {name}: {exc}")
                     snap.unread.add(pod["metadata"]["uid"])
+                if attr == "proxy":
+                    try:
+                        out = kube.kubectl(self.context, "exec", "-n", self.namespace, name, "-c", container,
+                                           "--", "sh", "-c", CPU_STAT_SCRIPT)
+                        snap.cpu_stat[pod["metadata"]["uid"]] = parse_cpu_stat(out)
+                    except kube.CommandError as exc:
+                        snap.errors.append(f"cpu.stat {name}: {exc}")
+                        snap.cpu_unread.add(pod["metadata"]["uid"])
             snap.scraped[attr] = per_pod
         return snap
 
@@ -417,6 +470,27 @@ class Install:
                     current = peaks.setdefault(container, {}).get(name, 0.0)
                     # One series per replica: the peak is the highest, the work the sum.
                     peaks[container][name] = max(current, max(values)) if reduce is max else current + sum(values)
+        prometheus_base = (
+            f'resource.type="{PROMETHEUS_RESOURCE}" AND resource.labels.project_id="{self.project}" '
+            f'AND resource.labels.cluster="{self.cluster}" AND resource.labels.namespace="{self.namespace}"'
+        )
+        query = f'metric.type="{PROXY_SLOTS_METRIC}" AND {prometheus_base}'
+        self.slots_query_error = None
+        try:
+            slot_series = self._time_series(query, "ALIGN_MAX", start, end)
+        except Exception as exc:  # the optional fourth query: its failure must not cost the three above
+            # Monitoring answers 404 for a metric type it has never stored: an install whose
+            # cluster does not run Managed Prometheus collection. Any other failure (a 429, a 5xx)
+            # is kept for the record's note. Either way the peak is unknown, and the container
+            # peaks above still stand.
+            if not (isinstance(exc, urllib.error.HTTPError) and exc.code == HTTP_NOT_FOUND):
+                self.slots_query_error = f"{type(exc).__name__}: {exc}"
+            slot_series = []
+        for series in slot_series:
+            values = [_point_value(point) for point in series.get("points", [])]
+            if values:
+                current = peaks.setdefault(PROXY_CONTAINER, {}).get(PROXY_SLOTS_PEAK, 0.0)
+                peaks[PROXY_CONTAINER][PROXY_SLOTS_PEAK] = max(current, max(values))
         return peaks
 
     def _time_series(self, query: str, aligner: str, start: float, end: float) -> list[dict[str, Any]]:
@@ -506,6 +580,42 @@ def _growth(before: Snapshot, after: Snapshot, target: str, family: str) -> floa
     return total
 
 
+def _growth_by_label(before: Snapshot, after: Snapshot, target: str, family: str, label: str) -> dict[str, float]:
+    """``_growth`` per value of one label: the same pod rules, one total per label value."""
+    totals: dict[str, float] = {}
+    for pod, samples in after.scraped.get(target, {}).items():
+        if pod in before.unread:
+            continue
+        earlier = before.scraped.get(target, {}).get(pod, [])
+        values = {labels.get(label, "") for name, labels, _ in samples if name == family}
+        for value in values:
+            now = sum(v for name, labels, v in samples if name == family and labels.get(label, "") == value)
+            then = sum(v for name, labels, v in earlier if name == family and labels.get(label, "") == value)
+            totals[value] = totals.get(value, 0.0) + counter_increase(then, now)
+    return totals
+
+
+def throttle_metrics(before: Snapshot, after: Snapshot) -> list[Metric]:
+    """The proxy container's CPU throttling across the window, from its cgroup counters."""
+    periods = throttled = seconds = 0.0
+    read = 0
+    for pod, now in after.cpu_stat.items():
+        if pod in before.cpu_unread:
+            continue
+        read += 1
+        then = before.cpu_stat.get(pod, {})
+        periods += counter_increase(then.get("nr_periods", 0.0), now.get("nr_periods", 0.0))
+        throttled += counter_increase(then.get("nr_throttled", 0.0), now.get("nr_throttled", 0.0))
+        seconds += counter_increase(then.get("throttled_seconds", 0.0), now.get("throttled_seconds", 0.0))
+    if not read:
+        # No pod was read at both ends of the window, so the throttling is unknown, not zero.
+        return []
+    metrics = [Metric("cpu_throttled_seconds", seconds, PROXY_CONTAINER)]
+    if periods > 0:
+        metrics.append(Metric("cpu_throttled_period_share", throttled / periods, PROXY_CONTAINER))
+    return metrics
+
+
 def counter_metrics(before: Snapshot, after: Snapshot) -> list[Metric]:
     """The counters' growth across a run's window, as metrics, pod by pod."""
     metrics: list[Metric] = []
@@ -528,6 +638,17 @@ def counter_metrics(before: Snapshot, after: Snapshot) -> list[Metric]:
         metrics.append(Metric("proxy_refusals", _growth(before, after, "proxy", PROXY_REFUSALS)))
         metrics.append(Metric("proxy_commands", _growth(before, after, "proxy", PROXY_COMMANDS)))
         metrics.append(Metric("proxy_command_seconds", _growth(before, after, "proxy", PROXY_COMMAND_SECONDS)))
+        for tool, count in sorted(_growth_by_label(before, after, "proxy", PROXY_COMMANDS, PROXY_TOOL_LABEL).items()):
+            if tool:
+                metrics.append(Metric(f"proxy_commands_{tool}", count))
+        by_tool = _growth_by_label(before, after, "proxy", PROXY_COMMAND_SECONDS, PROXY_TOOL_LABEL)
+        for tool, seconds in sorted(by_tool.items()):
+            if tool:
+                metrics.append(Metric(f"proxy_command_seconds_{tool}", seconds))
+        caps = [v for name, _, v in after.samples("proxy") if name == PROXY_SLOT_CAP]
+        if caps:
+            metrics.append(Metric(PROXY_SLOT_CAP_METRIC, max(caps)))
+        metrics.extend(throttle_metrics(before, after))
         delta: dict[float, float] = {}
         for pod, samples in after.scraped["proxy"].items():
             earlier = histogram_buckets(before.scraped.get("proxy", {}).get(pod, []), PROXY_WAIT)

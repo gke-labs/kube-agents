@@ -8,14 +8,16 @@
 # check does not read, and a line that is not an entry all fail) are in the
 # script's docstring; this file states only what is pinned and why.
 
-# #4331: the fix-pull-request lookup starts one daemon thread per forge call so
-# the call can be abandoned at its deadline; the inject route reaches it.
-agents/platform/scripts/session_kv_server.py _proposal_state 1
+# FIX_PR_LOOKUP_WORKERS daemon threads for the process, built once on first
+# use under _FIX_PR_LOOKUP_POOL_LOCK by _fix_pr_lookup_pool, which the inject
+# route reaches through the fix-pull-request lookup. Bounded by that `is None`
+# guard, which the check does not read.
+agents/platform/scripts/session_kv_server.py _FixPullRequestLookupPool.__init__ 1
 
-# The same abandon-at-deadline shape as _proposal_state, as a one-worker
-# executor per call with shutdown(wait=False); the cron-report route reaches
-# it. #4331 owns the KV server's per-request threads, so the fix for the
-# lookup above is the pattern for this one.
+# An abandon-at-deadline read as a one-worker executor per call with
+# shutdown(wait=False); the cron-report route reaches it. #4331 owns the KV
+# server's per-request threads, and _FixPullRequestLookupPool (a process-wide
+# pool with a bounded queue) is the pattern for this one.
 agents/platform/scripts/session_kv_server.py _fetch_ledger_issue 1
 
 # One executor of CARD_STOP_PARALLEL workers per stop request, left to finish

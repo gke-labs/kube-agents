@@ -231,6 +231,22 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
 			},
 		},
+		{
+			// spec.deployment.sizingProfile medium. Diff this against
+			// platformagent-tagged.yaml and the whole of what the field renders
+			// is the credential-proxy container's requests and limits on the
+			// proxy Deployment and the agent-api-auth sidecar's memory limit on
+			// the gateway pod; the shell keeps the small row, which has no
+			// medium figure. The default golden stays byte-identical, which is
+			// what holds an install that never set the field where it was.
+			name:         "PlatformAgentSizingMedium",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-sizing-medium.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sizing-medium.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
 	}
 
 	for _, tt := range tests {

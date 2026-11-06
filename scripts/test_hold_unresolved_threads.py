@@ -157,6 +157,21 @@ class SweepTest(unittest.TestCase):
         self.assertNotIn(f"/repos/{REPO}/issues/7/comments", paths)
         self.assertIn("comment is already there", lines[0])
 
+    def test_a_failed_comment_read_counts_as_that_pull_request_s_failure(self):
+        api = FakeAPI(pulls=[pull(7)], threads={7: [[False]]})
+        real = api.get_all
+
+        def refusing(path):
+            if path.endswith("/comments"):
+                raise RuntimeError("HTTP 502")
+            return real(path)
+
+        api.get_all = refusing
+        lines, failures = hold.sweep(api)
+        self.assertEqual(failures, 1)
+        self.assertIn("#7: failed: HTTP 502", lines)
+        self.assertNotIn(f"/repos/{REPO}/issues/7/comments", [path for path, _ in api.posts])
+
     def test_the_label_is_created_before_it_is_applied(self):
         api = FakeAPI(pulls=[pull(7)], threads={7: [[False]]})
         hold.sweep(api)
