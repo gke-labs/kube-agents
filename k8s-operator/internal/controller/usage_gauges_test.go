@@ -241,7 +241,9 @@ func TestUsageGauges_CoverEveryNumericAndTimeFieldOfTheStatus(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		tag := strings.Split(field.Tag.Get("json"), ",")[0]
-		if tag == "" || tag == "activeInterfaces" {
+		// The two lists are not gauges: the interfaces are words, and the
+		// top tools are rows the summary block prints from the status.
+		if tag == "" || tag == "activeInterfaces" || tag == "topTools" {
 			continue
 		}
 		if !named[tag] {
