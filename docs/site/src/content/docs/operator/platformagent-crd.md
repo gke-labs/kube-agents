@@ -680,7 +680,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Those are `cluster-agent-reconcile`, which scaffolds a profile for a newly onboarded cluster and
   prunes one for a deleted cluster; `oobe`, which runs first-run onboarding (the
   `bootstrap-inventory-*` entries ship disabled); and `profile-cron-tick`, the only thing that ticks
-  a **named** profile's own store — so every `cluster-*` roster goes quiet with it. Nothing errors
+  a **named** profile's own store — so every `cluster-*` roster goes quiet with it, and so does the [idle-install hold](/kube-agents/concepts/autonomous-watchdogs/#idle-installs) on the Platform Agent's model-run jobs, which runs inside that job. Nothing errors
   and nothing is logged: a job that is never ticked stays `scheduled` with a `next_run_at` in the
   past.
 

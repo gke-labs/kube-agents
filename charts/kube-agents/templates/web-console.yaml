@@ -189,6 +189,19 @@ spec:
                 secretKeyRef:
                   name: {{ $secretName | quote }}
                   key: API_SERVER_KEY
+            {{- /*
+            This container's memory limit in bytes, which the console turns
+            into the Go runtime's soft memory limit (nine tenths of it; an
+            explicit GOMEMLIMIT wins). Read from the container itself so it
+            follows webConsole.resources.limits.memory, and on Autopilot the
+            limit the cluster admitted rather than the one written here. With
+            no limit set the Downward API reports the node's allocatable
+            memory, and the soft limit is a share of that.
+            */}}
+            - name: WEB_CONSOLE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
           livenessProbe:
             httpGet:
               path: /healthz

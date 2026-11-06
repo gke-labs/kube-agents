@@ -73,8 +73,9 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
 # Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
-# in agents/platform/scripts/session_kv_server.py), on so that
-# incident-triage-workload-fold can see three replicas become one incident.
+# in agents/platform/scripts/session_kv_server.py; on by default at an hour),
+# set shorter here so that incident-triage-workload-fold can see three replicas
+# become one incident without one case's window reaching the next repetition.
 # Like the ceilings above it is install-wide, so it reaches every case, and the
 # value is bounded on both sides by measurements, not medians:
 #

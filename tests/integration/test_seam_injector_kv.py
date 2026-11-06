@@ -164,6 +164,10 @@ class InjectorKVSeamTest(unittest.TestCase):
                 env={
                     "PLATFORM_API_URL": "http://127.0.0.1:1",
                     "ALERT_DAILY_LIMIT_CRITICAL": "1",
+                    # The two injects name one workload, which the daemon folds
+                    # by default before the quota is asked; this test is about
+                    # the quota's answer, so folding is off.
+                    "INCIDENT_WORKLOAD_DEDUP_SECONDS": "0",
                 },
             )
             try:
