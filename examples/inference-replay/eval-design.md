@@ -137,9 +137,12 @@ The rules that keep this safe:
   date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. Any of these
   with a time of day beside it stays as written, since counting days would drop the time and give
   two moments a day apart one key: a time on the same line, within 30 characters across a line
-  break, or in another field of the same JSON object or list. Dotted and compact times (`10.42.01`,
-  `1042Z`) aren't read, since they look like version numbers. An answer that
-  names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
+  break, or anywhere in another value of a JSON object or list that encloses the date, at any
+  depth and inside strings that are JSON documents. A time inside a timestamp that is itself
+  turned into a how-far-from-now token doesn't count, since that token keeps its hour. Dotted and
+  compact times (`10.42.01`, `1042Z`) aren't read, since they look like version numbers. An answer
+  that names one of these dates isn't saved, since replayed the next day it would carry the wrong
+  date.
   The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
   `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its
   weekday ("findings for November 04"). In the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,

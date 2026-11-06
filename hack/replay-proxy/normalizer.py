@@ -150,8 +150,8 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 # dropped with it; the parenthesised zone (Hermes writes zone names, then
 # `UTC±HH:MM`) stays as written. A date-only ISO value and an `ls -l` date
 # with a year are day-counted the same way. Any of them with a time of day
-# beside it (time_near, Normalizer.time_beside) is left alone: day counting
-# would lose its time.
+# beside it (time_near, Normalizer.timed) is left alone: day counting would
+# lose its time.
 LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
 LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -160,20 +160,23 @@ LONG_DATE_RE = re.compile(
     r"(?=\s*\((?:[\w/+-]+,\s*)*UTC([+-])(\d{2}):(\d{2})\))?"
 )
 DATE_TODAY = "today"
-# A time of day (`10:42`, `10:42:01`, `10 PM`, `10pm`, `10h42`) on a date's
-# line, or overlapping TIME_NEAR_DATE_CHARS on either side of it across line
-# breaks: then the date is left alone, since day counting would drop what the
-# time says. Leaving a date as written only costs a match; day-counting one
-# with a time gives two moments a day apart one key. Three digit runs are not
-# a time of day: a zone offset (Hermes's `UTC+00:00`, a timestamp's
-# `10:42:00+05:30`), the time inside an ISO timestamp (after its `T`, which
-# the timestamp rule buckets itself), and the minutes or seconds of a time. A
-# `-` alone does not stop one: `2026-11-05-10:42` has a time. Dotted and
-# compact shapes (`10.42.01`, `1042Z`) are not read: they collide with
-# versions (`v1.31.2`) and other numbers.
+# A time of day (`10:42`, `10:42:01`, `10 PM`, `10pm`, `10h42`) beside a date
+# keeps the date as written, since day counting would drop what the time says:
+# leaving a date as written only costs a match, while day-counting one with a
+# time gives two moments a day apart one key. A time already inside a
+# timestamp a rule bucketed is not read: Normalizer.bucket_times replaces those
+# before any date is day-counted, and the bucket keeps their hour. A time in a
+# timestamp no rule buckets (`2026-02-30 10:42`) still counts. Not a time of
+# day: digits with a word character or `:` right before them (`110:42`, the
+# `42:01` of `10:42:01`), Hermes's `UTC+00:00` offset, or a colon form running
+# into more digits (`80:8080`). A `-` before one does not stop it:
+# `2026-11-05-10:42` has a time. Dotted and compact shapes (`10.42.01`,
+# `1042Z`) are not read: they collide with versions (`v1.31.2`).
 TIME_OF_DAY_RE = re.compile(
-    r"(?<![\w:])(?<!UTC[+-])(?<!\d{2}:\d{2}[+-])\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
+    r"(?<![\w:])(?<!UTC[+-])\d{1,2}(?::\d{2}(?::\d{2})?(?!\d)|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
 )
+# How far, across line breaks, a time of day reaches a date that is not on its
+# line (time_near); a time anywhere on the date's own line always does.
 TIME_NEAR_DATE_CHARS = 30
 # The longest time of day TIME_OF_DAY_RE matches (`10:42:01`, `10 p.m`): the
 # search starts and ends this far outside the window so a time overlapping its
@@ -314,17 +317,21 @@ def time_bucket(when: float, now: float) -> str:
 def time_near(text: str, start: int, end: int) -> bool:
     """Whether a time of day is on the line of text[start:end], or overlaps TIME_NEAR_DATE_CHARS either side of it.
 
-    The text is searched in place, not sliced, so the lookbehinds see what is
-    before the window and a time running past its edge still matches.
+    `text` is a string after Normalizer.bucket_times, so a bucketed
+    timestamp's time is already gone. It is searched in place, not sliced, so
+    the lookbehinds see what is before the window and a time running past its
+    edge still matches.
     """
+    # Each break is searched for only inside the line the previous one bounds,
+    # so finding a line costs its length, not the text's.
     line_start, line_end = 0, len(text)
     for brk in LINE_BREAKS:
-        before = text.rfind(brk, 0, start)
+        before = text.rfind(brk, line_start, start)
         if before >= 0:
-            line_start = max(line_start, before + len(brk))
-        after = text.find(brk, end)
+            line_start = before + len(brk)
+        after = text.find(brk, end, line_end)
         if after >= 0:
-            line_end = min(line_end, after)
+            line_end = after
     window_start, window_end = start - TIME_NEAR_DATE_CHARS, end + TIME_NEAR_DATE_CHARS
     pos = max(0, min(line_start, window_start) - TIME_OF_DAY_MAX_CHARS)
     endpos = min(len(text), max(line_end, window_end) + TIME_OF_DAY_MAX_CHARS)
@@ -333,18 +340,6 @@ def time_near(text: str, start: int, end: int) -> bool:
         if on_line or (m.end() > window_start and m.start() < window_end):
             return True
     return False
-
-
-def time_beside(values: List[Any]) -> List[bool]:
-    """For each value, whether another string among `values` holds a time of day.
-
-    A date's own string is read by time_near; this is for a date and its time
-    in sibling JSON fields (`{"date": "2026-11-05", "time": "10:42:01"}`), which
-    the walk normalizes one string at a time.
-    """
-    timed = [isinstance(v, str) and bool(TIME_OF_DAY_RE.search(v)) for v in values]
-    count = sum(timed)
-    return [count - own > 0 for own in timed]
 
 
 def answer_dates(text: str) -> List[Tuple[Optional[int], int, int]]:
@@ -474,9 +469,15 @@ class Normalizer:
         self.now = now
         self.keep_ips = keep_ips
         self.mapping = Mapping()
-        # Whether the string being normalized has a sibling holding a time of
-        # day (time_beside): then no date in it is day-counted.
+        # Whether a value in any object or list enclosing the one being walked
+        # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
+        # Per-request caches: a string's parsed JSON document (nested_json),
+        # and whether a string or container holds a time of day (timed), so
+        # each subtree is parsed and read once however deep the walk goes.
+        self.parsed: Dict[str, Any] = {}
+        self.timed_strings: Dict[str, bool] = {}
+        self.timed_containers: Dict[int, bool] = {}
 
     # -- structure ---------------------------------------------------------
 
@@ -494,7 +495,7 @@ class Normalizer:
         if isinstance(obj, list):
             if key == EVENTS_KEY:
                 obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
-            beside = time_beside(obj)
+            beside = self.siblings_timed(obj)
             return [self.beside(flag, lambda v=v: self.walk_dict(v, True)
                                 if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v))
                     for v, flag in zip(obj, beside)]
@@ -504,12 +505,17 @@ class Normalizer:
 
     def walk_dict(self, obj: Dict[str, Any], in_tool_call: bool) -> Dict[str, Any]:
         keys = sorted(obj)
-        beside = time_beside([obj[k] for k in keys])
+        beside = self.siblings_timed([obj[k] for k in keys])
         return {k: self.beside(flag, lambda k=k: self.walk(obj[k], k, in_tool_call)) for k, flag in zip(keys, beside)}
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
-        """Run `walk` with time_beside set to `flag`, then restore the enclosing value."""
-        outer, self.time_beside = self.time_beside, flag
+        """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
+
+        The flag is inherited: a time beside an enclosing value keeps every date
+        under it as written (`{"when": {"date": ...}, "time": "10:42"}`).
+        """
+        outer = self.time_beside
+        self.time_beside = outer or flag
         try:
             return walk()
         finally:
@@ -548,6 +554,38 @@ class Normalizer:
 
     # -- text --------------------------------------------------------------
 
+    def siblings_timed(self, values: List[Any]) -> List[bool]:
+        """For each value, whether another of `values` holds a time of day anywhere in it (timed).
+
+        A date's own string is read by time_near; this is for a date and its
+        time in different JSON values (`{"date": "2026-11-05", "time":
+        "10:42:01"}`, or one level apart), which the walk normalizes one string
+        at a time. Each request message is walked on its own
+        (normalize_request), so a time in one message never reaches another.
+        """
+        timed = [self.timed(v) for v in values]
+        count = sum(timed)
+        return [count - own > 0 for own in timed]
+
+    def timed(self, value: Any) -> bool:
+        """Whether a time of day is in `value`: in any string under it, read as a JSON document when it is one.
+
+        Times in timestamps a rule buckets do not count (bucket_times).
+        Cached per string and per container, so a subtree is read once.
+        """
+        if isinstance(value, str):
+            if value not in self.timed_strings:
+                nested = self.nested_json(value)
+                self.timed_strings[value] = (self.timed(nested) if nested is not None
+                                             else bool(TIME_OF_DAY_RE.search(self.bucket_times(value))))
+            return self.timed_strings[value]
+        if isinstance(value, (dict, list)):
+            if id(value) not in self.timed_containers:
+                children = value.values() if isinstance(value, dict) else value
+                self.timed_containers[id(value)] = any(self.timed(v) for v in children)
+            return self.timed_containers[id(value)]
+        return False
+
     def text(self, text: str) -> str:
         nested = self.nested_json(text)
         if nested is not None:
@@ -568,8 +606,14 @@ class Normalizer:
         text = AGE_WORDS_AGO_RE.sub(self.age_words, text)
         return text
 
+    def nested_json(self, text: str) -> Any:
+        """The JSON object or list `text` holds, else None; parsed once per request (the parse holds container ids)."""
+        if text not in self.parsed:
+            self.parsed[text] = self.parse_json_document(text)
+        return self.parsed[text]
+
     @staticmethod
-    def nested_json(text: str) -> Any:
+    def parse_json_document(text: str) -> Any:
         stripped = text.lstrip()
         if not stripped or stripped[0] not in JSON_OPENERS:
             return None
@@ -611,11 +655,18 @@ class Normalizer:
         return m.group(1) + m.group(2) + self.epoch_token(raw, self.epoch_value(raw))
 
     def timestamps(self, text: str) -> str:
-        text = ISO_TS_RE.sub(self.iso, text)
+        """Bucket every timestamp, then day-count the dates without a time beside them."""
+        text = self.bucket_times(text)
+        text = ISO_TS_RE.sub(self.iso_date, text)
+        text = LS_DATE_RE.sub(self.ls_year, text)
+        return LONG_DATE_RE.sub(self.long_date, text)
+
+    def bucket_times(self, text: str) -> str:
+        """Replace every timestamp a rule buckets, so no date reads its time as one beside it (time_near, timed)."""
+        text = ISO_TS_RE.sub(self.iso_time, text)
         text = RFC1123_RE.sub(self.rfc1123, text)
         text = OPENSSL_TS_RE.sub(self.openssl, text)
-        text = LS_DATE_RE.sub(self.ls_date, text)
-        return LONG_DATE_RE.sub(self.long_date, text)
+        return LS_DATE_RE.sub(self.ls_time, text)
 
     def long_date(self, m: "re.Match[str]") -> str:
         month, day, year, sign, hours, minutes = m.groups()
@@ -632,8 +683,10 @@ class Normalizer:
         """The date `m` matched: days from the request's day (at `offset` from UTC), noted as unrestorable.
 
         Left as written when a time of day is beside it, in its own string
-        (time_near) or a sibling JSON value (time_beside): day counting would
-        drop what the time says. The check is here so no date rule can skip it.
+        (time_near) or in a value of an enclosing JSON object or list (timed,
+        inherited through time_beside): day counting would drop what the time
+        says. The check is here so no date rule can skip it. A timestamp's time
+        is bucketed before this runs (bucket_times), so it does not count.
         """
         if self.time_beside or time_near(m.string, m.start(), m.end()):
             return m.group(0)
@@ -641,14 +694,24 @@ class Normalizer:
         self.mapping.add_date(when, today=days == 0)
         return day_bucket(days)
 
-    def iso(self, m: "re.Match[str]") -> str:
-        year, month, day, hour, minute, second, zone = m.groups()
+    def iso_date(self, m: "re.Match[str]") -> str:
+        year, month, day, hour = m.group(1), m.group(2), m.group(3), m.group(4)
+        if hour is not None:
+            return m.group(0)
         try:
-            when = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0))
+            when = datetime(int(year), int(month), int(day)).date()
         except ValueError:
             return m.group(0)
+        return self.date_token(m, when)
+
+    def iso_time(self, m: "re.Match[str]") -> str:
+        year, month, day, hour, minute, second, zone = m.groups()
         if hour is None:
-            return self.date_token(m, when.date())
+            return m.group(0)
+        try:
+            when = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second or 0))
+        except ValueError:
+            return m.group(0)
         offset = 0
         if zone and zone != UTC_ZONE:
             sign = -1 if zone[0] == ZONE_NEGATIVE else 1
@@ -674,24 +737,33 @@ class Normalizer:
             return m.group(0)
         return time_bucket(calendar.timegm(when.timetuple()), self.now)
 
-    def ls_date(self, m: "re.Match[str]") -> str:
+    def ls_year(self, m: "re.Match[str]") -> str:
+        month, day, _, _, year = m.groups()
+        if not year:
+            return m.group(0)
+        # Old files show a year and no time. date_token keeps the date as
+        # written when a time is beside it (`Nov  5 2026 10:42:01`).
+        try:
+            when = datetime(int(year), MONTHS.index(month) + 1, int(day)).date()
+        except ValueError:
+            return m.group(0)
+        return self.date_token(m, when)
+
+    def ls_time(self, m: "re.Match[str]") -> str:
         month, day, hour, minute, year = m.groups()
+        if year:
+            return m.group(0)
         now_year = datetime.fromtimestamp(self.now, timezone.utc).year
         try:
-            if year:
-                # Old files show a year and no time. date_token keeps the date
-                # as written when a time is beside it (`Nov  5 2026 10:42:01`).
-                return self.date_token(m, datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
-            else:
+            when = calendar.timegm(
+                datetime(now_year, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()
+            )
+            # ls prints a time only for the last six months; a date ahead
+            # of now is last year's.
+            if when - self.now > SECONDS_PER_DAY:
                 when = calendar.timegm(
-                    datetime(now_year, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()
+                    datetime(now_year - 1, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()
                 )
-                # ls prints a time only for the last six months; a date ahead
-                # of now is last year's.
-                if when - self.now > SECONDS_PER_DAY:
-                    when = calendar.timegm(
-                        datetime(now_year - 1, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()
-                    )
         except ValueError:
             return m.group(0)
         return time_bucket(when, self.now)

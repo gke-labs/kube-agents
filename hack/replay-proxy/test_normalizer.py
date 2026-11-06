@@ -279,12 +279,59 @@ class LongDateTest(unittest.TestCase):
             with self.subTest(on_5th):
                 self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
 
+    def test_a_time_a_json_level_away_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (
+                # In a nested object beside the date.
+                ({"date": "2026-11-05", "run": {"at": "10:42"}}, {"date": "2026-11-06", "run": {"at": "10:42"}}),
+                # Beside the object the date is in.
+                ({"when": {"date": "2026-11-05"}, "time": "10:42"}, {"when": {"date": "2026-11-06"}, "time": "10:42"}),
+                # Beside a string that holds a JSON document with the date.
+                ({"dates": json.dumps(["2026-11-05"]), "time": "10:42"},
+                 {"dates": json.dumps(["2026-11-06"]), "time": "10:42"}),
+                # In a string beside the date that holds a JSON document.
+                ({"date": "2026-11-05", "run": json.dumps({"at": "10:42"})},
+                 {"date": "2026-11-06", "run": json.dumps({"at": "10:42"})}),
+                # Read as the walk reads it, parsed: the raw text has no `10:42`.
+                ({"date": "2026-11-05", "run": '{"at": "\\u0031\\u0030:42"}'},
+                 {"date": "2026-11-06", "run": '{"at": "\\u0031\\u0030:42"}'})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
     def test_a_json_date_with_no_time_beside_it_still_counts_days(self):
         self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "status": "ok"}), self.at(2026, 11, 5)),
                          json.dumps({"date": "⟦TIME_today⟧", "status": "ok"}, ensure_ascii=False))
-        # A time in a nested object is not beside it.
-        self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "run": {"at": "10:42"}}), self.at(2026, 11, 5)),
-                         json.dumps({"date": "⟦TIME_today⟧", "run": {"at": "10:42"}}, ensure_ascii=False))
+        doc = {"when": {"date": "2026-11-05"}, "runs": [{"status": "ok", "log": json.dumps({"n": 3})}]}
+        out = self.norm_at(json.dumps(doc), self.at(2026, 11, 5))
+        self.assertEqual(json.loads(out)["when"]["date"], "⟦TIME_today⟧")
+        # A bucketed timestamp beside it carries no extra moment.
+        out = self.norm_at(json.dumps({"date": "2026-11-05", "updated": "2026-11-05 10:42:00Z"}), self.at(2026, 11, 5))
+        self.assertEqual(json.loads(out), {"date": "⟦TIME_today⟧", "updated": "⟦TIME_past_hours⟧"})
+
+    def test_a_bucketed_timestamp_does_not_keep_a_date_as_written(self):
+        # Its bucket keeps the hour, so the date beside it day-counts on both days.
+        cases = {
+            "seen 2026-11-05 10:42:00Z, due 2026-11-06": "seen ⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧",
+            "Nov  5 10:42:01 host logrotate[412]: rotated app.log to app-2026-11-05.log":
+                "⟦TIME_past_hours⟧:01 host logrotate[412]: rotated app.log to app-⟦TIME_today⟧.log",
+            "2026-11-05T10:42:00.123+05:30, due 2026-11-06": "⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧",
+            "Tue, 05 Nov 2026 10:42:01 +0000 then 2026-11-06": "⟦TIME_past_hours⟧ then ⟦TIME_future_day⟧",
+            "notAfter=Nov  5 10:42:01 2026 GMT, renew 2026-11-06": "notAfter=⟦TIME_past_hours⟧, renew ⟦TIME_future_day⟧",
+        }
+        for text, normalized in cases.items():
+            with self.subTest(text):
+                self.assertEqual(self.norm_at(text, self.at(2026, 11, 5)), normalized)
+                on_6th = text.replace("2026-11-06", "2026-11-07").replace("11-05", "11-06").replace("Nov  5", "Nov  6") \
+                    .replace("05 Nov", "06 Nov").replace("Tue,", "Wed,")
+                self.assertEqual(self.norm_at(on_6th, self.at(2026, 11, 6)), normalized)
+
+    def test_a_timestamp_no_rule_buckets_still_keeps_the_date(self):
+        # February 30th is not a timestamp the ISO rule buckets, so its time is read.
+        self.assertEqual(self.norm_at("2026-02-30 10:42 then 2026-11-06", self.at(2026, 11, 5)),
+                         "2026-02-30 10:42 then 2026-11-06")
+
+    def test_a_port_is_not_a_time_of_day(self):
+        self.assertEqual(self.norm_at("listening on 80:8080 since 2026-11-05", self.at(2026, 11, 5)),
+                         "listening on 80:8080 since ⟦TIME_today⟧")
 
     def test_a_time_just_before_the_window_is_read_with_what_precedes_it(self):
         # Sliced, the window began at `10:42` and lost the `T` before it.
