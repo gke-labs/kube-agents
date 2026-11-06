@@ -23,15 +23,20 @@
 # that added this case did on its own install; admitting it to a CI lane
 # is the eval install's setting to make.
 #
-# What it grades, and where: that the card's `assignee` is seeded-a's
-# Cluster Agent, read from kanban_create's arguments in the router's own
-# trajectory, which the inject lane's trace carries too, so the nightly
-# grades the route; that kanban_create succeeded; that seeded-a's Cluster
-# Agent is among the workers (worker_agents, set aside on the inject lane,
-# where the workers are not read, so graded over the agent API only: a dev
-# install, the today lane); that the answer names the cluster's namespaces,
-# including seeded-debug, which only a read of seeded-a can name; and that
-# no "which cluster" question was asked.
+# What it grades, and where: that a card was filed (kanban_create
+# succeeded, read by tool name alone, which both transports keep); that the
+# card went to seeded-a's Cluster Agent, read from kanban_create's
+# `assignee` and then from the workers (worker_agents) in one entry, which
+# the inject lane sets aside: the inject door sends the Planning Agent's
+# arguments as shapes ("<string, 48 chars>", a2a/hermes-bridge/activity.go
+# shapeOf, a2a/docs/hermes-bridge.md "What goes on the bus"), so no pattern
+# over them can name the assignee, and the workers are not graded there
+# until #2619. The route is therefore graded over the agent API only (a dev
+# install, the today lane); on the nightly a card to `platform` whose
+# answer named the namespaces passes until #2619 lands, with the worker
+# evidence on the record. And that the answer names the cluster's
+# namespaces, including seeded-debug, which only a read of seeded-a can
+# name; and that no "which cluster" question was asked.
 #
 # No `fixtures:` list. seeded-debug is the crashloop-workload fixture's
 # namespace on seeded-a's slot, named here so the fleet owner replacing that
@@ -61,6 +66,9 @@ domain: chat-and-routing
 verification_spec:
   # assert, not the converge default: the transcript is immutable once the
   # run ends, so polling a failed check would only wait out the timeout.
+  # Read by tool name alone, which both transports keep: trace-blind
+  # (kube_agents_bench.cases, trace_blind_checks), graded on the inject
+  # lane and the agent API alike; a run that filed no card fails it on both.
   - name: work-was-delegated-through-kanban
     role: objective
     mode: assert
@@ -68,26 +76,33 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_create"]
       require_success: true
-  # Profile names are `cluster-<project>-<cluster>-<location>`
-  # (cluster_agent_profile.profile_name); the project and location are the
-  # install's. Router scope with no `result` pattern, so the inject lane's
-  # trace grades it (kube_agents_bench.cases, _reads_the_workers): this is
-  # the route check every lane reads.
-  - name: the-card-was-filed-for-seeded-a-s-cluster-agent
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      arguments:
-        assignee: "cluster-.+-seeded-a-.+"
-  # The same route read from the workers' side; the inject lane sets it aside.
+  # The route, read from both sides in one fail-fast `sequence`: the
+  # router's `kanban_create` with its `assignee` (profile names are
+  # `cluster-<project>-<cluster>-<location>`,
+  # cluster_agent_profile.profile_name; the project and location are the
+  # install's), then seeded-a's Cluster Agent among the workers. One entry,
+  # not a bare router entry: the inject door sends the router's arguments as
+  # shapes (a2a/hermes-bridge/activity.go shapeOf), so an `assignee` pattern
+  # never matches there and a plain router entry on it fails every inject
+  # record. A compound with a workers-scope leaf is worker-blind as a whole
+  # (kube_agents_bench.cases, _reads_the_workers): set aside on the inject
+  # lane, graded over the agent API, where the argument is readable. The
+  # router leaf comes first so a run that filed no card is a graded fail
+  # there, not an unobserved `error` that blocks the repetition at the
+  # coverage rung.
   - name: seeded-a-cluster-agent-did-the-work
     role: objective
     mode: assert
     check:
-      type: worker_agents
-      required_agents: ["cluster-.+-seeded-a-.+"]
+      type: sequence
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+          arguments:
+            assignee: "cluster-.+-seeded-a-.+"
+          require_success: true
+        - type: worker_agents
+          required_agents: ["cluster-.+-seeded-a-.+"]
   - name: the-answer-names-the-clusters-namespaces-without-asking
     role: objective
     mode: assert

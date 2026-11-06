@@ -964,10 +964,11 @@
 # The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
 # install's Cluster Agent count, which no CI install does yet, so here the
 # block names every agent and the lookup is never called. What the nightly
-# grades is that the card's assignee was seeded-a's agent (kanban_create's
-# arguments, which the inject trace carries) and that the answer named its
-# namespaces; the worker_agents check is set aside on the inject lane, and
-# the lookup route is guarded only once an eval install sets the threshold.
+# grades is that a card was filed and that the answer named seeded-a's
+# namespaces; the route entry (the card's assignee, then the worker) is set
+# aside on the inject lane, whose trace shapes the router's arguments, and
+# is graded over the agent API until #2619; the lookup route is guarded
+# only once an eval install sets the threshold.
 # deployer: noop, read-only, reads seeded-a through its own agent, one
 # front-door turn plus the card round trip: +3 units.
 ./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
