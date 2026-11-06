@@ -625,8 +625,10 @@ message is "work kanban task t\_…"), and a front door's request names the card
 its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
 and whether it passed. So the copy job can match each saved answer to its card, the card to its
 run, and the run to pass or fail, and copy only the passing ones. A front door's first request
-names no card at all, only the case's prompt. It is matched through the request that came after
-it: an answer is copied when a passing run's next request went on from exactly that answer.
+names no card at all, only the case's prompt, and the board reads before its first card name none
+either. Each is matched through the requests that came after it: an answer is copied when a chain
+of requests, each going on from exactly the answer before it, reaches a request naming a passing
+run's card.
 
 Each case runs three times. Ideally each of the three would replay its own recording, so we still
 get three different samples instead of one sample three times. That needs the proxy to know the run

@@ -197,6 +197,56 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(self.world.decide(opening).decision, "ambiguous")
         self.assertEqual(self.world.decide(opening, lost=5).decision, "ambiguous")
 
+    def _board_chain(self, outcome, log_middle=True):
+        """A front door that reads its board twice before it creates its card: R1, R2, R3 card-less, then R4."""
+        card = "t_00000001"
+        self.world.run("case-a", 1, outcome, [card])
+        listing = {"role": "tool", "tool_call_id": "c9", "content": "[]"}
+        r1 = self.world.request(front(), "r1", recorded=True, answer="A")
+        steps = [("r2", [{"role": "assistant", "content": "A"}, listing], ("ctx-r1", "A"), "B"),
+                 ("r3", [{"role": "assistant", "content": "A"}, listing, {"role": "assistant", "content": "B"}, listing],
+                  ("ctx-r2", "B"), "C")]
+        for fingerprint, more, prior, answer in steps:
+            if log_middle or fingerprint != "r2":
+                self.world.request(front(*more), fingerprint, prior=prior, answer=answer)
+        last = steps[-1][1] + [{"role": "assistant", "content": "C"}, *created(card)]
+        self.world.request(front(*last), "r4", prior=("ctx-r3", "C"))
+        return r1
+
+    def test_an_opening_is_proven_through_card_less_continuations(self):
+        opening = self._board_chain("pass")
+        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
+
+    def test_a_chain_proven_to_a_failing_run_stays_a_fail(self):
+        self.assertEqual(self.world.decide(self._board_chain("fail")).decision, "fail")
+
+    def test_a_chain_broken_by_a_lost_line_stays_unproven(self):
+        opening = self._board_chain("pass", log_middle=False)
+        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
+        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
+
+    def _shared_middle(self, outcomes):
+        """Repetitions that open and read their board alike, each then creating its own card."""
+        listing = {"role": "tool", "tool_call_id": "c9", "content": "[]"}
+        opening = self.world.request(front(), "r1", recorded=True, answer="A")
+        middle = [{"role": "assistant", "content": "A"}, listing]
+        for rep, outcome in enumerate(outcomes, start=1):
+            card = f"t_{rep:08x}"
+            self.world.run("case-a", rep, outcome, [card])
+            self.world.request(front(*middle), "r2", prior=("ctx-r1", "A"), answer="B")
+            self.world.request(front(*middle, {"role": "assistant", "content": "B"}, *created(card, f"x{rep}")),
+                               f"r3-{rep}", prior=("ctx-r2", "B"))
+        return opening
+
+    def test_repetitions_sharing_a_card_less_step_each_prove_the_opening(self):
+        # Every run that went on from the shared middle answer sent the middle
+        # request after the opening's answer, so each is proven for the opening.
+        opening = self._shared_middle(["fail", "pass", "pass"])
+        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#2", "case-a#3")})
+
+    def test_repetitions_sharing_a_card_less_step_that_all_failed_stay_a_fail(self):
+        self.assertEqual(self.world.decide(self._shared_middle(["fail", "fail"])).decision, "fail")
+
     def test_a_line_without_an_answer_variant_is_never_published(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         opening = self.world.request(front(), "opening", recorded=True)

@@ -23,7 +23,9 @@ each line's answer (`answer_variant`) and the answer the request's last
 assistant message is (`prior_answer`), both as normalizer.answer_variant
 identifies an answer in a history. A continuation attributed to one run, holding
 the request as its prefix and that answer next, proves that run got that answer
-to that request; the answer is published when any such run passed, which is the
+to that request. The proof chains: a continuation with no card of its own
+(a front door that reads its board before it creates a card) counts for each run
+its own answer is proven, by the same rule, to have gone on from; the answer is published when any such run passed, which is the
 design's "at least one passing run produced that same fingerprint", here for
 the same answer as well. Only positive evidence decides, so a line lost before
 it reached a segment (a spent budget, a pod replaced before its last segment
@@ -423,14 +425,35 @@ class Attribution:
             for run_id in run.ids:
                 self.by_id.setdefault(run_id, set()).add(run.key)
         # Continuations by the answer they went on from: (build, answer pair) ->
-        # [(the continuation's prefix keys, its one run)].
+        # [(the continuation's prefix keys, a run proven for it)]. A continuation
+        # counts for the run its own cards name, or, with no card, for each run
+        # proven to have gone on from its own answer. Lines are taken longest
+        # first, so every continuation of a request is in before the request.
+        # A card-less continuation proven for several runs counts for each of
+        # them, never for a run it was not proven for: every one of them sent
+        # that request after that answer, since each holds both as a prefix.
         self.went_on: Dict[Tuple[str, Tuple[str, ...]], List[Tuple[List[str], str]]] = {}
-        for line in logs.lines:
-            if line.prior_answer is None:
-                continue
+        for line in sorted(logs.lines, key=lambda l: -len(l.chain)):
             run = self.run_of(line)
-            if run is not None:
-                self.went_on.setdefault((line.build, line.prior_answer), []).append((line.chain, run))
+            proven: Set[str] = {run} if run is not None else set()
+            if run is None:
+                own = self._own(line)
+                if own is None or own[1] or own[0]:
+                    continue
+                proven = self._went_on_from(line)
+            if line.prior_answer is not None:
+                for each in sorted(proven):
+                    self.went_on.setdefault((line.build, line.prior_answer), []).append((line.chain, each))
+
+    def _went_on_from(self, line: Line) -> Set[str]:
+        """The runs proven for continuations that hold `line`'s request and went on from its answer."""
+        evidence: Set[str] = set()
+        if line.answer_variant is not None:
+            depth = len(line.chain)
+            for chain, run in self.went_on.get((line.build, line.answer_variant), []):
+                if len(chain) > depth and chain[depth - 1] == line.chain[-1]:
+                    evidence.add(run)
+        return evidence
 
     def _own(self, line: Line) -> Optional[Tuple[Set[str], bool]]:
         """(runs its own IDs name, whether any ID names no graded run); None without stored text.
@@ -466,12 +489,7 @@ class Attribution:
         if runs:
             return self._of_runs(runs)
         # No card of its own: the runs seen going on from exactly its answer.
-        evidence = set()
-        if line.answer_variant is not None:
-            depth = len(line.chain)
-            for chain, run in self.went_on.get((line.build, line.answer_variant), []):
-                if len(chain) > depth and chain[depth - 1] == line.chain[-1]:
-                    evidence.add(run)
+        evidence = self._went_on_from(line)
         passed = {run for run in evidence if self.runs[run].passed}
         if passed:
             return Decision(PASS, tuple(sorted(passed)))
