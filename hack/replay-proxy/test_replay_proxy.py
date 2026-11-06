@@ -212,7 +212,7 @@ class ProxyTestCase(unittest.TestCase):
             listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
             store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
             upstream_timeout_seconds=self.upstream_timeout,
-            litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
+            model_behaviour_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
             job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
             log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
         )
@@ -741,7 +741,7 @@ class LogLineTest(ProxyTestCase):
         self.assertEqual(line["roles"], ["system", "user"])
         self.assertEqual(line["litellm_model_group"], "model-default")
         self.assertEqual(line["litellm_attempted_fallbacks"], "0")
-        self.assertEqual(line["litellm_config_checksum"], "abc123")
+        self.assertEqual(line["model_behaviour_checksum"], "abc123")
         self.assertEqual(line["litellm_image"], "ghcr.io/berriai/litellm:v1")
         self.assertIsInstance(line["latency_ms"], int)
         self.assertTrue(line["answer_hash"])
@@ -843,11 +843,11 @@ class FailClosedProxyTest(ProxyTestCase):
 class ConfigTest(unittest.TestCase):
     def test_from_env(self):
         config = replay_proxy.Config.from_env({
-            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_LITELLM_CONFIG_CHECKSUM": "c",
+            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_MODEL_BEHAVIOUR_CHECKSUM": "c",
             "REPLAY_LITELLM_IMAGE": "img", "REPLAY_STORE_DIR": "/s", "REPLAY_JOB_KIND": "nightly",
         })
         self.assertEqual((config.upstream_host, config.upstream_port), ("up", 4000))
-        self.assertEqual((config.litellm_config_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
+        self.assertEqual((config.model_behaviour_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
         self.assertEqual(config.job_kind, "nightly")
         self.assertGreaterEqual(replay_proxy.Config.from_env({}).upstream_timeout_seconds, 600)
 

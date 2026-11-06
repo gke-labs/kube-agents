@@ -947,6 +947,29 @@ def test_a_proxy_load_run_with_commands_from_outside_leaves_the_fits():
     assert shared.errors == ["brokered commands from outside the load ran during it: 3"]
 
 
+def test_a_run_without_its_totals_also_leaves_its_per_tool_and_throttle_readings():
+    window = ("2026-10-27T00:10:00Z", "2026-10-27T00:13:00Z")
+    readings = (("proxy_commands", 216.0), ("proxy_load_completed", 213.0), ("proxy_commands_gcloud", 216.0),
+                ("proxy_command_seconds_gcloud", 900.0), ("cpu_throttled_seconds", 40.0),
+                ("cpu_throttled_period_share", 0.9), ("proxy_slots_in_use_peak", 8.0))
+    # The slots peak is the shared broker's occupancy too, so it goes with the CPU totals.
+    split = {"proxy_commands_gcloud", "proxy_command_seconds_gcloud", "cpu_throttled_seconds",
+             "cpu_throttled_period_share", "proxy_slots_in_use_peak"}
+    shared = _short_run("proxy_load_gcloud", *window, metrics=readings, values={"proxy_concurrency": 16})
+    runner.Runner.mark_shared(shared, "proxy_load")
+    runner.Runner.cover_split_fits(shared)
+    assert split <= set(shared.excluded_from)
+    # A prompt answered without its operation leaves out the totals on another path.
+    unfinished = _short_run("fan_out", *window, metrics=readings)
+    unfinished.excluded_from = list(runner.RESOURCE_FITS)
+    runner.Runner.cover_split_fits(unfinished)
+    assert split <= set(unfinished.excluded_from)
+    clean = _short_run("fan_out", "2026-10-27T00:05:00Z", "2026-10-27T00:07:00Z", 2, metrics=readings)
+    runner.Runner.mark_shared(clean, "prompt")
+    runner.Runner.cover_split_fits(clean)
+    assert clean.excluded_from == []
+
+
 def test_cpu_seconds_sum_the_replicas_and_peaks_take_the_highest(monkeypatch):
     install = collect.Install("p", "ctx", "ns", "host", "zone")
 
@@ -1255,3 +1278,280 @@ def test_kubectl_requests_time_out_except_streaming_ones(monkeypatch):
     kube.kubectl("ctx", "exec", "pod", "--", "true", timeout=60)
     assert "--request-timeout=60s" in calls[0]
     assert not any(arg.startswith("--request-timeout") for arg in calls[1])
+
+
+PROXY_TEXT = """kubeagents_tool_execution_duration_seconds_count{{tool="kubectl"}} {kubectl}
+kubeagents_tool_execution_duration_seconds_count{{tool="gcloud"}} {gcloud}
+kubeagents_tool_execution_duration_seconds_sum{{tool="kubectl"}} {kubectl_s}
+kubeagents_tool_execution_duration_seconds_sum{{tool="gcloud"}} {gcloud_s}
+kubeagents_credential_proxy_slot_cap 8
+"""
+
+
+def _proxy(pod: str, kubectl: int, gcloud: int, kubectl_s: float, gcloud_s: float) -> dict[str, list]:
+    text = PROXY_TEXT.format(kubectl=kubectl, gcloud=gcloud, kubectl_s=kubectl_s, gcloud_s=gcloud_s)
+    return {pod: collect.parse_prometheus(text)}
+
+
+def test_proxy_commands_are_split_by_tool_and_the_cap_is_read():
+    before = Snapshot(scraped={"proxy": _proxy("p", 10, 4, 20.0, 40.0)})
+    after = Snapshot(scraped={"proxy": _proxy("p", 25, 6, 50.0, 70.0)})
+    metrics = {(m.name, m.container): m.value for m in collect.counter_metrics(before, after)}
+    assert metrics[("proxy_commands", None)] == 17
+    assert metrics[("proxy_commands_kubectl", None)] == 15
+    assert metrics[("proxy_commands_gcloud", None)] == 2
+    assert metrics[("proxy_command_seconds_kubectl", None)] == 30.0
+    assert metrics[("proxy_command_seconds_gcloud", None)] == 30.0
+    assert metrics[("proxy_slot_cap", None)] == 8
+
+
+def test_a_new_proxy_pod_counts_its_tools_from_zero():
+    before = Snapshot(scraped={"proxy": _proxy("old", 100, 50, 1.0, 1.0)})
+    after = Snapshot(scraped={"proxy": _proxy("new", 3, 1, 1.0, 1.0)})
+    metrics = {(m.name, m.container): m.value for m in collect.counter_metrics(before, after)}
+    assert metrics[("proxy_commands_kubectl", None)] == 3
+    assert metrics[("proxy_commands_gcloud", None)] == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [
+        ("usage_usec 9\nnr_periods 100\nnr_throttled 25\nthrottled_usec 2500000\n", 2.5),
+        ("nr_periods 100\nnr_throttled 25\nthrottled_time 2500000000\n", 2.5),
+    ],
+)
+def test_parse_cpu_stat_reads_cgroup_v2_and_v1(text, seconds):
+    stat = collect.parse_cpu_stat(text)
+    assert stat == {"nr_periods": 100.0, "nr_throttled": 25.0, "throttled_seconds": seconds}
+
+
+def test_throttle_metrics_are_the_window_growth():
+    before = Snapshot(cpu_stat={"p": {"nr_periods": 100.0, "nr_throttled": 10.0, "throttled_seconds": 1.0}})
+    after = Snapshot(cpu_stat={"p": {"nr_periods": 300.0, "nr_throttled": 110.0, "throttled_seconds": 6.0}})
+    metrics = {(m.name, m.container): m.value for m in collect.throttle_metrics(before, after)}
+    assert metrics[("cpu_throttled_seconds", "envoy-credential-proxy")] == 5.0
+    assert metrics[("cpu_throttled_period_share", "envoy-credential-proxy")] == 0.5
+
+
+def test_no_cpu_stat_means_no_throttle_metrics():
+    assert collect.throttle_metrics(Snapshot(), Snapshot()) == []
+
+
+class _NoPrometheusInstall(collect.Install):
+    """Monitoring with container series but no Managed Prometheus metric."""
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            raise collect.urllib.error.HTTPError("url", 404, "Cannot find metric(s)", None, None)
+        if aligner == "ALIGN_MAX":
+            return [{"resource": {"labels": {"container_name": "envoy-credential-proxy"}},
+                     "points": [{"value": {"int64Value": "734003200"}}]}]
+        return []
+
+
+def test_a_missing_slots_metric_keeps_the_container_peaks():
+    install = _NoPrometheusInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    peaks = install.container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["memory_peak_bytes"] == 734003200
+    assert "proxy_slots_in_use_peak" not in peaks["envoy-credential-proxy"]
+
+
+def test_remonitor_keeps_one_slots_peak_and_notes_a_missing_one(tmp_path):
+    path = tmp_path / "data.json"
+    records.merge(path, [records.Record(
+        commit="e" * 40, mode="next", phase="broker", factor="base", level=0, operation="audits_30m", run=1,
+        started="2026-10-28T20:00:00Z", ended="2026-10-28T20:30:00Z",
+        metrics=[records.Metric("proxy_slot_cap", 8.0), records.Metric("proxy_slots_in_use_peak", 3.0, "envoy-credential-proxy")])])
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), path)
+    run.install = type("Install", (), {"container_peaks": lambda self, start, end: {
+        "envoy-credential-proxy": {"memory_peak_bytes": 2.0, "proxy_slots_in_use_peak": 5.0}}})()
+    run.remonitor()
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    slots = [m["value"] for m in stored["metrics"] if m["name"] == "proxy_slots_in_use_peak"]
+    assert slots == [5.0]
+    assert runner.SLOTS_UNKNOWN_NOTE not in stored["errors"]
+    run.install = type("Install", (), {"container_peaks": lambda self, start, end: {
+        "envoy-credential-proxy": {"memory_peak_bytes": 2.0}}})()
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    assert stored["errors"] == [runner.SLOTS_UNKNOWN_NOTE]
+
+
+def test_a_record_from_an_older_runner_gets_no_slots_note():
+    record = records.Record(commit="e" * 40, mode="next", phase="phase3", factor="base", level=0,
+                            operation="audits_30m", run=1, started="2026-10-27T00:00:00Z",
+                            ended="2026-10-27T00:30:00Z", metrics=[records.Metric("proxy_commands", 9.0)])
+    runner.Runner.note_slots(record)
+    assert record.errors == []
+
+
+def _scrubber(project="my-project-123"):
+    run = object.__new__(runner.Runner)
+    run.project = project
+    return run
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("image us-central1-docker.pkg.dev/my-project-123/repo/agent:abc", "image us-central1-docker.pkg.dev/<project>/repo/agent:abc"),
+    # Only an answer preview is cut, so an error or the image keeps its end.
+    ("context gke_my-proj", "context gke_my-proj"),
+])
+def test_scrub_removes_the_whole_project(text, expected):
+    assert _scrubber().scrub(text) == expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("in my-project-123 and cut inside the ID my-proj", "in <project> and cut inside the ID <project>"),
+    ("running in the project `my", "running in the project `<project>"),
+    ("under project m", "under project <project>"),
+    ("under the `my-pr", "under the `<project>"),
+    ("ends with my-p", "ends with my-p"),
+    ("as per the install's `m", "as per the install's `m"),
+    ("a word that ends xmy-proj", "a word that ends xmy-proj"),
+])
+def test_scrub_answer_removes_a_cut_off_start_of_the_project(text, expected):
+    assert _scrubber().scrub_answer(text) == expected
+
+
+@pytest.mark.parametrize("tail,expected_end", [
+    ("under the project `my-project-123`.", "under the project"),
+    ("under the project `my", "under the project `my"),
+])
+def test_an_answer_preview_never_ends_inside_a_word(tail, expected_end):
+    # The tail starts so that the bound falls inside the ID in the first case.
+    head = "x " * ((operations.ANSWER_PREVIEW_CHARS - len("under the project `my")) // 2)
+    output = head[: operations.ANSWER_PREVIEW_CHARS - len("under the project `my")] + tail
+    preview = operations.answer_preview(output)
+    assert len(preview) <= operations.ANSWER_PREVIEW_CHARS
+    assert preview.rstrip().endswith(expected_end)
+
+
+def test_a_new_preview_keeps_a_complete_last_word_that_starts_the_project():
+    # A new preview never ends inside a word, so only the whole ID is scrubbed: the cut-off
+    # scrub, for stored records, would rewrite this complete word.
+    run = _scrubber()
+    assert run.fresh_answers(["in my-project-123, owned by my-proj"]) == ["in <project>, owned by my-proj"]
+    assert run.scrub_answer("owned by my-proj") == "owned by <project>"
+
+
+def test_an_answer_preview_with_no_space_keeps_the_hard_cut():
+    # A long URL or compact JSON has no word to cut before; an empty preview would read as a
+    # failed prompt.
+    output = "https://example.com/" + "x" * 400
+    assert operations.answer_preview(output) == output[: operations.ANSWER_PREVIEW_CHARS]
+
+
+def test_scrub_answer_leaves_the_earlier_phases_answers_unchanged():
+    # A project ID that starts with the same letter as one of their cut-off previews.
+    run = _scrubber("f-sample-project")
+    data = json.loads((REPO_BENCH / "scale" / "harness-limits.json").read_text())
+    answers = [a for r in data["records"] if not r["phase"].startswith("broker") for a in r.get("answers", [])]
+    assert answers
+    assert [run.scrub_answer(a) for a in answers] == answers
+
+
+class _SlotsInstall(collect.Install):
+    def __init__(self, slots=None, error=None):
+        super().__init__("p", "ctx", "ns", "scale-host", "us-central1-c")
+        self.slots, self.error = slots, error
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            if self.error:
+                raise collect.urllib.error.HTTPError("url", self.error, "error", None, None)
+            return [{"resource": {"labels": {}}, "points": [{"value": {"doubleValue": v}} for v in self.slots]}]
+        return []
+
+
+def test_a_slots_series_becomes_the_proxy_slots_peak():
+    peaks = _SlotsInstall(slots=[3.0, 5.0]).container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["proxy_slots_in_use_peak"] == 5.0
+
+
+class _FailingSlotsInstall(_NoPrometheusInstall):
+    """Container series, and a slots query that fails with a status other than 404."""
+
+    def _time_series(self, query, aligner, start, end):
+        if collect.PROXY_SLOTS_METRIC in query:
+            raise collect.urllib.error.HTTPError("url", 503, "Service Unavailable", None, None)
+        return super()._time_series(query, aligner, start, end)
+
+
+def test_a_failed_slots_query_keeps_the_container_peaks_and_says_why(tmp_path):
+    install = _FailingSlotsInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    peaks = install.container_peaks(0.0, 60.0)
+    assert peaks["envoy-credential-proxy"]["memory_peak_bytes"] == 734003200
+    assert "proxy_slots_in_use_peak" not in peaks["envoy-credential-proxy"]
+    assert install.slots_query_error.startswith("HTTPError: HTTP Error 503")
+    # The record keeps the peaks and notes the failed query, which is no monitoring error.
+    path = tmp_path / "data.json"
+    records.merge(path, [records.Record(
+        commit="e" * 40, mode="next", phase="broker", factor="base", level=0, operation="audits_30m", run=1,
+        started="2026-10-28T20:00:00Z", ended="2026-10-28T20:30:00Z",
+        metrics=[records.Metric("proxy_slot_cap", 8.0)])])
+    run = runner.Runner(load_plan(PHASE3, environ=ENV), path)
+    run.install = install
+    run.remonitor()
+    stored = records.load(path)["records"][0]
+    assert any(m["name"] == "memory_peak_bytes" for m in stored["metrics"])
+    [note] = stored["errors"]
+    assert note.startswith(runner.SLOTS_FAILED_NOTE) and "503" in note
+    assert not note.startswith(runner.MONITORING_ERROR)
+    # A later read that gets an answer drops the note.
+    run.install = _NoPrometheusInstall("p", "ctx", "ns", "scale-host", "us-central1-c")
+    run.remonitor()
+    assert records.load(path)["records"][0]["errors"] == [runner.SLOTS_UNKNOWN_NOTE]
+
+
+def test_a_pod_whose_cpu_stat_was_unread_at_the_start_adds_no_throttle():
+    before = Snapshot(cpu_unread={"p"})
+    after = Snapshot(cpu_stat={"p": {"nr_periods": 1e6, "nr_throttled": 4e5, "throttled_seconds": 9000.0}})
+    assert collect.throttle_metrics(before, after) == []
+
+
+BROKER_RAISED = REPO_BENCH / "scale" / "broker-proxy-raised.yaml"
+
+
+def _raised_runner(tmp_path, proxy_limits):
+    plan = load_plan(BROKER_RAISED, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    read = []
+
+    def limits():
+        read.append(True)
+        return {collect.PROXY_CONTAINER: proxy_limits}
+    run.install = types.SimpleNamespace(limits=limits)
+    return plan, run, read
+
+
+def test_a_run_starts_when_the_broker_carries_the_plan_s_limits(monkeypatch, tmp_path):
+    plan, run, read = _raised_runner(tmp_path, {"cpu_cores": 2.0, "memory_bytes": 2 * 1024**3})
+    started = []
+    monkeypatch.setattr(run, "run", lambda *a: started.append(True) or True)
+    args = types.SimpleNamespace(command="run", force=False, limit=None)
+    assert runner._mutate(run, args, []) == 0
+    assert started and read
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
+    assert "expect_proxy_limits: the broker matches" in run.dry_run([], force=True)
+
+
+def test_a_run_refuses_to_start_while_the_broker_carries_other_limits(monkeypatch, tmp_path):
+    plan, run, read = _raised_runner(tmp_path, {"cpu_cores": 1.0})
+    started = []
+    monkeypatch.setattr(run, "run", lambda *a: started.append(True) or True)
+    for command in ("run", "apply"):
+        args = types.SimpleNamespace(command=command, force=False, limit=None, factor="clusters", level=8)
+        with pytest.raises(SystemExit, match="cpu: the plan expects 2, the broker has 1"):
+            runner._mutate(run, args, [])
+    assert started == []
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
+    assert any("expect_proxy_limits: cpu: the plan expects 2" in line for line in run.dry_run([], force=True))
+
+
+def test_a_plan_that_names_no_limits_reads_none(tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    run.install = types.SimpleNamespace(limits=lambda: pytest.fail("a plan with no expect_proxy_limits read the limits"))
+    run.check_limits()
+    assert run.limit_mismatches() == []
