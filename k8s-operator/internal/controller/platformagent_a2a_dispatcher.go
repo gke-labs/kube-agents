@@ -674,11 +674,16 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// refused no-worker at admission; Jobs already running stay, since the policy holds
 	// only creates and each was held to its template when made. Only the
 	// signal off (a deliberate gate-off) tears Job mode down, below.
-	var jobErr error
+	// revokeErr is the !jobMode arm's revoke, which the gate-off sweep
+	// below starts from rather than repeat; bundleCopied spares the pool
+	// pass a second copy of the CA bundle.
+	var jobErr, revokeErr error
+	var bundleCopied bool
 	switch {
 	case !jobMode:
 		jobTemplates = nil
-		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
+		revokeErr = r.revokeDispatcherJobsRole(ctx, agent)
+		jobErr = revokeErr
 	case !profileNamespaceReady:
 		jobTemplates = nil
 		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
@@ -703,6 +708,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 				jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
 				break
 			}
+			bundleCopied = true
 		}
 		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 			jobTemplates = nil
@@ -791,9 +797,14 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	}
 	// Gated off: what an earlier pass rendered goes, before the pools, so
 	// the CA bundle (which the Job pods mount too) goes after the Jobs.
+	// The !jobMode arm has revoked the Jobs Role, deleteDispatcherJobResources'
+	// first step, so the sweep goes on from there.
 	var sweepErr error
 	if !signal {
-		sweepErr = r.deleteDispatcherJobResources(ctx, agent)
+		sweepErr = revokeErr
+		if sweepErr == nil {
+			sweepErr = r.deleteDispatcherJobsAndTemplates(ctx, agent)
+		}
 	}
 	// The warm pools the dispatcher hands interactive tasks to
 	// (agentprofile_pool.go). A failure there is the profile namespace's,
@@ -801,7 +812,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// signalled: a revoke or a transient failure above leaves templates out
 	// but running Jobs in place, and their pods mount it. Only the gate-off
 	// sweep, once it has deleted the Jobs, lets it go.
-	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, signal || sweepErr != nil)
+	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, bundleCopied, signal || sweepErr != nil)
 	if !signal {
 		return goerrors.Join(poolErr, sweepErr), nil
 	}

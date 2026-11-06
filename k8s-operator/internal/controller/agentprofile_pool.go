@@ -368,8 +368,9 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 // is the pools' only source of work. keepBundle says dispatcher Jobs may still
 // mount the bundle (Job mode signalled, even if revoked, since a revoke leaves
 // running Jobs to finish; or a gate-off sweep that didn't finish): it is then
-// kept even with no pool.
-func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, keepBundle bool) error {
+// kept even with no pool. bundleCopied says the caller copied the bundle this
+// pass (before publishing Job templates), so it isn't copied again.
+func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, bundleCopied, keepBundle bool) error {
 	imageVolumes := r.imageVolumeSupported(agent)
 	var pools []*appsv1.Deployment
 	var errs []error
@@ -407,8 +408,12 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 	// The CA bundle the pools mount, copied before the pools that need it.
 	// A copy that fails skips the pool applies (they would mount nothing)
 	// but not the sweep, which needs nothing from it.
-	if err := r.copyProfileCABundle(ctx, agent); err != nil {
-		errs = append(errs, err)
+	var copyErr error
+	if !bundleCopied {
+		copyErr = r.copyProfileCABundle(ctx, agent)
+	}
+	if copyErr != nil {
+		errs = append(errs, copyErr)
 	} else {
 		// One pool the API server refuses (a profile whose requests exceed
 		// its limits, a webhook) doesn't hold up the others or the sweep: a

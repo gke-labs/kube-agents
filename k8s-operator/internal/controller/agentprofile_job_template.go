@@ -507,10 +507,16 @@ func (r *PlatformAgentReconciler) revokeDispatcherJobsRole(ctx context.Context, 
 // dispatcher holds their leases once it is gone; propagated, so their pods go
 // too), then the templates, and the index last.
 func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	ns := profileNamespaceName(agent)
 	if err := r.revokeDispatcherJobsRole(ctx, agent); err != nil {
 		return err
 	}
+	return r.deleteDispatcherJobsAndTemplates(ctx, agent)
+}
+
+// deleteDispatcherJobsAndTemplates is deleteDispatcherJobResources after
+// the revoke, for a caller that has just revoked the Jobs Role itself.
+func (r *PlatformAgentReconciler) deleteDispatcherJobsAndTemplates(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	ns := profileNamespaceName(agent)
 	// One by one: the operator holds delete on Jobs, not deletecollection.
 	// Only those with this agent's labels (dispatchJobLabels, which the
 	// policy requires of every dispatcher Job).

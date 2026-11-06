@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -1063,6 +1066,76 @@ func TestARevokedJobModeKeepsTheCABundleForItsRunningJobs(t *testing.T) {
 	}
 	if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); err != nil {
 		t.Errorf("the CA bundle went with the revoke, under a running Job: %v", err)
+	}
+}
+
+// One pass reads each thing once, uncached: with Job templates and a read
+// pool, the CA bundle is copied once (before the templates, not again for the
+// pool); gated off, the Jobs Role is revoked once (in the revoke arm, not
+// again by the sweep).
+func TestAPassDoesNotRepeatItsUncachedReads(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	policy, binding := shippedDispatcherJobPolicy(t)
+	pns := profileNamespaceName(agent)
+	srcBundle := types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}
+	jobsRole := types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}
+	var mu sync.Mutex
+	gets := map[string]int{}
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		mu.Lock()
+		gets[fmt.Sprintf("%T %s", obj, key)]++
+		mu.Unlock()
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)).
+		WithInterceptorFuncs(funcs).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	count := func(obj client.Object, key types.NamespacedName) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return gets[fmt.Sprintf("%T %s", obj, key)]
+	}
+	reset := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		clear(gets)
+	}
+
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName("tse", agentv1alpha1.AgentProfileTierRead)}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("precondition: no read pool: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Fatalf("precondition: no Job template: %v", err)
+	}
+	reset()
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("second pass: %v / %v", err, profileErr)
+	}
+	if n := count(&corev1.ConfigMap{}, srcBundle); n != 1 {
+		t.Errorf("the NATS CA bundle was read %d times in one pass, want 1", n)
+	}
+
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	reset()
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("gate off: %v / %v", err, profileErr)
+	}
+	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+		if n := count(obj, jobsRole); n != 1 {
+			t.Errorf("the Jobs %T was read %d times in the gate-off pass, want 1", obj, n)
+		}
+		if err := c.Get(ctx, jobsRole, obj); !apierrors.IsNotFound(err) {
+			t.Errorf("the Jobs %T survived the gate-off: %v", obj, err)
+		}
 	}
 }
 
