@@ -1,6 +1,6 @@
 ---
 name: fleet-audit
-description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
+description: Publish the findings of an autonomous fleet audit as one continuously-rewritten issue per audit stream per install on the GitOps repository's forge, and propose fixes as narrow remediation pull requests (merge requests on GitLab).
 ---
 
 # fleet-audit — Audit Findings to a Ledger Issue
@@ -49,9 +49,10 @@ watchdog — **not** a prettified form of the audit id:
 | `upgrade-retrospective`       | `[audit] Upgrade Retrospective — 7 findings (0 critical)`                      |
 
 The mapping lives in `AUDITS` at the top of `audit_report.py` and mirrors `cron/jobs.json`; a test
-fails if the two drift apart. Do not restate a title anywhere else. On an install with a ledger
-scope the human name is followed by the host cluster's name in parentheses:
-`[audit] Workload Reliability Audit (platform-host) — 7 findings (2 critical)`.
+fails if the two drift apart. On an install with a ledger scope the human name is followed by the
+scope's name, the host cluster's, in parentheses:
+`[audit] Workload Reliability Audit (platform-host) — 7 findings (2 critical)`. Do not restate a
+title anywhere else.
 
 ## Run an audit
 

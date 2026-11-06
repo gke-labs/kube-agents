@@ -69,7 +69,8 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no new or changed coverage gap, no held close, no remediation pull request opened or
+> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no held close, no
+> remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -98,6 +99,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
   swallowing this one would leave the operator hearing only bad news.
+- **`retired_unlisted` is not empty** — the close retired a finding on a cluster the run listed
+  nowhere, unread. The operator has to know that it left the ledger without being confirmed fixed.
 - **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
   that is the same as on the last stored scheduled run was said on the run that got it, and is still in

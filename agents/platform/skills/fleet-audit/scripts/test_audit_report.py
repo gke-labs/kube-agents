@@ -35314,6 +35314,38 @@ class TestStoreLedger(HarnessTestCase):
         self.assertIn(audit_report.STORE_LOST_MEMORY_UNGUARDED_GAP, out["coverage_gaps"])
         self.assertEqual([], self.harness.forge_calls("proposal-close"))
 
+    def test_a_clean_run_names_the_findings_it_retires_unread_on_the_store_ledger(self):
+        """A previous finding on a cluster this run lists nowhere leaves the
+        stored ledger, is not resolved, and keeps its fix (#4901)."""
+        self.claim()
+        clusters = [
+            {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+            {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            {"name": RETIRED_CLUSTER, "location": "us-east4", "project": "acme-retired"},
+        ]
+        gone = make_finding(
+            fid="gone", cluster=RETIRED_CLUSTER, remediation={"kind": "manual", "note": "Fix."}
+        )
+        kept = make_finding(fid="a", remediation={"kind": "manual", "note": "Fix."})
+        first = self.run_once(make_doc(findings=[kept, gone], clusters=clusters))
+        self.assertEqual(first["new"], 2)
+        gone_id = derived_id(fid="gone", cluster=RETIRED_CLUSTER)
+        self.start()
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = [
+            entry
+            for entry in resolved_for(
+                published_body(make_doc(findings=[kept, gone], clusters=clusters), generated_at=NOW)
+            )
+            if entry["cluster"] != RETIRED_CLUSTER
+        ]
+        self.assertEqual(self.finish(clean), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["resolved"], 1)
+        self.assertEqual(out[audit_report.RETIRED_UNLISTED_KEY], [gone_id])
+        self.assertIn("RETIRED UNLISTED:", self.err)
+        self.assertNotIn(gone_id, self.latest().get("current_ids") or [])
+
     def test_the_summary_names_proposals_in_the_forge_s_own_noun(self):
         summary = audit_report.render_no_forge_summary(
             AUDIT, make_doc(findings=[]), [], [], [], True, [], "note.",
@@ -37012,6 +37044,20 @@ class TestScopedLedgerLookup(ScopedHarnessTestCase):
         self.assertEqual(self.find(), (None, None, None, None))
         self.assertEqual(self.harness.forge_calls("issue-update"), [])
 
+    def test_a_ledger_already_carrying_this_installs_label_is_used_without_a_write(self):
+        # The two-label listing lagged the label write; the stream listing
+        # shows the ledger with this install's own label. It is the ledger,
+        # not a candidate for adoption, and not a reason to open another.
+        self.harness.replies = {
+            f"issue-list labels={self.scope.label}": issues_view([]),
+            "issue-list": issues_view(
+                [self.ledger_issue(["agent:audit", f"audit:{AUDIT}", self.scope.label])]
+            ),
+        }
+        self.assertEqual(self.find()[0], 42)
+        self.assertEqual(self.harness.forge_calls("issue-update"), [])
+        self.assertEqual(self.harness.forge_calls("issue-view"), [])
+
     def test_the_highest_unscoped_ledger_is_the_one_adopted(self):
         self.harness.replies = {
             f"issue-list labels={self.scope.label}": issues_view([]),
@@ -37167,6 +37213,14 @@ class TestAnchorRelativeAges(BaseTestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.dated(text), text)
 
+    def test_an_age_inside_a_code_span_is_a_command_and_stays(self):
+        self.assertEqual(
+            self.dated('Run `journalctl --since "2 days ago"`; it last ran 3 days ago.'),
+            'Run `journalctl --since "2 days ago"`; it last ran 3 days ago as of 2026-08-01.',
+        )
+        fenced = "```\ngh run list --created '>3 days ago'\n```"
+        self.assertEqual(self.dated(fenced), fenced)
+
     def test_the_fields_dated_and_the_ones_left_as_written(self):
         finding = make_finding(
             title="Rollout finished 166 days ago",
@@ -37301,6 +37355,37 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         payload = self.stdout_json()
         self.assertTrue(payload["partial"])
         self.assertNotIn(audit_report.RETIRED_UNLISTED_KEY, payload)
+
+    def test_a_held_close_retires_nothing(self):
+        # One finding on a listed cluster the run neither reports nor
+        # explains, one on a cluster listed nowhere: the ledger stays open,
+        # so nothing is retired and the JSON line does not say otherwise.
+        self.previous_ledger(make_finding(fid="a"), self.gone())
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertNotIn(audit_report.RETIRED_UNLISTED_KEY, payload)
+        self.assertNotIn("RETIRED UNLISTED", self.err)
+
+    def test_a_retired_findings_fix_is_not_closed_as_no_longer_reproducing(self):
+        self.previous_ledger(self.gone())
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                pr(
+                    8,
+                    f"platform-agent/fix-{AUDIT}-gone",
+                    body=audit_report.delta_block([self.gone_id()]),
+                )
+            ]
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertEqual(payload[audit_report.RETIRED_UNLISTED_KEY], [self.gone_id()])
+        self.assertIn("its fix stays open", self.err)
 
     def test_a_close_that_only_retires_is_still_news(self):
         self.previous_ledger(self.gone())
