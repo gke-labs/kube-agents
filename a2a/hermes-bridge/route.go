@@ -48,8 +48,10 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive.
-	routeLostNote = "\n\n(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// answer that cannot arrive. Such a turn waits on its cards in turn
+	// (waitKanbanInTurn), so only a card still running when the wait ends
+	// is left without a way back.
+	routeLostNote = "\n\n(A card this turn left running cannot post its answer back to this conversation: the conversation's route could not be recorded.)"
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name

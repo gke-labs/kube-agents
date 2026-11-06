@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -256,6 +257,7 @@ func TestCancelActiveKanbanWait_MarksSessionCanceledBeforeWaitEnds(t *testing.T)
 	}
 	act := newSessionActivityState(sessionID, false)
 	act.cardsFiled.Store(true)
+	run.act.Store(act)
 
 	waitDone := make(chan struct{})
 	go func() {
@@ -908,6 +910,20 @@ func TestCardAnswerTextKeepsErrorTextBehindTheDebugSwitch(t *testing.T) {
 	if got := cardAnswerText(kanbanCardRow{ID: "t_4", Title: "x", Status: "done", Err: errSecret}); strings.Contains(got, errSecret) {
 		t.Errorf("a completed card with no report answered with its error text: %q", got)
 	}
+	// A blocked card with no question in its payload answers with a status
+	// line, never its error text.
+	for _, c := range []kanbanCardRow{
+		{ID: "t_5", Title: "x", Status: "blocked", Err: errSecret},
+		{ID: "t_6", Title: "x", Status: "blocked", BlockPayload: `{"error":"` + errSecret + `"}`, Err: errSecret},
+	} {
+		if got := cardAnswerText(c); strings.Contains(got, errSecret) || !strings.Contains(got, c.ID) {
+			t.Errorf("blocked card %s answer = %q, want a status line without the error text", c.ID, got)
+		}
+	}
+	// The status line's title is scrubbed.
+	if got := cardAnswerText(kanbanCardRow{ID: "t_7", Title: "Rotate password=hunter2xyzzy-status", Status: "failed"}); strings.Contains(got, "hunter2xyzzy-status") {
+		t.Errorf("status line carries the title's secret: %q", got)
+	}
 	t.Setenv(debugErrorTextEnv, "true")
 	if got := cardAnswerText(failed); !strings.Contains(got, "psql: FATAL") {
 		t.Errorf("failed card answer with the debug switch on = %q, want its error text", got)
@@ -957,5 +973,36 @@ c.commit()
 	}
 	if strings.Contains(got, canary) || !strings.Contains(got, "t_fail") || !strings.Contains(got, "failed") {
 		t.Errorf("answer = %q, want a line naming t_fail and its failure, without the error text", got)
+	}
+}
+
+// A kanban.db that can't be read ends the wait after a bounded run of failed
+// polls, with the turn's own text, rather than holding the turn to its
+// deadline.
+func TestWaitForKanbanCards_AnUnreadableBoardEndsTheWait(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	if err := os.WriteFile(db, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(hermesKanbanDBEnv, db)
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	sessionID := "a2a-ctx-corrupt"
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-corrupt", ContextID: "ctx-corrupt", CorrelationID: "corr-corrupt"}, state: stateRunning}
+	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
+	run.act.Store(act)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(kanbanMaxQueryFailures+30)*kanbanPollInterval)
+	defer cancel()
+	start := time.Now()
+	got, ok := b.waitForKanbanCards(run, ctx, act, sessionID, time.Now().Unix()-10, 1, "Dispatched a card.")
+	if !ok || got != "Dispatched a card." {
+		t.Fatalf("waitForKanbanCards = (%q, %v), want the turn's own text", got, ok)
+	}
+	if ctx.Err() != nil {
+		t.Errorf("the wait ran to the deadline (%s) instead of giving up on the unreadable board", time.Since(start))
 	}
 }

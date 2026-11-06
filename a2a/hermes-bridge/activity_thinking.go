@@ -190,7 +190,8 @@ func (a *activityState) SyncKanbanCard(cardID, title, workerSessionID string) {
 	title = strings.TrimSpace(title)
 	workerSessionID = strings.TrimSpace(workerSessionID)
 	if cardID != "" && title != "" {
-		a.trace.cardTitles[cardID] = shortCardClusterOrTitle(title)
+		// kanban.db's title is model-written: scrubbed, as at kanban_create.
+		a.trace.cardTitles[cardID] = shortCardClusterOrTitle(scrubInlineSecrets(title))
 	}
 	if workerSessionID != "" && cardID != "" {
 		a.trace.sessionCards[workerSessionID] = cardID
@@ -397,7 +398,7 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 		rawToolInput = openRaw
 	}
 	effectiveTool, _ := unwrapHermesToolCall(d.ToolName, rawToolInput)
-	if (d.SessionID == "" || d.SessionID == a.sessionID) && status != ActivityStatusError && (effectiveTool == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
+	if (d.SessionID == "" || d.SessionID == a.sessionID) && status != ActivityStatusError && (effectiveTool == kanbanCreateTool || countKanbanCreateCalls(d.ToolName, rawToolInput) > 0) {
 		a.cardsFiled.Store(true)
 		a.trace.turnCardsFiled = true
 	}

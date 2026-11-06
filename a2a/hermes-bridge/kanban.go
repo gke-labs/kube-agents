@@ -23,8 +23,13 @@ import (
 )
 
 const (
-	kanbanPollInterval          = time.Second
-	kanbanMaxEmptyPolls         = 3
+	kanbanPollInterval  = time.Second
+	kanbanMaxEmptyPolls = 3
+	// kanbanMaxQueryFailures bounds how many polls in a row may fail to read
+	// kanban.db before the turn stops waiting on its cards and ends with its
+	// own text: a board that can't be read (no python3 or sqlite3, a schema
+	// change, a corrupt file) must not hold every turn to its deadline.
+	kanbanMaxQueryFailures      = 30
 	kanbanOutOfTurnWindowSecs   = 7200
 	kanbanTrackedRetentionSecs  = 2 * kanbanOutOfTurnWindowSecs
 	hermesVenvPythonPath        = "/opt/hermes/.venv/bin/python3"
@@ -567,7 +572,9 @@ func cardAnswerText(c kanbanCardRow) string {
 	st := strings.ToLower(strings.TrimSpace(c.Status))
 	switch {
 	case isKanbanStatusBlocked(st):
-		return formatKanbanCardOutput(c)
+		if q := blockedCardQuestion(c); q != "" {
+			return q
+		}
 	case kanbanStatusSucceeded(st):
 		if res := strings.TrimSpace(c.Result); res != "" {
 			return res
@@ -582,6 +589,25 @@ func cardAnswerText(c kanbanCardRow) string {
 		return fmt.Sprintf("Kanban card `%s` finished with status `%s`.", c.ID, st)
 	}
 	return fmt.Sprintf("Kanban card `%s` (%s) finished with status `%s`.", c.ID, title, st)
+}
+
+// blockedCardQuestion is what a blocked card asks the user, from its block
+// payload's question, reason, message or summary (not its error), or "".
+func blockedCardQuestion(c kanbanCardRow) string {
+	bp := strings.TrimSpace(c.BlockPayload)
+	if bp == "" {
+		return ""
+	}
+	var parsed map[string]any
+	if json.Unmarshal([]byte(bp), &parsed) != nil {
+		return bp // a plain-text payload is the question itself
+	}
+	for _, k := range []string{"question", "reason", "message", "summary"} {
+		if v, ok := parsed[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // kanbanStatusSucceeded reports whether a card's status is a successful end.
@@ -683,6 +709,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	trackedSet := make(map[string]bool)
 	sawUnsettled := false
 	emptyPolls := 0
+	queryFailures := 0
 	ticker := time.NewTicker(kanbanPollInterval)
 	defer ticker.Stop()
 
@@ -692,6 +719,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 		}
 		cards, err := querySessionKanbanCards(taskCtx, pythonBin, dbPath, sessionID, turnStartUnix, trackedIDs)
 		if err == nil {
+			queryFailures = 0
 			var relevant []kanbanCardRow
 			for _, c := range cards {
 				if !isKanbanStatusBlocked(c.Status) {
@@ -808,6 +836,16 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 			}
 			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 			return "", false
+		} else {
+			queryFailures++
+			if queryFailures == 1 {
+				b.cfg.Logger.Warn("can't read the kanban board; still waiting on the turn's cards", "task", run.origin.TaskID, "err", err)
+			}
+			if queryFailures >= kanbanMaxQueryFailures {
+				b.cfg.Logger.Error("the kanban board stayed unreadable; the turn ends without waiting on its cards",
+					"task", run.origin.TaskID, "failures", queryFailures, "err", err)
+				break
+			}
 		}
 
 		if hasQueuedSteer(run) {

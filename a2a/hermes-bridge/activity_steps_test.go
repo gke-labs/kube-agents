@@ -739,7 +739,7 @@ func TestAPI_DebugErrorTextCarriesTheScrubbedFirstLine(t *testing.T) {
 		t.Errorf("a successful call carried error text %q", e.ErrorMessage)
 	}
 	// A long line is cut at the cap on a rune boundary.
-	long := strings.Repeat("é", 300) + " end"
+	long := "x" + strings.Repeat("é", 300) + " end" // an odd-byte prefix puts the cap mid-rune
 	if e = call("c5", "error", long, `null`); len(e.ErrorMessage) > debugErrorTextCap || !utf8.ValidString(e.ErrorMessage) || e.ErrorMessage == "" {
 		t.Errorf("error text of %d bytes (valid UTF-8 %v), want at most %d and valid", len(e.ErrorMessage), utf8.ValidString(e.ErrorMessage), debugErrorTextCap)
 	}
@@ -1073,5 +1073,37 @@ func TestWorkerHooks_DoNotMutateCoordinatorStepsOrCardsFiled(t *testing.T) {
 	}
 	if a.turnCalls != 0 {
 		t.Fatalf("worker post_tool_call incremented coordinator turnCalls = %d, want 0", a.turnCalls)
+	}
+}
+
+// A card's title from kanban.db is model-written, so the worker label that
+// names it is built from the scrubbed title, whichever source set it last.
+func TestWorkerLabelUsesTheScrubbedCardTitle(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-label-test"
+	a.SyncKanbanCard("t_lbl", "Rotate creds password=hunter2xyzzy-label", "worker-1")
+	a.mu.Lock()
+	label := a.workerLabelLocked("worker-1")
+	a.mu.Unlock()
+	if strings.Contains(label, "hunter2xyzzy-label") || !strings.Contains(label, "t_lbl") {
+		t.Errorf("worker label = %q, want the card named without the title's secret", label)
+	}
+}
+
+// A worker's kanban_* card id is capped before it is kept for attribution.
+func TestAWorkersCardIDIsCapped(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-cap-test"
+	long := strings.Repeat("c", 3*maxSubtaskIDBytes)
+	pre := hookDelivery{Event: hookPreToolCall, SessionID: "worker-cap", DeliveryID: "pre-cap", ToolName: "kanban_show",
+		ToolInput: json.RawMessage(`{"card_id":"` + long + `"}`)}
+	pre.Extra.ToolCallID = "cap-1"
+	a.observe(pre)
+	post := pre
+	post.Event, post.DeliveryID = hookPostToolCall, "post-cap"
+	post.Extra.Status = hookStatusOK
+	e, _, _ := a.observe(post)
+	if len(e.CardID) > maxSubtaskIDBytes || len(e.Worker) > maxSubtaskIDBytes+len("card:") {
+		t.Errorf("card id %d bytes, worker %q (%d bytes), want each within %d", len(e.CardID), e.Worker, len(e.Worker), maxSubtaskIDBytes)
 	}
 }
