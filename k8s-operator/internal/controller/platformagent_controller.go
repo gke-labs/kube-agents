@@ -5712,15 +5712,15 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		existing.Reason != reason ||
 		existing.Message != message ||
 		existing.ObservedGeneration != agent.Generation ||
-		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) {
+		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) ||
+		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
 	if !rendered {
 		return true
 	}
 	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
-		replicasLimitedConditionCurrent(agent, replicasLimitedMsg) &&
-		credentialProxyExecReadyCurrent(agent, execReady)
+		replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 }
 
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
@@ -5802,12 +5802,11 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	// CredentialProxyExecReady too: a park that rendered rendered the tier, and
-	// one can last days (ShellSandboxKeysMissing). An unrendered pass leaves it.
-	execReady := credentialProxyExecReadyRead{}
-	if rendered {
-		execReady = r.readCredentialProxyExecReady(ctx, agent)
-	}
+	// CredentialProxyExecReady on every park, rendered or not: the tier is
+	// applied before the egress allowlist refusal parks unrendered, and a park
+	// can last days (ShellSandboxKeysMissing). The read reports the tier as it
+	// stands in the cluster, so it is true on any pass.
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
 	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
@@ -5837,8 +5836,8 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	if rendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
-		setCredentialProxyExecReadyCondition(agent, execReady, now)
 	}
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	return r.Status().Update(ctx, agent)
 }

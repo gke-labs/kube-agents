@@ -84,7 +84,8 @@ func (r *PlatformAgentReconciler) readCredentialProxyExecReady(ctx context.Conte
 	err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: credentialProxyExecTierName(agent)}, deployment)
 	switch {
 	case err == nil:
-		ready = deployment.Status.ReadyReplicas
+		// Capped at the field: during a scale-down the old count is still Ready.
+		ready = min(deployment.Status.ReadyReplicas, desired)
 	case apierrors.IsNotFound(err):
 		// Not rendered yet on this pass: none Ready.
 	default:
@@ -106,8 +107,10 @@ func (r *PlatformAgentReconciler) readCredentialProxyExecReady(ctx context.Conte
 		condition.Message = fmt.Sprintf(credentialProxyExecReadyMessageFormat, ready, desired)
 		name, why, readErr := r.credentialProxyExecUnschedulablePod(ctx, agent)
 		if readErr != nil {
-			log.Info("exec tier pods not read; CredentialProxyExecReady gives no scheduling reason", "error", readErr.Error())
-		} else if name != "" {
+			log.Info("exec tier pods not read; CredentialProxyExecReady unchanged", "error", readErr.Error())
+			return credentialProxyExecReadyRead{}
+		}
+		if name != "" {
 			condition.Reason = credentialProxyExecUnschedulableReason
 			condition.Message = fmt.Sprintf(credentialProxyExecUnschedulableMessageFormat, ready, desired, name, why,
 				credentialProxyExecTierCPU, credentialProxyExecTierCPU)

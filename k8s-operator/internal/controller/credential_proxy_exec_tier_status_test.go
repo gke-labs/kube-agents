@@ -163,11 +163,9 @@ func TestTheStatusWriterFollowsTheTierAsItBecomesReady(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
-	var last ctrl.Result
 	condition := func(t *testing.T) *metav1.Condition {
 		t.Helper()
-		var err error
-		if last, err = r.Reconcile(ctx, req); err != nil {
+		if _, err := r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile: %v", err)
 		}
 		got := &agentv1alpha1.PlatformAgent{}
@@ -197,9 +195,6 @@ func TestTheStatusWriterFollowsTheTierAsItBecomesReady(t *testing.T) {
 	setReady(t, 1)
 	if c := condition(t); c == nil || c.Status != metav1.ConditionFalse || c.Message != "1 of 2 exec-tier replicas are Ready." {
 		t.Fatalf("after one replica: %+v", c)
-	}
-	if last.RequeueAfter == 0 || last.RequeueAfter > credentialProxyExecShortRequeue {
-		t.Errorf("a short tier requeues after %v, want at most %v", last.RequeueAfter, credentialProxyExecShortRequeue)
 	}
 	setReady(t, 2)
 	if c := condition(t); c == nil || c.Status != metav1.ConditionTrue || c.Message != "2 of 2 exec-tier replicas are Ready." {
@@ -269,5 +264,102 @@ func TestAParkThatRenderedTheTierStillReportsIt(t *testing.T) {
 	}
 	if c := meta.FindStatusCondition(stored(t).Status.Conditions, credentialProxyExecReadyConditionType); c != nil {
 		t.Fatalf("at 0 on the park the condition stays: %+v", c)
+	}
+}
+
+// On a today install nothing else asks for a sooner pass, so the short tier's
+// requeue is the one that brings the next read: 30s while short, and the
+// steady-state interval again once every replica is Ready.
+func TestAShortTierRequeuesSoonerOnATodayInstall(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+			CredentialProxy: &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(2))}},
+		}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	pass := func(t *testing.T) ctrl.Result {
+		t.Helper()
+		res, err := r.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		return res
+	}
+	pass(t)
+	if res := pass(t); res.RequeueAfter != credentialProxyExecShortRequeue {
+		t.Fatalf("short tier: RequeueAfter = %v, want %v", res.RequeueAfter, credentialProxyExecShortRequeue)
+	}
+	d := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyExecTierName(agent)}, d); err != nil {
+		t.Fatal(err)
+	}
+	d.Status.ReadyReplicas = 2
+	if err := cl.Status().Update(ctx, d); err != nil {
+		t.Fatal(err)
+	}
+	if res := pass(t); res.RequeueAfter != secretEnvReprobeInterval {
+		t.Fatalf("ready tier: RequeueAfter = %v, want the steady-state %v", res.RequeueAfter, secretEnvReprobeInterval)
+	}
+}
+
+// The scheduler's verdict can stand for days, and one failed pod list must not
+// trade it for a bare count and back.
+func TestAFailedPodListKeepsTheSchedulersReason(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	stored := metav1.Condition{Type: credentialProxyExecReadyConditionType, Status: metav1.ConditionFalse, Reason: credentialProxyExecUnschedulableReason, Message: "1 of 2 … Insufficient cpu"}
+	agent.Status.Conditions = []metav1.Condition{stored}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, execTierStatusDeployment(1)).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*corev1.PodList); ok {
+				return errors.New("apiserver unavailable")
+			}
+			return c.List(ctx, list, opts...)
+		},
+	}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	read := r.readCredentialProxyExecReady(context.Background(), agent)
+	if !credentialProxyExecReadyCurrent(agent, read) {
+		t.Error("a failed pod list asks for a status write")
+	}
+	setCredentialProxyExecReadyCondition(agent, read, metav1.Now())
+	if got := meta.FindStatusCondition(agent.Status.Conditions, credentialProxyExecReadyConditionType); got == nil || got.Reason != stored.Reason || got.Message != stored.Message {
+		t.Fatalf("condition = %+v, want it unchanged", got)
+	}
+}
+
+// The tier is applied before the egress allowlist refusal parks with the
+// workload unrendered, so the Degraded writer reads it on that park too.
+func TestAnUnrenderedParkStillReportsTheTier(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, execTierStatusDeployment(2)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+	ctx := context.Background()
+	if err := r.updateStatusDegraded(ctx, agent, "EgressAllowlistRefused", "refused", workloadNotRendered); err != nil {
+		t.Fatal(err)
+	}
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), got); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(got.Status.Conditions, credentialProxyExecReadyConditionType); c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("on an unrendered park: %+v", c)
+	}
+}
+
+// During a scale-down the old replicas are still Ready; the count is the field's.
+func TestAScaleDownCountsNoMoreReadyThanTheFieldAsks(t *testing.T) {
+	c := execTierCondition(t, ptr.To(int32(2)), execTierStatusDeployment(3))
+	if c == nil || c.Status != metav1.ConditionTrue || c.Message != "2 of 2 exec-tier replicas are Ready." {
+		t.Fatalf("condition = %+v", c)
 	}
 }
