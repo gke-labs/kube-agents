@@ -486,6 +486,20 @@ class WakeTest(PolicyCase):
         self.assertEqual(self.next_run("obtainability-audit"), "2026-08-06T06:50:00+00:00")
         self.assertEqual(self.state()["held"], {})
 
+    def test_a_held_slot_that_has_arrived_is_left_for_hermes_to_fire(self):
+        # The stage drops on the first tick at or after the held slot (a
+        # message read in the minutes before it, or a ticker outage across
+        # it): the slot is the job's own occurrence, so it stays and Hermes
+        # fires it, rather than moving a day past the run it was due for.
+        self.hibernate()
+        held_at = self.next_run("compliance-audit")  # 2026-08-07T06:20:00+00:00
+        later = NOW + timedelta(days=1)  # 06:20:30 the next day
+        lines = self.run_policy(Reader(later - timedelta(minutes=3)), now=later)
+        self.assertIn(f"released compliance-audit; due at its held slot {held_at}", lines[1])
+        self.assertEqual(self.next_run("compliance-audit"), held_at)
+        self.assertEqual(self.next_run("obtainability-audit"), "2026-08-07T06:50:00+00:00")
+        self.assertEqual(self.state()["held"], {})
+
     def test_a_job_hermes_advanced_meanwhile_is_left_alone(self):
         self.hibernate()
         jobs = json.loads(self.store.read_text())

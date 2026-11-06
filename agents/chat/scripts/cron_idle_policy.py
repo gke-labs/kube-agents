@@ -62,7 +62,9 @@ timestamp written. When the stage drops (a person wrote, or the thresholds
 moved) every held job whose ``next_run_at`` still equals its record is set to
 its next natural occurrence after now, never to now itself, so a returning
 operator gets the roster back on its schedule rather than eleven audits at
-once. A job Hermes advanced meanwhile is left as Hermes left it.
+once. A held slot that has already arrived is left where it is: it is the
+job's own occurrence, and Hermes fires it on the same tick. A job Hermes
+advanced meanwhile is left as Hermes left it.
 
 **Failure posture.** The signal is read through the shell sandbox at most once
 per :data:`SIGNAL_CACHE_TTL`, and only when a prompt-driven job is due or a
@@ -545,11 +547,16 @@ def _apply_locked(
         if record is not None and STAGE_RANK[stage] < _record_rank(record):
             released.append(job_id)
             if job.get("next_run_at") == record.get("next_run_at"):
-                target = _release_target(job, now, zone)
-                if target is not None:
-                    job["next_run_at"] = target.isoformat()
-                    changed = True
-                    lines.append(f"{label}: released {job_id}; next run {target.isoformat()}")
+                if _due(job, now):
+                    # The held slot has come: it is the job's own occurrence,
+                    # so Hermes fires it on this tick rather than a day later.
+                    lines.append(f"{label}: released {job_id}; due at its held slot {job['next_run_at']}")
+                else:
+                    target = _release_target(job, now, zone)
+                    if target is not None:
+                        job["next_run_at"] = target.isoformat()
+                        changed = True
+                        lines.append(f"{label}: released {job_id}; next run {target.isoformat()}")
             continue
         if stage == STAGE_ACTIVE or not _due(job, now):
             continue
