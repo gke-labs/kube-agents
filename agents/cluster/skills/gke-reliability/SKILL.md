@@ -1,6 +1,6 @@
 ---
 name: gke-reliability
-description: Workflows for ensuring high availability and reliability of GKE workloads.
+description: Workflows for ensuring high availability and reliability of GKE workloads. Use for PodDisruptionBudgets, replica counts, probes, zone spread and topology design reviews. For a "what is failing" or "is it healthy" question use workload-triage-scan instead.
 ---
 
 # GKE Reliability Skill
