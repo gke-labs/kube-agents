@@ -43,6 +43,7 @@ import os
 import pwd
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 AUDIT = "fleet-consistency-drift"
@@ -55,6 +56,12 @@ MANUAL_KIND = "manual"
 # The manifest the plant's run passed to `finish`, beside the path the SOP's
 # command writes to, so the agent's own collector output is never mistaken for it.
 PLANTED_MANIFEST_SUFFIX = ".planted"
+# Where the plant records the envelope its `finish` stored (its repository and
+# `finished_at`), so the teardown removes that envelope and nothing else. The
+# mark alone cannot name it: `finish` keeps the previous run's wording for a
+# finding whose evidence and severity did not change, so on a stream that
+# already carries the findings the stored document shows no mark.
+PLANT_STATE_NAME = ".bench-unchanged-manifest-digest-plant.json"
 DIGEST_RECORD_TEMPLATE = "last_scheduled_digest_{audit_id}.json"
 MIN_ARGC = 4
 ROOT_UID = 0
@@ -164,7 +171,23 @@ def digest_record_path(audit_report) -> Path:
     return Path(audit_report.SCRATCH_DIR) / DIGEST_RECORD_TEMPLATE.format(audit_id=AUDIT)
 
 
+def plant_state_path(audit_report) -> Path:
+    return Path(audit_report.SCRATCH_DIR) / PLANT_STATE_NAME
+
+
+def stored_envelope(audit_report) -> tuple[dict | None, str]:
+    """The newest envelope of the ledger this install publishes the stream to, and its repository."""
+    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+    latest = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
+    try:
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, repo
+    return (envelope if isinstance(envelope, dict) else None), repo
+
+
 def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> int:
+    started = datetime.now(timezone.utc)
     code, line = run_cli(audit_report, ["start", "--audit", AUDIT])
     if code != 0:
         print(f"start exited {code}; a {AUDIT} run may be in flight. Nothing planted.", file=sys.stderr)
@@ -200,19 +223,21 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
         payload = json.loads(line.strip().splitlines()[-1])
     except (ValueError, IndexError):
         payload = {}
-    repo = str(payload.get("repo") or "")
-    stored_marked = any(
-        mark in path.read_text(encoding="utf-8")
-        for path in _store_files(audit_report)
-    )
-    if not stored_marked:
+    envelope, repo = stored_envelope(audit_report)
+    finished_at = str((envelope or {}).get("finished_at") or "")
+    try:
+        finished = datetime.fromisoformat(finished_at)
+    except ValueError:
+        finished = None
+    if envelope is None or not envelope.get("scheduled") or finished is None or finished < started:
         teardown(audit_report, mark)
-        print("the report store does not hold the planted run.", file=sys.stderr)
+        print(f"the report store of {repo} does not hold this scheduled run (newest: {finished_at or 'none'}).", file=sys.stderr)
         return 1
+    plant_state_path(audit_report).write_text(json.dumps({"repo": repo, "finished_at": finished_at}), encoding="utf-8")
     recorded = digest_record_path(audit_report).is_file()
     print(
         f"planted a scheduled {AUDIT} run: {len(document['findings'])} finding(s), status {payload.get('status')}, "
-        f"silent_ok {payload.get('silent_ok')}{', repo ' + repo if repo else ''}; "
+        f"silent_ok {payload.get('silent_ok')}, repo {repo}, finished_at {finished_at}; "
         f"manifest digest {'recorded' if recorded else 'not recorded (this image ships no precheck)'}."
     )
     return 0
@@ -228,16 +253,29 @@ def _store_files(audit_report) -> list[Path]:
 
 
 def teardown(audit_report, mark: str) -> int:
+    """Remove the planted run: the envelope the state names, any envelope with the mark, and the scratch files."""
+    try:
+        state = json.loads(plant_state_path(audit_report).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    planted_finished_at = str(state.get("finished_at") or "")
     removed = 0
     for path in _store_files(audit_report):
         try:
-            if mark in path.read_text(encoding="utf-8"):
-                path.unlink()
-                removed += 1
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue
+        planted = mark in text
+        if not planted and planted_finished_at:
+            try:
+                planted = json.loads(text).get("finished_at") == planted_finished_at
+            except ValueError:
+                planted = False
+        if planted:
+            path.unlink()
+            removed += 1
     extra = 0
-    for path in (digest_record_path(audit_report), planted_manifest_path(audit_report)):
+    for path in (digest_record_path(audit_report), planted_manifest_path(audit_report), plant_state_path(audit_report)):
         try:
             path.unlink()
             extra += 1
