@@ -75,8 +75,11 @@ const (
 	// DefaultDroppedTerminalGiveUp is how long a failed task's terminal is
 	// retried once its profile is gone from the install config. Its publish
 	// grant goes with the profile at the next reconnect, so past this the
-	// task is settled without one rather than hold its slot for good.
-	DefaultDroppedTerminalGiveUp = 2 * time.Minute
+	// task is settled without one, and the terminal is lost, rather than
+	// hold its slot for good. It is well past the regrant cooldown and an
+	// operator reconcile, so a profile that drops out of the config briefly
+	// (its identity not rendered for a moment) is back before it fires.
+	DefaultDroppedTerminalGiveUp = 15 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
 	// DefaultStream is the stream the durables are on: profile submissions

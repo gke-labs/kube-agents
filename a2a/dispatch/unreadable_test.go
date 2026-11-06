@@ -29,6 +29,7 @@ func TestAnUnreadableRecordDecodesAsStartedAtItsWrite(t *testing.T) {
 		"empty object":   "{}",
 		"no times":       `{"taskId":"task-1","pod":"tse-0","kind":"top"}`,
 		"another schema": `{"v":2,"holder":"tse-0"}`,
+		"no expiry":      `{"taskId":"task-1","pod":"tse-0","renewedAt":"2026-11-06T11:00:00Z"}`,
 	} {
 		rec, readable := d.decodeLease(key, []byte(value), written)
 		if readable {
@@ -174,7 +175,9 @@ func TestADroppedProfilesTerminalIsGivenUpOnAfterABound(t *testing.T) {
 	var g grantSwitch
 	g.set("disp-old") // may not publish on tse2's .supervisor
 	cfg := testConfig()
-	cfg.DroppedTerminalGiveUp = time.Second
+	// Above one attempt (each bounded by kvOpTimeout), so a give-up at the
+	// first refusal would come in under it and be caught.
+	cfg.DroppedTerminalGiveUp = kvOpTimeout + 2*time.Second
 	h := &holding{profile: "tse2", tier: "read", kind: lib.SubmitKindTop, taskID: "task-1"}
 	del := &envDelivery{env: submissionEnv(t, "tse2", "task-1", "", map[string]string{})}
 

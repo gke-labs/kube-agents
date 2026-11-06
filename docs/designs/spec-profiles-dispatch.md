@@ -413,8 +413,9 @@ leave open:
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds. A terminal is retried
   until it lands, except for a profile that has left the install config: its `.supervisor`
-  grant goes at the next reconnect, so after `DroppedTerminalGiveUp` (two minutes) the task is
-  settled without one and the miss logged as an error.
+  grant goes at the next reconnect, so after `DroppedTerminalGiveUp` (fifteen minutes, well past
+  a brief drop from the config) the task is settled without one: its slot is freed, the
+  terminal is lost, and the loss is logged as an error (#5074).
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. While it is open, for
   `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a

@@ -176,6 +176,9 @@ type Dispatcher struct {
 	verifier Verifier
 	log      *slog.Logger
 	now      func() time.Time
+	// onSend, set (tests only), sees each dispatch message just before it is
+	// published, in the order the dispatcher sends them.
+	onSend func(subject string, msg lib.DispatchMessage)
 	// mint signs one task credential with the task-signing key, and
 	// taskKeys is that key's public half, which the dispatcher reads back
 	// each credential it mints with. mint is nil with no key: confirms then
@@ -1909,19 +1912,17 @@ func answerSubject(subject, class string) (profile, tier, pod string, ok bool) {
 	return t[2], t[3], t[4], true
 }
 
-// keyPod is the pod token of a lease key, <profile>.<tier>.<pod>.<task>:
-// the key, which only the dispatcher writes, is the pod's identity, not
-// the record's Pod field.
 // decodeLease is how every reader sees a PROFILE_LEASES value. A record
-// that doesn't decode, or decodes with neither a renewal nor a finish (not
-// this dispatcher's shape), has one meaning everywhere: a started task that
-// is not over, whose last sign of life is the entry's own write. So it has
-// the times a record written then would have: confirmed and renewed at
+// that doesn't decode, or decodes as neither a tombstone nor a running
+// record with a renewal and an expiry (not this dispatcher's shape), has
+// one meaning everywhere: a started task that is not over, whose last sign
+// of life is the entry's own write. So it has the times a record written
+// then would have: confirmed and renewed at
 // written, expiring a configured lease later, with no offer terms. readable
 // is false for it, for the logs. Corruption and an incompatible change to
 // lib.LeaseRecord are the only ways to reach it.
 func (d *Dispatcher) decodeLease(key string, value []byte, written time.Time) (rec lib.LeaseRecord, readable bool) {
-	if json.Unmarshal(value, &rec) == nil && (rec.Finished() || !rec.RenewedAt.IsZero()) {
+	if json.Unmarshal(value, &rec) == nil && (rec.Finished() || !rec.RenewedAt.IsZero() && !rec.ExpiresAt.IsZero()) {
 		return rec, true
 	}
 	lease := seconds(d.src.Config().LeaseSeconds)
@@ -1929,6 +1930,7 @@ func (d *Dispatcher) decodeLease(key string, value []byte, written time.Time) (r
 		ConfirmedAt: written, RenewedAt: written, ExpiresAt: written.Add(lease)}, false
 }
 
+// keyTask is the task token of a lease key, <profile>.<tier>.<pod>.<task>.
 func keyTask(key string) string {
 	t := strings.Split(key, ".")
 	if len(t) != strings.Count(lib.ProfileLeaseKey("p", "t", "x", "k"), ".")+1 {
@@ -1937,6 +1939,9 @@ func keyTask(key string) string {
 	return t[3]
 }
 
+// keyPod is the pod token of a lease key, <profile>.<tier>.<pod>.<task>:
+// the key, which only the dispatcher writes, is the pod's identity, not
+// the record's Pod field.
 func keyPod(key string) string {
 	t := strings.Split(key, ".")
 	if len(t) != strings.Count(lib.ProfileLeaseKey("p", "t", "x", "k"), ".")+1 {
@@ -1956,6 +1961,9 @@ func (d *Dispatcher) send(subject string, msg lib.DispatchMessage) error {
 	nc := d.bus.Conn()
 	if nc == nil {
 		return errors.New("not connected")
+	}
+	if d.onSend != nil {
+		d.onSend(subject, msg)
 	}
 	return nc.Publish(subject, data)
 }

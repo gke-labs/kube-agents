@@ -109,16 +109,6 @@ type bus struct {
 
 	mu        sync.Mutex
 	terminals map[string][]terminalSeen
-	// received is every dispatch message any fake worker got, as
-	// "<pod> <type> <task>", in the order they arrived.
-	received []string
-}
-
-// receivedOrder is the dispatch messages the fake workers got, in order.
-func (b *bus) receivedOrder() []string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return append([]string(nil), b.received...)
 }
 
 type terminalSeen struct {
@@ -582,9 +572,6 @@ func (w *fakeWorker) onMessage(msg *nats.Msg) {
 		w.t.Errorf("worker %s: dispatch message fails Validate: %v", w.pod, err)
 		return
 	}
-	w.b.mu.Lock()
-	w.b.received = append(w.b.received, w.pod+" "+string(m.Type)+" "+m.TaskID)
-	w.b.mu.Unlock()
 	w.mu.Lock()
 	switch m.Type {
 	case lib.DispatchAbandon:
