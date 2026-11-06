@@ -105,7 +105,6 @@ NEGATED = (
     "no public issue was opened.",
     "no new issue was created.",
     "no report was filed; the block is above.",
-    "nothing was filed. not a report is filed from this card.",
 )
 
 
