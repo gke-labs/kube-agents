@@ -1,6 +1,6 @@
 # Shadow-mode replay proxy
 
-The shadow-mode replay proxy is an eval fixture. It sits in front of LiteLLM on an eval install and records, for every model request, what an inference replay cache would have keyed on. It never serves a saved answer: every request goes to LiteLLM and every response comes back unchanged. It is part of stage 1 of the rollout in [`examples/inference-replay/eval-design.md`](../../examples/inference-replay/eval-design.md), which owns the normalization rules, the cache key and the reasons behind them: the proxy, the fingerprint log, the scrubbed request store and the hit-rate script. The join with run verdicts and the collision report are not built yet. An install never uses it, and nothing deploys it yet.
+The shadow-mode replay proxy is an eval fixture. It sits in front of LiteLLM on an eval install and records, for every model request, what an inference replay cache would have keyed on. It never serves a saved answer: every request goes to LiteLLM and every response comes back unchanged. It is part of stage 1 of the rollout in [`examples/inference-replay/eval-design.md`](../../examples/inference-replay/eval-design.md), which owns the normalization rules, the cache key and the reasons behind them: the proxy, the fingerprint log, the scrubbed request store and the hit-rate script. The join with run verdicts and the collision report are not built yet. An install never uses it; eval runs deploy it by default (see [In CI](#in-ci)).
 
 ## What it does
 
@@ -34,9 +34,44 @@ Check the report's health counts after the first day: lines by job kind; untagge
 | `REPLAY_JOB_PR`                   | empty                                 | The pull request number, stamped on every line          |
 | `REPLAY_JOB_PROJECT`              | empty                                 | The eval project, stamped on every line                 |
 | `REPLAY_JOB_BUILD`                | empty                                 | The Prow build ID, stamped on every line                |
+| `REPLAY_LOG_DIR`                  | empty                                 | Also write every line to segment files here             |
+| `REPLAY_LOG_SEGMENT_SECONDS`      | `60`                                  | Close a segment this long after its first line          |
+| `REPLAY_DATA_MAX_BYTES`           | `0` (no limit)                        | Stop the store and the segments at this many bytes      |
+
+With `REPLAY_LOG_DIR` set, `spool.py` appends each line to `<pod>-<start ms>-<seq>.jsonl.open` and renames it to `.jsonl` once it is 8 MiB or `REPLAY_LOG_SEGMENT_SECONDS` old, so a closed segment never changes. At start it closes the segments a previous run of the container left open, cut to their last whole line. On TERM or INT the proxy stops serving, spends at most 10 seconds logging what is queued, and closes the open segment before it exits. stdout still gets every line. With `REPLAY_DATA_MAX_BYTES` set, the store and the segments stop writing once the files under `REPLAY_STORE_DIR` and `REPLAY_LOG_DIR` hold that many bytes, and start again when the collector has emptied files; the line still goes to stdout and the store reports `budget_spent`.
 
 The image is built from the repository root (`docker build -f hack/replay-proxy/Dockerfile .`), because it copies the scrubbers from `agents/`.
 
+## In CI
+
+Every Prow presubmit and nightly eval puts the proxy in front of LiteLLM, unless the job sets `EVAL_REPLAY_SHADOW=false`. `hack/ci-deploy.sh` builds the image from this directory's `Dockerfile` (the `replay-shadow-proxy` step of `deploy/docker/cloudbuild-ci.yaml`) and installs it through the chart's `litellm.replayShadow` values: two proxy pods take the `inference-gateway` Service, and LiteLLM moves behind `inference-gateway-upstream`. Both carry `app: litellm`, the label the worker pods' egress policies admit, and differ by `kubeagents.x-k8s.io/inference-role` (`replay-shadow` or `litellm`). The comments on `litellm.replayShadow` in `charts/kube-agents/values.yaml` cover the rest. `hack/ci-eval-pr.sh`, which runs the presubmits and the nightlies, starts `collect_shadow.py` once it knows the host cluster and stops it from its EXIT trap. The collector copies closed segments and stored requests out of the proxy pods every 30 seconds, uploads them, then empties each uploaded file in the pod. At the end it makes one last pass, bounded to 60 seconds, that also takes the open segments. It prints counts and error classes to the `replay-shadow-collector.log` artifact and never fails the eval; the EXIT trap waits at most 75 seconds for its last pass, which runs while the trap's other captures do. The image has no `images.json` entry: each run builds it into its own project's registry and nothing publishes it, so there is nothing for `make mirror-images` to copy; `hack/check-image-inventory.sh` holds its Python base to the inventory.
+
+It uploads to `kube-agents-replay-shadow` (`EVAL_REPLAY_SHADOW_BUCKET` points it elsewhere, no `gs://`); the runners' grants on that bucket are in [`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md). It needs the `JOB_TYPE`, `BUILD_ID` and, on a presubmit, `PULL_NUMBER` that Prow sets. A presubmit is filed as `presubmit`; a periodic or postsubmit as `nightly`. A run it can't serve goes without it, with a one-line note: a batch run, a release-candidate run (`RC_COMMIT_SHA`, which builds no images), a run outside Prow, or a Prow job missing one of those tags. Setting `EVAL_REPLAY_SHADOW=true` makes each of those an error instead. Outside Prow, set `EVAL_REPLAY_SHADOW_JOB_KIND` to `presubmit` or `nightly`, plus `BUILD_ID` and, for a presubmit, `PULL_NUMBER`.
+
+Each run writes under `gs://<bucket>/replay-shadow/<nightly|presubmit>/<YYYY-MM-DD>/<BUILD_ID>/`, the date being the collector's start in UTC: `logs/*.jsonl` (the lines), `store/requests/*.json` and `store/blobs/*.json` (the scrubbed text), and `job-<ms>.json` (kind, project, build and pull request, written even when the run logged nothing). Every name is written once, so a merged copy of many runs loses nothing:
+
+```bash
+mkdir -p week/logs week/nightly week/presubmit
+for kind in nightly presubmit; do
+  for day in 2026-11-01 2026-11-02 2026-11-03 2026-11-04 2026-11-05 2026-11-06 2026-11-07; do
+    gcloud storage cp -r "gs://<bucket>/replay-shadow/${kind}/${day}" "week/${kind}" || true
+  done
+done
+find week/nightly week/presubmit -path '*/logs/*.jsonl' -exec cat {} + > week/logs/all.jsonl
+for sub in requests blobs; do
+  mkdir -p "week/store/${sub}"
+  find week/nightly week/presubmit -path "*/store/${sub}/*.json" -exec cp -n {} "week/store/${sub}/" \;
+done
+python3 hack/replay-proxy/analyze_shadow.py week/logs/all.jsonl
+```
+
+`analyze_shadow.py` reads the lines only; a miss's stored text is `week/store/requests/<request_id>.json`, whose entries name files in `week/store/blobs/`.
+
+Limitations, while the bucket and its grants are still to be made:
+
+- presubmit and nightly write under separate top-level prefixes, so an IAM condition on the object name can confine each job's identity to its own (create and view, never delete). Within the presubmit prefix one pull request's run could still write under another's build;
+- the image is built from the commit under test, not from `PULL_BASE_SHA` as the design's replay stage requires ("The proxy can't come from the pull request"). Shadow mode changes no verdict, but a pull request can change what its own run records.
+
 ## Tests
 
-The tests are standard-library `unittest` and need no cluster: `make test-python` runs them, or run them from this directory with `python3 -m unittest`. `test_replay_proxy.py` runs the proxy against a fake LiteLLM on localhost.
+The tests are standard-library `unittest` and need no cluster: `make test-python` runs them, or run them from this directory with `python3 -m unittest`. `test_replay_proxy.py` runs the proxy against a fake LiteLLM on localhost; `test_collect_shadow.py` runs the collector against a fake cluster and bucket, and as a process with fake `kubectl` and `gcloud`.

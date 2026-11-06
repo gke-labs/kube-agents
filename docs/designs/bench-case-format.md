@@ -375,7 +375,11 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+grade an edit to them by its effect. With `target: gateway` it execs into the agent container
+instead and diffs each skill directory the image's platform template ships (and its A2A
+overlay: every one when the profile carries the overlay's manifest, else each one the profile
+holds a name for) against the gateway's platform profile copy, the one `skill_manage` writes; entries beside them that no template ships (Hermes' own files, a skill
+authored under a new name) are reported, not failed, and no lane sets either target aside. A stack that runs Python in the sandbox does it as
 root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
 no `__pycache__` in the reference tree for this check to read as an edit. The check
 still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the

@@ -609,9 +609,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the paragraphs the onboarding report
     # opens with, and the verdicts it must not write.
     "bootstrap_report_posture": ("posture",),
-    # This repository, sandbox-reading. No field, like pull_request_opened:
-    # the diff against the image is the assertion. It reads the agent's own
-    # shell sandbox pod, not a seeded-fleet fixture, so it is not in
+    # This repository, sandbox- or agent-pod-reading. No field, like
+    # pull_request_opened: the diff against the image is the assertion, and
+    # `target` only picks which pod's copy is read. It reads the agent's own
+    # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run

@@ -70,7 +70,9 @@ a reap/resume cycle, which is the normal lifecycle, not an edge case. Per-space 
 mix unrelated conversations into one context and make the room the unit of history,
 which nobody wants from a busy channel.
 
-Session state lives in a NATS KV bucket, keyed by session key: `contextId`, current pod
+Session state lives in a NATS KV bucket, keyed by session key (the bucket also holds the
+gateway's kept refused home posts under `refused.<backend>.`, bounded in count and age,
+"Proactive posts" below): `contextId`, current pod
 name, bus session name, last-activity timestamp, roster, the task history with each
 task's own addressee (session addressees rotate per incarnation, so a straggler's
 replay must use the addressee its subjects carried, not the record's current one), and
@@ -1526,7 +1528,24 @@ under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
 prints) and `thread_id`, the thread it landed in, or an `error` naming why nothing was
-posted. The answer goes out once the first part has landed; a long text is chunked, and
+posted. A home request on a gateway that has no home channel is refused that way and kept
+(`a2a/gateway/notify_refused.go`): the text goes into the session-state bucket under the
+gateway's `refused.<backend>.` keys, at most fifty per backend, each pruned past thirty days
+at the next refusal, with a meta entry counting the refusals since the last digest and their
+last five subjects. When a home channel arrives, the gateway posts one digest into it (the
+count, the span, the last subjects, how many of those texts it still holds) and takes what it
+named off the count; the texts stay until pruned. The arrival is seen where the home channel is
+read: at a start that has one (the CR's, or on Slack the projected file's), or at the first
+home request that finds the projected file naming one (Slack, with the learn armed). The
+requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
+the relay records its own undelivered line as before, and the alert path records the alert as
+kept. For the posts to reach the route at all the agent has to be
+routed with no home channel: the operator names the route (`A2A_NOTIFY_PLATFORM`, below)
+whenever the gateway's backend is the install's only chat platform, home channel or not
+(`a2aGchatHomeRouted`, `a2aSlackHomeRouted`); on a Chat-and-Slack install with no Chat home
+the agent stays unrouted and posts to Slack through its Hermes platform, as before. The
+`HomeChannelUnset` condition says which of the two holds. The gateway writes nothing to the
+home-channel record, and the operator does not yet read the count. The answer goes out once the first part has landed; a long text is chunked, and
 the rest follows into the same thread. A request the gateway took and did not answer in
 time may still post, so `a2a notify` exits with its own status then, and the alert path
 treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
@@ -1534,9 +1553,14 @@ a request that fails or is refused after it has nobody to tell and is already re
 possibly posted, so the gateway logs it as lost, at error, with its first line. When the
 route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
 a third status, nothing posted; the alert path, which has one shot, waits through about
-half a minute of those before giving up. The agent-side callers
+half a minute of those before giving up. A home post the gateway refused and kept answers
+with `kept` beside the error, and `a2a notify` exits with a fourth status for it: the
+senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
+it as handled, so the keep holds one copy, and the alert path records the alert as kept
+rather than lost. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
-renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
+renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
+Slack not enabled (`a2aGchatHomeRouted`), and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
@@ -1589,8 +1613,10 @@ arrive.
 
 Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
 gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
-`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel);
-`A2A_NOTIFY_PLATFORM` is then `slack`. Conversation posts are armed whenever the gateway holds
+`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel). The agent
+is routed to the subject (`A2A_NOTIFY_PLATFORM` is `slack`) with that id, and with the field
+unset (`a2aSlackHomeRouted`: Slack is then the only chat platform, and the gateway keeps what it
+refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
 route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most

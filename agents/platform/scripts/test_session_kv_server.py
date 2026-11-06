@@ -2686,6 +2686,124 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
 
+    # What each forge the broker serves (providers/registry.py AVAILABLE)
+    # answers `proposal-create` with (providers/*/translate.py and the provider
+    # tests' fixtures): the forge, its configured host, the url, the repository
+    # the fold asks the forge about, and the number.
+    FORGE_PROPOSAL_URLS = (
+        ("github", "github.com", "https://github.com/acme/fleet/pull/7", "https://github.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/sub/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/sub/fleet",
+            7,
+            "group/sub/fleet",
+        ),
+        # A subgroup named like a marker before a numeric subgroup is still the
+        # repository: the last marker before the number is the merge request.
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/pulls/2024/fleet",
+            7,
+            "group/pulls/2024/fleet",
+        ),
+        ("gitea", "gitea.example.com", "https://gitea.example.com/acme/fleet/pulls/7", "https://gitea.example.com/acme/fleet", 7, "acme/fleet"),
+        # An in-cluster Gitea serves http on a .svc host (docs/site install/gitea.md).
+        (
+            "gitea",
+            "gitea-http.gitea.svc.cluster.local",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/7",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet",
+            7,
+            "demo/fleet",
+        ),
+        (
+            "bitbucket",
+            "bitbucket.org",
+            "https://bitbucket.org/acme/fleet/pull-requests/7/_/diff#comment-42",
+            "https://bitbucket.org/acme/fleet",
+            7,
+            "acme/fleet",
+        ),
+        (
+            "bitbucket-datacenter",
+            "bitbucket.example.com",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/7/overview",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet",
+            7,
+            "ACME/fleet",
+        ),
+    )
+    #: What a forge entry needs beyond provider and host; the in-cluster Gitea
+    #: declares its scheme and port.
+    FORGE_ENTRY_EXTRAS = {"gitea-http.gitea.svc.cluster.local": {"scheme": "http", "port": 3000}}
+
+    def test_the_forge_is_asked_about_a_pull_request_on_every_forge_the_broker_serves(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            for _provider, _host, url, repository, number, _path in self.FORGE_PROPOSAL_URLS:
+                with self.subTest(url=url):
+                    forge.call.reset_mock()
+                    self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+                    forge.call.assert_called_once_with(
+                        "proposal-view", {"number": number}, repository, retry_transient=True
+                    )
+
+    def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
+        import providers
+        from providers import registry as registry_module
+
+        forges = [{"provider": "github", "host": "github.com"}] + [
+            {"provider": provider, "host": host, "tokenPath": "/nonexistent/token", "allowedPaths": [], **self.FORGE_ENTRY_EXTRAS.get(host, {})}
+            for provider, host in sorted({(provider, host) for provider, host, *_rest in self.FORGE_PROPOSAL_URLS})
+            if provider != "github"
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "forges.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"forges": forges}, handle)
+        registry = providers.Registry({"forges": registry_module.load_forge_entries(path)})
+        self.assertEqual(
+            {cls.name for cls in providers.AVAILABLE},
+            {provider for provider, *_rest in self.FORGE_PROPOSAL_URLS},
+            "a forge the broker serves has no url shape here",
+        )
+        for provider, _host, url, repository, _number, repo_path in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(url=url):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), repository)
+                resolved, repo = registry.resolve(match.group(1))
+                self.assertEqual(resolved.name, provider)
+                self.assertEqual(repo, repo_path)
+
+    def test_an_incidents_fix_pull_request_is_found_on_every_forge_and_an_issue_is_not(self):
+        issue = "https://gitea.example.com/acme/fleet/issues/7"
+        cards = [(f"t-{i}", f"sess-{i}", row[2]) for i, row in enumerate(self.FORGE_PROPOSAL_URLS)]
+        self._board(cards=cards + [("t-issue", "sess-issue", issue)])
+        for i, row in enumerate(self.FORGE_PROPOSAL_URLS):
+            with self.subTest(url=row[2]):
+                self.assertEqual(session_kv_server._incident_pull_request_urls(f"sess-{i}"), [row[2]])
+        self.assertEqual(session_kv_server._incident_pull_request_urls("sess-issue"), [])
+        for not_a_proposal in (
+            issue,
+            "https://bitbucket.org/acme/fleet/issues/7",
+            "https://github.com/acme/fleet/commit/7",
+            # A listing, a marker with no number, and a number only in the query.
+            "https://gitea.example.com/acme/fleet/pulls",
+            "https://bitbucket.org/acme/fleet/pull-requests/",
+            "https://gitea.example.com/acme/fleet/pulls?state=open&id=7",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=not_a_proposal):
+                self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
+
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
         forge = MagicMock()
@@ -12853,6 +12971,34 @@ def closing_state(path):
     conn = sqlite3.connect(path, isolation_level=None)
     return closing(conn)
 
+
+class TestKeptRefusals(unittest.TestCase):
+    """`a2a notify` exit 5: the gateway kept a home post for its digest. The
+    re-senders treat it as handled, so the keep is not filled with retries."""
+
+    def test_drift_backlog_digest_kept_by_the_gateway_counts_as_sent(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", side_effect=exc), \
+                patch.object(session_kv_server.chat_notify, "routes", return_value=True):
+            self.assertTrue(session_kv_server._send_drift_backlog_digest("slack", "Drift backlog: 3 changes"))
+
+    def test_initial_alert_kept_by_the_gateway_returns_the_kept_marker(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server, "_run_alert_send", side_effect=exc):
+            self.assertEqual(session_kv_server._post_initial_alert("slack", "an alert"), session_kv_server.ALERT_KEPT_FOR_DIGEST)
+
+    def test_report_card_kept_by_the_gateway_posts_no_text(self):
+        res = MagicMock(returncode=chat_notify.NOTIFY_KEPT, stdout="", stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", return_value=res), \
+                patch.object(session_kv_server.chat_notify, "chat_command", return_value=["a2a"]):
+            posted = session_kv_server._post_audit_chat_via_gateway("slack", "platform", "audit", {"kind": "card"}, "text", "", 30)
+        self.assertIs(posted, session_kv_server.AUDIT_POST_KEPT)
+
+    def test_data_volume_warning_kept_by_the_gateway_stops_retrying(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
+                patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
+            self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
 
 
 if __name__ == "__main__":

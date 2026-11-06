@@ -174,6 +174,17 @@ true
 {{- end }}
 
 {{/*
+Whether the web console's PlatformAgent policy renders: the admissionPolicy values
+gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
+CR render (webConsole.enabled and webConsole.environment.enabled).
+*/}}
+{{- define "kube-agents.webConsoleCRPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) .Values.webConsole.enabled .Values.webConsole.environment.enabled -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else
@@ -1160,6 +1171,19 @@ topologySpreadConstraints:
       matchLabels:
         {{- .selectorLabels | nindent 8 }}
 {{- end }}
+{{- end }}
+
+{{/*
+The shadow-mode replay proxy's pod labels (litellm.replayShadow,
+templates/litellm.yaml), and so its Deployment's selector, the
+inference-gateway Service's selector while the proxy is on, and its egress
+policy's podSelector. app: litellm because the worker pods' egress policies
+admit only that label; the role tells the proxy from the LiteLLM pods, which
+carry kubeagents.x-k8s.io/inference-role: litellm while the proxy is on.
+*/}}
+{{- define "kube-agents.replayShadowSelectorLabels" -}}
+app: litellm
+kubeagents.x-k8s.io/inference-role: replay-shadow
 {{- end }}
 
 {{- /*
@@ -2490,6 +2514,12 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end -}}
 {{- if .Values.litellm.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
+       beside LiteLLM and only with it. */ -}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
+{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
 {{- end -}}
 {{- if include "kube-agents.hindsightEnabled" . -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
