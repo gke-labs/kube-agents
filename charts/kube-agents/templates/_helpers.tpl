@@ -174,6 +174,25 @@ true
 {{- end }}
 
 {{/*
+The operator flags the chart sets from first-class values, as a YAML env list (empty when
+none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
+preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
+operator.extraEnv already names is left out: extraEnv wins either way, and leaving it out
+keeps the container's env free of a duplicate name. `| default dict` because
+`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer.
+*/}}
+{{- define "kube-agents.operatorFlagEnv" -}}
+{{- $named := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $_ := set $named (toString (index ($e | default dict) "name")) true -}}
+{{- end -}}
+{{- if and (.Values.operator.mcpServer | default dict).enabled (not (hasKey $named "A2A_MCP_DOOR")) -}}
+- name: A2A_MCP_DOOR
+  value: "true"
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the web console's PlatformAgent policy renders: the admissionPolicy values
 gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
 CR render (webConsole.enabled and webConsole.environment.enabled).
@@ -3179,8 +3198,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
          #3869; the profile dispatcher, #4808). The operator renders each only while
-         operator.extraEnv sets its flag, so no golden renders it and footprint.yaml has no
-         entry for it. An entry's flag is read as the operator reads it, the last setting
+         its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
+         renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
          A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
          a $(VAR) reference the kubelet expands -- counts as on; none, null or another literal
@@ -3199,9 +3218,16 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $flagged := index $flaggedFile "pods" -}}
+    {{- /* The flags first-class values set (operator.mcpServer.enabled), then extraEnv: the
+           order operator-deployment.yaml renders them in, so the last setting wins here too. */ -}}
+    {{- $flagEnv := list -}}
+    {{- with (include "kube-agents.operatorFlagEnv" .) -}}
+      {{- $flagEnv = fromYamlArray . -}}
+    {{- end -}}
+    {{- $operatorEnv := concat $flagEnv (.Values.operator.extraEnv | default list) -}}
     {{- range $w := $flagged -}}
       {{- $on := false -}}
-      {{- range $e := ($.Values.operator.extraEnv | default list) -}}
+      {{- range $e := $operatorEnv -}}
         {{- if eq (toString (index ($e | default dict) "name")) $w.env -}}
           {{- $v := index $e "value" -}}
           {{- $literal := ternary (eq (toString $v) "true") (ne (trim (toString $v)) "") (eq (toString $w.enabledWhen) "true") -}}

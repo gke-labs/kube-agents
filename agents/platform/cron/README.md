@@ -636,7 +636,8 @@ crossing and a daily repeat would be noise, and because it would turn a
 stuck-cards report into text without its buttons. A board that cannot be read
 for "database or disk is full" while the volume is past the line, or for "disk
 I/O error" with no space left at all, is said as a full disk, with the line,
-not as a bare read error.
+not as a bare read error. Any other read error keeps the bare line, and the
+volume line follows it while the volume is past the warn line.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
