@@ -235,6 +235,11 @@ const (
 	shellSandboxCPULimit      = "2"
 	shellSandboxMemoryLimit   = "2Gi"
 
+	// The shell container's name, which the sizing step-up check reads the
+	// StatefulSet's template by (sizing_profile.go) and the eval harness execs
+	// into (hack/, pinned by scripts/test_ci_eval_inflight_note.py).
+	shellSandboxContainerName = "shell"
+
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.

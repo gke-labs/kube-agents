@@ -129,10 +129,9 @@ const (
 	// workload (a Deployment, or a StatefulSet under useStatefulSet) named
 	// with this suffix carries the agent-api-auth sidecar, the credential
 	// proxy Deployment (credentialProxyName) the broker, and the shell
-	// StatefulSet (shellSandboxName) the shell container, which
-	// shell_sandbox_manifests.go renders under this name.
+	// StatefulSet (shellSandboxName) the shell container
+	// (shellSandboxContainerName).
 	gatewayWorkloadNameSuffix = "-gateway"
-	shellSandboxContainerName = "shell"
 )
 
 // sizingSettledRequests and sizingSettledLimits are the resource names the
