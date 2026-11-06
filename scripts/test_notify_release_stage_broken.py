@@ -1076,7 +1076,7 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(len(comment.splitlines()), 1)
         self.assertTrue(comment.startswith("RED again: "), comment)
         self.assertTrue(comment.endswith("The RC eval has now returned RED 3 nights in a row."), comment)
-        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)}) ({CELL_1104})", comment)
+        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)}): {CELL_1104}", comment)
         patch = github.writes[1][2]
         self.assertEqual(patch["title"], STALL_TITLE_3)
         self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", patch["body"])
@@ -1340,19 +1340,30 @@ class StalledChainTest(unittest.TestCase):
         self.assertIn("| --- | --- | --- | --- | --- |", patch["body"])
         self.assertNotIn("\n| --- | --- | --- | --- |\n", patch["body"])
 
-    def test_a_case_name_with_a_pipe_or_a_line_break_cannot_split_the_row(self):
-        odd = [{"case": "bad|name\nhere", "domain": "d", "rung": 4, "rung_name": "COLLAPSE"}]
+    def test_a_line_break_pipe_or_backtick_in_any_case_field_cannot_split_the_row_or_the_code_span(self):
+        """All three fields come from the step-5 log through the poller's
+        JSON; none of them may end the row, shift a column, or close the
+        code span early (an `@` after a stray backtick would render live)."""
+        odd = [{"case": "bad|name\nhere`@x", "domain": "d", "rung": "4\r\n5", "rung_name": "COLLAPSE\nx|y"}]
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=odd))
         self.assertEqual(reconcile(github)[0], "stall-opened")
-        rows = rows_of(github.writes[1][2]["body"])
+        body = github.writes[1][2]["body"]
+        rows = rows_of(body)
         self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[0].endswith("| `bad name here` (rung 4 COLLAPSE, (no owner)) |"), rows[0])
+        self.assertTrue(rows[0].endswith("| `bad\\|name here'@x` (rung 4 5 COLLAPSE x\\|y, (no owner)) |"), rows[0])
+        self.assertNotIn("\r", body)
+        # A rewrite on the next night still finds both rows under the rule.
+        self.assertEqual(notifier.stall_rows_in(body), rows)
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=odd), night(33, 3, SHA_33), open_stall=[dict(issue(4001, body), title=STALL_TITLE_2)])
+        self.assertEqual(reconcile(github)[0], "stall-updated")
+        self.assertEqual(github.writes[1][2]["title"], STALL_TITLE_3)
+        self.assertEqual(len(rows_of(github.writes[1][2]["body"])), 3)
 
     def test_the_poller_red_cases_line_format_is_what_the_notifier_parses(self):
         cases = {"cases": CASE_1104, "partial": False}
         line = poller.red_cases_line(cases)
         self.assertEqual(notifier.extract_red_cases(f"2026-11-04T07:48:03.1Z {line}\n"), cases)
-        with mock.patch("sys.stdout", new=io.StringIO()):
+        with mock.patch("sys.stdout", new=io.StringIO()), mock.patch("sys.stderr", new=io.StringIO()):
             self.assertIsNone(notifier.extract_red_cases("2026-11-04T07:48:03.1Z red_cases=not json\n"))
         self.assertIsNone(notifier.extract_red_cases("2026-11-04T07:48:03.1Z verdict=red settled=true build_id=1 u\n"))
 

@@ -360,10 +360,12 @@ STALL_CELL_SEPARATOR = "|"
 # A row written before the red-cases column existed has this many cells;
 # a rewrite pads it rather than leaving it short under the wider header.
 STALL_ROW_CELLS_WITHOUT_CASES = 4
-# A case name is log-derived text inside a table cell and a Chat line: a
-# pipe or a line break in it would split the row, so each becomes a space.
-_CELL_BREAKING_RE = re.compile(r"[|\r\n]+")
-CELL_BREAK_REPLACEMENT = " "
+# The case, rung and rung name are log-derived text inside a code span in a
+# table cell: a line break would end the row (and the rows below it would be
+# lost on the next rewrite), so each becomes a space; `_inline` then handles
+# the backtick and the pipe as it does for the stage issue's cells.
+_LINE_BREAK_RE = re.compile(r"[\r\n]+")
+LINE_BREAK_REPLACEMENT = " "
 # How much of a line that did not parse the warning quotes.
 CELL_PREVIEW_CHARS = 120
 # The red-cases cell: each blocking case the step-5 log named, with its rung
@@ -381,7 +383,7 @@ STALL_NO_BLOCKING_CASE = "(no blocking case in the roll-up)"
 STALL_CASES_PARTIAL = " (partial: the eval stopped before grading every case)"
 STALL_FOOTER = "A case's owner is its `owner:` in `bench/tasks/<case>/task.yaml`, else its domain's owner in `docs/designs/domains.yaml`. The release pipeline owner is listed in `docs/ownership.md`."
 STALL_COMMENT = "RED again: {runs}. The RC eval has now returned RED {n} nights in a row."
-STALL_COMMENT_RUN = "{run} ({cases})"
+STALL_COMMENT_RUN = "{run}: {cases}"
 STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
 CHAT_STALLED = STALL_TITLE + ". Red cases: {cases}. Tracking {url}"
 CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
@@ -802,9 +804,16 @@ def extract_red_cases(log_text: str) -> dict | None:
     return None
 
 
+def cell_text(value) -> str:
+    """One log-derived value for the red-cases cell: no line break, no
+    backtick, no bare pipe survives."""
+    return _inline(_LINE_BREAK_RE.sub(LINE_BREAK_REPLACEMENT, str(value if value is not None else ""))).strip()
+
+
 def owner_of_case(case: str) -> str | None:
-    """The case's effective owner from the checkout, or None. A lookup that
-    raises (a checkout without the bench tree, an unreadable file) is a
+    """The case's effective owner from the checkout, or None. A case or a
+    task.yaml that is absent is None without an error; a lookup that raises
+    (an unreadable `domains.yaml`, a permissions error on the tree) is a
     warning and no owner: naming the owner must never stop the issue."""
     try:
         return effective_owner_of_case(case)
@@ -820,11 +829,18 @@ def stall_cases_cell(cases: dict | None) -> str:
         return STALL_CASES_UNAVAILABLE
     parts = []
     for case in cases[RED_CASES_CASES_KEY]:
-        name = _CELL_BREAKING_RE.sub(CELL_BREAK_REPLACEMENT, str(case.get(RED_CASE_NAME_KEY) or "")).strip()
+        name = cell_text(case.get(RED_CASE_NAME_KEY))
         if not name:
             continue
         owner = owner_of_case(name)
-        parts.append(STALL_CASE.format(case=name, rung=case.get(RED_CASE_RUNG_KEY), rung_name=case.get(RED_CASE_RUNG_NAME_KEY), owner=STALL_CASE_OWNER.format(owner=owner) if owner else STALL_NO_OWNER))
+        parts.append(
+            STALL_CASE.format(
+                case=name,
+                rung=cell_text(case.get(RED_CASE_RUNG_KEY)),
+                rung_name=cell_text(case.get(RED_CASE_RUNG_NAME_KEY)),
+                owner=STALL_CASE_OWNER.format(owner=owner) if owner else STALL_NO_OWNER,
+            )
+        )
     text = STALL_CASES_SEPARATOR.join(parts) or STALL_NO_BLOCKING_CASE
     return text + STALL_CASES_PARTIAL if cases[RED_CASES_PARTIAL_KEY] else text
 
