@@ -1337,8 +1337,8 @@ class UnitTest(unittest.TestCase):
         # Since #2493 the placeholder carries a delegated child's line note;
         # a typed turn has none, so the live check sees the bare placeholder.
         # The placeholder is a message value since the Google Chat Stop button:
-        # posted with Stop while the task runs.
-        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: true}})', gateway)
+        # posted with Stop naming the task while it runs.
+        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: taskID}})', gateway)
         self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
         # Main moved the notice into a constant; pin the constant and its use.
         self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
