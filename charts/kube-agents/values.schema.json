@@ -1304,6 +1304,11 @@
                 }
               }
             },
+            "incidentWorkloadDedupSeconds": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 86400
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,

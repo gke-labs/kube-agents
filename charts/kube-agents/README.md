@@ -565,8 +565,14 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `values.yaml` describes
-each toggle. The
+model annotations, and applied PR annotations). `webConsole.resources` is
+sized to run under its requests, which is what GKE Autopilot without Pod
+bursting clamps the limits to; the console reads the memory limit the cluster
+admitted through the Downward API and sets its Go soft memory limit to nine
+tenths of it. For a busier console raise `webConsole.resources.requests.memory`
+under that clamp, where the request is the ceiling, and `limits.memory` where
+bursting is on and the limit is. `values.yaml`
+describes each toggle. The
 [Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
 is canonical for what it does and how it is reached.
 
@@ -858,12 +864,13 @@ is canonical for the behaviour.
 The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
 exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
 100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
-`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
-(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
-reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
-itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+`agent-api-auth` resource blocks, and one `platformAgent.deployment.env` entry
+(`KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its reason and what GKE Autopilot without
+bursting runs it at. The fold window is not in it: `incidentWorkloadDedupSeconds` already renders
+the hour, and an `env` entry for the name would override that key. It does not size the agent
+container itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
 sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
-operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads it;
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
 out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
@@ -985,6 +992,17 @@ An entry with the same name in `platformAgent.deployment.env` wins over the key,
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
 gives each setting's meaning and default.
+
+`platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
+later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
+in `spec.deployment.env`. It defaults to `3600`, so a default render carries that entry; `0` turns
+folding off, the most is `86400`, and `null` renders no entry and leaves the default the operator
+renders into the agent container, the same hour. The same precedence rules as the ceilings apply:
+an entry of that name in `platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails
+the render while the key is set. A re-tag to a chart that does not declare the key, after it was
+set, needs `upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#one-incident-per-workload)
+has the fold rules.
 
 #### PlatformAgent annotations
 
@@ -1385,9 +1403,11 @@ old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_val
 every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
 rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
 larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
-bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
-the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
-rendered manifest. A cluster with bursting admits the manifest as rendered.
+bursting sets the limits equal to the requests, so the manager runs under its memory request, 256Mi
+by default, and `operator.resources.requests.memory` is the value to raise there; where Autopilot
+also raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, the manager runs under 512Mi
+and the admitted pod differs from the rendered manifest. Either way the manager reads the admitted
+limit. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 

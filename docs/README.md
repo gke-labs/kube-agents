@@ -217,6 +217,7 @@ identifier appears, add its source here.
 | Identifier | Source of truth |
 | --- | --- |
 | Kubernetes service-account names | `scripts/installer/common.sh` |
+| The workload fold window's default and cap (`INCIDENT_WORKLOAD_DEDUP_SECONDS`, 3600 and 86400) and its precedence | `INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS` and `INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS` in `agents/platform/scripts/session_kv_server.py` (the daemon's fallback); `incidentWorkloadDedupDefaultSeconds` in `k8s-operator/internal/controller/platformagent_manifests.go` (rendered into the agent container, replaced by a CR `spec.deployment.env` entry through `mergeEnvVars`); `platformAgent.deployment.incidentWorkloadDedupSeconds` in `charts/kube-agents/values.yaml` (renders that entry); `tests/test_chart_incident_workload_dedup.py` holds the three equal |
 | Seeded-fleet reconcile report keys and outcomes, fixture-state role states, the delete/replace allowlist | `hack/fleet_reconcile.py` (`OUTCOMES`, `write_report`), `scripts/eval_dashboard/fixture_state.py` (`ROLE_STATES`), `bench/tf/fleet/reconcile-allow.json` |
 | GCP service-account names an install creates, release namespace, GKE CMEK key ring and key | `install.defaults.env` |
 | The `spec.deployment.env` names the operator forwards to the agent container, as literal values | `safeSandboxEnvOverrides` in `k8s-operator/internal/controller/platformagent_manifests.go` |
