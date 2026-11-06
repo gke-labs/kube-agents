@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -115,10 +117,69 @@ func sizedWorkloadsOn(agent *agentv1alpha1.PlatformAgent, tier sizingTier, autop
 	return []client.Object{proxy, gateway, shell}
 }
 
+// autopilotClamped rewrites the sized workloads' templates the way GKE
+// Autopilot without Pod bursting admits them, record included: the figures
+// clamped (clampedToRequests) and the autopilot.gke.io/resource-adjustment
+// annotation on each template with the containers as they came in and as
+// they left, in the shape Autopilot writes it. clampedToRequests alone is
+// the figures without the record.
+func autopilotClamped(objs []client.Object) []client.Object {
+	recordOf := func(containers []corev1.Container) []autopilotAdjustedContainer {
+		var entries []autopilotAdjustedContainer
+		for _, container := range containers {
+			entries = append(entries, autopilotAdjustedContainer{
+				Name:     container.Name,
+				Requests: container.Resources.DeepCopy().Requests,
+				Limits:   container.Resources.DeepCopy().Limits,
+			})
+		}
+		return entries
+	}
+	type recorded struct {
+		Input    autopilotAdjustmentSide `json:"input"`
+		Output   autopilotAdjustmentSide `json:"output"`
+		Modified bool                    `json:"modified"`
+	}
+	annotate := func(template *corev1.PodTemplateSpec, input autopilotAdjustmentSide) {
+		record := recorded{
+			Input:    input,
+			Output:   autopilotAdjustmentSide{Containers: recordOf(template.Spec.Containers), InitContainers: recordOf(template.Spec.InitContainers)},
+			Modified: true,
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			panic(err)
+		}
+		if template.Annotations == nil {
+			template.Annotations = map[string]string{}
+		}
+		template.Annotations[autopilotResourceAdjustmentAnnotation] = string(raw)
+	}
+	inputs := map[client.Object]autopilotAdjustmentSide{}
+	for _, obj := range objs {
+		switch workload := obj.(type) {
+		case *appsv1.Deployment:
+			inputs[obj] = autopilotAdjustmentSide{Containers: recordOf(workload.Spec.Template.Spec.Containers), InitContainers: recordOf(workload.Spec.Template.Spec.InitContainers)}
+		case *appsv1.StatefulSet:
+			inputs[obj] = autopilotAdjustmentSide{Containers: recordOf(workload.Spec.Template.Spec.Containers)}
+		}
+	}
+	for _, obj := range clampedToRequests(objs) {
+		switch workload := obj.(type) {
+		case *appsv1.Deployment:
+			annotate(&workload.Spec.Template, inputs[obj])
+		case *appsv1.StatefulSet:
+			annotate(&workload.Spec.Template, inputs[obj])
+		}
+	}
+	return objs
+}
+
 // clampedToRequests rewrites the sized workloads' templates the way GKE
 // Autopilot without Pod bursting admits them: every container's cpu and
 // memory limit set equal to its request, and the ephemeral-storage limit
-// copied into the request where a limit alone was set.
+// copied into the request where a limit alone was set. No record of the
+// rewrite is written; autopilotClamped adds it.
 func clampedToRequests(objs []client.Object) []client.Object {
 	clamp := func(containers []corev1.Container) {
 		for i := range containers {
@@ -572,7 +633,7 @@ func TestResolveSizingTierWritesOnlyOnChange(t *testing.T) {
 func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 	t.Parallel()
 	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
-	step := sizingStepBetween(agent, false, nil, sizingTierSmall, sizingTierFleet)
+	step := sizingStepBetween(agent, false, false, sizingTierSmall, sizingTierFleet)
 	// Requests: the broker 500m -> 4 CPU and 1Gi -> 8Gi; the sidecar and the
 	// shell keep theirs. Limits: CPU 2 -> 8 on the broker; memory 2Gi -> 8Gi
 	// on the broker, 2Gi -> 8Gi on the sidecar, 2Gi -> 4Gi on the shell;
@@ -589,34 +650,37 @@ func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 		t.Errorf("ephemeral-storage limits moved by %s", q.String())
 	}
 	// On Autopilot the broker's small row already requests 2 CPU and 2Gi.
-	autopilot := sizingStepBetween(agent, true, nil, sizingTierSmall, sizingTierMedium)
+	autopilot := sizingStepBetween(agent, true, false, sizingTierSmall, sizingTierMedium)
 	if q := autopilot.requests[corev1.ResourceCPU]; !q.IsZero() {
 		t.Errorf("Autopilot small -> medium moved the CPU request by %s", q.String())
 	}
 	assertQuantity(t, autopilot.requests, corev1.ResourceMemory, "2Gi")
-	// Autopilot without bursting: the running templates carry every limit
-	// equal to its request, so the limits side counts what admission charges
-	// the clamped pods, the requests' movement. Small -> fleet: the broker's
-	// 2 -> 4 CPU and 2Gi -> 8Gi requests move both of its limits by the
-	// same; the sidecar's 2Gi -> 8Gi and the shell's 2Gi -> 4Gi memory
-	// limits over requests that do not move count nothing, where the rows'
-	// limits as written would add 6Gi and 2Gi.
-	every := map[corev1.ResourceName]bool{corev1.ResourceCPU: true, corev1.ResourceMemory: true, corev1.ResourceEphemeralStorage: true}
-	clamped := sizingClampedLimits{credentialProxyContainerName: every, agentAPIAuthContainerName: every, shellSandboxContainerName: every}
-	fleet := sizingStepBetween(agent, true, clamped, sizingTierSmall, sizingTierFleet)
+	// Autopilot without bursting (clamped): admission lowers every limit to
+	// its request, so the limits side counts what it charges the clamped
+	// pods, the requests' movement. Small -> fleet: the broker's 2 -> 4 CPU
+	// and 2Gi -> 8Gi requests move both of its limits by the same; the
+	// sidecar's 2Gi -> 8Gi and the shell's 2Gi -> 4Gi memory limits over
+	// requests that do not move count nothing, where the rows' limits as
+	// written would add 6Gi and 2Gi.
+	fleet := sizingStepBetween(agent, true, true, sizingTierSmall, sizingTierFleet)
 	assertQuantity(t, fleet.requests, corev1.ResourceCPU, "2")
 	assertQuantity(t, fleet.requests, corev1.ResourceMemory, "6Gi")
 	assertQuantity(t, fleet.limits, corev1.ResourceCPU, "2")
 	assertQuantity(t, fleet.limits, corev1.ResourceMemory, "6Gi")
-	asWritten := sizingStepBetween(agent, true, nil, sizingTierSmall, sizingTierFleet)
+	asWritten := sizingStepBetween(agent, true, false, sizingTierSmall, sizingTierFleet)
 	assertQuantity(t, asWritten.limits, corev1.ResourceCPU, "6")
 	assertQuantity(t, asWritten.limits, corev1.ResourceMemory, "14Gi")
-	// A clamp on one container's memory alone leaves the other names and the
-	// other containers as written: the sidecar's 6Gi memory limit drops out,
-	// the broker's 6Gi and the shell's 2Gi stay.
-	sidecarOnly := sizingStepBetween(agent, true, sizingClampedLimits{agentAPIAuthContainerName: {corev1.ResourceMemory: true}}, sizingTierSmall, sizingTierFleet)
-	assertQuantity(t, sidecarOnly.limits, corev1.ResourceCPU, "6")
-	assertQuantity(t, sidecarOnly.limits, corev1.ResourceMemory, "8Gi")
+	// The clamp is the cluster's, not a name's: the broker's medium row
+	// writes an equal 2/2 CPU pair itself, and the step from it still counts
+	// the CPU limit on the requests' movement (2 -> 4) when the cluster
+	// clamps, since the fleet pod's 8 CPU limit is lowered to its 4 CPU
+	// request too; and as written (2 -> 8) when it does not, as under
+	// bursting, where that equal pair is not a clamp and the fleet pod
+	// keeps its 8.
+	clampedFromMedium := sizingStepBetween(agent, true, true, sizingTierMedium, sizingTierFleet)
+	assertQuantity(t, clampedFromMedium.limits, corev1.ResourceCPU, "2")
+	burstingFromMedium := sizingStepBetween(agent, true, false, sizingTierMedium, sizingTierFleet)
+	assertQuantity(t, burstingFromMedium.limits, corev1.ResourceCPU, "6")
 }
 
 // TestSizingStepReadsEachSideAsRendered pins the step's reading of an
@@ -645,7 +709,7 @@ func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
 	assertQuantity(t, shellFleet.Requests, corev1.ResourceMemory, "3Gi")
 	// The step: the broker 500m -> 3 CPU and 1Gi -> 8Gi, the shell 512Mi ->
 	// 3Gi; merged on both sides, the two overrides would read as zero.
-	step := sizingStepBetween(agent, false, nil, sizingTierSmall, sizingTierFleet)
+	step := sizingStepBetween(agent, false, false, sizingTierSmall, sizingTierFleet)
 	assertQuantity(t, step.requests, corev1.ResourceCPU, "2500m")
 	assertQuantity(t, step.requests, corev1.ResourceMemory, "9728Mi")
 	// An override every row admits is the override on both sides, so the
@@ -654,7 +718,7 @@ func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
 	admitted.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 	}}
-	sidecar := sizingStepBetween(admitted, false, nil, sizingTierSmall, sizingTierFleet)
+	sidecar := sizingStepBetween(admitted, false, false, sizingTierSmall, sizingTierFleet)
 	// 6Gi from the broker and 2Gi from the shell; the sidecar's 1Gi limit
 	// holds on both rows.
 	assertQuantity(t, sidecar.limits, corev1.ResourceMemory, "8Gi")
@@ -700,34 +764,45 @@ func TestSizingTierRows(t *testing.T) {
 	assertQuantity(t, shell.Limits, corev1.ResourceMemory, "4Gi")
 }
 
-func TestSizingRowsKeepTheClampReadable(t *testing.T) {
+func TestAutopilotClampedLimitsReadsTheRecord(t *testing.T) {
 	t.Parallel()
-	// sizedContainerCarries reads a limit equal to its request as Autopilot's
-	// clamp on a name the row requests, and lets the requests side stand for
-	// it. That reading is sound under bursting, where limits survive, only
-	// while no row sets a limit equal to its request on a name the next row
-	// raises the limit of alone: such a lower template would read as the
-	// higher tier with its limit short. Each container's three rows, on
-	// both cluster types, keep that shape.
-	rows := map[string]func(tier sizingTier) corev1.ResourceRequirements{
-		"proxy on Standard":  func(tier sizingTier) corev1.ResourceRequirements { return credentialProxyTierResources(tier, false) },
-		"proxy on Autopilot": func(tier sizingTier) corev1.ResourceRequirements { return credentialProxyTierResources(tier, true) },
-		"sidecar":            agentAPIAuthTierResources,
-		"shell":              shellSandboxTierResources,
-	}
-	for container, row := range rows {
-		for lower := sizingTierSmall; lower < sizingTierFleet; lower++ {
-			from, to := row(lower), row(lower+1)
-			for _, name := range sizingSettledLimits {
-				fromLimit, fromRequest := from.Limits[name], from.Requests[name]
-				toLimit, toRequest := to.Limits[name], to.Requests[name]
-				raisesLimitAlone := toLimit.Cmp(fromLimit) > 0 && toRequest.Cmp(fromRequest) == 0
-				if raisesLimitAlone && fromLimit.Cmp(fromRequest) == 0 {
-					t.Errorf("%s %s -> %s raises the %s limit alone (%s -> %s) off a row whose limit equals its request: a clamped read cannot tell the two apart",
-						container, lower, lower+1, name, fromLimit.String(), toLimit.String())
-				}
-			}
+	// The clamp is read off Autopilot's own record alone, in the shape it
+	// writes: a limit the output carries equal to its request where the
+	// input carried a higher one. The template's figures say nothing on
+	// their own, so an equal pair with no record, or one the record shows
+	// came in equal (an override pinned to the lower row's limit), is not a
+	// clamp; a key the record carries that this operator does not read is
+	// ignored, and a record it cannot parse reads as absent with an error.
+	recorded := `{"input":{"containers":[{"name":"envoy-credential-proxy","requests":{"cpu":"2","memory":"2Gi"},"limits":{"cpu":"2","ephemeral-storage":"2Gi","memory":"2Gi"}}],` +
+		`"initContainers":[{"name":"agent-api-auth","requests":{"cpu":"150m","memory":"384Mi"},"limits":{"cpu":"1","ephemeral-storage":"1Gi","memory":"4Gi"}}]},` +
+		`"output":{"containers":[{"limits":{"cpu":"2","ephemeral-storage":"2Gi","memory":"2Gi"},"requests":{"cpu":"2","ephemeral-storage":"2Gi","memory":"2Gi"},"name":"envoy-credential-proxy"}],` +
+		`"initContainers":[{"limits":{"cpu":"150m","ephemeral-storage":"1Gi","memory":"384Mi"},"requests":{"cpu":"150m","ephemeral-storage":"1Gi","memory":"384Mi"},"name":"agent-api-auth"}]},"modified":true}`
+	template := func(raw string) corev1.PodTemplateSpec {
+		tpl := corev1.PodTemplateSpec{}
+		if raw != "" {
+			tpl.Annotations = map[string]string{autopilotResourceAdjustmentAnnotation: raw}
 		}
+		return tpl
+	}
+	sidecar, err := autopilotClampedLimits(template(recorded), agentAPIAuthContainerName)
+	if err != nil {
+		t.Fatalf("autopilotClampedLimits: %v", err)
+	}
+	if !sidecar[corev1.ResourceCPU] || !sidecar[corev1.ResourceMemory] || sidecar[corev1.ResourceEphemeralStorage] {
+		t.Fatalf("sidecar clamped = %v, want cpu and memory (lowered to their requests) and not ephemeral-storage (copied into the request, the limit unchanged)", sidecar)
+	}
+	proxy, err := autopilotClampedLimits(template(recorded), credentialProxyContainerName)
+	if err != nil || len(proxy) != 0 {
+		t.Fatalf("proxy clamped = %v, %v; want nothing: its pairs came in equal and the record shows them unchanged", proxy, err)
+	}
+	if names, err := autopilotClampedLimits(template(recorded), shellSandboxContainerName); err != nil || len(names) != 0 {
+		t.Fatalf("a container the record does not carry clamped = %v, %v; want nothing", names, err)
+	}
+	if names, err := autopilotClampedLimits(template(""), agentAPIAuthContainerName); err != nil || names != nil {
+		t.Fatalf("no record clamped = %v, %v; want nil", names, err)
+	}
+	if names, err := autopilotClampedLimits(template("{not json"), agentAPIAuthContainerName); err == nil || names != nil {
+		t.Fatalf("a record that does not parse clamped = %v, err %v; want nil and the error", names, err)
 	}
 }
 
@@ -1090,19 +1165,53 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 			t.Fatalf("admission saw %d dry-run Pods for a quota with no PriorityClass scope, want none", len(seen))
 		}
 	})
-	t.Run("a dry run admission refuses leaves a PriorityClass quota binding", func(t *testing.T) {
+	t.Run("a dry run admission refuses holds the step", func(t *testing.T) {
 		t.Parallel()
-		// A quota short of a whole extra pod refuses the dry run (the quota
-		// plugin checks a dry run too): the class is unknown, and both an In
-		// and a DoesNotExist quota are read as binding.
-		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: default-class"))
+		// The dry run adds a whole pod where the step adds a difference, so
+		// a quota the step would never trip (a pods count at its cap) can
+		// refuse it: the class is unknown, nothing is measured, and neither
+		// an In nor a DoesNotExist quota is read as binding, since a cap
+		// naming one would tell the reader to raise a quota that may not
+		// count these pods. The latch and the condition stand as they were.
+		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: pod-count, requested: pods=1, used: pods=12, limited: pods=12"))
+		held := func(t *testing.T, agent *agentv1alpha1.PlatformAgent, why string) {
+			t.Helper()
+			if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+				t.Fatalf("status.effectiveSizingTier = %q, want small: %s", agent.Status.EffectiveSizingTier, why)
+			}
+			if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+				t.Fatalf("SizingCappedByQuota = %+v after admission refused the dry run, want none: %s", cond, why)
+			}
+		}
 		agent, seen := run(t, inDefault, "cluster-default", refused)
-		cappedBy(t, agent, "default-class", "an In quota was skipped after admission refused the dry run")
+		held(t, agent, "an In quota was read as binding on a refused dry run")
 		if len(seen) != 1 {
 			t.Fatalf("admission saw %d dry-run Pods, want 1", len(seen))
 		}
 		agent, _ = run(t, noClass, "", refused)
-		cappedBy(t, agent, "no-class", "a DoesNotExist quota was skipped after admission refused the dry run")
+		held(t, agent, "a DoesNotExist quota was read as binding on a refused dry run")
+	})
+	t.Run("a refused dry run keeps a standing cap as written", func(t *testing.T) {
+		t.Parallel()
+		// Capped at small by the In quota on an earlier pass, then the dry
+		// run refused: the condition is neither cleared nor rewritten.
+		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: pod-count"))
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		standing := fmt.Sprintf(sizingCappedByQuotaMessageFormat, sizingTierMedium, inDefault.Name, corev1.ResourceRequestsMemory, sizingTierSmall, sizingTierSmall)
+		setSizingCappedByQuotaCondition(agent, standing, metav1.Now())
+		objs := append([]client.Object{agent, inDefault}, sizedWorkloadsAt(agent, sizingTierSmall)...)
+		var seen []*corev1.Pod
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
+			WithInterceptorFuncs(admissionStamping("cluster-default", refused, &seen)).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall || cond == nil || cond.Message != standing {
+			t.Fatalf("status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want small with the standing message kept", agent.Status.EffectiveSizingTier, cond)
+		}
 	})
 	t.Run("with no proxy Deployment the step is held before admission is asked", func(t *testing.T) {
 		t.Parallel()
@@ -1230,9 +1339,9 @@ func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 	t.Run("Autopilot without bursting takes the fleet step on the requests' movement", func(t *testing.T) {
 		t.Parallel()
 		seed := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
-		agent, _ := run(t, true, clampedToRequests(sizedWorkloadsOn(seed, sizingTierSmall, true)))
+		agent, _ := run(t, true, autopilotClamped(sizedWorkloadsOn(seed, sizingTierSmall, true)))
 		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
-			t.Fatalf("status.effectiveSizingTier = %q, want fleet: the step counted the rows' limits on templates Autopilot clamped", agent.Status.EffectiveSizingTier)
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: the step counted the rows' limits on templates Autopilot's record shows clamped", agent.Status.EffectiveSizingTier)
 		}
 		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
 			t.Fatalf("SizingCappedByQuota set on a step the clamped pods fit: %+v", cond)
@@ -1250,6 +1359,85 @@ func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 		agent, recorder := run(t, false, sizedWorkloadsAt(seed, sizingTierSmall))
 		cappedAtMedium(t, agent, recorder, "nothing clamps a limit on Standard")
 	})
+}
+
+func TestSizingRunningLimitsClampedReadsTheRecord(t *testing.T) {
+	t.Parallel()
+	// The step's clamp flag comes from Autopilot's record on the running
+	// templates and from nothing else: true when a record shows a limit
+	// lowered to its request, false on templates that carry the rows as
+	// written (Standard, bursting) and on templates whose limits equal their
+	// requests with no record of a rewrite.
+	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+	for name, tc := range map[string]struct {
+		workloads []client.Object
+		want      bool
+	}{
+		"Autopilot's record of a clamp":          {autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true)), true},
+		"the rows as written":                    {sizedWorkloadsOn(agent, sizingTierSmall, true), false},
+		"equal pairs without Autopilot's record": {clampedToRequests(sizedWorkloadsOn(agent, sizingTierSmall, true)), false},
+		"no workload to read":                    {nil, false},
+	} {
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, tc.workloads...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
+		if got := r.sizingRunningLimitsClamped(context.Background(), agent); got != tc.want {
+			t.Errorf("%s: sizingRunningLimitsClamped = %v, want %v", name, got, tc.want)
+		}
+	}
+	t.Run("a record it cannot read is as written, and logged", func(t *testing.T) {
+		t.Parallel()
+		workloads := autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true))
+		workloads[0].(*appsv1.Deployment).Spec.Template.Annotations[autopilotResourceAdjustmentAnnotation] = "{not json"
+		var lines []string
+		ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { lines = append(lines, args) }, funcr.Options{}))
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, workloads...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
+		// The gateway's and the shell's records still read, so the cluster
+		// still reads as clamping; the proxy's unreadable record is logged.
+		if !r.sizingRunningLimitsClamped(ctx, agent) {
+			t.Fatal("sizingRunningLimitsClamped = false with two readable records of a clamp")
+		}
+		if !slices.ContainsFunc(lines, func(line string) bool {
+			return strings.Contains(line, "cannot read Autopilot's resource-adjustment record") && strings.Contains(line, credentialProxyName(agent))
+		}) {
+			t.Fatalf("log lines = %q, want the unreadable record named with the proxy Deployment", lines)
+		}
+	})
+}
+
+func TestResolveSizingTierCountsTheBrokersEqualCPUPairAsWrittenUnderBursting(t *testing.T) {
+	t.Parallel()
+	// Latched medium at 25 clusters on Autopilot with bursting, one
+	// limits.cpu quota, 10 hard and 6 used. The broker's medium row writes
+	// an equal 2/2 CPU pair itself, and the fleet row 4/8: the step's CPU
+	// limit as written is +6 (the sidecar's and the shell's do not move),
+	// and under bursting the fleet pod keeps its 8, so admission charges the
+	// 6 and 4 free is short. A step that read the broker's equal pair as a
+	// clamp would count +2, promote, and lose the broker to admission.
+	agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+	quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsCPU, "10", "6")
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(append([]client.Object{agent, quota}, sizedWorkloadsOn(agent, sizingTierMedium, true)...)...).
+		WithStatusSubresource(agent).Build()
+	recorder := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: true, autopilotResolved: true}
+	if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+		t.Fatalf("resolveSizingTier: %v", err)
+	}
+	cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+	if agent.Status.EffectiveSizingTier != sizingProfileMedium || cond == nil || !strings.Contains(cond.Message, "has no room on limits.cpu") {
+		t.Fatalf("status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want medium capped on limits.cpu", agent.Status.EffectiveSizingTier, cond)
+	}
+	var events []string
+	for len(recorder.Events) > 0 {
+		events = append(events, <-recorder.Events)
+	}
+	if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 6") }) {
+		t.Fatalf("events = %q, want the cap's Warning with the rows' 6 CPU", events)
+	}
 }
 
 func TestResolveSizingTierTakesTheEarnedTierWithNoQuotaBeforeTheWorkloadsSettle(t *testing.T) {
@@ -1483,11 +1671,19 @@ func TestSizingTierSettled(t *testing.T) {
 			s.Status.ReadyReplicas = 0
 			return all(p, g, s)
 		}, false},
-		{"the proxy scaled to zero has nothing to settle", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the proxy scaled to zero by hand has not settled", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			// The operator renders one replica and its next apply puts it
+			// back; until it is available the quota charges no broker while
+			// the step is measured from the broker's row.
 			p.Spec.Replicas = ptr.To[int32](0)
 			p.Status.UpdatedReplicas, p.Status.Replicas, p.Status.AvailableReplicas = 0, 0, 0
 			return all(p, g, s)
-		}, true},
+		}, false},
+		{"the shell scaled to zero by hand has not settled", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			s.Spec.Replicas = ptr.To[int32](0)
+			s.Status.UpdatedReplicas, s.Status.Replicas, s.Status.ReadyReplicas = 0, 0, 0
+			return all(p, g, s)
+		}, false},
 		{"the gateway without the sidecar is not compared", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			g.Spec.Template.Spec.InitContainers = nil
 			return all(p, g, s)
@@ -1499,12 +1695,15 @@ func TestSizingTierSettled(t *testing.T) {
 			rr.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
 			return all(p, g, s)
 		}, true},
-		{"the template Autopilot clamped to its requests settles small", sizingTierSmall, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
-			return clampedToRequests(all(p, g, s))
+		{"the template Autopilot clamped to its requests, on its record, settles small", sizingTierSmall, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return autopilotClamped(all(p, g, s))
 		}, true},
-		{"the template Autopilot clamped to its requests settles medium", sizingTierMedium, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
-			return clampedToRequests(all(p, g, s))
+		{"the template Autopilot clamped to its requests, on its record, settles medium", sizingTierMedium, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return autopilotClamped(all(p, g, s))
 		}, true},
+		{"an equal pair without Autopilot's record is the row's limit short", sizingTierSmall, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return clampedToRequests(all(p, g, s))
+		}, false},
 		{"on Standard a limit equal to its request is the row's limit short", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			return clampedToRequests(all(p, g, s))
 		}, false},
@@ -1530,7 +1729,7 @@ func TestSizingTierSettled(t *testing.T) {
 		// requests side still tells the small template from the medium one.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
 		scheme := setupScheme()
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, clampedToRequests(sizedWorkloadsOn(agent, sizingTierSmall, true))...)...).Build()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true))...)...).Build()
 		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
 		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "Deployment/"+credentialProxyName(agent) {
 			t.Fatalf("sizingTierUnsettledWorkload = %q for a small template clamped at the medium latch, want the proxy Deployment", got)
@@ -1543,14 +1742,65 @@ func TestSizingTierSettled(t *testing.T) {
 		// the shell at the small render are what medium runs there, and
 		// the proxy at the medium render settles the tier with them.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
-		medium := clampedToRequests(sizedWorkloadsOn(agent, sizingTierMedium, true))
-		small := clampedToRequests(sizedWorkloadsOn(agent, sizingTierSmall, true))
+		medium := autopilotClamped(sizedWorkloadsOn(agent, sizingTierMedium, true))
+		small := autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true))
 		objs := []client.Object{agent, medium[0], small[1], small[2]}
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
 		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "" {
 			t.Fatalf("sizingTierUnsettledWorkload = %q, want settled: the clamped small sidecar and shell are the medium ones", got)
+		}
+	})
+	t.Run("an override's equal pair is not a clamp", func(t *testing.T) {
+		t.Parallel()
+		// A sidecar memory request pinned to the small row's 2Gi limit
+		// writes an equal 2Gi/2Gi pair at small, which the medium row
+		// (2Gi request, 4Gi limit) raises the limit of alone. Under
+		// bursting there is no record and the limit is compared as written;
+		// on a clamping cluster the record shows the pair came in equal and
+		// left unchanged. Either way the small template has not settled
+		// medium, where a reading that took any equal pair for the clamp
+		// would let the requests side stand for a limit it never carried.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		agent.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+		}}
+		// The proxy and the shell are at the medium render, so the gateway
+		// is the one workload left to settle.
+		for name, templates := range map[string]struct{ small, medium []client.Object }{
+			"under bursting":        {sizedWorkloadsOn(agent, sizingTierSmall, true), sizedWorkloadsOn(agent, sizingTierMedium, true)},
+			"on a clamping cluster": {autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true)), autopilotClamped(sizedWorkloadsOn(agent, sizingTierMedium, true))},
+		} {
+			sidecar := sizedContainer(templates.small[1].(*appsv1.Deployment).Spec.Template, agentAPIAuthContainerName).Resources
+			if sidecar.Requests.Memory().Cmp(*sidecar.Limits.Memory()) != 0 {
+				t.Fatalf("%s: the small sidecar template carries %s/%s on memory, want the override's equal pair", name, sidecar.Requests.Memory(), sidecar.Limits.Memory())
+			}
+			objs := []client.Object{agent, templates.medium[0], templates.small[1], templates.medium[2]}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
+			if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "Deployment/"+agent.Name+gatewayWorkloadNameSuffix {
+				t.Fatalf("%s: sizingTierUnsettledWorkload = %q, want the gateway: its small template read as settled at medium on the override's equal pair", name, got)
+			}
+		}
+	})
+	t.Run("the gateway at zero under scaleToZero has settled", func(t *testing.T) {
+		t.Parallel()
+		// The operator renders zero replicas there, so zero available is
+		// every replica it renders; the proxy and the shell still want
+		// their one.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		agent.Spec.Deployment.ScaleToZero = ptr.To(true)
+		workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+		gateway := workloads[1].(*appsv1.Deployment)
+		gateway.Spec.Replicas = ptr.To[int32](0)
+		gateway.Status.UpdatedReplicas, gateway.Status.Replicas, gateway.Status.AvailableReplicas = 0, 0, 0
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, workloads...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierSmall); got != "" {
+			t.Fatalf("sizingTierUnsettledWorkload = %q, want settled: the gateway renders zero replicas under scaleToZero", got)
 		}
 	})
 	t.Run("a template at the lower tier has not settled the higher one", func(t *testing.T) {
