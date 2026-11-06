@@ -20,8 +20,11 @@ that field and holds the prompt-driven jobs back in two stages:
 
 Jobs with ``no_agent`` prompt no model and are never touched; neither is a job
 whose ``next_run_at`` Hermes has yet to compute. A missing field falls back to
-the CR's creation time, so an install nobody has ever messaged idles from the
-day it was created. The field counts every chat message the gateway accepted,
+the CR's creation time while ``chatMessagesInboundTotal`` counts nothing, so
+an install nobody has ever messaged idles from the day it was created; with
+messages counted and the field absent (an operator upgraded, or rolled back
+and returned, since the last message) the signal is unknown and nothing is
+held until the next one. The field counts every chat message the gateway accepted,
 the agent API's included; turns through the A2A inject door are the one door
 it does not count, so an install driven only through that door opts out with
 ``CRON_IDLE_THROTTLE_DAYS=0`` in ``spec.deployment.env`` (the operator copies
@@ -117,6 +120,10 @@ PLATFORM_AGENT_RESOURCE = "platformagents.kubeagents.x-k8s.io"
 KUBECTL_TIMEOUT_SECONDS = 30
 SIGNAL_SOURCE_HUMAN = "lastHumanActiveTime"
 SIGNAL_SOURCE_CREATED = "creationTimestamp"
+# The counter the field is projected from. Positive with the field absent
+# means an operator has yet to write the field since it started (an upgrade,
+# or a rollback and return), not that nobody has ever written.
+INBOUND_COUNTER = "chatMessagesInboundTotal"
 
 # The siblings this module needs from the Platform Agent's script directory.
 # In the pod every script shares one directory; a checkout keeps them under
@@ -222,7 +229,9 @@ def read_signal() -> tuple[datetime, str]:
     """When a person last wrote to the install, and which field said so.
 
     ``status.usage.lastHumanActiveTime`` when the CR carries it, else the CR's
-    creation time. Raises when the CR cannot be read or carries neither.
+    creation time while the install counts no chat message. Raises when the CR
+    cannot be read, carries neither, or counts messages the field has yet to
+    reflect: the signal is then unknown rather than "idle since creation".
     """
     sandbox_exec = _platform_module(SANDBOX_MODULE)
     namespace = os.environ.get(NAMESPACE_ENV, "").strip() or DEFAULT_NAMESPACE
@@ -243,6 +252,15 @@ def read_signal() -> tuple[datetime, str]:
     human = parse_timestamp(usage.get(SIGNAL_SOURCE_HUMAN))
     if human is not None:
         return human, SIGNAL_SOURCE_HUMAN
+    try:
+        inbound = int(usage.get(INBOUND_COUNTER) or 0)
+    except (TypeError, ValueError):
+        inbound = 0
+    if inbound > 0:
+        raise RuntimeError(
+            f"{SIGNAL_SOURCE_HUMAN} is absent while {INBOUND_COUNTER} counts {inbound}; "
+            "the operator writes it on the next message"
+        )
     created = parse_timestamp((agent.get("metadata") or {}).get(SIGNAL_SOURCE_CREATED))
     if created is not None:
         return created, SIGNAL_SOURCE_CREATED

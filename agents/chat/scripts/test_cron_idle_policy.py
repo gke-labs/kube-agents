@@ -740,6 +740,16 @@ class ReadSignalTest(unittest.TestCase):
         self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
         self.stub(self.listing())
         self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
+        self.stub(self.listing({"usage": {"chatMessagesInboundTotal": 0}}))
+        self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
+
+    def test_absent_field_with_counted_messages_is_unknown(self):
+        # An operator upgraded, or rolled back and returned, since the last
+        # message: the field is missing, not never written, so no creation-time
+        # fallback and nothing held until the next message.
+        self.stub(self.listing({"usage": {"chatMessagesInboundTotal": 14, "lastActiveTime": "2026-08-06T06:00:00Z"}}))
+        with self.assertRaisesRegex(RuntimeError, "lastHumanActiveTime is absent while chatMessagesInboundTotal counts 14"):
+            cip.read_signal()
 
     def test_namespace_comes_from_the_environment(self):
         import os

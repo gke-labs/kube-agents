@@ -186,7 +186,7 @@ A watchdog therefore fires through the same execute → deliver → record path 
 
 ### Idle installs
 
-An install nobody talks to keeps its schedule only for a week. Before it looks for due work, the dispatcher reads when a person last messaged the install: `status.usage.lastHumanActiveTime` on the `PlatformAgent`, or the resource's creation time while no message has arrived. It then holds the model-run jobs on every named profile's store back in two stages. It runs inside `profile-cron-tick`, so under the experimental `platformFrontDoor` flag, where that job never fires, nothing is held:
+An install nobody talks to keeps its schedule only for a week. Before it looks for due work, the dispatcher reads when a person last messaged the install: `status.usage.lastHumanActiveTime` on the `PlatformAgent`, or the resource's creation time while the install counts no chat message. It then holds the model-run jobs on every named profile's store back in two stages. It runs inside `profile-cron-tick`, so under the experimental `platformFrontDoor` flag, where that job never fires, nothing is held:
 
 | Idle for              | Model-run jobs                                                  | `no_agent` jobs |
 | --------------------- | --------------------------------------------------------------- | --------------- |
@@ -200,7 +200,7 @@ A chat message ends the hold within about ten minutes: the operator reads the co
 
 Two environment variables on the agent container tune it, through `spec.deployment.env`: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. The two are independent: raising the throttle alone leaves hibernation at its own threshold. Turning the policy off releases whatever it held.
 
-The field counts every chat message the gateway accepts, the agent API's included. Turns through the A2A inject door do not count, so an install driven only through that door, an evaluation install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there. A served CRD that predates the field has it pruned, and the install then idles from its creation time; the supported upgrade path refreshes the CRDs, a hand `helm upgrade` may not.
+The field counts every chat message the gateway accepts, the agent API's included. Turns through the A2A inject door do not count, so an install driven only through that door, an evaluation install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there. While the field is absent but `status.usage.chatMessagesInboundTotal` counts messages (an operator upgraded, or rolled back and returned, since the last message; a served CRD that predates the field) the signal is unknown and nothing is held until the next message. A served CRD that predates the counter too leaves the install idling from its creation time; the supported upgrade path refreshes the CRDs, a hand `helm upgrade` may not.
 
 When the field cannot be read (the sandbox is off, or the agent's Role no longer reaches the resource) the last reading stands for a day and then nothing new is held; the dispatcher says so once in its output. A held occurrence leaves no row in the job's history: the hold moves the slot rather than skipping it.
 
