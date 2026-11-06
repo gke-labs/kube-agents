@@ -1,7 +1,6 @@
 package dispatch
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -310,7 +309,7 @@ func TestARefusalIsRecordedBeforeItIsReported(t *testing.T) {
 // and the bucket keeps every task's tombstone there for the submit stream's
 // retention. The read must cost one pass over the records, not a round trip
 // per record, or a busy (profile, tier) outgrows the read's budget and stops
-// dispatching. Here it gets a budget a round trip per record can't meet.
+// dispatching. Here it gets a message cap a round trip per record can't meet.
 func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 	const tombstones = 20000
 	b := newBus(t, "tse-0")
@@ -334,29 +333,32 @@ func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 		t.Fatal(err)
 	}
 	ti := oneProfile("tse", 2, "tse-0")
-	d, err := New(testConfig(), b.connect("dispatcher"), ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	conn := b.connect("dispatcher")
+	d, err := New(testConfig(), conn, ti.src, ti.pool, &fakeVerifier{}, quietLog())
 	if err != nil {
 		t.Fatal(err)
 	}
-	// On an idle laptop's embedded server 20000 round trips take about
-	// 800ms and one pass about 30ms; under the race detector about 3.3s and
-	// 750ms. A clustered bus's round trip is longer still.
-	budget := 300 * time.Millisecond
-	if raceEnabled {
-		budget = 2 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(b.ctx, budget)
-	defer cancel()
+	// Count what the read sends rather than time it: a clock budget tight
+	// enough to tell one pass from a round trip per record (about 750ms
+	// against 3.3s under the race detector) is also tight enough for a
+	// loaded CI runner to miss. One pass sends a handful of requests; a
+	// round trip per record sends one per tombstone.
+	maxRequests := uint64(tombstones / 100)
+	before := conn.Conn().Stats().OutMsgs
 	start := time.Now()
-	pods, err := d.leasedPods(ctx, "tse", "read", 0)
+	pods, err := d.leasedPods(b.ctx, "tse", "read", 0)
 	took := time.Since(start)
+	sent := conn.Conn().Stats().OutMsgs - before
 	if err != nil {
 		t.Fatalf("leasedPods over %d tombstones: %v after %v", tombstones, err, took)
+	}
+	if sent > maxRequests {
+		t.Errorf("leasedPods sent %d messages over %d tombstones, want at most %d: a round trip per record", sent, tombstones, maxRequests)
 	}
 	if !pods["tse-live"] || pods["tse-old"] || len(pods) != 1 {
 		t.Errorf("leased pods %v, want only tse-live", pods)
 	}
-	t.Logf("leasedPods over %d tombstones took %v", tombstones, took)
+	t.Logf("leasedPods over %d tombstones sent %d messages and took %v", tombstones, sent, took)
 }
 
 // The configured retention counts when it is longer than the fixed value,
