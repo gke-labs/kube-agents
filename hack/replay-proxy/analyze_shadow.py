@@ -534,13 +534,16 @@ def filed_kind(path: str) -> Optional[str]:
 
 
 def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tuple[str, str]], int]:
-    """Each log file under `paths` with its job kind, and how many were skipped off the layout.
+    """Each log segment under `paths` with its job kind, and how many were skipped off the layout.
 
-    With `kind`, every file found is that kind. Without it, a file's kind is
-    filed_kind's; one found under a directory but off the layout is skipped and
-    counted. Raises ValueError for a path that does not exist, a file named
-    outright that is off the layout, or a directory with log files none of
-    which is on it, each a mistake in the arguments rather than a planted file.
+    With `kind`, every segment found is that kind. Without it, a segment's kind
+    is filed_kind's, and one found under a directory but off the layout is
+    skipped and counted, as is a directory with nothing at the layout (with a
+    note on stderr): an object a presubmit planted under its own prefix must
+    not stop the analysis of the rest. Raises ValueError for the operator's own
+    argument mistakes: a path that does not exist, a file named outright that is
+    not a segment or is off the layout, or a run where log segments were found
+    and none is at the layout. A run with no segments at all reads nothing.
     """
     found: List[Tuple[str, str]] = []
     off_layout = 0
@@ -549,6 +552,9 @@ def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tu
         if not os.path.exists(path):
             raise ValueError(f"{path} does not exist")
         if not os.path.isdir(path):
+            if not path.endswith(LOG_SUFFIX):
+                raise ValueError(f"{path} is not a log segment (*{LOG_SUFFIX}); job manifests and the store are not "
+                                 "read as logs")
             file_kind = kind or filed_kind(path)
             if file_kind is None:
                 raise ValueError(f"{path} is not at the bucket's layout ({layout}, with no other directory in its "
@@ -560,10 +566,13 @@ def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tu
         filed = [(name, kind or filed_kind(name)) for name in files]
         kept = [(name, file_kind) for name, file_kind in filed if file_kind is not None]
         if files and not kept:
-            raise ValueError(f"{path} holds no log file at the bucket's layout ({layout}, with no other directory "
-                             "in its path named for a kind); pass a kind folder or its parent, or --kind")
+            print(f"note: {path} holds no log segment at the bucket's layout; its {len(files)} are counted as "
+                  f"{SKIP_OFF_LAYOUT} and skipped", file=sys.stderr)
         found += kept
         off_layout += len(files) - len(kept)
+    if off_layout and not found:
+        raise ValueError(f"no log segment is at the bucket's layout ({layout}, with no other directory in its path "
+                         "named for a kind); pass the kind folders or their parent, or --kind")
     return found, off_layout
 
 

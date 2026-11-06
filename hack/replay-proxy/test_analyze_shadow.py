@@ -678,14 +678,49 @@ class FolderKindTest(unittest.TestCase):
                 self.assertEqual(skipped["off_layout_files"], 1)
                 os.remove(stray)
 
-    def test_a_directory_with_no_file_at_the_layout_is_refused(self):
+    def test_a_run_with_nothing_at_the_layout_is_refused(self):
         loose = tempfile.mkdtemp(dir=TEMP_DIR)
         with open(os.path.join(loose, "seg.jsonl"), "w") as handle:
             handle.write(json.dumps(presubmit("p1", 2, "10", "b1", "A", ["a"])) + "\n")
-        with self.assertRaisesRegex(ValueError, "holds no log file at the bucket's layout"):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(ValueError, "no log segment is at the bucket's layout"):
             analyze_shadow.load([loose])
         records, _ = analyze_shadow.load([loose], kind="presubmit")
         self.assertEqual([r.request_id for r in records], ["p1"])
+        # No segments at all is an empty run, not a mistake.
+        records, skipped = analyze_shadow.load([tempfile.mkdtemp(dir=TEMP_DIR)])
+        self.assertEqual((records, skipped["off_layout_files"]), ([], 0))
+
+    def test_a_planted_folder_with_nothing_at_the_layout_does_not_stop_the_recipe(self):
+        # The reviewer's reproduction: week/nightly-untrusted holds only 2026-11-05/x.jsonl.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        for kind, relative, entry in (
+                ("nightly", "2026-11-05/1790/logs/seg.jsonl", line("n1", 1, "nightly", "n", "A", ["a"])),
+                ("presubmit", "2026-11-05/1791/logs/seg.jsonl", presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                ("nightly-untrusted", "2026-11-05/x.jsonl", line("u1", 1, "nightly-untrusted", "u", "A", ["a"]))):
+            target = os.path.join(week, kind, relative)
+            os.makedirs(os.path.dirname(target))
+            with open(target, "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        folders = [os.path.join(week, kind) for kind in ("nightly", "nightly-untrusted", "presubmit")]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(analyze_shadow.main([*folders, "--json"]), 0)
+        rep = json.loads(out.getvalue())
+        self.assertEqual(rep["health"]["off_layout_files"], 1)
+        self.assertEqual((rep["requests"], rep["estimates"]["low"]["hits"]), (2, 1))
+        self.assertIn(f"note: {folders[1]} holds no log segment at the bucket's layout", err.getvalue())
+
+    def test_a_named_job_manifest_is_not_read_as_a_log(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        manifest = os.path.join(os.path.dirname(os.path.dirname(path)), "job-1762300000000.json")
+        with open(manifest, "w") as handle:
+            json.dump({"kind": "presubmit", "build": "1"}, handle)
+        self.assertEqual(analyze_shadow.filed_kind(manifest), "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "is not a log segment"):
+                    analyze_shadow.load([manifest], kind=kind)
 
     def test_a_folder_inside_a_kind_folder_keeps_that_kind(self):
         path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
