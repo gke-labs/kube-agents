@@ -1426,14 +1426,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
 		//
-		// The dispatcher's pod-read binding there is removed, for the
-		// ClusterRoleBinding's reason above: left behind, anyone who later
-		// creates a ServiceAccount of the dispatcher's name inherits pod read
-		// in that namespace. A failure is logged and never holds the
-		// finalizer, under the profile-namespace rule (#3827 settles what a
-		// refused delete should do).
+		// The dispatcher's warm pools there go, with their CA bundle copy
+		// (their pods hold bus and broker tokens), and so does its pod-read
+		// binding, for the ClusterRoleBinding's reason above: left behind,
+		// anyone who later creates a ServiceAccount of the dispatcher's name
+		// inherits pod read in that namespace. A failure is logged and never
+		// holds the finalizer, under the profile-namespace rule (#3827
+		// settles what a refused delete should do).
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
-			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm

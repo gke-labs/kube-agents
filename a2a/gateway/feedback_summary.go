@@ -35,7 +35,7 @@ const (
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
 	//: matches its own block's shape (the script adds the performance figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 47
+	usageSummaryMaxLines = 53
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -97,7 +97,77 @@ const (
 	usageNoReading            = "no reading"
 	usageForgeReadingSuffix   = " (as the forge reports)"
 	usageGatewayReadingSuffix = " (as the gateway reports)"
+	//: status.usage.topTools: the operator's reading of the broker's five
+	//: most-invoked tool and subcommand pairs since the broker pod started,
+	//: and the row fields it carries. The script's TOP_TOOLS_* names.
+	usageTopToolsKey         = "topTools"
+	usageTopToolsShown       = 5
+	usageToolField           = "tool"
+	usageToolSubcommandField = "subcommand"
+	usageToolTotalField      = "total"
+	//: A bare tool's subcommand, printed as the tool alone; the pair's
+	//: separator otherwise. The broker's SUBCOMMAND_NONE and the script's NONE.
+	usageToolSubcommandNone = "none"
+	usageToolPairSeparator  = "/"
+	//: The broker's LABEL_OTHER: the tool it refused to run, and a word
+	//: outside a tool's vocabulary; the script's OTHER_BUCKET.
+	usageToolOther = "other"
+	//: The block's label, the script's line verbatim.
+	usageTopToolsLabel = "tools (top 5, since broker start)"
 )
+
+// : The broker's outcome vocabulary in the order a row prints its breakdown:
+// : the script's TOOL_STATUS_ORDER verbatim, and the status row's field names.
+var usageSummaryToolStatusOrder = []string{"success", "error", "blocked", "busy", "abandoned"}
+
+// : The broker's tool vocabulary and, per tool, its subcommand vocabulary:
+// : the script's BROKER_SUBCOMMANDS verbatim (GatewayCopyTest holds the two
+// : equal, and the script's to the broker's). Not a filter: the operator
+// : writes the status from its own copy. It is the block's vocabulary, so
+// : that an install whose spec spells one of these words (a cluster named
+// : "compute") is not refused for a row the broker's counter named.
+var usageSummaryBrokerSubcommands = map[string][]string{
+	"kubectl": {
+		"annotate", "api-resources", "api-versions", "apply", "attach", "auth",
+		"autoscale", "cluster-info", "config", "cordon", "cp", "create", "debug",
+		"delete", "describe", "diff", "drain", "edit", "events", "exec", "explain",
+		"expose", "get", "label", "logs", "patch", "port-forward", "proxy", "replace",
+		"rollout", "run", "scale", "set", "taint", "top", "uncordon", "version", "wait",
+	},
+	"gcloud": {
+		"artifacts", "asset", "auth", "billing", "components", "compute", "config",
+		"container", "iam", "info", "init", "logging", "monitoring", "projects",
+		"resource-manager", "services", "version",
+	},
+	"git": {
+		"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+		"check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
+		"describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
+		"ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
+		"reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
+		"sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
+		"tag", "update-ref", "version", "worktree",
+	},
+	"gh": {
+		"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+		"repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+		"workflow",
+	},
+	"feedback": {"submit"},
+}
+
+// : The words of the tools block beyond what the degraded render prints:
+// : the tools (the broker's own "other" included), every subcommand, the
+// : outcomes and the two fallback words. The script's TEMPLATE_EXTRA_TOKENS.
+var usageSummaryToolTokens = func() []string {
+	tokens := []string{usageToolOther, usageToolSubcommandNone}
+	for tool, subcommands := range usageSummaryBrokerSubcommands {
+		tokens = append(tokens, tool)
+		tokens = append(tokens, subcommands...)
+	}
+	tokens = append(tokens, usageSummaryToolStatusOrder...)
+	return tokens
+}()
 
 // : status.usage fields, in the order the block prints them; a missing counter
 // : prints 0, a missing reading (usageSummaryReadings) prints usageNoReading.
@@ -178,6 +248,9 @@ var usageSummaryTemplateTokens = func() map[string]bool {
 		for _, tok := range usageSummaryToken.FindAllString(text, -1) {
 			tokens[tok] = true
 		}
+	}
+	for _, tok := range usageSummaryToolTokens {
+		tokens[tok] = true
 	}
 	return tokens
 }()
@@ -429,6 +502,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		lastHuman = usageSummaryNever
 	}
 	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
+	lines = append(lines, renderTopTools(usage)...)
 	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
 	days := windowDays(window)
 	if !haveTasks {
@@ -452,6 +526,48 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, usageSummaryFeedbackTemplate...)
 	lines = append(lines, usageSummaryFence)
 	return strings.Join(lines, "\n")
+}
+
+// renderTopTools is the tools block from status.usage.topTools, the script's
+// lines verbatim: the label and unavailable when the status carries no list
+// (the operator has no current reading of the broker, or the served CRD
+// predates the field), the label and none for an empty one, else the label
+// and one row per entry, in the status's order and at most usageTopToolsShown
+// of them: the tool, or tool/subcommand for a subcommand other than none, its
+// total, and in parentheses each outcome the row carries above zero, in
+// usageSummaryToolStatusOrder. The script renders the same list the same way
+// when it falls back to the status.
+func renderTopTools(usage map[string]any) []string {
+	raw, ok := usage[usageTopToolsKey].([]any)
+	if !ok {
+		return []string{usageTopToolsLabel + ": " + usageSummaryUnavailable}
+	}
+	var rows []string
+	for _, item := range raw {
+		entry, ok := item.(map[string]any)
+		if !ok || len(rows) >= usageTopToolsShown {
+			continue
+		}
+		pair := asString(entry[usageToolField])
+		if subcommand := asString(entry[usageToolSubcommandField]); subcommand != usageToolSubcommandNone {
+			pair += usageToolPairSeparator + subcommand
+		}
+		var parts []string
+		for _, status := range usageSummaryToolStatusOrder {
+			if n := asInt(entry[status]); n > 0 {
+				parts = append(parts, fmt.Sprintf("%s %d", status, n))
+			}
+		}
+		line := fmt.Sprintf("  %s: %d", pair, asInt(entry[usageToolTotalField]))
+		if len(parts) > 0 {
+			line += " (" + strings.Join(parts, ", ") + ")"
+		}
+		rows = append(rows, line)
+	}
+	if len(rows) == 0 {
+		return []string{usageTopToolsLabel + ": " + usageSummaryNone}
+	}
+	return append([]string{usageTopToolsLabel + ":"}, rows...)
 }
 
 func stringLeaves(v any, out *[]string) {

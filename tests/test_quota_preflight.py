@@ -64,12 +64,12 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 9
-_DEFAULT_REQUESTS_CPU_MILLIS = 2706
+_DEFAULT_REQUESTS_CPU_MILLIS = 2756
 _DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 9408 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9536 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
@@ -99,8 +99,13 @@ _HA_REPLICAS = 2
 # The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
 # The agent pod is larger but rolls with Recreate at the default single replica.
 _LARGEST_SURGING_REQUEST_MILLIS = 100
-# The operator's own request: the smallest GKE Autopilot admits unchanged beside 128Mi.
-_OPERATOR_REQUEST_MILLIS = 50
+# The operator's own request, sized to be livable as the limit an Autopilot cluster without
+# bursting clamps to, and inside the band GKE Autopilot admits unchanged beside 256Mi.
+_OPERATOR_REQUEST_MILLIS = 100
+# The web console's request (webConsole.resources), sized to be livable as the limit an
+# Autopilot cluster without bursting clamps to.
+_WEB_CONSOLE_REQUEST_MILLIS = 100
+_WEB_CONSOLE_REQUEST_MEMORY_BYTES = 128 * 1024**2
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
 _OPERATOR_STORAGE_BYTES = 102 * 1024**3
@@ -1145,16 +1150,45 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertIsNotNone(required, "probe ConfigMap not found")
         return chart_pods, required
 
-    def test_the_operator_is_told_the_charts_pods_and_their_surges(self) -> None:
-        """The chart-pods annotation is the preflight's pod total less what the operator
-        renders and the uninstall-only cleanup hook, plus one surge pod for each workload the
-        preflight's own list marks as surging, so the counts cannot drift (#3848). With
-        operator.enabled=false the operator runs elsewhere, and neither counts it."""
-        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
-        operator_pods = (
-            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
-            + op["kubeProxy"]["pods"]
-        )
+    def _rendered_chart_pods(self, sets: list[str]) -> tuple[int, int, list[str]]:
+        """An oracle independent of kube-agents.chartWorkloads: the standing pods the chart
+        actually renders in the release namespace, and their surge pods, read from the
+        manifests. Every Deployment and StatefulSet the chart renders there counts at its
+        replicas; Helm hooks (the uninstall cleanup Job) are not standing. A Deployment that
+        runs a pod and doesn't roll Recreate sizes one surge pod; a StatefulSet sizes none."""
+        res = self._render({"probe": {}}, sets)
+        self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
+        chart_pods, pods, surges, names = None, 0, 0, []
+        for doc in yaml.safe_load_all(res.stdout):
+            if not doc:
+                continue
+            meta = doc.get("metadata", {})
+            if doc.get("kind") == "PlatformAgent":
+                chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+            if "helm.sh/hook" in (meta.get("annotations") or {}):
+                continue
+            # A pod-running kind neither list models would pass both unseen, so it fails here.
+            self.assertNotIn(doc.get("kind"), ("DaemonSet", "Job", "CronJob", "ReplicaSet", "Pod"),
+                             f"the chart renders a {doc.get('kind')} that kube-agents.chartWorkloads doesn't model")
+            if doc.get("kind") not in ("Deployment", "StatefulSet"):
+                continue
+            if meta.get("namespace") not in (None, "", "default"):  # helm template renders into "default"
+                continue
+            replicas = doc["spec"].get("replicas", 1)
+            pods += replicas
+            names.append(f"{doc['kind']}/{meta['name']}={replicas}")
+            if doc["kind"] == "Deployment" and replicas > 0:
+                if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
+                    surges += 1
+        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        return chart_pods, pods + surges, names
+
+    def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
+        """The chart-pods annotation equals the standing pods the chart renders in the release
+        namespace plus their surge pods, read from the rendered manifests rather than from
+        the list the annotation is computed from, so a workload the list misses fails here
+        (#3848, #4893: the replay proxy was missed). With operator.enabled=false the operator
+        runs elsewhere, and neither counts it."""
         for sets in (
             [],
             ["hindsight.enabled=true", "githubMinter.enabled=true",
@@ -1164,7 +1198,28 @@ class PreflightDecisionTest(unittest.TestCase):
             ["platformAgent.cleanupHook.enabled=false"],
             ["operator.enabled=false", "hindsight.enabled=true"],
             ["webConsole.enabled=true"],
+            # The replay proxy, with the values its schema requires (the probe chart drops the
+            # schema, but a real render needs them), at its default replicas and at 5.
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly"],
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+             "litellm.replayShadow.replicaCount=5"],
+            ["litellm.replicaCount=0"],
         ):
+            with self.subTest(sets=sets):
+                chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
+                self.assertEqual(chart_pods, rendered, names)
+
+    def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
+        """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
+        uninstall-only cleanup hook, and a surge pod for each that surges (#4893)."""
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        operator_pods = (
+            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
+            + op["kubeProxy"]["pods"]
+        )
+        for sets in ([], ["platformAgent.cleanupHook.enabled=false"], ["litellm.replayShadow.enabled=true"]):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
@@ -1447,8 +1502,8 @@ class PreflightDecisionTest(unittest.TestCase):
         base = self._requirements()
         with_console = self._requirements(["webConsole.enabled=true"])
         self.assertEqual(with_console["pods"], base["pods"] + 1)
-        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
-        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + _WEB_CONSOLE_REQUEST_MILLIS)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + _WEB_CONSOLE_REQUEST_MEMORY_BYTES)
 
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
@@ -1744,8 +1799,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2706m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2806m"', res.stderr)
+        # The release's 2756m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2856m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1754,7 +1809,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"11456Mi"', res.stderr)
+        # The release's 9536Mi plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"11584Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""

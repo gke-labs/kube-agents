@@ -8539,6 +8539,41 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 	})
 }
 
+// One parse decides both the count and the discard (#4893): a value is used
+// exactly when no reason is given, an absent annotation takes the default
+// without one, and every discarded value takes the default with one.
+func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
+	absent := a2aTestAgent()
+	if n, why := a2aChartPodsCount(absent); n != a2aDefaultChartPods || why != "" {
+		t.Fatalf("absent: (%d, %q), want the default and no reason", n, why)
+	}
+	for _, c := range []struct {
+		raw  string
+		want int64
+		used bool
+	}{
+		{"0", 0, true},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{fmt.Sprint(a2aMaxChartPods), a2aMaxChartPods, true},
+		{fmt.Sprint(a2aMaxChartPods + 1), a2aDefaultChartPods, false},
+		{"-1", a2aDefaultChartPods, false},
+		{"", a2aDefaultChartPods, false},
+		{"seven", a2aDefaultChartPods, false},
+		{"99999999999999999999", a2aDefaultChartPods, false},
+	} {
+		agent := a2aTestAgent()
+		agent.SetAnnotations(map[string]string{a2aChartPodsAnnotation: c.raw})
+		n, why := a2aChartPodsCount(agent)
+		if n != c.want || (why == "") != c.used {
+			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
+		}
+		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
+			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		}
+	}
+}
+
 // A chart-pods annotation the operator discards is reported, once per spec
 // generation, as a Warning event; an absent one (a CR written without the
 // chart) and a usable one are not.
