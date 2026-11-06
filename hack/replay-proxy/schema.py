@@ -27,6 +27,7 @@ LATENCY_MS = "latency_ms"
 CLIENT_DISCONNECTED = "client_disconnected"
 UPSTREAM_INCOMPLETE = "upstream_incomplete"
 OBSERVE_FAILED = "observe_failed"
+# LiteLLM's headers; null on a served line, which never reached LiteLLM.
 LITELLM_MODEL_GROUP = "litellm_model_group"
 LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
 PROMPT_TOKENS = "prompt_tokens"
@@ -45,6 +46,8 @@ DIAG_MESSAGE_HASHES = "diag_message_hashes"
 DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
+# Why replay would not have saved the answer; empty on a served line, whose
+# answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
 STORED = "stored"
 STORE_SKIPPED = "store_skipped"

@@ -735,6 +735,16 @@ class ReplayTest(ProxyTestCase):
             out.truncate(0)
             out.seek(0)
 
+    def test_a_served_line_is_not_judged_as_a_new_answer(self):
+        # Served, the model was not called: no LiteLLM headers, and nothing to save.
+        self.record(chat("t_11111111", stream=False))
+        _, port, out = self.replay()
+        self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
+        line = self.lines(1, out)[0]
+        self.assertTrue(line["served"])
+        self.assertEqual(line["unstorable"], [])
+        self.assertEqual((line["litellm_model_group"], line["litellm_attempted_fallbacks"]), (None, None))
+
     def test_a_non_streamed_hit(self):
         self.record(chat("t_11111111", stream=False))
         _, port, out = self.replay()
