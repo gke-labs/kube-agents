@@ -13,6 +13,13 @@ import (
 // line to cancelSentNotice with the Stop control gone, so the line a person
 // pressed is the one that answers. The relay leaves the line so
 // (ActiveTask.LineClosed) until its terminal edit makes it "canceled". A
+// stop typed on Google Chat with a line to answer on takes the same answer
+// (chatTypedStop): the word and the button read alike, one line and no
+// posts, where a DM's thread-less key would otherwise put the line, the
+// "cancel sent" post and the relay's "canceled" each in a message of its
+// own. A second typed stop while the cancel is pending moves "cancel
+// already sent" onto the line. The console and Discord keep the posts: they
+// draw no button, and the posted replies are their contract. A
 // second press while the cancel is pending has no button to land on; one
 // that arrives anyway, or one on a task a typed stop already detached,
 // closes the line if the first closing edit did not land, and otherwise
@@ -68,6 +75,38 @@ func (g *Gateway) chatStopPress(ctx context.Context, rec *SessionRecord, msg Inb
 		active.LineClosed = true
 	}
 	g.closePressedLine(rec, active, pressed)
+}
+
+// isChatTypedStop reports a stop typed on Google Chat: the word, from the
+// backend's own ingress, naming no task (a press names one, and so does a
+// program's cancel) and not a click.
+func isChatTypedStop(msg InboundMessage, backend string) bool {
+	return backend == gchatBackend && msg.TaskID == "" && !msg.Click
+}
+
+// chatTypedStop answers a stop typed on Google Chat on rec's active task,
+// which has a line: the quiet cancel, then the line closed on
+// cancelSentNotice, as a press is answered. A cancel that did not reach the
+// bus is said on the line, which keeps its control. A second stop while the
+// cancel is pending closes the line on cancelAlreadySentNotice, which also
+// lands the close a first edit missed. No message of the typist's is
+// touched: the typed message is not a line.
+func (g *Gateway) chatTypedStop(ctx context.Context, rec *SessionRecord, authority Authority) {
+	active := rec.ActiveTask
+	if active.Detached {
+		if g.closeLineOnPress(rec, active, cancelAlreadySentNotice) {
+			active.LineClosed = true
+		}
+		g.log.Info("chat typed stop on a task already stopping", "conversation", rec.Key, "taskId", active.TaskID)
+		return
+	}
+	if !g.cancelTaskVoiced(ctx, rec, authority, true) {
+		g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), active.TaskID)
+		return
+	}
+	if g.closeLineOnPress(rec, active, cancelSentNotice) {
+		active.LineClosed = true
+	}
 }
 
 // closeLineOnPress edits the active task's line to text with no Stop
