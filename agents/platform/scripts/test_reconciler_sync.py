@@ -325,9 +325,16 @@ class ConfigSyncTest(unittest.TestCase):
 
 class InputTest(unittest.TestCase):
     def test_a_merge_commit_that_is_not_a_full_id_is_refused(self):
-        for bad in ("", MERGE[:12], "main", MERGE + "0"):
+        for bad in ("", MERGE[:11], MERGE[:13], "main", MERGE + "0"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 rs.read_sync(ARGO_SYNCED_AT_MERGE, bad)
+
+    def test_bitbucket_clouds_abbreviated_merge_commit_matches_as_a_prefix(self):
+        reading = rs.read_sync(ARGO_SYNCED_AT_MERGE, MERGE[:12].upper())
+        self.assertEqual((reading.state, reading.revision), (rs.APPLIED, MERGE))
+        self.assertIn("applied the merge commit", reading.detail)
+        self.assertEqual(rs.read_sync(argo(revision=BEFORE), MERGE[:12], ancestry(False)).state, rs.PENDING)
+        self.assertEqual(rs.read_sync(flux(f"main@sha1:{MERGE}"), MERGE[:12]).state, rs.APPLIED)
 
     def test_a_sha256_merge_commit_is_accepted(self):
         sha256 = "a" * 64

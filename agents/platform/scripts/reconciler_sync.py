@@ -112,6 +112,10 @@ _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _FLUX_REVISION_RE = re.compile(r"(?:^|@sha1:|^sha1:|/)([0-9a-f]{40})$")
 _FLUX_SHA256_REVISION_RE = re.compile(r"(?:^|@sha256:|^sha256:|/)([0-9a-f]{64})$")
 
+# Bitbucket Cloud's `mergeCommit` is a 12-character abbreviation, compared with
+# a full id as a prefix (the proposal shape, test_providers_contract.py).
+_ABBREVIATED_MERGE_RE = re.compile(r"^[0-9a-f]{12}$")
+
 IsAncestor = Callable[[str, str], "bool | None"]
 
 
@@ -165,11 +169,16 @@ def _flux_commit(value: Any, from_repository: bool) -> str:
     return match.group(1) if match else ""
 
 
+def _is_merge(revision: str, merge: str) -> bool:
+    """Is `revision` the merge commit, which may be given abbreviated?"""
+    return revision == merge or (len(merge) < len(revision) and revision.startswith(merge))
+
+
 def _reaches(revision: str, merge: str, is_ancestor: IsAncestor | None) -> bool | None:
     """Does `revision` contain the merge commit? None when nobody can say."""
     if not revision:
         return None
-    if revision == merge:
+    if _is_merge(revision, merge):
         return True
     return is_ancestor(merge, revision) if is_ancestor is not None else None
 
@@ -196,7 +205,7 @@ def _settled(
     for rev in revisions:
         answer = _reaches(rev, merge, is_ancestor)
         if answer is True:
-            what = "the merge commit" if rev == merge else f"{_short(rev)}, which contains the merge commit"
+            what = "the merge commit" if _is_merge(rev, merge) else f"{_short(rev)}, which contains the merge commit"
             return SyncReading(APPLIED, reconciler, rev, f"applied {what} {_short(merge)}", health)
         answers.append(answer)
     shown = ", ".join(_short(r) for r in revisions)
@@ -361,13 +370,17 @@ def read_sync(obj: Mapping, merge_commit: str, is_ancestor: IsAncestor | None = 
     contains ``merge_commit``: True, False, or None when it cannot tell. It is
     called only for a revision that is not the merge commit.
 
-    Raises ValueError for a merge commit that is not a full Git object id or an
+    Raises ValueError for a merge commit that is not a full Git object id (or
+    Bitbucket Cloud's 12-character abbreviation, matched as a prefix) or an
     object of a kind this module does not read, and TypeError for an object
     that is not a mapping.
     """
-    merge = _commit(merge_commit)
+    text = str(merge_commit or "").strip().lower()
+    merge = _commit(text) or (text if _ABBREVIATED_MERGE_RE.match(text) else "")
     if not merge:
-        raise ValueError("merge_commit must be a full 40- or 64-character Git commit id")
+        raise ValueError(
+            "merge_commit must be a full 40- or 64-character Git commit id, or Bitbucket Cloud's 12-character abbreviation"
+        )
     if not isinstance(obj, Mapping):
         raise TypeError("the reconciler object must be a JSON object")
     group = str(obj.get("apiVersion") or "").split("/", 1)[0]
