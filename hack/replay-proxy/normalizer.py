@@ -14,6 +14,7 @@ matches one computed by another. Keep rules in this file for that reason.
 
 from __future__ import annotations
 
+import bisect
 import calendar
 import hashlib
 import json
@@ -150,7 +151,7 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 # dropped with it; the parenthesised zone (Hermes writes zone names, then
 # `UTC±HH:MM`) stays as written. A date-only ISO value and an `ls -l` date
 # with a year are day-counted the same way. Any of them with a time of day
-# beside it (time_near, Normalizer.timed) is left alone: day counting would
+# beside it (TimeIndex.near, Normalizer.timed) is left alone: day counting would
 # lose its time.
 LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
@@ -169,21 +170,20 @@ DATE_TODAY = "today"
 # timestamp no rule buckets (`2026-02-30 10:42`) still counts. Not a time of
 # day: digits with a word character or `:` right before them (`110:42`, the
 # `42:01` of `10:42:01`), Hermes's `UTC+00:00` offset, or a colon form running
-# into more digits (`80:8080`). A `-` before one does not stop it:
-# `2026-11-05-10:42` has a time. Dotted and compact shapes (`10.42.01`,
-# `1042Z`) are not read: they collide with versions (`v1.31.2`).
+# into more digits (`80:8080`). An escaped `\n`, `\r` or `\t` before one is a
+# boundary, not the word character `n`: `...\n10:42:01` in unparsed JSON has a
+# time. A `-` before one does not stop it either: `2026-11-05-10:42` has a
+# time. Dotted and compact shapes (`10.42.01`, `1042Z`) are not read: they
+# collide with versions (`v1.31.2`).
 TIME_OF_DAY_RE = re.compile(
-    r"(?<![\w:])(?<!UTC[+-])\d{1,2}(?::\d{2}(?::\d{2})?(?!\d)|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
+    r"(?:(?<=\\n)|(?<=\\r)|(?<=\\t)|(?<![\w:]))(?<!UTC[+-])"
+    r"\d{1,2}(?::\d{2}(?::\d{2})?(?!\d)|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
 )
 # How far, across line breaks, a time of day reaches a date that is not on its
-# line (time_near); a time anywhere on the date's own line always does.
+# line (TimeIndex.near); a time anywhere on the date's own line always does.
 TIME_NEAR_DATE_CHARS = 30
-# The longest time of day TIME_OF_DAY_RE matches (`10:42:01`, `10 p.m`): the
-# search starts and ends this far outside the window so a time overlapping its
-# edge is read whole, not cut.
-TIME_OF_DAY_MAX_CHARS = 8
 # Line breaks, real and JSON-escaped (a tool result can carry `\n` as text).
-LINE_BREAKS = ("\n", "\\n")
+LINE_BREAK_RE = re.compile(r"\n|\\n")
 # The shapes an answer may name a date in, read case-insensitively and
 # compared as dates (Mapping.answer_repeats_date), so a new spelling is a new
 # shape here, not a missed string. A letter or digit touching a shape stops
@@ -314,32 +314,42 @@ def time_bucket(when: float, now: float) -> str:
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
 
 
-def time_near(text: str, start: int, end: int) -> bool:
-    """Whether a time of day is on the line of text[start:end], or overlaps TIME_NEAR_DATE_CHARS either side of it.
+@dataclass(frozen=True)
+class TimeIndex:
+    """Where a string's times of day and line breaks are, found in one scan of the whole string.
 
-    `text` is a string after Normalizer.bucket_times, so a bucketed
-    timestamp's time is already gone. It is searched in place, not sliced, so
-    the lookbehinds see what is before the window and a time running past its
-    edge still matches.
+    The scan runs over the whole string, never a slice, so the lookbehinds
+    see what is before any window. Each date's question is then two bisects,
+    so a long line with thousands of dates costs its length once, not once
+    per date.
     """
-    # Each break is searched for only inside the line the previous one bounds,
-    # so finding a line costs its length, not the text's.
-    line_start, line_end = 0, len(text)
-    for brk in LINE_BREAKS:
-        before = text.rfind(brk, line_start, start)
-        if before >= 0:
-            line_start = before + len(brk)
-        after = text.find(brk, end, line_end)
-        if after >= 0:
-            line_end = after
-    window_start, window_end = start - TIME_NEAR_DATE_CHARS, end + TIME_NEAR_DATE_CHARS
-    pos = max(0, min(line_start, window_start) - TIME_OF_DAY_MAX_CHARS)
-    endpos = min(len(text), max(line_end, window_end) + TIME_OF_DAY_MAX_CHARS)
-    for m in TIME_OF_DAY_RE.finditer(text, pos, endpos):
-        on_line = m.start() >= line_start and m.end() <= line_end
-        if on_line or (m.end() > window_start and m.start() < window_end):
+
+    time_starts: List[int]
+    time_ends: List[int]
+    break_starts: List[int]
+    break_ends: List[int]
+    length: int
+
+    @classmethod
+    def of(cls, text: str) -> "TimeIndex":
+        times = [m.span() for m in TIME_OF_DAY_RE.finditer(text)]
+        breaks = [m.span() for m in LINE_BREAK_RE.finditer(text)]
+        return cls([a for a, _ in times], [b for _, b in times], [a for a, _ in breaks], [b for _, b in breaks],
+                   len(text))
+
+    def near(self, start: int, end: int) -> bool:
+        """Whether a time of day is on the line of [start, end), or overlaps TIME_NEAR_DATE_CHARS either side of it."""
+        before = bisect.bisect_right(self.break_ends, start) - 1
+        line_start = self.break_ends[before] if before >= 0 else 0
+        after = bisect.bisect_left(self.break_starts, end)
+        line_end = self.break_starts[after] if after < len(self.break_starts) else self.length
+        # Matches never overlap, so their ends are as sorted as their starts.
+        first_on_line = bisect.bisect_left(self.time_starts, line_start)
+        if first_on_line < len(self.time_starts) and self.time_ends[first_on_line] <= line_end:
             return True
-    return False
+        first_past_window_start = bisect.bisect_right(self.time_ends, start - TIME_NEAR_DATE_CHARS)
+        return (first_past_window_start < len(self.time_starts)
+                and self.time_starts[first_past_window_start] < end + TIME_NEAR_DATE_CHARS)
 
 
 def answer_dates(text: str) -> List[Tuple[Optional[int], int, int]]:
@@ -369,6 +379,17 @@ def day_bucket(days: int) -> str:
         span = next((label for limit, label in DAY_BUCKETS if abs(days) < limit), TIME_BUCKET_BEYOND)
         name = (TIME_FUTURE_PREFIX if days > 0 else TIME_PAST_PREFIX) + span
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
+
+
+def key_timed(key: Any) -> bool:
+    """Whether an object key holds a time of day. Keys go into the key as written, so a timestamp in one counts."""
+    return isinstance(key, str) and bool(TIME_OF_DAY_RE.search(key))
+
+
+def strip_recent_work(text: str) -> str:
+    """Drop the `## Recent work` digest, which the key leaves out (RECENT_WORK_RE)."""
+    text = RECENT_WORK_RE.sub(RECENT_WORK_STRIPPED, text)
+    return RECENT_WORK_ESCAPED_RE.sub(RECENT_WORK_ESCAPED_STRIPPED, text)
 
 
 @dataclass
@@ -473,40 +494,59 @@ class Normalizer:
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
         # Per-request caches: a string's parsed JSON document (nested_json),
-        # and whether a string or container holds a time of day (timed), so
-        # each subtree is parsed and read once however deep the walk goes.
+        # whether a string or container holds a time of day (timed), and a
+        # string's TimeIndex, so each is computed once however often it is asked.
         self.parsed: Dict[str, Any] = {}
         self.timed_strings: Dict[str, bool] = {}
-        self.timed_containers: Dict[int, bool] = {}
+        self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
+        self.time_indexes: Dict[str, TimeIndex] = {}
 
     # -- structure ---------------------------------------------------------
+    #
+    # What the key keeps of a value is decided once, by `replacement` (a value
+    # swapped whole for a token) and `kept_items` (the children walked, after
+    # dropping heartbeats). Both `walk` and `timed` read through them, so a time
+    # in something the key drops or replaces never decides a date.
 
-    def walk(self, obj: Any, key: Optional[str] = None, in_tool_call: bool = False) -> Any:
-        if key is not None and self.is_opaque(key, in_tool_call):
-            return self.opaque(obj)
-        if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
-            return self.epoch_token(str(obj), self.epoch_value(obj))
-        if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
-            return self.keyed_number(str(obj))
-        if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
-            return self.age(obj)
+    def walk(self, obj: Any, key: Optional[str] = None, in_tool_call: bool = False, is_tool_call: bool = False) -> Any:
+        """Normalize `obj`, found under `key`; `in_tool_call` when its parent is a tool call, `is_tool_call` when it is one."""
+        replace = self.replacement(obj, key, in_tool_call)
+        if replace is not None:
+            return replace()
         if isinstance(obj, str):
             return self.text(obj)
-        if isinstance(obj, list):
-            if key == EVENTS_KEY:
-                obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
-            beside = self.siblings_timed(obj)
-            return [self.beside(flag, lambda v=v: self.walk_dict(v, True)
-                                if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v))
-                    for v, flag in zip(obj, beside)]
-        if isinstance(obj, dict):
-            return self.walk_dict(obj, False)
+        if isinstance(obj, (list, dict)):
+            items = self.kept_items(obj, key, is_tool_call)
+            beside = self.siblings_timed(items)
+            walked = [self.beside(flag, lambda item=item: self.walk(*item)) for item, flag in zip(items, beside)]
+            if isinstance(obj, dict):
+                return {item[1]: value for item, value in zip(items, walked)}
+            return walked
         return obj
 
-    def walk_dict(self, obj: Dict[str, Any], in_tool_call: bool) -> Dict[str, Any]:
-        keys = sorted(obj)
-        beside = self.siblings_timed([obj[k] for k in keys])
-        return {k: self.beside(flag, lambda k=k: self.walk(obj[k], k, in_tool_call)) for k, flag in zip(keys, beside)}
+    def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
+        """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
+        if key is not None and self.is_opaque(key, in_tool_call):
+            return lambda: self.opaque(obj)
+        if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
+            return lambda: self.epoch_token(str(obj), self.epoch_value(obj))
+        if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
+            return lambda: self.keyed_number(str(obj))
+        if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
+            return lambda: self.age(obj)
+        return None
+
+    @staticmethod
+    def kept_items(obj: Any, key: Optional[str], is_tool_call: bool) -> List[Tuple[Any, Optional[str], bool, bool]]:
+        """The children `walk` keeps, as its arguments: (value, key or None, in_tool_call, is_tool_call).
+
+        A dict's keys come sorted; a kanban card's heartbeat events are dropped.
+        """
+        if isinstance(obj, dict):
+            return [(obj[k], k, is_tool_call, False) for k in sorted(obj)]
+        if key == EVENTS_KEY:
+            obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
+        return [(v, None, False, key == TOOL_CALLS_KEY and isinstance(v, dict)) for v in obj]
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
@@ -554,44 +594,51 @@ class Normalizer:
 
     # -- text --------------------------------------------------------------
 
-    def siblings_timed(self, values: List[Any]) -> List[bool]:
-        """For each value, whether another of `values` holds a time of day anywhere in it (timed).
+    def siblings_timed(self, items: List[Tuple[Any, Optional[str], bool, bool]]) -> List[bool]:
+        """For each of kept_items' children, whether a time of day is beside it: in another child, or in its own key.
 
-        A date's own string is read by time_near; this is for a date and its
-        time in different JSON values (`{"date": "2026-11-05", "time":
-        "10:42:01"}`, or one level apart), which the walk normalizes one string
-        at a time. Each request message is walked on its own
+        A date's own string is read by TimeIndex.near; this is for a date and
+        its time in different JSON values or keys (`{"date": "2026-11-05",
+        "time": "10:42:01"}`, or one level apart), which the walk normalizes one
+        string at a time. Each request message is walked on its own
         (normalize_request), so a time in one message never reaches another.
         """
-        timed = [self.timed(v) for v in values]
+        own_keys = [key_timed(item[1]) for item in items]
+        timed = [own_key or self.timed(*item) for item, own_key in zip(items, own_keys)]
         count = sum(timed)
-        return [count - own > 0 for own in timed]
+        return [own_key or count - own > 0 for own, own_key in zip(timed, own_keys)]
 
-    def timed(self, value: Any) -> bool:
-        """Whether a time of day is in `value`: in any string under it, read as a JSON document when it is one.
+    def timed(self, value: Any, key: Optional[str] = None, in_tool_call: bool = False, is_tool_call: bool = False) -> bool:
+        """Whether a time of day is in what the key keeps of `value` (same arguments as walk).
 
-        Times in timestamps a rule buckets do not count (bucket_times).
+        Reads every string and object key under it, a string as the JSON
+        document it holds when it holds one, through the walk's own
+        replacement and kept_items: a placeholder, a token or a dropped
+        heartbeat holds no time. Times in timestamps a rule buckets do not count
+        (bucket_times), nor do times in the recent-work digest the key strips.
         Cached per string and per container, so a subtree is read once.
         """
+        if self.replacement(value, key, in_tool_call) is not None:
+            return False
         if isinstance(value, str):
             if value not in self.timed_strings:
                 nested = self.nested_json(value)
-                self.timed_strings[value] = (self.timed(nested) if nested is not None
-                                             else bool(TIME_OF_DAY_RE.search(self.bucket_times(value))))
+                self.timed_strings[value] = (self.timed(nested) if nested is not None else
+                                             bool(TIME_OF_DAY_RE.search(self.bucket_times(strip_recent_work(value)))))
             return self.timed_strings[value]
         if isinstance(value, (dict, list)):
-            if id(value) not in self.timed_containers:
-                children = value.values() if isinstance(value, dict) else value
-                self.timed_containers[id(value)] = any(self.timed(v) for v in children)
-            return self.timed_containers[id(value)]
+            cache_key = (id(value), key, is_tool_call)
+            if cache_key not in self.timed_containers:
+                self.timed_containers[cache_key] = any(
+                    key_timed(item[1]) or self.timed(*item) for item in self.kept_items(value, key, is_tool_call))
+            return self.timed_containers[cache_key]
         return False
 
     def text(self, text: str) -> str:
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)
-        text = RECENT_WORK_RE.sub(RECENT_WORK_STRIPPED, text)
-        text = RECENT_WORK_ESCAPED_RE.sub(RECENT_WORK_ESCAPED_STRIPPED, text)
+        text = strip_recent_work(text)
         text = self.age_columns(text)
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
@@ -662,7 +709,7 @@ class Normalizer:
         return LONG_DATE_RE.sub(self.long_date, text)
 
     def bucket_times(self, text: str) -> str:
-        """Replace every timestamp a rule buckets, so no date reads its time as one beside it (time_near, timed)."""
+        """Replace every timestamp a rule buckets, so no date reads its time as one beside it (TimeIndex.near, timed)."""
         text = ISO_TS_RE.sub(self.iso_time, text)
         text = RFC1123_RE.sub(self.rfc1123, text)
         text = OPENSSL_TS_RE.sub(self.openssl, text)
@@ -683,16 +730,23 @@ class Normalizer:
         """The date `m` matched: days from the request's day (at `offset` from UTC), noted as unrestorable.
 
         Left as written when a time of day is beside it, in its own string
-        (time_near) or in a value of an enclosing JSON object or list (timed,
-        inherited through time_beside): day counting would drop what the time
-        says. The check is here so no date rule can skip it. A timestamp's time
-        is bucketed before this runs (bucket_times), so it does not count.
+        (TimeIndex.near, built once per string) or in a value or key of an
+        enclosing JSON object or list (timed, inherited through time_beside):
+        day counting would drop what the time says. The check is here so no
+        date rule can skip it. A timestamp's time is bucketed before this runs
+        (bucket_times), so it does not count; nor does anything the key drops.
         """
-        if self.time_beside or time_near(m.string, m.start(), m.end()):
+        if self.time_beside or self.time_index(m.string).near(m.start(), m.end()):
             return m.group(0)
         days = (when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days
         self.mapping.add_date(when, today=days == 0)
         return day_bucket(days)
+
+    def time_index(self, text: str) -> TimeIndex:
+        """The TimeIndex of `text`, built once per string: every date in one sub() pass shares it."""
+        if text not in self.time_indexes:
+            self.time_indexes[text] = TimeIndex.of(text)
+        return self.time_indexes[text]
 
     def iso_date(self, m: "re.Match[str]") -> str:
         year, month, day, hour = m.group(1), m.group(2), m.group(3), m.group(4)

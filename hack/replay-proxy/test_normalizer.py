@@ -4,6 +4,7 @@ import calendar
 import json
 import unittest
 from datetime import datetime
+from unittest import mock
 
 import normalizer
 
@@ -297,6 +298,50 @@ class LongDateTest(unittest.TestCase):
             with self.subTest(on_5th):
                 self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
 
+    def test_a_time_after_an_escaped_line_break_inside_a_json_string_is_read(self):
+        # Double-escaped: once parsed, the string still holds a two-character `\n`.
+        for on_5th, on_6th in (
+                # Beside the date in its own string.
+                ({"stdout": "Built 2026-11-05\\n10:42:01 ok"}, {"stdout": "Built 2026-11-06\\n10:42:01 ok"}),
+                # In a sibling string.
+                ({"date": "2026-11-05", "log": "ok\\n10:42 done"}, {"date": "2026-11-06", "log": "ok\\n10:42 done"})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_a_time_in_an_object_key_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (
+                ({"date": "2026-11-05", "slots": {"10:42": "booked"}}, {"date": "2026-11-06", "slots": {"10:42": "booked"}}),
+                # The date's own key.
+                ({"10:42": "2026-11-05"}, {"10:42": "2026-11-06"})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_what_the_key_drops_does_not_decide_a_date(self):
+        def card(events):
+            return {"task": {"id": "t_11111111", "due": "2026-11-05"}, "events": events}
+        claimed = {"kind": "claimed", "payload": None}
+        beat = {"kind": "heartbeat", "payload": {"note": "retrying at 10:42"}}
+        self.assertEqual(fp(request(json.dumps(card([claimed]))), now=self.at(2026, 11, 5)),
+                         fp(request(json.dumps(card([claimed, beat]))), now=self.at(2026, 11, 5)))
+        # Opaque values become placeholders, so a time-like run in one is no time.
+        signed = {"due": "2026-11-05", "signature": "c2lnbmF0dXJl 10:42 PM", "tool_call_id": "call_1__thought__10:42",
+                  "provider_specific_fields": {"at": "10:42"}}
+        self.assertEqual(json.loads(self.norm_at(json.dumps(signed), self.at(2026, 11, 5)))["due"], "⟦TIME_today⟧")
+        calls = {"due": "2026-11-05", "tool_calls": [{"id": "call_1__thought__10:42", "type": "function"}]}
+        self.assertEqual(normalizer.Normalizer(self.at(2026, 11, 5), False).walk(calls)["due"], "⟦TIME_today⟧")
+        # The recent-work digest is stripped from the key.
+        digest = {"due": "2026-11-05", "body": "## Recent work by @bot\n- t_22222222 at 10:42\n\nrest"}
+        self.assertEqual(json.loads(self.norm_at(json.dumps(digest), self.at(2026, 11, 5)))["due"], "⟦TIME_today⟧")
+
+    def test_a_line_of_dates_is_scanned_for_times_once(self):
+        # Each date asks about the same line; scanning it once per date made a
+        # long single-line text cost dates x length.
+        text = " ".join(["2026-11-05"] * 200)
+        with mock.patch.object(normalizer.TimeIndex, "of", wraps=normalizer.TimeIndex.of) as scan:
+            out = self.norm_at(text, self.at(2026, 11, 5))
+        self.assertEqual(out, " ".join(["⟦TIME_today⟧"] * 200))
+        self.assertEqual(scan.call_count, 1)
+
     def test_a_json_date_with_no_time_beside_it_still_counts_days(self):
         self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "status": "ok"}), self.at(2026, 11, 5)),
                          json.dumps({"date": "⟦TIME_today⟧", "status": "ok"}, ensure_ascii=False))
@@ -334,12 +379,14 @@ class LongDateTest(unittest.TestCase):
                          "listening on 80:8080 since ⟦TIME_today⟧")
 
     def test_a_time_just_before_the_window_is_read_with_what_precedes_it(self):
-        # Sliced, the window began at `10:42` and lost the `T` before it.
-        self.assertEqual(self.norm_at("seen 2026-11-05T10:42:00Z, next check due on: 2026-11-06", self.at(2026, 11, 5)),
-                         "seen ⟦TIME_past_hours⟧, next check due on: ⟦TIME_future_day⟧")
-        # A timestamp's zone offset is not a time of day either.
-        self.assertEqual(self.norm_at("seen 2026-11-05T10:42:00+05:30, due 2026-11-06", self.at(2026, 11, 5)),
-                         "seen ⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧")
+        # February 30th is no timestamp a rule buckets, so its `T10:42` stays in
+        # the text. The second date starts at 46, so its window starts at
+        # `10:42`: read from there alone, the `T` before it is lost and `10:42`
+        # looks like a time of day.
+        text = "seen 2026-02-30T10:42:00Z, next check due on: 2026-11-06"
+        self.assertEqual(text.index("2026-11-06") - normalizer.TIME_NEAR_DATE_CHARS, text.index("10:42"))
+        self.assertEqual(self.norm_at(text, self.at(2026, 11, 5)),
+                         "seen 2026-02-30T10:42:00Z, next check due on: ⟦TIME_future_day⟧")
 
     def test_a_time_on_the_line_or_past_the_window_edge_keeps_two_moments_apart(self):
         for on_5th in ("2026-11-05 | provisioning-cluster-request-never-creates | 10:42:01",
@@ -348,7 +395,9 @@ class LongDateTest(unittest.TestCase):
                        # On the line before, starting outside the window and ending inside it.
                        "10:42:01" + " " * 24 + "\n2026-11-05",
                        # A `-` before the time.
-                       "2026-11-05-10:42", "Nov  5 2026-10:42"):
+                       "2026-11-05-10:42", "Nov  5 2026-10:42",
+                       # A JSON-escaped line break before the time, in text that is not JSON.
+                       "2026-11-05\\n10:42", '{"stdout": "Built 2026-11-05\\n10:42:01 ok"'):
             with self.subTest(on_5th):
                 self.assert_moments_apart(on_5th, on_5th.replace("11-05", "11-06").replace("Nov  5", "Nov  6"))
 
