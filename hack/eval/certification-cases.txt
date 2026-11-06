@@ -24,6 +24,12 @@
 # pull request.
 
 # part 1
+# Capability row: observability, logging and Managed Prometheus; the
+# obtainability audit on a Deployment whose container is OOM-killed in a loop
+# (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
+# limit). A declared gap, expected_fail: no audit reads a container's OOMKilled
+# last termination or restart count; the gap is #2579.
+./tasks/observability-gmp-kube-state-metrics-oom/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on an admission webhook whose CA bundle certificate has expired (the
 # planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
