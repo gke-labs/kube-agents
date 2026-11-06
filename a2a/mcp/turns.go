@@ -82,20 +82,20 @@ const (
 	// DefaultConversation is the alias a call without one uses.
 	DefaultConversation = "default"
 
-	firstStepWaitWindow   = 6 * time.Second
-	nextStepWaitWindow    = 5 * time.Second
-	minStepBatchWait      = 600 * time.Millisecond
-	stepDebounceWait      = 350 * time.Millisecond
-	stepActivityWaitMax   = 1100 * time.Millisecond
-	stepPollWait          = 200 * time.Millisecond
-	stepPollIdleSleep     = 50 * time.Millisecond
-	delegationSettleGrace = 400 * time.Millisecond
-	// delegationFollowGrace is how long a streamed poll waits for the first
-	// task delegated from a finished, delegating root before it takes the
-	// root's own answer. The gateway's relay mints that task and can trail
-	// the root's terminal by up to its relayLagGrace (10 minutes by
+	firstStepWaitWindow = 6 * time.Second
+	nextStepWaitWindow  = 5 * time.Second
+	minStepBatchWait    = 600 * time.Millisecond
+	stepDebounceWait    = 350 * time.Millisecond
+	stepActivityWaitMax = 1100 * time.Millisecond
+	stepPollWait        = 200 * time.Millisecond
+	stepPollIdleSleep   = 50 * time.Millisecond
+	// delegationFollowGrace is how long a streamed poll of a finished,
+	// delegating root waits for its chain to answer (chainAnswered) before
+	// it takes the answer it has: the first delegated task, and the wake
+	// task the relay mints once a child ends, can each trail the task
+	// before them by up to the gateway's relayLagGrace (10 minutes by
 	// default), and the non-streamed wait (waitForChain) waits its whole
-	// wait for it; each poll inside the grace reports the turn still
+	// wait for them; each poll inside the grace reports the turn still
 	// running.
 	delegationFollowGrace = 10 * time.Minute
 	reportGatherBudget    = 5 * time.Second
@@ -615,7 +615,7 @@ type taskStepState struct {
 	prevReportedActs     int
 	lastReportedActs     int
 	lastWaitStepTitle    string
-	followEmptySince     time.Time
+	awaitAnswerSince     time.Time
 	settledDelegationsAt time.Time
 	settledFollowedCount int
 	followedRefs         []TaskRef
@@ -1812,9 +1812,20 @@ type FollowedTask struct {
 	Err  error
 }
 
-// delegationSettle is how long, once every followed task has finished,
-// WaitForTurn waits for another delegation before taking the last answer.
+// delegationSettle is how long, once every followed task has finished and
+// the chain has answered (chainAnswered), a wait (WaitForTurn, or a
+// streamed WaitForTurnStep) waits for another delegation before taking the
+// last answer.
 const delegationSettle = 2 * time.Second
+
+// chainAnswered is the rule both waits end a delegated chain on, together
+// with delegationSettle: a followed task other than the root has finished
+// with a result. A child's own result is only interim while the relay has
+// yet to mint the task that wakes the delegator with it.
+func chainAnswered(out TurnOutcome) bool {
+	return out.AnswerFrom != nil && *out.AnswerFrom != out.Root &&
+		out.Answer != nil && out.Answer.Final && out.Answer.Artifact(lib.ArtifactResult) != nil
+}
 
 // WaitForTurn waits, within wait, for the turn's task to finish and, when it
 // delegated (it carries a delegate artifact; a handoff to kanban cards is
@@ -2068,22 +2079,13 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 
 	waitedAny := waitedRoot
 	followedRefs := st.syncFollowedTasksLocked()
-	if len(followedRefs) == 0 {
-		if st.watch == nil {
-			out.Unfollowed = true
-			return out, true, waitedAny, nil
-		}
-		if st.followEmptySince.IsZero() {
-			st.followEmptySince = time.Now()
-		}
-		if time.Since(st.followEmptySince) >= delegationFollowGrace {
-			return out, true, waitedAny, nil
-		}
-		return out, false, waitedAny, nil
+	if len(followedRefs) == 0 && st.watch == nil {
+		out.Unfollowed = true
+		return out, true, waitedAny, nil
 	}
-	st.followEmptySince = time.Time{}
 
 	allFollowedFinal := true
+	unreadable := false
 	for _, fRef := range followedRefs {
 		convs.aliasTaskStepState(fRef, st)
 		ft, waitedChild, ferr := b.pollSingleTaskLocked(ctx, st, fRef)
@@ -2093,6 +2095,7 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 		out.Followed = append(out.Followed, FollowedTask{Ref: fRef, Task: ft, Err: ferr})
 		if tooLargeToRead(ferr) {
 			st.failedTasks[fRef] = ferr
+			unreadable = true
 			continue
 		}
 		if ferr != nil {
@@ -2109,12 +2112,27 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 		}
 	}
 
+	// The chain ends as waitForChain ends it: on an answer with a result
+	// (chainAnswered) and delegationSettle with nothing new. Two cases end
+	// it without one, where waiting on could not bring one into view: a
+	// state with no watch finds no further delegated task, and a followed
+	// task too large to read is never read again.
+	ended := chainAnswered(out) || st.watch == nil || unreadable
+	if allFollowedFinal && !ended {
+		st.settledFollowedCount = 0
+		st.settledDelegationsAt = time.Time{}
+		if st.awaitAnswerSince.IsZero() {
+			st.awaitAnswerSince = time.Now()
+		}
+		return out, time.Since(st.awaitAnswerSince) >= delegationFollowGrace, waitedAny, nil
+	}
+	st.awaitAnswerSince = time.Time{}
 	if allFollowedFinal {
 		if st.settledDelegationsAt.IsZero() || len(followedRefs) != st.settledFollowedCount {
 			st.settledFollowedCount = len(followedRefs)
 			st.settledDelegationsAt = time.Now()
 		}
-		if time.Since(st.settledDelegationsAt) >= delegationSettleGrace {
+		if time.Since(st.settledDelegationsAt) >= delegationSettle {
 			return out, true, waitedAny, nil
 		}
 	} else {
@@ -2311,7 +2329,7 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 			settledAt = time.Time{}
 			continue
 		}
-		if out.AnswerFrom != nil && *out.AnswerFrom != root {
+		if chainAnswered(out) {
 			if settledAt.IsZero() {
 				settledAt = time.Now()
 			} else if time.Since(settledAt) >= delegationSettle {

@@ -1707,9 +1707,9 @@ func TestWaitForTurnStepPersistsDelegationSettleAcrossShortPolls(t *testing.T) {
 	}
 	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
 
-	// Poll exclusively with a 100ms wait (< delegationSettleGrace = 400ms);
+	// Poll exclusively with a 100ms wait (< delegationSettle = 2s);
 	// settledDelegationsAt on taskStepState must persist across calls and settle.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(delegationSettle + 2*time.Second)
 	settled := false
 	for time.Now().Before(deadline) {
 		stepOut, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 100*time.Millisecond)
@@ -1724,6 +1724,87 @@ func TestWaitForTurnStepPersistsDelegationSettleAcrossShortPolls(t *testing.T) {
 	}
 	if !settled {
 		t.Fatal("delegated turn never settled across short-window WaitForTurnStep polls")
+	}
+}
+
+// A streamed delegated turn whose wake task trails its child's end (the
+// relay's lag) settles on the wake task's answer, as the non-streamed wait
+// does: not on the child's interim result inside delegationSettle, and not
+// at all while no task has answered with a result.
+func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		childResult bool
+		lag         time.Duration
+	}{
+		{"child with a result", true, time.Second},
+		{"child without a result", false, delegationSettle + time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url, js := testBus(t)
+			nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(nc.Close)
+			rootID, childID, wakeID := "task-lag-root", "task-lag-child", "task-lag-wake"
+			_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+				conv := "console:" + strings.Split(m.Subject, ".")[2]
+				var f ConsoleInFrame
+				if json.Unmarshal(m.Data, &f) != nil {
+					return
+				}
+				publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+				publishRun(t, js, fakeAddressee, rootID, "", false)
+				publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactDelegate, "cluster-a: inspect")
+				publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+				publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+				publishRun(t, js, "cluster-a", childID, "child notes", tc.childResult)
+				if !tc.childResult {
+					publishStatus(t, js, "cluster-a", childID, lib.StateCompleted, true)
+				}
+				go func() {
+					time.Sleep(tc.lag)
+					publishSubmission(t, js, fakeAddressee, wakeID, conv, "child finished", childID)
+					publishRun(t, js, fakeAddressee, wakeID, wakeAnswer, true)
+				}()
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := nc.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			b := dial(t, url)
+			convs := NewConversations().WithEvents(b.Events())
+			token, _, err := convs.ResolveCall("", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", 5*time.Second)
+			if err != nil || res.Task == nil {
+				t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+			}
+			convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+			var out TurnStepOutcome
+			for i := 0; i < 40; i++ {
+				out, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 60*time.Second)
+				if err != nil {
+					t.Fatalf("WaitForTurnStep: %v", err)
+				}
+				if !out.StillRunning {
+					break
+				}
+			}
+			if out.StillRunning {
+				t.Fatal("the streamed delegated turn never settled")
+			}
+			_, _, txt := FormatTurnCustomToolEnvelope(out)
+			if out.Outcome.AnswerFrom == nil || out.Outcome.AnswerFrom.TaskID != wakeID {
+				t.Errorf("answer from %v; want %s/%s", out.Outcome.AnswerFrom, fakeAddressee, wakeID)
+			}
+			mustContain(t, txt, wakeAnswer)
+		})
 	}
 }
 
