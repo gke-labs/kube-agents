@@ -19,7 +19,7 @@
 # .agents/rules/eval_driven_development.md asks.
 #
 # WHAT IS GRADED. The Planning Agent's own reply, which both transports carry
-# as the answer text: the composed submission (a summary line, the kind Bug,
+# as the answer text: the composed submission (a summary line, the kind,
 # a "what happened" section that keeps the user's words), the public-issue
 # warning, the offer of the usage summary, and a closing question. The same
 # two safeguards as the earlier case: no card before the yes (a tool_called
@@ -72,7 +72,11 @@ verification_spec:
         # offer's own "usage summary" is excluded, or the heading could never
         # be missing from a reply that makes the offer.
         - '(?i)\b(?<!usage )(?:summary|title)\b'
-        - '(?i)\bbug\b'
+        # The kind. The prompt's "once a day would do" reads as a bug or as a
+        # request, and the red run on main labelled it Feature request with
+        # the rest of the draft in order; either label is the composed kind,
+        # and the label is not what this case grades.
+        - '(?i)\b(?:bug|feature request)\b'
         - "(?i)what happened"
         - "(?i)twice a day"
         - "(?i)public issue"
