@@ -203,7 +203,9 @@ SERVICE_API_PORT = 8642
 # Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
 # recorded a condition under which no answer can be graded: transport exhausted,
 # the server reporting a provider rate limit or billing stop on the opening turn,
-# or a delegated worker encountering quota exhaustion before acting.
+# or a delegated worker's card blocked by its rate-limit guardrail with no
+# completion or block call of the worker's own and no artifact (#4998),
+# whether or not the worker acted first.
 # ``scoring.py`` matches this string on a record's error and classifies the repetition
 # as infrastructure rather than grading it. The literal is duplicated there (importing
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
@@ -238,6 +240,17 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
+# The block kind the worker's rate-limit guardrail files
+# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
+# test_harness.py holds the two equal) and the status it leaves the card in.
+_GUARDRAIL_BLOCK_KIND = "transient"
+_GUARDRAIL_BLOCK_STATUS = "blocked"
+# The verbs by which a worker closes or blocks its own card. The guardrail
+# blocks from the exit path with no tool call, so a card whose worker made
+# one of these calls was closed by the model, whatever text it carries.
+_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
+
+
 def _is_substantive_worker_action(name: str | None) -> bool:
     """Whether a tool entry recorded for a delegated worker constitutes substantive action.
 
@@ -251,7 +264,7 @@ def _is_substantive_worker_action(name: str | None) -> bool:
     if not name:
         return False
     # Worker terminal verbs that complete or block cards
-    if name in {"kanban_complete", "kanban_block"}:
+    if name in _WORKER_CARD_VERBS:
         return True
     # Terminal, shell, and direct command execution
     if name in {"terminal", "bash", "sh", "exec", "shell", "kubectl", "gcloud"}:
@@ -997,16 +1010,30 @@ def _guardrail_blocked_cards(
     and its newest run summary opens on the guardrail's prefix with a
     rate-limit or billing reason, no artifact was produced for it, and the
     captured worker trajectory (present, or nothing counts) holds no
-    ``kanban_block`` or ``kanban_complete`` call for it. One card that reads
-    otherwise is a delivery, and the run is graded on it.
+    ``kanban_block`` or ``kanban_complete`` call for it, nor a wrapper call
+    that could hide one. One card that reads otherwise is a delivery, and the
+    run is graded on it.
     """
     if not awaited or on_board is None or captured is None:
         return []
+    # A ``tool_call`` wrapper whose arguments cannot be read (not a dict, a
+    # clipped ``raw`` string, no names) may hold the worker's own close, as
+    # #3988 counts it as acted; it is read as a close here too, fail closed.
     closed_by_worker = {
         str(e.get("task"))
         for e in captured.entries
         if isinstance(e, dict)
-        and ({e.get("name")} | worker_trajectory.wrapped_tool_names(e)) & _WORKER_CARD_VERBS
+        and (
+            ({e.get("name")} | worker_trajectory.wrapped_tool_names(e)) & _WORKER_CARD_VERBS
+            or (
+                e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER
+                and (
+                    not isinstance(e.get("args"), dict)
+                    or isinstance(e.get("args", {}).get("raw"), str)
+                    or not worker_trajectory.wrapped_tool_names(e)
+                )
+            )
+        )
     }
     blocked: list[str] = []
     for tid in awaited:
@@ -1094,15 +1121,6 @@ def _canonical_session_tokens(
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
-# The block kind the worker's rate-limit guardrail files
-# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
-# test_harness.py holds the two equal) and the status it leaves the card in.
-_GUARDRAIL_BLOCK_KIND = "transient"
-_GUARDRAIL_BLOCK_STATUS = "blocked"
-# The verbs by which a worker closes or blocks its own card. The guardrail
-# blocks from the exit path with no tool call, so a card whose worker made
-# one of these calls was closed by the model, whatever text it carries.
-_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
 
 
 def _is_rate_limited_triage(

@@ -5285,9 +5285,10 @@ def _settle_after_guardrail_block(
     cards: dict[str, harness.board.BoardCard] | None,
     artifact_paths: list[str] = (),
     front_trajectory: list[dict[str, object]] | None = None,
+    awaited: list[str] = ("t_1",),
 ) -> harness.AgentResult:
-    """Settle one awaited card ``t_1`` with the board, the capture and the
-    artifacts faked; ``entries=None`` is a capture that could not run."""
+    """Settle the awaited cards (``t_1`` by default) with the board, the capture
+    and the artifacts faked; ``entries=None`` is a capture that could not run."""
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": harness._WorkerLog("log", "100", "100")})
     monkeypatch.setattr(
         harness.worker_trajectory,
@@ -5302,7 +5303,7 @@ def _settle_after_guardrail_block(
     res = harness.AgentResult(
         output="router ack", trajectory=list(front_trajectory or [{"name": "kanban_create"}])
     )
-    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+    harness.KubeAgentsHarness._settle(res, [], list(awaited))
     return res
 
 
@@ -5342,6 +5343,42 @@ def test_settle_keeps_a_card_the_worker_completed_under_the_tool_call_wrapper_gr
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, raw='{"name": "kanban_bl'),
+        {**_worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER), "args": "kanban_block(...)"},
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, calls=[{"arguments": {}}]),
+    ],
+    ids=["clipped-raw", "string-args", "no-names"],
+)
+def test_settle_keeps_a_card_graded_when_a_wrapper_call_could_hide_the_workers_close(
+    wrapper: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable ``tool_call`` wrapper may hold the worker's own kanban_block:
+    #3988 counts it as acted, and here it fails closed to graded."""
+    assert not harness.worker_trajectory.wrapped_tool_names(wrapper)
+    res = _settle_after_guardrail_block(monkeypatch, entries=[*_ACTED, wrapper], cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_fan_out_graded_when_one_card_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every awaited card has to be the guardrail's block: one that completed is
+    a delivery the run is graded on."""
+    cards = {**_GUARDRAIL_CARD, "t_2": harness.board.BoardCard("done", "The pods are healthy.", None, None)}
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=cards, awaited=["t_1", "t_2"]
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    both = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards={**_GUARDRAIL_CARD, "t_2": _GUARDRAIL_CARD["t_1"]},
+        awaited=["t_1", "t_2"],
+    )
+    assert both.errors and "blocked t_1, t_2" in both.errors[0]
+
+
 def test_settle_keeps_a_guardrail_blocked_card_with_an_artifact_graded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5371,8 +5408,11 @@ def test_settle_keeps_a_guardrail_blocked_card_graded_when_the_capture_is_missin
         harness.board.BoardCard("blocked", "Two clusters run it. Which one?", None, "transient"),
         harness.board.BoardCard("done", _GUARDRAIL_SUMMARY, None, "transient"),
         harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, None),
+        harness.board.BoardCard(
+            "blocked", "HTTP 429 (failure_reason=rate_limit): TPM quota exhausted", None, "transient"
+        ),
     ],
-    ids=["question-kind", "other-reason", "done", "no-kind"],
+    ids=["question-kind", "other-reason", "done", "no-kind", "reason-without-the-guardrail-prefix"],
 )
 def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
     card: harness.board.BoardCard, monkeypatch: pytest.MonkeyPatch
