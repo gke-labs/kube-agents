@@ -1430,7 +1430,9 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
             file=sys.stderr,
         )
         return 1
-    if payload.get("code") in POLICY_BLOCKED_CODES:
+    # The far side composes the payload: a `code` that is not a string (a
+    # list, an object) is not a refusal code, and must not raise out of here.
+    if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
         print(
             payload.get("message", "Command blocked for security reasons."),
             file=sys.stderr,

@@ -3069,6 +3069,17 @@ class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertEqual("no\n", err)
 
+    def test_a_code_that_is_not_a_string_is_a_plain_error_and_not_a_traceback(self):
+        # Membership in the code set is asked only of a string: a JSON body
+        # whose `code` is a list or an object (not hashable) is the far
+        # side's to compose and reads as the plain error it is.
+        for code_value in (["x"], {"k": "v"}, None, 7):
+            with self.subTest(code=code_value):
+                code, err, opened = self._refused_with({"status": "blocked", "code": code_value, "error": "no"})
+                self.assertEqual(1, code)
+                self.assertEqual("no\n", err)
+                self.assertEqual(1, len(opened))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
