@@ -551,7 +551,8 @@ func (r *AgentProfileReconciler) deleteOwnServiceAccount(ctx context.Context, p 
 	return client.IgnoreNotFound(r.Delete(ctx, &sa, client.Preconditions{UID: &sa.UID}))
 }
 
-// writeStatus records both conditions.
+// writeStatus records the three conditions: IdentityReady, CardPublished and
+// JobResourcesFit.
 func (r *AgentProfileReconciler) writeStatus(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, sa, idReason, idMsg, cardReason, cardMsg string, identityReady bool) error {
 	before := p.Status.DeepCopy()
 	p.Status.ObservedGeneration = p.Generation
