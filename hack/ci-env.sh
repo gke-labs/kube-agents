@@ -276,12 +276,15 @@ readonly REPLAY_MODE_STOP_WAIT_SECONDS=255
 # beside its logs (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_LANE_CACHE_MAX_AGE_HOURS=30
 readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
-# The proxy Deployment and its mode variable, read back by the eval so its
-# collector runs in the mode the deploy installed.
+# The proxy Deployment, and the variable the chart stamps the mode into
+# (charts/kube-agents/templates/litellm.yaml). The deploy decides the mode once;
+# the eval reads it back so its collector runs in the mode the proxy runs in.
 readonly REPLAY_SHADOW_DEPLOYMENT="inference-replay-shadow"
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
 readonly REPLAY_SHADOW_KUBECTL_TIMEOUT="30s"
-readonly REPLAY_SHADOW_JSONPATH_SEPARATOR="|"
+# A postsubmit records only on this branch; a periodic checks out main by its
+# job's extra_refs and carries no PULL_BASE_REF.
+readonly REPLAY_RECORD_BRANCH="main"
 readonly REPLAY_SHADOW_PULL_REFS=(PULL_NUMBER PULL_BASE_REF PULL_BASE_SHA PULL_PULL_SHA PULL_REFS)
 # A bucket name of 3-63 characters (dotted names past 63 are not accepted),
 # and the shapes of the tags that become object paths.
@@ -523,10 +526,11 @@ collect_credential_proxy_evidence() {
 #   main's (eval-design.md, "The proxy can't come from the pull request").
 #   Filed as replay-lane. Asked for by name, so every refusal is an error;
 #   there is no default to fall back to.
-# - record, on a nightly whose uploads run as REPLAY_SHADOW_NIGHTLY_RECORDER
-#   with no impersonation or token override, unless EVAL_REPLAY_RECORD=false.
-#   Anything else stays in shadow mode with a note; EVAL_REPLAY_RECORD=true
-#   makes that an error instead. A presubmit or batch run never records.
+# - record, on a periodic or a postsubmit of REPLAY_RECORD_BRANCH whose uploads
+#   run as REPLAY_SHADOW_NIGHTLY_RECORDER with no impersonation or token
+#   override, unless EVAL_REPLAY_RECORD=false. Anything else stays in shadow
+#   mode with a note; EVAL_REPLAY_RECORD=true makes that an error instead. A
+#   presubmit never records, and a batch run gets no proxy at all.
 # - shadow, otherwise.
 _replay_shadow_unusable() {
   if [ "${REPLAY_SHADOW_EXPLICIT}" = "true" ]; then
@@ -565,18 +569,13 @@ _replay_shadow_upload_identity() {
   echo "${account:-(no active gcloud account)}"
 }
 
-# The mode hack/ci-deploy.sh installed the proxy in (REPLAY_SHADOW_PROXY_MODE_VAR
-# on REPLAY_SHADOW_DEPLOYMENT; shadow when the variable is absent), or nothing
-# when the Deployment can't be read.
-_replay_shadow_deployed_mode() {
-  # The name first, so an unreadable Deployment is told from one without the variable.
-  local jsonpath="{.metadata.name}{\"${REPLAY_SHADOW_JSONPATH_SEPARATOR}\"}{.spec.template.spec.containers[?(@.name==\"${REPLAY_SHADOW_CONTAINER}\")].env[?(@.name==\"${REPLAY_SHADOW_PROXY_MODE_VAR}\")].value}"
-  local read
-  read="$(kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} --request-timeout="${REPLAY_SHADOW_KUBECTL_TIMEOUT}" \
-    -n "$1" get deployment "${REPLAY_SHADOW_DEPLOYMENT}" -o "jsonpath=${jsonpath}" 2>/dev/null)" || return 0
-  [ "${read%%"${REPLAY_SHADOW_JSONPATH_SEPARATOR}"*}" = "${REPLAY_SHADOW_DEPLOYMENT}" ] || return 0
-  local mode="${read#*"${REPLAY_SHADOW_JSONPATH_SEPARATOR}"}"
-  echo "${mode:-${REPLAY_MODE_SHADOW}}"
+# Prints one variable ($2) of the proxy container on REPLAY_SHADOW_DEPLOYMENT in namespace $1, as
+# hack/ci-deploy.sh installed it, or nothing when it can't be read or isn't
+# set. (gke-labs/kube-agents#4982 reads REPLAY_JOB_KIND back the same way.)
+_replay_shadow_deployed_env() {
+  local jsonpath="{.spec.template.spec.containers[?(@.name==\"${REPLAY_SHADOW_CONTAINER}\")].env[?(@.name==\"$2\")].value}"
+  kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} --request-timeout="${REPLAY_SHADOW_KUBECTL_TIMEOUT}" \
+    -n "$1" get deployment "${REPLAY_SHADOW_DEPLOYMENT}" -o "jsonpath=${jsonpath}" 2>/dev/null || true
 }
 
 # The replay lane's half of resolve_replay_shadow: every refusal an error.
@@ -751,7 +750,13 @@ resolve_replay_shadow() {
   local mode="${REPLAY_MODE_SHADOW}" cache_bucket="" identity
   if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
     identity="$(_replay_shadow_upload_identity)"
-    if [ "${identity}" = "${REPLAY_SHADOW_NIGHTLY_RECORDER}" ]; then
+    if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ "${PULL_BASE_REF:-}" != "${REPLAY_RECORD_BRANCH}" ]; then
+      if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
+        echo "ERROR: EVAL_REPLAY_RECORD=true on a postsubmit of '${PULL_BASE_REF:-}': only ${REPLAY_RECORD_BRANCH} records into the shared replay cache." >&2
+        return 1
+      fi
+      echo "Replay proxy: shadow mode, not record: a postsubmit of '${PULL_BASE_REF:-}' is not ${REPLAY_RECORD_BRANCH}." >&2
+    elif [ "${identity}" = "${REPLAY_SHADOW_NIGHTLY_RECORDER}" ]; then
       cache_bucket="$(_replay_cache_bucket)" || return 1
       mode="${REPLAY_MODE_RECORD}"
     elif [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
@@ -850,12 +855,26 @@ start_replay_shadow_collector() {
   local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
   mkdir -p "${artifact_dir}" 2>/dev/null || true
-  local mode="${REPLAY_SHADOW_MODE}" final_deadline="${REPLAY_SHADOW_COLLECTOR_FINAL_DEADLINE_SECONDS}"
-  if [ "${mode}" = "${REPLAY_MODE_RECORD}" ]; then
-    local deployed
-    deployed="$(_replay_shadow_deployed_mode "${namespace}")"
-    if [ "${deployed}" != "${REPLAY_MODE_RECORD}" ]; then
-      echo "WARNING: the proxy was installed in mode '${deployed}', not record; the collector runs in shadow mode and this night publishes nothing to the replay cache." >&2
+  local mode="${REPLAY_SHADOW_MODE}" final_deadline="${REPLAY_SHADOW_COLLECTOR_FINAL_DEADLINE_SECONDS}" deployed
+  # The deploy decided the mode; the collector follows the proxy, so a proxy
+  # recording is always emptied, whatever this shell's own check answers.
+  deployed="$(_replay_shadow_deployed_env "${namespace}" "${REPLAY_SHADOW_PROXY_MODE_VAR}")"
+  case "${deployed}" in
+  "${REPLAY_MODE_RECORD}" | "${REPLAY_MODE_REPLAY}")
+    if [ "${deployed}" != "${mode}" ]; then
+      echo "Replay proxy: the collector runs in ${deployed} mode, the mode the deploy installed, not ${mode} from this shell's own check." >&2
+    fi
+    mode="${deployed}"
+    ;;
+  "")
+    echo "Replay proxy: could not read the installed mode (or it is shadow); the collector runs in ${mode} mode from this shell's own check." >&2
+    ;;
+  *)
+    echo "WARNING: ${REPLAY_SHADOW_DEPLOYMENT} reads ${REPLAY_SHADOW_PROXY_MODE_VAR}='${deployed}'; the collector runs in ${mode} mode." >&2
+    ;;
+  esac
+  if [ "${mode}" = "${REPLAY_MODE_RECORD}" ] && [ -z "${REPLAY_CACHE_BUCKET:-}" ]; then
+    if ! REPLAY_CACHE_BUCKET="$(_replay_cache_bucket)"; then
       mode="${REPLAY_MODE_SHADOW}"
     fi
   fi
@@ -921,7 +940,7 @@ prepare_replay_lane_cache() {
   resolve_replay_shadow || return 1
   [ "${REPLAY_SHADOW_MODE}" = "${REPLAY_MODE_REPLAY}" ] || return 0
   local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" deployed work
-  deployed="$(_replay_shadow_deployed_mode "${namespace}")"
+  deployed="$(_replay_shadow_deployed_env "${namespace}" "${REPLAY_SHADOW_PROXY_MODE_VAR}")"
   if [ "${deployed}" != "${REPLAY_MODE_REPLAY}" ]; then
     echo "ERROR: the replay lane needs the proxy installed in replay mode; ${REPLAY_SHADOW_DEPLOYMENT} reads '${deployed}'." >&2
     return 1

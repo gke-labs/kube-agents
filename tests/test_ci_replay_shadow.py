@@ -227,7 +227,7 @@ class RecordModeResolveTest(unittest.TestCase):
     def test_a_nightly_uploading_as_the_recorder_records_into_the_cache_bucket(self):
         for job_type in ("periodic", "postsubmit"):
             with self.subTest(job_type=job_type):
-                values, err = _resolve(JOB_TYPE=job_type, FAKE_ACCOUNT=_RECORDER)
+                values, err = _resolve(JOB_TYPE=job_type, FAKE_ACCOUNT=_RECORDER, PULL_BASE_REF="main")
                 self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]),
                                  ("0", "nightly", "record", "kube-agents-replay-cache"))
                 self.assertEqual(err, "")
@@ -244,6 +244,24 @@ class RecordModeResolveTest(unittest.TestCase):
         values, err = _resolve(FAKE_ACCOUNT=_RECORDER, FAKE_OVERRIDE="someone@example.iam.gserviceaccount.com")
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("is set, so gcloud does not upload as its active account", err)
+
+    def test_a_postsubmit_records_only_on_main(self):
+        values, _ = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="main", FAKE_ACCOUNT=_RECORDER)
+        self.assertEqual(values["mode"], "record")
+        for ref in ("release-0.21", "", None):
+            with self.subTest(ref=ref):
+                values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF=ref, FAKE_ACCOUNT=_RECORDER)
+                self.assertEqual((values["rc"], values["mode"]), ("0", "shadow"))
+                self.assertIn("is not main", err)
+        values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="release-0.21", FAKE_ACCOUNT=_RECORDER,
+                               EVAL_REPLAY_RECORD="true")
+        self.assertEqual(values["rc"], "1")
+
+    def test_the_build_id_shape_is_the_publishers(self):
+        sys.path.insert(0, str(_ROOT / "hack" / "replay-proxy"))
+        import publish_cache
+        shape = re.search(r"^readonly REPLAY_SHADOW_BUILD_RE='\^(.*)\$'$", _CI_ENV.read_text(), re.MULTILINE)
+        self.assertEqual(shape.group(1), publish_cache.BUILD_PATTERN)
 
     def test_without_gcloud_it_never_records(self):
         path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if not os.path.exists(os.path.join(p, "gcloud")))
@@ -444,7 +462,7 @@ class _LifecycleBase(unittest.TestCase):
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         (self.bin / "gcloud").write_text(_FAKE_GCLOUD)
-        # The proxy Deployment's name and mode, as _replay_shadow_deployed_mode reads them.
+        # The proxy's installed mode, as _replay_shadow_deployed_env reads it.
         (self.bin / "kubectl").write_text('#!/usr/bin/env bash\nprintf "%s" "${FAKE_DEPLOYED:-}"\n')
         for tool in ("gcloud", "kubectl"):
             (self.bin / tool).chmod(0o755)
@@ -470,7 +488,7 @@ class _LifecycleBase(unittest.TestCase):
                                    _constants(text, "REPLAY_"), flags=re.MULTILINE)
         assert count == 1, f"expected one REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS in {_CI_ENV}, replaced {count}"
         functions = "".join(lift_function(n, text, _CI_ENV) for n in (
-            *_RESOLVE, "_replay_shadow_deployed_mode", "start_replay_shadow_collector",
+            *_RESOLVE, "_replay_shadow_deployed_env", "start_replay_shadow_collector",
             "signal_replay_shadow_collector", "wait_replay_shadow_collector"))
         return ("set -euo pipefail\n" + constants + f"REPLAY_SHADOW_COLLECTOR_SCRIPT={str(self.fake)!r}\n"
                 + 'REPLAY_SHADOW_COLLECTOR_PID=""\n' + functions + body)
@@ -587,7 +605,7 @@ class ModeCollectorTest(_LifecycleBase):
         return proc
 
     def test_a_trusted_nightly_installed_in_record_mode_collects_and_publishes(self):
-        proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED="inference-replay-shadow|record")
+        proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record")
         argv, pairs = self._argv_pairs()
         self.assertEqual(pairs["--mode"], "record")
         self.assertEqual(pairs["--publish-bucket"], "kube-agents-replay-cache")
@@ -598,20 +616,22 @@ class ModeCollectorTest(_LifecycleBase):
         self.assertNotIn(str(self.artifacts), pairs["--keep-dir"], "kept answers stay out of the public artifacts")
         self.assertIn("wait=255", proc.stdout)
 
-    def test_a_proxy_installed_in_shadow_mode_keeps_the_collector_in_shadow(self):
-        for deployed in ("inference-replay-shadow|", "inference-replay-shadow|shadow", ""):
-            with self.subTest(deployed=deployed):
-                self.argv.unlink(missing_ok=True)
-                proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED=deployed)
-                argv, _ = self._argv_pairs()
-                self.assertNotIn("--mode", argv)
-                self.assertNotIn("--publish-bucket", argv)
-                self.assertIn("runs in shadow mode", proc.stderr)
+    def test_a_recording_proxy_is_always_collected_in_record_mode(self):
+        # The deploy decided record; this shell's own account check now fails
+        # (gcloud auth list flaked). The collector still empties the cache.
+        proc = self._start(FAKE_ACCOUNT="", FAKE_DEPLOYED="record")
+        _, pairs = self._argv_pairs()
+        self.assertEqual((pairs["--mode"], pairs["--publish-bucket"]), ("record", "kube-agents-replay-cache"))
+        self.assertIn("the mode the deploy installed", proc.stderr)
 
-    def test_an_untrusted_nightly_never_publishes_whatever_was_installed(self):
-        self._start(FAKE_DEPLOYED="inference-replay-shadow|record")
-        argv, _ = self._argv_pairs()
-        self.assertNotIn("--publish-bucket", argv)
+    def test_a_shadow_proxy_or_an_unreadable_one_follows_this_shells_check(self):
+        for account, deployed, mode in ((_PROW_RUNNER, "", None), (_PROW_RUNNER, "shadow", None),
+                                        (_RECORDER, "", "record")):
+            with self.subTest(account=account, deployed=deployed):
+                self.argv.unlink(missing_ok=True)
+                self._start(FAKE_ACCOUNT=account, FAKE_DEPLOYED=deployed)
+                argv, pairs = self._argv_pairs()
+                self.assertEqual(pairs.get("--mode"), mode)
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
@@ -662,7 +682,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertEqual(calls, [])
 
     def test_it_fetches_then_seeds_every_pod(self):
-        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="inference-replay-shadow|replay")
+        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["fetch", "seed"])
         self.assertIn("--bucket kube-agents-replay-cache", calls[0])
@@ -672,7 +692,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn("--mode replay", calls[1])
 
     def test_a_proxy_not_installed_in_replay_mode_stops_the_lane(self):
-        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="inference-replay-shadow|shadow")
+        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="shadow")
         self.assertIn("rc=1", proc.stdout)
         self.assertEqual(calls, [])
 
@@ -680,7 +700,7 @@ class PrepareLaneCacheTest(_LifecycleBase):
         for overrides, expected in (({"FAKE_FETCH_RC": "1"}, ["fetch"]), ({"FAKE_SEED_RC": "1"}, ["fetch", "seed"])):
             with self.subTest(**overrides):
                 self.calls.unlink(missing_ok=True)
-                proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="inference-replay-shadow|replay",
+                proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay",
                                             **overrides)
                 self.assertIn("rc=1", proc.stdout)
                 self.assertEqual([c.split()[0] for c in calls], expected)
