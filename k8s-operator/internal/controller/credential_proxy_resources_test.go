@@ -69,12 +69,12 @@ func assertQuantity(t *testing.T, list corev1.ResourceList, name corev1.Resource
 // both (#4106).
 func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {CredentialProxy: &agentv1alpha1.CredentialProxySpec{}}} {
-		autopilot := resolveCredentialProxyResourcesFor(deployment, true)
+		autopilot := resolveCredentialProxyResourcesFor(deployment, true, sizingTierSmall)
 		assertQuantity(t, autopilot.Requests, corev1.ResourceCPU, "2")
 		assertQuantity(t, autopilot.Requests, corev1.ResourceMemory, "2Gi")
 		assertQuantity(t, autopilot.Limits, corev1.ResourceCPU, "2")
 		assertQuantity(t, autopilot.Limits, corev1.ResourceMemory, "2Gi")
-		got := resolveCredentialProxyResources(deployment)
+		got := resolveCredentialProxyResources(deployment, sizingTierSmall)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "500m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
@@ -116,37 +116,37 @@ func TestCredentialProxyLimitSetAloneBelowTheDefaultRequestLowersTheRequest(t *t
 	cpuAlone := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 	}).Spec.Deployment
-	got := resolveCredentialProxyResourcesFor(cpuAlone, true)
+	got := resolveCredentialProxyResourcesFor(cpuAlone, true, sizingTierSmall)
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "1")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
 	assertQuantity(t, got.Requests, corev1.ResourceMemory, "2Gi")
 
 	standard := resolveCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m")},
-	}).Spec.Deployment)
+	}).Spec.Deployment, sizingTierSmall)
 	assertQuantity(t, standard.Requests, corev1.ResourceCPU, "200m")
 	assertQuantity(t, standard.Requests, corev1.ResourceMemory, "1Gi")
 
 	raised := resolveCredentialProxyResourcesFor(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
-	}).Spec.Deployment, true)
+	}).Spec.Deployment, true, sizingTierSmall)
 	assertQuantity(t, raised.Requests, corev1.ResourceCPU, "2")
 	assertQuantity(t, raised.Limits, corev1.ResourceCPU, "4")
 
 	explicit := resolveCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-	}).Spec.Deployment)
+	}).Spec.Deployment, sizingTierSmall)
 	assertQuantity(t, explicit.Requests, corev1.ResourceCPU, "3")
 	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) == 0 {
+	}), credentialProxyResourcesPath); len(errs) == 0 {
 		t.Error("an explicit cpu request above its limit was admitted; want refused")
 	}
 	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
-	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) != 0 {
+	}), credentialProxyResourcesPath); len(errs) != 0 {
 		t.Errorf("a memory limit set alone under the default request was refused: %v", errs)
 	}
 }
@@ -160,7 +160,7 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 	memoryAlone := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
 	}).Spec.Deployment
-	got := resolveCredentialProxyResourcesFor(memoryAlone, true)
+	got := resolveCredentialProxyResourcesFor(memoryAlone, true, sizingTierSmall)
 	assertQuantity(t, got.Requests, corev1.ResourceMemory, "1536Mi")
 	assertQuantity(t, got.Requests, corev1.ResourceCPU, "1500m")
 	assertQuantity(t, got.Limits, corev1.ResourceCPU, "2")
@@ -168,37 +168,38 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 	explicit := resolveCredentialProxyResourcesFor(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
-	}).Spec.Deployment, true)
+	}).Spec.Deployment, true, sizingTierSmall)
 	assertQuantity(t, explicit.Requests, corev1.ResourceCPU, "2")
 
-	standard := resolveCredentialProxyResources(memoryAlone)
+	standard := resolveCredentialProxyResources(memoryAlone, sizingTierSmall)
 	assertQuantity(t, standard.Requests, corev1.ResourceCPU, "500m")
 	assertQuantity(t, standard.Requests, corev1.ResourceMemory, "1Gi")
 	// 256Mi would cap the CPU request at 250m on Autopilot; Standard keeps 500m.
 	smallMemory := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
 	}).Spec.Deployment
-	assertQuantity(t, resolveCredentialProxyResources(smallMemory).Requests, corev1.ResourceCPU, "500m")
-	assertQuantity(t, resolveCredentialProxyResourcesFor(smallMemory, true).Requests, corev1.ResourceCPU, "250m")
+	assertQuantity(t, resolveCredentialProxyResources(smallMemory, sizingTierSmall).Requests, corev1.ResourceCPU, "500m")
+	assertQuantity(t, resolveCredentialProxyResourcesFor(smallMemory, true, sizingTierSmall).Requests, corev1.ResourceCPU, "250m")
 
 	// A byte count just under 2Gi rounds the CPU request down to the 250m
 	// step below it, so the pair stays in the band and draws no band warning.
 	// 672Mi gives 656m before the step, which Autopilot would round up to
 	// 750m and then raise the memory to 768Mi, over the CR's limit.
-	justUnder := proxyAgentWithResources(&corev1.ResourceRequirements{
+	justUnderAgent := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2147483647")},
-	}).Spec.Deployment
-	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true).Requests, corev1.ResourceCPU, "1750m")
+	})
+	justUnder := justUnderAgent.Spec.Deployment
+	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true, sizingTierSmall).Requests, corev1.ResourceCPU, "1750m")
 	atFloor := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
 	}).Spec.Deployment
-	assertQuantity(t, resolveCredentialProxyResourcesFor(atFloor, true).Requests, corev1.ResourceCPU, "500m")
+	assertQuantity(t, resolveCredentialProxyResourcesFor(atFloor, true, sizingTierSmall).Requests, corev1.ResourceCPU, "500m")
 	// Under 256Mi the step still leaves 250m, Autopilot's smallest request.
 	tiny := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
 	}).Spec.Deployment
-	assertQuantity(t, resolveCredentialProxyResourcesFor(tiny, true).Requests, corev1.ResourceCPU, "250m")
-	_, warnings := ValidateCredentialProxyResources(justUnder, field.NewPath("spec"))
+	assertQuantity(t, resolveCredentialProxyResourcesFor(tiny, true, sizingTierSmall).Requests, corev1.ResourceCPU, "250m")
+	_, warnings := ValidateCredentialProxyResources(justUnderAgent, field.NewPath("spec"))
 	for _, w := range warnings {
 		if strings.Contains(w, "GiB per vCPU") {
 			t.Errorf("a band-held pair drew the band warning: %q", w)
@@ -324,7 +325,7 @@ func TestCredentialProxyVolumeLimitEnvFollowsTheRenderedSizeLimits(t *testing.T)
 			{Name: credentialProxyStateLimitEnv, Value: "1"},
 			{Name: credentialProxyTmpLimitEnv, Value: "1"},
 		}
-		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+		ephemeral := resolveCredentialProxyResources(agent.Spec.Deployment, renderedSizingTier(agent)).Limits[corev1.ResourceEphemeralStorage]
 		sizeLimits := map[string]int64{}
 		for _, vol := range buildCredentialProxyRuntimeVolumes(agent) {
 			if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {
@@ -424,7 +425,7 @@ func TestCredentialProxyOverrideDoesNotAliasTheCR(t *testing.T) {
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: decimalLimit},
 	}
-	got := resolveCredentialProxyResources(&agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: override}})
+	got := resolveCredentialProxyResources(&agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: override}}, sizingTierSmall)
 	rendered := got.Limits[corev1.ResourceMemory]
 	rendered.AsDec().SetScale(rendered.AsDec().Scale() - 1)
 	if override.Limits.Memory().Cmp(resource.MustParse("2Gi")) != 0 {
