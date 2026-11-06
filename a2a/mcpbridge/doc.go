@@ -3,7 +3,8 @@
 // kube-agents deployment through its in-cluster a2a-mcp server — discover and
 // connect to deployments across kubeconfig contexts, send a message and wait
 // for its answer, manage persistent /session workers, read and stop tasks,
-// read blackboard topics, and inspect or download the GitHub pull requests an
+// read the card reports that arrive after an answer (poll_events), read
+// blackboard topics, and inspect or download the GitHub pull requests an
 // agent filed. It relays notifications/progress frames as live progress, but
 // the in-cluster server sends none yet: a turn's result shows when it ends.
 //
