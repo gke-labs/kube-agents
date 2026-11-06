@@ -8,6 +8,7 @@ Run: python3 -m unittest discover -s tests -p 'test_session_retention_sim.py' -v
 """
 
 import importlib.util
+import os
 import pathlib
 import sqlite3
 import sys
@@ -43,9 +44,10 @@ class FakeSessionDB:
     def create_session(self, sid, source):
         self._conn.execute("INSERT INTO sessions (id, source, started_at) VALUES (?, ?, 0)", (sid, source))
 
-    def append_message(self, sid, role, content):
+    def append_message(self, sid, role, content, timestamp=None):
         self._conn.execute(
-            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, 0)", (sid, role, content)
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (sid, role, content, timestamp if timestamp is not None else 0),
         )
 
     def end_session(self, sid, reason):
@@ -53,10 +55,13 @@ class FakeSessionDB:
 
     def prune_sessions(self, older_than_days, sessions_dir, exclude_active_write_guards, last_active_before):
         FakeSessionDB.pruned_with.append((older_than_days, exclude_active_write_guards, last_active_before))
+        # Hermes' own measure of last activity (_LAST_ACTIVE_SQL): the newest message, else started_at.
         ids = [
             r[0]
             for r in self._conn.execute(
-                "SELECT id FROM sessions WHERE ended_at IS NOT NULL AND last_activity_at < ?", (last_active_before,)
+                "SELECT s.id FROM sessions s WHERE s.ended_at IS NOT NULL AND COALESCE("
+                "(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id), s.started_at) < ?",
+                (last_active_before,),
             )
         ]
         for sid in ids:
@@ -107,16 +112,27 @@ class SimulationTest(unittest.TestCase):
         self.assertEqual(4 * 2 + 30, out["assumptions"]["days_simulated"])
 
     def test_the_ceiling_is_derived_from_the_stated_inputs(self):
-        _, out = self.run_sim("--retention-days", "3", "--days", "40", "--slack", "2.5")
+        _, out = self.run_sim("--retention-days", "3", "--days", "90", "--slack", "2.5")
         window = 3 * 3 * out["stored_bytes_per_card"]
         self.assertAlmostEqual(out["window_bytes"], window, delta=3)
         self.assertAlmostEqual(out["ceiling_bytes"], out["overhead_bytes"] + window * 2.5, delta=8)
         self.assertIn(out["verdict"], ("under the ceiling", "OVER the ceiling"))
 
     def test_a_plateau_over_the_ceiling_fails_the_run(self):
-        code, out = self.run_sim("--retention-days", "3", "--days", "40", "--slack", "0.01")
+        code, out = self.run_sim("--retention-days", "3", "--days", "90", "--slack", "0.01")
         self.assertEqual("OVER the ceiling", out["verdict"])
         self.assertEqual(1, code)
+
+    def test_a_run_shorter_than_the_settling_time_gives_no_verdict(self):
+        code, out = self.run_sim("--retention-days", "3", "--days", "2")
+        self.assertEqual("too short to settle", out["verdict"])
+        self.assertEqual(0, code)
+
+    def test_a_store_still_growing_at_the_end_gives_no_verdict(self):
+        with patch.object(FakeSessionDB, "prune_sessions", lambda self, *a, **k: 0):
+            code, out = self.run_sim("--retention-days", "3", "--days", "45")
+        self.assertEqual("not settled", out["verdict"])
+        self.assertEqual(0, code)
 
     def test_vacuum_runs_only_when_asked(self):
         self.run_sim("--retention-days", "2", "--days", "40")
@@ -124,6 +140,27 @@ class SimulationTest(unittest.TestCase):
         _, out = self.run_sim("--retention-days", "2", "--days", "40", "--vacuum-over", "0.0")
         self.assertGreater(out["vacuums"], 0)
         self.assertEqual(out["vacuums"], FakeSessionDB.vacuumed)
+
+
+@unittest.skipUnless(os.environ.get("HERMES_SRC"), "set HERMES_SRC to a checkout of the pinned Hermes tag")
+class AgainstRealHermesTest(unittest.TestCase):
+    """Opt-in: the same run against Hermes' real SessionDB. CI has no Hermes, so this is for
+    whoever re-runs the measurement, to see the script still drives the store it models."""
+
+    def test_rows_level_off_and_hermes_rows_keep_their_display_identity(self):
+        sim = _load()
+        home = {}
+        real_rmtree = sim.shutil.rmtree
+        with patch.object(sim.shutil, "rmtree", lambda path, ignore_errors=False: home.setdefault("path", path)):
+            with patch("builtins.print") as printed:
+                sim.main(["--hermes-src", os.environ["HERMES_SRC"], "--retention-days", "3", "--cards-per-day", "3",
+                          "--bytes-per-card", "2000", "--messages-per-card", "4", "--days", "12", "--series"])
+        self.addCleanup(real_rmtree, home["path"], True)
+        out = sim.json.loads(printed.call_args.args[0])
+        self.assertEqual({9}, {day["sessions"] for day in out["series"][3:]})
+        conn = sqlite3.connect(pathlib.Path(home["path"]) / "state.db")
+        self.addCleanup(conn.close)
+        self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM messages WHERE display_identity IS NULL").fetchone()[0])
 
 
 if __name__ == "__main__":
