@@ -1,0 +1,40 @@
+package dispatch
+
+import (
+	"testing"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+// A profile that leaves the install drains (#5074): the config lists it
+// with no durables until DrainingUntil. A task it holds runs on and settles
+// as any other, and nothing new is dispatched for it: a submission that
+// reaches its stream afterwards is never offered.
+func TestADrainingProfileFinishesWhatItHoldsAndTakesNothingNew(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, 3*time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedCount() == 1 })
+
+	ti.update(func(c *lib.DispatchConfig) {
+		p := c.Profiles[0]
+		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		c.Profiles[0] = p
+	})
+	key := lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")
+	waitFor(t, 15*time.Second, "the held task settled", func() bool { return b.tombstones()[key].Finished() })
+	if ts := b.terminalsOf("task-1"); len(ts) != 1 || ts[0].state != lib.StateCompleted {
+		t.Errorf("task-1's terminals %+v, want its worker's completed alone", ts)
+	}
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	time.Sleep(3 * time.Second) // several retry delays and refreshes
+	if n := w.offerCount(); n != 1 {
+		t.Errorf("the draining profile's worker was offered %d tasks, want only task-1", n)
+	}
+}

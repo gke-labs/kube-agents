@@ -382,9 +382,17 @@ type DispatchProfile struct {
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
 	// Durables are the shared durables the operator created for it, one
-	// per (tier, kind).
+	// per (tier, kind). A draining profile has none.
 	Durables []DispatchDurable `json:"durables"`
+	// DrainingUntil, set, makes the profile draining (#5074): it has left
+	// the install, so it has no durables and nothing new is dispatched for
+	// it, but it stays listed, and keeps its .supervisor grant, until then,
+	// so the terminals of the tasks it still holds reach their requesters.
+	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 }
+
+// Draining reports whether the profile is draining (DrainingUntil).
+func (p DispatchProfile) Draining() bool { return !p.DrainingUntil.IsZero() }
 
 // DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
@@ -433,8 +441,11 @@ func (c DispatchConfig) Validate() error {
 		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
 			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
 		}
-		if p.Concurrency < 1 || len(p.Tiers) == 0 || len(p.Durables) == 0 {
-			return fmt.Errorf("dispatch config: profile %s needs a concurrency, a tier and a durable", p.Name)
+		if p.Concurrency < 1 || len(p.Tiers) == 0 {
+			return fmt.Errorf("dispatch config: profile %s needs a concurrency and a tier", p.Name)
+		}
+		if p.Draining() != (len(p.Durables) == 0) {
+			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {
