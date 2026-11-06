@@ -1007,15 +1007,22 @@ class ShadowProxy:
         entry[F.FINGERPRINT] = fingerprint
         entry[F.SETTINGS_HASH] = normalizer.settings_hash(normalized, self.key_context)
         entry[F.ROLES] = normalized.roles()
-        stored = replay_cache.stored_answer(upstream["message"], normalized.mapping) if upstream["message"] else {}
-        entry[F.UNSTORABLE] = unstorable_reasons(
-            body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
-            upstream_incomplete=upstream["upstream_incomplete"],
-            client_disconnected=upstream["client_disconnected"],
-            observe_failed=upstream["observe_failed"],
-            observe_too_large=upstream["observe_too_large"],
-            stored=stored,
-        )
+        stored: Dict[str, Any] = {}
+        if served is not None:
+            # A served answer is the recording's, not a new one from the model,
+            # so it is never a candidate to save and has no LiteLLM headers to
+            # judge: nothing here makes it unstorable.
+            entry[F.UNSTORABLE] = []
+        else:
+            stored = replay_cache.stored_answer(upstream["message"], normalized.mapping) if upstream["message"] else {}
+            entry[F.UNSTORABLE] = unstorable_reasons(
+                body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
+                upstream_incomplete=upstream["upstream_incomplete"],
+                client_disconnected=upstream["client_disconnected"],
+                observe_failed=upstream["observe_failed"],
+                observe_too_large=upstream["observe_too_large"],
+                stored=stored,
+            )
         # The per-message and answer hashes are of the normalized, unscrubbed
         # content, as the fingerprint is: the scrubber blanks the rest of a
         # line after a secret, so hashes of scrubbed text would hide real
