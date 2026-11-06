@@ -23,8 +23,20 @@ import (
 
 const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
+	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
+	metricsPortFlag         = "metrics-port"
 	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
 	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
+
+	// otelShutdownTimeout bounds the flush of buffered spans on exit.
+	otelShutdownTimeout = 5 * time.Second
+	// readHeaderTimeout closes a connection whose request headers have not
+	// arrived in time, so a slow client cannot hold one open indefinitely.
+	readHeaderTimeout = 15 * time.Second
+	// serverShutdownTimeout bounds srv.Shutdown after SIGTERM. main does not
+	// wait for Shutdown to return, so a request still in flight when the
+	// process exits is cut.
+	serverShutdownTimeout = 10 * time.Second
 )
 
 func envOrDefault(key, fallback string) string {
@@ -53,15 +65,15 @@ func envIntOrDefault(key string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("%s: KUBE_PROXY_METRICS_PORT is not an integer", metricsUnavailableAlert)
-		return 0
+		log.Printf("ALERT %s=%q is not an integer; using %d", key, raw, fallback) // #nosec G706 -- %q escapes newlines and control characters, so the value cannot forge a log line
+		return fallback
 	}
 	return v
 }
 
 func startMetricsListener(ctx context.Context, port int, metrics *k8sapiproxy.Metrics, logger *slog.Logger) {
 	if port == 0 {
-		logger.Info("metrics listener disabled: KUBE_PROXY_METRICS_PORT is unset")
+		logger.Info("metrics listener disabled: --" + metricsPortFlag + " resolved to 0 (its default comes from " + metricsPortEnv + ")")
 		return
 	}
 	srv, err := k8sapiproxy.NewMetricsServer(port, metrics, logger)
@@ -112,7 +124,7 @@ func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[stri
 func main() {
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
-		metricsPort              = flag.Int("metrics-port", envIntOrDefault("KUBE_PROXY_METRICS_PORT", 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
+		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
 		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
 		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
@@ -140,7 +152,7 @@ func main() {
 		log.Printf("warning: failed to initialize OpenTelemetry tracing, continuing with no-op tracer: %v", err)
 	} else if otelShutdown != nil {
 		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), otelShutdownTimeout)
 			defer cancel()
 			_ = otelShutdown(shutdownCtx)
 		}()
@@ -219,7 +231,7 @@ func main() {
 	srv := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           handler,
-		ReadHeaderTimeout: 15 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
@@ -227,7 +239,7 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()

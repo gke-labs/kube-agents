@@ -206,11 +206,13 @@ func (g *usageGauges) publishPhase(agent *agentv1alpha1.PlatformAgent) {
 }
 
 // usageBlockEmpty reports a status.usage that holds nothing: no counter moved,
-// no cluster gauge or time written, no interface. That is a pruned status as
-// the server returns it, and a new agent before its first poll; either way
-// the zeros are not a reading.
+// no cluster gauge or time written, no interface, no top tool. That is a
+// pruned status as the server returns it, and a new agent before its first
+// poll; either way the zeros are not a reading. Either list alone is a poll
+// that landed: the first poll baselines a broker that already ran commands
+// without moving a counter, yet projects its tool table as topTools.
 func usageBlockEmpty(u *agentv1alpha1.AgentUsageStatus) bool {
-	if len(u.ActiveInterfaces) != 0 {
+	if len(u.ActiveInterfaces) != 0 || len(u.TopTools) != 0 {
 		return false
 	}
 	for _, f := range usageExportFields {

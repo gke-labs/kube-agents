@@ -41,7 +41,7 @@ that eventually disagrees with it. Hindsight is the exception because it is one 
 unrelated workloads — an API server and its Postgres database — so `name` alone cannot tell them
 apart. Its objects carry `app.kubernetes.io/component: api` or `postgresql`, and those values are
 load-bearing rather than decorative: the Deployment and StatefulSet selectors, the `NetworkPolicy`
-that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
+objects that isolate the API pod and let only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
 database are all built from them. Do not add `component` anywhere else on the strength of this.
 
 One more source stamps labels at runtime rather than at install: the a2a chatops gateway

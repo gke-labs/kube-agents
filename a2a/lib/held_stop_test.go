@@ -340,6 +340,7 @@ func TestHeldRebindDuringStopDrainCancelsAfterTheNewContextDrains(t *testing.T) 
 	t.Cleanup(second.Close)
 	holders := []*Client{first, second}
 	h.submit("task-rd")
+	checked := 0
 	for round := 0; round < 50; round++ {
 		x := holders[round%2]
 		held := make(chan struct{}, 1)
@@ -378,9 +379,24 @@ func TestHeldRebindDuringStopDrainCancelsAfterTheNewContextDrains(t *testing.T) 
 		if err != nil {
 			t.Fatalf("round %d: Consumer: %v", round, err)
 		}
+		s.mu.Lock()
+		old := s.cc
+		s.mu.Unlock()
 		sub.Stop()
 		if err := s.consume(cons); err != nil {
 			t.Fatalf("round %d: consume: %v", round, err)
+		}
+		// The rebind is inside the drain window only if the old context is
+		// still open once consume has swapped in the new one, so awaitDrain
+		// sees the swap. If the old context closed first, awaitDrain may
+		// already have returned and the cancel may come first: such a round
+		// checks only the hand-over.
+		inside := true
+		select {
+		case <-old.Closed():
+			inside = false
+		default:
+			checked++
 		}
 		wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
 		err = sub.Wait(wctx)
@@ -390,9 +406,14 @@ func TestHeldRebindDuringStopDrainCancelsAfterTheNewContextDrains(t *testing.T) 
 		}
 		select {
 		case msg := <-early:
-			t.Fatalf("round %d: %s", round, msg)
+			if inside {
+				t.Fatalf("round %d: %s", round, msg)
+			}
 		default:
 		}
 		waitUnregistered(t, x, s)
+	}
+	if checked == 0 {
+		t.Fatal("no rebind landed inside the drain window, so the cancel order was never checked")
 	}
 }

@@ -1520,6 +1520,10 @@ _BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|
 _ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
 _UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+# A ``[next: ...]`` step line (``slack_moments.NEXT_STEP_LINE``): plumbing the presenters draw
+# as a button and no surface shows as text, so the step lines that end a result are taken off
+# before it is measured, as ``slack_moments.visible_text`` takes them off.
+_STEP_LINE = re.compile(r"\[next:[^\]\n]*\]", re.IGNORECASE)
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -1532,6 +1536,15 @@ def _delivered_results(final_message: str) -> list[str]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
         results.append(final_message[header.end() : end].strip())
     return results
+
+
+def _visible(result: str) -> str:
+    """``result`` as chat shows it: every step-shaped line at its end taken off."""
+    lines = result.rstrip().split("\n")
+    end = len(lines)
+    while end and (not lines[end - 1].strip() or _STEP_LINE.fullmatch(lines[end - 1].strip())):
+        end -= 1
+    return "\n".join(lines[:end]).rstrip()
 
 
 def _unabbreviate(text: str) -> str:
@@ -1559,7 +1572,9 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    its text, bold and code markers not at all, and the ``[next: ...]`` step
+    lines that end the result not at all (the presenters draw them as a
+    button), and ``max_sentences`` sentences, a bullet counting as one and a
     soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
@@ -1593,6 +1608,7 @@ class AnswerFirstVerifier(BaseVerifier):
         """The result's defects, and its lead's normalized text (``""`` without one)."""
         defects = []
         lead_text = ""
+        result = _visible(result)
         lead = _BOLD_LEAD.match(result)
         if lead is None:
             defects.append("does not open with a bold sentence")
@@ -4109,6 +4125,88 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
 _parse_github_time = github_writes.parse_github_time
 
 
+# Mirrors of the fleet-audit renderer's readers of its own body
+# (`agents/platform/skills/fleet-audit/scripts/audit_report.py`:
+# `FINDING_MARKER_RE`, `WHERE_LINE_RE`, `LISTED_LINE_RE`, the listed-section
+# brackets, and `parse_finding_locations`), copied rather than imported: the
+# presubmit's pinned grader is `bench/` alone, extracted without the rest of
+# the checkout. `bench/tests/test_verifiers.py` imports the renderer in the
+# full checkout and holds the mirror equal to it on a captured body.
+_FINDING_MARKER_RE = re.compile(
+    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
+_WHERE_LINE_RE = re.compile(
+    r"^- \*\*Where:\*\* `([^`\n]*)`"
+    r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)`[ \t]*$",
+    re.M,
+)
+_LISTED_LINE_RE = re.compile(
+    r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
+    re.M,
+)
+_LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+_LISTED_SECTION_END = "<!-- audit-listed:end -->"
+# The separator between a finding's id and its object segments, as
+# ``audit_report.py`` composes the id: ``<check>.<cluster>.<namespace>.<object>``.
+_FINDING_ID_SEPARATOR = "."
+
+
+def _held_ids(body: str) -> set[str]:
+    """Ids the ledger carries without this run having filed them: the
+    collector-held ones and the previous findings the run did not re-check."""
+    return {
+        fid
+        for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+        for match in pattern.findall(body)
+        for fid in _json_str_list(match)
+    }
+
+
+def _listed_objects(body: str) -> dict[str, str]:
+    """``{id: object}`` for the rows listed without detail, read as the
+    renderer's ``_listed_locations`` reads them: only between its brackets,
+    each alone on its line, and only when the body holds exactly one of each
+    in order."""
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped == _LISTED_SECTION_BEGIN:
+            begins.append(offset + len(line))
+        elif stripped == _LISTED_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        return {}
+    return {fid: obj for _title, _cluster, _ns, obj, fid in _LISTED_LINE_RE.findall(body[begins[0] : ends[0]])}
+
+
+def _finding_objects(body: str) -> dict[str, str]:
+    """Each finding the ledger renders, as ``{id: object}``, read as the
+    renderer's ``parse_finding_locations`` reads its own body: a listed row
+    counts when the delta block names its id and the held lists do not; a
+    heading's object is the first ``Where:`` line between its marker and the
+    next marker (past the new-finding marker an update writes), and a finding
+    whose ``Where:`` line is missing or does not parse is left out rather
+    than guessed at. Nothing the agent writes (the title, the text under the
+    ``Where:`` line) reaches the object.
+    """
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    deltas = _DELTA_RE.findall(body)
+    named = set(_json_str_list(deltas[-1]) if deltas else []) - _held_ids(body)
+    out = {fid: obj for fid, obj in _listed_objects(body).items() if fid in named}
+    markers = list(_FINDING_MARKER_RE.finditer(body))
+    for index, match in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+        where = _WHERE_LINE_RE.search(body, match.end(), end)
+        if where:
+            out[match.group(2)] = where.group(3)
+    return out
+
+
 def _finding_ids(body: str) -> tuple[list[str], str] | None:
     """This run's finding ids and the block they came from, or None when the ledger carries no block.
 
@@ -4221,6 +4319,19 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
+    ``finding`` — one rendered finding at a time, those of the check (or
+    checks) ``finding_check`` names (the first segment of the id), the ids the
+    ledger only carries (collector-held, not re-checked) left out. The phrases
+    must all sit in ONE such finding's object, the one the renderer writes on
+    the ``Where:`` line under its heading (or on its row when it is listed
+    without detail), read back as the renderer reads it; never its title,
+    cluster, namespace, impact, evidence or recommendation text. Use
+    it to bind a CHECK to an OBJECT: a ``body`` phrase for the
+    object matches every finding on that object, an id phrase for the check
+    matches that check on every object, and nothing in the pair requires one
+    finding to carry both. The id itself cannot carry the pair, since its
+    object segment is clipped per host.
+
     A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
     a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
@@ -4258,7 +4369,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
-    scope: Literal["body", "finding_ids"] = "body"
+    scope: Literal["body", "finding_ids", "finding"] = "body"
+    # The check whose findings ``scope: finding`` reads: the first segment of
+    # the finding id, ``no-memory-limit`` in
+    # ``no-memory-limit.<cluster>.<namespace>.<object>``. A list names the
+    # checks a case accepts for one defect (the SOP's slug and its synonyms).
+    finding_check: str | list[str] | None = None
     # Every id the ledger files must be readable in its body, outside the two
     # hidden id blocks: a finding cut for space and named only in
     # `audit-findings-all` is filed but invisible to the person reading it.
@@ -4271,6 +4387,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _finding_checks(self) -> list[str]:
+        raw = self.finding_check
+        names = [raw] if isinstance(raw, str) else list(raw or [])
+        return [n.strip() for n in names if n and n.strip()]
+
+    @model_validator(mode="after")
+    def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
+        checks = self._finding_checks()
+        if self.scope == "finding" and not checks:
+            raise ValueError("scope: finding needs finding_check, the check whose findings are read")
+        if self.scope != "finding" and self.finding_check is not None:
+            raise ValueError("finding_check is read only under scope: finding")
+        return self
 
     def _closed_by_the_reset(
         self,
@@ -4555,6 +4685,35 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # the rendered subset, and the reason should say so rather than
             # read as a finding the agent never filed.
             surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
+        elif self.scope == "finding":
+            checks = self._finding_checks()
+            check = ", ".join(checks)
+            prefixes = tuple(f"{c}{_FINDING_ID_SEPARATOR}".lower() for c in checks)
+            held = _held_ids(ledger["body"])
+            candidates = [
+                obj.lower()
+                for fid, obj in _finding_objects(ledger["body"]).items()
+                if fid.lower().startswith(prefixes) and fid not in held
+            ]
+
+            def _block_misses(block: str) -> int:
+                return (
+                    sum(1 for p in self.required_phrases if p.lower() not in block)
+                    + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
+                )
+
+            if candidates:
+                # The finding that comes closest is the one graded, so a fail
+                # names what the nearest finding of the check lacked.
+                text = min(candidates, key=_block_misses)
+                surface = (
+                    f"the {len(candidates)} finding(s) of check {check!r} in {ledger['slug']}, "
+                    "read one finding at a time"
+                )
+            else:
+                text = ""
+                surface = f"no finding of check {check!r} in {ledger['slug']}"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
@@ -4580,12 +4739,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # are previous findings this run did not check. Both are rendered
             # in what the findings leave; this check grades the findings the
             # run filed.
-            held = {
-                fid
-                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
-                for match in pattern.findall(body)
-                for fid in _json_str_list(match)
-            }
+            held = _held_ids(body)
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
@@ -4602,6 +4756,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
+            "finding_check": self.finding_check,
         }
         if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []

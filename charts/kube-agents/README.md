@@ -482,7 +482,7 @@ Old agent pods continue routing through `Service/litellm` until the operator upd
 kubectl delete svc litellm -n <namespace>
 ```
 
-**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`; apply an egress `NetworkPolicy` of your own for `hindsight-api` if you want to restrict its outbound traffic to your custom gateway.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -507,8 +507,9 @@ Helm adopts the object and rewrites its spec to the static copy in the same upgr
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API
-Deployment, the Postgres/pgvector StatefulSet behind it, an ingress-only
-NetworkPolicy standing in for the database's deliberate lack of a password,
+Deployment, the Postgres/pgvector StatefulSet behind it, NetworkPolicies
+isolating the API pod (`hindsight-api`) and standing in for the database's
+deliberate lack of a password (`hindsight-postgresql`),
 and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
 follows `platformAgent.harness.memory.provider`, so selecting a
 Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
@@ -831,6 +832,16 @@ value set and later cleared removes the field again. Changing it on a running
 release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
+
+### MCP server (`operator.mcpServer.enabled`)
+
+`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
+then renders the MCP server (`<agent>-a2a-mcp`) beside every `next`-mode `PlatformAgent` it
+manages. It defaults to `false`, and under `today` the operator renders nothing for it. An
+`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
+still works and wins over the value. The
+[MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
+what it renders and how a client connects.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1256,10 +1267,10 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+It also counts the standing pods the operator renders only behind an operator flag,
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
-blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
+and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
@@ -1534,7 +1545,7 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
-  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from

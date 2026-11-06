@@ -17,6 +17,7 @@ rather than the object assertion being allowed to stand in for it.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -332,6 +333,74 @@ class C1IsolationIsStructural(unittest.TestCase):
         ):
             decision = policy.evaluate_k8s("GET", target + "api/v1/pods", one, accept)
             self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET api/v1/pods?limit=1 with Accept {accept!r} is relayed whole")
+
+    def test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole(self) -> None:
+        """The event watcher's owner lookup reads one named, namespaced Pod
+        through the broker. The rule that admits it holds a JSON Accept every
+        range of which asks for a PartialObjectMetadata, so the server answers
+        with the Pod's ObjectMeta and never its spec or status. That ObjectMeta
+        still carries every annotation (a client-side apply's manifest, env
+        values included) and managedFields, so the broker relays only its
+        projection: the controller ownerReference's kind and name when it is a
+        kind the lookup folds on, and the pod-template-hash label for a
+        ReplicaSet controller. A full Pod read, a Pod
+        list, a cluster-scoped or other-group Pod path and a Pod subresource
+        stay refused."""
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        pod = "api/v1/namespaces/default/pods/web-0"
+        metadata = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+        self.assertEqual(policy.evaluate_k8s("GET", target + pod, {}, metadata).rule_id, policy.RULE_K8S_POD_METADATA)
+        self.assertNotIn(("", "pods"), policy.WATCHER_NAMED_READS, "a named Pod is readable whole")
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            metadata + ",application/json",
+            metadata + ";as=Table",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadata",
+        ):
+            decision = policy.evaluate_k8s("GET", target + pod, {}, accept)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET {pod} with Accept {accept!r} is relayed whole")
+        for path in (
+            "api/v1/pods/web-0",
+            "apis/metrics.k8s.io/v1beta1/namespaces/default/pods/web-0",
+            pod + "/log",
+            pod + "/exec",
+            "api/v1/namespaces/default/secrets/db",
+        ):
+            self.assertFalse(policy.evaluate_k8s("GET", target + path, {}, metadata).allowed, f"GET {path} is relayed")
+        self.assertFalse(policy.evaluate_k8s("POST", target + pod, {}, metadata).allowed, "a Pod write is relayed")
+        for query in ({"resourceVersion": ["0"]}, {"watch": ["true"]}, {"fieldSelector": ["x"]}):
+            self.assertEqual(
+                policy.evaluate_k8s("GET", target + pod, query, metadata).rule_id, policy.RULE_K8S_QUERY,
+                f"GET {pod} with {query} is relayed",
+            )
+        upstream = {
+            "kind": "PartialObjectMetadata",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": {
+                "name": "web-0", "namespace": "default", "uid": "u",
+                "labels": {"pod-template-hash": "abc", "app": "web"},
+                "annotations": {"kubectl.kubernetes.io/last-applied-configuration": '{"env":"hunter2"}'},
+                "managedFields": [{"manager": "kubectl"}],
+                "ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True, "uid": "o"}],
+            },
+        }
+        projected = json.loads(policy.project_pod_metadata(json.dumps(upstream).encode()))
+        self.assertEqual(
+            projected, {"metadata": {"ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True}]}},
+            "the broker relays more of a Pod than its controller",
+        )
+        upstream["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "web-abc", "controller": True}]
+        projected = json.loads(policy.project_pod_metadata(json.dumps(upstream).encode()))
+        self.assertEqual(projected["metadata"].get("labels"), {"pod-template-hash": "abc"}, "a Pod label beyond the hash is relayed")
+        upstream["metadata"]["ownerReferences"] = [{"kind": "Node", "name": "node-a", "controller": True}]
+        self.assertEqual(
+            json.loads(policy.project_pod_metadata(json.dumps(upstream).encode())), {"metadata": {}},
+            "the broker relays a controller the owner lookup does not fold on",
+        )
 
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy
