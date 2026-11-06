@@ -292,7 +292,8 @@ func serveUntilDrained(ctx context.Context, srv *http.Server, listen func() erro
 	drained := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		// ctx is already done; the drain gets its own deadline.
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		drained <- srv.Shutdown(shutdownCtx)
 	}()
