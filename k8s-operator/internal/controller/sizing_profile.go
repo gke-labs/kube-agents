@@ -1155,14 +1155,34 @@ func (r *PlatformAgentReconciler) sizingQuotas(ctx context.Context, agent *agent
 	return quotas.Items, nil
 }
 
+// sizingQuotaReadsAStep reports whether a ResourceQuota constrains a key the
+// step-up check reads (sizingQuotaDimensions). A quota whose hard keys are
+// pods, count/* or storage alone is not moved by a tier change
+// (sizingQuotaShortfall reads none of its keys), so it can neither refuse a
+// step nor cap the tier, whatever its scopes select.
+func sizingQuotaReadsAStep(quota *corev1.ResourceQuota) bool {
+	for _, dim := range sizingQuotaDimensions {
+		if _, constrained := quota.Spec.Hard[dim.key]; constrained {
+			return true
+		}
+	}
+	return false
+}
+
 // sizingQuotaPriorityClasses is the one-element set of the class admission
 // gives the sized pods (sizingAdmittedPriorityClass) when a quota in quotas
 // has a PriorityClass scope, the one scope whose answer needs admission asked,
-// and nil without asking otherwise. The second value is false when admission
-// was asked and gave no answer; the caller then measures no step.
+// and constrains a key the step moves (sizingQuotaReadsAStep); nil without
+// asking otherwise. A PriorityClass-scoped quota on pods or count/* alone,
+// the usual per-class shape, is read by nothing the class decides, and the
+// dry run it would force can be refused by an object the step never trips
+// (a pods quota at its cap, a webhook declining dry runs), which would hold
+// the step on every pass for a quota that cannot refuse it. The second value
+// is false when admission was asked and gave no answer; the caller then
+// measures no step.
 func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, quotas []corev1.ResourceQuota) ([]string, bool) {
 	for i := range quotas {
-		if sizingQuotaScopesPriorityClass(&quotas[i]) {
+		if sizingQuotaScopesPriorityClass(&quotas[i]) && sizingQuotaReadsAStep(&quotas[i]) {
 			class, answered := r.sizingAdmittedPriorityClass(ctx, agent)
 			if !answered {
 				return nil, false

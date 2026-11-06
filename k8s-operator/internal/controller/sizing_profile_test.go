@@ -1252,6 +1252,33 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 			t.Fatalf("admission saw %d dry-run Pods for a quota with no PriorityClass scope, want none", len(seen))
 		}
 	})
+	t.Run("a PriorityClass-scoped quota with no sizing key asks nothing", func(t *testing.T) {
+		t.Parallel()
+		// A per-class pods count quota reads no key the step moves, so the
+		// class decides nothing about it; the dry run it would force is set
+		// to be refused here, and the step is still measured, through the
+		// unscoped quota with room, and taken.
+		podCount := sizingQuotaOn("pod-count", corev1.ResourcePods, "5", "5")
+		podCount.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+			{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"critical"}},
+		}}
+		room := sizingQuota("room", "10Gi", "4Gi")
+		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: pod-count, requested: pods=1, used: pods=5, limited: pods=5"))
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		objs := append([]client.Object{agent, podCount, room}, sizedWorkloadsAt(agent, sizingTierSmall)...)
+		var seen []*corev1.Pod
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
+			WithInterceptorFuncs(admissionStamping("cluster-default", refused, &seen)).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if len(seen) != 0 {
+			t.Fatalf("admission saw %d dry-run Pods for a PriorityClass-scoped quota on pods alone, want none: the class decides nothing it reads", len(seen))
+		}
+		promoted(t, agent, "the step was held on a quota that constrains no key the step moves")
+	})
 	t.Run("a dry run admission refuses holds the step", func(t *testing.T) {
 		t.Parallel()
 		// The dry run adds a whole pod where the step adds a difference, so
