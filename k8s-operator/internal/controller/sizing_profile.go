@@ -137,6 +137,11 @@ const (
 	// that measures no step writes (sizingTierUnsettledWorkload).
 	sizingUnsettledDeploymentFormat  = "Deployment/%s"
 	sizingUnsettledStatefulSetFormat = "StatefulSet/%s"
+
+	// The generateName suffix of the Pod sizingAdmittedPriorityClass asks
+	// admission about, after the proxy Deployment's name; the Pod is a dry
+	// run and never exists, the name is what an audit log shows.
+	sizingDryRunPodSuffix = "-sizing-dry-run-"
 )
 
 // sizingSettledRequests and sizingSettledLimits are the resource names the
@@ -474,16 +479,17 @@ func addResourceDelta(total, from, to corev1.ResourceList) {
 // container, so never BestEffort; no activeDeadlineSeconds, so never
 // Terminating; no cross-namespace affinity term; and VolumeAttributesClass
 // tracks claims, never a pod's cpu or memory. PriorityClass is read against
-// classes, the priorityClassName values the live pods in the namespace carry
-// (namespacePodPriorityClasses): the controller sets none, but the API
+// classes, the priorityClassName admission gives the pod a step recreates
+// (sizingAdmittedPriorityClass): the controller sets none, but the API
 // server's Priority admission fills in the cluster's globalDefault
 // PriorityClass when one exists, and the quota plugin, which runs after it,
 // matches the scope against the filled-in name, so a fixed answer would skip
 // a quota scoped `In` that default, which binds the pods, and read a
 // `DoesNotExist` one, which does not. The requirement selects the pods when
-// it selects any class in the set; with no pod to read (classes empty) it is
-// read as selecting them, as is a scope this operator does not know: the
-// side that holds the tier rather than promotes past a quota that binds.
+// it selects any class in the set; with no answer from admission (classes
+// empty) it is read as selecting them, as is a scope this operator does not
+// know: the side that holds the tier rather than promotes past a quota that
+// binds.
 func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement, classes []string) bool {
 	switch req.ScopeName {
 	case corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort:
@@ -564,38 +570,52 @@ func sizingQuotaBindsThePods(quota *corev1.ResourceQuota, classes []string) bool
 	return true
 }
 
-// namespacePodPriorityClasses is the set of spec.priorityClassName values the
-// live pods in the agent's namespace carry, "" for a pod with none, sorted;
-// nil when the namespace has no pod. Every pod in the namespace is read, the
-// ones this operator created and their neighbours alike, because the Priority
-// admission plugin fills a globalDefault PriorityClass into a pod as it is
-// created and never rewrites a running one: on a cluster whose default was
-// created after the sized pods, those pods carry "" while any newer neighbour
-// carries the default, as the pod a step recreates will. A requirement that
-// selects any class in the set binds (sizingScopeSelectsThePods), so a quota
-// scoped In such a default holds the tier, a SizingCappedByQuota a raised
-// quota lifts, where a read of the operator's own pods alone would skip it
-// and admission would refuse the replacement once the running pod was gone.
-// The cost is a neighbour's class of its own binding a quota scoped In it,
-// which caps the tier visibly for pods the quota would not count; the file's
-// rule for every unknown is the side that holds the tier. With no pod at all
-// there is nothing to read, and the caller takes a PriorityClass requirement
-// as selecting the pods. Pods are not a cached kind here (manager_cache.go),
-// so the list goes through the API reader, as the ResourceQuota list does,
-// and only when a quota has a PriorityClass scope.
-func (r *PlatformAgentReconciler) namespacePodPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
-	pods := &corev1.PodList{}
-	if err := r.a2aReader().List(ctx, pods, client.InNamespace(agent.Namespace)); err != nil {
-		return nil, fmt.Errorf("listing the namespace's pods for the quota scopes: %w", err)
+// sizingAdmittedPriorityClass is the spec.priorityClassName the pod a step
+// recreates will carry, asked of admission itself: a server-side dry-run
+// create (client.DryRunAll) of a Pod built from the live credential-proxy
+// Deployment's template, which the API server runs through its admission
+// chain and returns as mutated without persisting. The Priority plugin in
+// that chain fills in the cluster's globalDefault PriorityClass when one
+// exists, so the answer is the name the quota plugin will match the real
+// replacement's scopes against: "" on a cluster with no default, the
+// default's name on one that has it, whenever it was created. Reading the
+// classes off the running pods could not see a default created after them,
+// since admission fills a class in at creation and never rewrites a running
+// pod, and the pod a Recreate rollout makes is a new one. The template is the
+// proxy's own, so the Pod carries its labels, service account and requests:
+// what the namespace's webhooks and quotas would see. The second value is
+// false when admission gave no answer: no proxy Deployment yet, or a dry run
+// refused (a ResourceQuota short of a whole extra pod at the running tier,
+// which the quota plugin checks on a dry run too; a webhook that declines dry
+// runs; a verb the ClusterRole lacks). The caller then takes a PriorityClass
+// requirement as binding, the side that holds the tier: a quota that refused
+// the dry run binds the pods, and the other refusals are rare and visible in
+// the log line here. The Pod goes through the writing client, as the writes
+// do; nothing is cached or created.
+func (r *PlatformAgentReconciler) sizingAdmittedPriorityClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, bool) {
+	log := logf.FromContext(ctx)
+	proxy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err != nil {
+		log.Info("no credential-proxy Deployment to ask admission about the sizing pods' priority class; a PriorityClass-scoped quota is read as binding",
+			"name", agent.Name, "namespace", agent.Namespace, "error", err.Error())
+		return "", false
 	}
-	var classes []string
-	for _, pod := range pods.Items {
-		if !slices.Contains(classes, pod.Spec.PriorityClassName) {
-			classes = append(classes, pod.Spec.PriorityClassName)
-		}
+	template := proxy.Spec.Template
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:    agent.Namespace,
+			GenerateName: credentialProxyName(agent) + sizingDryRunPodSuffix,
+			Labels:       template.Labels,
+			Annotations:  template.Annotations,
+		},
+		Spec: *template.Spec.DeepCopy(),
 	}
-	slices.Sort(classes)
-	return classes, nil
+	if err := r.Create(ctx, pod, client.DryRunAll); err != nil {
+		log.Info("admission refused the dry-run Pod that asks the sizing pods' priority class; a PriorityClass-scoped quota is read as binding",
+			"name", agent.Name, "namespace", agent.Namespace, "error", err.Error())
+		return "", false
+	}
+	return pod.Spec.PriorityClassName, true
 }
 
 // sizingDeploymentSettled and sizingStatefulSetSettled report whether one
@@ -783,16 +803,22 @@ func (r *PlatformAgentReconciler) sizingQuotas(ctx context.Context, agent *agent
 	return quotas.Items, nil
 }
 
-// sizingQuotaPriorityClasses is namespacePodPriorityClasses when a quota in
-// quotas has a PriorityClass scope, the one scope whose answer needs the live
-// pods read, and nil without a list otherwise.
-func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, quotas []corev1.ResourceQuota) ([]string, error) {
+// sizingQuotaPriorityClasses is the one-element set of the class admission
+// gives the sized pods (sizingAdmittedPriorityClass) when a quota in quotas
+// has a PriorityClass scope, the one scope whose answer needs admission asked,
+// and nil without asking otherwise; nil too when admission gave no answer,
+// which sizingScopeSelectsThePods reads as the requirement binding.
+func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, quotas []corev1.ResourceQuota) []string {
 	for i := range quotas {
 		if sizingQuotaScopesPriorityClass(&quotas[i]) {
-			return r.namespacePodPriorityClasses(ctx, agent)
+			class, answered := r.sizingAdmittedPriorityClass(ctx, agent)
+			if !answered {
+				return nil
+			}
+			return []string{class}
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 // sizingQuotaShortfall is nil when every quota in quotas (the namespace's
@@ -946,10 +972,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
 						"waitingOn", waitingOn, "clusters", count)
 				} else {
-					classes, err := r.sizingQuotaPriorityClasses(ctx, agent, quotas)
-					if err != nil {
-						return err
-					}
+					classes := r.sizingQuotaPriorityClasses(ctx, agent, quotas)
 					// The earned tier first, then each tier between it and
 					// the running one, every step measured from the running
 					// tier against the same used totals: the highest step the

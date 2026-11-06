@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -141,36 +144,16 @@ func clampedToRequests(objs []client.Object) []client.Object {
 	return objs
 }
 
-// sizedPodsWithClass is one live pod this operator created, carrying its
-// recommended labels and class as its priorityClassName ("" for a cluster
-// with no globalDefault class).
-func sizedPodsWithClass(agent *agentv1alpha1.PlatformAgent, class string) []client.Object {
-	return []client.Object{&corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "sized-pod", Namespace: agent.Namespace, Labels: commonLabels(agent)},
-		Spec:       corev1.PodSpec{PriorityClassName: class},
-	}}
-}
-
-// namespacePodWithClass is one live pod in the agent's namespace that this
-// operator did not create, carrying class as its priorityClassName.
-func namespacePodWithClass(agent *agentv1alpha1.PlatformAgent, class string) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: "neighbour-pod", Namespace: agent.Namespace},
-		Spec:       corev1.PodSpec{PriorityClassName: class},
-	}
-}
-
 // sizingFixtures is the CR with its three workloads landed at the tier it
-// renders and their pods carrying no priority class, plus objs.
+// renders, plus objs.
 func sizingFixtures(agent *agentv1alpha1.PlatformAgent, objs ...client.Object) []client.Object {
 	fixtures := append([]client.Object{agent}, sizedWorkloadsAt(agent, renderedSizingTier(agent))...)
-	fixtures = append(fixtures, sizedPodsWithClass(agent, "")...)
 	return append(fixtures, objs...)
 }
 
 // resolveSizing runs resolveSizingTier against a fake client holding the CR,
-// its landed workloads and pods (sizingFixtures) and objs, and returns the CR
-// as the client stores it afterwards.
+// its landed workloads (sizingFixtures) and objs, and returns the CR as the
+// client stores it afterwards.
 func resolveSizing(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) (*agentv1alpha1.PlatformAgent, *record.FakeRecorder) {
 	t.Helper()
 	scheme := setupScheme()
@@ -950,12 +933,42 @@ func TestSizingQuotaScopesPriorityClass(t *testing.T) {
 	}
 }
 
-func TestResolveSizingTierReadsThePriorityClassThePodsCarry(t *testing.T) {
+// admissionStamping is a fake client's Create that answers a dry-run Pod the
+// way the API server's Priority plugin does: it fills class into
+// spec.priorityClassName ("" for a cluster with no globalDefault
+// PriorityClass) and persists nothing. refuse, when set, is what admission
+// returns instead. Every dry-run Pod it saw is appended to seen.
+func admissionStamping(class string, refuse error, seen *[]*corev1.Pod) interceptor.Funcs {
+	return interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			pod, isPod := obj.(*corev1.Pod)
+			options := &client.CreateOptions{}
+			options.ApplyOptions(opts)
+			if !isPod || !slices.Contains(options.DryRun, metav1.DryRunAll) {
+				return c.Create(ctx, obj, opts...)
+			}
+			*seen = append(*seen, pod.DeepCopy())
+			if refuse != nil {
+				return refuse
+			}
+			if pod.Spec.PriorityClassName == "" {
+				pod.Spec.PriorityClassName = class
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
+}
+
+func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 	t.Parallel()
-	// A cluster with a globalDefault PriorityClass: the API server fills it
-	// in on every sized pod, so a quota scoped In that class binds them and
-	// a short one caps the tier, and a DoesNotExist quota does not bind them
-	// and is not read. Each quota is short of the medium step on its own.
+	// The class a PriorityClass scope is read against is the one admission
+	// gives the pod a step recreates, asked with a dry-run create of a Pod
+	// built from the proxy's template. On a cluster with a globalDefault
+	// class, created before or after the install, admission fills it in, so
+	// a quota scoped In that class binds the pods and a short one caps the
+	// tier, and a DoesNotExist quota does not bind them and is not read; on
+	// a cluster with no default the answer is "", and the two swap. Each
+	// quota is short of the medium step on its own.
 	inDefault := sizingQuota("default-class", "10Gi", "8Gi")
 	inDefault.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
 		{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"cluster-default"}},
@@ -964,21 +977,34 @@ func TestResolveSizingTierReadsThePriorityClassThePodsCarry(t *testing.T) {
 	noClass.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
 		{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpDoesNotExist},
 	}}
+	unscoped := sizingQuota("unscoped", "10Gi", "8Gi")
 	// run resolves one pass at 12 clusters from the small latch, the three
-	// workloads settled at small, with quota and the pods given in the
-	// namespace, and returns the CR as written.
-	run := func(t *testing.T, quota *corev1.ResourceQuota, pods ...client.Object) *agentv1alpha1.PlatformAgent {
+	// workloads settled at small (or the objs given), with quota in the
+	// namespace and admission answering class or refusing with refuse, and
+	// returns the CR as written and the dry-run Pods admission saw.
+	run := func(t *testing.T, quota *corev1.ResourceQuota, class string, refuse error, workloads ...client.Object) (*agentv1alpha1.PlatformAgent, []*corev1.Pod) {
 		t.Helper()
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
-		objs := append([]client.Object{agent, quota}, sizedWorkloadsAt(agent, sizingTierSmall)...)
-		objs = append(objs, pods...)
+		if workloads == nil {
+			workloads = sizedWorkloadsAt(agent, sizingTierSmall)
+		}
+		objs := append([]client.Object{agent, quota}, workloads...)
+		var seen []*corev1.Pod
 		scheme := setupScheme()
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).Build()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
+			WithInterceptorFuncs(admissionStamping(class, refuse, &seen)).Build()
 		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("resolveSizingTier: %v", err)
 		}
-		return agent
+		pods := &corev1.PodList{}
+		if err := cl.List(context.Background(), pods, client.InNamespace(agent.Namespace)); err != nil {
+			t.Fatal(err)
+		}
+		if len(pods.Items) != 0 {
+			t.Fatalf("%d Pods exist after the pass, want none: the dry run persisted", len(pods.Items))
+		}
+		return agent, seen
 	}
 	cappedBy := func(t *testing.T, agent *agentv1alpha1.PlatformAgent, quota, why string) {
 		t.Helper()
@@ -999,44 +1025,68 @@ func TestResolveSizingTierReadsThePriorityClassThePodsCarry(t *testing.T) {
 			t.Fatalf("SizingCappedByQuota set by a quota whose scope does not select the pods: %+v", cond)
 		}
 	}
-	t.Run("a quota In the default class binds the pods and caps the tier", func(t *testing.T) {
+	t.Run("a quota In the class admission stamps binds the pods and caps the tier", func(t *testing.T) {
 		t.Parallel()
-		cappedBy(t, run(t, inDefault, sizedPodsWithClass(agent0(), "cluster-default")...), "default-class", "a quota scoped to the class the pods carry was skipped")
+		agent, _ := run(t, inDefault, "cluster-default", nil)
+		cappedBy(t, agent, "default-class", "a quota scoped to the class admission gives the pods was skipped")
 	})
-	t.Run("a DoesNotExist quota does not bind pods carrying the default class", func(t *testing.T) {
+	t.Run("a DoesNotExist quota does not bind pods admission stamps a class on", func(t *testing.T) {
 		t.Parallel()
-		promoted(t, run(t, noClass, sizedPodsWithClass(agent0(), "cluster-default")...), "a quota that cannot count pods carrying a class capped the tier")
+		agent, _ := run(t, noClass, "cluster-default", nil)
+		promoted(t, agent, "a quota that cannot count pods carrying a class capped the tier")
 	})
-	t.Run("a neighbour's class is read beside the operator's own pods", func(t *testing.T) {
+	t.Run("with no default class an In quota does not bind and a DoesNotExist one does", func(t *testing.T) {
 		t.Parallel()
-		// The default was created after the operator's pods, which carry
-		// none; the neighbour created since carries it, as the pod the step
-		// recreates will, so the In quota binds.
-		cappedBy(t, run(t, inDefault, append(sizedPodsWithClass(agent0(), ""), namespacePodWithClass(agent0(), "cluster-default"))...), "default-class", "a class only the neighbour's pod carries was not read beside the operator's own")
+		agent, _ := run(t, inDefault, "", nil)
+		promoted(t, agent, "an In quota capped pods admission gives no class")
+		agent, _ = run(t, noClass, "", nil)
+		cappedBy(t, agent, "no-class", "a DoesNotExist quota was skipped with no class on the pods")
 	})
-	t.Run("a class-less neighbour is read beside the operator's own pods", func(t *testing.T) {
+	t.Run("the dry-run Pod is the proxy's template, asked once, and only with a PriorityClass scope", func(t *testing.T) {
 		t.Parallel()
-		// The set is the union both ways: a DoesNotExist quota binds while
-		// any pod in the namespace carries no class.
-		cappedBy(t, run(t, noClass, append(sizedPodsWithClass(agent0(), "cluster-default"), namespacePodWithClass(agent0(), ""))...), "no-class", "a DoesNotExist quota was skipped with a class-less pod in the namespace")
+		agent, seen := run(t, inDefault, "cluster-default", nil)
+		if len(seen) != 1 {
+			t.Fatalf("admission saw %d dry-run Pods, want 1", len(seen))
+		}
+		pod := seen[0]
+		if pod.Namespace != agent.Namespace || !strings.HasPrefix(pod.GenerateName, credentialProxyName(agent)+"-sizing-dry-run-") || pod.Name != "" {
+			t.Fatalf("dry-run Pod named %q/%q (generateName %q), want the proxy's name and the dry-run suffix in the agent's namespace", pod.Namespace, pod.Name, pod.GenerateName)
+		}
+		if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Name != credentialProxyContainerName {
+			t.Fatalf("dry-run Pod containers = %+v, want the proxy's template", pod.Spec.Containers)
+		}
+		if pod.Spec.PriorityClassName != "" {
+			t.Fatalf("dry-run Pod sent with priorityClassName %q, want none: the class is admission's to fill in", pod.Spec.PriorityClassName)
+		}
+		_, seen = run(t, unscoped, "cluster-default", nil)
+		if len(seen) != 0 {
+			t.Fatalf("admission saw %d dry-run Pods for a quota with no PriorityClass scope, want none", len(seen))
+		}
 	})
-	t.Run("a neighbour's pod is read before the operator's own exist", func(t *testing.T) {
+	t.Run("a dry run admission refuses leaves a PriorityClass quota binding", func(t *testing.T) {
 		t.Parallel()
-		// The default class is filled in on every pod created without one,
-		// so a neighbour's class says what the sized pods will carry.
-		cappedBy(t, run(t, inDefault, namespacePodWithClass(agent0(), "cluster-default")), "default-class", "the class the namespace's pods carry was not read before the operator's own exist")
+		// A quota short of a whole extra pod refuses the dry run (the quota
+		// plugin checks a dry run too): the class is unknown, and both an In
+		// and a DoesNotExist quota are read as binding.
+		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: default-class"))
+		agent, seen := run(t, inDefault, "cluster-default", refused)
+		cappedBy(t, agent, "default-class", "an In quota was skipped after admission refused the dry run")
+		if len(seen) != 1 {
+			t.Fatalf("admission saw %d dry-run Pods, want 1", len(seen))
+		}
+		agent, _ = run(t, noClass, "", refused)
+		cappedBy(t, agent, "no-class", "a DoesNotExist quota was skipped after admission refused the dry run")
 	})
-	t.Run("with no pod in the namespace a PriorityClass quota binds", func(t *testing.T) {
+	t.Run("with no proxy Deployment to build the Pod from a PriorityClass quota binds", func(t *testing.T) {
 		t.Parallel()
-		cappedBy(t, run(t, inDefault), "default-class", "an In quota was skipped with no pod to read the class from")
-		cappedBy(t, run(t, noClass), "no-class", "a DoesNotExist quota was skipped with no pod to read the class from")
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierSmall)[1:]
+		agent, seen := run(t, inDefault, "cluster-default", nil, workloads...)
+		cappedBy(t, agent, "default-class", "an In quota was skipped with no template to ask admission about")
+		if len(seen) != 0 {
+			t.Fatalf("admission saw %d dry-run Pods with no proxy Deployment, want none", len(seen))
+		}
 	})
-}
-
-// agent0 is the CR the pod fixtures above label for: the name and namespace
-// sizingAgent gives every CR, before the profile and the count are set.
-func agent0() *agentv1alpha1.PlatformAgent {
-	return sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
 }
 
 func TestResolveSizingTierTakesTheEarnedTierWithNoQuotaBeforeTheWorkloadsSettle(t *testing.T) {
