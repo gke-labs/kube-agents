@@ -1112,3 +1112,93 @@ func TestWaitForKanbanCards_AnUnreadableBoardEndsTheWait(t *testing.T) {
 		t.Errorf("the wait ran to the deadline (%s) instead of giving up on the unreadable board", time.Since(start))
 	}
 }
+
+// A shutdown ends a synthesis turn in flight: the run's answer is held, so
+// nothing else would, and the cards' joined reports stand in.
+func TestASynthesisTurnEndsOnShutdown(t *testing.T) {
+	reqArrived := make(chan struct{})
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		close(reqArrived)
+		<-r.Context().Done()
+	})
+	b := &Bridge{cfg: Config{APIURL: stub.srv.URL + "/v1/chat/completions", APIKey: testAPIKey, APIModel: DefaultAPIModel}, apiClient: stub.srv.Client()}
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-synth-close", ContextID: "ctx-synth-close"}, state: stateRunning}
+	cards := []kanbanCardRow{{ID: "t_1", Title: "Cluster 1", Status: "done", Result: "Nodes Ready"}, {ID: "t_2", Title: "Cluster 2", Status: "done", Result: "Pods Healthy"}}
+	done := make(chan string, 1)
+	go func() {
+		done <- b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-synth-close", 1, "ack", cards, []string{"Nodes Ready", "Pods Healthy"})
+	}()
+	select {
+	case <-reqArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the synthesis request never arrived")
+	}
+	b.closing.Store(true)
+	select {
+	case got := <-done:
+		if !strings.Contains(got, "Nodes Ready") || !strings.Contains(got, "Pods Healthy") {
+			t.Errorf("answer after shutdown = %q, want the joined reports", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the synthesis turn did not end on the shutdown")
+	}
+}
+
+// The task's deadline during the cards' synthesis keeps the answers in hand
+// rather than failing the task.
+func TestTheDeadlineDuringASynthesisKeepsTheAnswer(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	since := time.Now().Unix() - 10
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, since = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+for i, r in ((1, "Nodes Ready"), (2, "Pods Healthy")):
+  c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+    ("t_s%d" % i, "Cluster %d" % i, "done", "cluster-diagnostics", "a2a-ctx-synth-dl", r, "", since + i, since + i + 1, None))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(since, 10)).CombinedOutput(); err != nil {
+		t.Fatalf("init db: %v\n%s", err, out)
+	}
+	t.Setenv(hermesKanbanDBEnv, db)
+	_, url := startServer(t)
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) { <-r.Context().Done() })
+	b := startAPIBridge(t, url, stub, nil)
+	sessionID := "a2a-ctx-synth-dl"
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-synth-dl", ContextID: "ctx-synth-dl", CorrelationID: "corr-synth-dl"}, state: stateRunning, answerHeld: true}
+	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
+	close(act.done)
+	run.act.Store(act)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, ok := b.waitForKanbanCards(run, ctx, act, sessionID, since, 1, "ok")
+	if !ok || !strings.Contains(got, "Nodes Ready") || !strings.Contains(got, "Pods Healthy") {
+		t.Fatalf("waitForKanbanCards = (%q, %v), want the cards' reports, not a failure", got, ok)
+	}
+}
+
+// A synthesis step is announced only when a synthesis turn runs.
+func TestASynthesisIsAnnouncedOnlyWhenOneRuns(t *testing.T) {
+	one := []kanbanCardRow{{ID: "t_1"}}
+	two := []kanbanCardRow{{ID: "t_1"}, {ID: "t_2"}}
+	if cardSynthesisRuns(nil, 1, "", one) {
+		t.Error("one card: a synthesis announced, but the card stands in as it is")
+	}
+	if !cardSynthesisRuns(nil, 1, "", two) {
+		t.Error("two cards and no answer of the turn's own: no synthesis announced")
+	}
+	if cardSynthesisRuns(nil, 1, strings.Repeat("a full answer of the turn's own. ", 20), two) {
+		t.Error("a substantive answer of the turn's own stands in: no synthesis runs")
+	}
+}
