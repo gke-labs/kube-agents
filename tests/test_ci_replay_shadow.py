@@ -463,7 +463,9 @@ class _LifecycleBase(unittest.TestCase):
         self.bin.mkdir()
         (self.bin / "gcloud").write_text(_FAKE_GCLOUD)
         # The proxy's installed mode, as _replay_shadow_deployed_env reads it.
-        (self.bin / "kubectl").write_text('#!/usr/bin/env bash\nprintf "%s" "${FAKE_DEPLOYED:-}"\n')
+        # FAKE_KUBECTL_FAIL makes the Deployment unreadable.
+        (self.bin / "kubectl").write_text(
+            '#!/usr/bin/env bash\n[ -z "${FAKE_KUBECTL_FAIL:-}" ] || exit 1\nprintf "%s" "${FAKE_DEPLOYED:-}"\n')
         for tool in ("gcloud", "kubectl"):
             (self.bin / tool).chmod(0o755)
         self.artifacts = self.tmp / "artifacts"
@@ -488,7 +490,7 @@ class _LifecycleBase(unittest.TestCase):
                                    _constants(text, "REPLAY_"), flags=re.MULTILINE)
         assert count == 1, f"expected one REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS in {_CI_ENV}, replaced {count}"
         functions = "".join(lift_function(n, text, _CI_ENV) for n in (
-            *_RESOLVE, "_replay_shadow_deployed_env", "start_replay_shadow_collector",
+            *_RESOLVE, "_replay_shadow_deployed_env", "_replay_shadow_deployed_mode", "start_replay_shadow_collector",
             "signal_replay_shadow_collector", "wait_replay_shadow_collector"))
         return ("set -euo pipefail\n" + constants + f"REPLAY_SHADOW_COLLECTOR_SCRIPT={str(self.fake)!r}\n"
                 + 'REPLAY_SHADOW_COLLECTOR_PID=""\n' + functions + body)
@@ -624,20 +626,31 @@ class ModeCollectorTest(_LifecycleBase):
         self.assertEqual((pairs["--mode"], pairs["--publish-bucket"]), ("record", "kube-agents-replay-cache"))
         self.assertIn("the mode the deploy installed", proc.stderr)
 
-    def test_a_shadow_proxy_or_an_unreadable_one_follows_this_shells_check(self):
-        for account, deployed, mode in ((_PROW_RUNNER, "", None), (_PROW_RUNNER, "shadow", None),
-                                        (_RECORDER, "", "record")):
-            with self.subTest(account=account, deployed=deployed):
+    def test_a_readable_proxy_without_a_mode_is_shadow_even_when_this_shell_would_record(self):
+        # The chart renders REPLAY_MODE only for record and replay: a Deployment
+        # read without it is a shadow install, never one to record against.
+        for deployed in ("", "shadow", "garbled"):
+            with self.subTest(deployed=deployed):
                 self.argv.unlink(missing_ok=True)
-                self._start(FAKE_ACCOUNT=account, FAKE_DEPLOYED=deployed)
-                argv, pairs = self._argv_pairs()
+                self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED=deployed)
+                argv, _ = self._argv_pairs()
+                self.assertNotIn("--mode", argv)
+                self.assertNotIn("--publish-bucket", argv)
+
+    def test_an_unreadable_proxy_falls_back_to_this_shells_check(self):
+        for account, mode in ((_RECORDER, "record"), (_PROW_RUNNER, None)):
+            with self.subTest(account=account):
+                self.argv.unlink(missing_ok=True)
+                proc = self._start(FAKE_ACCOUNT=account, FAKE_KUBECTL_FAIL="1", FAKE_DEPLOYED="record")
+                _, pairs = self._argv_pairs()
                 self.assertEqual(pairs.get("--mode"), mode)
+                self.assertIn("could not read the installed mode", proc.stderr)
 
     def test_the_lane_collects_in_replay_mode_with_its_seed_and_report_inputs(self):
         body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
                 'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
         self._fake_collector()
-        proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv))
+        proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
@@ -692,9 +705,11 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertIn("--mode replay", calls[1])
 
     def test_a_proxy_not_installed_in_replay_mode_stops_the_lane(self):
-        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="shadow")
-        self.assertIn("rc=1", proc.stdout)
-        self.assertEqual(calls, [])
+        for overrides in ({"FAKE_DEPLOYED": "shadow"}, {"FAKE_DEPLOYED": ""}, {"FAKE_KUBECTL_FAIL": "1"}):
+            with self.subTest(**overrides):
+                proc, calls = self._prepare(EVAL_REPLAY_LANE="true", **overrides)
+                self.assertIn("rc=1", proc.stdout)
+                self.assertEqual(calls, [])
 
     def test_nothing_to_replay_or_a_pod_that_did_not_take_it_stops_the_lane(self):
         for overrides, expected in (({"FAKE_FETCH_RC": "1"}, ["fetch"]), ({"FAKE_SEED_RC": "1"}, ["fetch", "seed"])):

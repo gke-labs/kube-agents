@@ -569,13 +569,24 @@ _replay_shadow_upload_identity() {
   echo "${account:-(no active gcloud account)}"
 }
 
-# Prints one variable ($2) of the proxy container on REPLAY_SHADOW_DEPLOYMENT in namespace $1, as
-# hack/ci-deploy.sh installed it, or nothing when it can't be read or isn't
-# set. (gke-labs/kube-agents#4982 reads REPLAY_JOB_KIND back the same way.)
+# Prints one variable ($2) of the proxy container on REPLAY_SHADOW_DEPLOYMENT
+# in namespace $1, as hack/ci-deploy.sh installed it: empty when the Deployment
+# was read and the variable is not set. Returns 1, printing nothing, when the
+# Deployment can't be read, so a caller tells "not set" from "unknown" by the
+# status. (gke-labs/kube-agents#4982 reads REPLAY_JOB_KIND back the same way.)
 _replay_shadow_deployed_env() {
   local jsonpath="{.spec.template.spec.containers[?(@.name==\"${REPLAY_SHADOW_CONTAINER}\")].env[?(@.name==\"$2\")].value}"
   kubectl ${AGENT_CLUSTER_CONTEXT:+--context "${AGENT_CLUSTER_CONTEXT}"} --request-timeout="${REPLAY_SHADOW_KUBECTL_TIMEOUT}" \
-    -n "$1" get deployment "${REPLAY_SHADOW_DEPLOYMENT}" -o "jsonpath=${jsonpath}" 2>/dev/null || true
+    -n "$1" get deployment "${REPLAY_SHADOW_DEPLOYMENT}" -o "jsonpath=${jsonpath}" 2>/dev/null
+}
+
+# The mode the proxy was installed in: its REPLAY_MODE, or shadow when the
+# chart left the variable out (it renders it only for record and replay).
+# Returns 1, printing nothing, when the Deployment can't be read.
+_replay_shadow_deployed_mode() {
+  local value
+  value="$(_replay_shadow_deployed_env "$1" "${REPLAY_SHADOW_PROXY_MODE_VAR}")" || return 1
+  echo "${value:-${REPLAY_MODE_SHADOW}}"
 }
 
 # The replay lane's half of resolve_replay_shadow: every refusal an error.
@@ -827,12 +838,14 @@ replay_shadow_helm_args() {
 # caller: a setting resolve_replay_shadow refuses, or a missing python3 or
 # gcloud, is a warning and no collector.
 #
-# Record mode needs the proxy to be recording too: the collector copies saved
-# answers out and publishes them only when this shell resolved record and the
-# deploy installed the proxy in record mode (read back from its Deployment), so
-# two processes that asked gcloud at different times can only fall back to
-# shadow, never into recording. Record and replay keep what they copy in a
-# private directory on this machine (REPLAY_KEEP_DIR), never the artifacts.
+# The collector runs in the mode the deploy installed the proxy in, read back
+# from its Deployment (_replay_shadow_deployed_mode): record when the proxy
+# records, so its cache is always emptied, and shadow when it doesn't, so a
+# shadow proxy is never recorded against, whatever this shell's own account
+# check answers. Only when the Deployment can't be read does this shell's own
+# resolution decide; the proxy then bounds its own cache (REPLAY_DATA_MAX_BYTES).
+# Record and replay keep what they copy in a private directory on this machine
+# (REPLAY_KEEP_DIR), never the artifacts.
 REPLAY_SHADOW_COLLECTOR_PID=""
 REPLAY_SHADOW_COLLECTOR_WAIT_SECONDS=""
 REPLAY_KEEP_DIR=""
@@ -857,22 +870,24 @@ start_replay_shadow_collector() {
   mkdir -p "${artifact_dir}" 2>/dev/null || true
   local mode="${REPLAY_SHADOW_MODE}" final_deadline="${REPLAY_SHADOW_COLLECTOR_FINAL_DEADLINE_SECONDS}" deployed
   # The deploy decided the mode; the collector follows the proxy, so a proxy
-  # recording is always emptied, whatever this shell's own check answers.
-  deployed="$(_replay_shadow_deployed_env "${namespace}" "${REPLAY_SHADOW_PROXY_MODE_VAR}")"
-  case "${deployed}" in
-  "${REPLAY_MODE_RECORD}" | "${REPLAY_MODE_REPLAY}")
-    if [ "${deployed}" != "${mode}" ]; then
-      echo "Replay proxy: the collector runs in ${deployed} mode, the mode the deploy installed, not ${mode} from this shell's own check." >&2
-    fi
-    mode="${deployed}"
-    ;;
-  "")
-    echo "Replay proxy: could not read the installed mode (or it is shadow); the collector runs in ${mode} mode from this shell's own check." >&2
-    ;;
-  *)
-    echo "WARNING: ${REPLAY_SHADOW_DEPLOYMENT} reads ${REPLAY_SHADOW_PROXY_MODE_VAR}='${deployed}'; the collector runs in ${mode} mode." >&2
-    ;;
-  esac
+  # recording is always emptied and a shadow one is never recorded against,
+  # whatever this shell's own check answers.
+  if deployed="$(_replay_shadow_deployed_mode "${namespace}")"; then
+    case "${deployed}" in
+    "${REPLAY_MODE_SHADOW}" | "${REPLAY_MODE_RECORD}" | "${REPLAY_MODE_REPLAY}")
+      if [ "${deployed}" != "${mode}" ]; then
+        echo "Replay proxy: the collector runs in ${deployed} mode, the mode the deploy installed, not ${mode} from this shell's own check." >&2
+      fi
+      mode="${deployed}"
+      ;;
+    *)
+      echo "WARNING: ${REPLAY_SHADOW_DEPLOYMENT} reads ${REPLAY_SHADOW_PROXY_MODE_VAR}='${deployed}'; the collector runs in shadow mode." >&2
+      mode="${REPLAY_MODE_SHADOW}"
+      ;;
+    esac
+  else
+    echo "Replay proxy: could not read the installed mode from ${REPLAY_SHADOW_DEPLOYMENT}; the collector runs in ${mode} mode from this shell's own check." >&2
+  fi
   if [ "${mode}" = "${REPLAY_MODE_RECORD}" ] && [ -z "${REPLAY_CACHE_BUCKET:-}" ]; then
     if ! REPLAY_CACHE_BUCKET="$(_replay_cache_bucket)"; then
       mode="${REPLAY_MODE_SHADOW}"
@@ -940,7 +955,7 @@ prepare_replay_lane_cache() {
   resolve_replay_shadow || return 1
   [ "${REPLAY_SHADOW_MODE}" = "${REPLAY_MODE_REPLAY}" ] || return 0
   local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" deployed work
-  deployed="$(_replay_shadow_deployed_env "${namespace}" "${REPLAY_SHADOW_PROXY_MODE_VAR}")"
+  deployed="$(_replay_shadow_deployed_mode "${namespace}")" || deployed="(unreadable)"
   if [ "${deployed}" != "${REPLAY_MODE_REPLAY}" ]; then
     echo "ERROR: the replay lane needs the proxy installed in replay mode; ${REPLAY_SHADOW_DEPLOYMENT} reads '${deployed}'." >&2
     return 1
