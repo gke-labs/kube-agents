@@ -1229,13 +1229,23 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_a_max_surge_past_int64_counts_as_the_replicas(self) -> None:
         """A whole number or percentage of 20 digits or more is past int64. Converting it
         with a plain int64 wraps negative on amd64 (or reads 0), which would stamp a
-        negative or short count; it is clamped, and the cap at the replicas applies."""
+        negative or short count; it is clamped, and the cap at the replicas applies. arm64
+        saturates the conversion instead, so a regression here fails only on amd64, as CI is."""
         base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
         for huge in ("1000000000000000000000%", "99999999999999999999"):
             with self.subTest(huge=huge):
                 req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"],
                                          extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={huge}"])
                 self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+
+    def test_a_replica_count_near_int64_does_not_wrap_the_stamped_count(self) -> None:
+        """The chart-pods sums saturate rather than wrap (#4876's review): a replica count of
+        2^62 at maxSurge 100% would carry a plain int64 add past 2^63 and stamp a negative
+        count, which skips the 64-pod cap. Saturated, it stays past the cap and is refused."""
+        res = self._render({"probe": {}}, ["platformAgent.mode=next", "operator.replicaCount=4611686018427387904",
+                                           "operator.rollingUpdate.maxSurge=100%"])
+        self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", res.stderr)
 
     def test_a_max_surge_that_is_not_a_whole_number_or_percentage_counts_as_the_replicas(self) -> None:
         """The schema admits any string, and validate.yml requires such a value to render

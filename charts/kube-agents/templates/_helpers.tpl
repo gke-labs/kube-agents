@@ -2154,14 +2154,14 @@ it to the Deployments and StatefulSets a render actually puts in the release nam
 {{- range $w := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
   {{- if $w.standing -}}
     {{- $n := $w.pods | int64 -}}
-    {{- $pods = add $pods $n -}}
+    {{- $pods = include "kube-agents.satAdd" (dict "a" $pods "b" $n) | int64 -}}
     {{- /* As many surge pods as its maxSurge allows; none at zero replicas. */ -}}
     {{- if $w.surges -}}
-      {{- $surges = add $surges (include "kube-agents.surgePods" (dict "maxSurge" $w.maxSurge "replicas" $n) | int64) -}}
+      {{- $surges = include "kube-agents.satAdd" (dict "a" $surges "b" (include "kube-agents.surgePods" (dict "maxSurge" $w.maxSurge "replicas" $n) | int64)) | int64 -}}
     {{- end -}}
   {{- end -}}
 {{- end -}}
-{{- add $pods $surges -}}
+{{- include "kube-agents.satAdd" (dict "a" $pods "b" $surges) -}}
 {{- end }}
 
 {{/*
@@ -2812,7 +2812,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
        used+required fits the release at rest and then stalls its first rollout, which is the
        failure values.yaml warns about under hindsight.api.rollingUpdate. Rollouts are
        per-workload, so room for one surge Pod at a time is enough. */ -}}
-{{- /* How many chart workloads roll with a surge pod: kube-agents.chartQuotaPods counts one each. */ -}}
+{{- /* The surge pods every chart workload's rollout can add (kube-agents.surgePods), the figure
+       kube-agents.chartQuotaPods stamps. */ -}}
 {{- $chartSurgePods := 0 -}}
 {{- $surgeCpuReq := 0 -}}
 {{- $surgeCpuLim := 0 -}}
@@ -2844,7 +2845,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
            for the operator's session quota. The patch's surge room stays one pod of the
            largest surging workload: enough for a rollout to make progress, since the
            ReplicaSet controller creates the next surge pod as quota frees up. */ -}}
-    {{- $chartSurgePods = add $chartSurgePods $surgePods -}}
+    {{- $chartSurgePods = include "kube-agents.satAdd" (dict "a" $chartSurgePods "b" $surgePods) | int64 -}}
     {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
     {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
     {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}
