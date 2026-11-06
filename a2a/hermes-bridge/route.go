@@ -50,8 +50,8 @@ const (
 	// recorded, so the user is told rather than left waiting for a card's
 	// answer that cannot arrive. Such a turn waits on its cards in turn
 	// (waitKanbanInTurn), so only a card still running when the wait ends
-	// is left without a way back.
-	routeLostNote = "\n\n(A card this turn left running cannot post its answer back to this conversation: the conversation's route could not be recorded.)"
+	// is left without a way back; most such turns file none, hence "if".
+	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name

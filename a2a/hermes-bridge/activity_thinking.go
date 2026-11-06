@@ -18,6 +18,7 @@ var (
 	pyReprReasoningRe    = regexp.MustCompile(`reasoning(?:_content)?=['"]([^'"]+)['"]`)
 	cmdClusterFlagRe     = regexp.MustCompile(`(?:--cluster|--context)[=\s]+['"]?([A-Za-z0-9_.:-]+)['"]?`)
 	kanbanCardIDPattern  = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
+	kanbanCardIDExact    = regexp.MustCompile(`^t_[A-Za-z0-9_-]{2,32}$`)
 
 	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|1//[0-9A-Za-z_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|r8_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
 	// A private-key armour header ends in "PRIVATE KEY-----" (PEM, OpenSSH,
@@ -186,7 +187,8 @@ func (a *activityState) SyncKanbanCard(cardID, title, workerSessionID string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.initSessionTraceLocked()
-	cardID = strings.TrimSpace(cardID)
+	// Capped as the argument path caps a worker's card id.
+	cardID = capBytes(strings.TrimSpace(cardID), maxSubtaskIDBytes)
 	title = strings.TrimSpace(title)
 	workerSessionID = strings.TrimSpace(workerSessionID)
 	if cardID != "" && title != "" {
@@ -208,7 +210,12 @@ func extractKanbanCardIDFromCwd(cwd string) string {
 	if slash := strings.IndexByte(rest, '/'); slash >= 0 {
 		rest = rest[:slash]
 	}
-	return strings.TrimSpace(rest)
+	// The segment is hermes's card id; anything else (an overlong or odd
+	// path a tool changed into) names no card.
+	if rest = strings.TrimSpace(rest); !kanbanCardIDExact.MatchString(rest) {
+		return ""
+	}
+	return rest
 }
 
 func unwrapHermesToolCall(toolName string, rawInput json.RawMessage) (string, map[string]any) {
@@ -410,7 +417,11 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 	if len(e.Input) == 0 && len(openEntry.Input) > 0 {
 		e.Input = openEntry.Input
 	}
-	createdCardID := createdKanbanCardID(effectiveTool, d.Extra.Result)
+	// A failed create made no card: its result's text may name another one.
+	var createdCardID string
+	if status != ActivityStatusError {
+		createdCardID = createdKanbanCardID(effectiveTool, d.Extra.Result)
+	}
 	a.observeWorkerContextLocked(d, rawToolInput, createdCardID)
 	e.SessionID = capRunes(d.SessionID, activityCallIDCap)
 	e.Worker = a.workerLabelLocked(d.SessionID)

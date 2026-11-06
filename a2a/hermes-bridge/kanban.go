@@ -282,7 +282,7 @@ func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.
 	}
 	return stepmsg.Step{
 		Kind:  stepmsg.KindSubtask,
-		Title: capBytes(fmt.Sprintf("Specialist check completed: %s.", shortTitle), maxStepTitleBytes),
+		Title: capBytes(fmt.Sprintf("Specialist check %s: %s.", cardSettledWord(c.Status), shortTitle), maxStepTitleBytes),
 		Subtask: &stepmsg.Subtask{
 			ID:           capBytes(c.ID, maxSubtaskIDBytes),
 			Title:        capBytes(capRunes(title, cardStepTitleCap), maxStepTitleBytes),
@@ -580,7 +580,13 @@ func cardAnswerText(c kanbanCardRow) string {
 			return res
 		}
 	case debugErrorTextOn():
-		if out := strings.TrimSpace(formatKanbanCardOutput(c)); out != "" {
+		// As on an activity entry: the error's first line (else the run's),
+		// scrubbed and capped.
+		text := strings.TrimSpace(c.Err)
+		if text == "" {
+			text = strings.TrimSpace(formatKanbanCardOutput(c))
+		}
+		if out := oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap); out != "" {
 			return out
 		}
 	}
@@ -611,6 +617,23 @@ func blockedCardQuestion(c kanbanCardRow) string {
 }
 
 // kanbanStatusSucceeded reports whether a card's status is a successful end.
+// cardSettledWord is the one word a settled card's step title gives its end,
+// so a blocked or failed card is not announced as a completed check.
+func cardSettledWord(status string) string {
+	switch st := strings.ToLower(strings.TrimSpace(status)); {
+	case kanbanStatusSucceeded(st):
+		return "completed"
+	case isKanbanStatusBlocked(st):
+		return "blocked"
+	case st == "canceled" || st == "cancelled":
+		return "canceled"
+	case st == "failed" || st == "gave_up":
+		return "failed"
+	default:
+		return "settled"
+	}
+}
+
 func kanbanStatusSucceeded(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "done", "completed", "archived":
@@ -663,6 +686,12 @@ func querySessionKanbanCards(ctx context.Context, pythonBin, dbPath, sessionID s
 	cmd := exec.CommandContext(qCtx, pythonBin, "-c", kanbanDBPyScript, "poll", dbPath, sessionID, strconv.FormatInt(sinceUnix, 10), strings.Join(trackedIDs, ","))
 	out, err := cmd.Output()
 	if err != nil {
+		// The script's traceback names the cause (a corrupt file, a schema
+		// change, no sqlite3 module); the exit status alone does not.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return nil, fmt.Errorf("%w: %s", err, tail(strings.TrimSpace(string(exitErr.Stderr)), apiBodyTailBytes))
+		}
 		return nil, err
 	}
 	var rows []kanbanCardRow
@@ -694,8 +723,25 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 		run.mu.Unlock()
 		return "", false
 	}
-	run.answerHeld = false
+	// The turn's answer is finished and stays held while its cards run, so a
+	// shutdown leaves the run to this worker (shutdownTasks), which sees
+	// closing at its next poll and ends the task with that answer.
 	run.mu.Unlock()
+
+	// waitEnded decides a wait whose taskCtx ended: a cancel ends it as
+	// finalizeAPIError does (completed, with the answer, when no card was
+	// filed), and the deadline keeps the finished answer rather than failing
+	// a turn whose own work is done.
+	waitEnded := func() (keepAnswer bool) {
+		if run.canceled.Load() && !b.closing.Load() && !run.deadlineHit.Load() {
+			return !turnFiledCards && (act == nil || !act.cardsFiled.Load()) && len(trackedIDs) == 0
+		}
+		if run.canceled.Load() {
+			return false
+		}
+		b.cfg.Logger.Warn("the task's deadline or a shutdown ended the wait on its cards; the turn ends with its own answer", "task", run.origin.TaskID)
+		return true
+	}
 
 	if act != nil {
 		act.inTurn.Store(false)
@@ -713,6 +759,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 	ticker := time.NewTicker(kanbanPollInterval)
 	defer ticker.Stop()
 
+poll:
 	for {
 		if act != nil && act.cardsFiled.Load() {
 			turnFiledCards = true
@@ -761,8 +808,8 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 						continue
 					}
 					st := cardStep(c, settledCount, totalCount, "")
-					progText := fmt.Sprintf("Kanban specialist checks: %d/%d completed (%d running) — latest: %s (%s)",
-						settledCount, totalCount, totalCount-settledCount, strings.TrimSuffix(strings.TrimPrefix(st.Title, "Specialist check completed: "), "."), st.Subtask.Verdict)
+					progText := fmt.Sprintf("Kanban specialist checks: %d/%d settled (%d running) — latest: %s (%s)",
+						settledCount, totalCount, totalCount-settledCount, st.Subtask.Title, st.Subtask.Verdict)
 					run.mu.Lock()
 					if act != nil {
 						b.publishSteps(run, act, []stepmsg.Step{st})
@@ -830,8 +877,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 				}
 			}
 		} else if taskCtx.Err() != nil {
-			if !turnFiledCards && (act == nil || !act.cardsFiled.Load()) && len(trackedIDs) == 0 &&
-				run != nil && run.canceled.Load() && !b.closing.Load() && !run.deadlineHit.Load() {
+			if waitEnded() {
 				break
 			}
 			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
@@ -855,11 +901,15 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 			break
 		}
 
+		if b.closing.Load() && !run.canceled.Load() {
+			b.cfg.Logger.Warn("shutdown ended the wait on the turn's cards; the turn ends with its own answer", "task", run.origin.TaskID)
+			break
+		}
+
 		select {
 		case <-taskCtx.Done():
-			if !turnFiledCards && (act == nil || !act.cardsFiled.Load()) && len(trackedIDs) == 0 &&
-				run != nil && run.canceled.Load() && !b.closing.Load() && !run.deadlineHit.Load() {
-				break
+			if waitEnded() {
+				break poll
 			}
 			b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 			return "", false

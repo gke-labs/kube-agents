@@ -553,6 +553,8 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 // relied on for any of it. The mutants this kills: publishing the detailed
 // input, the error text, a result preview, or the reasoning as a thought.
 func TestAPI_EntriesCarryShapesAndNoResultErrorOrReasoningText(t *testing.T) {
+	// The default this test holds, whatever the shell running it exports.
+	t.Setenv(debugErrorTextEnv, "")
 	a := newActivityState(false)
 	a.sessionID = "a2a-shape-test"
 	const (
@@ -1091,6 +1093,36 @@ func TestWorkerLabelUsesTheScrubbedCardTitle(t *testing.T) {
 }
 
 // A worker's kanban_* card id is capped before it is kept for attribution.
+// A failed kanban_create made no card: an id its error text names is not
+// published as the entry's card, nor registered as one this task owns.
+func TestAFailedKanbanCreateNamesNoCard(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-failed-create"
+	create := hookDelivery{Event: hookPostToolCall, SessionID: "a2a-failed-create", DeliveryID: "post-fail", ToolName: kanbanCreateTool,
+		ToolInput: json.RawMessage(`{"title":"Child check","parent":"t_root9"}`)}
+	create.Extra.ToolCallID = "call-fail"
+	create.Extra.Status = "error"
+	create.Extra.Result = json.RawMessage(`{"error":"parent t_root9 not found"}`)
+	e, _, _ := a.observe(create)
+	if e.CardID != "" || a.hasCardID("t_root9") {
+		t.Errorf("failed create: cardId %q, owned t_root9 %v; want neither", e.CardID, a.hasCardID("t_root9"))
+	}
+}
+
+// A card id read from a worker's cwd is hermes's id shape or nothing.
+func TestACwdCardIDMustBeACardID(t *testing.T) {
+	for cwd, want := range map[string]string{
+		"/opt/data/kanban/workspaces/t_abc123/repo":                       "t_abc123",
+		"/opt/data/kanban/workspaces/" + strings.Repeat("x", 4000) + "/r": "",
+		"/opt/data/kanban/workspaces/../x":                                "",
+		"/opt/data/kanban/workspaces/t_" + strings.Repeat("a", 40):        "",
+	} {
+		if got := extractKanbanCardIDFromCwd(cwd); got != want {
+			t.Errorf("extractKanbanCardIDFromCwd(%.60q) = %q, want %q", cwd, got, want)
+		}
+	}
+}
+
 func TestAWorkersCardIDIsCapped(t *testing.T) {
 	a := newActivityState(false)
 	a.sessionID = "a2a-cap-test"
