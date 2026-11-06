@@ -1408,6 +1408,122 @@ func TestResolveSizingTierHoldsTheStepWhileASizedWorkloadIsAbsent(t *testing.T) 
 	}
 }
 
+// While discovery cannot say whether the cluster is Autopilot, the proxy is
+// rendered at the type it was last rendered for (credentialProxyAutopilot).
+// The sizing reads take the same type, so a proxy kept at its Autopilot
+// requests is settled at them and measured at them, not read as a Standard
+// proxy that has not rolled.
+func TestSizingReadsTheProxyAtItsRenderedTypeWhileDiscoveryFails(t *testing.T) {
+	t.Parallel()
+	failing := func() *mockAutopilotDiscovery {
+		return &mockAutopilotDiscovery{serverGroupsErr: fmt.Errorf("connection refused")}
+	}
+	t.Run("a proxy recorded as Autopilot is read as Autopilot", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		objs := sizedWorkloadsOn(agent, sizingTierMedium, true)
+		proxy := objs[0].(*appsv1.Deployment)
+		proxy.Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, objs...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, DiscoveryClient: failing()}
+		if !r.sizingAutopilot(context.Background(), agent) {
+			t.Fatalf("sizingAutopilot = false with discovery failing over a proxy recorded as Autopilot; want the type the proxy is rendered at")
+		}
+	})
+	t.Run("an override the Autopilot band lowers settles at the Autopilot render", func(t *testing.T) {
+		t.Parallel()
+		// A small memory request takes the Autopilot CPU request below the
+		// Standard one (500m against 1 at medium), so the proxy kept at its
+		// Autopilot render is short of the Standard row: read as Standard,
+		// the step would be held on every pass.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+		}}
+		objs := sizedWorkloadsOn(agent, sizingTierMedium, true)
+		objs[0].(*appsv1.Deployment).Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, objs...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, DiscoveryClient: failing()}
+		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "" {
+			t.Fatalf("sizingTierUnsettledWorkload = %q, want settled at the Autopilot render the proxy is kept at", got)
+		}
+	})
+	t.Run("the step is measured at the Autopilot rows", func(t *testing.T) {
+		t.Parallel()
+		// Latched small with a requests.memory quota 2560Mi short of full:
+		// the Autopilot rows' small-to-medium step fits it, the Standard
+		// rows' does not. Measured at the Standard rows, the tier would be
+		// capped at small on a quota that has room.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		objs := sizedWorkloadsOn(agent, sizingTierSmall, true)
+		objs[0].(*appsv1.Deployment).Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
+		quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceRequestsMemory, "20Gi", "17920Mi")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota}, objs...)...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), DiscoveryClient: failing()}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want medium, the step measured at the Autopilot rows",
+				agent.Status.EffectiveSizingTier, meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType))
+		}
+	})
+	t.Run("a refusal on a figure the Autopilot step does not move is not the step's", func(t *testing.T) {
+		t.Parallel()
+		// Latched medium, the proxy refused on requests.cpu. The Autopilot
+		// rows move no CPU request from small to medium, so stepping back
+		// would not admit the pod and the latch stays; read at the Standard
+		// rows, which move it, the refusal would step the latch back to small.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+		objs := sizedWorkloadsOn(agent, sizingTierMedium, true)
+		proxy := objs[0].(*appsv1.Deployment)
+		proxy.Annotations = map[string]string{credentialProxyClusterTypeAnnotation: credentialProxyClusterTypeAutopilot}
+		refusedByQuotaOn(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceRequestsCPU, "1")
+		quota := sizingQuotaOn("platform-baseline-quota", corev1.ResourceRequestsCPU, "100", "1")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota}, objs...)...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), DiscoveryClient: failing()}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the refused figure is one the Autopilot step does not move", agent.Status.EffectiveSizingTier)
+		}
+	})
+	t.Run("a refused override is read as the render reads it", func(t *testing.T) {
+		t.Parallel()
+		// A proxy an older operator wrote carries no cluster-type annotation,
+		// so the type is the one whose requests it carries. The render drops a
+		// refused override before it compares; the sizing read must too, or
+		// it compares against the override's figures and reads Standard.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("8")},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+		}}
+		objs := sizedWorkloadsOn(agent, sizingTierMedium, true)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, objs...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, DiscoveryClient: failing()}
+		if !r.sizingAutopilot(context.Background(), agent) {
+			t.Fatalf("sizingAutopilot = false for a proxy at the Autopilot render with a refused override; want Autopilot, as the render reads it")
+		}
+	})
+	t.Run("with no proxy yet sizing reads Standard", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, DiscoveryClient: failing()}
+		if r.sizingAutopilot(context.Background(), agent) {
+			t.Fatalf("sizingAutopilot = true with discovery failing and no proxy; want Standard, as the render picks")
+		}
+	})
+}
+
 func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
 	t.Parallel()
 	// Latched small at 25 clusters with one limits.memory quota, 20Gi hard
