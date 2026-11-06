@@ -200,44 +200,11 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 
 // gchatWithoutRating is layout with its rating buttons removed, and a button
 // list left empty by that removed with them, so gchatWithRating draws one
-// pair on it again. It returns new slices and maps and leaves layout as it
-// is.
+// pair on it again (gchatWithoutButtons).
 func gchatWithoutRating(layout gchatChatLayout) gchatChatLayout {
-	var widgets []map[string]any
-	for _, w := range layout.Widgets {
-		list, ok := w[gchatButtonListKey].(map[string]any)
-		if !ok {
-			widgets = append(widgets, w)
-			continue
-		}
-		existing, _ := list[gchatButtonsKey].([]map[string]any)
-		var buttons []map[string]any
-		for _, b := range existing {
-			click, _ := b[gchatOnClickKey].(map[string]any)
-			action, _ := click[gchatActionKey].(map[string]any)
-			if action[gchatFunctionKey] != gchatFeedbackFunction {
-				buttons = append(buttons, b)
-			}
-		}
-		if len(buttons) == len(existing) {
-			widgets = append(widgets, w)
-			continue
-		}
-		if len(buttons) == 0 {
-			continue
-		}
-		newList := make(map[string]any, len(list))
-		for k, v := range list {
-			newList[k] = v
-		}
-		newList[gchatButtonsKey] = buttons
-		newWidget := make(map[string]any, len(w))
-		for k, v := range w {
-			newWidget[k] = v
-		}
-		newWidget[gchatButtonListKey] = newList
-		widgets = append(widgets, newWidget)
-	}
+	widgets := gchatWithoutButtons(layout.Widgets, func(b map[string]any) bool {
+		return gchatButtonFunction(b) == gchatFeedbackFunction
+	})
 	return gchatChatLayout{Text: layout.Text, Widgets: widgets}
 }
 

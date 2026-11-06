@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -359,5 +360,148 @@ func TestGchatBoardLineAndRowText(t *testing.T) {
 	}
 	if _, err := gchatBoardRowLayout(gchatChatLayout{Text: "10. x"}, 1, "l", true); !errors.Is(err, errGchatBoardRowGone) {
 		t.Errorf("row 1 found in %q: %v", "10. x", err)
+	}
+}
+
+// A message laid out again through the notify route has new rows, so the
+// claim a settled tap kept on the old row 1 does not hold the new row 1's
+// buttons dead: a tap on it acts again.
+func TestGchatBoardReLayoutFreesTheRowsClaims(t *testing.T) {
+	a, f, actor := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("first tap: %q", reason)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); reason != gchatBoardBusy {
+		t.Fatalf("a second tap before the re-layout: %q", reason)
+	}
+	again := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
+		Rows: []chatmsg.Row{{Text: "**Only z**", Tasks: []string{"t_9"}, Actions: []string{"retry", "drop"}}}}
+	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "again", Chat: again}); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_9")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap on the new row 1: %q", reason)
+	}
+	calls := actor.taken()
+	if len(calls) != 2 || calls[1].Action != "drop" || strings.Join(calls[1].Tasks, ",") != "t_9" {
+		t.Fatalf("board actions = %+v, want the new row's drop as the second", calls)
+	}
+	body := checkPatch(t, f, 3, gchatBoardMessage)
+	if want := "*1 task is stuck.*\n\n1. *Only z* — Dropped. Test Sender, 15:04 UTC"; body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+}
+
+// The row is found in the rows block, not at the first line that starts
+// with its number: a detail with a numbered list of its own is left alone.
+func TestGchatBoardTapEditsTheRowNotADetailLine(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	card := gchatBoardCard()
+	card.Detail = "1. not a row\n2. nor this"
+	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	text := body["text"].(string)
+	if !strings.Contains(text, "\n\n1. not a row\n2. nor this\n\n1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n2. ") {
+		t.Errorf("text =\n%s", text)
+	}
+	for _, tc := range []struct {
+		lines        []string
+		start, count int
+	}{
+		{[]string{"h", "", "1. a", "2. b", "", "x"}, 2, 2},
+		{[]string{"1. d", "", "1. a", "2. b"}, 2, 2},
+		{[]string{"1. a", "2. b", "", "1. f"}, 0, 2},
+		{[]string{"1. d", "", "1. a"}, 2, 1},
+		{[]string{"h", "10. x"}, 0, 0},
+	} {
+		if start, count := gchatBoardRowsBlock(tc.lines); start != tc.start || count != tc.count {
+			t.Errorf("rows block of %q = %d, %d; want %d, %d", tc.lines, start, count, tc.start, tc.count)
+		}
+	}
+}
+
+// A progress message draws its plan in the rows' place, so rows that carry
+// buttons draw none there: a button for a row not shown would name nothing.
+func TestGchatBoardButtonsAreDrawnOnlyWithTheRows(t *testing.T) {
+	m := gchatBoardCard()
+	m.Plan = &chatmsg.Plan{Items: []chatmsg.PlanItem{{ID: "c1", Title: "Triage x", Status: chatmsg.StatusInProgress}}}
+	layout, err := renderGchatChat(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.Widgets != nil || strings.Contains(layout.Text, "1. ") {
+		t.Errorf("plan layout = %+v, want no row buttons and no numbered rows", layout)
+	}
+}
+
+// The gateway hands the Chat adapter the board route and the admission
+// rule on New: an allowlisted presser's tap acts, another's does not. The
+// mux and the side door pass the rule through to the adapter behind them.
+func TestGchatBoardAdmitsIsWiredThroughNewMuxAndSideDoor(t *testing.T) {
+	s := startServer(t)
+	provision(t, s.ClientURL())
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, s.ClientURL(), lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/patch"] = map[string]any{"name": gchatBoardMessage}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	cfg := &Config{NATSURL: s.ClientURL(), DefaultAddressee: "platform", IdleTTL: 30 * time.Minute,
+		AttributionSalt: []byte("test-salt"), GchatAllowedUsers: []string{"Sender@example.com"}}
+	if _, err := New(Options{Client: client, Adapter: a, Config: cfg, Backend: "gchat"}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	actor, admits := a.boardActor, a.boardAdmits
+	a.mu.Unlock()
+	if actor == nil || admits == nil {
+		t.Fatal("New wired no board route or rule into the Chat adapter")
+	}
+	if !admits("gchat", "sender@example.com") || admits("gchat", "other@example.com") {
+		t.Error("the rule is not the gateway's allowlist")
+	}
+	// With no bridge on the bus the tap fails and the row says so; a tap
+	// from an unlisted presser is dropped before any call.
+	other := gchatBoardTap(t, "retry", 1, "t_1")
+	other.click.User.Email = "other@example.com"
+	if _, reason := a.classify(other); reason != gchatBoardUnverified {
+		t.Errorf("unlisted presser: %q", reason)
+	}
+	ev := gchatBoardTap(t, "retry", 1, "t_1")
+	ev.Message.Text = "1. x"
+	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("listed presser: %q", reason)
+	}
+	if body := checkPatch(t, f, 0, gchatBoardMessage); body["text"] != "1. x — Couldn't retry it just now. Try again." {
+		t.Errorf("text after a tap with no bridge = %q", body["text"])
+	}
+
+	behindMux := newTestGchatAdapterWithRelay(t, newFakeChatRelay(t))
+	m, err := NewMultiAdapter("gchat", "console", map[string]Adapter{"gchat": behindMux, "console": newFakeAdapter()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetBoardAdmits(func(string, string) bool { return true })
+	behindDoor := newTestGchatAdapterWithRelay(t, newFakeChatRelay(t))
+	door := WithSideDoors(behindDoor, nil, nil).(*sideDoorAdapter)
+	door.SetBoardAdmits(func(string, string) bool { return true })
+	for name, b := range map[string]*GoogleChatAdapter{"mux": behindMux, "side door": behindDoor} {
+		b.mu.Lock()
+		set := b.boardAdmits != nil
+		b.mu.Unlock()
+		if !set {
+			t.Errorf("the %s did not pass SetBoardAdmits through", name)
+		}
 	}
 }

@@ -1795,7 +1795,10 @@ on the same line, the time in UTC since Chat has no date token, and the row's tw
 tap that did not land keeps them under a line saying so, so a second tap asks again, and so does
 one whose patch Chat refused. One tap per row at a time, and the edits of one message in turn under
 its rewrite lock, each from the layout the adapter last sent it; a message posted before a restart
-is edited from the event's copy of it, text and buttons (`gchat_board.go`).
+is edited from the event's copy of it, text and buttons (`gchat_board.go`). The report caps its
+rows at `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on
+buttons in one list is not documented in a form this spec can cite and has not been measured, and
+a layout Chat refuses falls back to the text as any does.
 
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`

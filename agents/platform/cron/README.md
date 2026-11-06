@@ -606,9 +606,11 @@ and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
-agent turn. Google Chat, and a run that also reports the board's other
-findings, get the text.
+today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
+allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
+where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
+is never an agent turn. Google Chat under today, and a run that also reports
+the board's other findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be

@@ -24,8 +24,10 @@ import (
 // a mention or a <url|text> in it is defanged as in any post. It lays out
 // and never composes: every word comes from the message, and the only things
 // it adds are its backend's own -- the glyph on a plan item, the step
-// markers, the bullet on a row, and the Stop button the gateway asks for
-// under a running task's line (gchat_stop.go).
+// markers, the bullet on a row, the Stop button the gateway asks for under
+// a running task's line (gchat_stop.go), and, where a row carries Retry and
+// Drop, the row's number in the bullet's place and the "Retry n" and "Drop
+// n" labels on its buttons (gchat_board.go).
 const (
 	// gchatChatTextMax bounds the laid-out text: the adapter's one bound on
 	// a posted text (gchatTextMax). A message past it posts as its
@@ -106,10 +108,15 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	if strings.TrimSpace(m.Detail) != "" {
 		add(toGchatText(m.Detail))
 	}
+	// The rows' buttons are drawn only where the rows are: a progress
+	// message's plan takes their place, and a button for a row not shown
+	// would name nothing.
+	var rowButtons []map[string]any
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(gchatChatPlan(m.Plan))
 	} else {
 		add(gchatChatRows(m.Rows))
+		rowButtons = gchatBoardButtons(m.Rows)
 	}
 	add(gchatChatAfter(m.After))
 	if m.Fold != nil {
@@ -117,7 +124,7 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	}
 	layout := gchatChatLayout{
 		Text:    strings.Join(sections, gchatChatSectionGap),
-		Widgets: gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), gchatBoardButtons(m.Rows)...)),
+		Widgets: gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
 	}
 	if layout.Text == "" && len(layout.Widgets) == 0 {
 		return gchatChatLayout{}, errGchatChatEmpty
