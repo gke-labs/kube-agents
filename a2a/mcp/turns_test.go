@@ -1569,6 +1569,84 @@ func TestStepStateEvictionPrefersInactiveAndRemovesAllAliasedKeys(t *testing.T) 
 	}
 }
 
+// A poll that re-keys a followed task's id from another state closes that
+// state only after it has released its own mu, so two polls each evicting
+// the other's state cannot deadlock; and it cuts short the other state's
+// in-flight poll rather than wait out its window.
+func TestAPollClosesAStateItEvictsOnlyAfterReleasingItsOwnLock(t *testing.T) {
+	url, js := testBus(t)
+	conv := "console:tok-evict"
+	root := TaskRef{Addressee: fakeAddressee, TaskID: "task-evict-root"}
+	child := TaskRef{Addressee: "cluster-a", TaskID: "task-evict-child"}
+	publishSubmission(t, js, root.Addressee, root.TaskID, conv, "delegate", "")
+	publishRun(t, js, root.Addressee, root.TaskID, "", false)
+	publishArtifact(t, js, root.Addressee, root.TaskID, lib.ArtifactDelegate, "cluster-a: check")
+	publishStatus(t, js, root.Addressee, root.TaskID, lib.StateCompleted, true)
+	publishSubmission(t, js, child.Addressee, child.TaskID, conv, "check", root.TaskID)
+	publishRun(t, js, child.Addressee, child.TaskID, "child answer", true)
+
+	b := dial(t, url)
+	convs := NewConversations()
+	mine := convs.initTaskStepState(root, "tok-mine", "", true, nil, nil)
+	mine.followedRefs = []TaskRef{child}
+	// Another state keyed under the child's id, its poll in flight (it
+	// holds its mu).
+	other := convs.initTaskStepState(child, "tok-other", "", true, nil, nil)
+	var otherCancelled atomic.Bool
+	other.setCancelPoll(func() { otherCancelled.Store(true) })
+	other.mu.Lock()
+	otherLocked := true
+	defer func() {
+		if otherLocked {
+			other.mu.Unlock()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.WaitForTurnStep(t.Context(), convs, nil, root, 5*time.Second)
+		done <- err
+	}()
+	rekeyed := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		convs.mu.Lock()
+		rekeyed = convs.steps[child.TaskID] == mine
+		convs.mu.Unlock()
+		if rekeyed {
+			break
+		}
+	}
+	if !rekeyed {
+		t.Fatal("the poll never keyed its state under the followed task's id")
+	}
+	// From here mine.mu is held for the rest of the poll; it must come
+	// free while the evicted state is still busy.
+	released := false
+	for deadline := time.Now().Add(delegationSettle + 8*time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if mine.mu.TryLock() {
+			mine.mu.Unlock()
+			released = true
+			break
+		}
+	}
+	if !released {
+		t.Error("the poll held its own lock while closing the state it evicted")
+	}
+	if !otherCancelled.Load() {
+		t.Error("the evicted state's in-flight poll was not cut short")
+	}
+	other.mu.Unlock()
+	otherLocked = false
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("WaitForTurnStep: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("WaitForTurnStep did not return once the evicted state was free")
+	}
+}
+
 func TestConcurrentStepStateOperationsNoDeadlockOrRace(t *testing.T) {
 	convs := NewConversations()
 	const workers = 8
@@ -1588,9 +1666,10 @@ func TestConcurrentStepStateOperationsNoDeadlockOrRace(t *testing.T) {
 				}
 				st := convs.getOrCreateTaskStepState(root, tw)
 				st.mu.Lock()
-				convs.aliasTaskStepState(child, st)
+				evicted := convs.aliasTaskStepState(child, st)
 				convs.setRunning(token, &child)
 				st.mu.Unlock()
+				closeEvicted(evicted)
 
 				_, _ = convs.knownTaskRef(child.TaskID)
 				_ = convs.activeStepFollowedTasks(token, root)

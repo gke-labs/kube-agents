@@ -647,6 +647,9 @@ type taskStepState struct {
 	// cancelMu guards it, not mu.
 	cancelMu   sync.Mutex
 	cancelPoll context.CancelFunc
+	// evicted are the states this poll's aliasTaskStepState evicted, for
+	// WaitForTurnStep to close once it has released mu.
+	evicted []*taskStepState
 }
 
 func (s *taskStepState) setCancelPoll(cancel context.CancelFunc) {
@@ -909,9 +912,14 @@ func (c *Conversations) getOrCreateTaskStepState(ref TaskRef, w *turnWatch) *tas
 	return st
 }
 
-func (c *Conversations) aliasTaskStepState(child TaskRef, st *taskStepState) {
+// aliasTaskStepState keys st under child too. It returns the states it
+// evicted to make room, or that child was keyed to, for the caller to close
+// (closeEvicted) once it no longer holds st.mu: closing one takes its mu,
+// and two polls each closing the other's state while holding their own
+// would deadlock.
+func (c *Conversations) aliasTaskStepState(child TaskRef, st *taskStepState) []*taskStepState {
 	if c == nil || st == nil || child.TaskID == "" {
-		return
+		return nil
 	}
 	var toClose []*taskStepState
 	c.mu.Lock()
@@ -934,7 +942,15 @@ func (c *Conversations) aliasTaskStepState(child TaskRef, st *taskStepState) {
 		c.steps[child.TaskID] = st
 	}
 	c.mu.Unlock()
-	for _, s := range toClose {
+	return toClose
+}
+
+// closeEvicted closes states aliasTaskStepState evicted, cutting short any
+// poll in flight on one first (as stopTaskStepState does) rather than wait
+// out its window for its mu. The caller holds no state's mu.
+func closeEvicted(states []*taskStepState) {
+	for _, s := range states {
+		s.cancelInFlightPoll()
 		s.closeAll()
 	}
 }
@@ -1856,7 +1872,12 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	}
 	st := convs.getOrCreateTaskStepState(root, w)
 	st.mu.Lock()
-	defer st.mu.Unlock()
+	defer func() {
+		evicted := st.evicted
+		st.evicted = nil
+		st.mu.Unlock()
+		closeEvicted(evicted)
+	}()
 
 	st.disarmIdleReleaseLocked()
 	if st.watch != nil && st.watchTimer != nil {
@@ -2097,7 +2118,7 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	allFollowedFinal := true
 	unreadable := false
 	for _, fRef := range followedRefs {
-		convs.aliasTaskStepState(fRef, st)
+		st.evicted = append(st.evicted, convs.aliasTaskStepState(fRef, st)...)
 		ft, waitedChild, ferr := b.pollSingleTaskLocked(ctx, st, fRef)
 		if waitedChild {
 			waitedAny = true
