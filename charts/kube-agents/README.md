@@ -1120,8 +1120,9 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
+console and its environment page are on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1143,7 +1144,8 @@ The fourth, `kube-agents-web-console-cr`, is generated from
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
-makes.
+makes. Inside `forges`, the console may not move an existing forge's credential to
+another host, add a forge with a credential, or change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
