@@ -301,7 +301,8 @@ ingress gap above.
   patch, so it isn't done.
 - **A PodDisruptionBudget** of `maxUnavailable: 1`, with `unhealthyPodEvictionPolicy:
 AlwaysAllow` as the callout's has, so a node drain takes one replica at a time and an unhealthy
-  replica never blocks a drain.
+  replica never blocks a drain. It exists only while more than one replica is Ready: one
+  applied while the standby can't come up (no room, a failed pull) would pin the only pod.
 - **A zone topology spread** (`ScheduleAnyway`), as the callout and verifier already have, so a
   single-zone install still schedules. On Autopilot the spread and the PDB behave as on Standard:
   Autopilot honours a PDB on its own node upgrades, and `ScheduleAnyway` asks for no capacity it

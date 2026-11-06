@@ -99,10 +99,15 @@ const (
 
 // termWaitBusMax bounds a wait on the bus (not on the bucket): a fault local
 // to this pod's path to NATS would otherwise keep the Lease here while a
-// standby whose bus works stands idle. Past it the term start fails, the
-// lease is released, and the standby takes it. A missing bucket is the same
-// for every replica, so that wait has no bound. A var so tests can shorten it.
+// standby whose bus works stands idle. Past it the term start fails with
+// errTermBusGaveUp, the lease is released, and the standby takes it; this
+// replica campaigns again in the same process (Election.Run). A missing
+// bucket is the same for every replica, so that wait has no bound. A var so
+// tests can shorten it.
 var termWaitBusMax = 60 * time.Second
+
+// errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
+var errTermBusGaveUp = errors.New("the bus didn't answer")
 
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
@@ -837,9 +842,10 @@ func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 // through (Registry.BeginTerm). The election calls it on acquiring the
 // lease, before Run.
 //
-// A missing session-state bucket, or a bus that is down, is waited out
-// rather than returned: returning ends the term before it starts, and the
-// restarted pod meets the same wait. Readiness names it meanwhile.
+// A missing session-state bucket is waited out rather than returned: every
+// replica meets the same wait. A bus that is down is waited out for
+// termWaitBusMax, then returned so the lease can move (Election.Run).
+// Readiness names the wait meanwhile.
 func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
 	defer g.termWaiting.Store(false)
 	var loggedAt, busSince time.Time
@@ -854,7 +860,7 @@ func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
 		} else if busSince.IsZero() {
 			busSince = time.Now()
 		} else if time.Since(busSince) >= termWaitBusMax {
-			return 0, fmt.Errorf("the bus didn't answer for %s, so the lease goes to a replica whose bus may: %w", termWaitBusMax, err)
+			return 0, fmt.Errorf("%w for %s, so the lease goes to a replica whose bus may: %w", errTermBusGaveUp, termWaitBusMax, err)
 		}
 		g.termWaitBus.Store(bus)
 		g.termWaiting.Store(true)

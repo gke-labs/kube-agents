@@ -6345,10 +6345,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 	// Its budget, after the Deployment it selects, so a drain takes one
-	// replica at a time; only while it runs more than one. At one replica a
-	// budget protects nothing, and one rendered over a scale-out that hasn't
-	// happened yet would pin the one pod that runs.
-	if err := r.reconcileA2AGatewayPDB(ctx, agent, ptr.Deref(dep.Spec.Replicas, 1) > 1); err != nil {
+	// replica at a time; only while more than one is rendered and Ready. At
+	// one replica a budget protects nothing, and one applied while the
+	// standby hasn't come up (or can't: no room, a failed pull) would pin
+	// the one pod that runs. The ready count is the one read above, so the
+	// budget lands a pass after the standby is Ready.
+	scaledOut := ptr.Deref(dep.Spec.Replicas, 1) > 1 && gatewayExists && liveGateway.Status.ReadyReplicas > 1
+	if err := r.reconcileA2AGatewayPDB(ctx, agent, scaledOut); err != nil {
 		return state, err
 	}
 

@@ -2329,11 +2329,16 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	// The gateway's budget renders only once it's scaled out, which takes a
-	// pod on its image holding the Lease and a second pass.
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
 	electGateway(t, ctx, cl, agent)
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.

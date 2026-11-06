@@ -93,9 +93,37 @@ type Leader interface {
 // after lead returns and only if this replica still holds it, so a standby
 // takes over from a gateway that has stopped.
 //
+// A term start that gave up on the bus (errTermBusGaveUp) doesn't end Run:
+// the lease is released as on any other stop, and this replica stands back
+// for a lease's duration and campaigns again. A standby whose bus works
+// takes the lease meanwhile; with none, this replica retakes it. Exiting
+// instead would put every replica on a down bus into CrashLoopBackOff, and
+// the bus coming back would then wait on the kubelet's backoff.
+//
 // Run returns nil when ctx ended, ErrLeadershipLost when the lease was lost
 // or a write was fenced, and otherwise the error that stopped lead.
 func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Context, RunOptions) error) error {
+	for {
+		err := e.campaign(ctx, leader, lead)
+		if !errors.Is(err, errTermBusGaveUp) || ctx.Err() != nil {
+			return err
+		}
+		standBack := orDefault(e.LeaseDuration, electionLeaseDuration) + 2*orDefault(e.RetryPeriod, electionRetryPeriod)
+		log := e.Log
+		if log == nil {
+			log = slog.Default()
+		}
+		log.Warn("gateway election: standing back before campaigning again, so a replica whose bus answers can lead", "lease", e.Lease, "for", standBack)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(standBack):
+		}
+	}
+}
+
+// campaign is one campaign for the lease and at most one term (Run).
+func (e Election) campaign(ctx context.Context, leader Leader, lead func(context.Context, RunOptions) error) error {
 	log := e.Log
 	if log == nil {
 		log = slog.Default()

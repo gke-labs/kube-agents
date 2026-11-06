@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -189,9 +190,18 @@ func TestAnElectedGatewayScalesOutOnTheNextPass(t *testing.T) {
 	if *dep.Spec.Replicas != 2 || dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
 		t.Fatalf("after an election: %d replicas, %s", *dep.Spec.Replicas, dep.Spec.Strategy.Type)
 	}
+	// Two rendered, one running: a budget now would pin the leader until the
+	// standby is Ready, which it may never be.
 	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, depKey, pdb); err == nil {
+		t.Fatal("a gateway budget before the standby is Ready")
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
 	if err := cl.Get(ctx, depKey, pdb); err != nil {
-		t.Fatalf("no gateway budget: %v", err)
+		t.Fatalf("no gateway budget once both replicas are Ready: %v", err)
 	}
 	if !metav1.IsControlledBy(pdb, agent) {
 		t.Error("the gateway budget isn't owned by the PlatformAgent, so the teardown would skip it")
@@ -505,4 +515,88 @@ func electGateway(t *testing.T, ctx context.Context, cl client.Client, agent *ag
 		t.Fatal(err)
 	}
 	takeLease(t, ctx, cl, agent, holder.Name)
+}
+
+// gatewayReplicasReady sets the gateway Deployment's ready count, as the
+// Deployment controller would once its pods pass readiness.
+func gatewayReplicasReady(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent, n int32) {
+	t.Helper()
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep); err != nil {
+		t.Fatal(err)
+	}
+	dep.Status.ObservedGeneration = dep.Generation
+	dep.Status.Replicas, dep.Status.ReadyReplicas = n, n
+	if err := cl.Status().Update(ctx, dep); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A standby that goes away takes the budget with it: one Ready pod needs no
+// budget, and one would refuse the drain of the leader.
+func TestTheGatewayBudgetGoesWhenTheStandbyDoes(t *testing.T) {
+	t.Setenv(a2aGatewayImageEnvVar, "example.com/a2a-gateway:v1")
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	electGateway(t, ctx, cl, agent)
+	for i := 0; i < 2; i++ {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}
+	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Fatalf("no budget over two Ready replicas: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 1)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); err == nil {
+		t.Fatal("the budget outlived the standby")
+	}
+}
+
+// A hand-set minAvailable on the live budget. A forced apply can't remove a
+// field it never owned, so without clearForeignPDBBudgetField every apply
+// merges to both fields, is refused, and fails the A2A reconcile from then on.
+func TestTheGatewayBudgetRecoversFromAForeignBudgetField(t *testing.T) {
+	agent := a2aTestAgent()
+	live := buildA2AGatewayPDB(agent)
+	live.Spec.MaxUnavailable = nil
+	live.Spec.MinAvailable = ptr.To(intstr.FromInt32(1))
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, live).
+		WithInterceptorFuncs(pdbSSAInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	if err := r.reconcileA2AGatewayPDB(ctx, agent, true); err != nil {
+		t.Fatalf("reconcile after a hand-set minAvailable: %v", err)
+	}
+	pdb := &policyv1.PodDisruptionBudget{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(live), pdb); err != nil {
+		t.Fatal(err)
+	}
+	if pdb.Spec.MinAvailable != nil {
+		t.Errorf("minAvailable survived the reconcile: %v", pdb.Spec.MinAvailable)
+	}
+	if pdb.Spec.MaxUnavailable == nil || pdb.Spec.MaxUnavailable.IntValue() != 1 {
+		t.Errorf("maxUnavailable = %v, want 1", pdb.Spec.MaxUnavailable)
+	}
 }

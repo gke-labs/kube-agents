@@ -2679,7 +2679,9 @@ that roll; it shows the one Recreate already has. An elected replica that holds 
 as above, and an elected gateway's term waits for the `session-state` bucket the same way
 (`waiting for bucket session-state: ...`). Its term also waits for a bus that isn't answering
 (`waiting for the bus: ...`), but only for 60 seconds: past that it gives the Lease up, so a
-standby whose bus works can take it. A standby answers 200 once it is connected and has read
+standby whose bus works can take it, and stands back for a lease's duration before campaigning
+again in the same process (it doesn't exit, so a bus outage puts no replica into
+CrashLoopBackOff). A standby answers 200 once it is connected and has read
 the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
 as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
 replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the

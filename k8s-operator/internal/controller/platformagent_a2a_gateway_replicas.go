@@ -245,13 +245,17 @@ func a2aGatewayStandbyPods(agent *agentv1alpha1.PlatformAgent) int64 {
 }
 
 // reconcileA2AGatewayPDB applies the gateway's budget while it runs more than
-// one replica and removes it otherwise.
+// one replica and removes it otherwise. A hand-set minAvailable is cleared
+// first, as for every budget this controller owns (clearForeignPDBBudgetField).
 func (r *PlatformAgentReconciler) reconcileA2AGatewayPDB(ctx context.Context, agent *agentv1alpha1.PlatformAgent, scaledOut bool) error {
 	pdb := buildA2AGatewayPDB(agent)
 	if !scaledOut {
 		return r.deleteA2AObjectIfOwned(ctx, agent, pdb, r.Client, nil)
 	}
 	if err := ctrl.SetControllerReference(agent, pdb, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
 		return err
 	}
 	if err := r.applyManaged(ctx, agent, pdb); err != nil {
