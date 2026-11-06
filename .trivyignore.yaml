@@ -58,9 +58,12 @@ misconfigurations:
     paths:
       - "k8s-operator/config/rbac/**"
 
-  # Ignore KSV-0041: three callers need a Secret verb on manager-role, and trivy
-  # cannot scope an exemption to one rule -- `paths` globs are its whole
-  # vocabulary -- so exempting either exempts the whole rbac directory.
+  # Ignore KSV-0041: three callers need a Secret verb on the manager role, and
+  # trivy cannot scope an exemption to one rule -- `paths` globs are its whole
+  # vocabulary -- so exempting either exempts the whole rbac directory. The
+  # grant is the namespaced Role document in role.yaml (the marker carries
+  # `namespace=`), bound in the install namespace; the ClusterRole names
+  # secrets nowhere, and trivy flags a Role for the verbs just the same.
   #
   #   - `get`: checkShellSandboxKeys asks whether the sandbox's authorized-keys
   #     Secret exists, so the CR can report a missing one instead of leaving the

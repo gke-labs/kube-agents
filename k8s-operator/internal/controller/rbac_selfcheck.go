@@ -95,6 +95,10 @@ const (
 	rbacProbeLogName = "rbac-selfcheck"
 	// rbacSubresourceSeparator splits "pods/log" into resource and subresource.
 	rbacSubresourceSeparator = "/"
+	// rbacNamespacedLabelSuffix marks a namespaced permission in the denied
+	// list, so a shortfall reads "get secrets (in the operator's namespace)"
+	// and nobody goes looking for a missing ClusterRole rule.
+	rbacNamespacedLabelSuffix = " (in the operator's namespace)"
 )
 
 // requiredPermission is one rule the controller needs, in the shape the
@@ -112,6 +116,14 @@ type requiredPermission struct {
 	// operator reported RBACIncomplete against a ClusterRole that had
 	// exactly the rule it was asking about.
 	Name string
+
+	// Namespaced marks a rule the markers declare with `namespace=`, which
+	// controller-gen renders as a Role in the install namespace rather than
+	// into the ClusterRole. The probe asks about that namespace: a grant held
+	// through a RoleBinding does not authorize the cluster-wide request, so
+	// probing without it would report a shortfall on every correctly
+	// installed operator.
+	Namespaced bool
 }
 
 var (
@@ -148,10 +160,12 @@ var requiredPermissions = []requiredPermission{
 	// resourcequotas: the mode-next session-pod bound is rendered and removed
 	// by the operator, so this one is write rather than read.
 	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
-	// secrets: `get` for checkShellSandboxKeys; the rest for the mode-next A2A
-	// credential and config Secrets the operator generates. No list/watch --
-	// see tests/test_operator_secrets_grant.py.
-	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get", "create", "update", "patch", "delete"}},
+	// secrets: `get` for checkShellSandboxKeys and stampSecretEnvHash; the rest
+	// for the mode-next A2A credential and config Secrets the operator
+	// generates. Namespaced: the marker carries `namespace=`, so the grant is a
+	// Role in the install namespace and the ClusterRole names secrets nowhere.
+	// No list/watch -- see tests/test_operator_secrets_grant.py.
+	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get", "create", "update", "patch", "delete"}, Namespaced: true},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
@@ -196,6 +210,7 @@ func describePermission(verb, group, resource string) string {
 type permissionTuple struct {
 	group, resource, subresource, verb string
 	name                               string
+	namespaced                         bool
 	label                              string
 }
 
@@ -209,10 +224,14 @@ func flattenRequiredPermissions() []permissionTuple {
 				if permission.Name != "" {
 					label += " (" + permission.Name + ")"
 				}
+				if permission.Namespaced {
+					label += rbacNamespacedLabelSuffix
+				}
 				tuples = append(tuples, permissionTuple{
 					group: permission.Group, resource: resource, subresource: subresource, verb: verb,
-					name:  permission.Name,
-					label: label,
+					name:       permission.Name,
+					namespaced: permission.Namespaced,
+					label:      label,
 				})
 			}
 		}
@@ -226,9 +245,13 @@ func flattenRequiredPermissions() []permissionTuple {
 // denied ones in declaration order. An error means the probe could not run
 // and says nothing about permissions; callers must not read it as a denial.
 //
-// The reviews carry no namespace: both install paths bind the role through
-// a ClusterRoleBinding, so cluster-wide is the grant being checked.
-func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAccessReviewInterface) ([]string, error) {
+// A cluster-scoped tuple is reviewed with no namespace: both install paths
+// bind the ClusterRole through a ClusterRoleBinding, so cluster-wide is the
+// grant being checked. A namespaced tuple is reviewed in namespace, the
+// operator's own, where both paths bind the Role; an empty namespace (under
+// `make run`, off the cluster) reviews it cluster-wide, which the developer's
+// own credential answers.
+func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string) ([]string, error) {
 	tuples := flattenRequiredPermissions()
 	denied := make([]bool, len(tuples))
 	errs := make([]error, len(tuples))
@@ -248,16 +271,18 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 				errs[i] = ctx.Err()
 				return
 			}
+			attributes := &authorizationv1.ResourceAttributes{
+				Group:       tuple.group,
+				Resource:    tuple.resource,
+				Subresource: tuple.subresource,
+				Name:        tuple.name,
+				Verb:        tuple.verb,
+			}
+			if tuple.namespaced {
+				attributes.Namespace = namespace
+			}
 			review := &authorizationv1.SelfSubjectAccessReview{
-				Spec: authorizationv1.SelfSubjectAccessReviewSpec{
-					ResourceAttributes: &authorizationv1.ResourceAttributes{
-						Group:       tuple.group,
-						Resource:    tuple.resource,
-						Subresource: tuple.subresource,
-						Name:        tuple.name,
-						Verb:        tuple.verb,
-					},
-				},
+				Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: attributes},
 			}
 			result, err := reviews.Create(ctx, review, metav1.CreateOptions{})
 			if err != nil {
@@ -302,6 +327,10 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 // probes and reports nothing denied.
 type RBACChecker struct {
 	reviews authorizationv1client.SelfSubjectAccessReviewInterface
+	// namespace is where the namespaced permissions are probed: the
+	// operator's own, where both install paths bind the Role. Empty off the
+	// cluster, which probes them cluster-wide instead.
+	namespace string
 	// interval and timeout are fields so tests can shorten them.
 	interval time.Duration
 	timeout  time.Duration
@@ -311,9 +340,10 @@ type RBACChecker struct {
 	probed bool
 }
 
-// NewRBACChecker returns a checker that probes through reviews.
-func NewRBACChecker(reviews authorizationv1client.SelfSubjectAccessReviewInterface) *RBACChecker {
-	return &RBACChecker{reviews: reviews, interval: rbacReprobeInterval, timeout: RBACProbeTimeout}
+// NewRBACChecker returns a checker that probes through reviews, asking about
+// namespace for the permissions the markers declare namespaced.
+func NewRBACChecker(reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string) *RBACChecker {
+	return &RBACChecker{reviews: reviews, namespace: namespace, interval: rbacReprobeInterval, timeout: RBACProbeTimeout}
 }
 
 // Probe runs the self-check now under the checker's timeout, remembers the
@@ -327,7 +357,7 @@ func (c *RBACChecker) Probe(ctx context.Context) ([]string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	denied, err := probeRBAC(ctx, c.reviews)
+	denied, err := probeRBAC(ctx, c.reviews, c.namespace)
 	if err != nil {
 		return nil, err
 	}
