@@ -117,6 +117,6 @@ func (r *PlatformAgentReconciler) replaceStuckA2ANATSPod(ctx context.Context, ag
 		"pod", pod.Name, "revision", revision, "updateRevision", updateRevision)
 	r.recordEvent(agent, corev1.EventTypeWarning, a2aNATSStuckPodReplacedReason,
 		fmt.Sprintf("Replaced A2A bus pod %s: not Ready for %s on revision %s, while the StatefulSet renders %s.",
-			pod.Name, a2aNATSStuckPodGrace, revision, updateRevision))
+			pod.Name, now.Sub(since).Truncate(time.Second), revision, updateRevision))
 	return 0, nil
 }

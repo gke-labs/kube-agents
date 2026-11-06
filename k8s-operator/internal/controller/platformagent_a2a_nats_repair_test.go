@@ -165,6 +165,10 @@ func TestAStuckBusPodOnAnOldRevisionIsReplaced(t *testing.T) {
 		if !strings.Contains(event, a2aNATSStuckPodReplacedReason) || !strings.Contains(event, stuckPodOldRevision) {
 			t.Errorf("event %q does not name the reason and the old revision", event)
 		}
+		// How long the pod was down, not the grace: 2m1s for a pod down grace+1s.
+		if !strings.Contains(event, "not Ready for 2m1s") {
+			t.Errorf("event %q does not carry how long the pod was not Ready", event)
+		}
 	default:
 		t.Error("no event recorded for the replacement")
 	}
