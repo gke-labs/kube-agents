@@ -748,15 +748,15 @@ func usageTopToolsForPoll(scraped []usageScrapedPod, misses int) (rows []agentv1
 			count := counts[status]
 			row.Total += count
 			switch status {
-			case toolInvocationsStatusOrder[0]:
+			case toolStatusSuccess:
 				row.Success = count
-			case toolInvocationsStatusOrder[1]:
+			case toolStatusError:
 				row.Error = count
-			case toolInvocationsStatusOrder[2]:
+			case toolStatusBlocked:
 				row.Blocked = count
-			case toolInvocationsStatusOrder[3]:
+			case toolStatusBusy:
 				row.Busy = count
-			case toolInvocationsStatusOrder[4]:
+			case toolStatusAbandoned:
 				row.Abandoned = count
 			}
 		}

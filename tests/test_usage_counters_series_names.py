@@ -51,6 +51,25 @@ def _py_const(name, path=None):
     return match.group(1)
 
 
+def _go_words(path, body):
+    """The strings of a Go composite literal's keys or elements: a quoted
+    literal as written, an identifier resolved to the constant it names."""
+    words = []
+    for quoted, name in re.findall(r'"([^"]+)"|\b([A-Za-z_]\w*)\b(?=\s*(?:[:,}\n]|$))', body):
+        if quoted:
+            words.append(quoted)
+        elif name not in ("true", "false"):
+            words.append(_go_const(path, name))
+    return words
+
+
+def _go_set(path, name):
+    """The keys of a map[string]bool literal named name in path."""
+    match = re.search(rf"{name}\s*=\s*map\[string\]bool\{{([^}}]*)\}}", path.read_text())
+    assert match, f"{name} not found in {path}"
+    return set(_go_words(path, match.group(1)))
+
+
 def _watcher_family(field):
     """The Name the watcher registers for the CounterVec stored in field."""
     match = re.search(rf'{field}:\s*prometheus\.NewCounterVec\(prometheus\.CounterOpts\{{\s*Name:\s*"([^"]+)"', _WATCHER_METRICS_GO.read_text())
@@ -171,10 +190,7 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_A2A_METRICS_GO, "processStartTimeName"))
 
     def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
-        source = _SCRAPE_GO.read_text()
-        match = re.search(r"toolInvocationsCountedStatuses\s*=\s*map\[string\]bool\{([^}]*)\}", source)
-        self.assertIsNotNone(match, "toolInvocationsCountedStatuses not found")
-        counted = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        counted = _go_set(_SCRAPE_GO, "toolInvocationsCountedStatuses")
         self.assertEqual({_py_const("TOOL_STATUS_SUCCESS"), _py_const("TOOL_STATUS_ERROR")}, counted)
         excluded = {_py_const(name) for name in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED")}
         self.assertFalse(counted & excluded)
@@ -191,10 +207,7 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_py_const("BROKER_FAILURES_METRIC"), _go_const(_SCRAPE_GO, "brokerFailuresSeries"))
 
     def test_the_refused_outcomes_are_the_brokers_blocked_busy_and_abandoned(self):
-        source = _SCRAPE_GO.read_text()
-        match = re.search(r"toolInvocationsRefusedStatuses\s*=\s*map\[string\]bool\{([^}]*)\}", source)
-        self.assertIsNotNone(match, "toolInvocationsRefusedStatuses not found")
-        refused = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        refused = _go_set(_SCRAPE_GO, "toolInvocationsRefusedStatuses")
         self.assertEqual(
             {_py_const("TOOL_STATUS_BLOCKED"), _py_const("TOOL_STATUS_BUSY"), _py_const("TOOL_STATUS_ABANDONED")},
             refused,
@@ -204,12 +217,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_two_status_sets_are_the_brokers_whole_vocabulary(self):
         """A status the broker adds and neither set names would land in neither counter."""
-        source = _SCRAPE_GO.read_text()
         sets = set()
         for name in ("toolInvocationsCountedStatuses", "toolInvocationsRefusedStatuses"):
-            match = re.search(rf"{name}\s*=\s*map\[string\]bool\{{([^}}]*)\}}", source)
-            self.assertIsNotNone(match, f"{name} not found")
-            sets |= set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+            sets |= _go_set(_SCRAPE_GO, name)
         # Any module-level declaration shape: a bare name or an annotated one
         # (NAME: Final = ...), either quote style, so a constant written in a
         # shape this test did not foresee is still read rather than skipped.
@@ -265,9 +275,37 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_go_const(_SCRAPE_GO, "toolSubcommandNone"), cp.SUBCOMMAND_NONE)
         order = re.search(r"toolInvocationsStatusOrder\s*=\s*\[\]string\{([^}]*)\}", source)
         self.assertIsNotNone(order, "toolInvocationsStatusOrder not found")
-        statuses = re.findall(r'"([^"]+)"', order.group(1))
+        statuses = _go_words(_SCRAPE_GO, order.group(1))
         self.assertEqual(statuses, list(fs.TOOL_STATUS_ORDER))
         self.assertEqual(set(statuses), set(cp.TOOL_STATUSES))
+
+    def test_the_tool_enum_on_the_status_field_is_the_scrape_maps_keys(self):
+        """The CRD's enum on topTools[].tool is a copy of the tools the scrape folds; a
+        tool in the map and not the enum fails the whole status patch, not one row."""
+        types_go = (_REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go").read_text()
+        struct = types_go[types_go.index("type ToolUsageSummary struct"):]
+        enum = re.search(r"\+kubebuilder:validation:Enum=(\S+)", struct)
+        self.assertIsNotNone(enum, "no Enum marker on ToolUsageSummary.Tool")
+        source = _SCRAPE_GO.read_text()
+        start = source.index("toolInvocationsSubcommands = map[string][]string{")
+        body = source[start : source.index("\n\t}\n", start)]
+        keys = set(re.findall(r'^\t\t"(\w+)":', body, re.M)) | {_go_const(_SCRAPE_GO, "toolLabelOther")}
+        self.assertEqual(set(enum.group(1).split(";")), keys)
+
+    def test_the_top_tools_cap_is_five_everywhere_it_is_spelled(self):
+        """The CRD's MaxItems, the operator's cut, the gateway's and the script's row
+        caps are four copies of one number; the block's label spells it too."""
+        types_go = (_REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go").read_text()
+        field = types_go[types_go.index("// TopTools is the credential broker's"):types_go.index("TopTools []ToolUsageSummary")]
+        max_items = int(re.search(r"\+kubebuilder:validation:MaxItems=(\d+)", field).group(1))
+        poller = (_REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_poller.go").read_text()
+        operator = int(re.search(r"^\s*usageTopToolsShown\s*=\s*(\d+)", poller, re.M).group(1))
+        gateway_go = (_REPO_ROOT / "a2a" / "gateway" / "feedback_summary.go").read_text()
+        gateway = int(re.search(r"^\s*usageTopToolsShown\s*=\s*(\d+)", gateway_go, re.M).group(1))
+        import feedback_summary as fs
+
+        self.assertEqual({max_items, operator, gateway, fs.TOP_TOOLS_SHOWN}, {5})
+        self.assertIn(f"top {fs.TOP_TOOLS_SHOWN}", fs.TOP_TOOLS_LABEL)
 
 
 if __name__ == "__main__":

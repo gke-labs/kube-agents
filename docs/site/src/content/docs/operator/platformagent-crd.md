@@ -1426,7 +1426,7 @@ and the second poll in a row that cannot read the broker clears it. It moves nei
 summary script and the chat gateway's `/feedback summary` print it as the
 `tools (top 5, since broker start)` block.
 
-The operator also serves every counter, cluster gauge, reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+The operator also serves every counter, cluster gauge, scalar reading and time of this block (the two lists, `activeInterfaces` and `topTools`, aside), and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
 under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment

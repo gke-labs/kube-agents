@@ -186,6 +186,15 @@ const (
 	// say whether the command had started. The two sets partition the
 	// broker's vocabulary, so the two counters together are every request.
 	toolInvocationsStatusLabel = "status"
+	// The broker's five outcomes (its TOOL_STATUS_* constants): the two
+	// status sets below partition them, toolInvocationsStatusOrder prints
+	// them, and a topTools row carries one field per outcome under the
+	// same name.
+	toolStatusSuccess   = "success"
+	toolStatusError     = "error"
+	toolStatusBlocked   = "blocked"
+	toolStatusBusy      = "busy"
+	toolStatusAbandoned = "abandoned"
 	// The tool counter's other two labels, read for status.usage.topTools:
 	// the executable and its first bare word, each from the broker's closed
 	// vocabulary (toolInvocationsSubcommands). toolLabelOther is what the
@@ -219,18 +228,23 @@ const (
 )
 
 var (
-	toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
-	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
+	toolInvocationsCountedStatuses = map[string]bool{toolStatusSuccess: true, toolStatusError: true}
+	toolInvocationsRefusedStatuses = map[string]bool{toolStatusBlocked: true, toolStatusBusy: true, toolStatusAbandoned: true}
 	// toolInvocationsStatusOrder is the broker's whole outcome vocabulary, the
 	// two sets above in the order the summary block prints them: the statuses
 	// a topTools row carries, and the only ones a sample is folded under.
-	toolInvocationsStatusOrder = []string{"success", "error", "blocked", "busy", "abandoned"}
+	toolInvocationsStatusOrder = []string{toolStatusSuccess, toolStatusError, toolStatusBlocked, toolStatusBusy, toolStatusAbandoned}
 	// toolInvocationsSubcommands is the broker's tool vocabulary and, per tool,
 	// its subcommand vocabulary (credential_proxy.py's ALLOWED_EXECUTABLES and
 	// _subcommand_vocabulary; the empty entry is its LABEL_OTHER tool, which
-	// has none), the third copy after the broker's own and the summary
-	// script's BROKER_SUBCOMMANDS; tests/test_usage_counters_series_names.py
-	// holds this one to the broker's. A sample whose tool is not a key here is
+	// has none). The vocabulary lives in four places: the broker's own, the
+	// summary script's BROKER_SUBCOMMANDS (held to the broker's by its
+	// GatewayCopyTest), the A2A gateway's usageSummaryBrokerSubcommands in
+	// a2a/gateway/feedback_summary.go (held to the script's by the same test;
+	// it is the chat block's audit vocabulary, so a word missing there has a
+	// cluster named after it refuse the block), and this one, which
+	// tests/test_usage_counters_series_names.py holds to the broker's along
+	// with the tool enum on the status field. A sample whose tool is not a key here is
 	// not folded into topTools, and a subcommand outside its tool's list reads
 	// toolLabelOther, so the status carries no word the broker did not declare.
 	toolInvocationsSubcommands = map[string][]string{
