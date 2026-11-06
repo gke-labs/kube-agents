@@ -262,6 +262,9 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.replayShadow` is an eval-only fixture, off by default: CI turns it on to put the
+inference-replay shadow proxy in front of LiteLLM ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md)).
+
 `litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
 replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
 where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
@@ -1117,7 +1120,7 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
 `ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
@@ -1134,6 +1137,13 @@ access, Pod Security "restricted", and exactly the session labels. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The fourth, `kube-agents-web-console-cr`, is generated from
+`k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
+web console and its environment page are on. It holds the console's
+ServiceAccount to its own annotations and `spec.integration.forges`,
+`repositories` and `github` on the PlatformAgent, and refuses any other change it
+makes.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1195,9 +1205,11 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
-`valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
-size, since the operator sizes the two alike. The mode is read from the values, so a mode set
+It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
+is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
+blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
@@ -1468,6 +1480,10 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
+  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
+  differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and

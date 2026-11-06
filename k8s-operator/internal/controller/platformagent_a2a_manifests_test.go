@@ -1598,6 +1598,12 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
 		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
 	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	}
 }
 
 // The chart's standing pods come from the annotation the chart stamps on the
@@ -1689,6 +1695,7 @@ func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
 	if got := a2aStandingPods(agent); got != rendered {
 		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
 	}
+
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:

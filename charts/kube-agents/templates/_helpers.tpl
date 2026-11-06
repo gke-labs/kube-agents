@@ -174,6 +174,17 @@ true
 {{- end }}
 
 {{/*
+Whether the web console's PlatformAgent policy renders: the admissionPolicy values
+gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
+CR render (webConsole.enabled and webConsole.environment.enabled).
+*/}}
+{{- define "kube-agents.webConsoleCRPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) .Values.webConsole.enabled .Values.webConsole.environment.enabled -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else
@@ -1160,6 +1171,19 @@ topologySpreadConstraints:
       matchLabels:
         {{- .selectorLabels | nindent 8 }}
 {{- end }}
+{{- end }}
+
+{{/*
+The shadow-mode replay proxy's pod labels (litellm.replayShadow,
+templates/litellm.yaml), and so its Deployment's selector, the
+inference-gateway Service's selector while the proxy is on, and its egress
+policy's podSelector. app: litellm because the worker pods' egress policies
+admit only that label; the role tells the proxy from the LiteLLM pods, which
+carry kubeagents.x-k8s.io/inference-role: litellm while the proxy is on.
+*/}}
+{{- define "kube-agents.replayShadowSelectorLabels" -}}
+app: litellm
+kubeagents.x-k8s.io/inference-role: replay-shadow
 {{- end }}
 
 {{- /*
@@ -2491,6 +2515,12 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- if .Values.litellm.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
 {{- end -}}
+{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
+       beside LiteLLM and only with it. */ -}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
+{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
+{{- end -}}
 {{- if include "kube-agents.hindsightEnabled" . -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
@@ -2850,30 +2880,47 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- end -}}
     {{- end -}}
   {{- end -}}
-  {{- /* The MCP server (#3869): one more pod, rendered only while operator.extraEnv sets
-         A2A_MCP_DOOR to "true", so no golden renders it and footprint.yaml has no entry of
-         its own. The operator sizes it as the console (TestTheMCPPodIsSizedLikeTheConsole
-         holds the two equal) and rolls it Recreate at one replica, so it is counted once at
-         the console's figures and sizes no surge. An entry the chart cannot read -- a
-         valueFrom, a non-string value -- counts as on; a literal value other than "true",
-         or none or null, is what the operator reads as off, and leaves it out. */ -}}
+  {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
+         #3869; the profile dispatcher, #4808). The operator renders each only while
+         operator.extraEnv sets its flag, so no golden renders it and footprint.yaml has no
+         entry for it. An entry's flag is read as the operator reads it, the last setting
+         winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
+         A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
+         a $(VAR) reference the kubelet expands -- counts as on; none, null or another literal
+         leaves it out. A missing or unreadable file fails the render, as footprint.yaml does. Each rolls Recreate at its replicas,
+         so it sizes no surge. */ -}}
   {{- if $next -}}
-    {{- $mcpDoor := false -}}
-    {{- range $e := (.Values.operator.extraEnv | default list) -}}
-      {{- if eq (toString (index ($e | default dict) "name")) "A2A_MCP_DOOR" -}}
-        {{- $v := index $e "value" -}}
-        {{- $mcpDoor = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (eq (toString $v) "true") -}}
+    {{- $flaggedFile := .Files.Get "files/flagged-pods.yaml" | fromYaml -}}
+    {{- $flaggedOK := kindIs "slice" (index $flaggedFile "pods") -}}
+    {{- range $w := (ternary (index $flaggedFile "pods") list $flaggedOK) -}}
+      {{- $flaggedOK = and $flaggedOK (kindIs "map" $w) (kindIs "string" (index ($w | default dict) "env")) (kindIs "string" (index ($w | default dict) "enabledWhen")) -}}
+      {{- range $key := list "replicas" "cpuMillisRequest" "cpuMillisLimit" "memoryBytesRequest" "memoryBytesLimit" "ephemeralStorageBytesRequest" "ephemeralStorageBytesLimit" -}}
+        {{- $flaggedOK = and $flaggedOK (or (kindIs "float64" (index ($w | default dict) $key)) (kindIs "int64" (index ($w | default dict) $key)) (kindIs "int" (index ($w | default dict) $key))) -}}
       {{- end -}}
     {{- end -}}
-    {{- if $mcpDoor -}}
-      {{- $mcp := $next.a2aConsole | default dict -}}
-      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (int64 1)) | int64 -}}
-      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($mcp.cpuMillisRequest | default 0 | int64)) | int64 -}}
-      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($mcp.cpuMillisLimit | default 0 | int64)) | int64 -}}
-      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($mcp.memoryBytesRequest | default 0 | int64)) | int64 -}}
-      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($mcp.memoryBytesLimit | default 0 | int64)) | int64 -}}
-      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($mcp.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
-      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($mcp.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+    {{- if not $flaggedOK -}}
+      {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $flagged := index $flaggedFile "pods" -}}
+    {{- range $w := $flagged -}}
+      {{- $on := false -}}
+      {{- range $e := ($.Values.operator.extraEnv | default list) -}}
+        {{- if eq (toString (index ($e | default dict) "name")) $w.env -}}
+          {{- $v := index $e "value" -}}
+          {{- $literal := ternary (eq (toString $v) "true") (ne (trim (toString $v)) "") (eq (toString $w.enabledWhen) "true") -}}
+          {{- $on = or (hasKey $e "valueFrom") (and (hasKey $e "value") (not (kindIs "string" $v)) (not (kindIs "invalid" $v))) (and (kindIs "string" $v) (or $literal (contains "$(" $v))) -}}
+        {{- end -}}
+      {{- end -}}
+      {{- if $on -}}
+        {{- $n := $w.replicas | default 1 | int64 -}}
+        {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" $n) | int64 -}}
+        {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (mul $n ($w.cpuMillisRequest | default 0 | int64))) | int64 -}}
+        {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (mul $n ($w.cpuMillisLimit | default 0 | int64))) | int64 -}}
+        {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (mul $n ($w.memoryBytesRequest | default 0 | int64))) | int64 -}}
+        {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (mul $n ($w.memoryBytesLimit | default 0 | int64))) | int64 -}}
+        {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (mul $n ($w.ephemeralStorageBytesRequest | default 0 | int64))) | int64 -}}
+        {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (mul $n ($w.ephemeralStorageBytesLimit | default 0 | int64))) | int64 -}}
+      {{- end -}}
     {{- end -}}
   {{- end -}}
   {{- with $next.storage -}}

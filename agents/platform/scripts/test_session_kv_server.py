@@ -1317,6 +1317,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # A kind the route refuses after the key check, so the authorised half
         # of the test writes no backlog row and starts no digest worker.
         ("POST", "/v1/drift-backlog", {"kind": "not-drift"}),
+        ("POST", "/v1/excluded-events", {"kind": "not-an-event"}),
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
@@ -2685,6 +2686,124 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             forge.call.reset_mock()
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
+
+    # What each forge the broker serves (providers/registry.py AVAILABLE)
+    # answers `proposal-create` with (providers/*/translate.py and the provider
+    # tests' fixtures): the forge, its configured host, the url, the repository
+    # the fold asks the forge about, and the number.
+    FORGE_PROPOSAL_URLS = (
+        ("github", "github.com", "https://github.com/acme/fleet/pull/7", "https://github.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/sub/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/sub/fleet",
+            7,
+            "group/sub/fleet",
+        ),
+        # A subgroup named like a marker before a numeric subgroup is still the
+        # repository: the last marker before the number is the merge request.
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/pulls/2024/fleet",
+            7,
+            "group/pulls/2024/fleet",
+        ),
+        ("gitea", "gitea.example.com", "https://gitea.example.com/acme/fleet/pulls/7", "https://gitea.example.com/acme/fleet", 7, "acme/fleet"),
+        # An in-cluster Gitea serves http on a .svc host (docs/site install/gitea.md).
+        (
+            "gitea",
+            "gitea-http.gitea.svc.cluster.local",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/7",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet",
+            7,
+            "demo/fleet",
+        ),
+        (
+            "bitbucket",
+            "bitbucket.org",
+            "https://bitbucket.org/acme/fleet/pull-requests/7/_/diff#comment-42",
+            "https://bitbucket.org/acme/fleet",
+            7,
+            "acme/fleet",
+        ),
+        (
+            "bitbucket-datacenter",
+            "bitbucket.example.com",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/7/overview",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet",
+            7,
+            "ACME/fleet",
+        ),
+    )
+    #: What a forge entry needs beyond provider and host; the in-cluster Gitea
+    #: declares its scheme and port.
+    FORGE_ENTRY_EXTRAS = {"gitea-http.gitea.svc.cluster.local": {"scheme": "http", "port": 3000}}
+
+    def test_the_forge_is_asked_about_a_pull_request_on_every_forge_the_broker_serves(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            for _provider, _host, url, repository, number, _path in self.FORGE_PROPOSAL_URLS:
+                with self.subTest(url=url):
+                    forge.call.reset_mock()
+                    self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+                    forge.call.assert_called_once_with(
+                        "proposal-view", {"number": number}, repository, retry_transient=True
+                    )
+
+    def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
+        import providers
+        from providers import registry as registry_module
+
+        forges = [{"provider": "github", "host": "github.com"}] + [
+            {"provider": provider, "host": host, "tokenPath": "/nonexistent/token", "allowedPaths": [], **self.FORGE_ENTRY_EXTRAS.get(host, {})}
+            for provider, host in sorted({(provider, host) for provider, host, *_rest in self.FORGE_PROPOSAL_URLS})
+            if provider != "github"
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "forges.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"forges": forges}, handle)
+        registry = providers.Registry({"forges": registry_module.load_forge_entries(path)})
+        self.assertEqual(
+            {cls.name for cls in providers.AVAILABLE},
+            {provider for provider, *_rest in self.FORGE_PROPOSAL_URLS},
+            "a forge the broker serves has no url shape here",
+        )
+        for provider, _host, url, repository, _number, repo_path in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(url=url):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), repository)
+                resolved, repo = registry.resolve(match.group(1))
+                self.assertEqual(resolved.name, provider)
+                self.assertEqual(repo, repo_path)
+
+    def test_an_incidents_fix_pull_request_is_found_on_every_forge_and_an_issue_is_not(self):
+        issue = "https://gitea.example.com/acme/fleet/issues/7"
+        cards = [(f"t-{i}", f"sess-{i}", row[2]) for i, row in enumerate(self.FORGE_PROPOSAL_URLS)]
+        self._board(cards=cards + [("t-issue", "sess-issue", issue)])
+        for i, row in enumerate(self.FORGE_PROPOSAL_URLS):
+            with self.subTest(url=row[2]):
+                self.assertEqual(session_kv_server._incident_pull_request_urls(f"sess-{i}"), [row[2]])
+        self.assertEqual(session_kv_server._incident_pull_request_urls("sess-issue"), [])
+        for not_a_proposal in (
+            issue,
+            "https://bitbucket.org/acme/fleet/issues/7",
+            "https://github.com/acme/fleet/commit/7",
+            # A listing, a marker with no number, and a number only in the query.
+            "https://gitea.example.com/acme/fleet/pulls",
+            "https://bitbucket.org/acme/fleet/pull-requests/",
+            "https://gitea.example.com/acme/fleet/pulls?state=open&id=7",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=not_a_proposal):
+                self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
 
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
@@ -11393,6 +11512,130 @@ class TestBoardAction(unittest.TestCase):
         self.board.unlink()
         results = self.act("retry", ["t_a"]).json()["results"]
         self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
+class TestExcludedEvents(unittest.TestCase):
+    """`POST /v1/excluded-events`: the events alert-exclude rules held back."""
+
+    PAYLOAD = {
+        "kind": "k8s-event",
+        "reason": "BackOff",
+        "namespace": "payments",
+        "kind_of_object": "Pod",
+        "name": "payments-api-7d9f-abcde",
+        "uid": "uid-excluded-1",
+        "message": "Back-off restarting failed container app",
+        "cluster": "seeded-a",
+        "type": "Warning",
+        "occurrences": 3,
+    }
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def tearDown(self):
+        import sqlite3
+
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def _post(self, **overrides):
+        return self.client.post("/v1/excluded-events", json=dict(self.PAYLOAD, **overrides))
+
+    def _rows(self):
+        import sqlite3
+        from contextlib import closing
+
+        with closing(sqlite3.connect(temp_db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM intercepted_events WHERE excluded != 0 ORDER BY id")]
+
+    def test_the_daemon_advertises_the_route(self):
+        health = self.client.get("/healthz").json()
+        self.assertIn(session_kv_server.ALERT_EXCLUDED_FEATURE, health["features"])
+
+    def test_a_record_writes_an_excluded_row_with_no_session_alert_or_quota(self):
+        resp = self._post()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"status": "excluded"})
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["cluster"], row["namespace"], row["object_uid"], row["reason"]),
+                         ("seeded-a", "payments", "uid-excluded-1", "BackOff"))
+        self.assertEqual(row["occurrences"], 3)
+        self.assertEqual((row["notified"], row["session_id"], row["fold_key"], row["excluded"]), (0, "", "", 1))
+        self.trigger.assert_not_called()
+        quota = self.client.get("/v1/alert-quota").json()
+        self.assertFalse(any(bucket.get("used") for bucket in quota.values() if isinstance(bucket, dict)),
+                         f"an excluded event spent quota: {quota}")
+
+    def test_later_records_add_to_the_same_row(self):
+        self._post(occurrences=2)
+        self._post(occurrences=5)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["occurrences"], 7)
+
+    def test_another_reason_or_object_gets_its_own_row(self):
+        self._post()
+        self._post(reason="Failed")
+        self._post(uid="uid-excluded-2")
+        self._post(cluster="seeded-b")
+        self.assertEqual(len(self._rows()), 4)
+
+    def test_records_without_a_uid_fold_only_within_their_workload(self):
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="billing")
+        rows = self._rows()
+        self.assertEqual(sorted((r["workload"], r["occurrences"]) for r in rows), [("api-1", 6), ("billing", 3)])
+
+    def test_a_row_older_than_the_fold_window_is_not_added_to(self):
+        import sqlite3
+
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE excluded = 1",
+                    (f"-{session_kv_server.EXCLUDED_ROW_FOLD_SECONDS + 60} seconds",),
+                )
+        self._post()
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_the_route_prunes_the_ledger(self):
+        with patch.object(session_kv_server, "cleanup_old_records", wraps=session_kv_server.cleanup_old_records) as cleanup:
+            self._post()
+        cleanup.assert_called_once()
+
+    def test_the_feed_reads_the_row_as_excluded(self):
+        self._post()
+        feed = self.client.get("/v1/intercepted-events").json()
+        statuses = [e["status"] for e in feed["events"] if e["cluster"] == "seeded-a" and e["namespace"] == "payments"]
+        self.assertIn(session_kv_server.FEED_STATUS_EXCLUDED, statuses)
+
+    def test_refused_records(self):
+        too_many = session_kv_server.EXCLUDED_OCCURRENCES_MAX + 1
+        for overrides in ({"kind": "gitops-drift"}, {"occurrences": 0}, {"occurrences": "3"}, {"occurrences": True},
+                          {"occurrences": too_many}, {"occurrences": 2 ** 70}):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(self._post(**overrides).status_code, 400)
+        self.assertEqual(self._rows(), [])
+
+
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 

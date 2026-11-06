@@ -143,7 +143,7 @@ Delegation on the inject path is a seam, not a feature, and it is deliberately n
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds; these are reported, not scored. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds, and `shape.json`, copied the same way from `KUBE_AGENTS_SHAPE_FILE`, for the shape of the reply the run delivered (`kube_agents_bench/chat_shape.py`: whether it opens on its answer, an apology, the messages the thread received, and word counts); both are reported, not scored, and `bench-gate case` prints them as each repetition's `rep N timing:` and `rep N shape:` lines. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \
@@ -169,7 +169,7 @@ Thresholds are named environment variables, all with the documented default: `EV
 The certification suite is the set of cases behind the certified-capabilities page. It has its
 own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
 `hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
-`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, rerun from Deck and never on a cron),
+`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case named there. A certification case is an ordinary
 case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
 `scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
@@ -184,7 +184,7 @@ block. The lane's record is its logs bucket, read by the page per case and model
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Three rules hold for every fixture a certification case plants, enforced in review until a
+Four rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -198,6 +198,9 @@ validator check lands with the first stack that needs it:
 3. Fixture credentials are inert literals, never a token that was once valid, and a service account
    a fixture creates is destroyed in the same stack. The expected-fail marker hides a fixture that
    failed to plant, so the `resource_property` safeguard stays on every case.
+4. A declared-gap fixture plants a signal the agent's read role reaches (a webhook configuration's
+   CA bundle, an object's condition, an event), never a Secret: agents hold no Secret access, so a
+   gap recorded on one could never close.
 
 ## Portal CUJ evaluations
 

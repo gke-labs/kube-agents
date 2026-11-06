@@ -385,6 +385,101 @@
         "traceLogPath": {
           "type": "string",
           "pattern": "^/tmp/([^\\x00/]*[^\\x00/.][^\\x00/]*/)*[^\\x00/]*[^\\x00/.][^\\x00/]*$"
+        },
+        "replayShadow": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": "string"
+                },
+                "pullPolicy": {
+                  "type": "string",
+                  "enum": ["Always", "IfNotPresent", "Never"]
+                }
+              }
+            },
+            "replicaCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "rollingUpdate": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "maxSurge": {
+                  "type": ["integer", "string", "null"]
+                },
+                "maxUnavailable": {
+                  "type": ["integer", "string", "null"]
+                }
+              }
+            },
+            "job": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["", "nightly", "presubmit"]
+                },
+                "project": {
+                  "type": "string"
+                },
+                "build": {
+                  "type": "string"
+                },
+                "pr": {
+                  "type": "string"
+                }
+              }
+            },
+            "resources": {
+              "type": "object"
+            }
+          },
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": ["enabled"]
+          },
+          "then": {
+            "required": ["image", "job"],
+            "properties": {
+              "image": {
+                "required": ["repository", "tag"],
+                "properties": {
+                  "repository": {
+                    "minLength": 1
+                  },
+                  "tag": {
+                    "minLength": 1
+                  }
+                }
+              },
+              "job": {
+                "required": ["kind"],
+                "properties": {
+                  "kind": {
+                    "enum": ["nightly", "presubmit"]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

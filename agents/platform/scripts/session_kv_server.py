@@ -291,6 +291,10 @@ FEED_STATUS_FOLDED = "folded"
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
 FEED_STATUS_BACKLOG = "backlog"
+# A row an alert-exclude rule held back in the watcher (POST /v1/excluded-events).
+# Checked first: its `notified` is 0, and it was never offered to chat, so it is
+# neither suppressed nor filtered.
+FEED_STATUS_EXCLUDED = "excluded"
 # The alert was admitted and its triage turn never started: the retries ran out,
 # or the start was queued past `TRIAGE_QUEUE_WAIT_LIMIT_S` and its one attempt
 # failed (`triage_state = aborted`).
@@ -964,9 +968,12 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # request a card opened is a `pr_opened` event on that card in kanban.db
 # (agents/platform/plugins/pr_opened). Same pattern as that plugin's
 # PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
-# forge.call takes, then the number.
+# forge.call takes, then the number, for every forge the broker serves (GitHub
+# /pull/, GitLab /-/merge_requests/, Gitea /pulls/, Bitbucket /pull-requests/;
+# http for an in-cluster Gitea; the last marker before the number wins, and the
+# tail after it carries no further marker, `/-/` or `/issues/`).
 PR_OPENED_EVENT_KIND = "pr_opened"
-PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
@@ -1049,7 +1056,9 @@ INJECT_KIND_STALL = "controller-stall"
 # event for the watcher's --quiet-after since the last sighting. It arrives on
 # the alert's own session, which is how `_inject_followup` finds the thread.
 INJECT_KIND_FOLLOWUP = "k8s-event-followup"
-INJECT_KINDS_SUPPORTED = ["k8s-event", INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# The watcher's incident kind, which POST /v1/excluded-events also takes.
+INJECT_KIND_EVENT = "k8s-event"
+INJECT_KINDS_SUPPORTED = [INJECT_KIND_EVENT, INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
 # What this daemon does with an event's session beyond posting the alert,
 # advertised twice: on the event path's `injected` answer, which the watcher
 # records per session (injectResponse.Features in injector.go), and under
@@ -1255,7 +1264,23 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
 DRIFT_BACKLOG_FEATURE = "drift-backlog"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP]
+# The watcher posts the events its alert-exclude rules hold back to
+# POST /v1/excluded-events, for the daily recap's count, only when it reads this
+# feature: an older daemon has no such route.
+ALERT_EXCLUDED_FEATURE = "alert-excluded"
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP, ALERT_EXCLUDED_FEATURE]
+# How far back POST /v1/excluded-events looks for the object's row to add to.
+# An hour, not a day: the daily recap selects rows by `created_at`, so a row
+# that kept collecting for a day after it was created would carry sightings
+# from after one recap that the next recap does not read. An hour bounds that
+# to one hour at the recap's edge, for at most 24 rows per object and reason a
+# day. The watcher sends one record per key per flush interval.
+EXCLUDED_ROW_FOLD_SECONDS = 60 * 60
+# The most sightings one record may carry. The watcher sends at most a flush
+# interval's worth; the bound keeps a bad caller from overflowing the column.
+EXCLUDED_OCCURRENCES_MAX = 1_000_000
+# The event type a record without one is graded as, as the inject route does.
+EXCLUDED_DEFAULT_EVENT_TYPE = "Warning"
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
 # digest or a card; the other three are terminal.
@@ -1501,6 +1526,9 @@ def init_db() -> None:
                 # live dispatcher, so startup stamps it to created_at below
                 # and NULL never means "old".
                 ("dispatched_at", "dispatched_at TEXT"),
+                # 1 on a row an alert-exclude rule held back in the watcher
+                # (POST /v1/excluded-events); 0 on every other row.
+                ("excluded", "excluded INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column in ledger_columns:
                     continue
@@ -6348,6 +6376,87 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
     return {"status": "backlog"}
 
 
+@app.post("/v1/excluded-events", dependencies=[Depends(verify_api_key)])
+def post_excluded_event(payload: Dict[str, Any]) -> Dict[str, str]:
+    """Count one event that an alert-exclude rule held back in the watcher.
+
+    The watcher posts here, with no session, the events its rules match
+    (ALERT_EXCLUDED_FEATURE), so the daily recap can say how much the rules
+    hold back. Nothing here spends quota, posts to chat or starts a turn. The
+    row is marked `excluded`, which keeps it out of every count of alerts and
+    out of the workload fold (it has no fold_key and `notified` is 0).
+
+    One row per object and reason per EXCLUDED_ROW_FOLD_SECONDS: a later record
+    adds its `occurrences` to that row. The watcher sends a record per key per
+    flush interval, carrying the sightings since its last one, so a chronic
+    failure stays one row an hour however often it repeats.
+    """
+    if payload.get("kind") != INJECT_KIND_EVENT:
+        raise HTTPException(status_code=400, detail=f"an excluded event needs kind {INJECT_KIND_EVENT!r}")
+    occurrences = payload.get("occurrences", 1)
+    if (
+        not isinstance(occurrences, int)
+        or isinstance(occurrences, bool)
+        or not 1 <= occurrences <= EXCLUDED_OCCURRENCES_MAX
+    ):
+        raise HTTPException(
+            status_code=400, detail=f"occurrences must be an integer from 1 to {EXCLUDED_OCCURRENCES_MAX}"
+        )
+    event_reason = payload.get("reason") or TRIAGE_DEFAULT_REASON
+    namespace = payload.get("namespace") or TRIAGE_DEFAULT_NAMESPACE
+    object_kind = payload.get("kind_of_object") or TRIAGE_DEFAULT_KIND
+    object_uid = payload.get("uid") or ""
+    event_cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    _, severity_label = get_severity_details(payload.get("type") or EXCLUDED_DEFAULT_EVENT_TYPE, event_reason)
+    clean_name = clean_workload_name(object_kind, payload.get("name") or "")
+    clean_msg = clean_event_message(payload.get("message") or "")
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            with conn:
+                updated = conn.execute(
+                    "UPDATE intercepted_events SET occurrences = occurrences + ? "
+                    "WHERE id = (SELECT id FROM intercepted_events WHERE excluded = 1 AND cluster = ? "
+                    "AND object_uid = ? AND reason = ? AND created_at >= datetime('now', ?) "
+                    # A record with no UID folds only into a row of the same
+                    # workload, so nameless objects of different workloads
+                    # stay apart.
+                    "AND (object_uid != '' OR (namespace = ? AND workload = ?)) "
+                    "ORDER BY id DESC LIMIT 1)",
+                    (occurrences, event_cluster, object_uid, event_reason, f"-{EXCLUDED_ROW_FOLD_SECONDS} seconds",
+                     namespace, clean_name),
+                ).rowcount
+                if not updated:
+                    conn.execute(
+                        "INSERT INTO intercepted_events "
+                        "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                        "occurrences, notified, session_id, excluded) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 1)",
+                        (
+                            event_cluster,
+                            namespace,
+                            clean_name,
+                            object_uid,
+                            object_kind,
+                            event_reason,
+                            clean_msg[:LEDGER_MESSAGE_MAX_CHARS],
+                            severity_label,
+                            occurrences,
+                        ),
+                    )
+                # This route writes at the cluster's rate and creates no
+                # session, so it prunes here too: otherwise a quiet install
+                # whose rules mute the noise would never reach the TTL and the
+                # row cap.
+                cleanup_old_records(conn)
+    except sqlite3.Error as exc:
+        # A 5xx, as the drift backlog route answers: the row is all this route
+        # does. The watcher keeps the sightings and sends them with its next
+        # record for the key.
+        logger.error(f"Failed to record excluded event {object_uid or '(no uid)'} {event_reason}: {exc}")
+        raise HTTPException(status_code=503, detail="the excluded event could not be written") from exc
+    return {"status": FEED_STATUS_EXCLUDED}
+
+
 # The digest worker. One daemon thread, started by the first pending row and
 # gone once none are left; the rows are the state, so a restart loses nothing
 # but the wait (see _arm_drift_backlog_digest_if_pending at the bottom of the
@@ -8047,6 +8156,7 @@ def _feed_status(
     backlog: int = DRIFT_BACKLOG_NONE,
     duplicate_of: Optional[int] = None,
     triage_state: str = "",
+    excluded: int = 0,
 ) -> str:
     """What became of a ledger row, in the inject route's own words.
 
@@ -8062,8 +8172,11 @@ def _feed_status(
     triage never started is still `notified`, and `injected` would say the triage
     is under way. A row whose delivery failed or is unconfirmed stays
     `undelivered` whatever its triage did: that the alert may not have been seen
-    is the fact a reader needs first.
+    is the fact a reader needs first. A row an alert-exclude rule held back is
+    `excluded`: it was never offered to chat.
     """
+    if excluded:
+        return FEED_STATUS_EXCLUDED
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG
     if duplicate_of is not None:
@@ -8095,7 +8208,8 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request, "
+        "excluded"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -8121,7 +8235,7 @@ def list_intercepted_events(
             "severity": row["severity"],
             "status": _feed_status(
                 row["notified"], row["severity"], row["delivery_error"], row["backlog"],
-                row["duplicate_of"], row["triage_state"],
+                row["duplicate_of"], row["triage_state"], row["excluded"],
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],

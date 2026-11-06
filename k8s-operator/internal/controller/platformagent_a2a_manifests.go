@@ -4310,13 +4310,11 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// The workloads rendered on a condition, which the next-mode golden (the
 	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
 	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
-	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the MCP
-	// door and the dispatcher follow the operator's flags.
+	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
+	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
-	n += a2aMCPStandingPods(agent)
-	if a2aDispatcherEnabled() {
-		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
-	}
+	n += a2aFlaggedStandingPods(agent)
 	return n
 }
 
