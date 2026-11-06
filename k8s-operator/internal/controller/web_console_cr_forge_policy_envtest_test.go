@@ -138,6 +138,10 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 			forgeGitHub+","+forgeGitLab+","+forgeGitea+`,{"name":"gh-two","namespace":"kubernetes"}`, reposBothForge)},
 		{"a namespace changed on a forge with no credential", integration(
 			`{"name":"github","namespace":"kubernetes"},`+forgeGitLab+","+forgeGitea, reposBothForge)},
+		{"a credentialed forge's host spelled in another case", integration(forgeGitHub+","+
+			strings.Replace(forgeGitLab, "gitlab.example.com", "GitLab.Example.com", 1)+","+forgeGitea, reposBothForge)},
+		{"the GitHub forge's host spelled out as www.github.com", integration(
+			`{"name":"github","host":"www.github.com","namespace":"gke-labs"},`+forgeGitLab+","+forgeGitea, reposBothForge)},
 		{"a forge removed", integration(forgeGitHub,
 			`[{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"}]`)},
 	} {

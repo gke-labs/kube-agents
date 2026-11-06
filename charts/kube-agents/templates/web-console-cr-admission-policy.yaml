@@ -158,13 +158,20 @@ spec:
         variables.oldIntegration.all(k, k in variables.consoleIntegrationKeys || k in variables.newIntegration)
       message: "the web console may change only spec.integration.forges, repositories and github on a PlatformAgent"
       reason: Forbidden
-    # A forge that already existed (matched by name) keeps where its credential goes: host, port,
-    # scheme, provider (absent reads as github), credentialsRef and caBundleRef, and the namespace
+    # A forge that already existed (matched by name) keeps where its credential goes: host (trimmed
+    # and lowercased, and on a GitHub forge the github.com spellings read as github.com, as the
+    # operator's canonicalHost reads it), port, scheme, provider (absent reads as github),
+    # credentialsRef and caBundleRef, and the namespace
     # when it has a credentialsRef, since that namespace scopes the token's allowed paths. The
     # console copies a same-name forge's fields, so its own writes pass.
     - expression: >-
         variables.newForges.all(f, variables.oldForges.all(o, o.name != f.name || (
-          (has(o.host) ? o.host : '') == (has(f.host) ? f.host : '') &&
+          ((has(o.provider) && o.provider.trim() != '' ? o.provider.trim().lowerAscii() : 'github') == 'github' &&
+            (!has(o.host) || o.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com']) ?
+            'github.com' : (has(o.host) ? o.host.trim().lowerAscii() : '')) ==
+          ((has(f.provider) && f.provider.trim() != '' ? f.provider.trim().lowerAscii() : 'github') == 'github' &&
+            (!has(f.host) || f.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com']) ?
+            'github.com' : (has(f.host) ? f.host.trim().lowerAscii() : '')) &&
           (has(o.port) ? o.port : 0) == (has(f.port) ? f.port : 0) &&
           (has(o.scheme) ? o.scheme : '') == (has(f.scheme) ? f.scheme : '') &&
           (has(o.provider) && o.provider.trim() != '' ? o.provider.trim().lowerAscii() : 'github') ==
