@@ -295,9 +295,41 @@ def _stored_since(path: Path, repo_dir: Path | None, since: datetime | None, tex
     return finished is not None and finished >= since
 
 
+def _store_directory(path: Path, audit_report) -> Path:
+    """The repository store directory an envelope file belongs to."""
+    return path.parent.parent if path.parent.name == audit_report.REPORT_RUNS_DIR else path.parent
+
+
+def restore_store(directory: Path, audit_report) -> str:
+    """Leave a repository store directory as `finish` left it before the planted run.
+
+    `finish` writes each run to `runs/` and a copy to `latest.json`, and the
+    store reads `latest.json` alone: a directory that exists without it is a
+    lost memory, not a store never written (`store_never_published`), and the
+    stream's next run would hold its ledger open over it. So `latest.json`
+    comes back as a copy of the newest run left in `runs/`, and a directory
+    with no run left goes, as it did not exist before the plant wrote it.
+    """
+    latest = directory / audit_report.REPORT_LATEST_NAME
+    runs = directory / audit_report.REPORT_RUNS_DIR
+    if latest.exists():
+        return "kept"
+    remaining = sorted(runs.glob("*.json")) if runs.is_dir() else []
+    if remaining:
+        latest.write_bytes(remaining[-1].read_bytes())
+        return "restored"
+    for empty in (runs, directory):
+        try:
+            empty.rmdir()
+        except OSError:
+            return "left"
+    return "removed"
+
+
 def teardown(audit_report, mark: str) -> int:
     """Remove the planted run and what it led to: any envelope with the mark, every envelope of the
-    planted repository stored at or after the planted run, and the scratch files."""
+    planted repository stored at or after the planted run, and the scratch files; then put each
+    repository store touched back as it was (`restore_store`)."""
     try:
         state = json.loads(plant_state_path(audit_report).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -310,6 +342,7 @@ def teardown(audit_report, mark: str) -> int:
         except (ValueError, OSError):
             repo_dir = None
     removed = 0
+    touched: set[Path] = set()
     for path in _store_files(audit_report):
         try:
             text = path.read_text(encoding="utf-8")
@@ -318,6 +351,8 @@ def teardown(audit_report, mark: str) -> int:
         if mark in text or _stored_since(path.resolve(), repo_dir, since, text):
             path.unlink()
             removed += 1
+            touched.add(_store_directory(path, audit_report))
+    restored = [f"{directory.name}: {restore_store(directory, audit_report)}" for directory in sorted(touched)]
     extra = 0
     for path in (digest_record_path(audit_report), planted_manifest_path(audit_report), plant_state_path(audit_report)):
         try:
@@ -325,7 +360,10 @@ def teardown(audit_report, mark: str) -> int:
             extra += 1
         except FileNotFoundError:
             continue
-    print(f"removed {removed} stored envelope(s) of the planted run and the runs closed from it, and {extra} scratch file(s).")
+    print(
+        f"removed {removed} stored envelope(s) of the planted run and the runs closed from it, and {extra} scratch file(s)"
+        + (f"; store {', '.join(restored)}." if restored else ".")
+    )
     return 0
 
 
