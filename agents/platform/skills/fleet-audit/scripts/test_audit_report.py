@@ -35875,9 +35875,28 @@ class TestPrecheck(BaseTestCase):
         self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
         self.assertIn("the digest record was written for the scheduled run that finished at 2020-01-01", out["reason"])
 
-    def test_a_close_that_dies_puts_the_draft_back_and_exits_1(self):
+    def in_flight_note(self):
+        return Path(audit_report.inflight_path_for(AUDIT))
+
+    def claim_for_real(self):
+        """`start` leaves the real in-flight note from here on, and the test releases it."""
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def test_a_close_that_published_releases_the_in_flight_note(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.claim_for_real()
+        self.start()
+        self.assertTrue(self.in_flight_note().is_file())
+        self.assertEqual(self.precheck(self.manifest_file("day2"), start=False), 0, self.err)
+        self.assertEqual(self.stdout_json()[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertFalse(self.in_flight_note().exists())
+
+    def test_a_close_that_dies_puts_the_draft_back_keeps_the_note_and_exits_1(self):
+        """The SOP continues past an exit 1, so the run is still in flight."""
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
         draft = Path(audit_report.findings_path_for(AUDIT))
+        self.claim_for_real()
         self.start()
         draft.write_text('{"the": "draft"}', encoding="utf-8")
         with patch.object(audit_report, "_finish", side_effect=RuntimeError("the adapter went away")):
@@ -35886,15 +35905,147 @@ class TestPrecheck(BaseTestCase):
         self.assertIn("FATAL: the adapter went away", self.err)
         self.assertEqual(draft.read_text(encoding="utf-8"), '{"the": "draft"}')
         self.assertIsNone(audit_report._PRECHECK_VERDICT)
+        self.assertTrue(self.in_flight_note().is_file())
 
-    def test_a_rejected_close_with_no_draft_leaves_no_findings_file(self):
+    def test_a_lost_broker_raw_from_the_close_is_said_as_an_outage_and_keeps_the_note(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.claim_for_real()
+        self.start()
+        lost = ConnectionError("connection refused")
+        with patch.object(audit_report, "_finish", side_effect=lost), patch.object(audit_report, "broker_lost", return_value=True):
+            rc = self.precheck(self.manifest_file("day2"), start=False)
+        self.assertEqual(rc, 2)
+        self.assertIn("BROKER UNAVAILABLE", self.err)
+        self.assertIn("re-run `precheck`", self.err)
+        self.assertTrue(self.in_flight_note().is_file())
+
+    def test_a_rejected_close_with_no_draft_leaves_no_findings_file_and_keeps_the_note(self):
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
         draft = Path(audit_report.findings_path_for(AUDIT))
+        self.claim_for_real()
         self.start()
         draft.unlink(missing_ok=True)
         with patch.object(audit_report, "_finish", side_effect=audit_report.ValidationError("no")):
             self.assertEqual(self.precheck(self.manifest_file("day2"), start=False), 0, self.err)
         self.assertFalse(draft.exists())
+        self.assertTrue(self.in_flight_note().is_file())
+
+    def rewrite_stored_document(self, mutate):
+        """Change the stored document in every envelope of the store, as `finish` might have left it."""
+        for path in [self.store() / "latest.json", *(self.store() / "runs").glob("*.json")]:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            mutate(envelope["document"])
+            path.write_text(json.dumps(envelope), encoding="utf-8")
+
+    def refused_close(self, mutate=None, closes=False, **patches):
+        """A day-1 finish with one finding, the store changed by `mutate`, then a day-2 precheck; its line.
+
+        Unless `closes`, the store is asserted untouched by the precheck.
+        """
+        candidate = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments",
+        }
+        finding = make_finding(remediation=dict(REPLAYABLE_REMEDIATION))
+        self.finish(make_doc(findings=[finding]), self.manifest_file("day1", candidates=[candidate]))
+        if mutate is not None:
+            self.rewrite_stored_document(mutate)
+        stored = self.latest()
+        self.start()
+        with contextlib.ExitStack() as stack:
+            for name, value in patches.items():
+                stack.enter_context(patch.object(audit_report, name, **value))
+            rc = self.precheck(self.manifest_file("day2", candidates=[candidate]), start=False)
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        if not closes:
+            self.assertEqual(self.latest(), stored)
+        return out
+
+    def test_a_stored_remediation_that_names_a_file_means_a_full_run(self):
+        def to_manifest(document):
+            document["findings"][0]["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/netpol.yaml"}
+
+        out = self.refused_close(to_manifest)
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("names a file this run has not written", out["reason"])
+        self.assertIn(audit_report.PRECHECK_CONTINUES_SUFFIX, out["reason"])
+
+    def test_a_stored_remediation_finish_wrote_a_note_on_means_a_full_run(self):
+        for mark in (
+            audit_report.DECLINED_FIX_NOTE.format(reason="the owner keeps it"),
+            audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/api` declared at acme/fleet:notes/api.md"),
+        ):
+            with self.subTest(mark=mark[:30]):
+                self.setUp()
+
+                def with_note(document, mark=mark):
+                    document["findings"][0]["remediation"]["note"] = f"{mark} Write a default-deny policy."
+
+                out = self.refused_close(with_note)
+                self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+                self.assertIn("carries a note finish wrote", out["reason"])
+
+    def test_a_stored_run_that_withheld_postures_means_a_full_run(self):
+        def withheld(document):
+            document[audit_report.POSTURES_WITHHELD_KEY] = {"findings": [], "unsearched": ["acme/notes"], "run_record": True}
+
+        out = self.refused_close(withheld)
+        self.assertEqual(out["reason"], audit_report.PRECHECK_WITHHELD_REASON + audit_report.PRECHECK_CONTINUES_SUFFIX)
+
+    def test_a_declared_entry_whose_declaration_this_run_did_not_file_means_a_full_run(self):
+        entry = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "billing",
+            "object": "Namespace/billing",
+            "title": "declared",
+            "declaration": {"repo": "acme/fleet", "path": "notes/billing.md", "excerpt": "mesh policy"},
+        }
+
+        def declared(document):
+            document["declared"] = [entry]
+
+        out = self.refused_close(declared, read_declarations={"return_value": []})
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("is not among the ones this run's start filed", out["reason"])
+        self.assertIn(audit_report.published_id(entry), out["reason"])
+
+    def test_a_declared_entry_this_run_files_again_is_replayed(self):
+        entry = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "billing",
+            "object": "Namespace/billing",
+            "title": "declared",
+            "declaration": {"repo": "acme/fleet", "path": "notes/billing.md", "excerpt": "mesh policy"},
+        }
+        filed = {"check": "netpol-missing", "namespace": "billing", "object": "Namespace/billing", "repo": "acme/fleet", "path": "notes/billing.md", "excerpt": "mesh policy"}
+
+        def declared(document):
+            document["declared"] = [entry]
+
+        out = self.refused_close(declared, closes=True, read_declarations={"return_value": [filed]})
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertEqual(out["declared"], 1)
+
+    def test_a_repository_this_run_did_not_search_means_a_full_run(self):
+        record = {"repo": "no_forge/local", "context_repos": ["acme/notes"], "started_at": "2026-01-01T00:00:00Z", "searched": [], "sources": []}
+        out = self.refused_close(None, read_run_record={"return_value": record})
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("this run's start did not search acme/notes", out["reason"])
+        searched = {**record, "searched": ["acme/notes@abc123"]}
+        self.setUp()
+        out = self.refused_close(None, closes=True, read_run_record={"return_value": searched})
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+
+    def test_a_run_with_no_record_from_start_means_a_full_run(self):
+        out = self.refused_close(None, read_run_record={"return_value": None})
+        self.assertEqual(out["reason"], audit_report.PRECHECK_NO_RUN_RECORD_REASON + audit_report.PRECHECK_CONTINUES_SUFFIX)
 
     def test_a_lost_broker_during_the_close_is_said_and_exits_2(self):
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
@@ -35937,6 +36088,10 @@ class TestPrecheck(BaseTestCase):
         self.assertNotIn(audit_report.PRECHECK_KEY, self.latest())
 
 
+# A remediation a close can run `finish` on again: no file, no note of the harness's.
+REPLAYABLE_REMEDIATION = {"kind": "manual", "note": "Write a default-deny policy."}
+
+
 class TestPrecheckOnTheForgePath(HarnessTestCase):
     """The close `precheck` runs is the forge path's own `finish`."""
 
@@ -35946,8 +36101,12 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         path.write_text(json.dumps(manifest), encoding="utf-8")
         return str(path)
 
+    def searched_this_run(self):
+        """The record `start` leaves on an install whose harness search read the GitOps repository."""
+        audit_report.write_run_record(AUDIT, "acme/fleet", [], searched=["acme/fleet@abc123"])
+
     def test_an_unchanged_scheduled_run_closes_with_the_ledger_untouched(self):
-        a = make_finding(fid="a", severity="major")
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
         body = published_body(make_doc(findings=[a]), generated_at=NOW)
         self.seed_report(
             body,
@@ -35967,6 +36126,7 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertTrue(first["silent_ok"])
         self.assertNotIn(audit_report.PRECHECK_KEY, first)
 
+        self.searched_this_run()
         rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
 
         self.assertEqual(rc, 0, self.err)
@@ -35981,7 +36141,7 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertEqual([f["id"] for f in latest["document"]["findings"]], audit_report.parse_delta_block(body))
 
     def test_a_pending_remediate_request_keeps_the_run_a_full_one(self):
-        a = make_finding(fid="a", severity="major")
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
         body = published_body(make_doc(findings=[a]), generated_at=NOW)
         self.seed_report(
             body,
@@ -36003,6 +36163,7 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
             "*-view comments": comments_view({"comments": [comment(f"/remediate {requested}")]}),
         }
 
+        self.searched_this_run()
         rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
 
         self.assertEqual(rc, 0, self.err)
@@ -36010,6 +36171,37 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
         self.assertIn(f"a /remediate request is pending on the ledger for {requested}", out["reason"])
         self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+
+    def test_a_stored_manifest_remediation_means_a_full_run_with_the_ledger_untouched(self):
+        """The fix file `finish` read on the previous run is not in a workspace `start` reset."""
+        a = make_finding(fid="a", severity="major")
+        self.assertEqual(a["remediation"]["kind"], "manifest")
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        self.assertEqual(self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])]), 0, self.err)
+        stored = (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+        calls_before = len(self.harness.calls)
+
+        rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("names a file this run has not written", out["reason"])
+        self.assertIn(audit_report.parse_delta_block(body)[0], out["reason"])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+        self.assertEqual(len(self.harness.calls), calls_before)
 
     def test_a_ledger_whose_requests_cannot_be_read_means_a_full_run(self):
         with patch.object(audit_report, "find_existing_issue", side_effect=RuntimeError("the forge timed out")):

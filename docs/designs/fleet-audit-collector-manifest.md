@@ -581,7 +581,22 @@ carries no pending `/remediate` request (`pending_ledger_requests`, read as `sta
 ledger that cannot be read counts as pending), `precheck` writes that document to `findings_path`
 and runs `finish --scheduled` on it with this run's manifest. The request rule is there because
 the stored document answers no request: `finish` opens a fix only for a `manifest` remediation,
-so a request on a `manual` finding would otherwise wait until the fleet changed. Nothing in §3.1–§3.6 or the ledger design changes:
+so a request on a `manual` finding would otherwise wait until the fleet changed. The stored
+document is the one `finish` left, after the passes that write on it, and the close runs those
+passes again on a workspace `start` has reset, so `stored_document_replay_problem` refuses what
+they could not reproduce, by the rule the carry already applies (`_remediation_may_carry`): a
+finding whose remediation names a file (the worker's `manifest` fix, or a generated one, which
+this run has not written, so the pass would degrade it or refuse the close) or carries a note
+`finish` wrote (`HARNESS_NOTE_MARKS`: a declined fix, which the pass would refuse again for want
+of the decline; a shield, which it would write twice); a document with `postures_withheld`; a
+`declared[]` entry whose declaration this run's `start` did not file again (`read_declarations`,
+joined on `_declaration_key`), which the close would otherwise keep silent after the owner removed
+or narrowed it; and, where the document owes the declared-intent step, a run record whose own
+`searched` does not cover every repository the step names, since the document's search record is
+the previous run's and would hide a repository this run's `start` could not read. Each is a full
+run, so a stream whose findings carry such a remediation does not take the saving until it is
+closed or declined by a person; a pre-mutation copy of the document in the envelope would widen
+the gate to them and is not made here. Nothing in §3.1–§3.6 or the ledger design changes:
 the cross-check holds the stored document to the fresh manifest, the delta and the scheduled
 baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finish`'s, plus
 `precheck: unchanged`, and the stored envelope carries the same key
@@ -589,9 +604,11 @@ baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finis
 `last_full_run_at`, so a static fleet is still drafted in full once a week. A `finish` that
 rejects the stored document puts the findings file back as it was and reports `closed: false`
 with the rejection, and a close that dies on anything else puts it back and fails as any command
-does; a newer on-demand run, a store with nothing, a document from another scheme, a record of
-another run or a pending request are reasons to run in full, never errors. An on-demand run never
-passes the flag, so it is never closed from a stored document.
+does; on either the stream's in-flight note stays, since the run goes on and the SOP's own
+`finish` releases it, and only a close that published releases it. A newer on-demand run, a store
+with nothing, a document from another scheme, a record of another run, a pending request or a
+document the close cannot run `finish` on again are reasons to run in full, never errors. An
+on-demand run never passes the flag, so it is never closed from a stored document.
 
 What a close waives, by design: the SOP steps after the collector. On the stockout and cost
 streams some sub-conditions are checked by hand rather than by the collector, and a closed run

@@ -1804,6 +1804,20 @@ PRECHECK_RECORD_MISMATCH_REASON = (
     "the digest record was written for the scheduled run that finished at {recorded}, and the newest "
     "stored run finished at {stored}"
 )
+PRECHECK_REMEDIATION_REASON = (
+    "the stored document's remediation for {ids} names a file this run has not written, or "
+    "carries a note finish wrote, which a close cannot write again"
+)
+PRECHECK_WITHHELD_REASON = (
+    "the stored run withheld posture findings for want of a declared-intent search, so it is no baseline"
+)
+PRECHECK_NO_RUN_RECORD_REASON = "this run has no record from start, so its declared-intent search is unknown"
+PRECHECK_UNSEARCHED_REASON = (
+    "this run's start did not search {slugs}, which the stored document's own search record would hide"
+)
+PRECHECK_DECLARATION_GONE_REASON = (
+    "the declaration the stored document relied on for {ids} is not among the ones this run's start filed"
+)
 # On the stored envelope only: the title and place of each previous finding
 # that the run kept under _Not re-checked this run_ (`unread_held_entries`).
 # The note and id-only tiers of the held span write no row for them, and the
@@ -23399,11 +23413,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     except Exception as exc:
         # A lost broker that reached here raw is the same outage `forge`
         # names, and keeps the note for the re-run the skill prescribes.
-        if broker_lost(exc):
-            raise BrokerUnavailable(
-                f"the broker at {proxy_endpoint()} did not answer: {exc}. "
-                "Check the credential-proxy pod and re-run `finish`."
-            ) from exc
+        raise_if_broker_lost(exc, "finish")
         release_in_flight(audit_id)
         raise
     except BaseException:
@@ -23418,6 +23428,15 @@ def handle_finish(args: argparse.Namespace) -> None:
         raise
     release_in_flight(audit_id)
     _record_scheduled_digest(args, audit_id)
+
+
+def raise_if_broker_lost(exc: BaseException, command: str) -> None:
+    """Raise `exc` again as `BrokerUnavailable` when it is a lost broker; otherwise return."""
+    if broker_lost(exc):
+        raise BrokerUnavailable(
+            f"the broker at {proxy_endpoint()} did not answer: {exc}. "
+            f"Check the credential-proxy pod and re-run `{command}`."
+        ) from exc
 
 
 def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
@@ -23524,12 +23543,82 @@ def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | No
     document = newest.get("document")
     if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
         return None, "the newest stored run carries no usable findings document"
+    unreplayable = stored_document_replay_problem(document, audit_id, store_repo)
+    if unreplayable:
+        return None, unreplayable
     pending, unread = pending_ledger_requests(audit_id, store_repo)
     if unread:
         return None, PRECHECK_LEDGER_UNREAD_REASON.format(error=unread)
     if pending:
         return None, PRECHECK_PENDING_REQUESTS_REASON.format(ids=", ".join(pending))
     return document, f"the document of the scheduled run that finished at {stored}"
+
+
+def stored_document_replay_problem(document: dict, audit_id: str, store_repo: str) -> str | None:
+    """Why `finish` cannot be run again on a stored document, or None when it can.
+
+    The store keeps the document as `finish` left it, after the passes that
+    write on it, and a close runs those passes again on a workspace `start`
+    has reset. Two kinds of state do not survive that. A remediation the carry
+    would not copy either (`_remediation_may_carry`): one that names a file
+    (the worker's `manifest` fix, or a generated one, which this run has not
+    written, so the pass would degrade it or refuse the close) or one `finish`
+    wrote a note on (a declined fix, which the pass would refuse again for
+    want of the decline; a shield, which it would write a second time). And
+    the previous run's reading of the repositories: postures it withheld
+    because a repository went unsearched, which the pass would empty; a
+    `declared[]` entry whose declaration this run's `start` did not file
+    again, which the close would keep silent; and a search record of its own
+    that would hide a repository this run's `start` did not search. Each is
+    a reason to run in full: the gate costs a full run when it cannot vouch
+    for a close.
+    """
+    unreplayable = [
+        str(finding.get("id", ""))
+        for finding in document.get("findings") or []
+        if isinstance(finding, dict)
+        and (
+            _remediation_is_file_backed(finding.get("remediation"))
+            or _harness_wrote_note(finding.get("remediation"))
+        )
+    ]
+    if unreplayable:
+        return PRECHECK_REMEDIATION_REASON.format(ids=", ".join(unreplayable))
+    if isinstance(document.get(POSTURES_WITHHELD_KEY), dict):
+        return PRECHECK_WITHHELD_REASON
+    declared = [entry for entry in document.get("declared") or [] if isinstance(entry, dict)]
+    if declared:
+        filed = read_declarations(audit_id, repo=store_repo)
+        scoped = {
+            _declaration_key(entry, with_cluster=True)
+            for entry in filed
+            if entry.get(DECLARATION_CLUSTER_FIELD)
+        }
+        fleet_wide = {
+            _declaration_key(entry, with_cluster=False)
+            for entry in filed
+            if not entry.get(DECLARATION_CLUSTER_FIELD)
+        }
+        gone = [
+            published_id(entry)
+            for entry in declared
+            if _declaration_key(entry, with_cluster=True) not in scoped
+            and _declaration_key(entry, with_cluster=False) not in fleet_wide
+        ]
+        if gone:
+            return PRECHECK_DECLARATION_GONE_REASON.format(ids=", ".join(gone))
+    if declared_intent_applies(document):
+        record = read_run_record(audit_id, repo=store_repo)
+        if record is None:
+            return PRECHECK_NO_RUN_RECORD_REASON
+        # The harness's own search, without the document's: the stored
+        # document's entries are the previous run's, and would hide a
+        # repository this run's `start` could not read.
+        own = {DECLARED_INTENT_SEARCHED_KEY: list(record.get(RUN_RECORD_SEARCHED_KEY) or [])}
+        missing = unsearched_repositories(own, record)
+        if missing:
+            return PRECHECK_UNSEARCHED_REASON.format(slugs=", ".join(missing))
+    return None
 
 
 def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], str | None]:
@@ -23566,7 +23655,9 @@ def _close_from_stored_document(
     document is that reason: the manifest digested the same, but `finish` is
     the judge of whether the document still fits it. A broker outage, and any
     other failure of the close, is raised as it is from any command; the same
-    `precheck` is re-run once the broker answers.
+    `precheck` is re-run once the broker answers. The stream's in-flight note
+    is released only by a close that published: after any failure the run is
+    still under way, and the SOP's own `finish` releases it.
     """
     path = Path(findings_path_for(audit_id))
     previous = path.read_bytes() if path.is_file() else None
@@ -23591,19 +23682,31 @@ def _close_from_stored_document(
 
     log(f"PRECHECK: {verdict}: closing the run from {source}")
     set_precheck_verdict(verdict)
+    # `_finish` rather than `handle_finish`: the in-flight note is this run's,
+    # and on every failure the run goes on (the SOP's next step is the same
+    # `precheck` once more, then the rest of the SOP, whose own `finish`
+    # releases it), so only a close that published releases it here.
     try:
-        handle_finish(close)
+        _finish(close, audit_id)
     except BrokerUnavailable:
         put_back()
         raise
     except ValidationError as exc:
         put_back()
         return f"finish did not take the stored document ({exc}){PRECHECK_CONTINUES_SUFFIX}"
+    except Exception as exc:
+        put_back()
+        raise_if_broker_lost(exc, "precheck")
+        raise
     except BaseException:
         # A close that died on anything else: the worker continues from the
         # draft it had, and `main` reports the failure as for any command.
         put_back()
         raise
+    else:
+        # While the verdict is still set: the record keeps `last_full_run_at`.
+        release_in_flight(audit_id)
+        _record_scheduled_digest(close, audit_id)
     finally:
         set_precheck_verdict(None)
     return None
