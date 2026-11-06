@@ -49,8 +49,8 @@ cycle.
    flag, dependency or regex alternative; otherwise reply
    `declined: <reason about this change>` or `deferred to #N`, record it in
    **Self-Review**, and resolve the thread: an open thread hides the PR from
-   its reviewer. A reviewer who disagrees reopens it or replies; on a reply
-   that asks for the fix, unresolve the thread and owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
+   its reviewer. A reviewer who disagrees replies in it; on a reply that
+   asks for the fix, unresolve the thread and owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
    mechanism - then it is a design question for the human reviewer, deferred
    to an issue, not built on a review round. Resolve only a thread a commit
    fixed, you showed factually wrong, or a bot finding you declined or

@@ -461,8 +461,9 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   the loop or without. An open thread makes the pull request the author's on the reviewers'
   dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
   reviewer would never see a pull request that kept one open. The reply stays on the resolved
-  thread. A reviewer who disagrees reopens it or replies in it; a reply does not reopen it, so on one
-  that asks for the fix, unresolve it, and it is your move again (**who counts**, next;
+  thread. A reviewer who disagrees replies in it (one with write access may also unresolve it); a
+  reply does not reopen it, so on one that asks for the fix, unresolve it, and it is your move again
+  (**who counts**, next;
   [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
@@ -500,9 +501,12 @@ findings you declined or deferred; the description thread waits for the body edi
 or for your reply declining an ask the bot repeated. An open thread makes the pull request its
 author's on the reviewers' dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)),
 so a declined bot thread left open hides the pull request from the reviewer who has to rule on it.
-A reviewer who disagrees reopens the thread or replies in it. A reply does not reopen a resolved
-thread, so on a reply that asks for the fix, unresolve it (`unresolveReviewThread`, below): it owes
-the fix and stays open until the fix lands ([green is settled](#green-is-settled), _who counts_). A
+A reviewer who disagrees replies in the thread; only the author or a user with write access can
+unresolve it. A reply does not reopen a resolved thread, so on a reply that asks for the fix,
+unresolve it (`unresolveReviewThread`, below): it owes the fix and stays open until the fix lands
+([green is settled](#green-is-settled), _who counts_). Nothing mechanical holds a pull request on a
+resolved declined thread: `scripts/hold_unresolved_threads.py` counts unresolved threads only, and
+`AI Review` is not a required check, so the reviewer's approval is their ruling on the declines. A
 disagreement with a human reviewer stays open until they are satisfied: resolving it does not end a
 disagreement with a person. A pull request carrying
 both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
@@ -521,7 +525,7 @@ query($pr: Int!) {
     pullRequest(number: $pr) {
       reviewThreads(first: 100) {
         nodes {
-          id isResolved isOutdated viewerCanResolve path line
+          id isResolved isOutdated viewerCanResolve viewerCanUnresolve path line
           comments(first: 20) { nodes { databaseId author { login } body } }
           last: comments(last: 1) { nodes { author { login } } }
         }
@@ -530,7 +534,7 @@ query($pr: Int!) {
   }
 }' -F pr=<number> --jq '.data.repository.pullRequest.reviewThreads.nodes[]
   | select((.isResolved | not) or (.last.nodes[0].author.login != "<your-login>"))
-  | "\(.path):\(.line // "outdated") thread \(.id) resolved=\(.isResolved) canResolve=\(.viewerCanResolve)
+  | "\(.path):\(.line // "outdated") thread \(.id) resolved=\(.isResolved) canResolve=\(.viewerCanResolve) canUnresolve=\(.viewerCanUnresolve)
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
@@ -567,7 +571,7 @@ Five ways that goes wrong quietly:
   poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
   that newer review repeats after your reply is a dispute for the human reviewer, not another edit:
   reply `declined: <reason>`, record it in **Self-Review**, and resolve the thread like any other
-  declined bot thread; a reviewer who disagrees reopens it, or replies and you unresolve it
+  declined bot thread; a reviewer who disagrees replies, and you unresolve it
   ([green is settled](#green-is-settled), _who counts_).
 
 ## How a change merges

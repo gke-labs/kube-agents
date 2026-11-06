@@ -286,7 +286,7 @@ fix, before any `/review`; a skipped live run is written `Not live-tested: <what
 why no install reaches it>`; a description ask repeated after your reply is a dispute for the human
 reviewer, not another edit.
 
-**Resolve a thread** only when **fully confident the issue is addressed**: the fix is on the PR head
+**Resolve a thread** when **fully confident the issue is addressed**: the fix is on the PR head
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
 you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
 the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
