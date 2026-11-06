@@ -26,7 +26,7 @@
 #   - against each template: if the Job's pod runs as that template's ServiceAccount, its pod spec
 #     equals the template's exactly, and its pod labels are the template's plus only the ones the
 #     Job controller adds. Exact equality pins every field (images, staging init containers,
-#     volumes, runtimeClassName, resources, securityContext, scheduling) with no list to drift.
+#     volumes, runtime class, resources, securityContext, scheduling) with no list to drift.
 #     Its pod annotations are the template's exactly too.
 #
 # The operator writes a template before listing its ServiceAccount in the index, and unlists it
