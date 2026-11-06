@@ -145,24 +145,45 @@ const (
 	// render carries, for the event and the log.
 	sizingLimitRangeRatioFigureFormat = "%.3g"
 	// sizingStepRefusedMessageFormat is the SizingCappedByQuota message the
-	// back-out writes (sizingRefusedStep): a step the quota check admitted
-	// whose recreated pod admission then refused on a ResourceQuota, because
-	// the namespace admitted another pod between the measurement and the
-	// Recreate. It takes the tier stepped back from, the workload whose pod
-	// was refused, the quota admission named, admission's own message, and
-	// the tier that stays. Admission's message is part of the condition
-	// because it is what tells one refusal from the next: the pod name it
+	// back-out writes (sizingRefusedStep): a pod of the latched tier that
+	// admission refused on a ResourceQuota for a key the step up to that
+	// tier moved, whether the quota check admitted the step and the
+	// namespace admitted another pod between the measurement and the
+	// Recreate, or an explicit profile set the tier before auto did. It
+	// takes the workload whose pod was refused, the tier stepped back from,
+	// the quota admission named, admission's own message, and the tier that
+	// stays. Admission's message is part of the condition because it is one
+	// of the two things that tell one refusal from the next (the other is
+	// the figure it asked for, sizingRefusalIsTheSteps): the pod name it
 	// carries is the ReplicaSet's, so the same refusal read again on a
 	// later pass is not stepped back from twice, and a refusal of the lower
 	// row's pod, a new ReplicaSet's, is.
-	sizingStepRefusedMessageFormat = "spec.deployment.sizingProfile is auto and the step up to the %s tier found room on every ResourceQuota, " +
-		"but admission refused the pod %s recreates for it, ResourceQuota %s having been used up since (%s); " +
+	sizingStepRefusedMessageFormat = "spec.deployment.sizingProfile is auto and admission refused the pod %s recreates at the %s tier, " +
+		"ResourceQuota %s having no room for it (%s); " +
 		"the %s tier stays until the quota is raised or sizingProfile names the tier, which the operator applies without this check"
 	// resourceQuotaExceededPhrase opens the quota admission plugin's refusal
-	// ("exceeded quota: <name>, requested: ..., used: ..., limited: ..."),
-	// the name running to the next resourceQuotaExceededNameEnd.
+	// ("exceeded quota: <name>, requested: <key>=<quantity>,..., used: ...,
+	// limited: ..."), the name running to the next
+	// resourceQuotaExceededNameEnd; the requested list, the keys the pod
+	// crossed with the quantities the pod asked for on them, runs from
+	// resourceQuotaRequestedPhrase to resourceQuotaUsedPhrase, its pairs
+	// separated by resourceQuotaListSeparator and each key from its quantity
+	// by resourceQuotaPairSeparator.
 	resourceQuotaExceededPhrase  = "exceeded quota: "
 	resourceQuotaExceededNameEnd = ","
+	resourceQuotaRequestedPhrase = "requested: "
+	resourceQuotaUsedPhrase      = ", used: "
+	resourceQuotaListSeparator   = ","
+	resourceQuotaPairSeparator   = "="
+	// sizingStepBackHoldInterval is how long after a step back
+	// (sizingRefusedStep) the gate measures no step up, so that a namespace
+	// whose slack sits near a step's size, with pods landing in the
+	// broker's drain window, cycles between two rows at most once per
+	// interval rather than on every pass the lower row settles. The record
+	// is the operator's own (steppedBackAt), kept the way the pruned-field
+	// echo is: a restart forgets it and measures on the next settled pass,
+	// at worst one cycle early.
+	sizingStepBackHoldInterval = 10 * time.Minute
 	// sizingCappedByQuotaEventFormat is the Warning event's text: the
 	// condition message, then the figures as they stood when it was written.
 	// It takes the message, the cluster count, the free quantity, the quota
@@ -580,13 +601,35 @@ func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamp
 	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for i := range before {
-		fromRequests, toRequests := effectiveRequests(before[i].resources), effectiveRequests(after[i].resources)
-		addResourceDelta(step.requests, fromRequests, toRequests)
-		addResourceDelta(step.limits,
-			clampedLimits(before[i].resources.Limits, fromRequests, clamped),
-			clampedLimits(after[i].resources.Limits, toRequests, clamped))
+		addRenderStep(&step, before[i].resources, after[i].resources, clamped)
 	}
 	return step
+}
+
+// sizedContainerStepBetween is sizingStepBetween for the one sized container
+// named name (renderedSizedContainersAt's names): what the step from from to
+// to moves on the pod that container runs in, since the other containers of
+// that pod keep their figures. The zero step for a name that is not sized.
+func sizedContainerStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, name string, from, to sizingTier) sizingStep {
+	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
+	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
+	for i := range before {
+		if before[i].container == name {
+			addRenderStep(&step, before[i].resources, after[i].resources, clamped)
+		}
+	}
+	return step
+}
+
+// addRenderStep adds to step what one container's render moves from before
+// to after: the requests as admission accounts them (effectiveRequests) and
+// the limits through clamped.
+func addRenderStep(step *sizingStep, before, after corev1.ResourceRequirements, clamped bool) {
+	fromRequests, toRequests := effectiveRequests(before), effectiveRequests(after)
+	addResourceDelta(step.requests, fromRequests, toRequests)
+	addResourceDelta(step.limits,
+		clampedLimits(before.Limits, fromRequests, clamped),
+		clampedLimits(after.Limits, toRequests, clamped))
 }
 
 // renderedSizedContainersAt is the three sized containers as the reconciler
@@ -1378,28 +1421,45 @@ func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, c
 // is down until a person names a lower tier. This reads it. The proxy
 // Deployment and the gateway's, when it is a Deployment, are read for a
 // ReplicaFailure condition whose message names a quota
-// (resourceQuotaNamedIn); the first found is returned, and the caller steps
-// the latch back one tier and writes the cap with admission's message. The
-// StatefulSets (the shell, the gateway under useStatefulSet) carry no such
-// condition and are not read: their refused pod shows as the hold the
-// settled wait logs. Nil at small, where there is no tier to step back to,
-// and for a refusal the condition on the CR already records: the ReplicaSet
-// keeps its condition until it is scaled away, and the Deployment copies it
-// for a pass or two after the step back, so the same message is read as
-// already answered; the lower row's pod, refused by a new ReplicaSet, comes
-// with a new message and is stepped back from in turn.
+// (resourceQuotaNamedIn) and is the latched tier's step being refused
+// (sizingRefusalIsTheSteps: a key the step up to the tier moved on that
+// pod, asked for at that tier's figure and not the row above's); the first
+// found is returned, and the caller steps the latch back one tier and
+// writes the cap with admission's message. A refusal on a key no row moves
+// (a pods count at its cap, a requests.memory quota refusing the gateway's
+// pod, whose sidecar's request every row keeps) is not the step's and is
+// left to the settled hold, which logs the workload that cannot settle;
+// stepping back would recreate the broker at a lower row the refusal does
+// not care about. The StatefulSets (the shell, the gateway under
+// useStatefulSet) carry no such condition and are not read: their refused
+// pod shows as the hold the settled wait logs. Nil at small, where there is
+// no tier to step back to, and for a refusal the condition on the CR
+// already records: the ReplicaSet keeps its condition until it is scaled
+// away, and the Deployment copies it for a pass or two after the step back,
+// so the same message is read as already answered, as is a message asking
+// for the row above's figure, whichever Deployment carries it and whatever
+// the condition says; the lower row's pod, refused by a new ReplicaSet,
+// comes with a new message at the lower figure and is stepped back from in
+// turn.
 func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) *sizingRefusal {
 	if tier == sizingTierSmall {
 		return nil
 	}
-	keys := []client.ObjectKey{{Namespace: agent.Namespace, Name: credentialProxyName(agent)}}
+	sized := []struct {
+		key       client.ObjectKey
+		container string
+	}{{client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, credentialProxyContainerName}}
 	if !useStatefulSet(agent) {
-		keys = append(keys, client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix})
+		sized = append(sized, struct {
+			key       client.ObjectKey
+			container string
+		}{client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, agentAPIAuthContainerName})
 	}
 	recorded := sizingCappedCondition(agent).message
-	for _, key := range keys {
+	autopilot, clamped, clampRead := r.clusterAutopilot(), false, false
+	for _, workload := range sized {
 		dep := &appsv1.Deployment{}
-		if err := r.Get(ctx, key, dep); err != nil {
+		if err := r.Get(ctx, workload.key, dep); err != nil {
 			continue
 		}
 		for _, cond := range dep.Status.Conditions {
@@ -1410,10 +1470,62 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 			if !named || strings.Contains(recorded, cond.Message) {
 				continue
 			}
-			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, key.Name), quota: quota, message: cond.Message}
+			if !clampRead {
+				clamped, clampRead = r.sizingRunningLimitsClamped(ctx, agent), true
+			}
+			if !sizingRefusalIsTheSteps(agent, autopilot, clamped, dep.Spec.Template, workload.container, tier, quotaRefusalRequested(cond.Message)) {
+				continue
+			}
+			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, workload.key.Name), quota: quota, message: cond.Message}
 		}
 	}
 	return nil
+}
+
+// sizingRefusalIsTheSteps reports whether a quota refusal of the pod the
+// sized container named name runs in, read with the latch at tier, is a
+// refusal of that tier's pod on a key the step up to it moved. requested is
+// the refusal's list (quotaRefusalRequested): the quota keys the pod crossed
+// and the pod's figure on each. One key is enough when it is a key the
+// step-up check reads (sizingQuotaDimensions), the container's own figure
+// on it rose from the tier below (sizedContainerStepBetween, the limits
+// through clamped), and the pod's figure the refusal names is under what the
+// pod would ask at the row above tier (sizingPodFigures on template with the
+// container at that row's render). The last term tells a refusal of the row
+// above, lingering on the Deployment after a step back from it, from the
+// latched row's own: the one asks for the row above's figure or more, the
+// other for less. At the top row nothing lingers from above.
+func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, template corev1.PodTemplateSpec, name string, tier sizingTier, requested corev1.ResourceList) bool {
+	if tier == sizingTierSmall || len(requested) == 0 {
+		return false
+	}
+	step := sizedContainerStepBetween(agent, autopilot, clamped, name, tier-1, tier)
+	var aboveRequests, aboveLimits corev1.ResourceList
+	if tier < sizingTierFleet {
+		for _, rendered := range renderedSizedContainersAt(agent, autopilot, tier+1) {
+			if rendered.container == name {
+				aboveRequests, aboveLimits = sizingPodFigures(template, name, rendered.resources, clamped)
+			}
+		}
+	}
+	for _, dim := range sizingQuotaDimensions {
+		asked, named := requested[dim.key]
+		if !named {
+			continue
+		}
+		side, above := step.requests, aboveRequests
+		if dim.limits {
+			side, above = step.limits, aboveLimits
+		}
+		if moved, ok := side[dim.resource]; !ok || moved.Sign() <= 0 {
+			continue
+		}
+		if bound, ok := above[dim.resource]; ok && asked.Cmp(bound) >= 0 {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // resourceQuotaNamedIn is the ResourceQuota an admission refusal names, as
@@ -1427,6 +1539,31 @@ func resourceQuotaNamedIn(message string) (string, bool) {
 	name, _, _ := strings.Cut(after, resourceQuotaExceededNameEnd)
 	name = strings.TrimSpace(name)
 	return name, name != ""
+}
+
+// quotaRefusalRequested is the requested list of an admission refusal, as
+// the quota plugin words it (resourceQuotaRequestedPhrase): the quota keys
+// the pod crossed, each with the figure the pod asked for on it. Empty when
+// the message carries none; a pair that does not parse is skipped.
+func quotaRefusalRequested(message string) corev1.ResourceList {
+	requested := corev1.ResourceList{}
+	_, after, found := strings.Cut(message, resourceQuotaRequestedPhrase)
+	if !found {
+		return requested
+	}
+	list, _, _ := strings.Cut(after, resourceQuotaUsedPhrase)
+	for _, pair := range strings.Split(list, resourceQuotaListSeparator) {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), resourceQuotaPairSeparator)
+		if !ok {
+			continue
+		}
+		quantity, err := resource.ParseQuantity(strings.TrimSpace(value))
+		if err != nil {
+			continue
+		}
+		requested[corev1.ResourceName(strings.TrimSpace(key))] = quantity
+	}
+	return requested
 }
 
 // sizingCappedConditionCurrent reports whether the SizingCappedByQuota
@@ -1489,11 +1626,16 @@ func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 // (sizingLimitRangeBound), since that admission plugin refuses the recreated
 // pod the way a short quota does; the LimitRange is read before the quota,
 // the order admission evaluates them in, so the condition names the LimitRange
-// when both refuse. With a quota in the namespace, a step is measured only once
-// the running tier's workloads have settled (sizingTierSettled), since the
-// used totals it is measured against do not charge a step whose pods
-// admission has not yet created; until then the latch and the condition stay
-// where they are, with no write and no event. A count that falls leaves the latch where it is and clears the
+// when both refuse. With a quota or a LimitRange in the namespace, a step is
+// measured only once the running tier's workloads have settled
+// (sizingTierSettled): the used totals a quota is measured against do not
+// charge a step whose pods admission has not yet created, and a Pod-type
+// LimitRange item is measured against the running templates, which a
+// workload that is absent or still rolling does not supply; until then the
+// latch and the condition stay where they are, with no write and no event.
+// For sizingStepBackHoldInterval after a step back no step is measured
+// either (sizingStepBackHeld), so a namespace whose slack sits near a step's
+// size cycles at most once per interval. A count that falls leaves the latch where it is and clears the
 // condition, since it no longer earns the step; a pass with no reading (the
 // gauges absent before the first poll, or cleared after two polls that read
 // no gateway) leaves the latch and the condition both where they are, so a
@@ -1533,7 +1675,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			from := tier
 			tier--
 			capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingStepRefusedMessageFormat,
-				from, refused.workload, refused.quota, refused.message, tier)}
+				refused.workload, from, refused.quota, refused.message, tier)}
 		} else if observed, ok := observedClusterCount(agent); ok {
 			count = observed
 			if earned := sizingTierForClusterCount(count); earned > tier {
@@ -1546,11 +1688,15 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					return err
 				}
 				waitingOn := ""
-				if len(quotas) > 0 {
+				if len(quotas) > 0 || len(ranges) > 0 {
 					waitingOn = r.sizingTierUnsettledWorkload(ctx, agent, tier)
 				}
-				classes, answered := []string(nil), true
+				heldFor, heldBack := time.Duration(0), false
 				if waitingOn == "" {
+					heldFor, heldBack = r.sizingStepBackHeld(agent)
+				}
+				classes, answered := []string(nil), true
+				if waitingOn == "" && !heldBack {
 					classes, answered = r.sizingQuotaPriorityClasses(ctx, agent, quotas)
 				}
 				switch {
@@ -1559,18 +1705,35 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// (the pass after a promotion, while the proxy recreates),
 					// so the quotas' used totals do not yet charge the step
 					// just taken and a step measured from the latch would
-					// count it as free. Nothing is measured: the cap stands
-					// as written, and the workloads' status updates
-					// re-enqueue the CR when the pods have settled. With no
-					// quota there is nothing to measure against, and the
-					// earned tier is taken as before. The hold is logged on
-					// every pass it takes, so a wait that never ends (a
-					// workload that cannot settle at the tier's render) is
-					// told apart from a quiet pass.
+					// count it as free, and the running templates a Pod-type
+					// LimitRange item is read against are not all there or
+					// not yet at the tier's render, so a pod's sum read off
+					// them would miss a container or carry the wrong row.
+					// Nothing is measured: the cap stands as written, and the
+					// workloads' status updates re-enqueue the CR when the
+					// pods have settled. With no quota and no LimitRange
+					// there is nothing to measure against, and the earned
+					// tier is taken as before. The hold is logged on every
+					// pass it takes, so a wait that never ends (a workload
+					// that cannot settle at the tier's render) is told apart
+					// from a quiet pass.
 					capped = sizingCappedCondition(agent)
 					logf.FromContext(ctx).Info("sizing step held until the running tier's workloads settle",
 						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
 						"waitingOn", waitingOn, "clusters", count)
+				case heldBack:
+					// A step back (sizingRefusedStep) within the last
+					// sizingStepBackHoldInterval: the room the refused step
+					// lost may be back already, and a pass that measured it
+					// would take the step again, into the next pod the
+					// namespace admits during the drain. Nothing is measured
+					// until the interval has passed; the cap stands as the
+					// step back wrote it, and the hold is logged on every pass
+					// it takes, as the settled hold is.
+					capped = sizingCappedCondition(agent)
+					logf.FromContext(ctx).Info("sizing step held after a step back until the hold interval passes",
+						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
+						"heldFor", heldFor.Round(time.Second).String(), "holdInterval", sizingStepBackHoldInterval.String(), "clusters", count)
 				case !answered:
 					// A quota scopes the pods by PriorityClass and admission
 					// refused the dry run that asks which class they get
@@ -1677,8 +1840,24 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
+	if refused != nil {
+		r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), time.Now())
+	}
 	r.noteSizingTierEcho(ctx, agent)
 	return nil
+}
+
+// sizingStepBackHeld reports whether this CR's latch was stepped back
+// (sizingRefusedStep) within the last sizingStepBackHoldInterval, and for
+// how long the hold has stood. The record is in memory (steppedBackAt), as
+// the pruned-field echo's is: an operator restart reads no hold.
+func (r *PlatformAgentReconciler) sizingStepBackHeld(agent *agentv1alpha1.PlatformAgent) (time.Duration, bool) {
+	recorded, stepped := r.steppedBackAt.Load(client.ObjectKeyFromObject(agent))
+	if !stepped {
+		return 0, false
+	}
+	held := time.Since(recorded.(time.Time))
+	return held, held < sizingStepBackHoldInterval
 }
 
 // sizingTierPruned reports whether the served CRD has been seen to drop

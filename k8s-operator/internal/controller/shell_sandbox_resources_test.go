@@ -404,3 +404,44 @@ func TestShellSandboxRefusalRanksAfterTheOtherResourceRefusals(t *testing.T) {
 		})
 	}
 }
+
+// TestShellSandboxResourcesFollowTheRenderedTier: the StatefulSet the
+// operator builds carries the shell row of the tier the CR renders, through
+// buildShellSandboxContainer's one call of the resolver: the fleet row's 4Gi
+// under an explicit fleet profile and under auto latched at fleet, the small
+// row everywhere else, since the shell has no medium row; an override still
+// merges over the row.
+func TestShellSandboxResourcesFollowTheRenderedTier(t *testing.T) {
+	for _, tc := range []struct {
+		name, profile, latched, memoryLimit string
+	}{
+		{"an explicit fleet profile renders the fleet row", sizingProfileFleet, "", shellSandboxFleetMemoryLimit},
+		{"an explicit medium profile keeps the small row", sizingProfileMedium, "", shellSandboxMemoryLimit},
+		{"auto latched at fleet renders the fleet row", sizingProfileAuto, sizingProfileFleet, shellSandboxFleetMemoryLimit},
+		{"auto latched at medium keeps the small row", sizingProfileAuto, sizingProfileMedium, shellSandboxMemoryLimit},
+		{"auto with no latch yet keeps the small row", sizingProfileAuto, "", shellSandboxMemoryLimit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := sandboxAgentWithResources(nil)
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{SizingProfile: tc.profile}
+			agent.Status.EffectiveSizingTier = tc.latched
+			got := shellContainerOf(t, agent).Resources
+			assertQuantity(t, got.Limits, corev1.ResourceMemory, tc.memoryLimit)
+			assertQuantity(t, got.Requests, corev1.ResourceCPU, shellSandboxCPURequest)
+			assertQuantity(t, got.Requests, corev1.ResourceMemory, shellSandboxMemoryRequest)
+			assertQuantity(t, got.Limits, corev1.ResourceCPU, shellSandboxCPULimit)
+			if len(got.Requests) != 2 || len(got.Limits) != 2 {
+				t.Errorf("render carries %d requests and %d limits, want 2 and 2", len(got.Requests), len(got.Limits))
+			}
+		})
+	}
+	t.Run("an override merges over the fleet row", func(t *testing.T) {
+		agent := sandboxAgentWithResources(&corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		})
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{SizingProfile: sizingProfileFleet}
+		got := shellContainerOf(t, agent).Resources
+		assertQuantity(t, got.Requests, corev1.ResourceMemory, "1Gi")
+		assertQuantity(t, got.Limits, corev1.ResourceMemory, shellSandboxFleetMemoryLimit)
+	})
+}

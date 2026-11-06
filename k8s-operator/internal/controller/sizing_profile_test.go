@@ -1444,9 +1444,10 @@ func TestResolveSizingTierCountsTheBrokersEqualCPUPairAsWrittenUnderBursting(t *
 
 func TestResolveSizingTierTakesTheEarnedTierWithNoQuotaBeforeTheWorkloadsSettle(t *testing.T) {
 	t.Parallel()
-	// With no ResourceQuota in the namespace there is nothing to measure a
-	// step against, so the earned tier is taken whatever the workloads'
-	// state, as before the settled wait: here none of the three exists yet.
+	// With no ResourceQuota and no LimitRange in the namespace there is
+	// nothing to measure a step against, so the earned tier is taken
+	// whatever the workloads' state, as before the settled wait: here none
+	// of the three exists yet.
 	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
@@ -1960,6 +1961,53 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 			t.Errorf("event does not carry the pod's sum: %s", event)
 		}
 	})
+	t.Run("a Pod-type item holds the step while a sized workload is absent", func(t *testing.T) {
+		t.Parallel()
+		// The same pod bound, no ResourceQuota, and the gateway Deployment
+		// gone at the pass (a hand delete; the gauges still answer for two
+		// polls). A pass that read the pod's sum with no template would read
+		// the medium sidecar alone, 4Gi, under the 4Gi bound, latch medium,
+		// and recreate the gateway into the LimitRanger's refusal of the
+		// real 5Gi sum, which nothing reads. The pass holds instead, logging
+		// the workload it waits on; once the gateway is back the sum is read
+		// and the step refused with the condition.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+		gateway := workloads[1].(*appsv1.Deployment)
+		gateway.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		}
+		podBound := sizingLimitRange("pod-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi")
+		podBound.Spec.Limits[0].Type = corev1.LimitTypePod
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, podBound, workloads[0], workloads[2]).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		var logged strings.Builder
+		ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: the pod's sum was read with the gateway Deployment absent", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota set on a held pass: %+v", cond)
+		}
+		if !strings.Contains(logged.String(), "sizing step held until the running tier's workloads settle") || !strings.Contains(logged.String(), `"waitingOn"="Deployment/`+agent.Name+gatewayWorkloadNameSuffix+`"`) {
+			t.Fatalf("the held pass did not log the hold naming the gateway Deployment:\n%s", logged.String())
+		}
+		if err := cl.Create(ctx, gateway); err != nil {
+			t.Fatalf("recreating the gateway Deployment: %v", err)
+		}
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("second pass: %v", err)
+		}
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall || cond == nil || cond.Reason != sizingCappedByLimitRangeReason {
+			t.Fatalf("after the gateway was recreated: status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want small with the LimitRange reason", agent.Status.EffectiveSizingTier, cond)
+		}
+	})
 	t.Run("a Pod-type max every pod's sum admits lets the step through", func(t *testing.T) {
 		t.Parallel()
 		// The fixtures' pods carry the sized container alone, so a per-pod
@@ -2074,12 +2122,17 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 // controller copies it: the ReplicaFailure condition True with the quota
 // plugin's message, the pod's generateName naming the ReplicaSet.
 func refusedByQuota(dep *appsv1.Deployment, replicaSet, quota, requested string) {
+	refusedByQuotaOn(dep, replicaSet, quota, corev1.ResourceRequestsMemory, requested)
+}
+
+// refusedByQuotaOn is refusedByQuota on any quota key.
+func refusedByQuotaOn(dep *appsv1.Deployment, replicaSet, quota string, key corev1.ResourceName, requested string) {
 	dep.Status = appsv1.DeploymentStatus{ObservedGeneration: dep.Generation, Replicas: 1, UpdatedReplicas: 1, UnavailableReplicas: 1, Conditions: []appsv1.DeploymentCondition{{
 		Type:   appsv1.DeploymentReplicaFailure,
 		Status: corev1.ConditionTrue,
 		Reason: "FailedCreate",
-		Message: fmt.Sprintf("pods %q is forbidden: exceeded quota: %s, requested: requests.memory=%s, used: requests.memory=7Gi, limited: requests.memory=10Gi",
-			replicaSet+"-", quota, requested),
+		Message: fmt.Sprintf("pods %q is forbidden: exceeded quota: %s, requested: %s=%s, used: %s=7Gi, limited: %s=10Gi",
+			replicaSet+"-", quota, key, requested, key, key),
 	}}}
 }
 
@@ -2114,7 +2167,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByQuotaReason {
 			t.Fatalf("SizingCappedByQuota = %+v, want True with reason %s", cond, sizingCappedByQuotaReason)
 		}
-		for _, want := range []string{"step up to the fleet tier", "Deployment/" + credentialProxyName(agent), "ResourceQuota platform-baseline-quota", "exceeded quota: platform-baseline-quota", "the medium tier stays"} {
+		for _, want := range []string{"the pod Deployment/" + credentialProxyName(agent) + " recreates at the fleet tier", "ResourceQuota platform-baseline-quota", "exceeded quota: platform-baseline-quota", "the medium tier stays"} {
 			if !strings.Contains(cond.Message, want) {
 				t.Errorf("message lacks %q: %s", want, cond.Message)
 			}
@@ -2137,7 +2190,7 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
 		proxy := workloads[0].(*appsv1.Deployment)
 		refusedByQuota(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
-		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, sizingTierFleet, "Deployment/"+credentialProxyName(agent), "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
+		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, "Deployment/"+credentialProxyName(agent), sizingTierFleet, "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
 		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: recorded}, metav1.Now())
 		stored, recorder := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
 		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
@@ -2158,14 +2211,14 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
 		proxy := workloads[0].(*appsv1.Deployment)
 		refusedByQuota(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
-		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, sizingTierFleet, "Deployment/"+credentialProxyName(agent), "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
+		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, "Deployment/"+credentialProxyName(agent), sizingTierFleet, "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
 		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: recorded}, metav1.Now())
 		refusedByQuota(proxy, credentialProxyName(agent)+"-5c6d7e8f9", "platform-baseline-quota", "4Gi")
 		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
 		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
 			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
 		}
-		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || !strings.Contains(cond.Message, "step up to the medium tier") || !strings.Contains(cond.Message, "the small tier stays") {
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || !strings.Contains(cond.Message, "recreates at the medium tier") || !strings.Contains(cond.Message, "the small tier stays") {
 			t.Fatalf("SizingCappedByQuota = %+v, want the medium step's refusal", cond)
 		}
 	})
@@ -2196,15 +2249,154 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 	})
 	t.Run("the gateway Deployment's refusal is read as the proxy's is", func(t *testing.T) {
 		t.Parallel()
+		// A limits.memory quota: the fleet step raises the sidecar's memory
+		// limit from 4Gi to 8Gi, and the gateway pod's limits sum in the
+		// fixture is the sidecar's alone.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
 		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
-		refusedByQuota(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", "384Mi")
-		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		refusedByQuotaOn(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceLimitsMemory, "8Gi")
+		stored, _ := resolve(t, agent, workloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsMemory, "10Gi", "7Gi"))
 		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
 			t.Fatalf("status.effectiveSizingTier = %q, want medium", stored.Status.EffectiveSizingTier)
 		}
 		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || !strings.Contains(cond.Message, "Deployment/"+agent.Name+gatewayWorkloadNameSuffix) {
 			t.Fatalf("SizingCappedByQuota = %+v, want the gateway Deployment named", cond)
+		}
+	})
+	t.Run("a refusal on a key the step did not move on that pod is not read", func(t *testing.T) {
+		t.Parallel()
+		// The sidecar requests 384Mi of memory at every tier, so a
+		// requests.memory quota refusing the gateway's pod is not the fleet
+		// step's doing and a lower row would not relieve it; the pod shows
+		// as the settled hold instead. The latch and the condition stand.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuota(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", "384Mi")
+		stored, recorder := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a refusal on the sidecar's unchanged request moved the latch", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none", cond)
+		}
+		if len(recorder.Events) != 0 {
+			t.Fatalf("%d events, want none", len(recorder.Events))
+		}
+	})
+	t.Run("a pods count refusal is not read", func(t *testing.T) {
+		t.Parallel()
+		// A pods quota at its cap refuses the recreated broker whatever its
+		// row: no tier is read from it.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuotaOn(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourcePods, "1")
+		stored, _ := resolve(t, agent, workloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourcePods, "10", "10"))
+		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a pods count refusal moved the latch", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none", cond)
+		}
+	})
+	t.Run("the row above's refusal lingering on the other Deployment after a step back is not stepped back from", func(t *testing.T) {
+		t.Parallel()
+		// Both Deployments were refused at fleet on a limits.memory quota:
+		// the pass before stepped back from the proxy's refusal and
+		// recorded its message. This pass reads the gateway's, which the
+		// condition does not record, and which asks for the fleet sidecar's
+		// 8Gi, the row above the latch: the old ReplicaSet's, not the medium
+		// pod's. With the condition recorded, and with it cleared since (a
+		// count that fell, the watcher switched off), the latch stays; the
+		// count here, 12, earns the latched tier, so the pass clears the
+		// standing record as any pass with no step to earn does.
+		for _, recorded := range []bool{true, false} {
+			agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+			workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+			proxy := workloads[0].(*appsv1.Deployment)
+			refusedByQuotaOn(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", corev1.ResourceLimitsMemory, "8Gi")
+			if recorded {
+				message := fmt.Sprintf(sizingStepRefusedMessageFormat, "Deployment/"+credentialProxyName(agent), sizingTierFleet, "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
+				setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: message}, metav1.Now())
+			}
+			refusedByQuotaOn(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-6c8d9e0f1", "platform-baseline-quota", corev1.ResourceLimitsMemory, "8Gi")
+			stored, recorder := resolve(t, agent, workloads, sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsMemory, "10Gi", "7Gi"))
+			if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+				t.Fatalf("recorded=%v: status.effectiveSizingTier = %q, want medium: the fleet row's lingering refusal was stepped back from twice", recorded, stored.Status.EffectiveSizingTier)
+			}
+			if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+				t.Fatalf("recorded=%v: SizingCappedByQuota = %+v, want none at a count that earns the latched tier", recorded, cond)
+			}
+			if len(recorder.Events) != 0 {
+				t.Fatalf("recorded=%v: %d events, want none", recorded, len(recorder.Events))
+			}
+		}
+	})
+	t.Run("the next step up is measured only once the hold interval after a step back has passed", func(t *testing.T) {
+		t.Parallel()
+		// The proxy's fleet pod is refused with 13Gi free: the room came
+		// back as soon as the pod that took it ended. The pass steps back
+		// to medium; once the medium workloads settle, a pass that measured
+		// at once would take the fleet step again, into the next pod the
+		// namespace admits during the drain. The pass holds for
+		// sizingStepBackHoldInterval, logging it, and measures after.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuota(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), sizingQuota("platform-baseline-quota", "20Gi", "7Gi"))...).WithStatusSubresource(agent).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		var logged strings.Builder
+		ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("first pass: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q after the refusal, want medium", agent.Status.EffectiveSizingTier)
+		}
+		// The medium row rendered and settled: the proxy and the gateway at
+		// the medium render with the refusal gone, the shell unchanged.
+		for i, obj := range sizedWorkloadsAt(agent, sizingTierMedium) {
+			if i == 2 {
+				continue
+			}
+			settled := obj.(*appsv1.Deployment)
+			current := &appsv1.Deployment{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(settled), current); err != nil {
+				t.Fatal(err)
+			}
+			current.Spec.Template = settled.Spec.Template
+			if err := cl.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			current.Status = settled.Status
+			if err := cl.Status().Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for len(recorder.Events) > 0 {
+			<-recorder.Events
+		}
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("held pass: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q on the pass after the step back, want medium: the step was measured again inside the hold", agent.Status.EffectiveSizingTier)
+		}
+		if !strings.Contains(logged.String(), "sizing step held after a step back until the hold interval passes") {
+			t.Fatalf("the held pass did not log the hold:\n%s", logged.String())
+		}
+		if len(recorder.Events) != 0 {
+			t.Fatalf("%d events on the held pass, want none", len(recorder.Events))
+		}
+		// The interval passed: the fleet step is measured against 13Gi free
+		// and taken.
+		r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-sizingStepBackHoldInterval))
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("pass after the hold: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q after the hold interval, want fleet", agent.Status.EffectiveSizingTier)
 		}
 	})
 }
@@ -2221,6 +2413,22 @@ func TestResourceQuotaNamedIn(t *testing.T) {
 		if got != want || named != (want != "") {
 			t.Errorf("resourceQuotaNamedIn(%q) = %q, %v; want %q", message, got, named, want)
 		}
+	}
+}
+
+func TestQuotaRefusalRequested(t *testing.T) {
+	t.Parallel()
+	requested := quotaRefusalRequested(`pods "p-" is forbidden: exceeded quota: platform-baseline-quota, requested: limits.memory=12Gi,requests.memory=4608Mi, used: limits.memory=7Gi,requests.memory=3Gi, limited: limits.memory=16Gi,requests.memory=10Gi`)
+	limits, requests := requested[corev1.ResourceLimitsMemory], requested[corev1.ResourceRequestsMemory]
+	if len(requested) != 2 || limits.Cmp(resource.MustParse("12Gi")) != 0 || requests.Cmp(resource.MustParse("4608Mi")) != 0 {
+		t.Errorf("requested = %v, want limits.memory=12Gi and requests.memory=4608Mi", requested)
+	}
+	if got := quotaRefusalRequested(`pods "p-" is forbidden: violates PodSecurity`); len(got) != 0 {
+		t.Errorf("requested on a message without the list = %v, want none", got)
+	}
+	got := quotaRefusalRequested(`exceeded quota: q, requested: pods=1,memory=not-a-quantity, used: pods=10, limited: pods=10`)
+	if pods := got[corev1.ResourcePods]; len(got) != 1 || pods.Cmp(resource.MustParse("1")) != 0 {
+		t.Errorf("requested with one pair that does not parse = %v, want pods=1 alone", got)
 	}
 }
 

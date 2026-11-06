@@ -505,6 +505,15 @@ type PlatformAgentReconciler struct {
 	// cleared by an echo that carries the field, and when the CR is deleted.
 	prunedSizingTier sync.Map
 
+	// steppedBackAt records, per CR, when resolveSizingTier last stepped the
+	// sizing latch back from a pod admission refused on a quota
+	// (sizingRefusedStep); the gate measures no step up for
+	// sizingStepBackHoldInterval after it (sizingStepBackHeld). Keyed by
+	// ObjectKey, value time.Time; cleared when the CR is deleted. In memory
+	// by design: a restart forgets the hold and measures on the next settled
+	// pass.
+	steppedBackAt sync.Map
+
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
 	// so each generation logs them once. Keyed by ObjectKey, value int64;
@@ -4929,6 +4938,7 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
+	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
