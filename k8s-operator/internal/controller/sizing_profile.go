@@ -115,18 +115,41 @@ const (
 	sizingCappedByQuotaReason        = "ResourceQuotaShort"
 	sizingCappedByLimitRangeReason   = "LimitRangeShort"
 	// sizingCappedByQuotaMessageFormat takes the tier earned, the quota's
-	// name, the quota key, the running tier, and the running tier again.
+	// name, the quota key, the running tier the refused step was measured
+	// from, and the tier that stays: the running tier again when every step
+	// was refused, the admitted candidate when a lower step was taken, so
+	// the figures the event and the log carry beside it (the refused step's
+	// free and need) belong to the step the message names.
 	sizingCappedByQuotaMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
 		"but ResourceQuota %s has no room on %s for the step up from %s; the %s tier stays until the quota is raised " +
 		"or sizingProfile names the tier, which the operator applies without this check"
 	// sizingCappedByLimitRangeMessageFormat takes the tier earned, the
 	// LimitRange's name, the bound (sizingLimitRangeMax or Min), the resource
-	// name, the sized container, the running tier, and the running tier
-	// again.
+	// name, the sized container, the running tier the refused step was
+	// measured from, and the tier that stays, as the quota format does.
 	sizingCappedByLimitRangeMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
 		"but LimitRange %s sets a per-container %s on %s that the %s container crosses at the step up from %s; " +
 		"the %s tier stays until the LimitRange admits the row or sizingProfile names the tier, " +
 		"which the operator applies without this check"
+	// sizingStepRefusedMessageFormat is the SizingCappedByQuota message the
+	// back-out writes (sizingRefusedStep): a step the quota check admitted
+	// whose recreated pod admission then refused on a ResourceQuota, because
+	// the namespace admitted another pod between the measurement and the
+	// Recreate. It takes the tier stepped back from, the workload whose pod
+	// was refused, the quota admission named, admission's own message, and
+	// the tier that stays. Admission's message is part of the condition
+	// because it is what tells one refusal from the next: the pod name it
+	// carries is the ReplicaSet's, so the same refusal read again on a
+	// later pass is not stepped back from twice, and a refusal of the lower
+	// row's pod, a new ReplicaSet's, is.
+	sizingStepRefusedMessageFormat = "spec.deployment.sizingProfile is auto and the step up to the %s tier found room on every ResourceQuota, " +
+		"but admission refused the pod %s recreates for it, ResourceQuota %s having been used up since (%s); " +
+		"the %s tier stays until the quota is raised or sizingProfile names the tier, which the operator applies without this check"
+	// resourceQuotaExceededPhrase opens the quota admission plugin's refusal
+	// ("exceeded quota: <name>, requested: ..., used: ..., limited: ..."),
+	// the name running to the next resourceQuotaExceededNameEnd.
+	resourceQuotaExceededPhrase  = "exceeded quota: "
+	resourceQuotaExceededNameEnd = ","
 	// sizingCappedByQuotaEventFormat is the Warning event's text: the
 	// condition message, then the figures as they stood when it was written.
 	// It takes the message, the cluster count, the free quantity, the quota
@@ -231,6 +254,16 @@ type sizingBound struct {
 	container  string
 	quantity   resource.Quantity
 	figure     resource.Quantity
+}
+
+// sizingRefusal is a sized Deployment whose pod admission refused on a
+// ResourceQuota, read off its ReplicaFailure condition
+// (sizingRefusedStep): the workload (kind and name), the quota the message
+// names, and the message as the condition carries it.
+type sizingRefusal struct {
+	workload string
+	quota    string
+	message  string
 }
 
 // sizingCap is the SizingCappedByQuota condition's content: the reason
@@ -1188,6 +1221,69 @@ func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, c
 	return nil
 }
 
+// sizingRefusedStep is the ResourceQuota refusal the latched tier's pods
+// met at admission, or nil. The gate measures a step against the quotas'
+// used totals once and writes the latch before the proxy Deployment, a
+// Recreate, has drained its old pod and asked admission for the new one; a
+// pod the namespace admits in that window (a session pod, an A2A job, a
+// sibling agent's step) takes the room the gate found, the ReplicaSet's
+// create is refused with "exceeded quota", and the Deployment carries
+// ReplicaFailure True with admission's message. Nothing in the gate reads
+// that: the latch names the tier, the proxy never settles, and the broker
+// is down until a person names a lower tier. This reads it. The proxy
+// Deployment and the gateway's, when it is a Deployment, are read for a
+// ReplicaFailure condition whose message names a quota
+// (resourceQuotaNamedIn); the first found is returned, and the caller steps
+// the latch back one tier and writes the cap with admission's message. The
+// StatefulSets (the shell, the gateway under useStatefulSet) carry no such
+// condition and are not read: their refused pod shows as the hold the
+// settled wait logs. Nil at small, where there is no tier to step back to,
+// and for a refusal the condition on the CR already records: the ReplicaSet
+// keeps its condition until it is scaled away, and the Deployment copies it
+// for a pass or two after the step back, so the same message is read as
+// already answered; the lower row's pod, refused by a new ReplicaSet, comes
+// with a new message and is stepped back from in turn.
+func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) *sizingRefusal {
+	if tier == sizingTierSmall {
+		return nil
+	}
+	keys := []client.ObjectKey{{Namespace: agent.Namespace, Name: credentialProxyName(agent)}}
+	if !useStatefulSet(agent) {
+		keys = append(keys, client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix})
+	}
+	recorded := sizingCappedCondition(agent).message
+	for _, key := range keys {
+		dep := &appsv1.Deployment{}
+		if err := r.Get(ctx, key, dep); err != nil {
+			continue
+		}
+		for _, cond := range dep.Status.Conditions {
+			if cond.Type != appsv1.DeploymentReplicaFailure || cond.Status != corev1.ConditionTrue {
+				continue
+			}
+			quota, named := resourceQuotaNamedIn(cond.Message)
+			if !named || strings.Contains(recorded, cond.Message) {
+				continue
+			}
+			return &sizingRefusal{workload: fmt.Sprintf(sizingUnsettledDeploymentFormat, key.Name), quota: quota, message: cond.Message}
+		}
+	}
+	return nil
+}
+
+// resourceQuotaNamedIn is the ResourceQuota an admission refusal names, as
+// the quota plugin words it (resourceQuotaExceededPhrase), and whether the
+// message carries one.
+func resourceQuotaNamedIn(message string) (string, bool) {
+	_, after, found := strings.Cut(message, resourceQuotaExceededPhrase)
+	if !found {
+		return "", false
+	}
+	name, _, _ := strings.Cut(after, resourceQuotaExceededNameEnd)
+	name = strings.TrimSpace(name)
+	return name, name != ""
+}
+
 // sizingCappedConditionCurrent reports whether the SizingCappedByQuota
 // condition on the CR already says capped, where the zero value means
 // absent.
@@ -1239,7 +1335,11 @@ func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 // the highest tier, at or under what the cluster count earns, whose step from
 // the running tier every ResourceQuota that counts the pods has room for; a
 // quota short on every step keeps the running tier, and any refused step sets
-// the condition. A step is also refused when a Container-type LimitRange in
+// the condition. A step the gate admitted whose recreated pod admission then
+// refused on a quota (sizingRefusedStep) is stepped back: the latch moves
+// down one tier and the condition names the quota and admission's message,
+// so the latch records what the pods run and the broker comes back at the
+// lower row. A step is also refused when a Container-type LimitRange in
 // the namespace bounds a figure the candidate's render crosses
 // (sizingLimitRangeBound), since that admission plugin refuses the recreated
 // pod the way a short quota does; the LimitRange is read before the quota,
@@ -1270,10 +1370,26 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	capped := sizingCap{}
 	var short *sizingShortfall
 	var bound *sizingBound
+	var refused *sizingRefusal
 	var count int64
 	if profile == sizingProfileAuto {
 		tier = latched
-		if observed, ok := observedClusterCount(agent); ok {
+		if refused = r.sizingRefusedStep(ctx, agent, tier); refused != nil {
+			// The latched tier's recreated pod was refused on a quota the
+			// gate had found room on (sizingRefusedStep): the latch steps
+			// back one tier, so that it again records what the pods run,
+			// and the cap names the quota and what admission said. The
+			// next pass renders the lower row; when its pod settles, the
+			// gate measures the step up again against the used totals as
+			// they stand, and when it too is refused this reads that
+			// refusal and steps back once more. The count is not read
+			// here: a refused pod is backed out of whatever the count
+			// earns, and the pass after decides from the count.
+			from := tier
+			tier--
+			capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingStepRefusedMessageFormat,
+				from, refused.workload, refused.quota, refused.message, tier)}
+		} else if observed, ok := observedClusterCount(agent); ok {
 			count = observed
 			if earned := sizingTierForClusterCount(count); earned > tier {
 				quotas, err := r.sizingQuotas(ctx, agent)
@@ -1349,13 +1465,18 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 						tier = candidate
 						break
 					}
+					// The message names the step the figures were measured
+					// from (running) and the tier that stays (tier, the
+					// admitted candidate when one was taken); the next
+					// settled pass measures from that tier and the message
+					// changes once, recording that step's figures with it.
 					switch {
 					case bound != nil:
 						capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(sizingCappedByLimitRangeMessageFormat,
-							earned, bound.limitRange, bound.bound, bound.key, bound.container, tier, tier)}
+							earned, bound.limitRange, bound.bound, bound.key, bound.container, running, tier)}
 					case short != nil:
 						capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingCappedByQuotaMessageFormat,
-							earned, short.quota, short.key, tier, tier)}
+							earned, short.quota, short.key, running, tier)}
 					}
 				}
 			}
@@ -1383,6 +1504,11 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		if previous != "" {
 			r.recordEvent(agent, corev1.EventTypeNormal, sizingTierChangedReason, fmt.Sprintf(sizingTierChangedMessageFormat, previous, tier, profile))
 		}
+	}
+	if refused != nil {
+		log.Info("sizing tier stepped back: admission refused the recreated pod on a ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,
+			"workload", refused.workload, "quota", refused.quota, "from", agent.Status.EffectiveSizingTier, "to", tier.String(), "admission", refused.message)
+		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByQuotaEventReason, capped.message)
 	}
 	if short != nil && !sizingCappedConditionCurrent(agent, capped) {
 		log.Info("sizing tier capped by ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,

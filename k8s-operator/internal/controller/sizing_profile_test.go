@@ -488,8 +488,10 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		// requests (the broker's 1Gi to 8Gi), the medium step 3Gi. A quota
 		// with 5Gi free refuses the first and admits the second, so the
 		// tier reaches medium rather than waiting at small for the whole
-		// fleet step, and the cap names fleet as earned and medium as the
-		// tier that stays; the event carries the refused step's figures.
+		// fleet step, and the cap names fleet as earned, small as the tier
+		// the refused step was measured from and medium as the tier that
+		// stays; the event carries that step's figures, the small->fleet
+		// ones the message names.
 		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
 			sizingQuota("platform-baseline-quota", "10Gi", "5Gi"))
 		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
@@ -499,7 +501,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		if cond == nil {
 			t.Fatal("SizingCappedByQuota absent although the fleet step was refused")
 		}
-		for _, want := range []string{"earns the fleet tier", "ResourceQuota platform-baseline-quota has no room on requests.memory", "step up from medium", "the medium tier stays"} {
+		for _, want := range []string{"earns the fleet tier", "ResourceQuota platform-baseline-quota has no room on requests.memory", "step up from small", "the medium tier stays"} {
 			if !strings.Contains(cond.Message, want) {
 				t.Errorf("message lacks %q: %s", want, cond.Message)
 			}
@@ -1594,15 +1596,27 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 	}
 
 	// The medium pod is available: the workloads have settled, the fleet
-	// step is measured, and it is still short, as written.
+	// step is measured from medium (4Gi against 2Gi free) and is still
+	// short. The message now names medium as the step's start where the
+	// first pass named small, so it changes this once, and the write and
+	// the Warning recorded with it carry the medium->fleet figures.
 	proxy.Status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1}
 	if err := cl.Status().Update(ctx, proxy); err != nil {
 		t.Fatal(err)
 	}
 	pass("fifth pass, the medium workloads settled")
 	capped("after the medium workloads settled")
-	if writes != 1 {
-		t.Fatalf("%d status writes after the medium workloads settled, want 1: the cap stood as written", writes)
+	if writes != 2 || len(recorder.Events) != 3 {
+		t.Fatalf("%d status writes and %d events after the medium workloads settled, want 2 and 3: the re-measured step's message was not recorded", writes, len(recorder.Events))
+	}
+	if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); !strings.Contains(cond.Message, "step up from medium") {
+		t.Fatalf("the settled pass's message does not name the step it measured: %s", cond.Message)
+	}
+	for len(recorder.Events) > 1 {
+		<-recorder.Events
+	}
+	if event := <-recorder.Events; !strings.Contains(event, "2Gi of requests.memory free, the step adds 4Gi") {
+		t.Fatalf("the settled pass's event does not carry the medium->fleet figures: %s", event)
 	}
 	if held("Deployment/"+credentialProxyName(agent)) != 3 {
 		t.Fatalf("the three passes in the proxy's rollout logged the hold %d times, want 3, and the settled pass none:\n%s", held("Deployment/"+credentialProxyName(agent)), logged.String())
@@ -1614,8 +1628,8 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 		t.Fatal(err)
 	}
 	pass("sixth pass, the quota raised")
-	if agent.Status.EffectiveSizingTier != sizingProfileFleet || writes != 2 {
-		t.Fatalf("after the quota was raised: tier %q, %d writes; want fleet and 2", agent.Status.EffectiveSizingTier, writes)
+	if agent.Status.EffectiveSizingTier != sizingProfileFleet || writes != 3 {
+		t.Fatalf("after the quota was raised: tier %q, %d writes; want fleet and 3", agent.Status.EffectiveSizingTier, writes)
 	}
 	if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
 		t.Fatalf("SizingCappedByQuota kept after the fleet step was admitted: %+v", cond)
@@ -1851,7 +1865,7 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByLimitRangeReason || cond.ObservedGeneration != 3 {
 			t.Fatalf("SizingCappedByQuota = %+v, want True with reason %s", cond, sizingCappedByLimitRangeReason)
 		}
-		for _, want := range []string{"earns the fleet tier", "LimitRange tenant-bounds sets a per-container max on memory that the " + credentialProxyContainerName + " container crosses", "step up from medium", "the medium tier stays"} {
+		for _, want := range []string{"earns the fleet tier", "LimitRange tenant-bounds sets a per-container max on memory that the " + credentialProxyContainerName + " container crosses", "step up from small", "the medium tier stays"} {
 			if !strings.Contains(cond.Message, want) {
 				t.Errorf("message lacks %q: %s", want, cond.Message)
 			}
@@ -1966,4 +1980,159 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 			t.Errorf("Autopilot clamped: status.effectiveSizingTier = %q, want fleet: the broker's limit is its 4 CPU request there", agent.Status.EffectiveSizingTier)
 		}
 	})
+}
+
+// refusedByQuota is admission's refusal of a Deployment's pod on a
+// ResourceQuota, as the ReplicaSet controller records it and the Deployment
+// controller copies it: the ReplicaFailure condition True with the quota
+// plugin's message, the pod's generateName naming the ReplicaSet.
+func refusedByQuota(dep *appsv1.Deployment, replicaSet, quota, requested string) {
+	dep.Status = appsv1.DeploymentStatus{ObservedGeneration: dep.Generation, Replicas: 1, UpdatedReplicas: 1, UnavailableReplicas: 1, Conditions: []appsv1.DeploymentCondition{{
+		Type:   appsv1.DeploymentReplicaFailure,
+		Status: corev1.ConditionTrue,
+		Reason: "FailedCreate",
+		Message: fmt.Sprintf("pods %q is forbidden: exceeded quota: %s, requested: requests.memory=%s, used: requests.memory=7Gi, limited: requests.memory=10Gi",
+			replicaSet+"-", quota, requested),
+	}}}
+}
+
+func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
+	t.Parallel()
+	// The window the settled wait does not cover: the gate measured the
+	// step with room to spare and latched fleet, step 11 updated the proxy
+	// Deployment, and while its Recreate drained the old broker another pod
+	// landed in the namespace and took the room. The 8Gi pod is refused and
+	// the Deployment carries ReplicaFailure naming the quota.
+	resolve := func(t *testing.T, agent *agentv1alpha1.PlatformAgent, workloads []client.Object, objs ...client.Object) (*agentv1alpha1.PlatformAgent, *record.FakeRecorder) {
+		t.Helper()
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(append([]client.Object{agent}, workloads...), objs...)...).WithStatusSubresource(agent).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		return agent, recorder
+	}
+	t.Run("a quota refusal of the recreated proxy steps the latch back and names the quota", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuota(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
+		stored, recorder := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the refused step was not stepped back from", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByQuotaReason {
+			t.Fatalf("SizingCappedByQuota = %+v, want True with reason %s", cond, sizingCappedByQuotaReason)
+		}
+		for _, want := range []string{"step up to the fleet tier", "Deployment/" + credentialProxyName(agent), "ResourceQuota platform-baseline-quota", "exceeded quota: platform-baseline-quota", "the medium tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		if len(events) != 2 || !strings.Contains(events[0], "sizing tier fleet -> medium") || !strings.Contains(events[1], sizingCappedByQuotaEventReason) {
+			t.Fatalf("events = %q, want the tier change then the cap", events)
+		}
+	})
+	t.Run("the refusal the condition already records is not stepped back from again", func(t *testing.T) {
+		t.Parallel()
+		// The pass after the step back: the Deployment still copies the old
+		// ReplicaSet's condition while that ReplicaSet is scaled away, the
+		// template is at medium and its pod not yet available. The latch
+		// stays at medium and the gate holds for the settled wait.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		proxy := workloads[0].(*appsv1.Deployment)
+		refusedByQuota(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
+		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, sizingTierFleet, "Deployment/"+credentialProxyName(agent), "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
+		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: recorded}, metav1.Now())
+		stored, recorder := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the same refusal was stepped back from twice", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || cond.Message != recorded {
+			t.Fatalf("SizingCappedByQuota = %+v, want the recorded refusal as written", cond)
+		}
+		if len(recorder.Events) != 0 {
+			t.Fatalf("%d events on the pass that read the recorded refusal, want none", len(recorder.Events))
+		}
+	})
+	t.Run("the lower row's pod refused in turn is stepped back from again", func(t *testing.T) {
+		t.Parallel()
+		// A new ReplicaSet's pod at the medium row is refused too: a new
+		// message, so the latch steps back to small.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		proxy := workloads[0].(*appsv1.Deployment)
+		refusedByQuota(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
+		recorded := fmt.Sprintf(sizingStepRefusedMessageFormat, sizingTierFleet, "Deployment/"+credentialProxyName(agent), "platform-baseline-quota", proxy.Status.Conditions[0].Message, sizingTierMedium)
+		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: recorded}, metav1.Now())
+		refusedByQuota(proxy, credentialProxyName(agent)+"-5c6d7e8f9", "platform-baseline-quota", "4Gi")
+		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || !strings.Contains(cond.Message, "step up to the medium tier") || !strings.Contains(cond.Message, "the small tier stays") {
+			t.Fatalf("SizingCappedByQuota = %+v, want the medium step's refusal", cond)
+		}
+	})
+	t.Run("a refusal at small has no tier to step back to", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+		refusedByQuota(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "1Gi")
+		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "10Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota = %+v, want none: the proxy has not settled, so nothing was measured", cond)
+		}
+	})
+	t.Run("a refusal that names no quota is not read", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		proxy := workloads[0].(*appsv1.Deployment)
+		refusedByQuota(proxy, credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "8Gi")
+		proxy.Status.Conditions[0].Message = `pods "x-" is forbidden: violates PodSecurity "restricted:latest"`
+		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a refusal that is not the quota's moved the latch", stored.Status.EffectiveSizingTier)
+		}
+	})
+	t.Run("the gateway Deployment's refusal is read as the proxy's is", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierFleet)
+		refusedByQuota(workloads[1].(*appsv1.Deployment), agent.Name+gatewayWorkloadNameSuffix+"-7d9f8b6c4", "platform-baseline-quota", "384Mi")
+		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond == nil || !strings.Contains(cond.Message, "Deployment/"+agent.Name+gatewayWorkloadNameSuffix) {
+			t.Fatalf("SizingCappedByQuota = %+v, want the gateway Deployment named", cond)
+		}
+	})
+}
+
+func TestResourceQuotaNamedIn(t *testing.T) {
+	t.Parallel()
+	for message, want := range map[string]string{
+		`pods "p-" is forbidden: exceeded quota: platform-baseline-quota, requested: requests.memory=8Gi, used: requests.memory=7Gi, limited: requests.memory=10Gi`: "platform-baseline-quota",
+		`pods "p-" is forbidden: exceeded quota: a, b`: "a",
+		`pods "p-" is forbidden: violates PodSecurity`: "",
+		`exceeded quota: `: "",
+	} {
+		got, named := resourceQuotaNamedIn(message)
+		if got != want || named != (want != "") {
+			t.Errorf("resourceQuotaNamedIn(%q) = %q, %v; want %q", message, got, named, want)
+		}
+	}
 }
