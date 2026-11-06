@@ -11,6 +11,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -34,6 +35,7 @@ from scripts.check_sqlite_query_plans import (  # noqa: E402
     leading_keyword,
     main,
     cte_names,
+    planned_text,
     scan,
     scanned_table,
     table_aliases,
@@ -151,6 +153,50 @@ FIXTURE_SERVER = textwrap.dedent(
             raise RuntimeError(str(shadowed))
 
 
+    def closure(conn):
+        shadowed = "SELECT id FROM events WHERE cluster = ?"
+
+        def inner():
+            return conn.execute(shadowed, ("x",)).fetchall()
+
+        return inner()
+
+
+    def closure_inner_wins(conn):
+        columns = "cluster"
+
+        def inner():
+            columns = "id"
+            return conn.execute(f"SELECT {columns} FROM events WHERE created_at > ?", ("x",)).fetchall()
+
+        return inner()
+
+
+    def closure_rebound(conn):
+        columns = "id"
+        sql = f"SELECT {columns} FROM events WHERE created_at > ?"
+
+        def inner():
+            columns = "cluster"
+            return conn.execute(sql, ("x",)).fetchall()
+
+        return inner()
+
+
+    def automatic_index(conn):
+        return conn.execute(
+            "SELECT n.body FROM events e JOIN notes n ON n.author = e.cluster WHERE e.created_at > ?", ("x",)
+        ).fetchall()
+
+
+    def create_as_select(conn, cluster):
+        conn.execute("CREATE TEMP TABLE recent AS SELECT id FROM events WHERE cluster = ?", (cluster,))
+
+
+    def create_view(conn):
+        conn.execute("CREATE VIEW IF NOT EXISTS recent_events AS SELECT id FROM events WHERE created_at > '2026'")
+
+
     def comma_list(conn, cluster):
         return conn.execute(
             "SELECT e.id FROM notes n, events e WHERE e.cluster = ? AND n.id = e.id", (cluster,)
@@ -249,6 +295,9 @@ FIXTURE_BASELINE = textwrap.dedent(
     fixture_server.py aliased notes 1
     fixture_server.py twice events 2
     fixture_server.py unpacked_shadow events 1
+    fixture_server.py closure.inner events 1
+    fixture_server.py automatic_index notes 1
+    fixture_server.py create_as_select events 1
     fixture_server.py comma_list events 1
     fixture_server.py quoted_alias events 1
     fixture_server.py Store.method notes 1
@@ -327,6 +376,18 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(kinds[server + "unpacked_shadow"], [KIND_FINDING])
         # A name also bound by `except ... as` resolves to nothing, not to the module constant.
         self.assertEqual(kinds[server + "except_shadow"], [KIND_DYNAMIC])
+        # A nested function reads the enclosing function's local, not the module constant it shadows.
+        self.assertEqual(kinds[server + "closure.inner"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "closure_inner_wins.inner"], [KIND_OK])
+        # A name the nested function rebinds counts as a second binding of the outer one, so it resolves to nothing.
+        self.assertEqual(kinds[server + "closure_rebound.inner"], [KIND_DYNAMIC])
+        # The planner builds an automatic index by reading the whole inner table; its line says SEARCH.
+        self.assertEqual(kinds[server + "automatic_index"], [KIND_FINDING])
+        self.assertIn("automatic_index finding table=notes plan=SEARCH n USING AUTOMATIC COVERING INDEX (author=?)", out)
+        # The query under a CREATE ... AS SELECT is planned; a view's indexed query passes.
+        self.assertEqual(kinds[server + "create_as_select"], [KIND_FINDING])
+        self.assertIn("create_as_select finding table=events plan=SCAN events", out)
+        self.assertEqual(kinds[server + "create_view"], [KIND_OK])
         # The second table of a comma list, and a double-quoted alias, map back to their tables.
         self.assertEqual(kinds[server + "comma_list"], [KIND_FINDING])
         self.assertIn("comma_list finding table=events plan=SCAN e ", out)
@@ -363,6 +424,10 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(by_function["sibling_constant"], "SELECT id FROM events WHERE created_at > ?")
         self.assertEqual(by_function["joined_columns"], "SELECT id, cluster, reason FROM events WHERE created_at > ?")
         self.assertEqual(by_function["unpacked_shadow"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertEqual(by_function["closure.inner"], "SELECT id FROM events WHERE cluster = ?")
+        # The inner binding wins; an outer local a nested function rebinds is bound twice, so nothing resolves.
+        self.assertEqual(by_function["closure_inner_wins.inner"], "SELECT id FROM events WHERE created_at > ?")
+        self.assertIsNone(by_function["closure_rebound.inner"])
         self.assertIsNone(by_function["except_shadow"])
         self.assertIsNone(by_function["joined_comprehension"])
         self.assertIsNone(by_function["local_twice"])
@@ -397,6 +462,34 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("odd_alias: `SCAN x` names 'x', which is neither a table the schema defines nor an alias", err)
         self.assertIn("odd_alias error table=- plan=SCAN x", out)
         self.assertNotIn("odd_alias ok", out)
+
+    def test_rebound_alias_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def rebound_alias(conn, author):
+                return conn.execute(
+                    "SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM notes e WHERE e.author = ?)", (author,)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        # Newer SQLite prints `SCAN e EXISTS` for this shape, so the plan text is not pinned.
+        self.assertIn("rebound_alias: `SCAN e", err)
+        self.assertIn("names 'e', an alias the statement binds to more than one table; give each reference its own alias", err)
+        self.assertNotIn("rebound_alias ok", out)
+        self.assertNotIn("rebound_alias finding", out)
+
+    def test_old_sqlite_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        with mock.patch.object(sqlite3, "sqlite_version_info", (3, 34, 1)), mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("sqlite3 library 3.34.1 is older than 3.36.0", err)
+        self.assertEqual(out, "")
 
     def test_explain_binds_null_to_named_and_positional_parameters(self) -> None:
         conn = sqlite3.connect(":memory:")
@@ -435,9 +528,11 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("baseline.txt:10: expected `<file> <function> <table> <count>`", err)
         self.assertIn("baseline.txt:11: expected `<file> <function> <table> <count>`", err)
         self.assertIn("baseline.txt:12: fixture_server.py unindexed events already has an entry at line 2", err)
-        # `many`, `comma_list`, `quoted_alias` and `unpacked_shadow` have no entry and are reported beside the problems.
+        # `many`, `comma_list`, `quoted_alias`, `unpacked_shadow`, `closure.inner`, `automatic_index` and
+        # `create_as_select` have no entry and are reported beside the problems.
         self.assertIn("many scans notes: `SCAN notes`", err)
-        self.assertIn("4 finding(s) not pinned and 7 problem(s)", err)
+        self.assertIn("automatic_index scans notes: `SEARCH n USING AUTOMATIC COVERING INDEX (author=?)`", err)
+        self.assertIn("7 finding(s) not pinned and 7 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
         baseline = _write_fixture(self.root)
@@ -464,11 +559,14 @@ class PlanLineTests(unittest.TestCase):
     def test_scan_lines(self) -> None:
         self.assertEqual(scanned_table("SCAN events"), "events")
         self.assertEqual(scanned_table("SCAN events AS e"), "events")
-        self.assertEqual(scanned_table("SCAN TABLE events"), "events")
-        self.assertEqual(scanned_table("SCAN events USING AUTOMATIC COVERING INDEX (cluster=?)"), "events")
+        # An automatic index is a full read of the table under a SEARCH verb.
+        self.assertEqual(scanned_table("SEARCH notes USING AUTOMATIC COVERING INDEX (author=?)"), "notes")
+        self.assertEqual(scanned_table("SEARCH notes USING AUTOMATIC PARTIAL COVERING INDEX (author=?)"), "notes")
+        self.assertEqual(scanned_table("SEARCH notes AS n USING AUTOMATIC INDEX (author=?)"), "notes")
         self.assertIsNone(scanned_table("SCAN events USING INDEX idx_events_created_at"))
         self.assertIsNone(scanned_table("SCAN events USING COVERING INDEX idx_events_created_at"))
         self.assertIsNone(scanned_table("SEARCH events USING INTEGER PRIMARY KEY (rowid=?)"))
+        self.assertIsNone(scanned_table("SEARCH events USING INDEX idx_events_created_at (created_at>?)"))
         self.assertIsNone(scanned_table("LIST SUBQUERY 1"))
         # A constant row and a subquery are names the schema does not hold, which judge() drops.
         self.assertEqual(scanned_table("SCAN CONSTANT ROW"), "CONSTANT")
@@ -482,8 +580,21 @@ class PlanLineTests(unittest.TestCase):
         self.assertEqual(table_aliases("SELECT id FROM events WHERE id = ? ORDER BY id DESC LIMIT ?", tables), {})
         self.assertEqual(table_aliases("INSERT INTO events (id, cluster) VALUES (?, ?)", tables), {})
         self.assertEqual(table_aliases("SELECT id FROM other o", tables), {})
+        # One alias bound to the same table twice maps; bound to two tables, it maps to nothing.
+        self.assertEqual(table_aliases("SELECT id FROM events r WHERE id IN (SELECT id FROM events r)", tables), {"r": "events"})
+        self.assertEqual(table_aliases("SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM notes e)", tables), {"e": None})
         self.assertEqual(cte_names("WITH RECURSIVE c(n) AS (SELECT 1), d AS (SELECT 2) SELECT * FROM c, d"), frozenset({"c", "d"}))
         self.assertEqual(cte_names("SELECT id FROM events WHERE id = ?"), frozenset())
+
+    def test_planned_text(self) -> None:
+        self.assertEqual(planned_text("SELECT id FROM events WHERE id = ?"), "SELECT id FROM events WHERE id = ?")
+        self.assertEqual(planned_text("CREATE TEMP TABLE r AS SELECT id FROM events"), "SELECT id FROM events")
+        self.assertEqual(planned_text("CREATE VIEW v AS\n  WITH c AS (SELECT 1) SELECT * FROM c"), "WITH c AS (SELECT 1) SELECT * FROM c")
+        self.assertEqual(planned_text("create table if not exists r as select id from events"), "select id from events")
+        self.assertIsNone(planned_text("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, created_at TEXT)"))
+        self.assertIsNone(planned_text("CREATE INDEX IF NOT EXISTS idx ON events (created_at)"))
+        self.assertIsNone(planned_text("PRAGMA journal_mode=WAL"))
+        self.assertIsNone(planned_text("BEGIN IMMEDIATE"))
 
     def test_leading_keyword(self) -> None:
         self.assertEqual(leading_keyword("\n  -- a note\n  select 1"), "SELECT")

@@ -143,9 +143,10 @@ line, and the check skips the spans on that line. CI runs the same check through
 `agents/platform/scripts/session_kv_server.py`, `findings_queue.py`, `session_retention.py` or
 `session_manager.py`, run `make sqlite-plan-check` (it imports the server, so it needs
 `make test-python-deps`). It prepares every fixed statement under `EXPLAIN QUERY PLAN` against the
-schema the server builds and fails a `SCAN <table>` without an index on a table this repository
-defines, because such a read grows with the fleet; statements on tables Hermes owns are listed as
-skipped, and the scans already in the tree are pinned with a reason in
+schema the server builds and fails a plan that reads a whole table this repository defines (a
+`SCAN <table>` without an index, or a `SEARCH` through an automatic index, which is built by
+reading the table), because such a read grows with the fleet; statements on tables Hermes owns are
+listed as skipped, and the scans already in the tree are pinned with a reason in
 `scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs the same check through
 `scripts/test_check_sqlite_query_plans.py`.
 
