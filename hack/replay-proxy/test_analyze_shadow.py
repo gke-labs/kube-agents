@@ -692,6 +692,40 @@ class FolderKindTest(unittest.TestCase):
         records, _ = analyze_shadow.load([os.path.dirname(os.path.dirname(os.path.dirname(path)))])
         self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
 
+    def test_a_missing_path_is_named_with_or_without_a_kind(self):
+        missing = os.path.join(TEMP_DIR, "no-such", "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, f"{missing} does not exist"):
+                    analyze_shadow.load([missing], kind=kind)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit_:
+                    analyze_shadow.main([missing] + (["--kind", kind] if kind else []))
+                self.assertEqual(exit_.exception.code, 2)
+                self.assertIn(f"{missing} does not exist", err.getvalue())
+
+    def test_a_directory_is_searched_for_segments(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        with open(os.path.join(os.path.dirname(path), "job-1.json"), "w") as handle:
+            handle.write("{}")
+        records, skipped = analyze_shadow.load([os.path.dirname(path)])
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["not_json"], 0)
+
+    def test_a_file_under_no_kind_folder_is_refused_unless_a_kind_is_given(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+        with handle:
+            handle.write(json.dumps(line("n1", 1, "nightly", "n", "A", ["a"])) + "\n")
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([handle.name])
+        records, _ = analyze_shadow.load([handle.name], kind="nightly")
+        self.assertEqual([r.kind for r in records], ["nightly"])
+        records, skipped = analyze_shadow.load([handle.name], kind="presubmit")
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            analyze_shadow.main([handle.name])
+        self.assertIn("--kind", err.getvalue())
 
 
 if __name__ == "__main__":

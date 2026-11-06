@@ -528,14 +528,16 @@ def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tu
 
     With `kind`, every file found is that kind. Without it, a file's kind is
     filed_kind's; one found under a directory but off the layout is skipped and
-    counted. Raises ValueError for a file named outright that is off the
-    layout, or a directory with log files none of
+    counted. Raises ValueError for a path that does not exist, a file named
+    outright that is off the layout, or a directory with log files none of
     which is on it, each a mistake in the arguments rather than a planted file.
     """
     found: List[Tuple[str, str]] = []
     off_layout = 0
     layout = f"<{'|'.join(JOB_KINDS)}>/<YYYY-MM-DD>/<build>/{LOGS_DIR}/<segment>{LOG_SUFFIX}"
     for path in paths:
+        if not os.path.exists(path):
+            raise ValueError(f"{path} does not exist")
         if not os.path.isdir(path):
             file_kind = kind or filed_kind(path)
             if file_kind is None:
