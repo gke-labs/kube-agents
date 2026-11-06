@@ -1193,6 +1193,11 @@
                 }
               }
             },
+            "incidentMaxOpenPullRequests": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 2147483647
+            },
             "eventWatcher": {
               "type": "object",
               "additionalProperties": false,
@@ -1318,6 +1323,10 @@
                   "type": "object"
                 }
               }
+            },
+            "sizingProfile": {
+              "type": ["string", "null"],
+              "enum": ["", "small", "medium", "fleet", "auto", null]
             }
           }
         },

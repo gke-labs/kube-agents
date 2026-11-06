@@ -1284,6 +1284,16 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The most triage pull requests open or being opened at once, when
+    # INCIDENT_TRIAGE_OPEN_PULL_REQUEST is "true" in env above. A triage whose
+    # pull request would pass the limit still runs, but its report asks for a
+    # reply, and a note in the alert's thread says that the limit held its pull
+    # request back. Rendered as INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+    # spec.deployment.env when above 0. 0 is no limit. An entry with the same
+    # name in env above wins, and a valueFrom entry for it fails the render
+    # while this key is above 0. The site's chatops page, "Limiting the open
+    # triage pull requests", has the rules.
+    incidentMaxOpenPullRequests: 0
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
     # the agent-api-auth container, which runs the watcher. A key that you do
@@ -1327,7 +1337,8 @@ platformAgent:
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
     # when the proxy is OOM-killed under a large fleet. The quota preflight
-    # counts the override, and on Autopilot the Autopilot requests. A cpu or
+    # counts the override, at the sizing profile's row when the operator would
+    # refuse it against that row, and on Autopilot the Autopilot requests. A cpu or
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
@@ -1392,6 +1403,23 @@ platformAgent:
     # apply crds/ first (upgrade.sh does).
     agentAPIAuth:
       resources: {}
+    # The preset the credential proxy, the agent-api-auth sidecar and the shell
+    # container start from, forwarded to the CR as spec.deployment.sizingProfile
+    # when set: small (the operator's defaults, and what an unset value means),
+    # medium, fleet, or auto, which steps the tier up as the fleet the operator
+    # counts grows, from the tier the CR's status last recorded (a count that
+    # falls never lowers it), holding a step the namespace's ResourceQuota has
+    # no room for or a LimitRange bound refuses, stepping back one tier when
+    # admission refuses the pod a step recreated, and saying so in the CR's
+    # SizingCappedByQuota condition. The three
+    # resources overrides above and in harness.experimental.shellSandbox are
+    # applied per key over the preset, so an explicit key always wins. The
+    # quota preflight counts medium and fleet at their rows and auto at the
+    # small row it starts from; a later promotion is the operator's check. The
+    # CRD reference's spec.deployment section has each row's figures. On an
+    # existing install the chart fails the upgrade when the installed CRD
+    # predates the field; apply crds/ first (upgrade.sh does).
+    sizingProfile: ""
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,
   # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace
