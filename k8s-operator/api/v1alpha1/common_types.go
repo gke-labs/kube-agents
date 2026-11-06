@@ -2545,7 +2545,9 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+	// Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+	// Ready condition then reads False with reason ScaledToZero.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
