@@ -640,6 +640,32 @@ printf '{"type":"result","subtype":"success","result":"settings=%%s md=%%s state
 	}
 }
 
+// offerUntilAccepted offers task until the pod accepts it, as the dispatcher
+// does. A pod stays busy after a task's final renewal until its post-task
+// workspace reset ends, and declines an offer meanwhile; any other decline
+// fails the test.
+func offerUntilAccepted(t *testing.T, d *fakeDispatcher, task string, sub *lib.Envelope) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		d.offer(task, sub, 5)
+		a := d.nextAccept(5 * time.Second)
+		if a.TaskID != task {
+			t.Fatalf("an answer for %q, want %q", a.TaskID, task)
+		}
+		if a.Accepted {
+			return
+		}
+		if a.Reason != declineBusy {
+			t.Fatalf("%s declined: %s", task, a.Reason)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: the pod stayed busy", task)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // Each task's harness gets its own config directory, never one an earlier
 // task's model could have touched, and starts fresh rather than resuming.
 func TestEachTaskGetsItsOwnConfigAndAFreshHarness(t *testing.T) {
@@ -655,16 +681,26 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
 	ln, addr := readyListener(t)
+	var slowOnce sync.Once
 	go func() {
 		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
 			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
 			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
+			// A slow post-task reset after task-one, as on a loaded runner:
+			// the pod stays busy after its final renewal until the reset
+			// ends. Only the first, so task-two's reset is not still running
+			// when the test's temp directories are removed.
+			ResetPaths: []string{t.TempDir()},
+			resetHook: func(phase string) {
+				if phase == "after-task" {
+					slowOnce.Do(func() { time.Sleep(500 * time.Millisecond) })
+				}
+			},
 		})
 	}()
 	waitReady(t, addr)
 	for _, task := range []string{"task-one", "task-two"} {
-		d.offer(task, profileSubmission(t, task, "go", nil), 5)
-		d.nextAccept(5 * time.Second)
+		offerUntilAccepted(t, d, task, profileSubmission(t, task, "go", nil))
 		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 		if _, final := drainLeases(d, task, 20*time.Second); !final {
 			t.Fatalf("%s: no final renewal", task)
