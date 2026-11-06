@@ -681,11 +681,11 @@ wait_for_exit() {
 # SIGTERM the credential runtime alone and wait for it. Not drain_supervised:
 # that sweeps the pid's children first, and the runtime's children are the
 # brokered commands in flight (kubectl, git, gh, gcloud, each in its own
-# session), which the runtime lets finish: in the broker role it drains them
-# for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an answer; in
-# the other roles its exec route stays open for the settle window, and one
-# still running when the runtime exits dies with the pod. A sweep would end
-# them at the first instant of the stop.
+# session), which the runtime lets finish: in the broker and exec roles it
+# drains them for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an
+# answer; in the other roles its exec route stays open for the settle window,
+# and one still running when the runtime exits dies with the pod. A sweep would
+# end them at the first instant of the stop.
 drain_runtime() {
   local budget="$1"
   local pid="$2"

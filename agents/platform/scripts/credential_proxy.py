@@ -589,9 +589,9 @@ SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 SHUTDOWN_ERROR = "credential proxy shutting down"
 # The drain thread's name, for a reader of a thread dump mid-stop.
 SHUTDOWN_THREAD_NAME = "shutdown"
-# In the broker role the stop is a drain (install_shutdown_handler): new
-# requests are refused with the `draining` bound, and the requests already in
-# flight get this long to finish before the commands still running are ended.
+# In the broker and exec roles the stop is a drain (install_shutdown_handler):
+# new requests are refused with the `draining` bound, and the requests already
+# in flight get this long to finish before the commands still running are ended.
 # The pod's terminationGracePeriodSeconds (45 s, the operator's
 # credentialProxyTerminationGraceSeconds) holds this, SHUTDOWN_END_WAIT_SECONDS,
 # the hand-back and the entrypoint's kill of Envoy after it; the entrypoint
@@ -13305,16 +13305,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     teams_relay: TeamsRelay | None = None
-    # Set by the SIGTERM handler (install_shutdown_handler). While set, the
-    # two Chat event-pull routes answer 503 SHUTDOWN_ERROR, and the settle
-    # routes and the Slack pull serve until the server stops, so the gateway's
-    # acks for pulls already answered still land. In the sidecar roles every
-    # other route serves too; in the broker role `draining` below refuses them.
+    # Set by the SIGTERM handler (install_shutdown_handler). While set, the two
+    # Chat event-pull routes answer 503 SHUTDOWN_ERROR, and the settle routes
+    # and the Slack pull serve until the server stops, so the gateway's acks for
+    # pulls already answered still land. In the sidecar roles every other route
+    # serves too; in the broker and exec roles `draining` below refuses them.
     shutting_down = threading.Event()
-    # Set by the SIGTERM handler in the broker role, where the stop is a drain
-    # (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is refused
-    # with the `draining` bound before its route runs, so no command is refused
-    # half-way and a retry never runs one twice; the drain waits on in_flight.
+    # Set by the SIGTERM handler in the broker and exec roles, where the stop is
+    # a drain (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is
+    # refused with the `draining` bound before its route runs, so no command is
+    # refused half-way and a retry never runs one twice; the drain waits on
+    # in_flight.
     draining = threading.Event()
     in_flight = InFlight()
     # The read-only Cloud API relay's credential and transport. Armed by
@@ -16557,11 +16558,11 @@ def install_shutdown_handler(
     gateway on a next install reads Slack itself. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
-    With drain_seconds (the broker role, SHUTDOWN_DRAIN_SECONDS), the stop is
-    a drain as well: every new request outside DRAIN_OPEN_ROUTES is refused
-    503 with the `draining` bound, the Slack relay stops taking events from
-    Slack, and the requests already in flight get up to drain_seconds from the
-    signal to finish. The commands still running then are ended through
+    With drain_seconds (the broker and exec roles, SHUTDOWN_DRAIN_SECONDS), the
+    stop is a drain as well: every new request outside DRAIN_OPEN_ROUTES is
+    refused 503 with the `draining` bound, the Slack relay stops taking events
+    from Slack, and the requests already in flight get up to drain_seconds from
+    the signal to finish. The commands still running then are ended through
     executor.end_commands and answer DRAINED_COMMAND_EXIT_CODE; their requests
     get end_wait_seconds to write it. Only then are the Chat receipts handed
     back and the server stopped. The other roles keep the short stop: their
