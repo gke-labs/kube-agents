@@ -9,8 +9,11 @@ the first-run card cap (#3702), the clusters past it. Walking Steps 2 to 4 of
 calls per cluster, and three such walks do not fit the platform profile's
 kanban worker budget; the sweep then completes with one cluster recorded, or
 runs past the hand-off's wait (#4115). This script reads the same facts in
-three reads and prints the SOP's Step 5 ``metadata`` object, which the
-worker pastes into the card's ``clusters`` list unchanged.
+three reads and writes the SOP's Step 5 ``metadata`` object where the
+onboarding hand-off reads it, one file per cluster under ``SWEEP_DIR``; the
+worker names the cluster on its card and nothing more, because a worker that
+relays the object through its completion call has lost it (partial objects on
+one model, booleans on another, #4115). The object is printed as well.
 
 Three reads: ``gcloud container clusters describe`` for the topology, through
 the credential proxy's gcloud shim; a paged workload dump (Deployments,
@@ -30,15 +33,22 @@ families) are listed in ``workloads`` but raise no finding: the hand-off
 marks a finding there ``provider_managed`` and the ranking stage scores it
 apart, and the by-hand audit this replaces reports on the user's workloads.
 
-    cluster_inventory_collect.py --project P --location L --cluster C [--out FILE]
+    cluster_inventory_collect.py --project P --location L --cluster C --sweep-id T [--sweep-dir DIR] [--out FILE]
+
+The file carries the sweep card it belongs to: ``--sweep-id``, required
+unless the dispatcher's ``HERMES_KANBAN_TASK`` names the card (it does in the
+card's workspace); the hand-off takes only a file stamped with its own sweep.
 """
 from __future__ import annotations
 
 import argparse
 import functools
 import json
+import os
+import re
 import shlex
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -136,6 +146,19 @@ GAP_STDERR_CHARS = 200
 TERMINAL_TIMEOUT_SECONDS = 600
 READ_BUDGET_SECONDS = 480
 BUDGET_EXHAUSTED = "the read budget of {budget} s was spent before this read, so it did not run"
+# Where the object goes for the hand-off (bootstrap_handoff.SWEEP_DIR and
+# SWEEP_FILE_FORMAT; test_cluster_inventory_collect.py holds the copies equal),
+# stamped with when it was collected and the sweep card it belongs to, which
+# the dispatcher hands the worker as HERMES_KANBAN_TASK.
+SWEEP_DIR = "/opt/data/INVENTORY.sweep"
+SWEEP_FILE_FORMAT = "{project}__{location}__{cluster}.json"
+SWEEP_FILE_STAMP_AT = "collected_at"
+SWEEP_FILE_STAMP_SWEEP = "sweep_id"
+SWEEP_CARD_ENV = "HERMES_KANBAN_TASK"
+TMP_SUFFIX = ".tmp"
+# bootstrap_handoff.IDENTITY_COMPONENT_RE: the hand-off reads a file only for an
+# identity of bare names, and the file is named from these three arguments.
+IDENTITY_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 EXIT_OK = 0
 
 Run = collector_run.Run
@@ -498,14 +521,53 @@ def collect_cluster_inventory(
     )
 
 
+def sweep_file_path(project: str, location: str, cluster: str, sweep_dir: str = SWEEP_DIR) -> Path:
+    """The hand-off's file for this cluster (bootstrap_handoff.sweep_file_path)."""
+    return Path(sweep_dir) / SWEEP_FILE_FORMAT.format(project=project, location=location, cluster=cluster)
+
+
+def write_sweep_file(metadata: dict, path: Path) -> str | None:
+    """Write the object atomically for the hand-off; the reason when it could not be."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle, tmp = tempfile.mkstemp(prefix=path.name, suffix=TMP_SUFFIX, dir=path.parent)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(metadata, indent=2) + "\n")
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    except OSError as exc:
+        return f"could not write {path}: {exc}"
+    return None
+
+
+def _bare_name(value: str) -> str:
+    if not IDENTITY_COMPONENT_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a bare name (letters, digits, . _ : -)")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", required=True)
-    parser.add_argument("--location", required=True, help="the cluster's region or zone")
-    parser.add_argument("--cluster", required=True, help="the bare GKE cluster name")
-    parser.add_argument("--out", help="write the metadata object here instead of stdout")
+    parser.add_argument("--project", required=True, type=_bare_name)
+    parser.add_argument("--location", required=True, type=_bare_name, help="the cluster's region or zone")
+    parser.add_argument("--cluster", required=True, type=_bare_name, help="the bare GKE cluster name")
+    parser.add_argument("--out", help="write the printed copy of the object to this file instead of stdout")
+    parser.add_argument("--sweep-dir", default=SWEEP_DIR, help="where the hand-off reads the object from")
+    card_from_env = os.environ.get(SWEEP_CARD_ENV, "")
+    parser.add_argument(
+        "--sweep-id", type=_bare_name, default=card_from_env or None, required=not card_from_env,
+        help=f"the sweep card this audit belongs to; defaults to ${SWEEP_CARD_ENV}, the card the dispatcher named",
+    )
     args = parser.parse_args(argv)
     metadata = collect_cluster_inventory(args.project, args.location, args.cluster, run=default_run)
+    metadata[SWEEP_FILE_STAMP_AT] = int(time.time())
+    metadata[SWEEP_FILE_STAMP_SWEEP] = args.sweep_id
+    problem = write_sweep_file(metadata, sweep_file_path(args.project, args.location, args.cluster, args.sweep_dir))
+    if problem:
+        metadata["gaps"].append(problem)
     text = json.dumps(metadata, indent=2) + "\n"
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")

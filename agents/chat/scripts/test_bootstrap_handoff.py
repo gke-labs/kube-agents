@@ -12,6 +12,7 @@ rather than with a copy of its rules.
 """
 
 import contextlib
+import copy
 import json
 import os
 import shlex
@@ -327,6 +328,248 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(inventory_findings.parse_block(text), [])
 
 
+class _ReadFailed(RuntimeError):
+    """sandbox_exec.SandboxReadFailed, as the stub raises it."""
+
+
+class _Unavailable(RuntimeError):
+    """sandbox_exec.SandboxUnavailable, as the stub raises it."""
+
+
+class CollectedAuditsTest(unittest.TestCase):
+    """The sweep's relayed audits give way to the collector's files (#4115)."""
+
+    IDENT = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        self.sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        self.sweep_dir.mkdir()
+        self.sandbox = types.SimpleNamespace(
+            sandbox_enabled=lambda: False, TERMINAL_PRINCIPAL="agent", run=None,
+            read_bytes=lambda *_a, **_k: None, SandboxReadFailed=_ReadFailed, SandboxUnavailable=_Unavailable,
+        )
+        p = mock.patch.object(h, "_sandbox", lambda: self.sandbox)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _file(self, ident=None, **over):
+        ident = ident or self.IDENT
+        obj = {
+            **ident,
+            "topology": {"k8s_version": "1.35"},
+            "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment", "replicas": "1/1",
+                           "probes": {"startup": False}, "telemetry": "none",
+                           "security_context": {"read_only_root_fs": False, "added_capabilities": []}}],
+            "namespace_governance": [],
+            "findings": [{"check": "probes-startup", "severity": "medium", "area": "reliability",
+                          "namespace": "shop", "workload": "web", "issue": "web has no startupProbe",
+                          "recommendation": "add one"}],
+            "gaps": [],
+            h.SWEEP_FILE_STAMP_AT: NOW - 10,
+            h.SWEEP_FILE_STAMP_SWEEP: SWEEP,
+        }
+        obj.update(over)
+        return obj
+
+    def _write(self, obj, ident=None):
+        ident = ident or self.IDENT
+        path = self.sweep_dir / Path(h.sweep_file_path(**ident)).name
+        path.write_text(json.dumps(obj) if not isinstance(obj, (bytes, str)) else obj if isinstance(obj, str) else "")
+        if isinstance(obj, bytes):
+            path.write_bytes(obj)
+        return path
+
+    def _state(self, clusters):
+        return {"sweep": {"id": SWEEP, "status": "done", "block_reason": "", "metadata": {"clusters": clusters, "fleet": []}},
+                "clusters": [], "archived_clusters": 0}
+
+    def _merge(self, state, past_cap=()):
+        return h.merge_collected_audits(state, self.d, SWEEP, NOW - 60, list(past_cap))
+
+    def test_the_file_replaces_the_card_entry_the_worker_relayed(self):
+        # Green 1's shape: the worker's copy lost every list to a boolean.
+        self._write(self._file())
+        relayed = {**self.IDENT, "topology": False, "workloads": False, "findings": [False], "gaps": []}
+        state = self._state([relayed])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(len(entry["workloads"]), 1)
+        self.assertEqual(entry["findings"][0]["check"], "probes-startup")
+        self.assertEqual(h._malformed(entry), [])
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_named_cluster_without_a_file_keeps_its_entry_with_a_gap(self):
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(len(entry["gaps"]), 1)
+        self.assertIn("is missing", entry["gaps"][0])
+        self.assertIn(h.sweep_file_path(**self.IDENT), entry["gaps"][0])
+        self.assertIn("no — see Gaps", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_past_cap_cluster_the_worker_did_not_name_takes_its_file(self):
+        self._write(self._file())
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry["cluster"], "seeded-c")
+
+    def test_a_past_cap_cluster_with_neither_name_nor_file_is_left_alone(self):
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["sweep"]["metadata"]["clusters"], [])
+
+    def test_a_wrong_file_is_a_gap_not_an_audit(self):
+        cases = {
+            "not JSON": b"{not json",
+            "not a JSON object": json.dumps([1, 2]).encode(),
+            "names cluster 'other'": json.dumps(self._file(cluster="other")).encode(),
+            "from sweep t_old": json.dumps(self._file(**{h.SWEEP_FILE_STAMP_SWEEP: "t_old"})).encode(),
+            "before this sweep was filed": json.dumps(self._file(**{h.SWEEP_FILE_STAMP_AT: NOW - 600})).encode(),
+            "carries no collected_at": json.dumps({k: v for k, v in self._file().items() if k != h.SWEEP_FILE_STAMP_AT}).encode(),
+            f"over {h.SWEEP_FILE_MAX_BYTES} bytes": b"{" + b" " * h.SWEEP_FILE_MAX_BYTES + b"}",
+        }
+        for why, raw in cases.items():
+            with self.subTest(why=why):
+                self._write(raw)
+                state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+                self.assertTrue(self._merge(state))
+                [entry] = state["sweep"]["metadata"]["clusters"]
+                self.assertEqual(entry["workloads"], [])
+                self.assertIn(why, entry["gaps"][0])
+
+    def test_an_unreachable_sandbox_asks_for_a_retry(self):
+        self.sandbox.sandbox_enabled = lambda: True
+
+        def unreachable(*_a, **_k):
+            raise self.sandbox.SandboxUnavailable("ssh: no route")
+
+        self.sandbox.read_bytes = unreachable
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertFalse(self._merge(state))
+
+    def test_a_read_that_ran_and_failed_is_a_gap(self):
+        self.sandbox.sandbox_enabled = lambda: True
+
+        def failed(*_a, **_k):
+            raise self.sandbox.SandboxReadFailed("not a regular file")
+
+        self.sandbox.read_bytes = failed
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("could not be read", entry["gaps"][0])
+
+    def test_the_sandbox_read_is_byte_capped_and_as_the_terminal_login(self):
+        self.sandbox.sandbox_enabled = lambda: True
+        reads = []
+        self.sandbox.read_bytes = lambda path, **kw: reads.append((path, kw)) or json.dumps(self._file()).encode()
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [(path, kw)] = reads
+        self.assertEqual(path, h.sweep_file_path(**self.IDENT))
+        self.assertEqual(kw["max_bytes"], h.SWEEP_FILE_MAX_BYTES + 1)
+        self.assertEqual(kw["principal"], "agent")
+        self.assertEqual(len(state["sweep"]["metadata"]["clusters"][0]["workloads"]), 1)
+
+    def test_cluster_agent_cards_are_never_touched(self):
+        self._write(self._file())
+        state = self._state([])
+        card = {"id": "t_card", "status": "done", "key": "k", "title": "x",
+                "metadata": {**self.IDENT, "workloads": [], "findings": []}, "block_reason": ""}
+        state["clusters"] = [copy.deepcopy(card)]
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["clusters"], [card])
+        # The roster read puts the file under the sweep, not under the card.
+        self.assertEqual(state["sweep"]["metadata"]["clusters"][0]["cluster"], "seeded-c")
+
+    def test_two_clusters_of_one_name_in_two_locations_are_two_audits(self):
+        # GKE names are unique per project and location; the files and the
+        # merge are keyed on all three, so both are read.
+        west = {"project": "p", "location": "europe-west1", "cluster": "seeded-c"}
+        self._write(self._file())
+        self._write(self._file(west), west)
+        state = self._state([{**self.IDENT, "gaps": []}, {**west, "gaps": []}])
+        self.assertTrue(self._merge(state))
+        entries = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual([e["location"] for e in entries], ["us-central1-a", "europe-west1"])
+        self.assertTrue(all(len(e["workloads"]) == 1 and not e["gaps"] for e in entries))
+
+    def test_an_entry_without_a_location_and_two_roster_matches_keeps_its_copy(self):
+        agents = [
+            {"name": "a", "key": "ka", "identity": dict(self.IDENT)},
+            {"name": "b", "key": "kb", "identity": {"project": "p", "location": "europe-west1", "cluster": "seeded-c"}},
+        ]
+        state = self._state([{"project": "p", "cluster": "seeded-c", "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state, past_cap=agents))
+        copies = [e for e in state["sweep"]["metadata"]["clusters"] if e.get("gaps")]
+        self.assertEqual(len(copies), 1)
+        self.assertIn("roster has 2 clusters of that name", copies[0]["gaps"][0])
+
+    def test_a_file_with_no_sweep_stamp_is_refused(self):
+        self._write(self._file(**{h.SWEEP_FILE_STAMP_SWEEP: ""}))
+        state = self._state([{**self.IDENT, "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("carries no sweep_id", entry["gaps"][0])
+
+    def test_a_roster_only_cluster_with_a_wrong_file_leaves_a_gap_under_the_sweep(self):
+        self._write(self._file(**{h.SWEEP_FILE_STAMP_AT: NOW - 600}))
+        state = self._state([])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        self.assertEqual(state["sweep"]["metadata"]["clusters"], [])
+        [gap] = state["sweep"]["metadata"]["gaps"]
+        self.assertIn("before this sweep was filed", gap)
+        self.assertIn("the card did not name this cluster", gap)
+
+    def test_an_entry_without_a_location_takes_the_rosters_and_one_row_results(self):
+        # B1: the card named the cluster without its location; keyed by project and
+        # cluster, the entry and the roster's identity are one cluster, one file, one row.
+        self._write(self._file())
+        state = self._state([{"project": "p", "cluster": "seeded-c", "gaps": ["worker note"]}])
+        agent = {"name": "cluster-p-seeded-c", "key": "k", "identity": dict(self.IDENT)}
+        self.assertTrue(self._merge(state, past_cap=[agent]))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry["location"], "us-central1-a")
+        self.assertEqual(len(entry["workloads"]), 1)
+        self.assertEqual(entry["gaps"], ["worker note"])  # the worker's gaps ride along
+        self.assertEqual(h.compose(state, timed_out=False, now=NOW).count("| seeded-c | p |"), 1)
+
+    def test_an_entry_without_a_location_anywhere_keeps_its_copy_with_a_gap(self):
+        state = self._state([{"project": "p", "cluster": "seeded-c", "workloads": [], "findings": [], "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("names no location", entry["gaps"][0])
+
+    def test_a_cluster_named_twice_keeps_the_first_entry_with_a_gap(self):
+        self._write(self._file())
+        first = {**self.IDENT, "workloads": [], "findings": [], "gaps": []}
+        state = self._state([first, {**self.IDENT, "gaps": ["second"]}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("names this cluster twice", entry["gaps"][0])
+        self.assertEqual(entry["workloads"], [])
+
+    def test_an_identity_that_is_not_a_bare_name_is_not_read(self):
+        reads = []
+        self.sandbox.sandbox_enabled = lambda: True
+        self.sandbox.read_bytes = lambda path, **kw: reads.append(path) or None
+        for bad in ({"cluster": "../etc"}, {"project": "p/q"}, {"location": ""}):
+            with self.subTest(bad=bad):
+                state = self._state([{**self.IDENT, **bad, "workloads": [], "findings": [], "gaps": []}])
+                self.assertTrue(self._merge(state))
+                [entry] = state["sweep"]["metadata"]["clusters"]
+                self.assertTrue(any("bare name" in g or "no location" in g for g in entry["gaps"]), entry["gaps"])
+        self.assertEqual(reads, [])
+
+
 class HandOffTest(unittest.TestCase):
     _real_file_prioritize = staticmethod(h.file_prioritize)
 
@@ -356,8 +599,66 @@ class HandOffTest(unittest.TestCase):
         self.filed.append(1)
         return f"t_rank{len(self.filed)}"
 
-    def _run(self, now=NOW):
-        return h.hand_off(self.d, self.scan_marker, None, now=now)
+    def _run(self, now=NOW, full_roster=None):
+        return h.hand_off(self.d, self.scan_marker, None, now=now, full_roster=full_roster)
+
+    def test_the_hand_off_reads_the_collectors_file_for_a_past_cap_cluster(self):
+        # The worker named the cluster and nothing more (SOP step 4); the audit came by file.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+        obj = {**ident, "topology": {}, "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment",
+               "replicas": "1/1", "probes": {"startup": True}, "telemetry": "none",
+               "security_context": {"read_only_root_fs": True, "added_capabilities": []}}],
+               "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        _board(self.board, "done", {"clusters": [{**ident, "gaps": []}], "fleet": []}, [])
+        self.assertEqual(self._run(), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", raw)
+        self.assertIn("| seeded-c | shop | web | Deployment | 1/1 | yes | none | yes |", raw)
+
+    def test_a_carded_clusters_file_is_not_read_as_the_sweeps(self):
+        # The roster entry whose key the marker lists as carded has its own
+        # card; a file for it (a collector run by hand) must not become a sweep
+        # row beside that card's.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-a"}
+        obj = {**ident, "topology": {}, "workloads": [], "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        key = "bootstrap-inventory-cluster-cluster-p-seeded-a-us-central1-a"
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncarded={key}\n")
+        _board(self.board, "done", {"clusters": [], "fleet": []}, [])
+        roster = [{"name": "cluster-p-seeded-a-us-central1-a", "key": key, "title": "t", "cluster_label": "c", "identity": ident}]
+        # With every roster cluster carded and no card done, nothing was audited:
+        # the hand-off writes the no-coverage report and files no ranking card.
+        self.assertIsNone(self._run(full_roster=lambda: roster))
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertNotIn("| seeded-a | p | us-central1-a | t_sweep |", raw)
+        self.assertIn("no cluster was audited", (self.d / "INVENTORY.md").read_text())
+
+    def test_the_hand_off_reads_a_past_cap_file_the_card_did_not_name(self):
+        # The roster leg: hand_off builds past_cap from full_roster minus the
+        # carded keys and the file is read though the worker named nothing.
+        sweep_dir = self.d / Path(h.SWEEP_DIR).name
+        sweep_dir.mkdir()
+        ident = {"project": "p", "location": "us-central1-a", "cluster": "seeded-c"}
+        obj = {**ident, "topology": {}, "workloads": [{"namespace": "shop", "name": "web", "kind": "Deployment",
+               "replicas": "1/1", "probes": {"startup": True}, "telemetry": "none",
+               "security_context": {"read_only_root_fs": True, "added_capabilities": []}}],
+               "namespace_governance": [], "findings": [], "gaps": [],
+               h.SWEEP_FILE_STAMP_AT: NOW - 10, h.SWEEP_FILE_STAMP_SWEEP: SWEEP}
+        (sweep_dir / Path(h.sweep_file_path(**ident)).name).write_text(json.dumps(obj))
+        self.scan_marker.write_text(f"task_id={SWEEP}\nfiled_at={NOW - 60}\ncarded=\n")
+        _board(self.board, "done", {"clusters": [], "fleet": []}, [])
+        roster = [{"name": "cluster-p-seeded-c-us-central1-a", "key": "bootstrap-inventory-cluster-cluster-p-seeded-c-us-central1-a",
+                   "title": "t", "cluster_label": "c", "identity": ident}]
+        self.assertEqual(self._run(full_roster=lambda: roster), "t_rank1")
+        raw = (self.d / "INVENTORY.raw.md").read_text()
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", raw)
 
     def _run_roster(self, roster, now=NOW):
         import bootstrap_scan_gate

@@ -2037,6 +2037,10 @@ class ScanGateTest(unittest.TestCase):
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        # The hand-off predicts a past-cap cluster's collector file from this.
+        for agent in agents.values():
+            self.assertEqual(sorted(agent["identity"]), ["cluster", "location", "project"])
+            self.assertIn(agent["identity"]["cluster"], agent["cluster_label"])
         self.assertEqual(sorted(agents), sorted([short, hashed]))
         self.assertEqual(agents[short]["key"], f"{prefix}{short}")
         self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
@@ -2514,7 +2518,9 @@ class ScanGateTest(unittest.TestCase):
         body = bootstrap_scan_gate._task_body()
         self.assertIn(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH, body)
         self.assertIn("--project <project> --location <location> --cluster <cluster>", body)
-        self.assertIn("put the object it prints into `clusters` unchanged", body)
+        self.assertIn(bootstrap_scan_gate.SWEEP_DIR + "/<project>__<location>__<cluster>.json", body)
+        self.assertIn("Do not copy the object anywhere: the gate takes it from the file", body)
+        self.assertIn("one `{project, location, cluster, gaps}` entry per cluster Step 3 audited", body)
         self.assertIn("only where the script itself cannot run", body)
         # The constant is the sandbox path of a file this repository ships: the
         # staged root /opt/data/profiles/platform/ maps onto agents/platform/.

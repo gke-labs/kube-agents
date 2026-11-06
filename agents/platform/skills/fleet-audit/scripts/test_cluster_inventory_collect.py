@@ -348,12 +348,83 @@ class ClusterLevelSlugs(unittest.TestCase):
         self.assertEqual((meta["project"], meta["location"], meta["cluster"]), (PROJECT, LOCATION, CLUSTER))
 
 
+class SweepFile(unittest.TestCase):
+    def test_the_path_format_is_the_hand_offs(self):
+        self.assertEqual(cic.SWEEP_DIR, bootstrap_handoff.SWEEP_DIR)
+        self.assertEqual(cic.SWEEP_FILE_FORMAT, bootstrap_handoff.SWEEP_FILE_FORMAT)
+        self.assertEqual(cic.SWEEP_FILE_STAMP_AT, bootstrap_handoff.SWEEP_FILE_STAMP_AT)
+        self.assertEqual(cic.SWEEP_FILE_STAMP_SWEEP, bootstrap_handoff.SWEEP_FILE_STAMP_SWEEP)
+        self.assertEqual(
+            str(cic.sweep_file_path(PROJECT, LOCATION, CLUSTER)), bootstrap_handoff.sweep_file_path(PROJECT, LOCATION, CLUSTER)
+        )
+
+    def test_main_writes_the_stamped_object_for_the_hand_off(self):
+        fake = FakeRun()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), \
+                patch.dict(os.environ, {cic.SWEEP_CARD_ENV: "t_sweep1"}), redirect_stderr(io.StringIO()):
+            sweep_dir = Path(tmp) / "INVENTORY.sweep"
+            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--sweep-dir", str(sweep_dir)])
+            written = json.loads((sweep_dir / f"{PROJECT}__{LOCATION}__{CLUSTER}.json").read_text(encoding="utf-8"))
+            leftovers = [p.name for p in sweep_dir.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual(rc, 0)
+        self.assertEqual(leftovers, [])
+        self.assertEqual(written["sweep_id"], "t_sweep1")
+        self.assertIsInstance(written["collected_at"], int)
+        self.assertEqual(len(written["workloads"]), 7)
+        self.assertTrue(bootstrap_handoff._named(written))
+        self.assertEqual(bootstrap_handoff._malformed(written), [])
+        # The hand-off takes it as this sweep's audit.
+        obj, why = bootstrap_handoff._collected_audit(
+            json.dumps(written).encode(), {"project": PROJECT, "location": LOCATION, "cluster": CLUSTER}, "t_sweep1", written["collected_at"] - 5
+        )
+        self.assertEqual(why, "")
+        self.assertEqual(obj["cluster"], CLUSTER)
+
+    def test_sweep_id_comes_from_the_flag_or_the_card_environment(self):
+        fake = FakeRun()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), \
+                patch.dict(os.environ, {cic.SWEEP_CARD_ENV: "t_env"}), redirect_stderr(io.StringIO()):
+            sweep_dir = Path(tmp) / "sweep"
+            cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--sweep-dir", str(sweep_dir), "--sweep-id", "t_flag"])
+            written = json.loads((sweep_dir / f"{PROJECT}__{LOCATION}__{CLUSTER}.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["sweep_id"], "t_flag")
+        # Neither the flag nor the environment: argparse refuses before any read.
+        fake2 = FakeRun()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake2), \
+                patch.dict(os.environ, {cic.SWEEP_CARD_ENV: ""}), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--sweep-dir", str(Path(tmp) / "sweep")])
+        self.assertEqual(fake2.calls, [])
+
+    def test_an_identity_that_is_not_a_bare_name_is_refused_before_any_read(self):
+        fake = FakeRun()
+        with patch.object(cic, "default_run", fake), redirect_stderr(io.StringIO()):
+            for argv in (["--project", "p/q", "--location", LOCATION, "--cluster", CLUSTER],
+                         ["--project", PROJECT, "--location", LOCATION, "--cluster", "../x"]):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    cic.main(argv)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(cic.IDENTITY_COMPONENT_RE.pattern, bootstrap_handoff.IDENTITY_COMPONENT_RE.pattern)
+
+    def test_an_unwritable_sweep_dir_is_a_gap_and_the_object_still_prints(self):
+        fake = FakeRun()
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), \
+                redirect_stderr(io.StringIO()):
+            blocked = Path(tmp) / "blocked"
+            blocked.write_text("a file, not a directory")
+            out = Path(tmp) / "meta.json"
+            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--sweep-dir", str(blocked), "--out", str(out), "--sweep-id", "t_sweep1"])
+            meta = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("could not write" in g for g in meta["gaps"]))
+
+
 class Cli(unittest.TestCase):
     def test_main_writes_the_object_to_out_and_exits_zero(self):
         fake = FakeRun()
         with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), redirect_stderr(io.StringIO()) as err:
             out = Path(tmp) / "meta.json"
-            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--out", str(out)])
+            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--out", str(out), "--sweep-dir", str(Path(tmp) / "sweep"), "--sweep-id", "t_sweep1"])
             self.assertEqual(rc, 0)
             meta = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(meta["cluster"], CLUSTER)
@@ -362,9 +433,10 @@ class Cli(unittest.TestCase):
 
     def test_main_exits_zero_when_the_cluster_is_unreachable(self):
         fake = FakeRun(credentials_rc=1)
-        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), redirect_stderr(io.StringIO()) as err:
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), patch.object(cic, "default_run", fake), \
+                patch.dict(os.environ, {cic.SWEEP_CARD_ENV: "t_sweep1"}), redirect_stderr(io.StringIO()) as err:
             out = Path(tmp) / "meta.json"
-            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--out", str(out)])
+            rc = cic.main(["--project", PROJECT, "--location", LOCATION, "--cluster", CLUSTER, "--out", str(out), "--sweep-dir", str(Path(tmp) / "sweep"), "--sweep-id", "t_sweep1"])
             meta = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(rc, 0)
         self.assertEqual(len(meta["gaps"]), 1)

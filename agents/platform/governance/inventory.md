@@ -47,18 +47,20 @@ reach it, an entry in `gaps` saying so.
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
 clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. For each one, run once, with the
-terminal's `timeout` set to 600:
+The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. For each one, run once, from your
+card's workspace (its environment names your card, which the file carries), with the terminal's
+`timeout` set to 600:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-audit/scripts/cluster_inventory_collect.py \
-  --project <project> --location <location> --cluster <cluster>
+  --project <project> --location <location> --cluster <cluster> --sweep-id <this card's id>
 ```
 
-and put the object it prints into `clusters` unchanged. It reads Steps 2 to 4 of
-`cluster_inventory_audit_sop.md` in three reads (one `gcloud` describe through the credential proxy,
-two paged `kubectl` dumps through the sandbox's kube-proxy kubeconfig) and prints that SOP's Step 5
-`metadata` shape:
+It reads Steps 2 to 4 of `cluster_inventory_audit_sop.md` in three reads (one `gcloud` describe
+through the credential proxy, two paged `kubectl` dumps through the sandbox's kube-proxy kubeconfig),
+writes that SOP's Step 5 `metadata` object to `/opt/data/INVENTORY.sweep/<project>__<location>__<cluster>.json`,
+where the onboarding gate reads it, and prints it. Do not copy the object into the card: the gate takes
+it from the file, and in `clusters` you name the cluster and nothing more (Step 4). The object:
 Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup probe,
 read-only root filesystem, added capabilities, namespace quota, addons, observability and hardening
 checks the Cluster Agents run. A read that failed is in the object's `gaps`, never guessed. Walk the
@@ -96,16 +98,21 @@ audited) and this `metadata`:
 
 ```json
 {
-  "fleet": [{ "project": "…", "cluster": "…", "location": "…", "status": "RUNNING" }],
-  "clusters": [<one Step 3 audit per cluster, in the single-cluster SOP's metadata shape>],
+  "fleet": [
+    { "project": "…", "cluster": "…", "location": "…", "status": "RUNNING" }
+  ],
+  "clusters": [{ "project": "…", "location": "…", "cluster": "…", "gaps": [] }],
   "telemetry": "<the PlatformAgent's .status.telemetry, one line>",
   "gaps": ["<anything you could not do, and why>"]
 }
 ```
 
 `fleet` is every cluster Step 1 listed: the hand-off names any of them that no audit reported on, so
-a silent gap does not read as a clean cluster. `clusters` is an empty list only when no cluster
-lacked a Cluster Agent and none was past the first-run cap. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
+a silent gap does not read as a clean cluster. `clusters` names each cluster Step 3 audited, with
+that cluster's `gaps`, and nothing more when the script wrote its file: the gate reads the audit from
+`/opt/data/INVENTORY.sweep/`, and an object copied into the card arrives partial or garbled. Only a
+by-hand walk (a cluster the script could not run against) puts the SOP's full object here. `clusters`
+is an empty list only when no cluster lacked a Cluster Agent and none was past the first-run cap. `telemetry` is the collector the agents export to: read `.status.telemetry` on the PlatformAgent
 once and summarise it. A Cluster Agent cannot see that resource, so the report shows it beside their
 observability findings. A cluster you could not reach goes in `gaps`, not silently out of `fleet`. If you could not
 list the clusters at all, say so in `gaps` and complete anyway — onboarding runs once.

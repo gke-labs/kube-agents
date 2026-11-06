@@ -78,6 +78,7 @@ _INTERPOLATIONS = {
     "local.run_wait": "900",
     "local.poll": "15",
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
+    "local.sweep_dir": "/opt/data/INVENTORY.sweep",
     "local.gate_script": "oobe.py bootstrap_scan_gate.py",
     "local.gate_wait": "300",
     "local.list_tries": "3",
@@ -116,6 +117,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.python": _INTERPOLATIONS["local.python"],
     "self.triggers.key_like": _INTERPOLATIONS["local.key_like"],
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
+    "self.triggers.sweep_dir": _INTERPOLATIONS["local.sweep_dir"],
     "self.triggers.cap_file": _INTERPOLATIONS["local.cap_file"],
     "self.triggers.cards_cap": _INTERPOLATIONS["local.cards_cap"],
     "self.triggers.cap_mark": _INTERPOLATIONS["local.cap_mark"],
@@ -210,7 +212,9 @@ elif "/opt/data/.first_run_cluster_cards" in cmd:
         sys.exit(1)
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
-elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
+elif ("rm" in cmd or script.startswith("rm -f ")) and "/opt/data/INVENTORY.md" in " ".join(cmd):
+    # The agent pod's rm is a bare argv; the sandbox's is `sh -c "rm -f <files> && rm -rf <dir>"`,
+    # the files and the collector's sweep directory in one exec.
     record("clear " + target)
     if os.environ.get("INVENTORY_RM_FAIL") == target:
         sys.stderr.write("error: unable to upgrade connection: container not found\n")

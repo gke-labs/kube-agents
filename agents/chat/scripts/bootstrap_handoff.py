@@ -46,6 +46,30 @@ ASSIGNEE = "platform"
 CARD_ORIGIN = "chat"
 RAW_PATH = "/opt/data/INVENTORY.raw.md"
 REPORT_PATH = "/opt/data/INVENTORY.md"
+# Where the sweep worker's collector leaves each audited cluster's Step 5
+# object (cluster_inventory_collect.py writes it, under the sandbox's
+# /opt/data): one file per cluster, named by the identity the hand-off can
+# predict, so the object never travels through the worker's completion call,
+# which has relayed it partial (gemini-4-argon) and as booleans
+# (gemini-3.8-flash, #4115). The two copies of the format are held equal by
+# test_cluster_inventory_collect.py.
+SWEEP_DIR = "/opt/data/INVENTORY.sweep"
+SWEEP_FILE_FORMAT = "{project}__{location}__{cluster}.json"
+# Above the largest object seen (a 46-workload cluster is about 30 KB); a
+# file over this is a gap, never a partial object.
+SWEEP_FILE_MAX_BYTES = 1 << 20
+# The fields the file must carry for the hand-off to take it over the card's
+# copy: the collector's two stamps, both required (a file with no sweep id
+# could be any login's write at the predicted path), and the identity it was
+# asked for.
+SWEEP_FILE_STAMP_AT = "collected_at"
+SWEEP_FILE_STAMP_SWEEP = "sweep_id"
+# A file is read only for an identity whose every component is a bare name: a
+# project id, a location and a GKE cluster name hold these characters, and a
+# `/` or an empty field would move the path out of SWEEP_DIR. The collector
+# refuses the same shapes before it writes.
+IDENTITY_FIELDS = ("project", "location", "cluster")
+IDENTITY_COMPONENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]*")
 # inventory_findings.py's DEFAULT_LIMITS_PATH, which its `select` reads;
 # test_bootstrap_handoff.py holds the two copies equal.
 LIMITS_PATH = "/opt/data/INVENTORY.limits.json"
@@ -994,6 +1018,174 @@ def _record(marker: Path, sweep_id: str, task_id: str, now: float) -> None:
     marker.write_text(f"sweep={sweep_id}\ntask_id={task_id}\nfiled_at={int(now)}\n", encoding="utf-8")
 
 
+def sweep_file_path(project: str, location: str, cluster: str) -> str:
+    """The collector's file for one cluster, under the sandbox's data root."""
+    return f"{SWEEP_DIR}/{SWEEP_FILE_FORMAT.format(project=project, location=location, cluster=cluster)}"
+
+
+def _read_sweep_file(data_dir: Path, path: str) -> bytes | None:
+    """The file's bytes (at most one over the cap), None when absent.
+
+    Raises what ``sandbox_exec.read_bytes`` raises: a sandbox that could not be
+    reached is the caller's signal to retry next tick; a read that ran and
+    failed is a gap for that cluster.
+    """
+    sx = _sandbox()
+    if not sx.sandbox_enabled():
+        local = data_dir / Path(SWEEP_DIR).name / Path(path).name
+        if not local.is_file():
+            return None
+        with local.open("rb") as fh:
+            return fh.read(SWEEP_FILE_MAX_BYTES + 1)
+    return sx.read_bytes(
+        path, max_bytes=SWEEP_FILE_MAX_BYTES + 1, principal=sx.TERMINAL_PRINCIPAL, timeout=SANDBOX_TIMEOUT_SECONDS
+    )
+
+
+def _collected_audit(raw: bytes, ident: dict, sweep_id: str, filed_at: float) -> tuple[dict | None, str]:
+    """The file's object when it is this sweep's audit of ``ident``, else why not."""
+    if len(raw) > SWEEP_FILE_MAX_BYTES:
+        return None, f"over {SWEEP_FILE_MAX_BYTES} bytes"
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None, "not JSON"
+    if not isinstance(obj, dict):
+        return None, "not a JSON object"
+    for field in IDENTITY_FIELDS:
+        if _text(obj.get(field)) != ident[field]:
+            return None, f"names {field} {_text(obj.get(field))!r}, not {ident[field]!r}"
+    stamped_sweep = _text(obj.get(SWEEP_FILE_STAMP_SWEEP))
+    if not stamped_sweep:
+        return None, f"carries no {SWEEP_FILE_STAMP_SWEEP}"
+    if stamped_sweep != sweep_id:
+        return None, f"from sweep {stamped_sweep}, not {sweep_id}"
+    stamped_at = obj.get(SWEEP_FILE_STAMP_AT)
+    if not isinstance(stamped_at, (int, float)) or isinstance(stamped_at, bool) or stamped_at != stamped_at:
+        return None, f"carries no {SWEEP_FILE_STAMP_AT}"
+    if stamped_at < filed_at:
+        return None, f"collected at {int(stamped_at)}, before this sweep was filed at {int(filed_at)}"
+    return obj, ""
+
+
+def _identity_ok(ident: dict) -> bool:
+    """Every component is a bare name: no empty field and nothing that moves the path."""
+    return all(IDENTITY_COMPONENT_RE.fullmatch(_text(ident.get(f)) or "") for f in IDENTITY_FIELDS)
+
+
+def merge_collected_audits(state: dict, data_dir: Path, sweep_id: str, filed_at: float, past_cap: list[dict]) -> bool:
+    """Replace the sweep's relayed audits with the collector's files.
+
+    The clusters read are the ones the sweep card named under ``clusters``
+    and ``past_cap``, the roster identities the first-run cap left to the
+    sweep, keyed by (project, location, cluster) as the files are named: a
+    GKE cluster name is unique only within a project and location. A named
+    entry without a location takes the roster's when exactly one roster
+    cluster has its project and name. For each, the file at
+    :func:`sweep_file_path` replaces the card's entry when it is this sweep's
+    audit of that cluster, with the worker's own gaps for it kept; a cluster
+    the card named whose file is missing or wrong keeps its entry with a gap
+    naming the file, so its Coverage row reads "no, see Gaps"; so does one
+    named twice, or without a location anywhere (or with two roster matches),
+    or with a component that is not a bare name. A cluster the card did not
+    name takes its file as its entry, nothing when there is none, and a gap
+    line under the sweep when a file is there but wrong. Cluster Agent cards
+    are never touched. Returns False when the sandbox could not be read at
+    all, which the caller takes as "retry next tick".
+    """
+    meta = state["sweep"]["metadata"]
+    entries = [c for c in _sweep_audits(state["sweep"]) if isinstance(c, dict)]
+    roster: dict[tuple[str, str, str], None] = {}
+    for agent in past_cap:
+        identity = agent.get("identity") if isinstance(agent, dict) else None
+        if isinstance(identity, dict):
+            ident = tuple(_text(identity.get(f)) for f in IDENTITY_FIELDS)
+            if all(ident):
+                roster.setdefault(ident, None)
+    locations_by_name: dict[tuple[str, str], list[str]] = {}
+    for project, location, cluster in roster:
+        locations_by_name.setdefault((project, cluster), []).append(location)
+    named: dict[tuple[str, str, str], dict] = {}
+    order: list[tuple[str, str, str]] = []
+    problems: dict[tuple[str, str, str], str] = {}
+    unresolved: list[dict] = []  # entries kept as they are, each with a gap already appended
+    unnamed: list[dict] = []
+    for entry in entries:
+        project, location, cluster = (_text(entry.get(f)) for f in IDENTITY_FIELDS)
+        if not (project and cluster):
+            unnamed.append(entry)  # compose reports an audit with no project or cluster as such
+            continue
+        if not location:
+            candidates = locations_by_name.get((project, cluster), [])
+            if len(candidates) == 1:
+                location = candidates[0]
+            else:
+                why = (
+                    "the card names no location for it and the roster has none"
+                    if not candidates
+                    else f"the card names no location for it and the roster has {len(candidates)} clusters of that name"
+                )
+                unresolved.append({**entry, "gaps": _gap_list(entry) + [f"{why}, so its file cannot be found; this entry is the card's own copy"]})
+                continue
+        key = (project, location, cluster)
+        if key in named:
+            problems[key] = "the card names this cluster twice; the first entry stands"
+            continue
+        named[key] = {**entry, "location": location}
+        order.append(key)
+    for key in roster:
+        if key not in named:
+            named[key] = {}
+            order.append(key)
+    merged: list[dict] = []
+    sweep_gaps: list[str] = []
+    sx = _sandbox()
+    for key in order:
+        project, location, cluster = key
+        card_entry = named[key]
+        ident = {"project": project, "location": location, "cluster": cluster}
+        why = problems.get(key, "")
+        raw = None
+        if not why and not _identity_ok(ident):
+            why = "its project, location or cluster is not a bare name, so its file is not read"
+        elif not why:
+            path = sweep_file_path(project, location, cluster)
+            try:
+                raw = _read_sweep_file(data_dir, path)
+            except sx.SandboxReadFailed as e:
+                why = f"the collector's file {path} could not be read: {e}"
+            except sx.SandboxUnavailable as e:
+                _log(f"cannot read {path}, the sandbox was not reached: {e}")
+                return False
+            except OSError as e:
+                why = f"the collector's file {path} could not be read: {e}"
+            except Exception as e:  # noqa: BLE001 - nothing is known about the file; retry next tick
+                _log(f"cannot read {path}: {e}")
+                return False
+            else:
+                if raw is None:
+                    why = f"the collector's file {path} is missing"
+                else:
+                    obj, bad = _collected_audit(raw, ident, sweep_id, filed_at)
+                    if obj is None:
+                        why = f"the collector's file {path} {bad}"
+                    else:
+                        merged.append({**obj, "gaps": _gap_list(obj) + _gap_list(card_entry)})
+                        continue
+        if card_entry:
+            merged.append({**card_entry, "gaps": _gap_list(card_entry) + [f"{why}; this entry is the card's own copy"]})
+        elif raw is not None or "could not be read" in why:
+            # A roster cluster the card never named, with a file that is not this
+            # sweep's audit: no row for it, but the reason is not thrown away.
+            sweep_gaps.append(f"{cluster} ({project}, {location}): {why}; the card did not name this cluster")
+    merged.extend(unresolved)
+    merged.extend(unnamed)
+    meta["clusters"] = merged
+    if sweep_gaps:
+        meta["gaps"] = _gap_list(meta) + sweep_gaps
+    return True
+
+
 def hand_off(
     data_dir: Path, scan_marker: Path, parse_task_id, roster=None, now: float | None = None, full_roster=None
 ) -> str | None:
@@ -1047,6 +1239,15 @@ def hand_off(
         return None
     if written:
         _log(f"{REPORT_PATH} is already written and sweep {sweep_id} has no hand-off; leaving it for delivery")
+        return None
+    carded = carded_keys(scan_marker) or frozenset()
+    try:
+        everyone = (full_roster() if callable(full_roster) else full_roster) or []
+    except Exception as e:  # noqa: BLE001 - as uncarded_budget reads it: no live roster, the named clusters still read
+        _log(f"could not list the roster for the collector's files: {e}")
+        everyone = []
+    past_cap = [a for a in everyone if isinstance(a, dict) and a.get("key") not in carded]
+    if not merge_collected_audits(state, data_dir, sweep_id, filed_at, past_cap):
         return None
     raw = compose(state, timed_out, now)
     if not write_raw(data_dir, raw):
