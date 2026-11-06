@@ -25,6 +25,8 @@ class FakeBucket:
     def __init__(self, root):
         self.root = root
         self.fail = False
+        # Command kinds (the Publisher's: publish, publish_record) that fail.
+        self.fail_kinds = set()
         self.calls = []
 
     def path(self, url):
@@ -34,7 +36,7 @@ class FakeBucket:
     def __call__(self, kind, cmd, timeout, input=None, env=None):
         self.calls.append((kind, list(cmd)))
         assert cmd[:3] == ["gcloud", "storage", "cp"] and "--no-clobber" in cmd, cmd
-        if self.fail:
+        if self.fail or kind in self.fail_kinds:
             return None
         if "-I" in cmd:
             dest = self.path(cmd[-1])
@@ -211,6 +213,25 @@ class PublishTest(unittest.TestCase):
         self.assertIn(f"answers/{fp(1)}.json", [o["name"] for o in self._records()[-1]["objects"][VERSION]])
         runs = self._records()[-1]["runs"]
         self.assertEqual(runs, [{"case": "case-a", "rep": 1, "outcome": "pass"}])
+
+    def test_names_whose_record_failed_go_in_the_next_record(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "pass", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.bucket.fail_kinds = {"publish_record"}
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.assertEqual(self._records(), [], "the record did not go up")
+        self.bucket.fail_kinds = set()
+        self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(2)
+        self.write_logs()
+        self.publisher.publish()
+        [record] = self._records()
+        self.assertEqual(sorted(o["name"] for o in record["objects"][VERSION]),
+                         [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"],
+                         "the earlier call's names ride in the next record, or no lane would ever fetch them")
 
     def test_object_names_refuse_anything_outside_the_layout(self):
         self.assertEqual(P.object_name("variants", f"{fp(1)}/{'a' * 16}.json"), f"variants/{fp(1)}-{'a' * 16}.json")
