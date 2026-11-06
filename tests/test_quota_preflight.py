@@ -1124,16 +1124,45 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertIsNotNone(required, "probe ConfigMap not found")
         return chart_pods, required
 
-    def test_the_operator_is_told_the_charts_pods_and_their_surges(self) -> None:
-        """The chart-pods annotation is the preflight's pod total less what the operator
-        renders and the uninstall-only cleanup hook, plus one surge pod for each workload the
-        preflight's own list marks as surging, so the counts cannot drift (#3848). With
-        operator.enabled=false the operator runs elsewhere, and neither counts it."""
-        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
-        operator_pods = (
-            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
-            + op["kubeProxy"]["pods"]
-        )
+    def _rendered_chart_pods(self, sets: list[str]) -> tuple[int, int, list[str]]:
+        """An oracle independent of kube-agents.chartWorkloads: the standing pods the chart
+        actually renders in the release namespace, and their surge pods, read from the
+        manifests. Every Deployment and StatefulSet the chart renders there counts at its
+        replicas; Helm hooks (the uninstall cleanup Job) are not standing. A Deployment that
+        runs a pod and doesn't roll Recreate sizes one surge pod; a StatefulSet sizes none."""
+        res = self._render({"probe": {}}, sets)
+        self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
+        chart_pods, pods, surges, names = None, 0, 0, []
+        for doc in yaml.safe_load_all(res.stdout):
+            if not doc:
+                continue
+            meta = doc.get("metadata", {})
+            if doc.get("kind") == "PlatformAgent":
+                chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+            if "helm.sh/hook" in (meta.get("annotations") or {}):
+                continue
+            # A pod-running kind neither list models would pass both unseen, so it fails here.
+            self.assertNotIn(doc.get("kind"), ("DaemonSet", "Job", "CronJob", "ReplicaSet", "Pod"),
+                             f"the chart renders a {doc.get('kind')} that kube-agents.chartWorkloads doesn't model")
+            if doc.get("kind") not in ("Deployment", "StatefulSet"):
+                continue
+            if meta.get("namespace") not in (None, "", "default"):  # helm template renders into "default"
+                continue
+            replicas = doc["spec"].get("replicas", 1)
+            pods += replicas
+            names.append(f"{doc['kind']}/{meta['name']}={replicas}")
+            if doc["kind"] == "Deployment" and replicas > 0:
+                if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
+                    surges += 1
+        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        return chart_pods, pods + surges, names
+
+    def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
+        """The chart-pods annotation equals the standing pods the chart renders in the release
+        namespace plus their surge pods, read from the rendered manifests rather than from
+        the list the annotation is computed from, so a workload the list misses fails here
+        (#3848, #4893: the replay proxy was missed). With operator.enabled=false the operator
+        runs elsewhere, and neither counts it."""
         for sets in (
             [],
             ["hindsight.enabled=true", "githubMinter.enabled=true",
@@ -1143,7 +1172,28 @@ class PreflightDecisionTest(unittest.TestCase):
             ["platformAgent.cleanupHook.enabled=false"],
             ["operator.enabled=false", "hindsight.enabled=true"],
             ["webConsole.enabled=true"],
+            # The replay proxy, with the values its schema requires (the probe chart drops the
+            # schema, but a real render needs them), at its default replicas and at 5.
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly"],
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+             "litellm.replayShadow.replicaCount=5"],
+            ["litellm.replicaCount=0"],
         ):
+            with self.subTest(sets=sets):
+                chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
+                self.assertEqual(chart_pods, rendered, names)
+
+    def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
+        """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
+        uninstall-only cleanup hook, and a surge pod for each that surges (#4893)."""
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        operator_pods = (
+            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
+            + op["kubeProxy"]["pods"]
+        )
+        for sets in ([], ["platformAgent.cleanupHook.enabled=false"], ["litellm.replayShadow.enabled=true"]):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
