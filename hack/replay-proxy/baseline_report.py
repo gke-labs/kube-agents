@@ -121,6 +121,7 @@ STATUS_NONE = "none"
 EVAL_RUNS = "runs"
 EVAL_BUILD_ID = "build_id"
 EVAL_TIER = "tier"
+EVAL_PR = "pr"
 EVAL_TASKS = "tasks"
 EVAL_TASK_NAME = "name"
 EVAL_REPS = "reps"
@@ -133,8 +134,11 @@ EVAL_TOKENS_PARTIAL = "partial"
 EVAL_PASS, EVAL_FAIL, EVAL_INFRA = "pass", "fail", "infra"
 EVAL_RESULTS = (EVAL_PASS, EVAL_FAIL, EVAL_INFRA)
 EVAL_TIER_DEFAULT = PRESUBMIT
-# A dashboard tier that is a presubmit for the proxy's job kind.
-EVAL_TIERS_AS_PRESUBMIT = (PRESUBMIT, "gitlab")
+EVAL_TIER_NIGHTLY = "nightly"
+# The forge lanes' tiers (scripts/eval_dashboard/tiers.py FORGE_TIERS): one
+# tier covers a lane's pull-request builds (with a `pr`) and its nightlies
+# (`pr` null), so the run's `pr` says which job kind it is.
+EVAL_FORGE_TIERS = ("gitlab", "ghes", "gitlab-ce")
 
 # Why a line or file was not counted, for the data-quality notes. not_json and
 # other_event come from analyze_shadow.iter_request_lines.
@@ -360,6 +364,16 @@ class EvalRun:
     build_id: str
     tier: str
     reps: List[Rep] = field(default_factory=list)
+    pr: Optional[str] = None
+
+    def matches_kind(self, kind: str) -> bool:
+        """Whether the dashboard's tier for this run agrees with the proxy's job kind: a presubmit is a
+        presubmit run or a forge-lane run with a pull request; a nightly (trusted or not) is a nightly run
+        or a forge-lane run without one."""
+        forge = self.tier in EVAL_FORGE_TIERS
+        if kind == PRESUBMIT:
+            return self.tier == PRESUBMIT or (forge and bool(self.pr))
+        return self.tier == EVAL_TIER_NIGHTLY or (forge and not self.pr)
 
 
 @dataclass
@@ -687,7 +701,9 @@ def load_eval(paths: Iterable[str], quality: Quality) -> Dict[str, EvalRun]:
             if build_id in runs:
                 quality.eval_duplicate_runs += 1
                 continue
-            run = EvalRun(build_id, str(raw.get(EVAL_TIER) or EVAL_TIER_DEFAULT))
+            pr = raw.get(EVAL_PR)
+            run = EvalRun(build_id, str(raw.get(EVAL_TIER) or EVAL_TIER_DEFAULT),
+                          pr=str(pr) if pr not in (None, "") else None)
             for task in raw.get(EVAL_TASKS) or []:
                 if not isinstance(task, dict) or not task.get(EVAL_TASK_NAME):
                     continue
@@ -889,8 +905,7 @@ def build_report(
         run = runs.get(build)
         if run is None:
             continue
-        tier_kind = PRESUBMIT if run.tier in EVAL_TIERS_AS_PRESUBMIT else run.tier
-        if tier_kind != kind:
+        if not run.matches_kind(kind):
             quality.eval_tier_mismatches += 1
     builds_out = []
     for (kind, build), build_lines in sorted(by_build.items(), key=lambda kv: kv[1][0].ts):

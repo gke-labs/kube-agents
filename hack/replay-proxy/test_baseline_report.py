@@ -54,8 +54,8 @@ def error_line(ts, error, kind="nightly", build="b1", status=200):
             "job": {"kind": kind, "project": "p1", "build": build, "pr": ""}, "status": status, "error": error}
 
 
-def eval_run(build_id, tasks, tier="nightly"):
-    return {"build_id": build_id, "tier": tier, "tasks": tasks}
+def eval_run(build_id, tasks, tier="nightly", pr=None):
+    return {"build_id": build_id, "tier": tier, "tasks": tasks, "pr": pr}
 
 
 def task(name, *reps):
@@ -350,9 +350,22 @@ class EvalJoin(unittest.TestCase):
         self.assertEqual(r["scopes"]["total"]["pass_rate"], 1.0)
 
     def test_a_gitlab_run_joins_a_presubmit_without_a_mismatch(self):
-        runs = [eval_run("b1", [task("c", {"result": "pass"})], tier="gitlab")]
+        runs = [eval_run("b1", [task("c", {"result": "pass"})], tier="gitlab", pr=2)]
         r = report([line("a", 1, kind="presubmit", build="b1", pr="2")], runs=runs)
         self.assertEqual(r["data_quality"]["eval_tier_mismatches"], 0)
+
+    def test_a_forge_lanes_pr_decides_its_job_kind(self):
+        cases = [
+            # (proxy kind, dashboard tier, dashboard pr, mismatch)
+            ("presubmit", "presubmit", 5, 0), ("presubmit", None, 5, 0), ("presubmit", "nightly", None, 1),
+            ("presubmit", "gitlab", 5, 0), ("presubmit", "gitlab", None, 1), ("presubmit", "ghes", 5, 0),
+            ("nightly", "nightly", None, 0), ("nightly", "gitlab", None, 0), ("nightly", "gitlab", 5, 1),
+            ("nightly", "gitlab-ce", None, 0), ("nightly", "presubmit", 5, 1), ("nightly", "weekly", None, 1),
+        ]
+        for kind, tier, pr, mismatch in cases:
+            run = eval_run("b1", [task("c", {"result": "pass"})], tier=tier, pr=pr)
+            r = report([line("a", 1, kind=kind, build="b1")], runs=[run])
+            self.assertEqual(r["data_quality"]["eval_tier_mismatches"], mismatch, (kind, tier, pr))
 
     def test_eval_data_without_runs_is_refused(self):
         with self.assertRaises(ValueError):
