@@ -715,7 +715,9 @@ class FixtureTests(unittest.TestCase):
         code, _, err = _run(self.root, baseline, bounded_indexes=frozenset({"idx_events_gone"}))
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("BOUNDED_INDEXES names 'idx_events_gone', which the schema does not build as a partial index", err)
-        self.assertIn("bounded_index_walk scans events: `SCAN events USING INDEX idx_events_backlog_pending`", err)
+        # 3.53 prints COVERING where 3.40 does not, so the index is asserted and the words before it are not.
+        self.assertIn("bounded_index_walk scans events: `SCAN events USING ", err)
+        self.assertIn("INDEX idx_events_backlog_pending` for `SELECT id FROM events WHERE backlog = 1`", err)
         self.assertIn("1 finding(s) not pinned and 1 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
