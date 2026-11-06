@@ -486,7 +486,9 @@ def main() -> int:
         binary = hermes_bin()
     except FileNotFoundError as exc:
         names = ", ".join(profile.name for profile, _ in work)
-        print(f"cannot tick {names}: {exc}")
+        # The policy has already written its holds; this run's output is
+        # the only place they are reported.
+        print("\n".join([*lines, f"cannot tick {names}: {exc}"]))
         return 1
 
     # Read once: every child gets the same home target, and re-parsing the

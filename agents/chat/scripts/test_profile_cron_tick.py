@@ -981,6 +981,21 @@ class IdlePolicyThroughMainTest(unittest.TestCase):
         self.assertIn("held compliance-audit", out)
         self.assertNotIn("ticked", out)
 
+    def test_a_missing_hermes_still_reports_the_holds(self):
+        def boom():
+            raise FileNotFoundError("no `hermes` anywhere")
+
+        self.set_signal(self.now - timedelta(days=15))
+        self.write(*self.roster())
+        self._patch(pct, "hermes_bin", boom)
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        # The holds were written before the binary was looked for; this
+        # output is the only place they are reported.
+        self.assertIn("held compliance-audit until 2026-08-07T06:20:00+00:00 (hibernate)", out)
+        self.assertIn("cannot tick platform", out)
+        self.assertEqual(self.jobs()["compliance-audit"]["next_run_at"], "2026-08-07T06:20:00+00:00")
+
     def test_a_chat_message_resumes_the_audits_on_the_next_tick(self):
         self.set_signal(self.now - timedelta(days=15))
         self.write(*self.roster())
