@@ -1,6 +1,6 @@
 # k8s-api-proxy
 
-The Kubernetes API proxy for the agent sandbox (`<agent>-kube-proxy` deployment). The sandbox's
+The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
 `kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
 authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
@@ -12,10 +12,10 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 `cmd/k8s-api-proxy` builds the production server binary.
 
 `NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
-that a TokenReview on the host cluster finds valid for the configured audience, from a username on
-an allowlist, and caches each acceptance or refusal for ten seconds by default. The audience should
-be one the API server does not accept, so a token sent to the proxy cannot be used against the API
-server directly; the operator picks it. A review that fails is a 503 rather than a 401.
+that a TokenReview on the host cluster finds valid for any of the configured audiences (`Audience` / `AudienceCallers`), from a username on
+an allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
+be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
+server directly; the operator picks them. A review that fails is a 503 rather than a 401.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
 `gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other

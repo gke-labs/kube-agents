@@ -206,12 +206,11 @@ func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
 // ingress, and egress to DNS, the bus, LiteLLM and the credential broker's
-// credentialed port only. The broker is where a worker's kubectl and gcloud
-// run (#3889); its side admits the profile namespace, and confines each call
-// to the task's cluster, once a profile identity exists
-// (credential_proxy_profiles.go). The egress is unconditional: a namespace
-// that exists only for profiles needs no second gate, and the broker's
-// TokenReview refuses any pod the identity map doesn't name.
+// credentialed port only. The broker is where a worker's gcloud runs (#3889);
+// it admits the profile namespace, and confines each call to the task's
+// cluster, once a profile identity exists (credential_proxy_profiles.go).
+// The egress is unconditional: a namespace that exists only for profiles needs
+// no second gate, and TokenReview refuses any pod the identity map doesn't name.
 func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},

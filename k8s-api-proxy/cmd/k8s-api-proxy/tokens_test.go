@@ -317,3 +317,28 @@ func TestScopedPoolTransportRefusesUnmappedClusterAndMintsPerProjectToken(t *tes
 		t.Fatalf("unexpected call counts after second project: iam=%d container=%d cluster=%d", iamCalls, containerCalls, clusterCalls)
 	}
 }
+
+func TestParseSessionAudienceCallers(t *testing.T) {
+	t.Parallel()
+
+	m, err := parseSessionAudienceCallers("", "")
+	if err != nil || m != nil {
+		t.Fatalf("expected nil map and nil error when session audience is unset, got %v, %v", m, err)
+	}
+
+	if _, err := parseSessionAudienceCallers("kubeagents-credential-proxy-session", "  "); err == nil {
+		t.Fatal("expected error when session audience is set without session callers")
+	}
+
+	m, err = parseSessionAudienceCallers(
+		"kubeagents-credential-proxy-session",
+		"system:serviceaccount:kubeagents-sessions:a2a-session",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := m["kubeagents-credential-proxy-session"]
+	if len(got) != 1 || got[0] != "system:serviceaccount:kubeagents-sessions:a2a-session" {
+		t.Fatalf("unexpected callers: %v", got)
+	}
+}

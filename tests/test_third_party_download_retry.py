@@ -83,6 +83,7 @@ ENVTEST_FETCH_TARGETS = ("envtest-path", "setup-envtest")
 #: downloads something is not covered until it is added here, and nothing in
 #: the repository notices that it is missing.
 DOWNLOAD_SOURCES = (
+    REPO_ROOT / "a2a" / "Dockerfile.worker",
     REPO_ROOT / "deploy" / "docker" / "Dockerfile",
     REPO_ROOT / "deploy" / "sandbox" / "Dockerfile",
     REPO_ROOT / "hack" / "ci-env.sh",

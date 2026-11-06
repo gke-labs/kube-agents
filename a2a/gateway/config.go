@@ -535,8 +535,11 @@ type Config struct {
 	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
 	// New refuses the view without it.
-	SessionClusterView bool
-	CredentialProxyURL string
+	SessionClusterView   bool
+	CredentialProxyURL   string
+	KubeProxyURL         string
+	KubeProxyCAConfigMap string
+	KubeProxyHostContext string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -697,6 +700,9 @@ func FromEnv() (*Config, error) {
 		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
 		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
 		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		KubeProxyURL:          os.Getenv("A2A_KUBE_PROXY_URL"),
+		KubeProxyCAConfigMap:  os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
+		KubeProxyHostContext:  os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:    capability.OptionalFromEnv(),

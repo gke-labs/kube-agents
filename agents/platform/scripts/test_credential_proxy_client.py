@@ -3308,5 +3308,74 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertEqual([], self.sleeps)
 
 
+class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
+    """Worker pods (UID 1000 with /home/node) initialize and merge ~/.kube/config."""
+
+    PROXY_URL = "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443"
+    HOST_CTX = "gke_acme-prod_us-central1_host-cluster"
+    TARGET_CTX = "gke_acme-prod_us-central1_target-cluster"
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.worker_home = self.root / "home" / "node"
+        self.worker_home.mkdir(parents=True)
+        self.worker_kubeconfig = self.worker_home / ".kube" / "config"
+        self.shared_kubeconfig = self.root / "opt" / "data" / ".kubeconfig"
+
+    def test_caller_default_kubeconfig_path_distinguishes_worker_from_shell_sandbox(self):
+        with patch.object(credential_proxy_client.os, "geteuid", return_value=1000), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            self.assertEqual(self.worker_kubeconfig, credential_proxy_client._caller_default_kubeconfig_path())
+            shutil.rmtree(self.worker_home)
+            self.assertEqual(self.shared_kubeconfig, credential_proxy_client._caller_default_kubeconfig_path())
+
+    def test_ensure_kube_proxy_context_initializes_host_kubeconfig_and_merges_target(self):
+        env = {
+            "KUBE_PROXY_URL": self.PROXY_URL,
+            "KUBE_PROXY_HOST_CONTEXT": self.HOST_CTX,
+            "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+            "KUBECONFIG": "",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                ["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"]
+            )
+        self.assertTrue(self.worker_kubeconfig.is_file())
+        text = self.worker_kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.HOST_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+    def test_ensure_kube_proxy_context_creates_kubeconfig_when_host_context_is_unset(self):
+        env = {
+            "KUBE_PROXY_URL": self.PROXY_URL,
+            "KUBE_PROXY_HOST_CONTEXT": "",
+            "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+            "KUBECONFIG": "",
+        }
+        with patch.dict("os.environ", env, clear=False), \
+                patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
+                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
+            credential_proxy_client.ensure_kube_proxy_context_for_argv(
+                ["kubectl", f"--context={self.TARGET_CTX}", "get", "pods"]
+            )
+        self.assertTrue(self.worker_kubeconfig.is_file())
+        text = self.worker_kubeconfig.read_text(encoding="utf-8")
+        self.assertIn(f"current-context: {self.TARGET_CTX}", text)
+        self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
