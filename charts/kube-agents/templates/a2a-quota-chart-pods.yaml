@@ -1,0 +1,23 @@
+{{- /*
+The chart's pods in the release namespace, with their rollout surge pods
+(kube-agents.chartQuotaPods), for the operator's next-mode session quota (#4883). The chart
+also stamps this count on the PlatformAgent it renders, as the
+kubeagents.x-k8s.io/a2a-quota-chart-pods annotation, and the annotation wins. This copy is
+for a PlatformAgent written by hand in a release with platformAgent.enabled=false, which
+still runs the operator, LiteLLM, Hindsight and the minter here: the operator reads it from
+the agent's namespace when the CR carries no annotation, rather than counting its default.
+A fixed name, since the operator looks it up by name. Anyone who can write ConfigMaps here
+can change it, so the operator holds it to the same cap as the annotation and reports a
+value it discards.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a2a-quota-chart-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/component: a2a-quota-chart-pods
+    {{- include "kube-agents.labels" . | nindent 4 }}
+data:
+  pods: {{ include "kube-agents.chartQuotaPods" . | quote }}

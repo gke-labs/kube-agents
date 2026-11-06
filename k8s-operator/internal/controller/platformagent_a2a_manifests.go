@@ -3999,14 +3999,22 @@ const (
 	// plus their surges (charts/kube-agents/templates/platform-agent-cr.yaml,
 	// from kube-agents.chartQuotaPods).
 	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
-	// a2aDefaultChartPods stands in when that annotation is absent (a
-	// PlatformAgent the chart did not render) or unreadable: the chart's
-	// default release, the operator and two LiteLLM replicas, and a surge pod
-	// for each of the two Deployments. It errs high for a CR in a namespace
-	// with no chart pods, which only loosens the bound, and low for a
-	// hand-written CR beside a chart release that runs more than the default
-	// (platformAgent.enabled=false), which must carry the annotation itself
-	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
+	// a2aChartPodsConfigMapName is the ConfigMap the chart renders in its
+	// release namespace with the same count, under a2aChartPodsConfigMapKey
+	// (charts/kube-agents/templates/a2a-quota-chart-pods.yaml). The operator
+	// reads it when the CR carries no annotation: a PlatformAgent written by
+	// hand in a release with platformAgent.enabled=false (#4883).
+	a2aChartPodsConfigMapName = "a2a-quota-chart-pods"
+	a2aChartPodsConfigMapKey  = "pods"
+	// a2aDefaultChartPods stands in when neither that annotation nor the
+	// chart's ConfigMap gives a usable count (a PlatformAgent in a namespace
+	// with no chart release, or an unreadable value): the chart's default
+	// release, the operator and two LiteLLM replicas, and a surge pod for each
+	// of the two Deployments. It errs high for a CR in a namespace with no
+	// chart pods, which only loosens the bound. A hand-written CR beside a
+	// chart release (platformAgent.enabled=false) gets the release's count
+	// from the ConfigMap (#4883). tests/test_quota_preflight.py ties it to a
+	// default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
@@ -4048,23 +4056,66 @@ type a2aChartPodsWarning struct {
 // chart's pods in agent's namespace, surges included, that the session quota
 // counts, and why the annotation was discarded, "" when it was used or is
 // absent. An absent one is a CR written without the chart, which the default
-// is for. A present one the operator discards is a figure the chart did not
-// write (the chart refuses to render one past the cap) or one it cannot read,
-// and the default may then sit below what the namespace runs, so the reason
-// is reported rather than silent.
+// is for (or one the chart's ConfigMap stands in for: a2aQuotaAgent). A
+// present one the operator discards is a figure the chart did not write (the
+// chart refuses to render one past the cap) or one it cannot read, and the
+// default may then sit below what the namespace runs, so the reason is
+// reported rather than silent.
 func a2aChartPodsCount(agent *agentv1alpha1.PlatformAgent) (int64, string) {
 	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
+	return a2aParseChartPods(raw, present, "annotation "+a2aChartPodsAnnotation)
+}
+
+// a2aParseChartPods is the one parse of a chart-pods count, wherever it was
+// read: the count, and why it was discarded, naming source.
+func a2aParseChartPods(raw string, present bool, source string) (int64, string) {
 	if !present {
 		return a2aDefaultChartPods, ""
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	switch {
 	case err != nil:
-		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%q is not a number; the session quota counts the default of %d chart pods instead", source, raw, a2aDefaultChartPods)
 	case v < 0 || v > a2aMaxChartPods:
-		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", source, raw, a2aMaxChartPods, a2aDefaultChartPods)
 	}
 	return v, ""
+}
+
+// a2aQuotaAgent is the agent the session quota is sized for: agent itself
+// when it carries the chart-pods annotation, or when its namespace has no
+// chart ConfigMap; otherwise a copy carrying the ConfigMap's count as the
+// annotation, so every sizing function reads one figure (#4883). The second
+// result is why that count was discarded, "" when it was used, naming the
+// source it came from. The ConfigMap is read uncached (a2aReader), like the
+// rest of this path's bookkeeping; anyone who can write ConfigMaps in the
+// namespace can set it, so it gets the annotation's cap and Warning.
+func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
+	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
+		_, why := a2aChartPodsCount(agent)
+		return agent, why, nil
+	}
+	cm := &corev1.ConfigMap{}
+	err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}, cm)
+	if errors.IsNotFound(err) {
+		return agent, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read the chart's pod count from ConfigMap %s: %w", a2aChartPodsConfigMapName, err)
+	}
+	raw, present := cm.Data[a2aChartPodsConfigMapKey]
+	_, why := a2aParseChartPods(raw, present, fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation))
+	if !present {
+		return agent, why, nil
+	}
+	sized := agent.DeepCopy()
+	annotations := sized.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[a2aChartPodsAnnotation] = raw
+	sized.SetAnnotations(annotations)
+	return sized, why, nil
 }
 
 // a2aChartPods is the count a2aChartPodsCount reads.
@@ -5934,12 +5985,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
 	// why both exist and why the quota sits above the cap).
-	quota := buildA2ASessionQuota(agent)
-	if why := a2aChartPodsDiscard(agent); why != "" {
+	quotaAgent, why, err := r.a2aQuotaAgent(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	quota := buildA2ASessionQuota(quotaAgent)
+	if why != "" {
 		key := client.ObjectKeyFromObject(agent)
-		// An annotation edit does not bump the generation, so the value is
-		// part of what was reported: a second bad value warns too.
-		seen := a2aChartPodsWarning{generation: agent.Generation, value: agent.Annotations[a2aChartPodsAnnotation]}
+		// An annotation (or ConfigMap) edit does not bump the generation, so
+		// the value is part of what was reported: a second bad value warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: quotaAgent.Annotations[a2aChartPodsAnnotation]}
 		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
 			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
 			r.a2aChartPodsWarned.Store(key, seen)

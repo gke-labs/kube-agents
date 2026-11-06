@@ -1137,13 +1137,15 @@ class PreflightDecisionTest(unittest.TestCase):
         runs a pod and doesn't roll Recreate sizes one surge pod; a StatefulSet sizes none."""
         res = self._render({"probe": {}}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
-        chart_pods, pods, surges, names = None, 0, 0, []
+        chart_pods, config_map, pods, surges, names = None, None, 0, 0, []
         for doc in yaml.safe_load_all(res.stdout):
             if not doc:
                 continue
             meta = doc.get("metadata", {})
             if doc.get("kind") == "PlatformAgent":
                 chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+            if doc.get("kind") == "ConfigMap" and meta.get("name") == "a2a-quota-chart-pods":
+                config_map = int(doc["data"]["pods"])
             if "helm.sh/hook" in (meta.get("annotations") or {}):
                 continue
             # A pod-running kind neither list models would pass both unseen, so it fails here.
@@ -1159,7 +1161,13 @@ class PreflightDecisionTest(unittest.TestCase):
             if doc["kind"] == "Deployment" and replicas > 0:
                 if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
                     surges += 1
-        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        # The ConfigMap is rendered on every release (#4883), and with a PlatformAgent it
+        # carries the same count as the annotation.
+        self.assertIsNotNone(config_map, "no a2a-quota-chart-pods ConfigMap rendered")
+        if chart_pods is None:
+            self.assertIn("platformAgent.enabled=false", sets, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+            chart_pods = config_map
+        self.assertEqual(config_map, chart_pods, "the ConfigMap and the annotation disagree")
         return chart_pods, pods + surges, names
 
     def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
@@ -1185,6 +1193,9 @@ class PreflightDecisionTest(unittest.TestCase):
              "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
              "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
+            # An operator-only release (#4883): no PlatformAgent, so the ConfigMap is the count.
+            ["platformAgent.enabled=false", "hindsight.enabled=true", "githubMinter.enabled=true",
+             "githubMinter.org=o", "githubMinter.repo=r"],
         ):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
