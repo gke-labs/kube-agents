@@ -1060,7 +1060,13 @@ class PreflightDecisionTest(unittest.TestCase):
             ["platformAgent.cleanupHook.enabled=false"],
             ["operator.enabled=false", "hindsight.enabled=true"],
             ["webConsole.enabled=true"],
-            ["litellm.replayShadow.enabled=true"],
+            # The replay proxy, with the values its schema requires (the probe chart drops the
+            # schema, but a real render needs them), at its default replicas and at 5.
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly"],
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+             "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
         ):
             with self.subTest(sets=sets):
