@@ -468,12 +468,14 @@ fi
 # gateway starts, and the session-retention cron job pins every session another session
 # still names as its parent so that prune keeps it. On the first start after an upgrade
 # the gateway's prune would run before the job ever had, so the same pinning runs here,
-# after the conversion above and before anything opens a session store. Best-effort: a
-# store it cannot pin is logged and the job tries again on its next tick.
+# after the conversion above and before anything opens a session store. Best-effort, and
+# brief: each store gets a few seconds, since this runs under the bootstrap lock. A store
+# it cannot pin is logged, and the gateway's prune at this start may then delete an aged
+# parent there; the job pins what is left on its next tick.
 SESSION_RETENTION_SCRIPT="${SESSION_RETENTION_SCRIPT:-/opt/defaults/scripts/session_retention.py}"
 if [ -f "$SESSION_RETENTION_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
     "$INSTALL_DIR/.venv/bin/python3" "$SESSION_RETENTION_SCRIPT" --pins-only --agent-home "$TARGET_DIR" \
-        || echo "WARN: pinning session parents did not finish (exit $?); the session-retention job pins them on its next tick" >&2
+        || echo "WARN: pinning session parents did not finish (exit $?); the gateway's prune at this start may delete aged parents in the stores named above" >&2
 fi
 
 # 2. Sync default agent files and subdirectories (plugins, SOUL.md, AGENTS.md, procedures, cron, scripts, governance)

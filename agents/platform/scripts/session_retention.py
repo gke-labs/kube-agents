@@ -72,6 +72,9 @@ FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
 # The ids this job pinned, in each store's state_meta, so it only ever unpins its own.
 PIN_LEDGER_KEY = "kube_agents_retention_pins"
 SQLITE_TIMEOUT_SECONDS = 30
+# The entrypoint pins under its bootstrap lock, one store after another; a store
+# busy for longer than this is logged rather than waited on.
+PINS_ONLY_TIMEOUT_SECONDS = 5
 # Hermes' error text goes inside one inline code span in chat; this bounds it.
 ERROR_SPAN_CHARS = 300
 # Hermes skips a store pruned less than min_interval_hours ago, timed from the
@@ -133,7 +136,7 @@ def prune_store(home: Path, days: int) -> dict:
             close()
 
 
-def keep_parents(home: Path) -> None:
+def keep_parents(home: Path, *, timeout: float = SQLITE_TIMEOUT_SECONDS) -> None:
     """Pin every session that still has a child, and unpin the ones this job pinned that have none.
 
     Readers here follow ``parent_session_id`` back to where a conversation
@@ -152,7 +155,7 @@ def keep_parents(home: Path) -> None:
     db_path = home / STATE_DB
     if not db_path.is_file():
         return
-    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=timeout, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (PIN_LEDGER_KEY,)).fetchone()
@@ -246,7 +249,7 @@ def pin_parents(agent_home: Path) -> list[str]:
     lines = []
     for home in homes(agent_home):
         try:
-            keep_parents(home)
+            keep_parents(home, timeout=PINS_ONLY_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
             lines.append(f"pinning session parents in {label(home, agent_home)} failed: {type(exc).__name__}")
     return lines

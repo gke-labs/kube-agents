@@ -241,6 +241,22 @@ class PinsOnlyForTheEntrypoint(RetentionTest):
         self.assertIn("profile `broken`", written)
 
 
+class PinsOnlyIsBrief(RetentionTest):
+    def test_a_busy_store_is_reported_after_a_short_wait_not_the_ticks(self):
+        busy = self.store("profiles", "busy")
+        self.sessions(busy, ("root", None, 0), ("tip", "root", 0))
+        holder = sqlite3.connect(busy / session_retention.STATE_DB, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        lines = session_retention.pin_parents(self.home)
+        waited = time.monotonic() - started
+        self.assertEqual(1, len(lines))
+        self.assertIn("profile `busy`", lines[0])
+        self.assertLess(session_retention.PINS_ONLY_TIMEOUT_SECONDS, session_retention.SQLITE_TIMEOUT_SECONDS)
+        self.assertLess(waited, session_retention.SQLITE_TIMEOUT_SECONDS)
+
+
 class FailuresAreSaidAndContained(RetentionTest):
     def test_one_store_failing_does_not_stop_the_rest(self):
         self.store()
