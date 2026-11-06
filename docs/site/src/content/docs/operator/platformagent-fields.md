@@ -177,6 +177,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `integration.googleChat.allowedUsers` | `[]string` | no |  |  | AllowedUsers is a list of allowed users. If not present, all users will be allowed. |
 | `integration.googleChat.homeChannel` | `string` | no |  |  | HomeChannel is the home channel Chat address. |
 | `integration.googleChat.mode` | `string` | no | `default` | one of `default`, `debug` | Mode controls output verbosity in Google Chat ("default" or "debug"). "default": Quiet mode (silences memory reviews, approval cards, and tool progress). "debug": Full verbosity (surfaces tool progress, memory reviews, interim messages, and approval cards). |
+| `integration.googleChat.answerFeedback` | `boolean` | no | `true` |  | AnswerFeedback draws thumbs-up and thumbs-down buttons under each final answer on Google Chat under spec.mode next, and keeps each rating with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned). False hides the buttons and keeps nothing. |
 | `integration.slack` | `object` | no |  |  | Slack configures the Slack integration. |
 | `integration.slack.enabled` | `boolean` | no | `false` |  | Enabled toggles the Slack integration. |
 | `integration.slack.botTokenSecretRef` | `corev1.SecretKeySelector` | no |  |  | BotTokenSecretRef securely references a Secret containing the SLACK_BOT_TOKEN. |

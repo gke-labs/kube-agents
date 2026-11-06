@@ -1752,6 +1752,10 @@ platformAgent:
       homeChannel: ""
       # "default" (quiet) or "debug" (full verbosity).
       mode: default
+      # Under spec.mode next, Google Chat's 👍/👎 buttons under each final answer;
+      # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
+      # false hides the buttons and keeps nothing.
+      answerFeedback: true
     slack:
       # Bot/app tokens are read from credentials.secretName under the
       # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.

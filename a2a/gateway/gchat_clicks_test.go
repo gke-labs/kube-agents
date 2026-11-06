@@ -71,7 +71,7 @@ func TestDecodeGchatLegacyClick(t *testing.T) {
 	}
 	check("as captured", ev)
 	// The clicked message's own buttons name the clicked one, and its link.
-	links, label := gchatMessageButtons(ev.Message, 1, "fallback")
+	links, label, _ := gchatMessageButtons(ev.Message, 1, "fallback")
 	if label != "platform-agent-host" || len(links) != 1 || links[0].Text != "Cloud Console" {
 		t.Errorf("buttons read back: label %q links %v", label, links)
 	}
@@ -633,11 +633,11 @@ func TestGchatWidgetsRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"accessoryWidgets":`+string(raw)+`}`), &m); err != nil {
 		t.Fatal(err)
 	}
-	links, label := gchatMessageButtons(m, 1, "fallback")
+	links, label, _ := gchatMessageButtons(m, 1, "fallback")
 	if label != "B" || len(links) != 1 || links[0].URL != "https://x.example/d" || links[0].Text != "docs" {
 		t.Errorf("round trip: label %q links %v", label, links)
 	}
-	if _, label := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
+	if _, label, _ := gchatMessageButtons(m, gchatChoiceUnknown, "fallback"); label != "fallback" {
 		t.Errorf("an unknown index names no button: %q", label)
 	}
 }
