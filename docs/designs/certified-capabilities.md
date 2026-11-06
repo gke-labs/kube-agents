@@ -32,14 +32,31 @@ commits no customer installs. This document separates the two.
   the pull request, the chat answer). A row has one or more scenarios as its tests.
 - **Roster.** `hack/eval/certification-cases.txt`: the scenarios the lane runs, in `# part N`
   sections, each line under a reason block that names the row it grades.
-- **Release window.** All scored repetitions of one scenario on one GA release, across every
-  build of the lane that graded that release. One release, one window; a Rerun on the same
-  release pools into it, never into a neighbouring release's window.
-- **Scored.** A repetition the harness graded pass or fail. Only scored repetitions vote.
-- **Infra.** A repetition the harness recorded as not run: its `results.json` `errors[]` starts
-  with `KUBE_AGENTS_INFRA_FAILURE` (`INFRA_FAILURE_MARKER` in `bench/kube_agents_bench/harness.py`
-  and `scoring.py`). It is kept and printed beside the window, outside the scored count, and
-  never votes.
+- **Release window.** All scored repetitions of one scenario on one GA release and one model,
+  across every build of the lane that graded that release. One release, one window; a Rerun on
+  the same release pools into it, never into a neighbouring release's window. A model change
+  starts a new window.
+- **Outcome.** Each repetition carries one outcome from the scorer (`RepResult.outcome` in
+  `bench/kube_agents_bench/scoring.py`): `pass`, `fail`, `blocked`, `infra` or
+  `not_applicable`. The page uses the scorer's outcome, never the raw marker, and shows it in
+  the reader's words below.
+- **Scored.** A `pass` or `fail`. Only scored repetitions vote in the rate (`scored` in
+  `scoring.py` today).
+- **Safety violation.** A `blocked` repetition on `Rung.FORBIDDEN_ACTION` (rung 1, a forbidden
+  write or action). It counts as a fail against the rate and is listed by cause; it is never
+  dropped from the cell. The build is red.
+- **No valid run.** A `blocked` repetition on `Rung.CHECK_DID_NOT_RUN` (rung 2) or
+  `Rung.NOT_A_REAL_RUN` (rung 3): the check did not run, or the record is not evidence of a
+  real agent run. It sits outside the rate with infra, listed by cause, and counts toward the
+  infra-share cap. The build is red.
+- **Infra.** A repetition the scorer classes as infrastructure, listed by cause: the
+  `KUBE_AGENTS_INFRA_FAILURE` marker anywhere in its errors, the delegation-ceiling marker, a
+  provisioning death, the never-ran signature, or a missing record (`scoring.py`, the
+  classification before the rungs). It sits outside the rate, never votes, and counts toward the
+  infra-share cap.
+- **Not applicable.** `not_applicable` as the scorer defines it (`REP_OUTCOME_NOT_APPLICABLE`):
+  a repetition whose checks do not apply on the transport it ran on. It is listed and never
+  votes.
 - **Declared gap.** A scenario marked `expected_fail: true` in its `task.yaml`
   ([`bench-case-format.md`](bench-case-format.md), "The fields"). Its roster reason block names
   the issue that owns the gap. It is shown as a gap, never as a pass.
@@ -50,30 +67,30 @@ The constants live in the page's rating reader, `scripts/eval_dashboard/certific
 on the prototype branch `wip/certified-journeys-design` at ce05a1a87; they are the numbers the
 check-in carries.
 
-| Constant                   | Value    | Meaning                                                                 |
-| -------------------------- | -------- | ----------------------------------------------------------------------- |
-| `WINDOW_RUNS`              | 60       | scored repetitions per scenario per release                             |
-| `CERTIFIED_PASSES_FULL`    | 57       | passes of 60 at which the Wilson lower bound first clears the row rule  |
-| `ROW_LOWER_BOUND`          | 0.85     | the 95 percent Wilson lower bound a row's tests must reach              |
-| `ROW_TEST_FLOOR`           | 0.80     | no single test in the row below this pass rate                          |
-| `LAPSE_LOWER_BOUND`        | 0.70     | a certified row below this bound on two checks in a row reads Lapsed    |
-| `WILSON_Z`                 | 1.959964 | the 95 percent two-sided normal quantile                                |
-| `CERTIFIED_PASSES_FILLING` | 24       | the prototype certifies at 24 of 24 while a window fills; **to remove** |
+| Constant                   | Value    | Meaning                                                                                                    |
+| -------------------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `WINDOW_RUNS`              | 60       | scored repetitions per scenario per release                                                                |
+| `CERTIFIED_PASSES_FULL`    | 57       | passes of 60 at which the Wilson lower bound first clears the row rule                                     |
+| `ROW_LOWER_BOUND`          | 0.85     | the 95 percent Wilson lower bound a row's tests must reach                                                 |
+| `ROW_TEST_FLOOR`           | 0.80     | no single test in the row below this pass rate                                                             |
+| `LAPSE_LOWER_BOUND`        | 0.70     | the prototype's lapse bound; per release, Lapsed is two consecutive release windows that both miss the bar |
+| `WILSON_Z`                 | 1.959964 | the 95 percent two-sided normal quantile                                                                   |
+| `CERTIFIED_PASSES_FILLING` | 24       | the prototype certifies at 24 of 24 while a window fills; **to remove**                                    |
 
 Per scenario and per release the bound depends on the count alone: 57 of 60 gives 0.863,
-56 of 60 gives 0.841. A pooled Rerun with more than 60 scored repetitions uses the same bound
-on the larger count.
+56 of 60 gives 0.841. A window closes at exactly 60 scored repetitions: a Rerun fills an open window up to 60, never past it.
 
 States of a cell (one scenario, one release):
 
-| Cell reads                           | When                                                                          |
-| ------------------------------------ | ----------------------------------------------------------------------------- |
-| No run on `<release>`                | the release has no lane build                                                 |
-| `n` of 60 scored, not enough runs    | fewer than 60 scored repetitions exist; no claim is made                      |
-| `k` of `n` on `<release>`, certified | `n` is at least 60 and the bound on `k` of `n` is at least 0.85               |
-| `k` of `n` on `<release>`            | `n` is at least 60 and the bound is below 0.85                                |
-| Declared gap                         | the scenario is `expected_fail` at the release's commit; shown with its issue |
-| Started to pass on `<release>`       | a declared gap passed every scored repetition (rung 5); the marker is stale   |
+| Cell reads                           | When                                                                                                                                                                                                                           |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| No run on `<release>`                | the release has no lane build                                                                                                                                                                                                  |
+| `n` of 60 scored, not enough runs    | fewer than 60 scored repetitions exist; no claim is made                                                                                                                                                                       |
+| Not certified, infra share           | more than about a third of the window's repetitions are infra or no valid run; the share is shown by cause and no certificate is given                                                                                         |
+| `k` of `n` on `<release>`, certified | `n` is at least 60 and the bound on `k` of `n` is at least 0.85                                                                                                                                                                |
+| `k` of `n` on `<release>`            | `n` is at least 60 and the bound is below 0.85                                                                                                                                                                                 |
+| Declared gap                         | the scenario is `expected_fail` at the release's commit; shown with its issue                                                                                                                                                  |
+| Started to pass on `<release>`       | a declared gap passed every scored repetition of the release window, infra set aside; the marker is stale (the lane's build reds on the scorer's own rung 5, one complete build, which is the build's reading, not the cell's) |
 
 A row is certified on a release when every non-gap test of the row is certified on that release
 and none is below the floor; the row's status cell carries the gap count ("certified, 3 known
@@ -84,23 +101,27 @@ gaps"). Nothing is inferred from a neighbouring release, from `main`, or from a 
 
 ```mermaid
 flowchart LR
-    GA["GA release published<br/>(version tag, published images)"] --> L["Certification lane<br/>ci-kube-agents-certification-1<br/>weekly, newest GA, 60 repetitions"]
+    GA["GA release published<br/>(version tag, published images)"] --> L["Certification lane<br/>ci-kube-agents-certification-1<br/>newest GA, two builds a week, 30 repetitions each"]
     L --> V["Per-release verdict<br/>k of n scored on release"]
     V --> C["Page cell<br/>count, date, state"]
     N["Nightly eval on main<br/>engineering signal"] -.-> C
 ```
 
-| Lane               | Grades                                           | Feeds                                                               |
-| ------------------ | ------------------------------------------------ | ------------------------------------------------------------------- |
-| Nightly eval       | `main`'s head, every night, the nightly roster   | the nightly dashboard, the evidence store, a "passes on main" badge |
-| Certification lane | the newest GA release's published images, weekly | the per-release cell; the only input to a certificate               |
+| Lane               | Grades                                                      | Feeds                                                               |
+| ------------------ | ----------------------------------------------------------- | ------------------------------------------------------------------- |
+| Nightly eval       | `main`'s head, every night, the nightly roster              | the nightly dashboard, the evidence store, a "passes on main" badge |
+| Certification lane | the newest GA release's published images, two builds a week | the per-release cell; the only input to a certificate               |
 
 The nightly never certifies. Its badge is labelled as `main`, reads "Passes on main", and is
 supporting evidence a reader can open; the certificate names the build the customer installs.
 
+The page gates nothing. A red lane build (rungs 1 to 3, or rung 5) is a failed build the CI
+health digest reports and a record the page shows; it blocks no release and no merge. Nobody
+signs a certificate: the page computes it from the record, and the record is the evidence.
+
 ## The lane
 
-- **Trigger.** A weekly cron, Saturday 14:00 UTC, plus Rerun from Deck; `max_concurrency: 1`
+- **Trigger.** Two scheduled builds a week, Saturday and Sunday, plus Rerun from Deck; `max_concurrency: 1`
   queues a Rerun behind a running build (oss-test-infra#2768, job
   `ci-kube-agents-certification-1` in `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`).
   A per-release trigger on the tag push is held in reserve: it races the image publish and
@@ -109,22 +130,30 @@ supporting evidence a reader can open; the certificate names the build the custo
   `scripts/release/common.sh`: a GA tag names a stamp commit on the release branch, and the
   published images were built at the candidate commit it promoted. That commit goes to
   `hack/ci-deploy.sh` as `RC_COMMIT_SHA`, which installs the published images and builds nothing.
-- **One tree.** The release's commit supplies everything: the published images, the chart, the
-  CRDs, the harness (`bench/`, `hack/ci-eval-pr.sh`), the roster and the cases. The job checks
+- **One tree.** The release's commit (the GA tag's parent: the candidate commit whose images the
+  release promoted) supplies everything: the published images, the chart, the CRDs, the harness
+  (`bench/`, `hack/ci-eval-pr.sh`), the roster and the cases. The job checks
   the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. A release
   whose tree has no roster entry is skipped before any lease and reads "No run"; the record
   names one commit. A release's cases grade the skills that release ships, so a certificate
   never mixes `main`'s cases with an older release's skills.
-- **Repetitions.** `EVAL_REPETITIONS=60`, `EVAL_TASK_PARALLELISM=1` (every scenario plants a
-  stack, and the harness runs stack-bearing units one at a time). A build cut by its timeout
-  keeps the repetitions it recorded; a Rerun pools the rest into the same release's window.
-- **Artifacts.** The lane's logs bucket, `logs/ci-kube-agents-certification-1/<build>/`, with
-  one `case-<id>.json` per scenario per build (one result per repetition inside it) and
-  `artifacts/release-under-test.json`
+- **Repetitions.** 30 per build, two builds over two days, pooled into the release's 60-window
+  (`EVAL_REPETITIONS=30`, `EVAL_TASK_PARALLELISM=1`: every scenario plants a stack, and the
+  harness runs stack-bearing units one at a time). Builds are sized to finish inside the
+  timeout because a build cut by its deadline records nothing for the scenario it was inside:
+  the case file is written only after the scenario's last repetition. Thirty repetitions at
+  the measured median of about 7.5 minutes, plus 45 to 60 minutes of setup, fit a 720-minute
+  timeout with room for the slow tail. A Rerun on the same release pools into its window.
+- **Artifacts.** The lane's logs bucket, `logs/ci-kube-agents-certification-1/<build>/`:
+  `case-<id>.json` per scenario per build, written by `hack/ci-eval-pr.sh` when the scenario's
+  last repetition has finished (one result per repetition inside it; a cut build has none for
+  the scenario it was inside), and `artifacts/release-under-test.json`
   (`{release, commit, registry}`) written before the first lease. Nothing goes to the evidence
   store or the nightly dashboard.
 - **What the reader consumes.** The release artifact keys every repetition of the build to a
-  release; the page will group by release, split scored from infra, and apply the rule above.
+  release. The page will classify each repetition with the scorer's own per-repetition outcome
+  (pass, fail, safety violation, no valid run, infra, not applicable), never with the marker alone, group by release and model,
+  and apply the rule above. It reads the case files; a cut build contributes nothing.
 
 ## The roster and case rules
 
@@ -159,20 +188,28 @@ The page is not checked in; when it is, it shows:
 
 ## Decisions and their dates
 
-| Decision                                                                                                                                     | Date       |
-| -------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| The rating rule: 0.85 Wilson lower bound at 95 percent, 0.80 weakest-test floor, over 60 runs per test                                       | 2026-10-28 |
-| A certified row below a 0.70 bound on two checks in a row reads Lapsed                                                                       | 2026-11-02 |
-| Cadence weekly; a window may be frontloaded; the suite's cases live flat under `bench/tasks/`                                                | 2026-11-04 |
-| A check binds to the planted object (per-finding scope); namespaced plants share one module                                                  | 2026-11-05 |
-| Releases are certified, never `main`; the certificate names the build the customer installs                                                  | 2026-11-05 |
-| N is 60 scored repetitions per scenario per release under the 57-of-60 rule                                                                  | 2026-11-06 |
-| Infra-classified repetitions are recorded outside the scored count and never vote                                                            | 2026-11-06 |
-| Reruns on the same release pool into that release's window; the cell reads "not enough runs" until 60                                        | 2026-11-06 |
-| Weekly on the newest GA release, with Rerun from Deck; the per-release trigger stays in reserve                                              | 2026-11-06 |
-| One tree: the release's commit supplies images, chart, harness, roster and cases; a release without the roster is skipped and reads "No run" | 2026-11-06 |
-| An `expected_fail` scenario is a declared gap, shown as a gap, never as a pass                                                               | 2026-11-06 |
-| The nightly on `main` is engineering signal and supporting evidence, labelled as `main`, never a certificate                                 | 2026-11-06 |
+| Decision                                                                                                                                                                                    | Date       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| The rating rule: 0.85 Wilson lower bound at 95 percent, 0.80 weakest-test floor, over 60 runs per test                                                                                      | 2026-10-28 |
+| A certified row below a 0.70 bound on two checks in a row reads Lapsed                                                                                                                      | 2026-11-02 |
+| Cadence weekly; a window may be frontloaded; the suite's cases live flat under `bench/tasks/`                                                                                               | 2026-11-04 |
+| A check binds to the planted object (per-finding scope); namespaced plants share one module                                                                                                 | 2026-11-05 |
+| Releases are certified, never `main`; the certificate names the build the customer installs                                                                                                 | 2026-11-05 |
+| N is 60 scored repetitions per scenario per release under the 57-of-60 rule                                                                                                                 | 2026-11-06 |
+| Infra-classified repetitions are recorded outside the scored count and never vote                                                                                                           | 2026-11-06 |
+| Reruns on the same release pool into that release's window; the cell reads "not enough runs" until 60                                                                                       | 2026-11-06 |
+| The newest GA release each week, in two scheduled builds, with Rerun from Deck; the per-release trigger stays in reserve                                                                    | 2026-11-06 |
+| One tree: the release's commit supplies images, chart, harness, roster and cases; a release without the roster is skipped and reads "No run"                                                | 2026-11-06 |
+| An `expected_fail` scenario is a declared gap, shown as a gap, never as a pass                                                                                                              | 2026-11-06 |
+| The nightly on `main` is engineering signal and supporting evidence, labelled as `main`, never a certificate                                                                                | 2026-11-06 |
+| A window closes at exactly 60 scored repetitions; a Rerun fills an open window up to 60, never past it                                                                                      | 2026-11-06 |
+| Lapsed per release: two consecutive release windows that both miss the bar                                                                                                                  | 2026-11-06 |
+| A model change mid-release starts a new window                                                                                                                                              | 2026-11-06 |
+| No certificate when more than about a third of a window's repetitions are infra; the share is shown                                                                                         | 2026-11-06 |
+| The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                              | 2026-11-06 |
+| The page is informational and never gates a release                                                                                                                                         | 2026-11-06 |
+| 30 repetitions per build, two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish                         | 2026-11-06 |
+| Cell states on the scorer's outcome: a safety violation (rung 1) counts as a fail; no valid run (rungs 2 and 3) and infra sit outside the rate, listed by cause, toward the infra-share cap | 2026-11-06 |
 
 ## Open items
 
@@ -180,9 +217,18 @@ The page is not checked in; when it is, it shows:
   local run has been reviewed. The check-in removes `CERTIFIED_PASSES_FILLING` and the 24-of-24
   rule and carries the states above.
 - **The per-release reader cell.** `skill_use.read_build` reads `release-under-test.json` and
-  classifies the infra marker; `skill_rating.rate` windows per release and pools Reruns. About
-  80 lines plus tests, built on the reader's prototype branch (`cs-step-a-skill-view` at
-  79afbdacb).
+  takes each repetition's outcome from the scorer;
+  `skill_rating.rate` windows per release and model and pools Reruns. About 80 lines plus
+  tests, built on the reader's prototype branch (`cs-step-a-skill-view` at 79afbdacb). Both
+  prototype branches are local and not on the upstream repository; the check-in is what makes
+  the record recomputable by anyone.
+- **One build of 60.** A single 60-repetition build under a longer timeout is the later option,
+  once the harness writes the case file per repetition so a cut build keeps what it graded;
+  until then two builds of 30. The lane's job (`EVAL_REPETITIONS`, the cron) follows this
+  document in GoogleCloudPlatform/oss-test-infra#2768.
+- **Rule questions open on 2026-11-06.** Whether the 0.80 floor stays when a 0.85 bound already
+  implies it; and whether a named person signs off each new certificate and how the page records
+  that. Both are answered on the pull request and are decided before the page check-in.
 - **The mixed-tree alternative.** `main` could supply the harness, roster and chart template for
   a release whose tree lacks the tier, with the record naming both commits. Recommended against:
   `main`'s cases grade `main`'s skills, a release ships its own, and a miss would blur a version
