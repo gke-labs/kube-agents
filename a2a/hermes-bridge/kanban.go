@@ -70,7 +70,14 @@ sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id
 err_col = "last_failure_error" if "last_failure_error" in cols else "''"
 assignee_col = "assignee" if "assignee" in cols else "''"
 select_sql = f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err FROM tasks"
-conds, params = [f"created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})"], [since_ts]
+# A session's poll reads the cards its task filed (created or updated since
+# the task began) or tracks, never an older card merely because it is
+# unsettled: one that never settles would hold every later turn on the
+# session to its deadline.
+if session_id == "*":
+    conds, params = [f"created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})"], [since_ts]
+else:
+    conds, params = ["created_at >= ?"], [since_ts]
 if "updated_at" in cols:
     conds.append("COALESCE(updated_at, 0) >= ?")
     params.append(since_ts)
