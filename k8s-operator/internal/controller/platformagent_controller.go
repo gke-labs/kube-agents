@@ -1330,6 +1330,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// A sizing step back's hold ends at a time (sizingStepBackHoldInterval),
+	// and the settled lower row sends no event for it, so the pass that
+	// measures the step again is scheduled for the hold's end.
+	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.

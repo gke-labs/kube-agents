@@ -2515,6 +2515,30 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 	})
 }
 
+// The steady-state requeue is capped at what is left of the hold while a step
+// back is held, so a quiet namespace measures the step when the hold ends
+// rather than at the fifteen-minute requeue; a stale or absent record leaves
+// the caller's ceiling.
+func TestSizingStepBackRequeueFollowsTheHold(t *testing.T) {
+	t.Parallel()
+	agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+	r := &PlatformAgentReconciler{}
+	key := client.ObjectKeyFromObject(agent)
+	if got := r.sizingStepBackRequeue(agent); got != secretEnvReprobeInterval {
+		t.Errorf("requeue with no step back = %s, want the caller's ceiling %s", got, secretEnvReprobeInterval)
+	}
+	elapsed := 3 * time.Minute
+	r.steppedBackAt.Store(key, time.Now().Add(-elapsed))
+	got := r.sizingStepBackRequeue(agent)
+	if remaining := sizingStepBackHoldInterval - elapsed; got <= 0 || got > remaining || got < remaining-time.Minute {
+		t.Errorf("requeue %s into the hold = %s, want about the %s left of it", elapsed, got, remaining)
+	}
+	r.steppedBackAt.Store(key, time.Now().Add(-sizingStepBackHoldInterval))
+	if got := r.sizingStepBackRequeue(agent); got != secretEnvReprobeInterval {
+		t.Errorf("requeue after the hold = %s, want the caller's ceiling %s", got, secretEnvReprobeInterval)
+	}
+}
+
 func TestResourceQuotaNamedIn(t *testing.T) {
 	t.Parallel()
 	for message, want := range map[string]string{

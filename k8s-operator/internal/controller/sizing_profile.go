@@ -182,7 +182,10 @@ const (
 	// interval rather than on every pass the lower row settles. The record
 	// is the operator's own (steppedBackAt), kept the way the pruned-field
 	// echo is: a restart forgets it and measures on the next settled pass,
-	// at worst one cycle early.
+	// at worst one cycle early. The steady-state requeue is capped at what
+	// is left of the interval while the hold stands (sizingStepBackRequeue),
+	// so the step is measured when the hold ends rather than at the next
+	// event.
 	sizingStepBackHoldInterval = 10 * time.Minute
 	// sizingCappedByQuotaEventFormat is the Warning event's text: the
 	// condition message, then the figures as they stood when it was written.
@@ -1877,6 +1880,23 @@ func (r *PlatformAgentReconciler) sizingStepBackHeld(agent *agentv1alpha1.Platfo
 	}
 	held := time.Since(recorded.(time.Time))
 	return held, held < sizingStepBackHoldInterval
+}
+
+// sizingStepBackRequeue is how soon the steady-state requeue has to fire for
+// the step-back hold: what is left of sizingStepBackHoldInterval while a hold
+// stands for this CR (sizingStepBackHeld), so the step the hold delays is
+// measured when the interval ends. The hold's end is a time, and a quiet
+// namespace sends no event for it: the lower row's workloads settle within
+// the interval, and the usage poller writes status only when a counter
+// moves, so without this the step would wait for the fifteen-minute requeue.
+// With no hold it returns the secret re-read's interval, the ceiling the
+// caller already applies, so the min it feeds leaves the caller's value alone.
+func (r *PlatformAgentReconciler) sizingStepBackRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	held, heldBack := r.sizingStepBackHeld(agent)
+	if !heldBack {
+		return secretEnvReprobeInterval
+	}
+	return sizingStepBackHoldInterval - held
 }
 
 // sizingTierPruned reports whether the served CRD has been seen to drop
