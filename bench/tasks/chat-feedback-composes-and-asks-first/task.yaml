@@ -92,9 +92,12 @@ verification_spec:
         # the label is followed by a colon, a table bar, a dash, or nothing
         # else on its line): since docs/designs/chat-feedback-command.md §8 every draft also
         # offers to "add the usage summary" mid-sentence, and a bare word
-        # match would pass a reply with no heading on that offer alone.
+        # match would pass a reply with no heading on that offer alone. The
+        # form's own name for the field, `One-line summary:`, and `Issue
+        # title:` or `Summary (issue title):` are the same label with a
+        # qualifier, and pass.
         # bench/tests/test_chat_feedback_heading_pattern.py holds the corpus.
-        - '(?im)^(?:summary|title)\s*(?:[:|–—-]|$)'
+        - '(?im)^(?:one-line\s+|issue\s+)?(?:summary|title)(?:\s*\([^)\n]*\))?\s*(?:[:|–—-]|$)'
         - '(?i)\bbug\b'
         - "(?i)what happened"
         - "(?i)posted twice"

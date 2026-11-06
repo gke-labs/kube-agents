@@ -75,9 +75,11 @@ verification_spec:
         # else on its line), because the offer this reply must also make
         # says "usage summary" mid-sentence and would otherwise satisfy the
         # heading check on its own, in every spelling ("usage-summary", a
-        # wrap, "a summary of the install's usage").
+        # wrap, "a summary of the install's usage"). The form's own name for
+        # the field, `One-line summary:`, and `Issue title:` or `Summary
+        # (issue title):` are the same label with a qualifier, and pass.
         # bench/tests/test_chat_feedback_heading_pattern.py holds the corpus.
-        - '(?im)^(?:summary|title)\s*(?:[:|–—-]|$)'
+        - '(?im)^(?:one-line\s+|issue\s+)?(?:summary|title)(?:\s*\([^)\n]*\))?\s*(?:[:|–—-]|$)'
         # The kind. The prompt's "once a day would do" reads as a bug or as a
         # request, and the red run on main labelled it Feature request with
         # the rest of the draft in order; either label is the composed kind,
