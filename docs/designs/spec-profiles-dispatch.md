@@ -382,12 +382,14 @@ leave open:
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
   once it is older than the stream's retention plus an hour. The retention is the dispatch
-  config's `submitRetentionSeconds`, which the operator renders from the constant it creates
-  the stream with, and never less than `lib.ProfileSubmitRetention` (72h). Both are compiled
-  values, not the live stream's max age, and the operator never edits an existing stream: a
-  release that raises the max age and a later one that lowers it leave the streams created
-  in between longer than the retention, so the constant isn't lowered below any max age a
-  release has shipped (#4948).
+  config's `submitRetentionSeconds`, never less than `lib.ProfileSubmitRetention` (72h). The
+  operator renders the longer of the constant it creates the stream with and the live stream's
+  max age, which the provision Job reads back and reports when it is longer
+  (`status.profileSubmitMaxAgeSeconds`). The operator never edits an existing stream, so a
+  stream an older release created longer, or one edited by hand, is covered this way, once the
+  Job's next run (at most a day) has read it. The retention is capped at a year
+  (`lib.MaxSubmitRetention`): a stream with no age limit, or a longer one, keeps tombstones that
+  long (#4948).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.

@@ -289,6 +289,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `inference` | `object` | no |  |  | Inference reports the Platform Agent's default model, as the install's LiteLLM config states it. The key is absent until the operator reads the config; an empty object means the config states no default model; a read that fails keeps what is there; the key is absent while the served CRD predates it. |
 | `inference.provider` | `string` | no |  |  | Provider is the LiteLLM provider slug, the text before the first "/" of the default model (gemini, vertex_ai, anthropic, openai, hosted_vllm). |
 | `inference.model` | `string` | no |  |  | Model is the model name after the provider, as typed, or the resource id alone for a resource reference. |
+| `profileSubmitMaxAgeSeconds` | `integer` | no |  |  | ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age, in seconds, when the A2A provision Job last found it longer than this operator creates the stream with (0 when the stream has no age limit). It is absent when the stream is no longer than that, or before a report. Provisioning never edits an existing stream, so one an older operator created longer, or one edited by hand, can keep submissions longer than this operator would, and the dispatcher is told the longer of the two (up to a year): a finished task's tombstone has to outlive its submission. It is read once per provision Job run, so a hand edit is picked up within a day. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: crd-fields-platformagent -->
