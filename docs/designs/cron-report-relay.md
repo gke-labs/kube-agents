@@ -201,9 +201,8 @@ only when its text is the report being relayed, with the flag on and a channel k
 leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
-(`chat_from_card`), with Retry and Drop under each row on Slack; the Google Chat renderer
-draws no row actions yet, so there the rows post with their card ids carried and no buttons.
-Its outcomes, and the report going out as text where the card does not post, are the audit
+(`chat_from_card`), with Retry and Drop under each row, on Slack and on Google Chat
+(`a2a/gateway/slack_board.go`, `a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
 card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row

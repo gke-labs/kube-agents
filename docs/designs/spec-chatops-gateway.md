@@ -1782,6 +1782,21 @@ layout too; both fall back to the text. The golden layouts of the shared cases a
 `a2a/gateway/testdata/gchat-chat/`, beside Slack's. An edit without a chat message replaces the layout, the widgets patched empty, unless it is a running task's line (The Stop button, below). A `mark` draws
 nothing: Chat's reaction API takes user credentials, and the relay holds the app's.
 
+A row that carries `tasks` and `actions` (the board-health card's; "The board-health card's
+buttons" under the Slack adapter) gets its Retry and Drop in the same button list, after the
+choices and links. The list sits under the whole message rather than under each row, so when any
+row carries buttons the renderer numbers every row in the bullet's place ("1. ", "2. ") and labels
+each row's buttons with its number ("Retry 1", "Drop 1"); the button's `kage.board` action carries
+the action, the row's number and the row's ids. A tap is never a turn: it is admitted by the rule
+an inbound message is (`resolvePrincipal`; Chat has no Home tab), then sent over the board route
+as a `lib.BoardAction` like a Slack tap, and the row's line is edited in place, "✓ Retrying.
+<name>, <time>", "Dropped. <name>, <time>" or "No longer stuck. <name>, <time>" set after its text
+on the same line, the time in UTC since Chat has no date token, and the row's two buttons gone; a
+tap that did not land keeps them under a line saying so, so a second tap asks again, and so does
+one whose patch Chat refused. One tap per row at a time, and the edits of one message in turn under
+its rewrite lock, each from the layout the adapter last sent it; a message posted before a restart
+is edited from the event's copy of it, text and buttons (`gchat_board.go`).
+
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
 with the clicked message and its space, `chat.user` the clicker, `commonEventObject` the
@@ -2293,7 +2308,8 @@ A board that cannot be read draws Fleet with a line saying so, never an empty fl
 that moves it (`slack_home_pick.go`; the record paragraph above says what a pick writes).
 
 **The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
-chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
+chat message (and Google Chat under `next` as the same message; "The Google Chat adapter" above has
+that renderer's form of the buttons) whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
 (`actions`, `retry` and `drop`; spec-a2a-payloads.md, "Chat messages"). The renderer lays such a
 row out as its text over an actions block keyed by the row (`kage_board.row.<n>`), labels the
 buttons Retry and Drop itself, and puts the row's ids, joined by commas, in their value

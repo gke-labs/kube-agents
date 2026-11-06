@@ -204,6 +204,14 @@ type gchatUX struct {
 	// its layout to patching it (lockRewrite), by message name, held only
 	// while a rewrite holds or waits on it, so it needs no ring.
 	rewriting map[string]*gchatRewriteLock
+	// board is the layout each message whose rows carry Retry and Drop was
+	// last sent with, by message name, and boardTaps the rows being tapped
+	// or settled, by message and row (gchat_board.go); boardOrder and
+	// boardTapsOrder are their rings.
+	board          map[string]gchatChatLayout
+	boardOrder     []string
+	boardTaps      map[string]bool
+	boardTapsOrder []string
 }
 
 // gchatRewriteLock orders the patches of one message: a rating tap, an
@@ -221,7 +229,8 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
 			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
-			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{}}
+			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{},
+			board: map[string]gchatChatLayout{}, boardTaps: map[string]bool{}}
 	}
 	return a.ux
 }
@@ -355,6 +364,9 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	case gchatFeedbackNoteFunction:
 		// Nor is a click on the note card a 👎 asks for.
 		return InboundMessage{}, a.feedbackNoteClick(ev)
+	case gchatBoardFunction:
+		// Nor is a board-health row's Retry or Drop (gchat_board.go).
+		return InboundMessage{}, a.boardClick(ev)
 	case gchatChatFunction:
 	default:
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"

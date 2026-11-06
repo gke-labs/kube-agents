@@ -110,6 +110,7 @@ const (
 	gchatButtonLink   gchatButtonKind = "link"
 	gchatButtonRating gchatButtonKind = "rating"
 	gchatButtonNote   gchatButtonKind = "note"
+	gchatButtonBoard  gchatButtonKind = "board"
 )
 
 // gchatRating is the rating buttons a message carries: task is the rated
@@ -253,6 +254,8 @@ func classifyGchatButton(b gchatButton) gchatButtonKind {
 		return gchatButtonRating
 	case gchatFeedbackNoteFunction:
 		return gchatButtonNote
+	case gchatBoardFunction:
+		return gchatButtonBoard
 	}
 	return gchatButtonOther
 }
@@ -546,14 +549,9 @@ func cloneGchatWidgets(widgets []gchatAccessoryWidget) []gchatAccessoryWidget {
 	return out
 }
 
-// patchRating patches message to layout.
+// patchRating patches message to layout (patchLayout).
 func (a *GoogleChatAdapter) patchRating(message string, layout gchatChatLayout) error {
-	arguments := map[string]any{
-		gchatNameArg:       message,
-		gchatUpdateMaskArg: gchatLayoutUpdateMask,
-		gchatBodyArg:       gchatLayoutBody(layout),
-	}
-	return a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
+	return a.patchLayout(message, layout)
 }
 
 // gchatNoteText is a typed note as kept: trimmed, and cut to the text box's

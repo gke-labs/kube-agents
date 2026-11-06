@@ -381,6 +381,14 @@ type GoogleChatAdapter struct {
 	// feedback is the answer-feedback recorder the gateway hands over
 	// (FeedbackSink); until then no rating buttons are drawn.
 	feedback FeedbackRecorder
+	// boardActor and boardAdmits are the board route and the admission
+	// rule the gateway hands over for a board-health row's Retry and Drop
+	// (BoardActSink, BoardAdmitSink; gchat_board.go); until both are set a
+	// tap changes nothing. now is the clock a tapped row's time is read
+	// from, time.Now outside a test.
+	boardActor  BoardActor
+	boardAdmits BoardAdmits
+	now         func() time.Time
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -597,6 +605,11 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 		a.rememberRating(message, rating)
 	}
 	a.trackQuestion(message, conversation, m.Chat, layout)
+	sent := layout
+	if rating.task != "" {
+		sent = rated
+	}
+	a.trackBoard(message, m.Chat, sent)
 	return message, landed, nil
 }
 
@@ -700,6 +713,7 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 		return err
 	}
 	a.trackQuestion(messageID, conversation, m.Chat, layout)
+	a.trackBoard(messageID, m.Chat, layout)
 	return nil
 }
 

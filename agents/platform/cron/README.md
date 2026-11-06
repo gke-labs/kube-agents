@@ -593,7 +593,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in

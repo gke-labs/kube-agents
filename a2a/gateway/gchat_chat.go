@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -11,7 +12,8 @@ import (
 // The Google Chat renderer for kube-agents.chat/v1 (spec-a2a-payloads.md,
 // "Chat messages"): one validated chat message laid out as a Chat text
 // message, in the spec's fixed order -- headline and note, detail, rows,
-// after, fold, then the buttons, choices before links -- with the buttons as
+// after, fold, then the buttons, choices before links, then the Retry and
+// Drop of any row that carries them (gchat_board.go) -- with the buttons as
 // accessory widgets under the message; in a progress message the plan
 // follows the headline in the rows' place. It is text rather than a card
 // because Chat's card text has no monospace and no code, which a table, a
@@ -115,7 +117,7 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	}
 	layout := gchatChatLayout{
 		Text:    strings.Join(sections, gchatChatSectionGap),
-		Widgets: gchatChatWidgets(m.Choices, m.Links),
+		Widgets: gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), gchatBoardButtons(m.Rows)...)),
 	}
 	if layout.Text == "" && len(layout.Widgets) == 0 {
 		return gchatChatLayout{}, errGchatChatEmpty
@@ -153,11 +155,18 @@ func gchatBoldLine(text string) string {
 }
 
 // gchatChatRows is the rows as a bulleted list: the severity as inline code
-// ahead of the text, the detail after it on the same line.
+// ahead of the text, the detail after it on the same line. When a row
+// carries buttons, every row is numbered in the bullet's place, since the
+// buttons sit under the whole message and name their row by its number
+// (gchat_board.go).
 func gchatChatRows(rows []chatmsg.Row) string {
 	var lines []string
-	for _, r := range rows {
+	numbered := slackChatRowsAct(rows)
+	for i, r := range rows {
 		line := gchatChatRowBullet
+		if numbered {
+			line = fmt.Sprintf(gchatBoardRowMarker, i+1)
+		}
 		if r.Severity != "" {
 			line += gchatChatCode + r.Severity + gchatChatCode + " "
 		}
@@ -252,11 +261,25 @@ func gchatChatPlan(p *chatmsg.Plan) string {
 }
 
 // gchatChatWidgets is the buttons as one accessory button list, choices
-// before links. A choice's click sends gchatChatFunction with the choice's
-// reply (its text when it has none) and index, which the adapter turns into
-// the clicker's message; a link button opens its url. The one primary entry
-// is drawn filled.
+// before links (gchatChatButtons).
 func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
+	return gchatButtonList(gchatChatButtons(choices, links))
+}
+
+// gchatButtonList is buttons as one accessory button list, nil for none.
+func gchatButtonList(buttons []map[string]any) []map[string]any {
+	if len(buttons) == 0 {
+		return nil
+	}
+	return []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
+}
+
+// gchatChatButtons is the choice and link buttons, choices before links. A
+// choice's click sends gchatChatFunction with the choice's reply (its text
+// when it has none) and index, which the adapter turns into the clicker's
+// message; a link button opens its url. The one primary entry is drawn
+// filled.
+func gchatChatButtons(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
 	var buttons []map[string]any
 	for i, c := range choices {
 		reply := c.Reply
@@ -278,10 +301,7 @@ func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[stri
 		b["onClick"] = map[string]any{"openLink": map[string]any{"url": l.URL}}
 		buttons = append(buttons, b)
 	}
-	if len(buttons) == 0 {
-		return nil
-	}
-	return []map[string]any{{"buttonList": map[string]any{"buttons": buttons}}}
+	return buttons
 }
 
 // gchatHomeButtons marks each choice button of a home post's layout with
