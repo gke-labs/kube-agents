@@ -535,7 +535,8 @@ no sweep. Every id on the line, `unpublished_candidates[].id` included, is the l
 (`published_id`: derived, then clipped at `MAX_FINDING_ID`).
 
 They are absent, not empty, on a run without the flag, so the line a stream without a collector
-prints is unchanged.
+prints is unchanged. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
+a `finish` a worker ran never does.
 
 ### 3.7 The precheck — `manifest_delta`, `precheck`
 
@@ -543,13 +544,17 @@ A scheduled run of a stream in `COLLECTOR_AUDITS` ran its collector and then had
 whole SOP, copy the manifest into a findings document and call `finish`, before anything told it the
 fleet had not changed since the previous scheduled run: a 250-turn session per stream per day whose
 answer was `[SILENT]`. `audit_report.py precheck --audit <id> --manifest-file <manifest>
-[--scheduled]` is the gate the nine governance SOPs run between the collector command and the
-drafting by hand.
+[--scheduled]` is the gate the governance SOPs run after the collector command and before the
+drafting by hand: every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run (`PRECHECK_STREAMS` in the fleet-audit test suite pins the set).
 
 `manifest_delta.manifest_digest` is a SHA-256 over the manifest with its volatile keys removed:
-`started_at` and `finished_at` at the top, and each command's `command`, `duration_s` and
-`output_sha256` (the `check` and `rc` pairs stay, because §3.1 reads them). Everything else is in
-it — every cluster's `outcome`, candidates with their severity, excerpt and impact,
+`started_at` and `finished_at` at the top, each command's `command`, `duration_s` and
+`output_sha256` (the `check` and `rc` pairs stay, because §3.1 reads them), and each candidate's
+`excerpt` and `impact`, which the collectors fill with ages (`AGE=12d`), log-window stamps and
+counts that move on a static fleet, and which §3.2 takes from the fresh manifest on a close.
+Everything else is in it — every cluster's `outcome`, candidates by identity, severity and their
+route and triage fields,
 `checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config
 Connector keys, and the top-level `checks_revision`, so a new collector build is a changed fleet — as a
 drop-list rather than a keep-list, so a key a collector adds later counts as a change until this
@@ -561,23 +566,39 @@ record, `(True, "findings-changed")` when the digest differs or the manifest can
 `checks_unevaluated`), `(True, "periodic-refresh")` when `now - last_full_run_at` reaches the age,
 and `(False, "unchanged")` otherwise.
 
-`finish --scheduled` with a manifest writes that record after it published (`digest`,
-`checks_revision`, `recorded_at`, `last_full_run_at`); a scheduled `finish` that waived the manifest
-removes it. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
+`finish --scheduled` with a manifest writes that record after it published (`version`, `audit`,
+`digest`, `checks_revision`, `recorded_at`, `last_full_run_at`, and `envelope_finished_at`, the
+`finished_at` of the envelope it stored; a record whose `audit` is another stream's reads as no
+record). It writes none, and removes any, when the store's newest envelope is not this run's
+published one: a run diverted because its repository was unreachable (`is_diverted`) published
+nothing, and a digest of its manifest would make the next close republish an older document over
+a fleet that changed. A scheduled `finish` that waived the manifest removes it too. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
 `unchanged`, the line is `{"verdict": …, "closed": false, "reason": …}` and the SOP continues. On
 `unchanged` with the flag, when the newest stored envelope of the ledger this run publishes to
-(`stored_scheduled_document`: not diverted, `scheduled: true`, this id scheme, a `document` with a
-findings list) is there, `precheck` writes that document to `findings_path` and runs `finish
---scheduled` on it with this run's manifest. Nothing in §3.1–§3.6 or the ledger design changes:
+(`stored_scheduled_document`: not diverted, `scheduled: true`, this id scheme, the run the record's
+`envelope_finished_at` names, a `document` with a findings list) is there, and the open ledger issue
+carries no pending `/remediate` request (`pending_ledger_requests`, read as `start` reads them; a
+ledger that cannot be read counts as pending), `precheck` writes that document to `findings_path`
+and runs `finish --scheduled` on it with this run's manifest. The request rule is there because
+the stored document answers no request: `finish` opens a fix only for a `manifest` remediation,
+so a request on a `manual` finding would otherwise wait until the fleet changed. Nothing in §3.1–§3.6 or the ledger design changes:
 the cross-check holds the stored document to the fresh manifest, the delta and the scheduled
 baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finish`'s, plus
 `precheck: unchanged`, and the stored envelope carries the same key
 ([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2); the record keeps its
 `last_full_run_at`, so a static fleet is still drafted in full once a week. A `finish` that
 rejects the stored document puts the findings file back as it was and reports `closed: false`
-with the rejection; a newer on-demand run, a store with nothing, or a document from another scheme
-are reasons to run in full, never errors. An on-demand run never passes the flag, so it is never
-closed from a stored document.
+with the rejection, and a close that dies on anything else puts it back and fails as any command
+does; a newer on-demand run, a store with nothing, a document from another scheme, a record of
+another run or a pending request are reasons to run in full, never errors. An on-demand run never
+passes the flag, so it is never closed from a stored document.
+
+What a close waives, by design: the SOP steps after the collector. On the stockout and cost
+streams some sub-conditions are checked by hand rather than by the collector, and a closed run
+republishes the previous document, whose `checks_run` attests them as that run ran them; a change
+only such a step would catch is seen on the weekly full run (`periodic-refresh`), and those two SOPs
+say so in their precheck step. The weekly refresh is the bound on everything the digest does not
+see.
 
 ## 4. The waiver — `--no-collector-manifest <reason>`
 

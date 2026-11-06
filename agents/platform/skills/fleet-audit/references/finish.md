@@ -25,7 +25,7 @@ and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-ru
 pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
 carry the same sentence as the shipped jobs in its prompt. The same flag goes to `precheck`, which
 runs this `finish` itself on a scheduled run whose collector manifest digests the same as the last
-scheduled run's ([The two-command lifecycle](lifecycle.md#the-two-command-lifecycle)): the
+scheduled run's ([`draft` and `precheck`](lifecycle.md#between-the-collector-and-finish-draft-and-precheck)): the
 document is that run's stored one, the manifest is this run's, and every rule below applies as it
 is. The line such a run prints is this command's, plus `precheck: unchanged`; a `finish` you run
 yourself never carries that key. A scheduled `finish` with a manifest also records the manifest's

@@ -286,6 +286,16 @@ def test_since_state_file_takes_the_stacks_fired_at_as_the_clock(root, monkeypat
     assert with_file.status == "pass", with_file.reason
 
 
+def test_the_planted_envelope_seconds_before_the_fire_does_not_count(root, monkeypatch):
+    """No skew in state-file mode: the plant's finish runs seconds before the fire, in the same pod."""
+    fired = STARTED - timedelta(hours=2)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    _store_with(root, {"precheck": None}, fired - timedelta(seconds=30))
+    result = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert result.status == "fail"
+    assert "since the stack fired the audit" in result.reason
+
+
 def test_an_envelope_older_than_the_fire_fails_with_the_fire_named(root, monkeypatch):
     fired = STARTED - timedelta(hours=2)
     monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))

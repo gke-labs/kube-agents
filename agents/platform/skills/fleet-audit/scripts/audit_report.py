@@ -534,8 +534,9 @@ MAX_REPORTED_FINDINGS_ERRORS = 20
 DRAFT_COMMAND = "draft --audit <id> --manifest-file <collector manifest> --out <findings file>"
 PRECHECK_COMMAND = "precheck --audit <id> --manifest-file <collector manifest> [--scheduled]"
 LIFECYCLE_HINT = (
-    f"The order is `start`, the SOP's collector command, `{PRECHECK_COMMAND}` (which closes an "
-    f"unchanged scheduled run itself), `{DRAFT_COMMAND}`, then "
+    f"The order is `start`, the SOP's collector command, `{PRECHECK_COMMAND}` on its manifest (which "
+    f"closes an unchanged scheduled run itself), the drafting by hand (`{DRAFT_COMMAND}` writes the "
+    "document to fill), then "
     "`finish --audit <id> --findings-file <findings file> --manifest-file <collector manifest>`."
 )
 PRECHECK_USAGE_HINT = (
@@ -1797,6 +1798,12 @@ PRECHECK_REASON_FINDINGS_CHANGED = (
 )
 PRECHECK_REASON_PERIODIC_REFRESH = "the last full synthesis is a week or more old; the SOP continues"
 PRECHECK_CONTINUES_SUFFIX = "; the SOP continues as a full run"
+PRECHECK_PENDING_REQUESTS_REASON = "a /remediate request is pending on the ledger for {ids}"
+PRECHECK_LEDGER_UNREAD_REASON = "the ledger's requests could not be read ({error})"
+PRECHECK_RECORD_MISMATCH_REASON = (
+    "the digest record was written for the scheduled run that finished at {recorded}, and the newest "
+    "stored run finished at {stored}"
+)
 # On the stored envelope only: the title and place of each previous finding
 # that the run kept under _Not re-checked this run_ (`unread_held_entries`).
 # The note and id-only tiers of the held span write no row for them, and the
@@ -23426,33 +23433,71 @@ def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
         return
     delta = _manifest_delta()
     manifest_file = str(getattr(args, "manifest_file", None) or "").strip()
+    record_path = delta.digest_path_for(audit_id, SCRATCH_DIR)
     try:
         if not manifest_file:
-            delta.digest_path_for(audit_id, SCRATCH_DIR).unlink(missing_ok=True)
+            record_path.unlink(missing_ok=True)
             return
         manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):
             return
+        # The record names the envelope this run stored, and only a published
+        # scheduled one: a run that was diverted (its repository unreachable)
+        # published nothing, so the next run must not read its digest as the
+        # ledger's state, and a run the store did not keep leaves nothing for
+        # `precheck` to republish.
+        newest = newest_stored_envelope(audit_id, getattr(args, "repo", None))
+        if not newest or is_diverted(newest) or newest.get(RUN_SCHEDULED_KEY) is not True:
+            record_path.unlink(missing_ok=True)
+            log(
+                f"precheck: no manifest digest recorded for {audit_id}; the store holds no published "
+                "scheduled run of this finish, so the next scheduled run drafts its findings in full."
+            )
+            return
         path = delta.record_scheduled_digest(
-            audit_id, manifest, time.time(), full_run=_PRECHECK_VERDICT is None, scratch_dir=SCRATCH_DIR
+            audit_id,
+            manifest,
+            time.time(),
+            full_run=_PRECHECK_VERDICT is None,
+            scratch_dir=SCRATCH_DIR,
+            envelope_finished_at=str(newest.get("finished_at") or ""),
         )
         log(f"precheck: recorded this scheduled run's manifest digest at {path}")
     except Exception as exc:  # noqa: BLE001 -- the record is for the next run; this one has published
+        record_path.unlink(missing_ok=True)
         log(
             f"WARNING: the manifest digest for {audit_id} was not recorded: {exc}; "
             "the next scheduled run drafts its findings in full."
         )
 
 
-def stored_scheduled_document(audit_id: str, repo: str | None) -> tuple[dict | None, str]:
+def newest_stored_envelope(audit_id: str, repo: str | None) -> dict | None:
+    """The newest envelope in the store of the ledger a run of `repo` publishes to, diverted included.
+
+    `{}` when the store holds none; None when the repository cannot be
+    resolved or the store cannot be read.
+    """
+    try:
+        directory = reports_dir_for(audit_id, resolve_repo_or_no_forge(audit_id, repo))
+    except Exception:  # noqa: BLE001 -- unresolvable is unknowable, and the callers treat None so
+        return None
+    return first_stored_record(directory, lambda envelope: True)
+
+
+def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | None = None) -> tuple[dict | None, str]:
     """The findings document of the last scheduled run of the ledger this run publishes to, or why not.
 
     The newest published envelope of that ledger's store (`first_stored_record`,
     skipping a diverted one) has to be a scheduled run's (`RUN_SCHEDULED_KEY`),
-    under this id scheme, with a `document` that has a findings list. A newer
-    on-demand run, a store that holds nothing, or a document from another
-    scheme is a reason to run the audit in full, never an error: the gate
-    costs a full run when it cannot vouch for a close.
+    under this id scheme, with a `document` that has a findings list, and the
+    run the digest `record` names (`envelope_finished_at`), so the digest and
+    the document are one run's. The ledger must carry no pending `/remediate`
+    request: the stored document answers none, and `finish` opens a fix only
+    for a `manifest` remediation, so a request on a `manual` finding would wait
+    until the fleet changed. A newer on-demand run, a store that holds nothing,
+    a document from another scheme, a mismatched record, a pending request or
+    a ledger that cannot be read is a reason to run the audit in full, never an
+    error: the gate costs a full run when it cannot vouch for a close.
     """
     try:
         store_repo = resolve_repo_or_no_forge(audit_id, repo)
@@ -23472,10 +23517,41 @@ def stored_scheduled_document(audit_id: str, repo: str | None) -> tuple[dict | N
         return None, "the newest stored run of this ledger was not a scheduled run"
     if newest.get("id_scheme") != ID_SCHEME:
         return None, "the newest stored run was written under another id scheme"
+    recorded = str((record or {}).get(_manifest_delta().RECORD_ENVELOPE_KEY) or "")
+    stored = str(newest.get("finished_at") or "")
+    if recorded and recorded != stored:
+        return None, PRECHECK_RECORD_MISMATCH_REASON.format(recorded=recorded, stored=stored)
     document = newest.get("document")
     if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
         return None, "the newest stored run carries no usable findings document"
-    return document, f"the document of the scheduled run that finished at {newest.get('finished_at')}"
+    pending, unread = pending_ledger_requests(audit_id, store_repo)
+    if unread:
+        return None, PRECHECK_LEDGER_UNREAD_REASON.format(error=unread)
+    if pending:
+        return None, PRECHECK_PENDING_REQUESTS_REASON.format(ids=", ".join(pending))
+    return document, f"the document of the scheduled run that finished at {stored}"
+
+
+def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], str | None]:
+    """The `/remediate` targets pending on the stream's open ledger issue, or why they are unknown.
+
+    Read the way `start` reads them. A ledger that is not an issue (no forge,
+    or a forge with no issue tracker) carries no requests; a lookup that fails
+    is unknown, and the caller runs in full rather than close over a request.
+    """
+    if _ledger_key(store_repo) == _ledger_key(NO_FORGE_REPO):
+        return [], None
+    try:
+        decision = finish_target(audit_id, store_repo)
+        if decision.ledger != LEDGER_FORGE:
+            return [], None
+        refresh_credentials(store_repo)
+        number, _, _, _ = find_existing_issue(store_repo, audit_id)
+        if number is None:
+            return [], None
+        return pending_remediate_targets(fetch_issue_comments(store_repo, number)), None
+    except Exception as exc:  # noqa: BLE001 -- unknown requests are a reason to run in full
+        return [], str(exc)
 
 
 def _close_from_stored_document(
@@ -23484,12 +23560,13 @@ def _close_from_stored_document(
     """Run `finish --scheduled` on the stored document and this run's manifest.
 
     None when `finish` published (it printed its own JSON line, with
-    `PRECHECK_KEY`); otherwise the reason the SOP continues, with the
-    findings file put back as it was, so a `draft` the collector command
-    wrote is still the one the worker fills. A rejected document is that
-    reason: the manifest digested the same, but `finish` is the judge of
-    whether the document still fits it. A broker outage is raised as it is
-    from any command, and the same `precheck` is re-run once it answers.
+    `PRECHECK_KEY`); otherwise the reason the SOP continues. On every outcome
+    but a publish the findings file is put back as it was, so a `draft` the
+    collector command wrote is still the one the worker fills. A rejected
+    document is that reason: the manifest digested the same, but `finish` is
+    the judge of whether the document still fits it. A broker outage, and any
+    other failure of the close, is raised as it is from any command; the same
+    `precheck` is re-run once the broker answers.
     """
     path = Path(findings_path_for(audit_id))
     previous = path.read_bytes() if path.is_file() else None
@@ -23506,18 +23583,27 @@ def _close_from_stored_document(
         manifest_file=manifest_file,
         no_collector_manifest=None,
     )
+    def put_back() -> None:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+
     log(f"PRECHECK: {verdict}: closing the run from {source}")
     set_precheck_verdict(verdict)
     try:
         handle_finish(close)
     except BrokerUnavailable:
+        put_back()
         raise
     except ValidationError as exc:
-        if previous is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_bytes(previous)
+        put_back()
         return f"finish did not take the stored document ({exc}){PRECHECK_CONTINUES_SUFFIX}"
+    except BaseException:
+        # A close that died on anything else: the worker continues from the
+        # draft it had, and `main` reports the failure as for any command.
+        put_back()
+        raise
     finally:
         set_precheck_verdict(None)
     return None
@@ -23557,7 +23643,9 @@ def handle_precheck(args: argparse.Namespace) -> None:
     elif run_llm:
         line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
     else:
-        document, source = stored_scheduled_document(audit_id, getattr(args, "repo", None))
+        document, source = stored_scheduled_document(
+            audit_id, getattr(args, "repo", None), delta.read_record(audit_id, SCRATCH_DIR)
+        )
         if document is None:
             line[PRECHECK_REASON_KEY] = f"{source}{PRECHECK_CONTINUES_SUFFIX}"
         else:
