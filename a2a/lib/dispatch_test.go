@@ -297,6 +297,9 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
 		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
 		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"overflowing stop grace":    {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing cooldown":      {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing deadline":      {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"duplicate profile":         {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
 		"no concurrency":            {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
 		"misnamed durable":          {func(c *DispatchConfig) { c.Profiles[0].Durables[0].Name = "other" }, "durable"},
@@ -401,9 +404,10 @@ func TestTheOperatorsHeldDurableIsOneSubscribeHeldBinds(t *testing.T) {
 	}
 }
 
-// A negative submission retention is refused; zero is an operator that
-// predates the field.
-func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
+// A negative submission retention is refused, and so is one past
+// MaxSubmitRetention, whose seconds would overflow a time.Duration well
+// before they mean anything; zero is an operator that predates the field.
+func TestDispatchConfigRefusesARetentionOutOfRange(t *testing.T) {
 	base := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20, RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("the base config: %v", err)
@@ -412,5 +416,17 @@ func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
 	neg.SubmitRetentionSeconds = -1
 	if err := neg.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
 		t.Errorf("a negative retention = %v, want refused", err)
+	}
+	longest := base
+	longest.SubmitRetentionSeconds = int(MaxSubmitRetention / time.Second)
+	if err := longest.Validate(); err != nil {
+		t.Errorf("the longest retention: %v", err)
+	}
+	for _, seconds := range []int{int(MaxSubmitRetention/time.Second) + 1, 27670112510} {
+		long := base
+		long.SubmitRetentionSeconds = seconds
+		if err := long.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
+			t.Errorf("a retention of %ds = %v, want refused", seconds, err)
+		}
 	}
 }

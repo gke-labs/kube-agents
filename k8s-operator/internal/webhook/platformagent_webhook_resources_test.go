@@ -82,7 +82,7 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
 	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("400Mi")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.limits.memory" || !strings.Contains(errs[0].Detail, "672Mi floor") {
 		t.Errorf("expected the floor refusal alone, got %v", errs)
 	}
@@ -101,7 +101,7 @@ func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.requests.memory" {
 		t.Errorf("expected the crossed-pair refusal alone, got %v", errs)
 	}
@@ -240,15 +240,15 @@ func TestCredentialProxyLimitEqualToTheRequestIsNotNoted(t *testing.T) {
 }
 
 // A request raised past a limit the CR never wrote: the merged result is what
-// is checked, and the error names the operator's default as the other side.
+// is checked, and the error names the sizing profile row's figure as the other side.
 func TestCredentialProxyRequestAboveTheDefaultLimitIsRefused(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
-	if !strings.Contains(msg, "operator's default 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
-		t.Errorf("message %q does not name the default limit it collides with", msg)
+	if !strings.Contains(msg, "sizing profile row's 2Gi memory limit") || !strings.Contains(msg, "set limits.memory as well") {
+		t.Errorf("message %q does not name the row's limit it collides with", msg)
 	}
 }
 
@@ -441,7 +441,7 @@ func TestCredentialProxyUnrepresentableCPUIsRefused(t *testing.T) {
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 2 {
 		t.Fatalf("expected the two cpu refusals alone, got %v", errs)
 	}
@@ -627,4 +627,29 @@ func TestShellSandboxLimitAloneDrawsTheNote(t *testing.T) {
 	if !noted {
 		t.Errorf("warnings = %v; want the limit-without-request note naming the shell", warnings)
 	}
+}
+
+// TestCredentialProxyOverrideIsValidatedAgainstTheLatchedRow: the row an
+// override is checked against is the one the CR renders, read off the status
+// the object carries. A 3 CPU request crosses the small row's 2 CPU limit and
+// sits under the fleet row's 8: an explicit fleet switched to auto keeps it,
+// since the latch stays at fleet, and auto with no latch yet refuses it.
+func TestCredentialProxyOverrideIsValidatedAgainstTheLatchedRow(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	override := &corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")}}
+	explicitFleet := proxyResourcesAgent(override)
+	explicitFleet.Spec.Deployment.SizingProfile = "fleet"
+	explicitFleet.Status.EffectiveSizingTier = "fleet"
+	if _, err := val.ValidateUpdate(context.Background(), explicitFleet.DeepCopy(), explicitFleet); err != nil {
+		t.Fatalf("an explicit fleet refused a 3 CPU request: %v", err)
+	}
+	switchedToAuto := explicitFleet.DeepCopy()
+	switchedToAuto.Spec.Deployment.SizingProfile = "auto"
+	if _, err := val.ValidateUpdate(context.Background(), explicitFleet, switchedToAuto); err != nil {
+		t.Fatalf("the switch from fleet to auto was refused for an override the latched fleet row admits: %v", err)
+	}
+	unlatched := switchedToAuto.DeepCopy()
+	unlatched.Status.EffectiveSizingTier = ""
+	_, err := val.ValidateUpdate(context.Background(), explicitFleet, unlatched)
+	assertFieldError(t, err, "spec.deployment.credentialProxy.resources.requests.cpu")
 }

@@ -34,6 +34,31 @@ CLUSTER = {
     "legacyAbac": {"enabled": True},
 }
 EVENT_GAP_S = 0.3
+# What the fake API server answers a named Pod GET with: a Pod's whole
+# ObjectMeta, which carries a client-side apply's manifest (env values
+# included), other labels and annotations, and managedFields.
+POD_METADATA_UPSTREAM = {
+    "kind": "PartialObjectMetadata",
+    "apiVersion": "meta.k8s.io/v1",
+    "metadata": {
+        "name": "web-0",
+        "namespace": "default",
+        "uid": "u-1",
+        "labels": {"app": "web", "pod-template-hash": "6cfdb6b98b", "team": "payments"},
+        "annotations": {
+            "kubectl.kubernetes.io/last-applied-configuration": '{"spec":{"containers":[{"env":[{"name":"DB_PASSWORD","value":"hunter2"}]}]}}',
+            "note": "x",
+        },
+        "managedFields": [{"manager": "kubectl", "fieldsV1": {"f:spec": {}}}],
+        "ownerReferences": [
+            {"apiVersion": "apps/v1", "kind": "StatefulSet", "name": "web", "uid": "u-2", "controller": True,
+             "blockOwnerDeletion": True},
+        ],
+    },
+}
+POD_METADATA_PROJECTED = {
+    "metadata": {"ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True}]},
+}
 # For the peer that stops reading its stream: the window the broker gives
 # it, how long a test waits for the broker to act, the handler thread's
 # logging settle after the close, and the API server's chunk, written until
@@ -51,6 +76,7 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         owner = self
         self.google_requests = []
         self.k8s_requests = []
+        self.pod_status, self.pod_body = 200, json.dumps(POD_METADATA_UPSTREAM).encode()
         self.stream_unread = False
 
         class Google(BaseHTTPRequestHandler):
@@ -109,8 +135,10 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
                         time.sleep(EVENT_GAP_S)
                     self.wfile.write(b"0\r\n\r\n")
                     return
-                body = b'{"kind":"EventList","items":[]}'
-                self.send_response(200)
+                status, body = 200, b'{"kind":"EventList","items":[]}'
+                if "/pods/" in self.path:
+                    status, body = owner.pod_status, owner.pod_body
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -184,7 +212,7 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         elif attribute in CredentialProxyHandler.__dict__:
             delattr(CredentialProxyHandler, attribute)
 
-    def _request(self, method, path, token="watcher-token", body=None, headers=None):
+    def _request(self, method, path, token="watcher-token", body=None, headers=None, response_headers=None):
         headers = dict(headers or {})
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -194,6 +222,8 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         try:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
+            if response_headers is not None:
+                response_headers.update(response.getheaders())
             return response.status, response.read()
         finally:
             connection.close()
@@ -396,11 +426,96 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(len(self.k8s_requests), 1)
 
+    def test_a_named_pod_reaches_the_api_server_only_as_metadata(self):
+        # The event watcher's owner lookup. The broker forwards the Accept the
+        # policy read, so the API server answers with the Pod's ObjectMeta.
+        metadata = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+        status, body = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0",
+            headers={"Accept": metadata},
+        )
+        self.assertEqual(status, 200, body)
+        [(path, headers)] = self.k8s_requests
+        self.assertEqual(path, "/api/v1/namespaces/default/pods/web-0")
+        self.assertEqual(headers["Accept"], metadata)
+        # Only the projection leaves the broker: no annotation (the
+        # last-applied manifest and its env value among them), no other label,
+        # no managedFields.
+        self.assertEqual(json.loads(body), POD_METADATA_PROJECTED)
+        self.assertNotIn(b"hunter2", body)
+        self.assertNotIn(b"managedFields", body)
+        self.k8s_requests.clear()
+        for accept in (None, "application/json", metadata + ",application/json"):
+            with self.subTest(accept=accept):
+                status, body = self._request(
+                    "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0",
+                    headers={"Accept": accept} if accept else None,
+                )
+                self.assertEqual(status, 403, body)
+                self.assertIn(watcher_policy.RULE_K8S_ACCEPT, json.loads(body)["message"])
+        self.assertEqual(self.k8s_requests, [])
+
+    def _pod_metadata(self, response_headers=None):
+        return self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0",
+            headers={"Accept": "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"},
+            response_headers=response_headers,
+        )
+
+    def test_a_projected_pod_answer_carries_its_length(self):
+        # Framed by length, so it ends where the body ends under HTTP/1.1
+        # keep-alive as well as under a close.
+        response_headers = {}
+        status, body = self._pod_metadata(response_headers)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(response_headers.get("Content-Length"), str(len(body)))
+
+    def test_a_pod_read_that_carries_a_body_closes_with_its_answer(self):
+        # The route reads no body on a GET, so the answer says it closes,
+        # and the unread bytes are never parsed as a next request.
+        response_headers = {}
+        status, body = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0",
+            body=b"{}",
+            headers={"Accept": "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"},
+            response_headers=response_headers,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(response_headers.get("Connection"), "close")
+        response_headers.clear()
+        self._pod_metadata(response_headers)
+        self.assertNotEqual(response_headers.get("Connection"), "close")
+
+    def test_a_pod_answer_the_broker_cannot_project_is_refused_not_relayed(self):
+        # A 200 that is not a PartialObjectMetadata (a full Pod, should the
+        # server ignore the Accept) and an answer past the size cap are each a
+        # 502 with none of the upstream body.
+        full_pod = json.dumps({"kind": "Pod", "metadata": POD_METADATA_UPSTREAM["metadata"], "spec": {}}).encode()
+        oversize = json.dumps(dict(POD_METADATA_UPSTREAM, pad="x" * credential_proxy.WATCHER_POD_METADATA_MAX_BYTES)).encode()
+        # An error answer past the cap is refused too, not relayed cut short.
+        for name, status_code, upstream in (
+            ("full pod", 200, full_pod), ("not json", 200, b"not json"), ("oversize", 200, oversize),
+            ("oversize error", 500, oversize),
+        ):
+            with self.subTest(name):
+                self.pod_status, self.pod_body = status_code, upstream
+                status, body = self._pod_metadata()
+                self.assertEqual(status, 502, body)
+                self.assertEqual(json.loads(body)["code"], "UPSTREAM_UNRELAYABLE")
+                self.assertNotIn(b"hunter2", body)
+
+    def test_a_pod_read_the_api_server_refuses_is_relayed_as_its_status(self):
+        status_body = b'{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}'
+        self.pod_status, self.pod_body = 404, status_body
+        status, body = self._pod_metadata()
+        self.assertEqual(status, 404)
+        self.assertEqual(body, status_body)
+
     def test_a_refusal_is_a_kubernetes_status_naming_the_rule(self):
         # client-go turns this into a StatusError with the message verbatim, so
         # the drift join's lookup error says which rule refused the read.
         status, body = self._request(
-            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0"
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/nodes/node-1"
         )
         self.assertEqual(status, 403)
         refusal = json.loads(body)

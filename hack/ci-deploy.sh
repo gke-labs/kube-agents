@@ -73,8 +73,9 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
 # Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
-# in agents/platform/scripts/session_kv_server.py), on so that
-# incident-triage-workload-fold can see three replicas become one incident.
+# in agents/platform/scripts/session_kv_server.py; on by default at an hour),
+# set shorter here so that incident-triage-workload-fold can see three replicas
+# become one incident without one case's window reaching the next repetition.
 # Like the ceilings above it is install-wide, so it reaches every case, and the
 # value is bounded on both sides by measurements, not medians:
 #
@@ -384,8 +385,9 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
-# GitLab CE lanes' only nightlies (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
-# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt); and the
+# GitLab CE lanes' weekly jobs (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
+# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt), with the next-mode
+# nightlies they replace listed until the weekly jobs run; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
@@ -402,7 +404,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it

@@ -47,8 +47,9 @@ session record carries that context. A subscription with no thread (a DM,
 or a space as a whole) is not delivered at all: posting it as a new thread in
 the home channel would move text meant for one space into another.
 
-When the route is not there (the gateway restarting, its route unarmed, the
-bus unreachable: ``a2a notify`` exit 4), :func:`resolve` answers no adapter,
+When the route is not there (the gateway restarting or stopping, its route
+unarmed, the bus unreachable, a record it couldn't read in time: ``a2a notify``
+exit 4), :func:`resolve` answers no adapter,
 which is upstream's disconnected-adapter path: skipped without a claim and
 without spending the failure budget. It learns this from a probe (an empty
 notify, which an armed gateway refuses at once) that the collector's pre-claim
@@ -128,7 +129,8 @@ HOME_FILE_PLATFORM = "slack"
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
 # request and did not answer (the post may still land, so it is not re-sent),
-# and the route is not there right now (nothing posted).
+# and the route is not there right now, including a refusal the gateway marks
+# retry (nothing posted).
 NOTIFY_OUTCOME_UNKNOWN = 3
 NOTIFY_ROUTE_UNAVAILABLE = 4
 # The gateway refused a home post for want of a home channel and kept it for
