@@ -116,7 +116,8 @@ REPORT_FORMAT_STANZA = """\
 Put the full answer in `result` as standard Markdown — the gateway posts it
 verbatim into the requester's chat thread, where Slack renders it as blocks
 and Google Chat flattens headings to bold, shows a pipe table as a monospace
-block, and splits anything past 4000 characters across messages:
+block (under `spec.mode: next`; the legacy Chat path shows the pipes as
+written), and splits anything past 4000 characters across messages:
 
 - Before you write the verdict, test every finding against the card's own
   definitions. When the card says what counts — "idle" meaning under 5% CPU,
@@ -168,8 +169,9 @@ block, and splits anything past 4000 characters across messages:
 - Put tabular data in one Markdown pipe table with a `---` separator row: a
   listing with a value per column (a row per node, cluster or workload) is a
   table, not a bullet per row, and its rows are not repeated as bullets. Keep
-  it to a few short columns, so Google Chat's monospace block fits the
-  message width.
+  it to a few short columns, so the monospace block the gateway shows under
+  `spec.mode: next` fits the message width and the pipes the legacy Chat
+  path shows as written stay readable.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
 - When knowledge or documentation lookups (e.g. Developer Knowledge MCP or web search) are used, conclude with a `## Sources` section citing the tools and documentation sources used; an answer that is only the opening paragraph links the doc in its evidence instead. The commands and cluster reads you ran are not sources.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
@@ -254,7 +256,8 @@ DEFECT_ADVICE = {
         "and has no real Markdown. Slack renders that as flat text. Use `##` "
         "headings. A pipe table with a `---` separator row is right for "
         "tabular data; keep it to a few short columns, which Google Chat "
-        "shows as a monospace block."
+        "shows as a monospace block under `spec.mode: next` and as written "
+        "on the legacy path."
     ),
     "heading-without-prose": (
         "`result` is a heading over a bare list. Put the answer on the first "

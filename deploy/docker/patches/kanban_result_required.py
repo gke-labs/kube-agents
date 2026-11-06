@@ -320,10 +320,11 @@ NEW_RESULT_DESCRIPTION = (
     "(the chat message already shows the card title), "
     "`[text](url)` for every artifact you name, backticks "
     "around raw values like ids, paths and timestamps, and a "
-    "one pipe table for tabular data (a row per node, cluster or "
-    "workload is a table row, not a bullet, and is not repeated as "
-    "one), kept to a few short columns, which Google Chat shows as "
-    "a monospace block."
+    "pipe table for tabular data, one table with a row per node, "
+    "cluster or workload (a row is not a bullet and is not repeated "
+    "as one), kept to a few short columns: Google Chat shows it as a "
+    "monospace block under `spec.mode: next` and as written on the "
+    "legacy path."
 )
 
 # Upstream's ``_handle_complete`` has raised the check through ``_check`` (a
