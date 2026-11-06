@@ -66,8 +66,10 @@ type ActiveTask struct {
 	// LineClosed marks a live message a Google Chat stop closed, a Stop
 	// press or a typed stop (chat_stop_press.go): it reads "cancel sent"
 	// with no Stop control, and the relay leaves it so until the terminal
-	// edit (updateRollingLine, showBusy). False for a typed stop on any
-	// other backend, whose line keeps moving until the terminal.
+	// edit (updateRollingLine, showBusy). False for every other stop: one
+	// typed on another backend, or on Google Chat on a task with no line
+	// or when the armed card stop answers it (cardStopWanted); such a line
+	// keeps moving until the terminal.
 	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
 	// and the revision the mint returned. Every envelope the gateway sends

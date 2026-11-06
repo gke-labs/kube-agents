@@ -104,9 +104,11 @@ const relayDurable = "gateway-relay"
 // cancelSentNotice is the gateway's answer to a stop with a task running:
 // posted for a typed stop, and edited onto the task's line for a Google
 // Chat Stop press or a stop typed on Google Chat (chat_stop_press.go).
-// cancelAlreadySentNotice answers a second stop while that cancel's terminal
-// is pending, on the same two surfaces. cancelNotSentNotice is the answer
-// when the cancel did not reach the bus.
+// cancelAlreadySentNotice answers a stop on a task whose cancel is already
+// on the bus: a second stop while the terminal is pending, posted or on the
+// line, and a named cancel of a task this conversation has already
+// cancelled (cancelNamedTask). cancelNotSentNotice is the answer when the
+// cancel did not reach the bus.
 const (
 	cancelSentNotice        = "🛑 cancel sent — the task ends when the executor confirms"
 	cancelAlreadySentNotice = "🛑 cancel already sent — the task ends when the executor confirms"
@@ -3160,7 +3162,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	if ref.Canceled {
-		g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
+		g.post(rec.Key, cancelAlreadySentNotice)
 		return
 	}
 	if ref.CorrelationID == "" {

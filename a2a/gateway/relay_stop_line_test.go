@@ -627,3 +627,40 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 		}
 	}
 }
+
+// A typed stop on Google Chat whose cancel does not reach the bus is said
+// on the line: "could not send the stop", with the Stop control kept for
+// another try, and nothing posted. The task stays attached and unmarked.
+func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-typed-nosend"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	deleteTasksStream(t, r.url)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M2", Text: "stop"}
+	waitFor(t, "the failure on the line with its Stop", func() bool {
+		return slices.ContainsFunc(r.adapter.stopLinesCopy(), func(l fakePost) bool {
+			return l.MessageID == line && strings.Contains(l.Text, "could not send the stop")
+		})
+	})
+	got, _ := r.g.reg.Get(context.Background(), conv)
+	if got == nil || got.ActiveTask == nil || got.ActiveTask.Detached || got.ActiveTask.LineClosed {
+		t.Fatalf("record after a failed cancel: %+v", got)
+	}
+	if ref, _ := got.TaskRefFor(origin.TaskID); ref.Canceled || ref.QuietCancel {
+		t.Fatalf("a failed cancel was recorded: %+v", ref)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🛑") || strings.Contains(p, "could not send") {
+			t.Errorf("a failed typed stop posted %q; the line is the reply", p)
+		}
+	}
+}

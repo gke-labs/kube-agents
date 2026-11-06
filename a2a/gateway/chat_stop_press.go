@@ -18,8 +18,9 @@ import (
 // posts, where a DM's thread-less key would otherwise put the line, the
 // "cancel sent" post and the relay's "canceled" each in a message of its
 // own. A second typed stop while the cancel is pending moves "cancel
-// already sent" onto the line. The console and Discord keep the posts: they
-// draw no button, and the posted replies are their contract. A
+// already sent" onto the line. Every other backend keeps the posts: the
+// console and Discord draw no button, and the posted replies are their
+// contract; Slack's typed stop keeps its rule beside the native Stop. A
 // second press while the cancel is pending has no button to land on; one
 // that arrives anyway, or one on a task a typed stop already detached,
 // closes the line if the first closing edit did not land, and otherwise
@@ -61,20 +62,29 @@ func (g *Gateway) chatStopPress(ctx context.Context, rec *SessionRecord, msg Inb
 		g.log.Info("chat stop press on a task already stopping", "conversation", rec.Key, "taskId", active.TaskID)
 		return
 	}
-	quiet := active.StatusMsgID != ""
-	if !g.cancelTaskVoiced(ctx, rec, authority, quiet) {
-		if quiet {
-			g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), active.TaskID)
-		}
+	if active.StatusMsgID == "" {
+		g.cancelTaskVoiced(ctx, rec, authority, false)
 		return
 	}
-	if !quiet {
-		return
+	if g.stopOnLine(ctx, rec, authority) {
+		g.closePressedLine(rec, active, pressed)
+	}
+}
+
+// stopOnLine sends the quiet cancel for rec's active task, which has a
+// line, and closes the line on cancelSentNotice; it reports whether the
+// cancel reached the bus. A cancel that did not is said on the line, which
+// keeps its control for another press or stop.
+func (g *Gateway) stopOnLine(ctx context.Context, rec *SessionRecord, authority Authority) bool {
+	active := rec.ActiveTask
+	if !g.cancelTaskVoiced(ctx, rec, authority, true) {
+		g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), active.TaskID)
+		return false
 	}
 	if g.closeLineOnPress(rec, active, cancelSentNotice) {
 		active.LineClosed = true
 	}
-	g.closePressedLine(rec, active, pressed)
+	return true
 }
 
 // isChatTypedStop reports a stop typed on Google Chat: the word, from the
@@ -85,12 +95,10 @@ func isChatTypedStop(msg InboundMessage, backend string) bool {
 }
 
 // chatTypedStop answers a stop typed on Google Chat on rec's active task,
-// which has a line: the quiet cancel, then the line closed on
-// cancelSentNotice, as a press is answered. A cancel that did not reach the
-// bus is said on the line, which keeps its control. A second stop while the
-// cancel is pending closes the line on cancelAlreadySentNotice, which also
-// lands the close a first edit missed. No message of the typist's is
-// touched: the typed message is not a line.
+// which has a line, as a press is answered (stopOnLine). A second stop
+// while the cancel is pending closes the line on cancelAlreadySentNotice,
+// which also lands the close a first edit missed. No message of the
+// typist's is touched: the typed message is not a line.
 func (g *Gateway) chatTypedStop(ctx context.Context, rec *SessionRecord, authority Authority) {
 	active := rec.ActiveTask
 	if active.Detached {
@@ -100,13 +108,7 @@ func (g *Gateway) chatTypedStop(ctx context.Context, rec *SessionRecord, authori
 		g.log.Info("chat typed stop on a task already stopping", "conversation", rec.Key, "taskId", active.TaskID)
 		return
 	}
-	if !g.cancelTaskVoiced(ctx, rec, authority, true) {
-		g.editLine(rec.Key, active.StatusMsgID, withLineNote(cancelNotSentNotice, active.LineNote), active.TaskID)
-		return
-	}
-	if g.closeLineOnPress(rec, active, cancelSentNotice) {
-		active.LineClosed = true
-	}
+	g.stopOnLine(ctx, rec, authority)
 }
 
 // closeLineOnPress edits the active task's line to text with no Stop
