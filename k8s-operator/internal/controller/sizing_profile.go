@@ -377,6 +377,19 @@ type sizingStep struct {
 	limits   corev1.ResourceList
 }
 
+// sizingClampedLimits is, per sized container name, the resource names on
+// which the running template carries a limit equal to its request: on a GKE
+// Autopilot cluster, the names its admission clamped without Pod bursting
+// (sizedLimitClamped, the shape sizedContainerCarries reads too). The pod a
+// step recreates is clamped the same way, so a limits.* quota is charged the
+// request on such a name, and the step's limits side there is the requests
+// side's difference rather than the rows' limits difference (the sidecar's
+// 2Gi to 8Gi memory limit over a 384Mi request moves the quota by nothing). A
+// name not clamped, and every name on a Standard cluster (nil), counts the
+// rows' limits as written. Read off the live workloads once per measuring
+// pass (sizingRunningClampedLimits).
+type sizingClampedLimits map[string]map[corev1.ResourceName]bool
+
 // renderedCredentialProxyResourcesAt is the credential-proxy container as
 // reconcileCredentialProxy renders it at tier: the CR's override merged over
 // the row when the tier's validator admits it, and the bare row when it
@@ -417,20 +430,44 @@ func renderedShellSandboxResourcesAt(agent *agentv1alpha1.PlatformAgent, tier si
 }
 
 // sizingStepBetween is the sizingStep from tier from to tier to for agent,
-// each side as the reconciler renders that tier.
-func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, from, to sizingTier) sizingStep {
+// each side as the reconciler renders that tier, the limits side read through
+// clamped (sizingClampedLimits).
+func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped sizingClampedLimits, from, to sizingTier) sizingStep {
 	deployment := agent.Spec.Deployment
-	pairs := [][2]corev1.ResourceRequirements{
-		{renderedCredentialProxyResourcesAt(deployment, autopilot, from), renderedCredentialProxyResourcesAt(deployment, autopilot, to)},
-		{renderedAgentAPIAuthResourcesAt(deployment, from), renderedAgentAPIAuthResourcesAt(deployment, to)},
-		{renderedShellSandboxResourcesAt(agent, from), renderedShellSandboxResourcesAt(agent, to)},
+	pairs := []struct {
+		container string
+		from, to  corev1.ResourceRequirements
+	}{
+		{credentialProxyContainerName, renderedCredentialProxyResourcesAt(deployment, autopilot, from), renderedCredentialProxyResourcesAt(deployment, autopilot, to)},
+		{agentAPIAuthContainerName, renderedAgentAPIAuthResourcesAt(deployment, from), renderedAgentAPIAuthResourcesAt(deployment, to)},
+		{shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, from), renderedShellSandboxResourcesAt(agent, to)},
 	}
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
 	for _, pair := range pairs {
-		addResourceDelta(step.requests, effectiveRequests(pair[0]), effectiveRequests(pair[1]))
-		addResourceDelta(step.limits, pair[0].Limits, pair[1].Limits)
+		fromRequests, toRequests := effectiveRequests(pair.from), effectiveRequests(pair.to)
+		addResourceDelta(step.requests, fromRequests, toRequests)
+		addResourceDelta(step.limits,
+			clampedLimits(pair.from.Limits, fromRequests, clamped[pair.container]),
+			clampedLimits(pair.to.Limits, toRequests, clamped[pair.container]))
 	}
 	return step
+}
+
+// clampedLimits is limits with each name in clamped replaced by its figure in
+// requests, the limit Autopilot's admission sets on a clamped name; limits as
+// given when nothing is clamped.
+func clampedLimits(limits, requests corev1.ResourceList, clamped map[corev1.ResourceName]bool) corev1.ResourceList {
+	if len(clamped) == 0 {
+		return limits
+	}
+	out := corev1.ResourceList{}
+	for name, quantity := range limits {
+		if request, ok := requests[name]; ok && clamped[name] {
+			quantity = request
+		}
+		out[name] = quantity.DeepCopy()
+	}
+	return out
 }
 
 // effectiveRequests is a container's requests as the API server accounts
@@ -662,24 +699,21 @@ func sizingStatefulSetSettled(sts *appsv1.StatefulSet, container string, rendere
 // this reading sound under bursting too, where limits survive: no row sets a
 // limit equal to its request on a name the next row raises the limit of
 // alone (TestSizingRowsKeepTheClampReadable), so an equal pair is a clamp or
-// a row the requests side tells apart. A name the row sets a limit for alone
-// (the proxy's ephemeral-storage) has no request to stand for it and is
-// compared as written; Autopilot copies such a limit into the request and
-// leaves the limit where it was. On a Standard cluster nothing rewrites a
-// limit and the row's limit is wanted as written.
+// a row the requests side tells apart. That holds for the rows alone: a CR
+// override that pins a request to the lower row's limit (a 2Gi memory request
+// on the sidecar) writes an equal pair on a cluster with bursting too, which
+// this reading takes for a clamp, so such a template at the lower tier reads
+// as settled at the higher one on the limit the override does not move. A
+// name the row sets a limit for alone (the proxy's ephemeral-storage) has no
+// request to stand for it and is compared as written; Autopilot copies such a
+// limit into the request and leaves the limit where it was. On a Standard
+// cluster nothing rewrites a limit and the row's limit is wanted as written.
 //
 // A template rendered at a lower tier falls short on a figure the step raises;
 // one whose override has since been lowered reads as settled with the quota
 // charged more than the step assumes, the safe side.
 func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements, autopilot bool) bool {
-	var found *corev1.Container
-	for _, list := range [][]corev1.Container{template.Spec.Containers, template.Spec.InitContainers} {
-		for i := range list {
-			if list[i].Name == name {
-				found = &list[i]
-			}
-		}
-	}
+	found := sizedContainer(template, name)
 	if found == nil {
 		return true
 	}
@@ -701,18 +735,87 @@ func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendere
 		if !set {
 			return false
 		}
-		if autopilot {
-			request, requested := found.Resources.Requests[resourceName]
-			_, rowRequests := rendered.Requests[resourceName]
-			if requested && rowRequests && got.Cmp(request) == 0 {
-				continue
-			}
+		if _, rowRequests := rendered.Requests[resourceName]; autopilot && rowRequests && sizedLimitClamped(found, resourceName) {
+			continue
 		}
 		if got.Cmp(wanted) < 0 {
 			return false
 		}
 	}
 	return true
+}
+
+// sizedContainer is the container named name in a pod template (its
+// containers or, for the native sidecar, its init containers), nil when the
+// template does not carry it.
+func sizedContainer(template corev1.PodTemplateSpec, name string) *corev1.Container {
+	var found *corev1.Container
+	for _, list := range [][]corev1.Container{template.Spec.Containers, template.Spec.InitContainers} {
+		for i := range list {
+			if list[i].Name == name {
+				found = &list[i]
+			}
+		}
+	}
+	return found
+}
+
+// sizedLimitClamped reports whether a container's template carries a limit
+// equal to its request on name, the shape GKE Autopilot's admission leaves on
+// every container without Pod bursting.
+func sizedLimitClamped(container *corev1.Container, name corev1.ResourceName) bool {
+	request, requested := container.Resources.Requests[name]
+	limit, limited := container.Resources.Limits[name]
+	return requested && limited && limit.Cmp(request) == 0
+}
+
+// sizingRunningClampedLimits reads, on a GKE Autopilot cluster, which limits
+// the running templates carry equal to their requests on each of the three
+// sized containers (sizedLimitClamped), for the step's limits side
+// (sizingClampedLimits); nil on a Standard cluster, where nothing clamps. The
+// reads are the cache hits sizingTierUnsettledWorkload makes, and the caller
+// measures only once that check has passed, so the templates read here carry
+// the running tier. A workload that cannot be read has no entry, and its
+// limits count as the rows write them, the side that holds.
+func (r *PlatformAgentReconciler) sizingRunningClampedLimits(ctx context.Context, agent *agentv1alpha1.PlatformAgent) sizingClampedLimits {
+	if !r.clusterAutopilot() {
+		return nil
+	}
+	clamped := sizingClampedLimits{}
+	note := func(template corev1.PodTemplateSpec, container string) {
+		found := sizedContainer(template, container)
+		if found == nil {
+			return
+		}
+		names := map[corev1.ResourceName]bool{}
+		for _, name := range sizingSettledLimits {
+			if sizedLimitClamped(found, name) {
+				names[name] = true
+			}
+		}
+		clamped[container] = names
+	}
+	proxy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err == nil {
+		note(proxy.Spec.Template, credentialProxyContainerName)
+	}
+	shell := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}, shell); err == nil {
+		note(shell.Spec.Template, shellSandboxContainerName)
+	}
+	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
+	if useStatefulSet(agent) {
+		gateway := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, gatewayKey, gateway); err == nil {
+			note(gateway.Spec.Template, agentAPIAuthContainerName)
+		}
+		return clamped
+	}
+	gateway := &appsv1.Deployment{}
+	if err := r.Get(ctx, gatewayKey, gateway); err == nil {
+		note(gateway.Spec.Template, agentAPIAuthContainerName)
+	}
+	return clamped
 }
 
 // sizingTierUnsettledWorkload is "" when the three sized workloads have
@@ -819,12 +922,13 @@ func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context
 // yet, which admission then settles). A quota whose scopes cannot select the
 // three pods (sizingQuotaBindsThePods, a PriorityClass scope read against
 // classes) is not read: admission would never evaluate them against it, so
-// it can neither refuse the step nor be raised to admit it.
-func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, quotas []corev1.ResourceQuota, classes []string, from, to sizingTier) *sizingShortfall {
+// it can neither refuse the step nor be raised to admit it. The step's limits
+// side is read through clamped (sizingClampedLimits).
+func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped sizingClampedLimits, quotas []corev1.ResourceQuota, classes []string, from, to sizingTier) *sizingShortfall {
 	if len(quotas) == 0 {
 		return nil
 	}
-	step := sizingStepBetween(agent, autopilot, from, to)
+	step := sizingStepBetween(agent, autopilot, clamped, from, to)
 	for i := range quotas {
 		quota := &quotas[i]
 		if !sizingQuotaBindsThePods(quota, classes) {
@@ -962,6 +1066,8 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 						"waitingOn", waitingOn, "clusters", count)
 				} else {
 					classes := r.sizingQuotaPriorityClasses(ctx, agent, quotas)
+					autopilot := r.clusterAutopilot()
+					clamped := r.sizingRunningClampedLimits(ctx, agent)
 					// The earned tier first, then each tier between it and
 					// the running one, every step measured from the running
 					// tier against the same used totals: the highest step the
@@ -972,7 +1078,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// quota by the least relieves.
 					running := tier
 					for candidate := earned; candidate > running; candidate-- {
-						shortfall := sizingQuotaShortfall(agent, r.clusterAutopilot(), quotas, classes, running, candidate)
+						shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate)
 						if shortfall == nil {
 							tier = candidate
 							break

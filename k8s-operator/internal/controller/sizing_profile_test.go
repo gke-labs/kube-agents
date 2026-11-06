@@ -60,14 +60,18 @@ func sizingAgent(profile, latched string, registered, monitored *int64) *agentv1
 }
 
 // sizingQuota is a ResourceQuota constraining requests.memory at hard with
-// used already accounted.
+// used already accounted; sizingQuotaOn the same on any hard key.
 func sizingQuota(name, hard, used string) *corev1.ResourceQuota {
+	return sizingQuotaOn(name, corev1.ResourceRequestsMemory, hard, used)
+}
+
+func sizingQuotaOn(name string, key corev1.ResourceName, hard, used string) *corev1.ResourceQuota {
 	return &corev1.ResourceQuota{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kubeagents-system"},
-		Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{corev1.ResourceRequestsMemory: resource.MustParse(hard)}},
+		Spec:       corev1.ResourceQuotaSpec{Hard: corev1.ResourceList{key: resource.MustParse(hard)}},
 		Status: corev1.ResourceQuotaStatus{
-			Hard: corev1.ResourceList{corev1.ResourceRequestsMemory: resource.MustParse(hard)},
-			Used: corev1.ResourceList{corev1.ResourceRequestsMemory: resource.MustParse(used)},
+			Hard: corev1.ResourceList{key: resource.MustParse(hard)},
+			Used: corev1.ResourceList{key: resource.MustParse(used)},
 		},
 	}
 }
@@ -568,7 +572,7 @@ func TestResolveSizingTierWritesOnlyOnChange(t *testing.T) {
 func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 	t.Parallel()
 	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
-	step := sizingStepBetween(agent, false, sizingTierSmall, sizingTierFleet)
+	step := sizingStepBetween(agent, false, nil, sizingTierSmall, sizingTierFleet)
 	// Requests: the broker 500m -> 4 CPU and 1Gi -> 8Gi; the sidecar and the
 	// shell keep theirs. Limits: CPU 2 -> 8 on the broker; memory 2Gi -> 8Gi
 	// on the broker, 2Gi -> 8Gi on the sidecar, 2Gi -> 4Gi on the shell;
@@ -585,11 +589,34 @@ func TestSizingStepBetweenSumsTheThreeContainers(t *testing.T) {
 		t.Errorf("ephemeral-storage limits moved by %s", q.String())
 	}
 	// On Autopilot the broker's small row already requests 2 CPU and 2Gi.
-	autopilot := sizingStepBetween(agent, true, sizingTierSmall, sizingTierMedium)
+	autopilot := sizingStepBetween(agent, true, nil, sizingTierSmall, sizingTierMedium)
 	if q := autopilot.requests[corev1.ResourceCPU]; !q.IsZero() {
 		t.Errorf("Autopilot small -> medium moved the CPU request by %s", q.String())
 	}
 	assertQuantity(t, autopilot.requests, corev1.ResourceMemory, "2Gi")
+	// Autopilot without bursting: the running templates carry every limit
+	// equal to its request, so the limits side counts what admission charges
+	// the clamped pods, the requests' movement. Small -> fleet: the broker's
+	// 2 -> 4 CPU and 2Gi -> 8Gi requests move both of its limits by the
+	// same; the sidecar's 2Gi -> 8Gi and the shell's 2Gi -> 4Gi memory
+	// limits over requests that do not move count nothing, where the rows'
+	// limits as written would add 6Gi and 2Gi.
+	every := map[corev1.ResourceName]bool{corev1.ResourceCPU: true, corev1.ResourceMemory: true, corev1.ResourceEphemeralStorage: true}
+	clamped := sizingClampedLimits{credentialProxyContainerName: every, agentAPIAuthContainerName: every, shellSandboxContainerName: every}
+	fleet := sizingStepBetween(agent, true, clamped, sizingTierSmall, sizingTierFleet)
+	assertQuantity(t, fleet.requests, corev1.ResourceCPU, "2")
+	assertQuantity(t, fleet.requests, corev1.ResourceMemory, "6Gi")
+	assertQuantity(t, fleet.limits, corev1.ResourceCPU, "2")
+	assertQuantity(t, fleet.limits, corev1.ResourceMemory, "6Gi")
+	asWritten := sizingStepBetween(agent, true, nil, sizingTierSmall, sizingTierFleet)
+	assertQuantity(t, asWritten.limits, corev1.ResourceCPU, "6")
+	assertQuantity(t, asWritten.limits, corev1.ResourceMemory, "14Gi")
+	// A clamp on one container's memory alone leaves the other names and the
+	// other containers as written: the sidecar's 6Gi memory limit drops out,
+	// the broker's 6Gi and the shell's 2Gi stay.
+	sidecarOnly := sizingStepBetween(agent, true, sizingClampedLimits{agentAPIAuthContainerName: {corev1.ResourceMemory: true}}, sizingTierSmall, sizingTierFleet)
+	assertQuantity(t, sidecarOnly.limits, corev1.ResourceCPU, "6")
+	assertQuantity(t, sidecarOnly.limits, corev1.ResourceMemory, "8Gi")
 }
 
 // TestSizingStepReadsEachSideAsRendered pins the step's reading of an
@@ -618,7 +645,7 @@ func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
 	assertQuantity(t, shellFleet.Requests, corev1.ResourceMemory, "3Gi")
 	// The step: the broker 500m -> 3 CPU and 1Gi -> 8Gi, the shell 512Mi ->
 	// 3Gi; merged on both sides, the two overrides would read as zero.
-	step := sizingStepBetween(agent, false, sizingTierSmall, sizingTierFleet)
+	step := sizingStepBetween(agent, false, nil, sizingTierSmall, sizingTierFleet)
 	assertQuantity(t, step.requests, corev1.ResourceCPU, "2500m")
 	assertQuantity(t, step.requests, corev1.ResourceMemory, "9728Mi")
 	// An override every row admits is the override on both sides, so the
@@ -627,7 +654,7 @@ func TestSizingStepReadsEachSideAsRendered(t *testing.T) {
 	admitted.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
 	}}
-	sidecar := sizingStepBetween(admitted, false, sizingTierSmall, sizingTierFleet)
+	sidecar := sizingStepBetween(admitted, false, nil, sizingTierSmall, sizingTierFleet)
 	// 6Gi from the broker and 2Gi from the shell; the sidecar's 1Gi limit
 	// holds on both rows.
 	assertQuantity(t, sidecar.limits, corev1.ResourceMemory, "8Gi")
@@ -1154,6 +1181,75 @@ func TestResolveSizingTierHoldsTheStepWhileASizedWorkloadIsAbsent(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestResolveSizingTierCountsTheClampedLimitsOnAutopilot(t *testing.T) {
+	t.Parallel()
+	// Latched small at 25 clusters with one limits.memory quota, 20Gi hard
+	// and 10Gi used. The fleet step's memory limits as the rows write them
+	// add 14Gi (the broker's 2Gi -> 8Gi, the sidecar's 2Gi -> 8Gi, the
+	// shell's 2Gi -> 4Gi). On Autopilot without bursting every limit is
+	// clamped to its request, so admission charges the quota the requests'
+	// movement, the broker's 6Gi alone, and the fleet pods are admitted
+	// against 10Gi free; a step that counted the rows' limits would cap the
+	// tier at medium on a quota the pods would never fill. Where the limits
+	// survive (Standard, or Autopilot with bursting, where the templates
+	// carry the rows' limits), the 14Gi is what admission charges and the
+	// cap on fleet is right.
+	quota := func() *corev1.ResourceQuota {
+		return sizingQuotaOn("platform-baseline-quota", corev1.ResourceLimitsMemory, "20Gi", "10Gi")
+	}
+	run := func(t *testing.T, autopilot bool, workloads []client.Object) (*agentv1alpha1.PlatformAgent, *record.FakeRecorder) {
+		t.Helper()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, quota()}, workloads...)...).WithStatusSubresource(agent).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder, autopilot: autopilot, autopilotResolved: true}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		return agent, recorder
+	}
+	cappedAtMedium := func(t *testing.T, agent *agentv1alpha1.PlatformAgent, recorder *record.FakeRecorder, why string) {
+		t.Helper()
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium || cond == nil || !strings.Contains(cond.Message, "earns the fleet tier") || !strings.Contains(cond.Message, "has no room on limits.memory") {
+			t.Fatalf("status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want medium with the cap naming fleet on limits.memory: %s", agent.Status.EffectiveSizingTier, cond, why)
+		}
+		// The tier change's Normal event comes first, then the cap's Warning
+		// with the figures.
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		if !slices.ContainsFunc(events, func(event string) bool { return strings.Contains(event, "the step adds 14Gi") }) {
+			t.Fatalf("events = %q, want the cap's Warning with the rows' 14Gi", events)
+		}
+	}
+	t.Run("Autopilot without bursting takes the fleet step on the requests' movement", func(t *testing.T) {
+		t.Parallel()
+		seed := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+		agent, _ := run(t, true, clampedToRequests(sizedWorkloadsOn(seed, sizingTierSmall, true)))
+		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: the step counted the rows' limits on templates Autopilot clamped", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota set on a step the clamped pods fit: %+v", cond)
+		}
+	})
+	t.Run("Autopilot with bursting counts the limits the templates carry", func(t *testing.T) {
+		t.Parallel()
+		seed := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+		agent, recorder := run(t, true, sizedWorkloadsOn(seed, sizingTierSmall, true))
+		cappedAtMedium(t, agent, recorder, "the limits survive under bursting and the quota is charged them")
+	})
+	t.Run("Standard counts the rows' limits as written", func(t *testing.T) {
+		t.Parallel()
+		seed := sizingAgent(sizingProfileAuto, sizingProfileSmall, nil, nil)
+		agent, recorder := run(t, false, sizedWorkloadsAt(seed, sizingTierSmall))
+		cappedAtMedium(t, agent, recorder, "nothing clamps a limit on Standard")
+	})
 }
 
 func TestResolveSizingTierTakesTheEarnedTierWithNoQuotaBeforeTheWorkloadsSettle(t *testing.T) {
