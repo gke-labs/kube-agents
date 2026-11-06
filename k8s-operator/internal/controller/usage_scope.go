@@ -89,6 +89,9 @@ func usageClusterRefsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usage
 	if !gatewayRead {
 		return nil, false
 	}
+	// Allocated, so a reading with no series is an empty list, not the nil that
+	// means no reading; the removal cause tells the two apart.
+	refs = []usageClusterRef{}
 	seen := map[usageClusterRef]bool{}
 	for _, s := range scraped {
 		if s.Clusters == nil {
@@ -157,7 +160,7 @@ func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef
 	// candidate: the message would otherwise tell the reader to declare it.
 	found := ""
 	for _, ref := range refs {
-		if ref.Name != h.ClusterName || ref.Location != h.Location || !scopeUndeclaredNamePattern.MatchString(ref.Project) {
+		if ref.Name != h.ClusterName || ref.Location != h.Location || !scopeUndeclaredNamePattern.MatchString(ref.Project) || isProjectNumber(ref.Project) {
 			continue
 		}
 		if found != "" && found != ref.Project {
@@ -249,12 +252,15 @@ func (p *UsageCounterPoller) projectScope(ctx context.Context, agent *agentv1alp
 		log.Info("the ScopeUndeclared condition is removed", "cause", scopeUndeclaredRemovalCause(agent, refs))
 	case existing == nil || existing.Status != want.Status || existing.Reason != want.Reason || existing.Message != want.Message:
 		meta.SetStatusCondition(&agent.Status.Conditions, *want)
-		named := make([]string, 0, len(neighbours))
-		for _, ref := range neighbours {
+		// Bounded as the message is: a project of hundreds of clusters would
+		// otherwise write them all into one line on every change of the set.
+		shown := neighbours[:min(len(neighbours), scopeUndeclaredNamesShown)]
+		named := make([]string, 0, len(shown))
+		for _, ref := range shown {
 			named = append(named, scopeUndeclaredLabel(ref.Project)+"/"+scopeUndeclaredLabel(ref.Location)+"/"+scopeUndeclaredLabel(ref.Name))
 		}
 		log.Info("spec.scope names no project, folder, organization or selector and the Cluster Agent reconcile has adopted clusters beyond the host; the ScopeUndeclared condition names them",
-			"clusters", len(neighbours), "names", strings.Join(named, ","))
+			"clusters", len(neighbours), "names", strings.Join(named, ","), "unnamed", len(neighbours)-len(shown))
 	default:
 		return nil
 	}
