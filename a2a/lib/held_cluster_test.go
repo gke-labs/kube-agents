@@ -23,6 +23,15 @@ import (
 // clusterSize is the cluster an install runs (R3).
 const clusterSize = 3
 
+// clusterStartAttempts is how many clusters startCluster starts, each on
+// fresh route ports, before a server that never binds its route port fails
+// the test.
+const clusterStartAttempts = 3
+
+// serverReadyTimeout is how long tryStartCluster waits for each server to
+// listen.
+const serverReadyTimeout = 10 * time.Second
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -34,7 +43,30 @@ func freePort(t *testing.T) int {
 }
 
 // startCluster runs clusterSize JetStream servers routed to each other.
+// freePort releases each route port before its server binds it, so another
+// socket can take the port in between. That server then listens for clients
+// but not for routes and never becomes ready (#5056). A cluster with such a
+// server is shut down and started again on fresh ports.
 func startCluster(t *testing.T) []*natsserver.Server {
+	t.Helper()
+	for attempt := 1; ; attempt++ {
+		servers, unrouted := tryStartCluster(t)
+		if unrouted == nil {
+			return servers
+		}
+		for _, s := range servers {
+			s.Shutdown()
+		}
+		if attempt == clusterStartAttempts {
+			t.Fatalf("each of %d clusters had a server that never bound its route port (last: %s)", clusterStartAttempts, unrouted.Name())
+		}
+		t.Logf("nats-server %s never bound its route port; starting the cluster again on fresh ports", unrouted.Name())
+	}
+}
+
+// tryStartCluster starts one cluster, and returns with it the server that
+// listens for clients but not for routes, or nil when every server is ready.
+func tryStartCluster(t *testing.T) ([]*natsserver.Server, *natsserver.Server) {
 	t.Helper()
 	ports := make([]int, clusterSize)
 	for i := range ports {
@@ -62,11 +94,17 @@ func startCluster(t *testing.T) []*natsserver.Server {
 		servers[i] = s
 	}
 	for _, s := range servers {
-		if !s.ReadyForConnections(10 * time.Second) {
-			t.Fatal("nats-server not ready")
+		if s.ReadyForConnections(serverReadyTimeout) {
+			continue
 		}
+		// A server binds its route port right after its client port, so one
+		// that listens only for clients lost its route port.
+		if s.Addr() != nil && s.ClusterAddr() == nil {
+			return servers, s
+		}
+		t.Fatal("nats-server not ready")
 	}
-	return servers
+	return servers, nil
 }
 
 func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
