@@ -565,7 +565,13 @@ before stage 3 of the rollout (turning replay on):
    live answer, while under replay it would be the saved one. That changes more than the answer
    itself:
    - the next request contains the live answer, so exact matches stop after the model's first
-     reply. The **simulated** estimate ignores the model's own replies to get past this;
+     reply. The **replayed** estimates (low and high, from the same sources) get past this: a
+     request counts when its settings and every message that isn't one of the model's replies
+     match an allowed recording, position by position. They're still estimates: shadow mode can't
+     hold the next two points fixed, so those still count as misses here, and they judge each
+     request alone, while a real replay stops at the conversation's first miss. For their misses
+     the script names the first message, replies aside, that no recording matched, which is where
+     normalizer work pays;
    - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
      platform agent writes is what the Cluster Agent reads. Under replay that text would match;
      in shadow mode it's worded differently every run;
@@ -575,12 +581,12 @@ before stage 3 of the rollout (turning replay on):
 
    The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
-   simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
-   of the remaining misses were tool results after a differently chosen action. Real record and
-   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement comes
-   from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
-   often pull requests start on a saved recording at all (prompt changes, project rotation), and the
-   stored text for normalizer work.
+   replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
+   raised it to 22%, and most of the remaining misses were tool results after a differently chosen
+   action. Real record and replay of the same cases, in "Measurements", reused 46–100%. So the
+   deciding measurement comes from real replay, in the replay lane below. Shadow mode stays for
+   what only it can measure: how often pull requests start on a saved recording at all (prompt
+   changes, project rotation), and the stored text for normalizer work.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
