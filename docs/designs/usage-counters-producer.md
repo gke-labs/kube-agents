@@ -167,8 +167,11 @@ a pruning record of their own for a CRD that predates them.
 
 The `cluster_up` series' labels, the triple each registered cluster's profile names, are read
 beside the gauges into the `ScopeUndeclared` condition (`usage_scope.go`): True, naming the
-clusters other than `spec.harness`'s, while `spec.scope` names no project, folder, organisation or
-selector; removed otherwise, and on the data volume reading's terms when there is no reading. The
+management project's clusters other than `spec.harness`'s, while `spec.scope` names no project,
+folder, organisation or selector; removed otherwise, and on the data volume reading's terms when
+there is no reading. A series in another project is a profile somebody made by hand, or one a
+dropped declaration still carries, so it is not counted; a harness that names its project by
+number cannot be matched against the series' project ID, so the operator says nothing then. The
 union across replicas, each triple once, sorted, so an unchanged fleet rewrites nothing. A third
 status patch, on the same terms as the second. The reconcile that adopted the clusters cannot
 write the CR, which is why the operator surfaces it from the watcher's reading
