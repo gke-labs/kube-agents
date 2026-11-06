@@ -6466,22 +6466,22 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
         # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
         # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
-        # next-mode pods the preflight now sums: the settings the tfvars carry reached
-        # the render.
+        # next-mode pods the preflight now sums (the A2A gateway's standby among them): the
+        # settings the tfvars carry reached the render.
         self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
-        self.assertIn("Pods:                22", proc.stdout)
+        self.assertIn("Pods:                23", proc.stdout)
         # The tfvars say autopilot, so the credential proxy is counted at the operator's
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        5.300 cores", proc.stdout)
-        self.assertIn("Memory requests:     12.28 GiB", proc.stdout)
+        self.assertIn("CPU requests:        5.350 cores", proc.stdout)
+        self.assertIn("Memory requests:     12.34 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        3.800 cores", standard.stdout)
-        self.assertIn("Memory requests:     11.28 GiB", standard.stdout)
+        self.assertIn("CPU requests:        3.850 cores", standard.stdout)
+        self.assertIn("Memory requests:     11.34 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
