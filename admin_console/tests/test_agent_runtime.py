@@ -957,6 +957,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
         for payload in (
             board["tasks"],
             tasks["tasks"],
+            detail["task"],
             detail["parents"],
             detail["children"],
         ):
