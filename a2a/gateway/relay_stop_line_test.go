@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -139,7 +140,7 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 	press := func(id string) {
 		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: id, Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
 	}
-	press("spaces/S1/messages/" + line + "#t1")
+	press(line + "#t1")
 	waitFor(t, "the line closed on cancel sent", func() bool {
 		for _, e := range r.adapter.editTexts() {
 			if strings.Contains(e, "cancel sent") {
@@ -149,7 +150,7 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 		return false
 	})
 	edits := len(r.adapter.editTexts())
-	press("spaces/S1/messages/" + line + "#t2")
+	press(line + "#t2")
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "still going"}}, false, false)
 	if err := exec.PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
@@ -252,4 +253,190 @@ func TestAPressWithNoLineSpeaksAsATypedStop(t *testing.T) {
 	if len(r.adapter.editTexts()) != 0 {
 		t.Errorf("edits = %q; want none without a line", r.adapter.editTexts())
 	}
+}
+
+// A stale press on a task the record cancelled re-renders the canceled line
+// (the superseding turn's closing edit may have failed); one on a task the
+// record knows ended otherwise leaves the line its end wrote, since the
+// terminal edit may have landed a moment before the press.
+func TestAStalePressOnAKnownTaskKeepsOrRestoresItsTerminalLine(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-known"
+	say := func(id, text string) {
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: id, Text: text}
+	}
+	say("spaces/S1/messages/M1", "first ask")
+	first := r.awaitTask(t, "platform")
+	if err := r.execFor(t, first, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first line", func() bool { return len(r.adapter.stopLinesCopy()) >= 2 })
+	firstLine := r.adapter.stopLinesCopy()[0].MessageID
+	say("spaces/S1/messages/M2", "stop")
+	waitFor(t, "the cancel notice", func() bool {
+		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "cancel sent") })
+	})
+	say("spaces/S1/messages/M3", "second ask")
+	second := awaitTaskAfter(t, r, "platform", first)
+	countCanceled := func() int {
+		n := 0
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		for _, e := range r.adapter.edits {
+			if e.MessageID == firstLine && strings.Contains(e.Text, "canceled") {
+				n++
+			}
+		}
+		return n
+	}
+	waitFor(t, "the superseded line closed", func() bool { return countCanceled() == 1 })
+	// A press on the first task's line: the record cancelled it, so the
+	// canceled line is written again, and nothing else changes.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+		MessageID: firstLine + "#2026-11-06T16:00:00Z", Intent: IntentCancel, TaskID: first.TaskID, Click: true}
+	waitFor(t, "the canceled line restored", func() bool { return countCanceled() == 2 })
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "has ended") {
+			t.Fatalf("a known task's stale press wrote the unknown-task notice: %q", e)
+		}
+	}
+	// The second task ends on its own; a press on its line afterwards
+	// leaves the terminal edit alone.
+	secondExec := r.execFor(t, second, "platform")
+	if err := secondExec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the second working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working") && lines[len(lines)-1].MessageID != firstLine
+	})
+	completeTask(t, secondExec, "done")
+	secondLine := r.adapter.stopLinesCopy()[len(r.adapter.stopLinesCopy())-1].MessageID
+	waitFor(t, "the second terminal "+secondLine+" in "+fmt.Sprint(r.adapter.editTexts())+" posts "+fmt.Sprint(r.adapter.postTexts()), func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		for _, e := range r.adapter.edits {
+			if e.MessageID == secondLine && strings.Contains(e.Text, "completed") {
+				return true
+			}
+		}
+		return false
+	})
+	edits := len(r.adapter.editTexts())
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+		MessageID: secondLine + "#2026-11-06T16:00:01Z", Intent: IntentCancel, TaskID: second.TaskID, Click: true}
+	say("spaces/S1/messages/M4", "third ask")
+	r.awaitTask(t, "platform")
+	for _, e := range r.adapter.editTexts()[edits:] {
+		if strings.Contains(e, "has ended") || strings.Contains(e, "canceled") {
+			t.Fatalf("a press on an ended task's line rewrote it: %q", e)
+		}
+	}
+}
+
+// A press whose closing edit failed leaves the line with its button and the
+// task detached; the next press retries the close, and the relay's progress
+// edits of a detached task carry no Stop meanwhile. A press whose message is
+// not the task's own line (a delegating parent's) closes that message too.
+func TestAPressRetriesAFailedCloseAndClosesThePressedLine(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-retry"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	r.adapter.mu.Lock()
+	r.adapter.failEdits = 1
+	r.adapter.mu.Unlock()
+	press := func(message, when string) {
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+			MessageID: message + "#" + when, Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
+	}
+	press(line, "t1")
+	waitForRecord(t, r, conv, "the detached task", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.Detached && !rec.ActiveTask.LineClosed
+	})
+	stops := len(r.adapter.stopLinesCopy())
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "still going"}}, false, false)
+	waitFor(t, "the progress edit without Stop", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "working")
+	})
+	if len(r.adapter.stopLinesCopy()) != stops {
+		t.Fatalf("a detached task's progress edit carried Stop: %+v", r.adapter.stopLinesCopy()[stops:])
+	}
+	press("spaces/S1/messages/PARENT", "t2")
+	waitFor(t, "the retried close and the pressed line", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		own, pressed := false, false
+		for _, e := range r.adapter.edits {
+			if strings.Contains(e.Text, "cancel sent") {
+				own = own || e.MessageID == line
+				pressed = pressed || e.MessageID == "spaces/S1/messages/PARENT"
+			}
+		}
+		return own && pressed
+	})
+	waitForRecord(t, r, conv, "the closed line", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.LineClosed
+	})
+	for _, l := range r.adapter.stopLinesCopy() {
+		if strings.Contains(l.Text, "cancel sent") {
+			t.Fatalf("a closing edit carried Stop: %+v", l)
+		}
+	}
+}
+
+// With the card stop armed, a press on the running task takes the typed
+// stop's path: the cancel sent post, the cards stopped, their replies.
+func TestAPressWithTheCardStopArmedIsATypedStop(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false, func(c *Config) {
+		c.CardStop = true
+		c.CardStopTimeout = 200 * time.Millisecond
+	})
+	conv := "gchat:spaces/S1/threads/T-cards"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool { return len(r.adapter.stopLinesCopy()) >= 2 })
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com",
+		MessageID: line + "#t1", Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
+	waitFor(t, "the typed stop's posts", func() bool {
+		posts := r.adapter.postTexts()
+		return slices.ContainsFunc(posts, func(s string) bool { return strings.Contains(s, "cancel sent") }) &&
+			slices.ContainsFunc(posts, func(s string) bool { return strings.Contains(s, "cards") })
+	})
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "cancel sent") {
+			t.Fatalf("the card-stop press closed the line as a quiet press would: %q", e)
+		}
+	}
+}
+
+// awaitTaskAfter is rig.awaitTask for the next submission on addressee after
+// seen: awaitTask returns the subject's first, which is seen again.
+func awaitTaskAfter(t *testing.T, r *rig, addressee string, seen *lib.Envelope) *lib.Envelope {
+	t.Helper()
+	var env *lib.Envelope
+	waitFor(t, "a later task submission on "+addressee, func() bool {
+		for _, e := range inSubjectEnvelopes(t, r.url, addressee) {
+			if e.Kind == lib.KindMessage && e.TaskID != seen.TaskID {
+				env = e
+				return true
+			}
+		}
+		return false
+	})
+	return env
 }

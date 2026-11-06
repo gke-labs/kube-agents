@@ -1205,7 +1205,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// A press on the running task answers on that task's own line, and
 		// posts nothing (chat_stop_press.go). With the card stop armed the
 		// press was made a typed stop above, and takes that path below.
-		g.chatStopPress(ctx, rec, authority)
+		g.chatStopPress(ctx, rec, msg, authority)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -3028,8 +3028,8 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 
 // cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
 // Slack Stop button's path (slack_stop.go) answers with one reply of its own,
-// and marks the task so the relay posts no "canceled" for it either
-// (TaskRef.QuietCancel).
+// Google Chat's on the task's line (chat_stop_press.go), and both mark the
+// task so the relay posts no "canceled" for it either (TaskRef.QuietCancel).
 func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,

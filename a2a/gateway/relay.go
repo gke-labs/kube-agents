@@ -779,7 +779,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		// A Slack Stop answers with its own one reply (slack_stop.go).
+		// A Stop button answers for itself: Slack's with one reply
+		// (slack_stop.go), Google Chat's on the line (chat_stop_press.go).
 		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
@@ -1097,7 +1098,13 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, taskID) {
+	// A detached task (a typed stop, its terminal pending) keeps its line
+	// moving, with no Stop control: the stop is sent.
+	stop := taskID
+	if active.Detached {
+		stop = ""
+	}
+	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, stop) {
 		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }

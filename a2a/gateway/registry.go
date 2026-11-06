@@ -303,9 +303,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
-	// QuietCancel marks a cancel the Slack Stop button sent
-	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
-	// relay posts no "canceled" line for the task's terminal.
+	// QuietCancel marks a cancel a Stop button sent (cancelTaskVoiced):
+	// Slack's answers with one reply of its own, Google Chat's on the
+	// task's line (chat_stop_press.go), so the relay posts no "canceled"
+	// line for the task's terminal.
 	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
@@ -511,8 +512,8 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	}
 }
 
-// markQuietCancel records that taskID's cancel came from the Slack Stop
-// button (TaskRef.QuietCancel).
+// markQuietCancel records that taskID's cancel came from a Stop button, on
+// Slack or Google Chat (TaskRef.QuietCancel).
 func (rec *SessionRecord) markQuietCancel(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
