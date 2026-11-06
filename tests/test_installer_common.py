@@ -5888,8 +5888,8 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
 class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
     gateway makes the proactive posts and arms them only on a home channel,
-    so a chat backend the gateway holds with none drops every alert while
-    conversations keep working. The front doors warn, never refuse, and the
+    so a chat backend the gateway holds with none refuses and keeps every
+    alert for a digest while conversations keep working. The front doors warn, never refuse, and the
     closing summary says it again. The backend follows the operator's
     a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
 
@@ -5910,7 +5910,7 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         proc = self._run()
         self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
-        self.assertIn("drop every one of them", proc.stdout)
+        self.assertIn("keeps them for one digest", proc.stdout)
         self.assertIn("HomeChannelUnset", proc.stdout)
         self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
         self.assertIn("slack-app/#home-channel", proc.stdout)
@@ -5957,7 +5957,7 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     def test_the_summary_repeats_it_last(self):
         proc = self._run(summary=True)
         lines = [l for l in proc.stdout.splitlines() if l]
-        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are not delivered there yet."), proc.stdout)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
         self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
 
@@ -6473,15 +6473,15 @@ class FootprintSummaryTest(unittest.TestCase):
         # The tfvars say autopilot, so the credential proxy is counted at the operator's
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        5.300 cores", proc.stdout)
-        self.assertIn("Memory requests:     12.78 GiB", proc.stdout)
+        self.assertIn("CPU requests:        5.850 cores", proc.stdout)
+        self.assertIn("Memory requests:     14.31 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        3.800 cores", standard.stdout)
-        self.assertIn("Memory requests:     11.78 GiB", standard.stdout)
+        self.assertIn("CPU requests:        4.350 cores", standard.stdout)
+        self.assertIn("Memory requests:     13.31 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one

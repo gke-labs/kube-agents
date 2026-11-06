@@ -307,6 +307,42 @@ class FingerprintTest(unittest.TestCase):
         ]
         self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"], "validate / step 2": []})
 
+    def test_a_join_that_names_no_test_drops_out_beside_the_shard_that_did(self):
+        """One flaky Python test fails its shard and the join over the shards.
+        The join's log names no test; filing it would open two more issues,
+        one per failed join step, on every Python flake (#4033)."""
+        shard_steps = job("x", "failure", ("success", "failure"))["steps"]
+        join_steps = job("x", "failure", ("failure", "failure"))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 2/3)", "steps": shard_steps, "test_ids": ["test_1 (m.A.test_1)"]},
+            {"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"]})
+
+    def test_a_join_that_fails_alone_still_files_under_its_steps(self):
+        """A broken coverage merge with every shard green is the join's own failure."""
+        join_steps = job("x", "failure", ("success", "failure"))["steps"]
+        jobs = [{"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []}]
+        self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 2": []})
+
+    def test_a_join_drops_out_beside_a_shard_that_failed_without_naming_a_test(self):
+        """A shard that died installing names no test; it files, and the join does not."""
+        shard_steps = job("x", "failure", ("failure",))["steps"]
+        join_steps = job("x", "failure", ("success", "failure", "failure"))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 2/3)", "steps": shard_steps, "test_ids": []},
+            {"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 1": []})
+
+    def test_a_job_of_another_name_that_names_no_test_still_files(self):
+        shard_steps = job("x", "failure", ("failure",))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 1/3)", "steps": shard_steps, "test_ids": ["test_1 (m.A.test_1)"]},
+            {"name": "lint", "steps": shard_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"], "lint / step 1": []})
+
     def test_past_the_container_cap_the_job_keeps_the_ids_it_named(self):
         many = [f"test_x (m.C{i:03}.test_x)" for i in range(reporter.MAX_CONTAINERS_PER_ATTEMPT + 1)]
         steps = job("x", "failure", ("failure",))["steps"]

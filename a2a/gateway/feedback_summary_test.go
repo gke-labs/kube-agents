@@ -2,10 +2,13 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -36,13 +39,15 @@ func summaryCR() map[string]any {
 				"clustersRegistered": int64(3), "clustersMonitored": int64(2),
 				"chatMessagesInboundTotal": int64(41), "sessionsTotal": int64(7),
 				"chatSessionsTotal":   int64(4),
-				"toolExecutionsTotal": int64(19127), "eventsIngestedTotal": int64(10),
+				"toolExecutionsTotal": int64(19127), "toolExecutionsBlockedTotal": int64(142), "brokerFailuresTotal": int64(3),
+				"eventsIngestedTotal": int64(10), "chatTurnsErroredTotal": int64(2), "backgroundTasksGaveUpTotal": int64(1), "negativeFeedbackTotal": int64(0),
 				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
 				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
 				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
 				"peopleSeen7d": int64(3), "peopleSeen30d": int64(11),
-				"lastActiveTime":   "2026-10-21T11:34:06Z",
-				"activeInterfaces": []any{"slack", "googlechat"},
+				"lastActiveTime":      "2026-10-21T11:34:06Z",
+				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
+				"activeInterfaces":    []any{"slack", "googlechat"},
 			},
 		},
 	}
@@ -133,12 +138,14 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"kube-agents usage & feedback summary (2026-10-21)",
 		"  version: 0.14.0", "  mode: next", "\n  model: vertex_ai/claude-opus-5\n", "  kubernetes: v1.33.4-gke.1234000",
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
-		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7\n  chatSessionsTotal: 4\n", "  remediationsProposedTotal: 4\n",
+		"  toolExecutionsTotal: 19127\n  toolExecutionsBlockedTotal: 142\n  brokerFailuresTotal: 3\n",
+		"  eventsIngestedTotal: 10\n  chatTurnsErroredTotal: 2\n  backgroundTasksGaveUpTotal: 1\n  negativeFeedbackTotal: 0\n",
+		"  sessionsTotal: 7\n  chatSessionsTotal: 4\n", "  remediationsProposedTotal: 4\n",
 		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
 		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
 		"  proposalHumanTouches: 5 (as the forge reports)\n",
 		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
-		"  lastActive: 2026-10-21T11:34:06Z",
+		"  lastActive: 2026-10-21T11:34:06Z\n  lastHumanActive: 2026-10-20T09:15:00Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
@@ -192,7 +199,7 @@ func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -458,5 +465,96 @@ func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
 	}
 	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
 		t.Fatalf("submitted %d envelope(s); it must submit none", n)
+	}
+}
+
+// topToolsFixture is the shared render fixture: status.usage.topTools as the
+// operator writes it and the lines both renderers must print for it; the
+// script's test_feedback_summary.py renders the same file through its status
+// fallback against the same lines.
+func topToolsFixture(t *testing.T) (rows []any, lines []string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "agents", "platform", "scripts", "testdata", "feedback_summary_top_tools.json"))
+	if err != nil {
+		t.Fatalf("reading the fixture: %v", err)
+	}
+	var fixture struct {
+		TopTools []any    `json:"topTools"`
+		Lines    []string `json:"lines"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("parsing the fixture: %v", err)
+	}
+	return fixture.TopTools, fixture.Lines
+}
+
+// The tools block is the script's, byte for byte, from the status: the shared
+// fixture's rows render to its lines, between lastHumanActive and performance,
+// and the block stays under its cap with the five rows and every reading.
+func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
+	rows, want := topToolsFixture(t)
+	cr := summaryCR()
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = rows
+	text := renderUsageSummary(summaryNow, cr, "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\nperformance: "
+	if !strings.Contains(text, block) {
+		t.Fatalf("block lacks the fixture's tools lines in place:\n%s", text)
+	}
+	if n := len(strings.Split(text, "\n")); n > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines with five rows, cap %d", n, usageSummaryMaxLines)
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+// An absent field prints unavailable, the script's word for a broker it could
+// not read; an empty list prints none; a list past five rows is cut to five,
+// and a row that is not an object is skipped.
+func TestRenderUsageSummaryTopToolsDegrade(t *testing.T) {
+	cr := summaryCR()
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\ntools (top 5, since broker start): unavailable\nperformance: "; !strings.Contains(text, want) {
+		t.Errorf("block lacks %q:\n%s", want, text)
+	}
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["topTools"] = []any{}
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\ntools (top 5, since broker start): none\n") {
+		t.Errorf("an empty list did not print none:\n%s", text)
+	}
+	var many []any
+	for i := 0; i < 7; i++ {
+		many = append(many, map[string]any{"tool": "git", "subcommand": "fetch", "total": int64(7 - i), "success": int64(7 - i)})
+	}
+	usage["topTools"] = append([]any{"not a row"}, many...)
+	text = renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if got := strings.Count(text, "  git/fetch: "); got != 5 {
+		t.Errorf("%d rows printed from a list of seven, want five:\n%s", got, text)
+	}
+	if strings.Contains(text, "not a row") {
+		t.Errorf("a row that is not an object reached the block:\n%s", text)
+	}
+}
+
+// A cluster named after a word the tools block can print, a gcloud group or
+// a kubectl verb, is not refused for a row that names it: the broker's
+// vocabulary is the block's own, as the script's TEMPLATE_EXTRA_TOKENS is.
+func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
+	cr := summaryCR()
+	cr["spec"].(map[string]any)["harness"].(map[string]any)["clusterName"] = "compute"
+	cr["spec"].(map[string]any)["scope"].(map[string]any)["projects"] = []any{"describe", "feedback"}
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = []any{
+		map[string]any{"tool": "gcloud", "subcommand": "compute", "total": int64(3), "success": int64(3)},
+		map[string]any{"tool": "kubectl", "subcommand": "describe", "total": int64(2), "error": int64(2)},
+		map[string]any{"tool": "feedback", "subcommand": "none", "total": int64(1), "success": int64(1)},
+	}
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if leaked := auditUsageSummary(usageSummaryWithoutModelLine(text), usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Fatalf("the audit refused the block's own vocabulary: %v", leaked)
+	}
+	for _, tool := range []string{"kubectl", "gcloud", "git", "gh", "feedback"} {
+		if _, ok := usageSummaryBrokerSubcommands[tool]; !ok {
+			t.Errorf("the gateway's vocabulary lacks %s", tool)
+		}
 	}
 }

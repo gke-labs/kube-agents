@@ -54,16 +54,18 @@ Neither workload reads a Secret, and that is a decision rather than an oversight
 no password in it. What keeps the database private is a ClusterIP service with no
 route in from outside the cluster, and — on clusters that enforce it —
 [`networkpolicy.yaml`](networkpolicy.yaml), which lets only the Hindsight API pod
-reach port 5432. A password would add an install step (generate it, keep two keys
-in agreement, rotate it) to protect an in-cluster database from pods that are
-already trusted with the memories it holds.
+reach port 5432 and confines `hindsight-api` itself to same-namespace and Managed
+Prometheus ingress on port 8888 and egress to cluster DNS, `hindsight-postgresql`,
+and the inference gateway. A password would add an install step (generate it, keep
+two keys in agreement, rotate it) to protect an in-cluster database from pods that
+are already trusted with the memories it holds.
 
-Note the qualifier on the NetworkPolicy. GKE enforces one only where the cluster
+Note the qualifier on the NetworkPolicies. GKE enforces them only where the cluster
 was created with Dataplane V2 or `--enable-network-policy`; everywhere else the
-object applies cleanly and does nothing, and any pod in the namespace can open a
+objects apply cleanly and do nothing, and any pod in the namespace can open a
 connection. That is the same footing as the `litellm` and `github-token-minter`
 policies this repo already ships, so it is a property of the cluster to check
-rather than of this directory to fix — but check it before treating the policy as
+rather than of this directory to fix — but check it before treating the policies as
 the boundary.
 
 One consequence to know: `POSTGRES_HOST_AUTH_METHOD` is read by `initdb` and

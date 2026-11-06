@@ -21,7 +21,15 @@ const (
 	ReasonNoWorker          = "no-worker"
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
+	ReasonStopped           = "stopped"
 )
+
+// waitBreaker is why a submission held back by a breaker is shown waiting.
+const waitBreaker = "breaker-open"
+
+// waitHandOffFailed is why a submission whose hand-off failed (a lease that
+// couldn't be written) is shown waiting.
+const waitHandOffFailed = "hand-off-failed"
 
 const (
 	// terminalEnvelopePrefix makes the dispatcher's terminal for a task one

@@ -14,7 +14,7 @@ FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 WORKDIR /app
 # Stdlib only: nothing to install.
 COPY hack/replay-proxy/schema.py hack/replay-proxy/normalizer.py hack/replay-proxy/diagnosis.py \
-     hack/replay-proxy/request_store.py hack/replay-proxy/replay_proxy.py /app/
+     hack/replay-proxy/request_store.py hack/replay-proxy/spool.py hack/replay-proxy/replay_proxy.py /app/
 # The scrubbers request_store.py loads by path (REPLAY_REDACTOR_PATH and
 # REPLAY_TRANSCRIPT_RULES_PATH default to these).
 COPY agents/chat/defaults/plugins/common/redactor.py /app/scrubbers/redactor.py

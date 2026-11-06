@@ -20,6 +20,7 @@ lifted out of the script):
 
 from __future__ import annotations
 
+import base64
 import http.client
 import importlib.util
 import io
@@ -72,8 +73,11 @@ class FakeGitHub:
     """A repository that changes as it is written to, so the read-back reads
     the result of the writes. Records every call in order."""
 
-    def __init__(self, pulls=(), branches=(), default="main", fail=None, stubborn=()):
+    def __init__(self, pulls=(), branches=(), default="main", fail=None, stubborn=(), files=None):
         self.open = {p["number"]: p for p in pulls}
+        # {path on the default branch: text}; a contents read of any other
+        # path answers 404.
+        self.files = dict(files or {})
         self.branches = [default, *branches]
         self.default = default
         self.calls = []
@@ -106,6 +110,20 @@ class FakeGitHub:
             assert body == {"state": "closed"}
             del self.open[number]
             return {}
+        if path.startswith(f"/repos/{REPO}/contents/"):
+            file_path = urllib.parse.unquote(path.split("/contents/", 1)[1].split("?", 1)[0])
+            if method == "GET":
+                assert path.endswith(f"?ref={self.default}"), path
+                if file_path not in self.files:
+                    raise _http_error(404)
+                text = self.files[file_path]
+                return {"path": file_path, "sha": f"sha-{len(text)}", "encoding": "base64", "content": base64.b64encode(text.encode()).decode()}
+            if method == "DELETE":
+                if ("DELETE", file_path) in self.fail:
+                    raise self.fail[("DELETE", file_path)]
+                assert body["sha"] == f"sha-{len(self.files[file_path])}" and body["branch"] == self.default, body
+                del self.files[file_path]
+                return {}
         if method == "DELETE":
             branch = urllib.parse.unquote(path.split("/git/refs/heads/", 1)[1])
             if ("DELETE", branch) in self.fail:
@@ -285,6 +303,76 @@ class ResetTest(unittest.TestCase):
             helper.reset(REPO, PROJECT, BUILD, "lease", "tok", False)
         # Label, close, two deletes: four writes, four pauses.
         self.assertEqual(pauses, [helper.WRITE_PAUSE_SECONDS] * 4)
+
+
+PLANTED = "clusters/seeded-a/seeded-reliability/kustomization.yaml"
+STACK_KUSTOMIZATION = textwrap.dedent("""\
+    apiVersion: kustomize.config.k8s.io/v1beta1
+    kind: Kustomization
+    metadata:
+      name: seeded-reliability
+      labels:
+        managed-by: kube-agents-bench
+    resources:
+      - checkout-gateway.yaml
+    """)
+FOREIGN_KUSTOMIZATION = STACK_KUSTOMIZATION.replace("managed-by: kube-agents-bench", "team: reliability")
+
+
+class PlantedStackFileTest(unittest.TestCase):
+    """The backstop for a Kustomize root that a killed unit of
+    obtainability-pdb-kustomize-overlay left on the default branch: it would
+    make obtainability-major-pdb-auto-pr's fix manual on that project."""
+
+    def test_the_stacks_kustomization_is_deleted_and_the_repository_is_clean(self):
+        github = FakeGitHub(files={PLANTED: STACK_KUSTOMIZATION, "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml": "kind: Deployment\n"})
+        record, out, _ = run_reset(github)
+        self.assertNotIn(PLANTED, github.files)
+        self.assertIn("clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", github.files)
+        self.assertEqual(record["stack_files_deleted"], [PLANTED])
+        self.assertTrue(record["clean"])
+        self.assertIn(PLANTED, out)
+
+    def test_a_kustomization_without_the_stacks_label_stays(self):
+        github = FakeGitHub(files={PLANTED: FOREIGN_KUSTOMIZATION})
+        record, out, _ = run_reset(github)
+        self.assertIn(PLANTED, github.files)
+        self.assertEqual(record["stack_files_deleted"], [])
+        self.assertEqual(record["stack_files_kept"], [PLANTED])
+        self.assertTrue(record["clean"])
+        self.assertEqual([m for m, _, _ in github.calls if m == "DELETE"], [])
+
+    def test_no_file_is_a_quiet_clean_and_only_the_one_path_is_read(self):
+        github = FakeGitHub()
+        record, _, err = run_reset(github)
+        self.assertTrue(record["clean"])
+        contents = [path for m, path, _ in github.calls if "/contents/" in path]
+        self.assertEqual(contents, [f"/repos/{REPO}/contents/{PLANTED}?ref=main"] * 2)
+        self.assertEqual(err, "")
+
+    def test_a_delete_github_refuses_leaves_the_repository_not_clean(self):
+        github = FakeGitHub(files={PLANTED: STACK_KUSTOMIZATION}, fail={("DELETE", PLANTED): _http_error(409)})
+        record, _, err = run_reset(github)
+        self.assertIn(PLANTED, github.files)
+        self.assertEqual(record["stack_files_undeleted"], [PLANTED])
+        self.assertFalse(record["clean"])
+        self.assertIn("was not deleted", err)
+
+    def test_dry_run_lists_the_file_and_deletes_nothing(self):
+        github = FakeGitHub(files={PLANTED: STACK_KUSTOMIZATION})
+        record, out, _ = run_reset(github, dry_run=True)
+        self.assertIn(PLANTED, github.files)
+        self.assertEqual([m for m, _, _ in github.calls if m != "GET"], [])
+        self.assertIn("would delete 1 stack file(s)", out)
+
+    def test_the_path_and_the_label_are_the_stacks(self):
+        stack = (REPO_ROOT / "bench" / "tf" / "prebuilt" / "kustomize-overlay-declaration")
+        self.assertEqual(helper.PLANTED_STACK_FILES, (PLANTED,))
+        self.assertIn('default     = "clusters/seeded-a/seeded-reliability"', (stack / "variables.tf").read_text())
+        plant = (stack / "plant.py").read_text()
+        self.assertIn(f'MANAGED_BY_KEY = "{helper.STACK_LABEL_KEY}"', plant)
+        self.assertIn(f'MANAGED_BY = "{helper.STACK_LABEL_VALUE}"', plant)
+        self.assertIn(f'KUSTOMIZATION_FILE = "{PLANTED.rsplit("/", 1)[1]}"', plant)
 
 
 class RetryTest(unittest.TestCase):

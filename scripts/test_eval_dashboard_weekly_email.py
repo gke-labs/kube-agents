@@ -1075,6 +1075,46 @@ class Tokens(Base):
         self.assertIn("(flat vs last week on the same scenarios)", we.chat_tokens(week))
         self.assertIn("; flat vs last week on the same scenarios", page)
 
+    def test_rep_cache(self):
+        self.assertIsNone(we.rep_cache({"n": 1}))
+        # No split (the inject transport, a line from before the split): no rate.
+        self.assertIsNone(we.rep_cache({"tokens": {"input": 9, "output": 1, "total": 10, "partial": False}}))
+        self.assertEqual(we.rep_cache({"tokens": {"input": 10, "cached": 70, "cache_write": 20, "total": 101}}), (70, 100))
+        # No cache_write: zero, so the prompt is input + cached.
+        self.assertEqual(we.rep_cache({"tokens": {"input": 30, "cached": 70, "total": 101}}), (70, 100))
+        self.assertIsNone(we.rep_cache({"tokens": {"input": None, "cached": 70, "total": 101}}))
+
+    def test_the_cache_hit_rate_pools_the_full_counts_that_carry_the_split(self):
+        # This week chat reps read 60 of every 100 prompt tokens from cache
+        # and cost reps 90; obs carries no split, and a partial cost rep's
+        # split is left out like its count.
+        def split(day, case, n):
+            return {"chat": (40, 60, 0), "cost": (5, 90, 5)}.get(CASES[case]) if day in THIS_WEEK else None
+
+        runs = with_tokens(timed_runs(), lambda day, case: LAST_WEEK_TOKENS if day in LAST_WEEK else THIS_WEEK_TOKENS[CASES[case]],
+                           partial=lambda day, case, n: day in THIS_WEEK and CASES[case] == "cost" and n == 1)
+        for r in runs:
+            day = int(r["started"][8:10])
+            for t in r["tasks"]:
+                for rep in t["reps"]:
+                    parts = split(day, t["name"], rep["n"])
+                    if parts is not None:
+                        rep["tokens"].update(dict(zip(("input", "cached", "cache_write"), parts)))
+                        if rep["tokens"]["partial"]:
+                            rep["tokens"]["cached"] = 0
+        week, page = self.produce_week(runs)
+        overall = week["overall"]
+        # 63 chat reps and 42 full cost reps: (63*60 + 42*90) / (105*100).
+        self.assertEqual(overall["cache_runs"], 105)
+        self.assertEqual(overall["cached_tokens"], 63 * 60 + 42 * 90)
+        self.assertEqual(overall["prompt_tokens"], 105 * 100)
+        self.assertEqual(we.tokens_figures(overall)["cache_pct"], 72)
+        line = "🔢 Tokens: typical 120k per run (▲ 20% vs last week on the same scenarios) · 72% of prompt from cache · 21 partial"
+        self.assertEqual(we.chat_tokens(week), line)
+        self.assertEqual(card_texts(we.chat_card(week)["card"]["sections"][3])[1], line)
+        self.assertIn("middle of 147 counted runs; &#9650; 20% vs last week on the same scenarios; "
+                      "72% of prompt tokens read from cache (105 runs); 21 partial left out<", page)
+
     def test_the_page_and_the_card_show_the_same_numbers(self):
         for runs in (tokened_runs(), with_tokens(timed_runs(), lambda day, case: 1_234_567),
                      with_tokens(timed_runs(), lambda day, case: 200_000 if day in LAST_WEEK else 150_000)):

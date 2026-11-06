@@ -55,8 +55,13 @@ role still drifted at the deadline gets a `<role>.drift` file beside its
 kubeconfig, one failed assertion per line with what was observed, which is the
 output contract a consumer reads.
 
-What it never does: mutate anything (every read is `kubectl get -o json` or
-`gcloud container clusters describe`), address a cluster it discovered itself
+A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
+world-open firewall rule and its VM) is published as `<role>.confirmed`
+alone, and its subjects are read with `gcloud compute instances list` or
+`gcloud compute firewall-rules list` in the project.
+
+What it never does: mutate anything (every read is `kubectl get -o json`,
+`gcloud container clusters describe` or `gcloud compute ... list`), address a cluster it discovered itself
 (the runner recorded each slot's cluster and location in `.fleet-context`), or
 kill the job. Weather -- an unreachable API server, a refused describe -- leaves
 the role "not checked" with a warning and no drift file; only positive
@@ -81,8 +86,9 @@ Output: everything goes to stderr, ending in one summary line:
 
 With `--report PATH` the same verdicts are written as JSON, one entry per
 catalog role: `converged`, `drifted` or `unchecked` with the lines above as
-`detail`, `unpublished` for a role the runner wrote no kubeconfig for, and
-`no_state` for one that declares no assertions.
+`detail`, `unpublished` for a role the runner did not publish (no kubeconfig,
+or for a project-scoped role no `.confirmed` list), and `no_state` for one
+that declares no assertions.
 
 Exit 0 whenever the fleet was looked at, whatever it found; 1 on a repository
 bug (unreadable catalog, malformed `state` entry, missing directory).
@@ -105,6 +111,9 @@ from pathlib import Path
 # writes beside them. `.drift` is this script's own output, one file per
 # drifted role; the other three names are the runner's.
 KUBECONFIG_SUFFIX = ".kubeconfig"
+# What the runner publishes for a project-scoped role, which has no
+# kubeconfig: the list of what its probes saw.
+CONFIRMED_SUFFIX = ".confirmed"
 DRIFT_SUFFIX = ".drift"
 CONTEXT_FILE = ".fleet-context"
 MARKER_FILE = ".kube-agents-fleet-kubeconfigs"
@@ -113,6 +122,14 @@ MARKER_FILE = ".kube-agents-fleet-kubeconfigs"
 # with `gcloud container clusters describe` rather than kubectl. Slots b and c
 # carry control-plane defects that no in-cluster object shows.
 CLUSTER_SUBJECT = "cluster"
+
+# A project-scoped role (`cluster_slot: null`) is a Compute Engine object no
+# cluster carries. Its subjects are `<kind>/<name-prefix>*`, read with
+# `gcloud compute <collection> list` in the project, and this is the kind to
+# collection map. The runner's probe grammar (hack/fleet-kubeconfigs.sh,
+# PROJECT_PROBE) accepts the same two kinds.
+PROJECT_COLLECTIONS = {"instance": "instances", "firewall": "firewall-rules"}
+PROJECT_SUBJECT_RE = re.compile(r"(instance|firewall)/(?P<prefix>[a-z0-9][a-z0-9-]*)\*")
 
 # Keys in `.fleet-context`, as the runner writes them: `project=<id>`; per
 # discovered slot, `cluster.<slot>=<name>` and `location.<slot>=<location>`;
@@ -329,11 +346,14 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
         if not NAME_RE.fullmatch(str(role)):
             raise CatalogError(f"role {role!r} is not a lowercase-hyphen name")
         slot = spec.get("cluster_slot")
-        if not isinstance(slot, str) or not NAME_RE.fullmatch(slot):
+        project_scoped = slot is None
+        if not project_scoped and (not isinstance(slot, str) or not NAME_RE.fullmatch(slot)):
             raise CatalogError(f"role {role!r} names a malformed cluster slot {slot!r}")
         namespace = spec.get("namespace")
         if namespace is not None and not NAME_RE.fullmatch(str(namespace)):
             raise CatalogError(f"role {role!r} names a malformed namespace {namespace!r}")
+        if project_scoped and namespace is not None:
+            raise CatalogError(f"role {role!r} is project-scoped and names a namespace {namespace!r}")
         state = spec.get("state")
         if not isinstance(state, list):
             raise CatalogError(f"role {role!r} declares no `state` list")
@@ -343,7 +363,12 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
             if not isinstance(entry, dict):
                 raise CatalogError(f"{where} is not a mapping")
             subject = entry.get("subject")
-            if subject != CLUSTER_SUBJECT and (
+            if project_scoped:
+                # Only the Compute Engine shape: a project-scoped role has no
+                # cluster to describe and no kubeconfig to read objects with.
+                if not isinstance(subject, str) or not PROJECT_SUBJECT_RE.fullmatch(subject):
+                    raise CatalogError(f"{where} declares a malformed project subject {subject!r}")
+            elif subject != CLUSTER_SUBJECT and (
                 not isinstance(subject, str) or not SUBJECT_RE.fullmatch(subject)
             ):
                 raise CatalogError(f"{where} declares a malformed subject {subject!r}")
@@ -467,6 +492,31 @@ def _objects(kind: str, out: str) -> list[dict]:
     if isinstance(doc, dict):
         return [doc]
     raise Unreadable(f"kubectl get {kind} printed an unexpected document")
+
+
+def read_compute(project: str, subject: str) -> list[dict]:
+    """The Compute Engine objects a project-scoped `<kind>/<name-prefix>*`
+    subject names: every object of the kind in `project` whose name starts
+    with the prefix. None there is an observation (an empty list), which an
+    assertion may fail on; a failed list is Unreadable."""
+    match = PROJECT_SUBJECT_RE.fullmatch(subject)
+    if not match:
+        raise Unreadable(f"{subject!r} is not a project subject")
+    collection = PROJECT_COLLECTIONS[subject.split("/", 1)[0]]
+    cmd = [
+        "gcloud", "compute", collection, "list", "--project", project,
+        f"--filter=name ~ ^{match.group('prefix')}", "--format", "json",
+    ]
+    rc, out, err = _run(cmd, GCLOUD_TIMEOUT_SECONDS)
+    if rc != 0:
+        raise Unreadable(f"compute {collection} list failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    try:
+        doc = json.loads(out)
+    except ValueError as exc:
+        raise Unreadable(f"compute {collection} list printed something other than JSON: {exc}") from exc
+    if not isinstance(doc, list):
+        raise Unreadable(f"compute {collection} list printed an unexpected document")
+    return [item for item in doc if isinstance(item, dict)]
 
 
 def read_cluster(project: str, name: str, location: str) -> dict:
@@ -770,6 +820,8 @@ class Reader:
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
+        if spec["cluster_slot"] is None:
+            return read_compute(self.project, subject)
         if subject == CLUSTER_SUBJECT:
             slot = spec["cluster_slot"]
             name = self.context.get(f"{CONTEXT_CLUSTER_PREFIX}{slot}")
@@ -878,6 +930,13 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
     return drift, unreadable, settling
 
 
+def published(directory: Path, role: str, spec: dict) -> bool:
+    """Did the runner publish the role? A cluster role by its kubeconfig; a
+    project-scoped role, which has none, by its `.confirmed` list."""
+    suffix = CONFIRMED_SUFFIX if spec["cluster_slot"] is None else KUBECONFIG_SUFFIX
+    return (directory / f"{role}{suffix}").is_file()
+
+
 def run(directory: Path, catalog: Path, project_override: str | None, wait: float, interval: float, report: Path | None = None) -> int:
     if not directory.is_dir() or not (directory / MARKER_FILE).exists():
         print(
@@ -902,7 +961,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
     pending = {
         role: spec
         for role, spec in roles.items()
-        if spec["state"] and (directory / f"{role}{KUBECONFIG_SUFFIX}").is_file()
+        if spec["state"] and published(directory, role, spec)
     }
     converged: list[str] = []
     last: dict[str, tuple[list[str], list[str]]] = {}

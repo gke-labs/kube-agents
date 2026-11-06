@@ -25,6 +25,9 @@ const (
 	// about 3s between a leader giving up (renewDeadline after its first
 	// failed renewal, which is retryPeriod after its last good one) and a
 	// standby taking over; 20s leaves about 8s for the step-down.
+	// The operator holds a deleted Lease's recreate back this long too
+	// (a2aGatewayLeaseRecreateHold in k8s-operator's
+	// platformagent_a2a_gateway_lease.go); change both together.
 	electionLeaseDuration = 20 * time.Second
 	electionRenewDeadline = 10 * time.Second
 	electionRetryPeriod   = 2 * time.Second

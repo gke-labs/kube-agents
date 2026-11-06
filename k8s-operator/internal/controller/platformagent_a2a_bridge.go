@@ -31,6 +31,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 // The Hermes bridge, rendered by the operator.
@@ -121,6 +122,27 @@ const (
 	a2aBridgeNATSURLEnvVar      = "NATS_URL"
 	a2aBridgeNATSUserEnvVar     = "NATS_USER"
 	a2aBridgeNATSPasswordEnvVar = "NATS_PASSWORD"
+
+	// a2aBridgeMemoryLimitEnvVar carries the bridge container's memory limit
+	// in bytes, written by the Downward API from the container's own
+	// limits.memory (a2aBridgeMemoryLimitResource), which the bridge turns
+	// into the Go runtime's soft memory limit (nine tenths of it; an explicit
+	// GOMEMLIMIT wins), as the manager does from OPERATOR_MEMORY_LIMIT_BYTES.
+	// Read from the container itself so it follows whatever the bridge is
+	// rendered with (the defaults, A2A_BRIDGE_RESOURCES, or under cli the
+	// agent container's copy), and on Autopilot the limit the cluster
+	// admitted rather than the one written here. With no memory limit
+	// rendered the Downward API reports the node's allocatable memory.
+	a2aBridgeMemoryLimitEnvVar   = "BRIDGE_MEMORY_LIMIT_BYTES"
+	a2aBridgeMemoryLimitResource = "limits.memory"
+
+	// The rendered bridge's default pair; a2aRenderedBridgeDefaultResources
+	// says how they were sized. Named so the install prerequisites page's
+	// check can read them (tests/test_quota_preflight.py).
+	a2aRenderedBridgeCPURequest    = "250m"
+	a2aRenderedBridgeMemoryRequest = "512Mi"
+	a2aRenderedBridgeCPULimit      = "1"
+	a2aRenderedBridgeMemoryLimit   = "1Gi"
 
 	// a2aBusyNoticeAtEnvVar is the gateway's busy-notice threshold: how many
 	// fixed-route tasks have to be ahead of a new turn before the gateway
@@ -328,6 +350,12 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// can come from an AgentPlugin's env, and a blank or unresolvable one
 		// would silently switch the bridge to its cli executor.
 		{Name: a2aBridgeAPIServerKeyEnvVar, Value: loopbackAgentAPIKey},
+		// This container's own memory limit, not the agent container's: no
+		// containerName, so the kubelet resolves it against the container
+		// the variable is in.
+		{Name: a2aBridgeMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+			Resource: a2aBridgeMemoryLimitResource,
+		}}},
 	}
 	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
@@ -337,8 +365,12 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 
 // a2aBridgeDroppedAgentEnv are agent env names the bridge must not inherit:
 // its own settings (replaced above, API_SERVER_KEY among them, so no plugin
-// value picks its executor), and the agent's bus identity, which names the
-// `agent` principal and its inbox rather than the bridge's.
+// value picks its executor), the agent's bus identity, which names the
+// `agent` principal and its inbox rather than the bridge's, and GOMEMLIMIT,
+// which the Go runtime applies before main and which would otherwise let a
+// plugin's value on the Python agent container override the soft limit the
+// bridge derives from its own admitted memory limit. A bridge-specific
+// GOMEMLIMIT belongs in a2aBridgeOwnEnv.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
 	sharedStateSetupEnvVar:      true,
 	a2aBridgeNATSURLEnvVar:      true,
@@ -349,6 +381,8 @@ var a2aBridgeDroppedAgentEnv = map[string]bool{
 	a2aActivitySecretEnvVar:     true,
 	a2aBusUserEnv:               true,
 	a2aBridgeAPIServerKeyEnvVar: true,
+	a2aBridgeMemoryLimitEnvVar:  true,
+	memlimit.GoMemLimitEnv:      true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent
@@ -391,22 +425,29 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 // a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
 // executor, the default: a Go relay to the agent container's API server, where
 // the turn itself runs. Measured idle at 1m CPU and 4-5Mi on three next
-// installs (gke-labs#2748). The request is sized to be livable as a ceiling,
-// because GKE Autopilot without Pod bursting sets each limit to its request:
-// one answer at the bridge's 8 MiB response cap takes about 80MiB to read,
-// decode and publish, and three at once about 113MiB. The limit gives ten at
-// once room where bursting is on. The cli executor runs
-// a one-shot hermes chat per task (about 430Mi each, up to BRIDGE_CONCURRENCY
-// of them) and doesn't fit these (a2aRenderedBridgeResources).
+// installs (gke-labs#2748). The request is sized to be livable as a ceiling
+// at the rendered default concurrency (a2aRenderedBridgeDefaultConcurrency),
+// because GKE Autopilot without Pod bursting sets each limit to its request.
+// The measured figures behind the pair, and what the request holds at that
+// concurrency, are stated once in a2a/docs/hermes-bridge.md ("It has its own
+// resources") and not repeated here. The bridge sets its Go soft memory limit
+// from whichever of the two the cluster admitted (a2aBridgeMemoryLimitEnvVar).
+// The pair sits in
+// the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged, so adding it
+// to the agent pod, whose total requests Autopilot evaluates, does not pull
+// the pod out of the band on its own. The cli
+// executor runs a one-shot hermes chat per task (about 430Mi each, up to
+// BRIDGE_CONCURRENCY of them) and doesn't fit these
+// (a2aRenderedBridgeResources).
 func a2aRenderedBridgeDefaultResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("100m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
+			corev1.ResourceCPU:    resource.MustParse(a2aRenderedBridgeCPURequest),
+			corev1.ResourceMemory: resource.MustParse(a2aRenderedBridgeMemoryRequest),
 		},
 		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("1"),
-			corev1.ResourceMemory: resource.MustParse("512Mi"),
+			corev1.ResourceCPU:    resource.MustParse(a2aRenderedBridgeCPULimit),
+			corev1.ResourceMemory: resource.MustParse(a2aRenderedBridgeMemoryLimit),
 		},
 	}
 }
