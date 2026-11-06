@@ -941,6 +941,21 @@ fi
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
+# --- agent model required in a Prow job: begin
+# In a Prow job (JOB_NAME is set by Prow and by nothing else, as the flag
+# guard below says) the lane's config sets all three, read from the build
+# cluster's eval-model Secret, and this public script names none: a job that
+# arrives without them stops here, before the image build and the Helm
+# install, instead of deploying the local default below, a model nobody
+# chose. AGENT_MODEL_OVERRIDE is hack/ci-eval-pr.sh's, checked here too so
+# the lease is not spent on a deploy whose records would stamp the default.
+# A local run keeps the defaults.
+if [ -n "${JOB_NAME:-}" ]; then
+  : "${MODEL_PROVIDER:?a Prow job sets MODEL_PROVIDER from the build cluster's eval-model Secret (the lane's config in oss-test-infra); this script defaults it only outside Prow}"
+  : "${MODEL_DEFAULT_NAME:?a Prow job sets MODEL_DEFAULT_NAME from the build cluster's eval-model Secret (the lane's config in oss-test-infra); this script defaults it only outside Prow}"
+  : "${AGENT_MODEL_OVERRIDE:?a Prow job sets AGENT_MODEL_OVERRIDE from the build cluster's eval-model Secret (the lane's config in oss-test-infra); hack/ci-eval-pr.sh defaults it only outside Prow}"
+fi
+# --- agent model required in a Prow job: end
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
 # --- agent key: begin
 # Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.

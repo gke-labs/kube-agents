@@ -915,8 +915,8 @@ sides of the switch at the same key. A step in cost or latency from that night h
 The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
 6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
 transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
-2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
-smoke jobs and the forge smoke variants stay on Vertex AI.
+2026-11-06, so the blocking gate's record has the same step from that day. Since then each lane's
+provider comes from its eval-model pair ([`ci-pool-projects.md`](ci-pool-projects.md) 5.10).
 
 ## The GitLab lane
 
