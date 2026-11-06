@@ -199,7 +199,9 @@ Six KV buckets ride the same JetStream deployment:
   belong in git, and this is where it goes instead.
 - `session-state` - the gateway's session registry (session key, `contextId`, current
   pod, roster, and the active task's bounded ask echo - user content, deliberately; the
-  gateway design owns the content-vs-identifier rule). The gateway's user is the only
+  gateway design owns the content-vs-identifier rule), and under `refused.<backend>.` the
+  home posts the chat.notify route refused for want of a home channel (agent output, bounded
+  in count and age; the gateway design's "Proactive posts"). The gateway's user is the only
   writer by grant, and since the 8/31 narrowing the only reader too: no other user
   holds `$KV.session-state.>` on either side, and the web user's consumer-create route
   INTO the bucket - a push consumer bound to `KV_session-state` - is closed by the

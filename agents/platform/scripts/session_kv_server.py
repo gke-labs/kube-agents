@@ -964,9 +964,12 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # request a card opened is a `pr_opened` event on that card in kanban.db
 # (agents/platform/plugins/pr_opened). Same pattern as that plugin's
 # PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
-# forge.call takes, then the number.
+# forge.call takes, then the number, for every forge the broker serves (GitHub
+# /pull/, GitLab /-/merge_requests/, Gitea /pulls/, Bitbucket /pull-requests/;
+# http for an in-cluster Gitea; the last marker before the number wins, and the
+# tail after it carries no further marker, `/-/` or `/issues/`).
 PR_OPENED_EVENT_KIND = "pr_opened"
-PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
@@ -2510,8 +2513,10 @@ def enabled_chat_platforms() -> list[str]:
     ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to. The operator renders the
-    variable only then, and it is reserved against every other source.
+    so it is still a platform this install posts to, with a home channel or
+    (when it is the only chat platform) without one, the gateway keeping the
+    refused posts for a digest. The operator renders the variable only then,
+    and it is reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -2613,7 +2618,9 @@ def _no_chat_route_error() -> str:
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
     backend whether or not a home channel is set, so with one named the cause is
     the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither.
+    misconfigured one, so it guesses at neither. A pod the operator has routed
+    never reaches this: its send goes to the gateway, whose refusal says the
+    post is kept.
     """
     platform = chat_notify.gateway_platform()
     setting = HOME_CHANNEL_SETTINGS.get(platform)
@@ -2661,6 +2668,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 #: falling through would post it a second time somewhere else. Deliberately not
 #: a plausible thread id, so a caller that ignores it addresses nothing.
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
+# `_post_initial_alert`'s fourth outcome: the gateway refused the alert for want
+# of a home channel and kept it for the digest it posts once one is set
+# (chat_notify.kept). Nothing posted now; the caller must not re-send.
+ALERT_KEPT_FOR_DIGEST = "\x00alert-kept-for-digest"
 
 
 def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
@@ -2696,9 +2707,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
-    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
-    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
-    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
+    gateway holds under next (chat_notify.py). Four outcomes, not two: a thread
+    id, `None` when the send failed, :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read, and
+    :data:`ALERT_KEPT_FOR_DIGEST` when the gateway kept it for want of a home
+    channel (the caller records it as kept and does not re-send). The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
@@ -2719,6 +2732,9 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
             # alert may well be in the channel, so it must not be sent again.
             logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
             return ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Alert to '{active_platform}' was refused for want of a home channel and kept by the gateway for its digest")
+            return ALERT_KEPT_FOR_DIGEST
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -4498,8 +4514,15 @@ def _trigger_agent_troubleshooter(
     else:
         active_platform = get_active_platform(platforms)
         thread_id = None
+        kept = False
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(candidate, _alert_for(candidate, alert_msg, slack_alert_msg), session_id)
+            if thread_id == ALERT_KEPT_FOR_DIGEST:
+                # Refused for want of a home channel and kept by the gateway for
+                # the digest it posts once one is set. Stop: the next platform
+                # is the same install, and the record below says kept, not lost.
+                active_platform, thread_id, kept = candidate, None, True
+                break
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
                 # trying the next platform would post it to a second channel to
@@ -4550,8 +4573,9 @@ def _trigger_agent_troubleshooter(
             # mode is false reassurance.
             mark_delivery_failed(
                 event_row_id,
-                f"no message id from {' or '.join(repr(p) for p in platforms)}; "
-                "see the session server log",
+                f"kept by the gateway for its digest: no home channel on {active_platform!r}"
+                if kept
+                else f"no message id from {' or '.join(repr(p) for p in platforms)}; see the session server log",
             )
             logger.error(
                 f"Alert for session {session_id} was not delivered to any enabled platform "
@@ -4914,6 +4938,9 @@ def _send_to_chat(
             # as a success does; a fresh post has no thread to register.
             logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
             return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Relayed report to {target} was kept by the gateway for its digest (no home channel)")
+            return None
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -4949,6 +4976,13 @@ class AuditPost(NamedTuple):
     """Where :func:`_post_audit_blocks` left the report: its thread."""
 
     thread_id: str
+
+
+# `_post_audit_chat_via_gateway`'s answer when the gateway refused the card for
+# want of a home channel and kept it for its digest (chat_notify.kept): the leg
+# is undelivered, and the text fallback must not follow, or the one report is
+# kept twice.
+AUDIT_POST_KEPT = AuditPost("")
 
 
 class AuditHeadline(NamedTuple):
@@ -5247,7 +5281,8 @@ def _post_audit_chat_via_gateway(
     gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
     posts itself when it does not lay the message out. Same outcomes as the
     relay path: None, to post text instead, after a refusal, a failure to
-    send, or a post that may have landed.
+    send, or a post that may have landed; and :data:`AUDIT_POST_KEPT` when the
+    gateway kept the card for want of a home channel, so no text follows.
     """
     path = ""
     try:
@@ -5274,6 +5309,9 @@ def _post_audit_chat_via_gateway(
             except OSError:
                 pass
     if res.returncode != 0:
+        if chat_notify.kept(res.returncode):
+            logger.warning(f"Relay for {profile}/{job_id}: report card kept by the gateway for its digest (no home channel); no text follows")
+            return AUDIT_POST_KEPT
         if chat_notify.outcome_unknown(res.returncode):
             logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
@@ -5762,8 +5800,10 @@ def relay_cron_report(
     they are skipped rather than missed.
 
     An install with no chat route gets no send at all, where the fallback to
-    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
-    `next` install whose gateway holds Slack with no home channel. The error
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
+    with neither platform, or a pod rendered before the operator routed its only
+    platform without a home channel (a routed pod sends, and the gateway refuses
+    and keeps the post). The error
     names the platform and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
@@ -5887,7 +5927,12 @@ def relay_cron_report(
                     posted = _post_failed_audit_via_gateway(
                         platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                     )
-        if posted is not None:
+        if posted is AUDIT_POST_KEPT:
+            # Kept by the gateway for its digest: undelivered, and no text
+            # follows, or the report is kept twice.
+            new_thread_id = None
+            posted = None
+        elif posted is not None:
             new_thread_id = posted.thread_id or None
         else:
             # A failed audit whose folded card did not post goes out whole: under
@@ -6671,6 +6716,12 @@ def _send_drift_backlog_digest(platform: str, message: str) -> bool:
         logger.warning(f"Drift backlog digest to '{platform}' timed out; treating it as sent")
         return True
     except subprocess.CalledProcessError as exc:
+        if chat_notify.kept(exc.returncode):
+            # Refused for want of a home channel and kept by the gateway for the
+            # digest it posts once one is set: handled for this run, so the rows
+            # are digested rather than re-sent every retry into the keep.
+            logger.warning(f"Drift backlog digest to '{platform}' was kept by the gateway for its digest (no home channel)")
+            return True
         if chat_notify.outcome_unknown(exc.returncode):
             logger.warning(f"Drift backlog digest to '{platform}' got no answer in time; treating it as sent")
             return True

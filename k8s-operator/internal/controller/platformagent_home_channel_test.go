@@ -75,7 +75,12 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}},
 		{"next slack, home set", slackHome("next", "C0123ABCD"), nil},
 		{"today slack, no home", slackHome("today", ""), nil},
-		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL"}},
+		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}},
+		{"next chat and slack, no chat home", func() string {
+			a := chatAndSlackTestAgent("next")
+			a.Spec.Integration.GoogleChat.HomeChannel = ""
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
+		}, []string{"Google Chat", "Slack Hermes platform meanwhile"}},
 		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
 		{"today chat, no home", chatHome("", ""), nil},
 		{"next chat and slack, chat home set", bothChatHomeOnly, nil},
@@ -94,8 +99,8 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 					t.Errorf("message does not name %q: %q", want, got)
 				}
 			}
-			if !strings.Contains(got, "dropped") {
-				t.Errorf("message must say the posts are dropped, not just that a field is empty: %q", got)
+			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "Slack Hermes platform") {
+				t.Errorf("message must say where the posts go meanwhile, not just that a field is empty: %q", got)
 			}
 		})
 	}
@@ -321,8 +326,12 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
 			}
-			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != (tc.wantEnv != "") {
-				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, tc.wantEnv != "")
+			// Routed with the CR's channel, and with the field empty (Slack is
+			// the only chat platform here, so the gateway keeps what it
+			// refuses); a malformed CR value routes nothing.
+			wantRouted := tc.wantEnv != "" || strings.TrimSpace(tc.crHome) == ""
+			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != wantRouted {
+				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, wantRouted)
 			}
 			msg := homeChannelUnsetMessage(a, rec)
 			if (msg != "") != tc.wantCond {

@@ -44,7 +44,8 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # makes report-text, tool-trace and published-artifact checks possible without
 # an upstream change; fleet_resource_property reads cluster state, but the
 # cluster of a seeded-fleet fixture ROLE rather than the ambient one;
-# sandbox_tree_matches_image execs into the agent's own shell sandbox pod.
+# sandbox_tree_matches_image execs into the agent's own shell sandbox pod, or
+# with `target: gateway` into its gateway pod.
 #
 # A key already in the registry when the scan runs is SKIPPED (see
 # devops_bench.core.registry), and upstream registers `resource_property` at

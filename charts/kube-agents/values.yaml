@@ -17,6 +17,11 @@
 # holds the pods the A2A gateway creates to the session pod shape, and sets
 # A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
 #
+# It also installs templates/web-console-cr-admission-policy.yaml where the web
+# console and its environment page are on: the console's ServiceAccount may
+# change only its own annotations and spec.integration.forges, repositories and
+# github on the PlatformAgent.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -645,6 +650,59 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # The shadow-mode inference replay proxy, an eval fixture
+  # (hack/replay-proxy/README.md): it takes the inference-gateway Service, logs
+  # what a replay cache would have keyed on for every request, and forwards
+  # each one unchanged to LiteLLM through the inference-gateway-upstream
+  # Service. It never serves a saved answer. Off on every install;
+  # hack/ci-deploy.sh turns it on for Prow eval runs (EVAL_REPLAY_SHADOW=false keeps it off).
+  # On, the LiteLLM pods also carry kubeagents.x-k8s.io/inference-role: litellm,
+  # and the proxy pods keep app: litellm, so the LiteLLM PodDisruptionBudget,
+  # PodMonitoring and the operator's litellm-policy select them too. Turned on
+  # in an upgrade rather than at install, inference-gateway moves to the proxy
+  # at once while LiteLLM still has to roll to gain the label, so model calls
+  # fail until it has; CI turns it on at install.
+  replayShadow:
+    enabled: false
+    # The image hack/ci-deploy.sh builds from hack/replay-proxy/Dockerfile into
+    # the eval project's registry. Nothing publishes it, so there is no
+    # default, and the reference is used as given: global.imageRegistry and
+    # global.thirdPartyImageRegistry do not rewrite it.
+    image:
+      repository: ""
+      tag: ""
+      pullPolicy: IfNotPresent
+    # Two, so a proxy restart or a node drain leaves one serving; there is no
+    # fallback to LiteLLM, which would split the traffic and lose its lines.
+    replicaCount: 2
+    # Surge first: the proxy is the only path to the model while it is on,
+    # so a rollout never drops below the running count. An eval namespace with
+    # a full ResourceQuota stalls this rollout (litellm.rollingUpdate above says
+    # why); set maxUnavailable: 1 there.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly or presubmit,
+    # and is required when the proxy is on: an untagged line counts in no
+    # estimate.
+    job:
+      kind: ""
+      project: ""
+      build: ""
+      pr: ""
+    # Ephemeral storage covers the 2Gi data volume (templates/litellm.yaml)
+    # plus 256Mi of container log. The proxy is one Python process: its
+    # analysis runs on one thread, and memory holds up to 1024 queued request
+    # bodies and a million first-seen message timestamps.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+        ephemeral-storage: 2304Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 2304Mi
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -858,14 +916,17 @@ platformAgent:
     size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Three of them the chart also derives from
+  # "PlatformAgent annotations"). Four of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
   # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
   # kubeagents.x-k8s.io/otlp-collector-namespace, and
   # litellm.modelProvider=openai_compatible stamps
   # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
-  # (unless the endpoint is public on port 443). When the chart stamps a key,
+  # (unless the endpoint is public on port 443), and every render stamps
+  # kubeagents.x-k8s.io/a2a-quota-chart-pods with the chart's pods and their
+  # rollout surges.
+  # When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the

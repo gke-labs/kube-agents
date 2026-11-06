@@ -144,12 +144,27 @@ type DispatchMessage struct {
 	AcceptSeconds int `json:"acceptSeconds,omitempty"`
 	// Reason says why a task is abandoned. An abandon only.
 	Reason string `json:"reason,omitempty"`
+	// TaskCredential and ProxyToken are the task's own credentials (#3889,
+	// a2a/taskcred), minted for the confirmed pod. A confirm only, and only
+	// when the dispatcher has a task-signing key; without them the worker
+	// keeps its pod-level grants. TaskCredential (audience nats) is what the
+	// worker presents on its task connection to the bus. ProxyToken
+	// (audience credential-proxy) confines the task to the cluster the
+	// dispatcher checked at admission, and is absent when the task names no
+	// cluster. Both name the task, its profile and tier, the pod and its UID,
+	// and expire at the task's deadline plus a clock-skew allowance, never
+	// past the configured maximum lifetime.
+	TaskCredential string `json:"taskCredential,omitempty"`
+	ProxyToken     string `json:"proxyToken,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
 func (m DispatchMessage) Validate() error {
 	if !ValidSubjectToken(m.TaskID) {
 		return fmt.Errorf("dispatch %s: task id %q is not one subject token", m.Type, m.TaskID)
+	}
+	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
+		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
 	}
 	switch m.Type {
 	case DispatchOffer:

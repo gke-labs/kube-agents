@@ -10,6 +10,8 @@
 #   - templates/a2a-gateway-pod-admission-policy.yaml is config/admission/a2a-gateway-pod-policy.yaml,
 #     verbatim, wrapped in the kube-agents.a2aGatewayPodPolicyEnabled helper, which the operator's
 #     A2A_GATEWAY_POD_POLICY env is set from too.
+#   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
+#     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
 #     the cert-manager objects), so it is compared rather than rewritten:
 #     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
@@ -33,6 +35,8 @@ VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
 readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
 readonly GATEWAY_POD_VAP_TPL=charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_SRC=k8s-operator/config/admission/web-console-cr-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_TPL=charts/kube-agents/templates/web-console-cr-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
@@ -161,6 +165,29 @@ if $check; then
   rm -f "$tmp"
 else
   mv "$tmp" "$GATEWAY_POD_VAP_TPL"
+fi
+
+# The web console's PlatformAgent policy: the same shape, under its own helper, which
+# also holds it to the installs where the console's ServiceAccount and its Role on the
+# CR render. Verbatim: the policy selects the console by its name's suffix, so there is
+# nothing release-scoped to substitute.
+[[ -f "$WEB_CONSOLE_CR_VAP_SRC" ]] || fail "admission policy source missing: $WEB_CONSOLE_CR_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.webConsoleCRPolicyEnabled" . }}'
+  echo "# GENERATED from $WEB_CONSOLE_CR_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.webConsoleCRPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30, with the web console and its'
+  echo '# environment page on.'
+  cat "$WEB_CONSOLE_CR_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$WEB_CONSOLE_CR_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $WEB_CONSOLE_CR_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$WEB_CONSOLE_CR_VAP_TPL"
 fi
 
 # Webhooks: compared, not generated. The failure message is deliberately not fail(),
