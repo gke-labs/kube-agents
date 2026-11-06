@@ -1,8 +1,7 @@
 # Post-merge verification: did the merged fix work?
 
 **Status:** proposed, 2026-11-06. Part of gke-labs/kube-agents#2000 (read Argo CD and Flux status
-to confirm fixes are live) and of the autonomy epic gke-labs/kube-agents#4250, whose first
-milestone is knowing what happened to each fix. Builds on
+to confirm fixes are live) and of the autonomy epic gke-labs/kube-agents#4250. Builds on
 [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the broker's 240 s proposal
 sweep), [`proposal-origin.md`](proposal-origin.md) (the claim, the `proposals_opened` ledger and
 the origin of each proposal), `mergeCommit` on the proposal record (#4933) and
@@ -47,7 +46,8 @@ cluster the agent's role already grants them
 (`k8s-operator/internal/controller/platformagent_manifests.go:6089-6119`).
 
 Out of scope: Flux `HelmRelease`, whose applied revision is a chart version rather than a Git
-commit, so whether it contains the merge cannot be asked of the forge (#5041 reads it `unknown`);
+commit, so whether it contains the merge cannot be asked of the forge (#5041's `read_sync` refuses
+the kind);
 fixes delivered by Terraform or Config Connector, which have no in-cluster revision to compare;
 pull requests from `submit-suggestion`, which carry no structured finding (open question 1); and
 merging anything. kube-agents never merges, approves or reopens a pull request.
@@ -78,24 +78,30 @@ the pull request opened, and never refreshed, so a later edit to the body change
 the finding ids in the body's hidden `audit-findings` block (`render_remediation_pr_body`,
 `audit_report.py:13825-13842`) and the stream, read from the `audit:<stream>` label
 (`remediation_labels`, `audit_report.py:15932`), or from the body's stream marker on a forge with
-no labels. A finding id is `<check>.<cluster>.<namespace>.<object>` (`audit_report.py:21068`), so it
-names the check and the target directly.
+no labels. A finding id names its check first, but the rest of it cannot be turned back into a
+target: each segment is lowercased with every other character replaced by `-`, and a long id is
+cut and given a digest (`_id_segment` and `_shorten_id`, `audit_report.py:5312-5327`, `:5397-5400`).
+So the target comes from the generated file itself. The PDB manifest carries the namespace and
+name, and its header comment names the cluster, the workload and the finding id
+(`_pdb_manifest`, `audit_report.py:17219-17227`).
 
-The body is not trusted for this. The model opens pull requests through the same `proposal-create`
-verb the audit uses, and the audit already treats a marker read from a body as forgery surface
-(`audit_report.py:11293-11296`). So the driver accepts the subject only when the proposal's changed
-files are exactly what the fix type's generator writes for those finding ids, re-rendered by the
-driver and compared byte for byte. A proposal that fails the comparison, or whose body has no
-`audit-findings` block, keeps a record with no subject, which is dropped without a report. A
-forged body can then name only a fix the harness would itself have written, for a target the audit
-already reads.
+Neither the body nor the file is trusted as it stands. The model opens pull requests through the
+same `proposal-create` verb the audit uses, and the audit already treats a marker read from a body
+as forgery surface (`audit_report.py:11293-11296`). So the driver reads the workload the header
+names, re-renders the fix with the type's generator from that live workload and the finding id,
+and accepts the subject only when the proposal's changed files are exactly that file, plus the
+kustomization line that lists it where the audit adds one, compared byte for byte. A proposal that
+fails the comparison, or whose body has no `audit-findings` block, keeps a record with no subject,
+which is dropped without a report. A forged pull request can then name only a fix the harness would
+itself have written, for a target the audit already reads.
 
 The subject also names the reconciler that delivers the target, read from the target workload's
 ownership markers: Argo's `argocd.argoproj.io/tracking-id`, Flux's `kustomize.toolkit.fluxcd.io/name`
 label, or Config Sync's annotations (`agents/cluster/skills/gke-load-bearing-change/SKILL.md:32-34`).
 For a missing PDB the budget does not exist yet, so the markers come from the workload it covers.
 The driver looks for an Argo Application on the target cluster first and then on the management
-cluster, which covers a central Argo CD there. The reconciler counts only when its source is the
+cluster, which covers a central Argo CD there; an Argo CD hub on a third cluster is not found. The
+reconciler counts only when its source is the
 pull request's repository and its path covers a changed file. Otherwise, including Argo releases
 that track by label and leave no `tracking-id`, the record has no reconciler and §3.3 observes the
 object instead.
@@ -127,10 +133,11 @@ walk bound, and a broker that does not serve the verb.
 
 `mergeCommit` needs care before it is used. #5041's `read_sync` takes only a full 40- or
 64-character commit id. Bitbucket Cloud gives 12 characters (#4933), so the driver expands it with
-one commit read before the first `read_sync` call. GitLab gives `null` after a fast-forward merge
-and Bitbucket Data Center may give `null`. After a fast-forward the proposal's head commit is
-itself on the target branch, so the driver uses `sourceRevision` instead. With neither, the record
-is reported "merged; the merge commit could not be identified, so the cluster was not judged".
+one commit read before the first `read_sync` call. GitLab gives `null` only after a fast-forward
+merge, where the proposal's head commit is itself on the target branch, so on GitLab the driver
+uses `sourceRevision` instead. Bitbucket Data Center may give `null` after any merge, including a
+squash whose head commit never reaches the target, so there the record is reported "merged; the
+merge commit could not be identified, so the cluster was not judged".
 
 ### 3.3 Wait until the reconciler has applied the merge
 
@@ -248,6 +255,10 @@ step, posts what is due, and prints only faults and the outcomes that go to chat
 are per check id in code. For `no-pdb`: a budget selecting the workload exists at its current
 generation (`status.observedGeneration == metadata.generation`), every pod is healthy
 (`currentHealthy == expectedPods`), `disruptionsAllowed >= 1`, and the narrowed re-check is clean.
+A pod restarting for reasons of its own makes `disruptionsAllowed` 0 for a moment, so a budget
+reading that fails is read again after a second window before the record is reported. One that
+still fails is reported, because a budget that allows no disruption blocks node drains, which is
+the `blocking-pdb` problem.
 
 It is not a model turn for three reasons. Waiting is most of the work, and a model turn that finds
 nothing to do is what `github_scan_gate.py` exists to avoid (`agents/platform/scripts/github_scan_gate.py:5-21`).
@@ -282,7 +293,7 @@ comment (open question 3).
 | Reconciler still at the old commit (the 11-05 case)            | nothing until it applies; "not applied by T" if it never does                                                        |
 | Reconciler error at the merge for 15 minutes                   | "not applied", with the reconciler's error reason                                                                    |
 | Ancestry cannot be answered (forge without compare, or outage) | `unconfirmed` keeps waiting; at T, "not applied: could not confirm the applied revision contains the merge"          |
-| Merge commit unknown (`null` with no fast-forward head)        | "merged; the merge commit could not be identified, so the cluster was not judged"                                    |
+| Merge commit unknown (Bitbucket Data Center `null`)            | "merged; the merge commit could not be identified, so the cluster was not judged"                                    |
 | Target owned by no reconciler the agent can read               | the object is observed directly and the report says so                                                               |
 | Cluster unreadable on a tick                                   | nothing; the tick retries. Unreadable for the whole window ends in "not applied" or a failed window, with the reason |
 | Re-check cannot run (audit failure, stream disabled)           | "applied, not re-checked", never "fixed"                                                                             |
@@ -291,8 +302,8 @@ comment (open question 3).
 | Pull request reverted by a person before the check finishes    | the re-check reports what it sees; the comment states the observation and makes no claim about cause                 |
 
 Each record moves through `open`, `merged`, `applied` and `reporting` to `reported`, and can leave
-early as `closed` (closed unmerged) or `dropped` (no subject). Any state can go straight to
-`reporting` when its deadline passes. The comment carries a hidden `post-merge-check:<outcome>`
+early as `closed` (closed unmerged) or `dropped` (no subject). Once merged, a record goes
+straight to `reporting` when its deadline passes. The comment carries a hidden `post-merge-check:<outcome>`
 marker. A driver that dies between posting and writing `reported` finds the record in `reporting`,
 reads the pull request's harness comments for the marker, and posts only if it is absent. The
 thread line is posted after the comment and marked on the record separately, so a crash costs at
