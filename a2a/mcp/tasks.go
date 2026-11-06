@@ -234,7 +234,12 @@ func (w *taskWatch) close() {
 // next reads what is pending, up to taskFetchBatch events at a time, or
 // waits up to taskFetchWait for the next event when nothing is.
 func (w *taskWatch) next(ctx context.Context) error {
-	wait := fetchWait(ctx, taskFetchWait)
+	return w.nextWait(ctx, taskFetchWait)
+}
+
+// nextWait is next with a caller-chosen maximum wait when nothing is pending.
+func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
+	wait := fetchWait(ctx, maxWait)
 	// Never below minFetchWait, even with less than that left: what is
 	// pending still arrives at once, and an empty fetch ends just past the
 	// deadline, which the caller then sees as ctx done and keeps what it has

@@ -95,7 +95,8 @@ const (
 	remoteMCPPath               = "/mcp"
 	remoteMCPSwarmPath          = "/mcp/swarm"
 	remoteMCPHealthPath         = "/healthz"
-	StreamingStepContinuePrefix = "⏳ **[STREAMING_STEP_CONTINUE]**"
+	// StreamingStepContinuePrefix marks a tool response whose remote A2A task is still streaming.
+	StreamingStepContinuePrefix = "STREAMING_STEP_CONTINUE: "
 	// staleStreamingTaskAge is how long a tracked task no call has touched is kept.
 	staleStreamingTaskAge = 10 * time.Minute
 )
@@ -373,7 +374,7 @@ func (g *gatewayBridgeSession) callRemoteTool(
 		_ = json.Unmarshal(rawArgs, &argsAny)
 	}
 	// Only the called conversation's entry goes upstream, never the rest of the local table
-	// (the in-cluster server reads nothing from _meta today).
+	// (the in-cluster server reads _meta.conversation_id to auto-enable step streaming).
 	metaMap := map[string]any{}
 	if alias := calledConversation(argsAny); alias != "" {
 		if entry, ok := snap.Conversations[alias]; ok {
@@ -393,8 +394,15 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	}
 	if meta.ProgressToken != nil {
 		metaMap["progressToken"] = meta.ProgressToken
-	} else {
+	} else if onProgress != nil {
 		metaMap["progressToken"] = "bridge-progress"
+	}
+	if meta.ConversationID != "" && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
+		if m, ok := argsAny.(map[string]any); ok {
+			if _, has := m["stream_steps"]; !has {
+				m["stream_steps"] = true
+			}
+		}
 	}
 
 	rpcPayload, err := json.Marshal(map[string]any{
@@ -1141,7 +1149,7 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 	}
 
-	isStreamingStep := strings.HasPrefix(text, StreamingStepContinuePrefix)
+	isStreamingStep := strings.HasPrefix(text, StreamingStepContinuePrefix) || strings.Contains(text, "STREAMING_STEP_CONTINUE")
 	if s.host != nil {
 		text, customMarkdown = s.host.OnAfterToolCall(ctx, s, name, isStreamingStep, text, customMarkdown)
 	}
@@ -1763,6 +1771,11 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		}
 	}
 	s.mu.Unlock()
+	if callErr == nil && convAlias != "" && s.store != nil {
+		if wid := extractTaskSessionWorkerID(responseText); wid != "" {
+			s.store.SetConversationSessionWorkerID(convAlias, wid)
+		}
+	}
 }
 
 // taskOwnerConversation is the conversation alias a tracked streaming task was started on (a
@@ -1801,14 +1814,29 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 }
 
 // runningTaskRefRegex matches the in-cluster server's line for a task still running
-// (a2a/mcp writeTask): "Task `<addressee>/<id>`: **<state>** (still running; ...".
-var runningTaskRefRegex = regexp.MustCompile("(?m)^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running")
+// (a2a/mcp writeTask or FormatTurnCustomToolEnvelope):
+// "Task `<addressee>/<id>`: **<state>** (still running; ..." or
+// "...Task `<addressee>/<id>` is actively running...".
+var (
+	runningTaskRefRegex       = regexp.MustCompile("(?m)(?:^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|Task `([^`\\s]+)` is actively running)")
+	taskSessionWorkerRefRegex = regexp.MustCompile("(?m)Task `((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+`")
+)
+
+func extractTaskSessionWorkerID(text string) string {
+	if m := taskSessionWorkerRefRegex.FindStringSubmatch(text); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
 
 // runningTaskRef is the task reference of the first task the server reports still running in
 // text, or "".
 func runningTaskRef(text string) string {
-	if m := runningTaskRefRegex.FindStringSubmatch(text); len(m) == 2 {
-		return m[1]
+	if m := runningTaskRefRegex.FindStringSubmatch(text); len(m) >= 3 {
+		if m[1] != "" {
+			return m[1]
+		}
+		return m[2]
 	}
 	return ""
 }

@@ -54,7 +54,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -208,17 +207,26 @@ const (
 	redactedValue = "[redacted]"
 )
 
-// What of an input reaches the bus is decided twice, because this stream
-// is retained for days and copied into eval records. redactedKeyPattern
-// and its siblings name input keys whose values never go on the bus, so
-// the trace still says a secret-looking key was there. Then every string
-// value becomes its shape (shapeValue): the graders on the inject lane
-// read tool names (an entry's tool, a tool_call wrapper's calls[].name)
-// and nothing of the arguments, and no grammar tells a resource name from
-// a credential under the same key, so no string value leaves the pod
-// whatever its key, and no value scrub is attempted. A credential a model
-// pastes into a terminal command is one string under "command", and ships
-// as a length.
+// What of an input reaches the bus does not depend on the executor mode,
+// because this stream is retained for days and copied into eval records.
+// First, redactedKeyPattern and its siblings name input keys whose values
+// never go on the bus, so the trace still says a secret-looking key was
+// there. Then every remaining string value becomes its shape (shapeValue):
+// the graders on the inject lane read tool names (an entry's tool, a
+// tool_call wrapper's calls[].name) and nothing of the arguments, so no
+// string value leaves the pod whatever its key. Results are not published
+// either, and neither is a failed call's error text: the entry carries the
+// call's status and hermes's own errorType word. The api executor (a
+// sessionID bound) adds attribution on top of the same entry: the step
+// title the call was planned under, the session, the worker or card it ran
+// for, and, on a kanban_create that made a card, the card's id. A title is
+// the one place a value taken from the arguments is published, and it is a
+// short identifier the renderer needs (a cluster, a file's tail, a search
+// query, a card's title), passed through scrubInlineSecrets as a net. The
+// model's reasoning is read for the step boundary it marks and is not
+// published: a model that has read a secret may restate it, and a scrubber
+// is not a contract.
+//
 // activityEntryBudget bounds the parts one task publishes on its trace and
 // its heartbeat together. Both ride the task's own events subject, which
 // the TASKS stream caps at 4096 messages per subject with discard-old, so a
@@ -354,8 +362,9 @@ func shapeOf(s string) string {
 
 // ActivityEntry is one data part of the activity artifact: one tool
 // invocation. tool and input are the worker adapter's shape; the rest is
-// what hermes's hook adds. Results are deliberately absent - no check reads
-// them and they are the riskiest payload in the pod.
+// what hermes's hook adds. Under the cli executor, results are omitted;
+// under the api executor, one-line scrubbed result/error previews and
+// worker/card attribution are populated for interactive step rendering.
 type ActivityEntry struct {
 	Tool   string          `json:"tool"`
 	Input  json.RawMessage `json:"input,omitempty"`
@@ -365,9 +374,15 @@ type ActivityEntry struct {
 	// status word (blocked, cancelled, timeout, error) or error_type
 	// (tool_error), so a guardrail refusal stays distinguishable from a
 	// tool failure in the trace.
-	ErrorType  string `json:"errorType,omitempty"`
-	DurationMs int64  `json:"durationMs,omitempty"`
-	At         string `json:"at,omitempty"`
+	ErrorType     string `json:"errorType,omitempty"`
+	ErrorMessage  string `json:"errorMessage,omitempty"`
+	ResultPreview string `json:"resultPreview,omitempty"`
+	SessionID     string `json:"sessionId,omitempty"`
+	Worker        string `json:"worker,omitempty"`
+	Title         string `json:"title,omitempty"`
+	CardID        string `json:"cardId,omitempty"`
+	DurationMs    int64  `json:"durationMs,omitempty"`
+	At            string `json:"at,omitempty"`
 	// Dropped is set only on the activityTruncatedTool entry: how many
 	// calls are missing from the trace, past the budget, failed to publish,
 	// or left unreported by the drain's deadline.
@@ -385,18 +400,19 @@ type hookDelivery struct {
 	// SessionID is the hermes session the call ran in, top-level in the
 	// payload; the door attributes an API-executor delivery by it.
 	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd"`
+	Profile   string `json:"profile"`
 	Extra     struct {
-		ToolCallID string      `json:"tool_call_id"`
-		DurationMs json.Number `json:"duration_ms"`
-		Status     string      `json:"status"`
-		ErrorType  string      `json:"error_type"`
-		// A post_api_request's: how the request ended, its ordinal in the
-		// turn, and hermes's sanitized response, of which the door reads
-		// the finish reason and whether any call was planned, and nothing
-		// else (synthesisLocked).
-		FinishReason string          `json:"finish_reason"`
-		APICallCount json.Number     `json:"api_call_count"`
-		Response     json.RawMessage `json:"response"`
+		ToolCallID       string          `json:"tool_call_id"`
+		DurationMs       json.Number     `json:"duration_ms"`
+		Status           string          `json:"status"`
+		ErrorType        string          `json:"error_type"`
+		ErrorMessage     string          `json:"error_message"`
+		Result           json.RawMessage `json:"result"`
+		FinishReason     string          `json:"finish_reason"`
+		APICallCount     json.Number     `json:"api_call_count"`
+		AssistantMessage json.RawMessage `json:"assistant_message"`
+		Response         json.RawMessage `json:"response"`
 	} `json:"extra"`
 }
 
@@ -417,6 +433,8 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Timestamp = lenientString(top["timestamp"])
 	d.DeliveryID = lenientString(top["delivery_id"])
 	d.SessionID = lenientString(top["session_id"])
+	d.Cwd = lenientString(top["cwd"])
+	d.Profile = lenientString(top["profile"])
 	var extra map[string]json.RawMessage
 	if raw, ok := top["extra"]; ok {
 		_ = json.Unmarshal(raw, &extra)
@@ -425,8 +443,11 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.ErrorMessage = lenientString(extra["error_message"])
+	d.Extra.Result = extra["result"]
 	d.Extra.FinishReason = lenientString(extra["finish_reason"])
 	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
+	d.Extra.AssistantMessage = extra["assistant_message"]
 	d.Extra.Response = extra["response"]
 	return nil
 }
@@ -479,18 +500,25 @@ type activityState struct {
 	// cardsFiled says a kanban_create call of this task's ended without an
 	// error: the turn handed work to cards, so its terminal keeps the ask
 	// marked (cardsMark in bridge.go).
-	cardsFiled atomic.Bool
+	cardsFiled  atomic.Bool
+	waitingCard atomic.Bool
+	waitInTurn  atomic.Bool
 
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
 	// to check a session's delivery against.
 	traced bool
 
-	mu         sync.Mutex
-	open       map[string]ActivityEntry // calls started and not yet ended
-	openOrder  []string                 // their ids, in start order
-	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
-	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
+	mu        sync.Mutex
+	open      map[string]ActivityEntry // calls started and not yet ended
+	openOrder []string                 // their ids, in start order
+	// openRaw is the raw tool input of each open call, kept in memory for
+	// the api executor's attribution when the call's end carries none (the
+	// nested tool name in hermes's wrapper, the worker-to-card mapping);
+	// it is never published.
+	openRaw    map[string]json.RawMessage
+	seen       map[string]struct{} // delivery ids, so a hermes retry is one call
+	seenRing   []string            // the ids in arrival order, the oldest forgotten past activitySeenCap
 	seenNext   int
 	calls      int
 	published  int // trace parts sent, against the budget less the reserve
@@ -499,6 +527,7 @@ type activityState struct {
 	lastTool   string
 	startedAt  time.Time
 	appended   map[string]bool // artifact name -> a first part went out
+	trace      sessionTrace
 
 	// openStep is the plan step the current run of one tool's calls is
 	// building, published when it closes (activity_steps.go); turnSession
@@ -527,12 +556,14 @@ type activityState struct {
 func newActivityState(withKey bool) *activityState {
 	a := &activityState{
 		open:      make(map[string]ActivityEntry),
+		openRaw:   make(map[string]json.RawMessage),
 		seen:      make(map[string]struct{}),
 		startedAt: time.Now(),
 		appended:  make(map[string]bool),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	a.waitInTurn.Store(true)
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
 		// crypto/rand.Read does not fail (it crashes the program if the
@@ -622,13 +653,20 @@ func hookSigned(key, sig string, body []byte) bool {
 // observe records one delivery. A start opens a call; an end closes it and
 // yields the entry to publish. Ends are the entries (one per invocation, the
 // spec's rule); starts exist so an interrupted call can still be reported.
+// The steps are the step records the delivery closed or planned
+// (activity_steps.go, activity_thinking.go).
 func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
 	id := d.Extra.ToolCallID
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
 		// end well enough for the interrupted flush, which is all the id
-		// is for.
-		id = "tool:" + d.ToolName
+		// is for. Include SessionID on API session tasks so concurrent
+		// specialist workers do not collide on a.open["tool:<name>"].
+		if a.sessionID != "" && d.SessionID != "" {
+			id = "tool:" + d.SessionID + ":" + d.ToolName
+		} else {
+			id = "tool:" + d.ToolName
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -647,31 +685,38 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	steps := a.observeStepsLocked(d)
+	steps := a.observeExecutorStepsLocked(d)
 	switch d.Event {
 	case hookPreToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
-		a.open[id] = ActivityEntry{
+		// The input goes on the bus as its shape under both executors
+		// (the note above redactInput); the api executor keeps the raw
+		// arguments of an open call in memory for its attribution only.
+		entry := ActivityEntry{
 			Tool:   capRunes(d.ToolName, activityToolNameCap),
 			Input:  redactInput(d.ToolName, d.ToolInput),
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
+		a.enrichPreToolCallLocked(d, &entry)
+		a.open[id] = entry
+		if a.sessionID != "" && len(d.ToolInput) > 0 {
+			a.openRaw[id] = d.ToolInput
+		}
 		return ActivityEntry{}, false, steps
 	case hookPostToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
-		if _, seen := a.open[id]; seen {
-			delete(a.open, id)
-			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
-		}
+		openEntry, openRaw := a.popOpenCallLocked(id, d)
 		a.calls++
-		a.turnCalls++
 		status := activityStatus(d)
-		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
-			a.cardsFiled.Store(true)
+		if a.sessionID == "" || d.SessionID == "" || d.SessionID == a.sessionID {
+			a.turnCalls++
+			if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+				a.cardsFiled.Store(true)
+			}
 		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
@@ -684,6 +729,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
+		a.enrichPostToolCallLocked(d, openEntry, openRaw, status, &e)
 		return e, true, steps
 	}
 	return ActivityEntry{}, false, steps
@@ -697,10 +743,14 @@ func (a *activityState) interrupted() []ActivityEntry {
 	out := make([]ActivityEntry, 0, len(a.openOrder))
 	for _, id := range a.openOrder {
 		e := a.open[id]
+		if a.sessionID != "" && e.SessionID != "" && e.SessionID != a.sessionID {
+			continue
+		}
 		e.Status = ActivityStatusInterrupted
 		out = append(out, e)
 	}
 	a.open = make(map[string]ActivityEntry)
+	a.openRaw = make(map[string]json.RawMessage)
 	a.openOrder = nil
 	return out
 }
@@ -852,7 +902,7 @@ func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 		return out
 	}
 	if tool == hermesToolCallWrapper {
-		if capped, ok := capWrapperCalls(red); ok {
+		if capped, ok := capWrapperCalls(red, activityInputCap); ok {
 			return capped
 		}
 	}
@@ -876,7 +926,7 @@ func truncatedStandIn(out []byte, headLen int) map[string]any {
 // small calls still keeps its names. False when the wrapper still does not
 // fit, or when the input is not the wrapper's shape, and the caller falls
 // back to the whole stand-in.
-func capWrapperCalls(red any) (json.RawMessage, bool) {
+func capWrapperCalls(red any, maxBytes int) (json.RawMessage, bool) {
 	m, ok := red.(map[string]any)
 	if !ok {
 		return nil, false
@@ -915,7 +965,7 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		if err != nil {
 			return nil, false
 		}
-		if len(out) <= activityInputCap {
+		if len(out) <= maxBytes {
 			return out, true
 		}
 	}
@@ -1297,6 +1347,9 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
 	if ok {
+		if entry.CardID != "" && d.SessionID == act.sessionID {
+			b.kanban.rememberCardOrigin(entry.CardID, run.origin.TaskID)
+		}
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {
@@ -1339,11 +1392,11 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 		return nil
 	}
 	for _, r := range runs {
-		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && a.inTurn.Load() {
+		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
 			return r
 		}
 	}
-	return nil
+	return matchWorkerDeliveryRun(runs, d)
 }
 
 // --- the heartbeat ---
