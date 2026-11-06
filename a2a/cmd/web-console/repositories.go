@@ -540,7 +540,8 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), repositoriesTimeout)
 	defer cancel()
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, validatedRepos, forgesList, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, validatedRepos, forgesList, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not patch PlatformAgent repositories: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update PlatformAgent in cluster: %v", err))
 		return
@@ -549,12 +550,14 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   validatedRepos,
-		Forges:         forgesList,
-		HelmValuesYAML: generateHelmValuesYAML(forgesList, validatedRepos),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, validatedRepos),
 	})
 }
 
-func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string, validatedRepos []repositoryInfo, forgesList []forgeInfo, categories map[string]string) error {
+// saveRepositoriesToCluster patches the PlatformAgent and returns the forges
+// in the order it wrote them, which is the cluster's.
+func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string, validatedRepos []repositoryInfo, forgesList []forgeInfo, categories map[string]string) ([]forgeInfo, error) {
 	if s.kube != nil {
 		path := fmt.Sprintf(platformAgentsAPIPath, s.cfg.PodNamespace, s.cfg.PlatformAgentName)
 		existingForges := map[string]map[string]any{}
@@ -563,7 +566,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 		hasGitHubAlias := false
 		var rawCR map[string]any
 		if err := s.kube.get(ctx, path, &rawCR); err != nil {
-			return fmt.Errorf("read PlatformAgent before patch: %w", err)
+			return nil, fmt.Errorf("read PlatformAgent before patch: %w", err)
 		}
 		if spec, ok := rawCR["spec"].(map[string]any); ok {
 			if integ, ok := spec["integration"].(map[string]any); ok {
@@ -684,7 +687,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 		}
 
 		if _, err := s.kube.doJSON(ctx, http.MethodPatch, path, patch, nil); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -693,7 +696,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 	s.cachedTopology = topology
 	s.cachedForges = forgesList
 	s.reposMu.Unlock()
-	return nil
+	return forgesList, nil
 }
 
 type repoConnectRequest struct {
@@ -873,7 +876,8 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 		categories[r.Repository] = r.Category
 	}
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, existingList, forges, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, existingList, forges, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not connect repository: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update repositories: %v", err))
 		return
@@ -882,8 +886,8 @@ func (s *server) handleRepositoriesConnect(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   existingList,
-		Forges:         forges,
-		HelmValuesYAML: generateHelmValuesYAML(forges, existingList),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, existingList),
 	})
 }
 
@@ -927,7 +931,8 @@ func (s *server) handleRepositoriesDisconnect(w http.ResponseWriter, r *http.Req
 		categories[r.Repository] = r.Category
 	}
 
-	if err := s.saveRepositoriesToCluster(ctx, topology, newList, forges, categories); err != nil {
+	saved, err := s.saveRepositoriesToCluster(ctx, topology, newList, forges, categories)
+	if err != nil {
 		log.Printf(logPrefix+"could not disconnect repository: %v", err)
 		writeError(w, http.StatusInternalServerError, "patch_failed", fmt.Sprintf("Failed to update repositories: %v", err))
 		return
@@ -936,8 +941,8 @@ func (s *server) handleRepositoriesDisconnect(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, repositoriesResponse{
 		Topology:       topology,
 		Repositories:   newList,
-		Forges:         forges,
-		HelmValuesYAML: generateHelmValuesYAML(forges, newList),
+		Forges:         saved,
+		HelmValuesYAML: generateHelmValuesYAML(saved, newList),
 	})
 }
 

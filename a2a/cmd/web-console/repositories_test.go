@@ -340,7 +340,7 @@ func TestSaveRepositoriesPreservesUnknownClusterFields(t *testing.T) {
 	})
 	s.kube = &kubeClient{base: fakeAPI.URL, token: "sa-token", client: fakeAPI.Client()}
 
-	err := s.saveRepositoriesToCluster(
+	_, err := s.saveRepositoriesToCluster(
 		httptest.NewRequest(http.MethodPost, "/api/repositories", nil).Context(),
 		"monorepo",
 		[]repositoryInfo{{Forge: "github", Provider: "github", Repository: "org/infra", Role: "gitops", BaseBranch: "main"}},
@@ -420,7 +420,7 @@ func TestDeprecatedGitHubAliasReadAndClearedOnWrite(t *testing.T) {
 
 	// Failed GET before PATCH must abort without issuing a PATCH.
 	getErr = true
-	if err := s.saveRepositoriesToCluster(
+	if _, err := s.saveRepositoriesToCluster(
 		httptest.NewRequest(http.MethodPost, "/api/repositories", nil).Context(),
 		"monorepo",
 		repos,
@@ -435,7 +435,7 @@ func TestDeprecatedGitHubAliasReadAndClearedOnWrite(t *testing.T) {
 
 	// Successful GET over deprecated alias clears spec.integration.github in the merge patch.
 	getErr = false
-	if err := s.saveRepositoriesToCluster(
+	if _, err := s.saveRepositoriesToCluster(
 		httptest.NewRequest(http.MethodPost, "/api/repositories", nil).Context(),
 		"monorepo",
 		repos,
@@ -604,5 +604,20 @@ func TestASaveFollowsTheClusterOrderOverAnOlderCache(t *testing.T) {
 	}
 	if got := forgeNames((*patched)[0]); !slices.Equal(got, []string{"ghe", "github"}) {
 		t.Errorf("forges %v, want the cluster's current order [ghe github]", got)
+	}
+	// The answer, which the page keeps for its next save, says what was written.
+	var answer repositoriesResponse
+	if err := json.NewDecoder(rec.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	var answered []string
+	for _, f := range answer.Forges {
+		answered = append(answered, f.Name)
+	}
+	if !slices.Equal(answered, []string{"ghe", "github"}) {
+		t.Errorf("answered forges %v, want the order written [ghe github]", answered)
+	}
+	if strings.Index(answer.HelmValuesYAML, "name: ghe") > strings.Index(answer.HelmValuesYAML, "name: github") {
+		t.Errorf("Helm values list github before ghe:\n%s", answer.HelmValuesYAML)
 	}
 }
