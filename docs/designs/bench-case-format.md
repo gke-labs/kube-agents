@@ -313,9 +313,11 @@ the delegated workers ran, read from the worker log of each card the front agent
 purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; the required patterns and runs also read a logged card's tagged calls; with `after_result_pattern` set, the check reads every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
 command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
-send nothing but carries a forbidden word as its argument, such as a plain
-`grep` exempted through its pattern argument so that whatever else shares the
-line is still graded; or with `required_runs` a script by its basename and the flags that must
+send nothing but carries a forbidden word as its argument; `exempt_grep_patterns: true`
+cuts each grep's pattern argument instead, read from the line's shell segments, so the
+grep's file operands and every other segment are still graded (a grep piped on,
+redirected anywhere but /dev/null, running a substitution or on a collapsed chain does
+not qualify), and the required list reads the rest of that command; or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the

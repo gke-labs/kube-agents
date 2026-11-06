@@ -52,18 +52,19 @@
 # passes. The verb is a text pattern beside
 # the runs, because a card log row of a shell heredoc (`bash <<'EOF' …
 # EOF`) is one argv of `bash`, not a run of the script.
-# An exemption first removes one grep, egrep or fgrep invocation with its
-# options and its pattern argument (quoted or bare). A bare word or a
-# double-quoted pattern has no `$(` or backquote, and a bare word also has no
-# <, >, (, ), ;, & or |. It does this only on a row that is that grep and nothing
-# else: after the pattern, the row has no |, ;, &, backquote, (, ), <, > or
-# newline, except a `2>/dev/null` or `> /dev/null` trailer, and it is not a
-# collapsed chain (a row ending ` + N command(s)`). The file operands, and any text that the rendering
-# joined onto the row, stay graded. So `grep -rn /v1/workspace <skill dir>`
-# and `grep "inspect_repository.py open" SKILL.md` pass, but a call typed on
-# the line after a grep fails. No other command is exempt: echo, printf,
-# cat, head, tail, less, ls, rg, sed and find can carry the route into a
-# file or a pipe, and a card log row drops a redirection.
+# The grep exemption (`exempt_grep_patterns`) first cuts each grep, egrep or
+# fgrep pattern argument out of the row, reading the row's shell segments
+# as bash does: an operator glued to the pattern (`grep x;curl …`) ends the
+# segment there. The options, the file operands, any text that the rendering
+# joined onto the row, and every other segment stay graded. A grep does not
+# qualify when it runs a substitution, when its output is piped on
+# (`| head`, `| sh`), when it redirects anywhere but /dev/null, or on a
+# collapsed chain (a row ending ` + N command(s)`). So
+# `grep -rn /v1/workspace <skill dir>`, `cd <dir> && grep …` and
+# `grep "inspect_repository.py open" SKILL.md` pass, but a call typed on the
+# line after a grep fails. No other command is exempt: echo, printf, cat,
+# head, tail, less, ls, rg, sed and find can carry the route into a file or
+# a pipe, and a card log row drops a redirection.
 # Known limits:
 #   - The check does not see a route that no row names: a script file that
 #     names it (`python3 /tmp/call.py`), a program that the execute_code tool
@@ -71,15 +72,11 @@
 #     chained behind a first command on a card log row is not on the row
 #     either (`cat SKILL.md + 1 command(s)`): the rendering keeps only the
 #     first command.
-#   - A row that is not one grep and names the route or a verb counts as a
+#   - A read that is not a grep and names the route or a verb counts as a
 #     call, which is a spurious red: an echo, a cat or another command that
-#     names it, a grep behind `if`, a wrapper such as timeout or an absolute
-#     path (/usr/bin/grep), and a collapsed chain whose first command names
-#     it. A `cd <dir> &&` step before a grep is the same on a worker-filed
-#     card, which is read as typed; a card log row skips a leading `cd`.
-#     A grep is also not exempt with a pipe (`| head -20`), with an option
-#     whose value is a separate word (`--include '*.md'`, `--context 3`), or
-#     with a `2>&1` or `&>/dev/null` trailer, which a typed card keeps.
+#     names it, a grep behind `if` or a wrapper such as timeout, and a
+#     collapsed chain whose first command names it. A grep piped on
+#     (`| head -20`) or with a `2>&1` trailer is graded whole too.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the
@@ -189,11 +186,9 @@ verification_spec:
       forbidden_runs:
         - script: inspect_repository.py
           word_patterns: ["^ ?(open|list|grep|fetch|close)$"]
-      # One grep invocation through its pattern argument, on a row that is
-      # that grep and nothing else; the case header states the limits.
-      exempt_patterns:
-        - >-
-          ^(?!.*\s\+\s\d+\scommands?\s*$)\s*(?:grep|egrep|fgrep)(?:\s+(?:-e\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$<>();&|](?:[^\s`$<>();&|]|\$(?!\())*)|-[ABCm]\s+\d+|-(?:[^\s`$<>();&|]|\$(?!\())+))*(?:\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^-\s"'`$<>();&|](?:[^\s`$<>();&|]|\$(?!\())*))?(?=[^;&|`()<>\n]*(?:\s*[12]?>\s*/dev/null)*\s*$)
+      # Each grep's pattern argument, read from the row's shell segments; the
+      # case header states the limits.
+      exempt_grep_patterns: true
       # Any row that names the workspace route, or the script with a verb
       # as the next word.
       forbidden_patterns:
