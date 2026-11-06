@@ -2080,22 +2080,29 @@ render rather than be refused, so the count bounds it from above. Takes a dict w
 {{- $replicas := .replicas | int64 -}}
 {{- $v := .maxSurge -}}
 {{- $raw := "" -}}
+{{- /* A Deployment's replicas are an int32, so a maxSurge of 11 or more digits, or a
+       percentage of 1000% or more, already reaches past any replica count: it counts as the
+       replicas outright, with no conversion that could overflow. Only smaller values are
+       converted, which keeps every number well inside int64 and float64 (#4876's review:
+       a 20-digit value wrapped through int64, and a 309-digit one read 0 through float64). */ -}}
 {{- if or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v) -}}
+  {{- /* A number past int64 doesn't survive the round trip, so it keeps its float spelling
+         ("1e+20"), which isn't digits and counts as the replicas below. */ -}}
   {{- $raw = toString ($v | int64) -}}
   {{- if ne (float64 ($v | int64)) (float64 $v) -}}{{- $raw = toString $v -}}{{- end -}}
 {{- else -}}
   {{- $raw = trim (toString $v) -}}
 {{- end -}}
-{{- $n := 0 -}}
-{{- /* Every conversion to an integer goes through clampInt64: a percentage or integer
-       of 20 digits or more is past int64, and a plain `int64` of it wraps negative on
-       amd64 or reads as 0, either of which would under-count. */ -}}
-{{- if not (regexMatch "^[0-9]+%?$" $raw) -}}
-  {{- $n = $replicas -}}
-{{- else if hasSuffix "%" $raw -}}
-  {{- $n = include "kube-agents.clampInt64" (ceil (divf (mulf (trimSuffix "%" $raw | float64) (float64 $replicas)) 100.0)) | int64 -}}
-{{- else -}}
-  {{- $n = include "kube-agents.clampInt64" ($raw | float64) | int64 -}}
+{{- $n := $replicas -}}
+{{- if regexMatch "^[0-9]+%?$" $raw -}}
+  {{- $digits := regexReplaceAll "^0+([0-9])" (trimSuffix "%" $raw) "${1}" -}}
+  {{- if hasSuffix "%" $raw -}}
+    {{- if lt (len $digits) 4 -}}
+      {{- $n = include "kube-agents.clampInt64" (ceil (divf (mulf ($digits | float64) (float64 $replicas)) 100.0)) | int64 -}}
+    {{- end -}}
+  {{- else if lt (len $digits) 11 -}}
+    {{- $n = $digits | int64 -}}
+  {{- end -}}
 {{- end -}}
 {{- if le $replicas (int64 0) -}}0{{- else -}}{{- min $n $replicas -}}{{- end -}}
 {{- end }}

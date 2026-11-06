@@ -1226,17 +1226,30 @@ class PreflightDecisionTest(unittest.TestCase):
         for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
             self.assertEqual(three[key], base[key], key)
 
-    def test_a_max_surge_past_int64_counts_as_the_replicas(self) -> None:
-        """A whole number or percentage of 20 digits or more is past int64. Converting it
-        with a plain int64 wraps negative on amd64 (or reads 0), which would stamp a
-        negative or short count; it is clamped, and the cap at the replicas applies. arm64
-        saturates the conversion instead, so a regression here fails only on amd64, as CI is."""
-        base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
-        for huge in ("1000000000000000000000%", "99999999999999999999"):
-            with self.subTest(huge=huge):
-                req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"],
-                                         extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={huge}"])
+    def test_a_max_surge_too_large_to_convert_counts_as_the_replicas(self) -> None:
+        """A Deployment's replicas are an int32, so a maxSurge of 1000% or more, or of 10 or
+        more digits, counts as the replicas outright, never through a conversion (#4876's
+        review). Covers the values a conversion got wrong: a 20-digit integer, which the YAML
+        parse makes a float past int64; 20- and 309-digit strings, which float64 reads as 0
+        or wraps; and a 23-digit percentage. Leading zeros don't count as digits."""
+        # maxUnavailable 1: main's both-zero guard (rollingUpdateFenceposts) reads a 309-digit
+        # value as 0 and would refuse the render before the count is reached.
+        sets = ["platformAgent.mode=next", "operator.replicaCount=3", "operator.rollingUpdate.maxUnavailable=1"]
+        base = self._requirements(sets)
+        for huge in ("99999999999999999999", "1000000000000000000000%", "1" + "0" * 309 + "%",
+                     "1" + "0" * 309, "1000%", "10000000000"):
+            with self.subTest(huge=huge[:12] + ("..." if len(huge) > 12 else "")):
+                req = self._requirements(sets, extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={huge}"])
                 self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+        for huge in (99999999999999999999, 10000000000, 1.0e300):
+            with self.subTest(numeric=huge):
+                # Through the values file, so the value reaches the template as a number.
+                req = self._requirements(sets, values={"operator": {"rollingUpdate": {"maxSurge": huge}}})
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
+        for small, extra in (("000000000002", 1), ("000034%", 1), ("999", 2), ("9999999999", 2)):
+            with self.subTest(small=small):
+                req = self._requirements(sets, extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={small}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + extra)
 
     def test_a_replica_count_near_int64_does_not_wrap_the_stamped_count(self) -> None:
         """The chart-pods sums saturate rather than wrap (#4876's review): a replica count of
