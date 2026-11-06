@@ -20,7 +20,10 @@ import (
 	"slices"
 	"time"
 
+	"github.com/nats-io/nkeys"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 const (
@@ -111,6 +114,16 @@ type Config struct {
 	// UnattendedTiers are the tiers on the unattended side of the
 	// interactive reserve.
 	UnattendedTiers []string
+	// TaskSigningKey, set, is the task-signing key (#3889, a2a/taskcred) the
+	// dispatcher mints each confirmed task's credentials with: a task
+	// credential for the bus and, for a task that names a cluster, a token
+	// for the credential proxy, both on the confirm. Unset, confirms carry
+	// neither and workers keep their pod-level grants.
+	TaskSigningKey nkeys.KeyPair
+	// TaskCredentialMaxLifetime caps those credentials' expiry from the time
+	// they are minted, the callout's A2A_TASK_CREDENTIAL_MAX_LIFETIME. Zero
+	// means the callout's default.
+	TaskCredentialMaxLifetime time.Duration
 }
 
 // DefaultConfig is every default.
@@ -149,6 +162,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("dispatch config: sweep interval and sweep age must be positive")
 	case c.Submitter == "" || c.Stream == "":
 		return fmt.Errorf("dispatch config: submitter and stream are required")
+	case c.TaskCredentialMaxLifetime < 0:
+		return fmt.Errorf("dispatch config: the task credential max lifetime must not be negative")
+	}
+	if c.TaskSigningKey != nil {
+		pub, err := c.TaskSigningKey.PublicKey()
+		if err != nil || !taskcred.ValidPublicKey(pub) {
+			return fmt.Errorf("dispatch config: the task-signing key is not a cluster key (C...)")
+		}
 	}
 	return nil
 }

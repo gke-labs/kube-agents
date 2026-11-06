@@ -1,5 +1,5 @@
 {
-  "version": "82a2819dd8f134f1",
+  "version": "be7785fac8a4e409",
   "namespace": "kubeagents-system",
   "profileNamespace": "kubeagents-system-profiles",
   "ceiling": 6,
@@ -9,6 +9,7 @@
   "renewSeconds": 20,
   "restartGraceSeconds": 60,
   "acceptTimeoutSeconds": 10,
+  "submitRetentionSeconds": 259200,
   "profiles": [
     {
       "name": "tse",

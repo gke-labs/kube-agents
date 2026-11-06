@@ -195,6 +195,26 @@ const (
 	// say whether the command had started. The two sets partition the
 	// broker's vocabulary, so the two counters together are every request.
 	toolInvocationsStatusLabel = "status"
+	// The broker's five outcomes (its TOOL_STATUS_* constants): the two
+	// status sets below partition them, toolInvocationsStatusOrder prints
+	// them, and a topTools row carries one field per outcome under the
+	// same name.
+	toolStatusSuccess   = "success"
+	toolStatusError     = "error"
+	toolStatusBlocked   = "blocked"
+	toolStatusBusy      = "busy"
+	toolStatusAbandoned = "abandoned"
+	// The tool counter's other two labels, read for status.usage.topTools:
+	// the executable and its first bare word, each from the broker's closed
+	// vocabulary (toolInvocationsSubcommands). toolLabelOther is what the
+	// broker writes for an executable it does not serve and for a word
+	// outside a tool's vocabulary (its LABEL_OTHER), and what this fold reads
+	// an unlisted subcommand as; toolSubcommandNone is a bare tool (its
+	// SUBCOMMAND_NONE).
+	toolInvocationsToolLabel       = "tool"
+	toolInvocationsSubcommandLabel = "subcommand"
+	toolLabelOther                 = "other"
+	toolSubcommandNone             = "none"
 
 	// The kinds a failed scrape is logged as: a closed vocabulary, never a
 	// byte the peer sent. The connection kinds are classified from the
@@ -217,8 +237,55 @@ const (
 )
 
 var (
-	toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
-	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
+	toolInvocationsCountedStatuses = map[string]bool{toolStatusSuccess: true, toolStatusError: true}
+	toolInvocationsRefusedStatuses = map[string]bool{toolStatusBlocked: true, toolStatusBusy: true, toolStatusAbandoned: true}
+	// toolInvocationsStatusOrder is the broker's whole outcome vocabulary, the
+	// two sets above in the order the summary block prints them: the statuses
+	// a topTools row carries, and the only ones a sample is folded under.
+	toolInvocationsStatusOrder = []string{toolStatusSuccess, toolStatusError, toolStatusBlocked, toolStatusBusy, toolStatusAbandoned}
+	// toolInvocationsSubcommands is the broker's tool vocabulary and, per tool,
+	// its subcommand vocabulary (credential_proxy.py's ALLOWED_EXECUTABLES and
+	// _subcommand_vocabulary; the empty entry is its LABEL_OTHER tool, which
+	// has none). The vocabulary lives in four places: the broker's own, the
+	// summary script's BROKER_SUBCOMMANDS (held to the broker's by its
+	// GatewayCopyTest), the A2A gateway's usageSummaryBrokerSubcommands in
+	// a2a/gateway/feedback_summary.go (held to the script's by the same test;
+	// it is the chat block's audit vocabulary, so a word missing there has a
+	// cluster named after it refuse the block), and this one, which
+	// tests/test_usage_counters_series_names.py holds to the broker's along
+	// with the tool enum on the status field. A sample whose tool is not a key here is
+	// not folded into topTools, and a subcommand outside its tool's list reads
+	// toolLabelOther, so the status carries no word the broker did not declare.
+	toolInvocationsSubcommands = map[string][]string{
+		"kubectl": {
+			"annotate", "api-resources", "api-versions", "apply", "attach", "auth",
+			"autoscale", "cluster-info", "config", "cordon", "cp", "create", "debug",
+			"delete", "describe", "diff", "drain", "edit", "events", "exec", "explain",
+			"expose", "get", "label", "logs", "patch", "port-forward", "proxy", "replace",
+			"rollout", "run", "scale", "set", "taint", "top", "uncordon", "version", "wait",
+		},
+		"gcloud": {
+			"artifacts", "asset", "auth", "billing", "components", "compute", "config",
+			"container", "iam", "info", "init", "logging", "monitoring", "projects",
+			"resource-manager", "services", "version",
+		},
+		"git": {
+			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+			"check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
+			"describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
+			"ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
+			"reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
+			"sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
+			"tag", "update-ref", "version", "worktree",
+		},
+		"gh": {
+			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+			"repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+			"workflow",
+		},
+		"feedback":     {"submit"},
+		toolLabelOther: {},
+	}
 )
 
 // a2aErroredTerminalStates are the A2A task terminals that are a failed turn:
@@ -307,14 +374,29 @@ func usageSiblingsFor(counter string) []usageSibling {
 // outcomes, the proposals by state, and the details, everything the sweep's
 // second step reads. A sweep can serve the first without the second, so each
 // has its own presence and its own miss streak. The third is the A2A
-// gateway's people reading, the people it saw in each window.
+// gateway's people reading, the people it saw in each window. The fourth is
+// the broker's top tools: its tool counter by tool and subcommand, which
+// every broker body carries (a broker that has run nothing carries an empty
+// one), read beside the counters the same series feeds and projected, not
+// folded, as status.usage.topTools.
 type usageReadingKind string
 
 const (
 	usageReadingOutcomes usageReadingKind = "outcomes"
 	usageReadingDetails  usageReadingKind = "details"
 	usageReadingPeople   usageReadingKind = "people"
+	usageReadingTopTools usageReadingKind = "topTools"
 )
+
+// usageToolPair is one tool and subcommand the broker's tool counter labels.
+type usageToolPair struct {
+	Tool       string
+	Subcommand string
+}
+
+// usageToolCounts is a pair's invocations by status, over
+// toolInvocationsStatusOrder; a status the body did not carry is absent.
+type usageToolCounts map[string]int64
 
 // usageReadingSpec is one status field a reading lands in: the family it is
 // read from, the label values it takes, the reading it belongs to, and
@@ -344,7 +426,7 @@ var usageReadingSpecs = []usageReadingSpec{
 }
 
 // usageReadingKinds is every reading, in a fixed order.
-var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople}
+var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople, usageReadingTopTools}
 
 // usageReadingKindsOf is the entries of specs whose reading is one of kinds,
 // in their order.
@@ -372,6 +454,11 @@ func usageReadingAged(kind usageReadingKind) bool {
 // the gateway serves both windows together or neither, so one alone is no
 // reading.
 func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
+	if kind == usageReadingTopTools {
+		// The tool counter is the broker's own, served from its first request
+		// on; a body that parsed is the reading, an empty table included.
+		return func(*usageReadingFold) bool { return true }
+	}
 	if usageReadingAged(kind) {
 		return func(f *usageReadingFold) bool {
 			if !f.aged[kind] {
@@ -414,6 +501,11 @@ type usageReading struct {
 	// carried no complete one: not the watcher's, or a watcher whose statfs
 	// failed, or one built before it exported the series.
 	DataVolume *usageDataVolume
+	// ToolPairs is the broker's tool counter by tool and subcommand, under
+	// the closed vocabularies, for a body asked for usageReadingTopTools;
+	// nil for any other. Not folded: the poll sums it across the broker pods
+	// read and projects the top rows as they stand (usageTopToolsForPoll).
+	ToolPairs map[usageToolPair]usageToolCounts
 }
 
 // usageDataVolume is one reading of the agent's data volume, in bytes.
@@ -593,11 +685,19 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	// of the kinds asked for, whether a sample resolved it, and the readings
 	// whose age series the body carries.
 	var readings *usageReadingFold
+	// pairs is the top-tools table, for a body asked for that reading: the
+	// tool counter's samples by tool and subcommand under the closed
+	// vocabularies, bounded by their product rather than by the body.
+	var pairs map[usageToolPair]map[string]float64
 	if len(kinds) > 0 {
 		readings = newUsageReadingFold(kinds)
 		families := readings.families()
 		if slices.ContainsFunc(kinds, usageReadingAged) {
 			families = append([]string{vcsReadingsAgeSeries}, families...)
+		}
+		if slices.Contains(kinds, usageReadingTopTools) {
+			pairs = map[usageToolPair]map[string]float64{}
+			families = append(families, toolInvocationsSeries)
 		}
 		for _, family := range families {
 			if !slices.Contains(wanted, family) {
@@ -675,6 +775,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						}
 						continue
 					}
+					if pairs != nil && name == toolInvocationsSeries {
+						// Into the table and on to the counters the same
+						// series feeds.
+						usageFoldToolPair(pairs, metric, value)
+					}
 					if readings != nil && readings.fold(name, metric, value) {
 						continue
 					}
@@ -704,7 +809,62 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 		}
 	}
+	if pairs != nil {
+		var ok bool
+		if out.ToolPairs, ok = usageToolPairsReading(pairs); !ok {
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+		}
+	}
 	return out, nil
+}
+
+// usageFoldToolPair takes one sample of the tool counter into the top-tools
+// table under the closed vocabularies: a tool outside toolInvocationsSubcommands
+// or a status outside toolInvocationsStatusOrder is not counted; a subcommand
+// outside its tool's list, or outside any (the broker's own other), reads
+// toolLabelOther; a bare tool, or a body without the label, reads
+// toolSubcommandNone. The summary script folds the broker's text the same way.
+func usageFoldToolPair(pairs map[usageToolPair]map[string]float64, metric *dto.Metric, value float64) {
+	tool := usageLabelValue(metric, toolInvocationsToolLabel)
+	status := usageLabelValue(metric, toolInvocationsStatusLabel)
+	subcommands, known := toolInvocationsSubcommands[tool]
+	if !known || !slices.Contains(toolInvocationsStatusOrder, status) {
+		return
+	}
+	subcommand := usageLabelValue(metric, toolInvocationsSubcommandLabel)
+	switch {
+	case subcommand == "":
+		subcommand = toolSubcommandNone
+	case subcommand != toolSubcommandNone && !slices.Contains(subcommands, subcommand):
+		subcommand = toolLabelOther
+	}
+	pair := usageToolPair{Tool: tool, Subcommand: subcommand}
+	if pairs[pair] == nil {
+		pairs[pair] = map[string]float64{}
+	}
+	pairs[pair][status] += value
+}
+
+// usageToolPairsReading is the table as integers, with a pair that counted
+// nothing dropped; ok is false when a count is past the float64-exact ceiling,
+// which no honest body reaches.
+func usageToolPairsReading(pairs map[usageToolPair]map[string]float64) (map[usageToolPair]usageToolCounts, bool) {
+	out := make(map[usageToolPair]usageToolCounts, len(pairs))
+	for pair, counts := range pairs {
+		row := usageToolCounts{}
+		for status, count := range counts {
+			if count > float64(usageTotalCeiling) {
+				return nil, false
+			}
+			if count > 0 {
+				row[status] = int64(count)
+			}
+		}
+		if len(row) > 0 {
+			out[pair] = row
+		}
+	}
+	return out, true
 }
 
 // usageDataVolumeReading turns the data volume series a body carried into a

@@ -43,7 +43,7 @@ func apiAuthAgentWithResources(override *corev1.ResourceRequirements) *agentv1al
 // goldens and the chart's quota preflight all carry.
 func TestAgentAPIAuthResourcesDefaultToTheOperatorsValues(t *testing.T) {
 	for _, deployment := range []*agentv1alpha1.DeploymentSpec{nil, {}, {AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{}}} {
-		got := resolveAgentAPIAuthResources(deployment)
+		got := resolveAgentAPIAuthResources(deployment, sizingTierSmall)
 		assertQuantity(t, got.Requests, corev1.ResourceCPU, "150m")
 		assertQuantity(t, got.Requests, corev1.ResourceMemory, "384Mi")
 		assertQuantity(t, got.Limits, corev1.ResourceCPU, "1")
@@ -120,7 +120,7 @@ func TestAgentAPIAuthFullOverrideReplacesEveryKey(t *testing.T) {
 func TestAgentAPIAuthOverrideDoesNotAliasTheCR(t *testing.T) {
 	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")}}
 	agent := apiAuthAgentWithResources(override)
-	resolved := resolveAgentAPIAuthResources(agent.Spec.Deployment)
+	resolved := resolveAgentAPIAuthResources(agent.Spec.Deployment, sizingTierSmall)
 	m := resolved.Limits[corev1.ResourceMemory]
 	m.Add(resource.MustParse("1Gi"))
 	resolved.Limits[corev1.ResourceMemory] = m
@@ -166,7 +166,7 @@ func TestValidateAgentAPIAuthResources(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			errs, warnings := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(tc.override).Spec.Deployment, path)
+			errs, warnings := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(tc.override), path)
 			if tc.wantErr != (len(errs) > 0) {
 				t.Errorf("errs = %v; want error: %v", errs, tc.wantErr)
 			}
@@ -185,7 +185,7 @@ func TestAgentAPIAuthHasNoChildBudgetFloor(t *testing.T) {
 	errs, _ := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("400Mi")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 0 {
 		t.Errorf("a 400Mi limit was refused (%v); the watcher has no child-budget floor", errs)
 	}

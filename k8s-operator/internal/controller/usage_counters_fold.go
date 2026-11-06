@@ -412,6 +412,10 @@ type usageScrapedPod struct {
 	// DataVolume is the watcher's data volume reading, nil for any pod but a
 	// gateway's and for a watcher body that carried none. Not folded either.
 	DataVolume *usageDataVolume
+	// ToolPairs is the broker's tool counter by tool and subcommand, nil for
+	// any pod but a broker's. Not folded either: the poll sums it across the
+	// broker pods read and projects the top rows (usageTopToolsForPoll).
+	ToolPairs map[usageToolPair]usageToolCounts
 }
 
 // usageSeed is what a poll that finds no usable document starts from: the

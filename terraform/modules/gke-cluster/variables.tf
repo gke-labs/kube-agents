@@ -147,16 +147,69 @@ variable "enable_backup_agent" {
   default     = true
 }
 
-variable "standard_machine_type" {
-  description = "Machine type for the Standard cluster's default node pool. Only used when cluster_mode = \"standard\"."
+variable "sizing_profile" {
+  description = <<-EOT
+    Which shape the Standard cluster's two node pools take when a machine type
+    or disk size is not given explicitly: "small" (the default), "medium", or
+    "fleet". "small" resolves to e2-standard-4 with a 100 GB pd-balanced boot
+    disk on both pools, today's rendering; "medium" resolves like "small"
+    until a later change gives it its own shape; "fleet" resolves the default
+    pool to n2-standard-8 with a 200 GB disk and the gVisor pool to
+    n2-standard-4 with a 150 GB disk. An explicit standard_* or gvisor_*
+    machine type or disk value always wins over the profile. The resolved
+    values are the module's standard_* and gvisor_* outputs. "" (what a
+    blanked TF_VAR_ line in install.env exports) and null both mean "small".
+    Only used when cluster_mode = "standard".
+  EOT
   type        = string
-  default     = "e2-standard-4"
+  default     = "small"
+  nullable    = false
+
+  # "" counts as unset, as it does on the four machine-type and disk-type
+  # inputs; the local that resolves the profile folds it to the default.
+  validation {
+    condition     = var.sizing_profile == "" || contains(["small", "medium", "fleet"], var.sizing_profile)
+    error_message = "sizing_profile must be \"small\", \"medium\" or \"fleet\"."
+  }
+}
+
+variable "standard_machine_type" {
+  description = "Machine type for the Standard cluster's default node pool. Null, the default, takes the sizing_profile's machine type (e2-standard-4 under \"small\"); an explicit value wins over the profile. Only used when cluster_mode = \"standard\"."
+  type        = string
+  default     = null
 }
 
 variable "standard_node_count" {
-  description = "Node count per zone for the Standard cluster's default node pool. Only used when cluster_mode = \"standard\"."
+  description = "Node count per zone the Standard cluster's default node pool is created with. It is google_container_cluster's initial_node_count, which the google provider treats as ForceNew on the cluster itself: changing it on a live cluster plans the cluster's destruction and recreation, so resize a live default pool with gcloud instead. Only used when cluster_mode = \"standard\"."
   type        = number
   default     = 1
+}
+
+variable "standard_disk_size_gb" {
+  description = "Boot disk size in GB for the Standard cluster's default node pool, at least 10. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when cluster_mode = \"standard\"."
+  type        = number
+  default     = null
+
+  # A conditional rather than `== null || ...`: Terraform below 1.10 evaluates
+  # both operands of ||, and `null >= 10` fails the plan at the default.
+  validation {
+    condition     = var.standard_disk_size_gb == null ? true : var.standard_disk_size_gb >= 10
+    error_message = "standard_disk_size_gb must be at least 10 GB, GKE's floor for a boot disk."
+  }
+}
+
+variable "standard_disk_type" {
+  description = "Boot disk type for the Standard cluster's default node pool: pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced. Null, the default, takes the sizing_profile's type (pd-balanced under every profile); an explicit value wins over the profile. Only used when cluster_mode = \"standard\"."
+  type        = string
+  default     = null
+
+  # "" counts as unset, as coalesce already treats it for the machine types:
+  # a blanked TF_VAR_ line in install.env exports "". Equality tests only, so
+  # Terraform below 1.10, which evaluates both operands, plans at null too.
+  validation {
+    condition     = (var.standard_disk_type == null || var.standard_disk_type == "") ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.standard_disk_type)
+    error_message = "standard_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
+  }
 }
 
 variable "enable_gvisor_node_pool" {
@@ -176,6 +229,59 @@ variable "gvisor_pool_name" {
   description = "Name of the gVisor node pool."
   type        = string
   default     = "gvisor-pool"
+}
+
+variable "gvisor_machine_type" {
+  description = "Machine type for the gVisor node pool. Null, the default, takes the sizing_profile's machine type (e2-standard-4 under \"small\"); an explicit value wins over the profile. Only used when enable_gvisor_node_pool = true."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_min_node_count" {
+  description = "Lower autoscaling bound of the gVisor node pool, per zone (a regional location scales each zone within these bounds), and the node count the pool is created with. Raising it later moves the bound in place; the creation count is left as it was. Only used when enable_gvisor_node_pool = true."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.gvisor_min_node_count >= 1 && floor(var.gvisor_min_node_count) == var.gvisor_min_node_count
+    error_message = "gvisor_min_node_count must be a whole number of at least 1."
+  }
+}
+
+variable "gvisor_max_node_count" {
+  description = "Upper autoscaling bound of the gVisor node pool, per zone. Must be at least gvisor_min_node_count; equal to it keeps the pool at a fixed size. Only used when enable_gvisor_node_pool = true."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.gvisor_max_node_count >= 1 && floor(var.gvisor_max_node_count) == var.gvisor_max_node_count
+    error_message = "gvisor_max_node_count must be a whole number of at least 1."
+  }
+}
+
+variable "gvisor_disk_size_gb" {
+  description = "Boot disk size in GB for the gVisor node pool, at least 10. Null, the default, takes the sizing_profile's size (100 under \"small\"); an explicit value wins over the profile. Only used when enable_gvisor_node_pool = true."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.gvisor_disk_size_gb == null ? true : var.gvisor_disk_size_gb >= 10
+    error_message = "gvisor_disk_size_gb must be at least 10 GB, GKE's floor for a boot disk."
+  }
+}
+
+variable "gvisor_disk_type" {
+  description = "Boot disk type for the gVisor node pool: pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced. Null, the default, takes the sizing_profile's type (pd-balanced under every profile); an explicit value wins over the profile. Only used when enable_gvisor_node_pool = true."
+  type        = string
+  default     = null
+
+  # "" counts as unset, as coalesce already treats it for the machine types:
+  # a blanked TF_VAR_ line in install.env exports "". Equality tests only, so
+  # Terraform below 1.10, which evaluates both operands, plans at null too.
+  validation {
+    condition     = (var.gvisor_disk_type == null || var.gvisor_disk_type == "") ? true : contains(["pd-standard", "pd-balanced", "pd-ssd", "hyperdisk-balanced"], var.gvisor_disk_type)
+    error_message = "gvisor_disk_type must be pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced."
+  }
 }
 
 variable "create_after" {

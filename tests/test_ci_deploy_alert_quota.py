@@ -195,6 +195,10 @@ class HelmRendersTheOverrideTest(unittest.TestCase):
                 "platformAgent.deployment.env[1].name=ALERT_DAILY_LIMIT_DRIFT",
                 "--set-string",
                 "platformAgent.deployment.env[1].value=0",
+                "--set-string",
+                "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS",
+                "--set-string",
+                "platformAgent.deployment.env[2].value=150",
             ],
             check=True,
             capture_output=True,
@@ -210,9 +214,12 @@ class HelmRendersTheOverrideTest(unittest.TestCase):
         ]
         self.assertEqual(len(crs), 1, "expected exactly one PlatformAgent in the render")
         env = crs[0]["spec"]["deployment"]["env"]
+        # The third pair is the one that has to win: the chart renders the
+        # window's default (platformAgent.deployment.incidentWorkloadDedupSeconds)
+        # into the same list, and the eval install's shorter window replaces it.
         self.assertEqual(
             {entry["name"]: entry["value"] for entry in env},
-            {"ALERT_DAILY_LIMIT_WARNING": "0", "ALERT_DAILY_LIMIT_DRIFT": "0"},
+            {"ALERT_DAILY_LIMIT_WARNING": "0", "ALERT_DAILY_LIMIT_DRIFT": "0", "INCIDENT_WORKLOAD_DEDUP_SECONDS": "150"},
         )
 
 

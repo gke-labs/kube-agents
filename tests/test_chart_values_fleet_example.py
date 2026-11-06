@@ -69,6 +69,11 @@ _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]
 # of the names the operator itself sets or lists as sensitive, so a name the
 # operator source never spells as a string reaches those two containers.
 _LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
+# The env names the CR template renders from a chart key (incidentWorkloadDedupSeconds,
+# alertDailyLimits.<bucket>). The template skips the key whenever env carries the name,
+# so an example entry for one would win over the key, its 0 included.
+_CHART_KEY_ENV_NAME_RE = re.compile(r'\$dedupName\s*:=\s*"(?P<name>[A-Z0-9_]+)"')
+_ALERT_LIMIT_ENV_NAME_RE = re.compile(r'printf\s+"(?P<prefix>ALERT_DAILY_LIMIT_)%s"')
 
 # The page's declared column, derived from the two files the page cites.
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
@@ -227,7 +232,7 @@ class ExampleShapeTest(unittest.TestCase):
         env = self.values["platformAgent"]["deployment"]["env"]
         self.assertEqual(
             [entry["name"] for entry in env],
-            ["INCIDENT_WORKLOAD_DEDUP_SECONDS", "KUBEAGENTS_AUDIT_AUTO_PROMOTE"],
+            ["KUBEAGENTS_AUDIT_AUTO_PROMOTE"],
         )
         for entry in env:
             with self.subTest(name=entry["name"]):
@@ -236,6 +241,19 @@ class ExampleShapeTest(unittest.TestCase):
                 # value is a string: a bare 3600 or false would fail at apply.
                 self.assertIsInstance(entry["value"], str)
                 self.assertNotIn("valueFrom", entry)
+
+    def test_no_env_entry_shadows_a_chart_key(self):
+        """The CR template skips a key's entry when `env` already carries the name, so an
+        example entry for one would win over the key's off switch."""
+        template = (_CHART / _CR_TEMPLATE).read_text()
+        dedup = _CHART_KEY_ENV_NAME_RE.search(template)
+        self.assertIsNotNone(dedup, "the CR template no longer names the fold window's env entry")
+        prefixes = set(_ALERT_LIMIT_ENV_NAME_RE.findall(template))
+        self.assertTrue(prefixes, "the CR template no longer renders alertDailyLimits as env entries")
+        for entry in self.values["platformAgent"]["deployment"]["env"]:
+            with self.subTest(name=entry["name"]):
+                self.assertNotEqual(entry["name"], dedup.group("name"), "incidentWorkloadDedupSeconds is the route")
+                self.assertFalse(entry["name"].startswith(tuple(prefixes)), "alertDailyLimits is the route")
 
     def test_the_names_the_maintainers_left_out_stay_out(self):
         """The page says the two names reach the proxy pod and not the agent container."""

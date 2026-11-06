@@ -26,6 +26,8 @@ KUBECTL = "kubectl"
 GCLOUD = "gcloud"
 DEFAULT_TIMEOUT_SECONDS = 300
 APPLY_TIMEOUT_SECONDS = 900
+# kubectl verbs that stream for as long as their command runs, so a request timeout would cut them.
+STREAMING_VERBS = ("exec", "logs", "port-forward", "wait")
 RESIZE_TIMEOUT_SECONDS = 1800
 CREATE_CLUSTER_TIMEOUT_SECONDS = 1800
 APPLY_CHUNK = 500
@@ -124,7 +126,10 @@ def context_name(project: str, location: str, cluster: str) -> str:
 
 
 def kubectl(context: str, *args: str, stdin: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> str:
-    return run([KUBECTL, "--context", context, *args], stdin=stdin, timeout=timeout)
+    # A request timeout makes a dropped connection fail, and so retry, instead of waiting on a dead
+    # socket; a streaming verb (exec, logs) runs as long as its command does and keeps none.
+    limit = [] if args and args[0] in STREAMING_VERBS else [f"--request-timeout={int(timeout)}s"]
+    return run([KUBECTL, "--context", context, *limit, *args], stdin=stdin, timeout=timeout)
 
 
 def kubectl_json(context: str, *args: str, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:

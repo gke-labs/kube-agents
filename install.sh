@@ -6057,7 +6057,7 @@ summarize_existing_cluster_mutations() {
 
   # 5. gVisor pool
   if [ "$is_autopilot" != "True" ] && is_truthy "$enable_gvisor"; then
-    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (1 e2-standard-4 per zone; new billable capacity)"
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (shape from sizing_profile and the gvisor_* inputs, small unless install.env sets their TF_VAR_ lines, see terraform/modules/gke-cluster/README.md; new billable capacity)"
   else
     echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} None (not requested or native on Autopilot)"
   fi
@@ -7327,7 +7327,7 @@ main() {
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
-    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
   }

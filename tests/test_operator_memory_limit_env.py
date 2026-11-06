@@ -23,6 +23,19 @@ _MANAGER = _REPO_ROOT / "k8s-operator" / "config" / "manager" / "manager.yaml"
 _MAIN_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "main.go"
 
 _ENV_CONST = re.compile(r'^\s*operatorMemoryLimitEnv\s*=\s*"([A-Z_]+)"', re.M)
+# The bridge's and the consoles' variables, agreed by name across the operator, the chart and
+# the bus module's binaries (a2a/lib/memlimit), which share no code with the operator. Each
+# side's own tests pin its own literal; this is the one place the copies meet.
+_A2A_BRIDGE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
+_A2A_CONSOLE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
+_WEB_CONSOLE_TEMPLATE = _REPO_ROOT / "charts" / "kube-agents" / "templates" / "web-console.yaml"
+_BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
+_CONSOLE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "console" / "main.go"
+_WEB_CONSOLE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "web-console" / "main.go"
+_BRIDGE_ENV_CONST = re.compile(r'^\s*a2aBridgeMemoryLimitEnvVar\s*=\s*"([A-Z_]+)"', re.M)
+_CONSOLE_ENV_CONST = re.compile(r'^\s*a2aConsoleMemoryLimitEnvVar\s*=\s*"([A-Z_]+)"', re.M)
+_BINARY_ENV_CONST = re.compile(r'^\s*memoryLimitEnv\s*=\s*"([A-Z_]+)"', re.M)
+_A2A_CONSOLE_BINARY_ENV_CONST = re.compile(r'^\s*envMemoryLimit\s*=\s*"([A-Z_]+)"', re.M)
 _RESOURCE = "limits.memory"
 _MANAGER_CONTAINER = "manager"
 
@@ -72,6 +85,41 @@ class OperatorMemoryLimitEnvTest(unittest.TestCase):
         # No containerName: the field refers to the container it is set on, so a renamed
         # container cannot leave it pointing at a name that no longer exists.
         self.assertNotIn("containerName", ref)
+
+
+def _const(pattern, path):
+    match = pattern.search(path.read_text())
+    assert match, f"{pattern.pattern} not found in {path}"
+    return match.group(1)
+
+
+def _env_block(template, name):
+    text = template.read_text()
+    match = re.search(rf"^(\s*)- name: {re.escape(name)}\n((?:\1  .*\n)+)", text, re.M)
+    assert match, f"{name} is not an env entry in {template}"
+    return match.group(2)
+
+
+class BridgeAndConsoleMemoryLimitEnvTest(unittest.TestCase):
+    """The variable each binary reads is the one its manifest sets. A rename on either side
+    breaks nothing that runs: the binary logs that the variable is unset and runs with no soft
+    limit, and every per-side test still passes against its own literal."""
+
+    def test_the_bridge_reads_the_variable_the_operator_sets(self):
+        name = _const(_BRIDGE_ENV_CONST, _A2A_BRIDGE_GO)
+        self.assertEqual(name, _const(_BINARY_ENV_CONST, _BRIDGE_MAIN))
+        self.assertIn("memlimit.Apply(memoryLimitEnv", _BRIDGE_MAIN.read_text())
+
+    def test_both_consoles_read_the_variable_the_operator_and_the_chart_set(self):
+        name = _const(_CONSOLE_ENV_CONST, _A2A_CONSOLE_GO)
+        self.assertEqual(name, _const(_A2A_CONSOLE_BINARY_ENV_CONST, _CONSOLE_MAIN))
+        self.assertEqual(name, _const(_BINARY_ENV_CONST, _WEB_CONSOLE_MAIN))
+        self.assertIn("memlimit.Apply(envMemoryLimit", _CONSOLE_MAIN.read_text())
+        self.assertIn("memlimit.Apply(memoryLimitEnv", _WEB_CONSOLE_MAIN.read_text())
+        block = _env_block(_WEB_CONSOLE_TEMPLATE, name)
+        self.assertIn("resourceFieldRef:", block)
+        self.assertIn(f"resource: {_RESOURCE}", block)
+        self.assertNotIn("containerName", block)
 
 
 if __name__ == "__main__":

@@ -193,6 +193,9 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 	// set's sample is the pod group's first counter; setSample names the rest.
 	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
 	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
+	if slices.Contains(kinds, usageReadingTopTools) {
+		out.ToolPairs = reading.ToolPairs
+	}
 	for i, counter := range counters {
 		value, named := reading.Samples[counter]
 		if !named && i == 0 {
@@ -262,8 +265,10 @@ func (s *stubUsageSource) setReadings(addr string, values map[string]int64, pres
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
+	// The top tools are set by setTopTools and kept across a readings change.
+	topTools := reading.ReadingsPresent[usageReadingTopTools]
 	reading.Readings = map[string]int64{}
-	reading.ReadingsPresent = map[usageReadingKind]bool{}
+	reading.ReadingsPresent = map[usageReadingKind]bool{usageReadingTopTools: topTools}
 	for _, kind := range present {
 		reading.ReadingsPresent[kind] = true
 	}
@@ -272,6 +277,24 @@ func (s *stubUsageSource) setReadings(addr string, values map[string]int64, pres
 			reading.Readings[spec.field] = v
 		}
 	}
+	s.readings[addr] = reading
+}
+
+// setTopTools gives addr's body the broker's tool table, present with the
+// pairs given (an empty table for an idle broker), beside whatever readings
+// it serves.
+func (s *stubUsageSource) setTopTools(addr string, pairs map[usageToolPair]usageToolCounts) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	if reading.ReadingsPresent == nil {
+		reading.ReadingsPresent = map[usageReadingKind]bool{}
+	}
+	reading.ReadingsPresent[usageReadingTopTools] = true
+	if pairs == nil {
+		pairs = map[usageToolPair]usageToolCounts{}
+	}
+	reading.ToolPairs = pairs
 	s.readings[addr] = reading
 }
 
@@ -411,6 +434,8 @@ type usageHarness struct {
 	pruningChatSessions bool
 	// pruningPeople is a CRD serving all but the two people readings.
 	pruningPeople bool
+	// pruningTopTools is a CRD serving all but topTools.
+	pruningTopTools bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -427,8 +452,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningPositive || h.pruningChatSessions || h.pruningPeople) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"positiveFeedbackTotal":null,"chatSessionsTotal":null,` + usageTestPeopleNulls + `}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningPositive || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"positiveFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -461,6 +486,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningPeople {
 					strip = `{"status":{"usage":{` + usageTestPeopleNulls + `}}}`
+				}
+				if h.pruningTopTools {
+					strip = `{"status":{"usage":{"topTools":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -513,6 +541,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			if isAgent && (h.pruningGauges || h.pruningPeople) {
 				pa.Status.Usage.PeopleSeen7d = nil
 				pa.Status.Usage.PeopleSeen30d = nil
+			}
+			if isAgent && (h.pruningGauges || h.pruningTopTools) {
+				pa.Status.Usage.TopTools = nil
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -4093,7 +4124,7 @@ func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 		gatewayAddr(): nil,
 		chatAddr():    nil,
 		a2aAddr():     {usageReadingPeople},
-		brokerAddr():  {usageReadingOutcomes, usageReadingDetails},
+		brokerAddr():  {usageReadingOutcomes, usageReadingDetails, usageReadingTopTools},
 	}
 	got := map[string][]usageReadingKind{}
 	for _, target := range targets {
@@ -4336,4 +4367,167 @@ func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGateway
 			t.Fatalf("two polls without the gateway pod: %d people misses, want 2", misses)
 		}
 	})
+}
+
+// usageTestSecondBrokerIP is a second broker pod, for the sum across pods.
+const usageTestSecondBrokerIP = "10.0.0.21"
+
+func secondBrokerAddr() string { return usageTestSecondBrokerIP + ":8766" }
+
+// topToolsMisses is the CR's run of polls without a broker body.
+func (h *usageHarness) topToolsMisses(agent *agentv1alpha1.PlatformAgent) int {
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	return h.p.readingMisses[usagePollKey(agent)][usageReadingTopTools]
+}
+
+// The broker's tool table lands as topTools: each pair summed across the
+// broker pods read, cut to the five largest totals with ties broken by tool
+// then subcommand, a pair with no count dropped, every outcome in its own
+// field; neither a first reading nor a changed one moves lastActiveTime or
+// lastHumanActiveTime, and the document keeps no total for it.
+func TestUsagePoller_TopToolsLandAsTheTopFiveAcrossBrokerPods(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	objects := append(usageDefaultObjects(created), usageBrokerPod("agent-credential-proxy-ccc", "broker-c", usageTestSecondBrokerIP, created))
+	h := newUsageHarness(t, usageTestAgent(created), objects...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.set(secondBrokerAddr(), 0, ptr.To(200.0))
+	get, describe := usageToolPair{Tool: "kubectl", Subcommand: "get"}, usageToolPair{Tool: "kubectl", Subcommand: "describe"}
+	monitoring, del := usageToolPair{Tool: "gcloud", Subcommand: "monitoring"}, usageToolPair{Tool: "kubectl", Subcommand: "delete"}
+	feedback, fetch, bare := usageToolPair{Tool: "feedback", Subcommand: "none"}, usageToolPair{Tool: "git", Subcommand: "fetch"}, usageToolPair{Tool: "gcloud", Subcommand: "none"}
+	h.stub.setTopTools(brokerAddr(), map[usageToolPair]usageToolCounts{
+		get: {"success": 14000, "error": 400}, describe: {"success": 3100}, monitoring: {"success": 800},
+		del: {"blocked": 12, "busy": 2, "abandoned": 1}, feedback: {"success": 5}, fetch: {"success": 3},
+	})
+	h.stub.setTopTools(secondBrokerAddr(), map[usageToolPair]usageToolCounts{
+		get: {"success": 500}, monitoring: {"error": 200}, bare: {"success": 5}, fetch: {},
+	})
+	h.poll(5)
+	status := h.status()
+	want := []agentv1alpha1.ToolUsageSummary{
+		{Tool: "kubectl", Subcommand: "get", Total: 14900, Success: 14500, Error: 400},
+		{Tool: "kubectl", Subcommand: "describe", Total: 3100, Success: 3100},
+		{Tool: "gcloud", Subcommand: "monitoring", Total: 1000, Success: 800, Error: 200},
+		{Tool: "kubectl", Subcommand: "delete", Total: 15, Blocked: 12, Busy: 2, Abandoned: 1},
+		// Two pairs at 5: feedback sorts before gcloud; git/fetch at 3 is sixth and cut.
+		{Tool: "feedback", Subcommand: "none", Total: 5, Success: 5},
+	}
+	if !usageTopToolsEqual(status.TopTools, want) {
+		t.Fatalf("topTools = %+v, want %+v", status.TopTools, want)
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("the top tools moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	if _, ok := h.document().Totals[usageNewerFieldTopTools]; ok {
+		t.Fatal("the document keeps a total for topTools")
+	}
+	// A change is projected as it stands, a fall included; the same table
+	// again patches nothing.
+	patches := h.patches
+	h.poll(10)
+	if h.patches != patches {
+		t.Fatal("an unchanged table re-patched the status")
+	}
+	h.stub.setTopTools(secondBrokerAddr(), map[usageToolPair]usageToolCounts{get: {"success": 1}})
+	h.poll(15)
+	if got := h.status().TopTools; len(got) != 5 || got[0].Total != 14401 || got[2].Total != 800 || got[4] != want[4] {
+		t.Fatalf("after the second broker's table fell: topTools = %+v", got)
+	}
+}
+
+// One poll without a broker body keeps the rows; the second in a row clears
+// them to absent, and a broker read again brings them back. A broker read
+// with an empty table, one that has run nothing since it started, clears the
+// field at once: that is a reading of none, not a miss.
+func TestUsagePoller_TopToolsClearAfterTwoPollsWithoutABrokerBody(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	table := map[usageToolPair]usageToolCounts{{Tool: "kubectl", Subcommand: "get"}: {"success": 7}}
+	h.stub.setTopTools(brokerAddr(), table)
+	h.poll(5)
+	if got := h.status().TopTools; len(got) != 1 || got[0].Total != 7 {
+		t.Fatalf("topTools = %+v, want the one row", got)
+	}
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	if got := h.status().TopTools; len(got) != 1 {
+		t.Fatalf("one failed broker read: topTools = %+v, want the row kept", got)
+	}
+	if misses := h.topToolsMisses(agent); misses != 1 {
+		t.Fatalf("one failed broker read: %d misses, want 1", misses)
+	}
+	h.poll(15)
+	if got := h.status().TopTools; got != nil {
+		t.Fatalf("two failed broker reads: topTools = %+v, want absent", got)
+	}
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setTopTools(brokerAddr(), table)
+	h.poll(20)
+	if got := h.status().TopTools; len(got) != 1 {
+		t.Fatalf("the broker read again: topTools = %+v, want the row back", got)
+	}
+	if misses := h.topToolsMisses(agent); misses != 0 {
+		t.Fatalf("the broker read again: %d misses, want the run ended", misses)
+	}
+	h.stub.setTopTools(brokerAddr(), nil)
+	h.poll(25)
+	if got := h.status().TopTools; got != nil {
+		t.Fatalf("an idle broker: topTools = %+v, want absent", got)
+	}
+	if misses := h.topToolsMisses(agent); misses != 0 {
+		t.Fatalf("an idle broker counted %d misses, want none", misses)
+	}
+}
+
+// A served CRD that carries every reading and prunes topTools records that
+// against the field's own record, not the readings' and not the counters':
+// the proposal readings keep landing, and a poll with topTools alone behind
+// does not re-patch while the record is fresh.
+func TestUsagePoller_TopToolsHaveTheirOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningTopTools = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.stub.setTopTools(brokerAddr(), map[usageToolPair]usageToolCounts{{Tool: "kubectl", Subcommand: "get"}: {"success": 7}})
+	h.poll(5)
+	status := h.status()
+	if status.TopTools != nil {
+		t.Fatalf("topTools = %+v under a CRD without it, want absent", status.TopTools)
+	}
+	if !h.p.newerFieldPruned(agent, usageNewerFieldTopTools) || h.p.newerFieldPruned(agent, usageNewerFieldReadings) || h.p.newerFieldPruned(agent, usageNewerFieldPeople) {
+		t.Fatal("the absence of topTools was not recorded against its own record alone")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of topTools was recorded as the counters' pruning")
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status = h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(4)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d under a CRD without topTools, want %d", spec.field, got, want)
+		}
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with topTools alone behind re-patched the status while its record was fresh")
+	}
+	// The record expires, the field is probed again and, served now, lands.
+	h.pruningTopTools = false
+	h.p.expireNewerFieldsRecordForTest(agent)
+	h.poll(20)
+	if got := h.status().TopTools; len(got) != 1 || got[0].Total != 7 {
+		t.Fatalf("after the CRD serves the field: topTools = %+v, want the row", got)
+	}
+	if h.p.newerFieldPruned(agent, usageNewerFieldTopTools) {
+		t.Fatal("the echo that carried topTools did not clear its record")
+	}
 }

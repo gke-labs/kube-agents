@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -184,6 +185,10 @@ type Counts struct {
 	// Expired is every 410 served: a list below the floor, a watch opened
 	// below it, or an open watch ended by Expire.
 	Expired int64
+	// Connections is every TCP connection the server has accepted. A client
+	// built from Config opens one per request, so it tracks Requests; a
+	// client that pools connections falls behind it.
+	Connections int64
 }
 
 // Server is one fake cluster. Its embedded httptest.Server's URL is the API
@@ -211,7 +216,7 @@ type Server struct {
 	retryAfterSeconds int
 
 	requests, lists, watches, watchLists, throttled, expired atomic.Int64
-	watchListsRefused                                        atomic.Int64
+	watchListsRefused, connections                           atomic.Int64
 }
 
 // kind is one of the three served resources: its path, the generator for its
@@ -307,13 +312,42 @@ func Start(opts Options) *Server {
 	if s.rv < firstResourceVersion {
 		s.rv = firstResourceVersion
 	}
-	s.Server = httptest.NewServer(http.HandlerFunc(s.serveHTTP))
+	s.Server = httptest.NewUnstartedServer(http.HandlerFunc(s.serveHTTP))
+	s.Server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			s.connections.Add(1)
+		}
+	}
+	s.Server.Start()
 	return s
 }
 
-// Config is a rest.Config for the fake, as a kubeconfig entry for it would be.
+// Config is a rest.Config for the fake, as a kubeconfig entry for it would
+// be, except that its transport keeps no connection alive between requests.
+// Over a pooled HTTP/1.1 connection, net/http's transport can wake the wrong
+// reader. When a body is closed while another goroutine's Read of it is
+// returning EOF, which is how client-go's StreamWatcher stops a stream the
+// API server ended with a 410, the transport drains what is left, puts the
+// connection back in the pool, and leaves that Read's end-of-body callback
+// parked on the connection's EOF channel (bodyEOFSignal and eofc in
+// net/http/transport.go's readLoop: the channel is signalled once per
+// response, and the early Close took the signal). The next response on the
+// reused connection signals the channel once more, the parked reader takes
+// it, and the reader of the new response parks in its place until the
+// connection closes, by the idle timeout at the latest; a reflector's
+// re-stream after an expiry delivers nothing for that long. The code is
+// older than Go 1.27.1, where it was traced; this Transport can go once
+// net/http hands the signal to the reader of the response it belongs to.
+// A connection per request leaves nothing to reuse, at one dial per request,
+// which the paged soaks absorb. It fixes the fake's clients only. The
+// watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
+// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its watches
+// now open on a non-pooled twin (cmd/k8s-event-watcher/watchtransport.go). A
+// test that sets a CA, a client certificate, a certificate callback or
+// Insecure on this config fails at client construction, since client-go
+// refuses those next to a Transport.
 func (s *Server) Config() *rest.Config {
-	return &rest.Config{Host: s.URL}
+	return &rest.Config{Host: s.URL, Transport: &http.Transport{DisableKeepAlives: true}}
 }
 
 // Generator is the generator the server serves from, for a test that wants
@@ -339,6 +373,7 @@ func (s *Server) Counts() Counts {
 		WatchListsRefused: s.watchListsRefused.Load(),
 		Throttled:         s.throttled.Load(),
 		Expired:           s.expired.Load(),
+		Connections:       s.connections.Load(),
 	}
 }
 

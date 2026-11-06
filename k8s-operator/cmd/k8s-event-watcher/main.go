@@ -230,7 +230,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
 	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
-	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
+	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy, a Failed saying \"host IP unknown\"; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
@@ -468,12 +468,28 @@ func preferProtobuf(cfg *rest.Config) {
 // newClusterClient builds the clientset every watched cluster is read with,
 // from a config preferring protobuf (see preferProtobuf).
 func newClusterClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	client, _, err := newClusterClients(cfg)
+	return client, err
+}
+
+// newClusterClients is newClusterClient plus the client the Events watch is
+// opened with, whose connections are never reused (see watchConfig). Where cfg
+// doesn't qualify for that, the second is the first.
+func newClusterClients(cfg *rest.Config) (client, watchClient kubernetes.Interface, err error) {
 	preferProtobuf(cfg)
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err = kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes client: %w", err)
+		return nil, nil, fmt.Errorf("kubernetes client: %w", err)
 	}
-	return client, nil
+	watchCfg, separate := watchConfig(cfg)
+	if !separate {
+		return client, client, nil
+	}
+	watchClient, err = kubernetes.NewForConfig(watchCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("kubernetes watch client: %w", err)
+	}
+	return client, watchClient, nil
 }
 
 // targetCluster is one cluster the watcher should monitor, discovered from a
@@ -498,6 +514,11 @@ type targetCluster struct {
 	// order, which boot need not have chosen (a refused describe skips it).
 	Source string
 	Client kubernetes.Interface
+	// WatchClient is the client the Events watch is opened with: Client's
+	// twin with no pooled connections where Client shares the process's
+	// default transport (see watchConfig), else Client itself. Nil means
+	// Client, which is what a test's fake and the direct cluster leave.
+	WatchClient kubernetes.Interface
 	// Autopilot says this is a GKE Autopilot cluster, read off the describe
 	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
 	// FailedScheduling gate is the only reader: an Autopilot cluster with no
@@ -587,17 +608,18 @@ func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics,
 		if c.Profile == directProfile {
 			return targetCluster{}, fmt.Errorf("the profile directory name %q is reserved for the directly reached cluster; rename the profile", directProfile)
 		}
-		client, err := newClusterClient(c.Config)
+		client, watchClient, err := newClusterClients(c.Config)
 		if err != nil {
 			return targetCluster{}, err
 		}
 		return targetCluster{
-			Name:      c.Identity.Cluster,
-			ProjectID: c.Identity.Project,
-			Location:  c.Identity.Location,
-			Profile:   c.Profile,
-			Client:    client,
-			Autopilot: c.Autopilot,
+			Name:        c.Identity.Cluster,
+			ProjectID:   c.Identity.Project,
+			Location:    c.Identity.Location,
+			Profile:     c.Profile,
+			Client:      client,
+			WatchClient: watchClient,
+			Autopilot:   c.Autopilot,
 		}, nil
 	})
 	if err != nil {
@@ -673,6 +695,10 @@ type dispatcher struct {
 	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
 	// per change of answer.
 	noFollowupLogged atomic.Bool
+
+	// excluded sends the events alert-exclude rules hold back to the daemon,
+	// for the daily recap's count; nil in a dry run.
+	excluded *excludedRecorder
 }
 
 func (d *dispatcher) clock() time.Time {
@@ -692,7 +718,12 @@ func (d *dispatcher) clock() time.Time {
 // filter's config rather than the flag so the default applies when the flag
 // was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
+	var excluded *excludedRecorder
+	if inj != nil && !f.dryRun {
+		excluded = newExcludedRecorder((&excludedPoster{inj: inj}).Post)
+	}
 	return &dispatcher{
+		excluded:    excluded,
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
@@ -889,7 +920,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	// A repeat blip on an event object kubelet kept from an earlier one
 	// carries that one's first sighting; the memo knows where this blip
 	// began, and the gate measures the span from there (settleMemo.BlipStart).
-	if settleApplies(canonical) {
+	if settleApplies(canonical, ev.Message) {
 		if start, ok := d.settles.BlipStart(ev, canonical, d.clock()); ok && start.After(ev.FirstSeen) {
 			ev.FirstSeen = start
 		}
@@ -904,7 +935,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// has to remember too: one that clears at two sightings and repeats
 		// inside the event's TTL would otherwise arrive at count three with
 		// the object's old first sighting and no tombstone to measure from.
-		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical, ev.Message) {
 			d.settles.Hold(ev, canonical, d.clock())
 		}
 		if gate == gateScaleUpMark {
@@ -917,13 +948,19 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		if gate == gateAlertExcluded && d.excluded != nil {
+			d.excluded.Note(ev)
+		}
 		// A sighting a gate stopped is still a sighting: an alerted object
 		// the scale-up hold keeps from Observe is not quiet.
 		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
-	if d.settles.Release(ev, canonical) {
+	// Only a sighting in the family releases a hold: every Failed on a pod
+	// shares one key, and a start error accepted on its first sighting is
+	// not the held "host IP unknown" lasting the period.
+	if settleApplies(canonical, ev.Message) && d.settles.Release(ev, canonical) {
 		d.metrics.settleOutcomes.WithLabelValues(ev.Cluster, ev.Project, ev.Location, canonical, settleOutcomeForwarded).Inc()
 		log.Printf("settled %s pod=%s/%s (count=%d, lasted %s); forwarding",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second))
@@ -1092,6 +1129,12 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
+	// Last, after the settle expiry and the follow-ups, whichever way the
+	// rest returns: they are what a reader sees, and the excluded records
+	// only feed the daily recap.
+	if d.excluded != nil {
+		defer d.excluded.Sweep(ctx)
+	}
 	now := d.clock()
 	quiet := d.filter.cfg.settle + settleQuietSlack
 	for _, h := range d.settles.Expire(now, quiet) {

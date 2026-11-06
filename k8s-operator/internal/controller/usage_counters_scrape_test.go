@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1035,6 +1036,132 @@ func TestPodUsageSource_ASingleSampleReadingTakesTheLargestOfARepeatedLabelSet(t
 	for field, want := range map[string]int64{"remediationsMergedTotal": 5, "proposalsMergedUntouched": 2, "proposalsAuthored": 19} {
 		if got := reading.Readings[field]; got != want {
 			t.Errorf("%s = %d, want %d", field, got, want)
+		}
+	}
+}
+
+// The broker's tool counter is also read by tool and subcommand into the
+// top-tools table, under the closed vocabularies: a listed pair under its own
+// words summed over the statuses the row carries, a bare tool under none, a
+// subcommand outside its tool's vocabulary (and any word under the broker's
+// other tool) under other, a sample whose tool or status is not in the
+// vocabulary left out, and the same samples still summed into the two
+// counters. A body not asked for the reading carries no table.
+func TestPodUsageSource_ReadsTheBrokersToolPairs(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE kubeagents_tool_invocations_total counter",
+		`kubeagents_tool_invocations_total{status="success",subcommand="get",tool="kubectl"} 14500`,
+		`kubeagents_tool_invocations_total{status="error",subcommand="get",tool="kubectl"} 400`,
+		`kubeagents_tool_invocations_total{status="blocked",subcommand="delete",tool="kubectl"} 12`,
+		`kubeagents_tool_invocations_total{status="busy",subcommand="delete",tool="kubectl"} 2`,
+		`kubeagents_tool_invocations_total{status="abandoned",subcommand="delete",tool="kubectl"} 1`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="none",tool="feedback"} 5`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="prod-eu-1",tool="gcloud"} 7`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="other",tool="gcloud"} 3`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="other",tool="other"} 9`,
+		`kubeagents_tool_invocations_total{status="success",subcommand="get",tool="acme-cli"} 100`,
+		`kubeagents_tool_invocations_total{status="exploded",subcommand="get",tool="kubectl"} 100`,
+		`kubeagents_tool_invocations_total{status="success",tool="git"} 2`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := map[usageToolPair]usageToolCounts{
+		{Tool: "kubectl", Subcommand: "get"}:    {"success": 14500, "error": 400},
+		{Tool: "kubectl", Subcommand: "delete"}: {"blocked": 12, "busy": 2, "abandoned": 1},
+		{Tool: "feedback", Subcommand: "none"}:  {"success": 5},
+		{Tool: "gcloud", Subcommand: "other"}:   {"success": 10},
+		{Tool: "other", Subcommand: "other"}:    {"success": 9},
+		{Tool: "git", Subcommand: "none"}:       {"success": 2},
+	}
+	if len(reading.ToolPairs) != len(want) {
+		t.Fatalf("pairs = %v, want %v", reading.ToolPairs, want)
+	}
+	for pair, counts := range want {
+		got := reading.ToolPairs[pair]
+		if len(got) != len(counts) {
+			t.Errorf("%v = %v, want %v", pair, got, counts)
+			continue
+		}
+		for status, n := range counts {
+			if got[status] != n {
+				t.Errorf("%v %s = %d, want %d", pair, status, got[status], n)
+			}
+		}
+	}
+	if !reading.ReadingsPresent[usageReadingTopTools] {
+		t.Errorf("present = %v, want the top tools present", reading.ReadingsPresent)
+	}
+	if reading.ReadingsPresent[usageReadingOutcomes] {
+		t.Errorf("present = %v, want no outcomes reading from a body without the age series", reading.ReadingsPresent)
+	}
+	// The same lines still feed the counters, the unlisted tool and status
+	// included: the counters' filter is the status alone.
+	if got := reading.Samples[usageCounterToolExecutions]; got != 15026 {
+		t.Errorf("toolExecutionsTotal = %d, want 15026", got)
+	}
+	if got := reading.Samples[usageCounterToolExecutionsBlocked]; got != 15 {
+		t.Errorf("toolExecutionsBlockedTotal = %d, want 15", got)
+	}
+
+	plain, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails})
+	if err != nil {
+		t.Fatalf("Scrape without the reading: %v", err)
+	}
+	if plain.ToolPairs != nil || plain.ReadingsPresent[usageReadingTopTools] {
+		t.Errorf("a body not asked for the top tools carried %v (present %v)", plain.ToolPairs, plain.ReadingsPresent[usageReadingTopTools])
+	}
+}
+
+// A broker that has run nothing serves the family with no sample, or not at
+// all: the reading is present and the table empty, which the poll projects as
+// an absent field, not as a miss.
+func TestPodUsageSource_AnIdleBrokerCarriesAnEmptyToolTable(t *testing.T) {
+	addr := serveBody(t, http.StatusOK, "# TYPE kubeagents_tool_invocations_total counter\n# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1759400000.25\n")
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageBrokerCounters, []usageReadingKind{usageReadingTopTools})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if !reading.ReadingsPresent[usageReadingTopTools] {
+		t.Fatalf("present = %v, want the top tools present on an idle broker", reading.ReadingsPresent)
+	}
+	if reading.ToolPairs == nil || len(reading.ToolPairs) != 0 {
+		t.Fatalf("pairs = %v, want an empty table", reading.ToolPairs)
+	}
+}
+
+// The vocabulary the fold reads the tool counter under is closed on every
+// label: the tools are the broker's, the status order is the two status sets
+// together, and the broker's other tool lists no subcommand.
+func TestToolInvocationsVocabularyIsClosed(t *testing.T) {
+	statuses := map[string]bool{}
+	for _, status := range toolInvocationsStatusOrder {
+		statuses[status] = true
+	}
+	for status := range toolInvocationsCountedStatuses {
+		if !statuses[status] {
+			t.Errorf("counted status %s is not in the status order", status)
+		}
+	}
+	for status := range toolInvocationsRefusedStatuses {
+		if !statuses[status] {
+			t.Errorf("refused status %s is not in the status order", status)
+		}
+	}
+	if len(statuses) != len(toolInvocationsCountedStatuses)+len(toolInvocationsRefusedStatuses) {
+		t.Errorf("status order %v is not the two sets together", toolInvocationsStatusOrder)
+	}
+	if subcommands, ok := toolInvocationsSubcommands[toolLabelOther]; !ok || len(subcommands) != 0 {
+		t.Errorf("the other tool lists %v, want an empty vocabulary", subcommands)
+	}
+	for tool, subcommands := range toolInvocationsSubcommands {
+		if slices.Contains(subcommands, toolSubcommandNone) || slices.Contains(subcommands, toolLabelOther) {
+			t.Errorf("%s lists a fallback word among its subcommands: %v", tool, subcommands)
 		}
 	}
 }
