@@ -3989,9 +3989,10 @@ const defaultA2AMaxSessions = 10
 //     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
 //     and the web console, plus one surge pod for each that rolls surge-first,
 //     since a chart bump rolls several in one upgrade), which only the chart
-//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
-//     The CR is in the namespace those pods run in, and the chart renders it
-//     whether or not it renders the operator;
+//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation,
+//     and renders them in the a2aChartPodsConfigMapName ConfigMap, which the
+//     operator reads in its own namespace for a CR without the annotation
+//     (a2aQuotaAgent);
 //   - a2aQuotaTransientMargin for what this operator starts beside the
 //     standing pods, and the gateway's overshoot.
 const (
@@ -4022,10 +4023,11 @@ const (
 	// chart's own count is a handful of pods, so a figure past this is not one
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
-	// a2aChartPodsDiscardedReason is the Warning event a CR carrying an
-	// annotation the operator will not use gets, once per spec generation and
-	// annotation value (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
-	// can sit below what the namespace runs.
+	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
+	// operator does not use a chart-pods count it finds, from the annotation or
+	// the ConfigMap, once per spec generation and reason (a2aQuotaAgent): the
+	// quota then counts a2aDefaultChartPods, which can sit below what the
+	// namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
 	// a2aQuotaTransientMargin is room for pods this operator starts beside the
 	// standing ones, at their worst moment, a helm upgrade: two rollout surge
@@ -4049,7 +4051,7 @@ func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
 // spec generation and the discarded annotation value.
 type a2aChartPodsWarning struct {
 	generation int64
-	value      string
+	value      string // the Warning's message: its source and the value, truncated
 }
 
 // a2aChartPodsCount reads the CR's chart-pods annotation once (#4893): the
@@ -4075,9 +4077,9 @@ func a2aParseChartPods(raw string, present bool, source string) (int64, string) 
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	switch {
 	case err != nil:
-		return a2aDefaultChartPods, fmt.Sprintf("%s=%q is not a number; the session quota counts the default of %d chart pods instead", source, raw, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is not a number; the session quota counts the default of %d chart pods instead", source, raw, a2aDefaultChartPods)
 	case v < 0 || v > a2aMaxChartPods:
-		return a2aDefaultChartPods, fmt.Sprintf("%s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", source, raw, a2aMaxChartPods, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", source, raw, a2aMaxChartPods, a2aDefaultChartPods)
 	}
 	return v, ""
 }
@@ -4100,22 +4102,32 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 		_, why := a2aChartPodsCount(agent)
 		return agent, why, nil
 	}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}
 	cm := &corev1.ConfigMap{}
-	err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}, cm)
+	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
+		// Outside the operator's namespace the count is not read. The lookup
+		// only decides whether to say so, so no answer from it can fail the
+		// reconcile.
+		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
+			return agent, "", nil
+		}
+		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%q), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+	}
+	err := r.a2aReader().Get(ctx, key, cm)
 	if errors.IsNotFound(err) {
 		return agent, "", nil
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read the chart's pod count from ConfigMap %s: %w", a2aChartPodsConfigMapName, err)
 	}
-	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
-		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%q), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
-	}
+	source := fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation)
 	raw, present := cm.Data[a2aChartPodsConfigMapKey]
-	_, why := a2aParseChartPods(raw, present, fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation))
 	if !present {
-		return agent, why, nil
+		// The chart always writes the key, so a ConfigMap of this name without
+		// it is not the chart's: say so rather than count the default silently.
+		return agent, fmt.Sprintf("%s is missing; the session quota counts the default of %d chart pods instead", source, a2aDefaultChartPods), nil
 	}
+	_, why := a2aParseChartPods(raw, present, source)
 	sized := agent.DeepCopy()
 	annotations := sized.GetAnnotations()
 	if annotations == nil {
@@ -6000,9 +6012,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	quota := buildA2ASessionQuota(quotaAgent)
 	if why != "" {
 		key := client.ObjectKeyFromObject(agent)
-		// An annotation (or ConfigMap) edit does not bump the generation, so
-		// the value is part of what was reported: a second bad value warns too.
-		seen := a2aChartPodsWarning{generation: agent.Generation, value: quotaAgent.Annotations[a2aChartPodsAnnotation]}
+		// An annotation or ConfigMap edit does not bump the generation, so what
+		// was reported is part of the key: a second bad value, or the same one
+		// from another source, warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: why}
 		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
 			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
 			r.a2aChartPodsWarned.Store(key, seen)
