@@ -647,15 +647,20 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 
 // reconcileA2ADispatcherWithJobMode is reconcileA2ADispatcher, also
 // returning what this pass made of Job mode, for the DispatcherJobMode
-// condition Reconcile writes on its way out (syncDispatcherJobMode). nil
-// when the pass made nothing of it: the signal off, the dispatcher disabled,
-// or a read that answered neither way and changed nothing. Returned with the
-// errors too, since a step after the Jobs Role failing doesn't undo what the
-// pass did to it.
+// condition Reconcile writes on its way out (syncDispatcherJobMode).
+// jobModeTornDown when the pass tore Job mode down: the dispatcher disabled
+// and removed, or the signal off and the gate-off sweep done. nil when the
+// pass made nothing of it: a read that answered neither way and changed
+// nothing, or a teardown that failed partway. Returned with the errors too,
+// since a step after the Jobs Role failing doesn't undo what the pass did to
+// it.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
 	if !a2aDispatcherEnabled() {
 		profileErr, err = r.removeA2ADispatcher(ctx, agent)
-		return nil, profileErr, err
+		if profileErr == nil && err == nil {
+			jobModeVerdict = jobModeTornDown
+		}
+		return jobModeVerdict, profileErr, err
 	}
 	// One rendering of each unattended profile's Job template, into the
 	// dispatch config and into the admission policy's params, so the two
@@ -702,7 +707,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 		jobTemplates = nil
 		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
 		jobModeVerdict = jobModeOff(jobModeReasonNamespaceNotReady, fmt.Sprintf(
-			"the profile namespace %s is not ready (absent, without the chart's markers, or without its network fence), %s",
+			"the profile namespace %s is not ready (absent, without the chart's markers, or its network fence not applied this pass), %s",
 			profileNamespaceName(agent), jobModeOffConsequence))
 	default:
 		selected, err := r.profileNamespaceSelectedByJobPolicy(ctx, agent)
@@ -845,6 +850,9 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 	// sweep, once it has deleted the Jobs, lets it go.
 	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, bundleCopied, signal || sweepErr != nil)
 	if !signal {
+		if sweepErr == nil {
+			jobModeVerdict = jobModeTornDown
+		}
 		return jobModeVerdict, goerrors.Join(poolErr, sweepErr), nil
 	}
 	return jobModeVerdict, goerrors.Join(jobErr, poolErr), nil

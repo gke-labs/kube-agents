@@ -132,9 +132,9 @@ var profileNamespaceSelector = map[string]string{
 // dispatcherJobModeCondition says on the PlatformAgent whether the dispatcher
 // runs unattended profile tasks as Jobs. The DispatcherJobPolicyMissing Event
 // says why not on each pass, but Events expire, and nothing else in status
-// said whether Job mode was on. Present only while the chart signals the
-// policy (A2A_DISPATCHER_JOB_POLICY) and the dispatcher runs, as
-// BusCredentialsReady is absent on a today install.
+// said whether Job mode was on. Written only while the chart signals the
+// policy (A2A_DISPATCHER_JOB_POLICY) and the dispatcher runs, and removed
+// only by a pass that tore Job mode down (jobModeTornDown).
 //
 // It follows what the dispatcher pass did to the Jobs Role, and nothing
 // else: True when the pass granted it, False with the reason when the pass
@@ -146,8 +146,8 @@ var profileNamespaceSelector = map[string]string{
 const dispatcherJobModeCondition = "DispatcherJobMode"
 
 const (
-	// The policy and its binding are in place, the profile namespace is
-	// selected by the binding, and the dispatcher holds its Jobs Role.
+	// The pass found the policy and its binding in place and the profile
+	// namespace selected by the binding, and granted the Jobs Role.
 	jobModeReasonInPlace = "InPlace"
 	// The policy or its binding is missing, unreadable (Forbidden) or
 	// loosened; the message is the DispatcherJobPolicyMissing Event's.
@@ -155,8 +155,9 @@ const (
 	// The profile namespace lacks a label the binding selects it by; the
 	// message is the DispatcherJobPolicyMissing Event's.
 	jobModeReasonNamespaceNotSelected = "NamespaceNotSelected"
-	// The profile namespace is absent, lacks the chart's markers, or has no
-	// network fence yet, so nothing renders there.
+	// The profile namespace is absent or lacks the chart's markers, or the
+	// pass didn't apply its network fence (a failed fence write or namespace
+	// read included), so nothing renders there.
 	jobModeReasonNamespaceNotReady = "NamespaceNotReady"
 	// A DispatchJobTemplate under a param's name isn't this agent's
 	// (errForeignDispatchJobParam). It stands until somebody removes it.
@@ -176,7 +177,7 @@ func jobModeOn(profileNamespace string) *metav1.Condition {
 		Type:   dispatcherJobModeCondition,
 		Status: metav1.ConditionTrue,
 		Reason: jobModeReasonInPlace,
-		Message: fmt.Sprintf("the dispatcher Job admission policy is in place and the dispatcher holds its Jobs Role in the profile namespace %s, so unattended profile tasks run as Jobs",
+		Message: fmt.Sprintf("the last pass that settled Job mode found the dispatcher Job admission policy in place and granted the dispatcher its Jobs Role in the profile namespace %s",
 			profileNamespace),
 	}
 }
@@ -189,23 +190,34 @@ func jobModeGrantFailed(err error) *metav1.Condition {
 	return jobModeOff(jobModeReasonGrantFailed, fmt.Sprintf("the dispatcher's Job mode could not be granted (%v), %s", err, jobModeOffConsequence))
 }
 
+// jobModeTornDown is the verdict of a pass that tore Job mode down, or found
+// nothing of it left to tear down: removeA2ADispatcher with the dispatcher
+// disabled, the gate-off sweep with the signal off, or cleanupA2A on a flip
+// to today, each run to completion. It alone removes the condition. A pass
+// that returns before any of them (a refusal above the A2A step, a sweep
+// that failed) leaves the condition as it was, as BusCredentialsReady is
+// left on a refused flip: the Jobs Role and the templates are still live,
+// and an absent condition would say Job mode is off. Compared by identity.
+var jobModeTornDown = &metav1.Condition{Type: dispatcherJobModeCondition}
+
 // syncDispatcherJobMode brings the DispatcherJobMode condition into line with
 // the dispatcher pass's verdict, and is called on the way out of Reconcile,
 // as syncBusCredentialsReady is and for its reason: written mid-sequence, an
 // early return would skip it, and on the way out it lands after
 // updateStatusReady and updateStatusDegraded rather than racing them.
 //
-// wantNext and the two operator settings decide whether the condition exists
-// at all; verdict, nil when the pass made nothing of Job mode, decides its
-// value. It writes status only on a change: this runs on every pass.
-func (r *PlatformAgentReconciler) syncDispatcherJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, wantNext bool, verdict *metav1.Condition) error {
-	if !wantNext || !a2aDispatcherEnabled() || !dispatcherJobPolicyRendered() {
+// verdict decides everything: nil when the pass made nothing of Job mode
+// (the condition stays as it was), jobModeTornDown when it tore Job mode
+// down (the condition goes), and otherwise the condition's new value. It
+// writes status only on a change: this runs on every pass.
+func (r *PlatformAgentReconciler) syncDispatcherJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, verdict *metav1.Condition) error {
+	switch verdict {
+	case nil:
+		return nil
+	case jobModeTornDown:
 		if meta.RemoveStatusCondition(&agent.Status.Conditions, dispatcherJobModeCondition) {
 			return r.Status().Update(ctx, agent)
 		}
-		return nil
-	}
-	if verdict == nil {
 		return nil
 	}
 	condition := *verdict

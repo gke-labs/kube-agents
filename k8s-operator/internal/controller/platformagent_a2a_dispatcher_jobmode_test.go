@@ -19,10 +19,12 @@ package controller
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -42,14 +44,18 @@ import (
 // jobModeFixture is a next install with the dispatcher on, the chart's Job
 // policy signal set, and the policy, its binding and the profile namespace
 // in place, reconciled through Reconcile. getErr, when set, answers reads of
-// the binding; statusWrites counts the PlatformAgent's status writes.
+// the binding; patchErr, when set and non-nil for an object, answers its
+// apply. statusWrites counts the PlatformAgent's status writes, and
+// statusLog has the condition types each of them carried, in order.
 type jobModeFixture struct {
 	r            *PlatformAgentReconciler
 	c            client.Client
 	rec          *record.FakeRecorder
 	req          ctrl.Request
 	getErr       error
+	patchErr     func(client.Object) error
 	statusWrites int
+	statusLog    [][]string
 }
 
 func newJobModeFixture(t *testing.T, objs ...client.Object) *jobModeFixture {
@@ -67,7 +73,14 @@ func newJobModeFixture(t *testing.T, objs ...client.Object) *jobModeFixture {
 		WithObjects(append([]client.Object{agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)}, objs...)...).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
-			Patch: fakeServerSideApplyInterceptors().Patch,
+			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if f.patchErr != nil {
+					if err := f.patchErr(obj); err != nil {
+						return err
+					}
+				}
+				return fakeServerSideApplyInterceptors().Patch(ctx, cl, obj, patch, opts...)
+			},
 			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if _, isBinding := obj.(*admissionregistrationv1.ValidatingAdmissionPolicyBinding); isBinding && f.getErr != nil {
 					return f.getErr
@@ -75,8 +88,13 @@ func newJobModeFixture(t *testing.T, objs ...client.Object) *jobModeFixture {
 				return cl.Get(ctx, key, obj, opts...)
 			},
 			SubResourceUpdate: func(ctx context.Context, cl client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-				if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok && subResourceName == "status" {
+				if agent, ok := obj.(*agentv1alpha1.PlatformAgent); ok && subResourceName == "status" {
 					f.statusWrites++
+					var types []string
+					for _, c := range agent.Status.Conditions {
+						types = append(types, c.Type)
+					}
+					f.statusLog = append(f.statusLog, types)
 				}
 				return cl.SubResource(subResourceName).Update(ctx, obj, opts...)
 			},
@@ -155,6 +173,8 @@ func TestDispatcherJobModeIsTrueWithThePolicyInPlace(t *testing.T) {
 // The condition is written on the way out of Reconcile, so neither
 // updateStatusReady nor updateStatusDegraded, both later in the pass than
 // the dispatcher step, leaves it unwritten: one pass is enough on either.
+// And it is the pass's last status write: a write mid-pass, followed by
+// theirs, would be the same race the exit write exists to avoid.
 func TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass(t *testing.T) {
 	for name, objs := range map[string][]client.Object{
 		"Ready":    {sandboxKeysSecret(a2aTestAgent())},
@@ -162,8 +182,19 @@ func TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newJobModeFixture(t, objs...)
-			f.mustReconcile(t)
 			f.mustReconcile(t) // the first pass adds the finalizer and returns
+			f.statusLog = nil
+			f.mustReconcile(t)
+			first := -1
+			for i, types := range f.statusLog {
+				if slices.Contains(types, dispatcherJobModeCondition) {
+					first = i
+					break
+				}
+			}
+			if first < 0 || first != len(f.statusLog)-1 {
+				t.Errorf("%s first written by status write %d of %d (%v), want the pass's last", dispatcherJobModeCondition, first+1, len(f.statusLog), f.statusLog)
+			}
 			agent := f.agent(t)
 			if name == "Degraded" {
 				if ready := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); ready == nil || ready.Status != metav1.ConditionFalse {
@@ -323,6 +354,36 @@ func TestEveryJobModeRevocationSaysWhy(t *testing.T) {
 			t.Errorf("message %q does not name the foreign template", got.Message)
 		}
 	})
+	// A failed read of the profile namespace and a failed copy of the CA
+	// bundle each revoke the Role, so each must say so.
+	for name, failGet := range map[string]func(client.Object, client.ObjectKey) bool{
+		"namespace unreadable": func(obj client.Object, _ client.ObjectKey) bool {
+			_, isNamespace := obj.(*corev1.Namespace)
+			return isNamespace
+		},
+		"CA bundle unreadable": func(obj client.Object, key client.ObjectKey) bool {
+			_, isConfigMap := obj.(*corev1.ConfigMap)
+			return isConfigMap && key == types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, c := jobTemplateTestReconciler(t, agent)
+			r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+				Patch: fakeServerSideApplyInterceptors().Patch,
+				Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					if failGet(obj, key) {
+						return apierrors.NewServerTimeout(corev1.Resource("objects"), "get", 1)
+					}
+					return cl.Get(ctx, key, obj, opts...)
+				},
+			})
+			got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantJobMode(t, got, metav1.ConditionFalse, jobModeReasonGrantFailed)
+		})
+	}
 	t.Run("Jobs Role refused", func(t *testing.T) {
 		r, c := jobTemplateTestReconciler(t, agent)
 		r.Client = interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
@@ -353,7 +414,7 @@ func TestDispatcherJobModeWritesStatusOnlyOnAChange(t *testing.T) {
 	on := jobModeOn(profileNamespaceName(agent))
 	for i, want := range []int{1, 0} {
 		f.statusWrites = 0
-		if err := f.r.syncDispatcherJobMode(ctx, agent, true, on); err != nil {
+		if err := f.r.syncDispatcherJobMode(ctx, agent, on); err != nil {
 			t.Fatal(err)
 		}
 		if f.statusWrites != want {
@@ -362,21 +423,102 @@ func TestDispatcherJobModeWritesStatusOnlyOnAChange(t *testing.T) {
 	}
 	// No verdict this pass: nothing to write.
 	f.statusWrites = 0
-	if err := f.r.syncDispatcherJobMode(ctx, agent, true, nil); err != nil {
+	if err := f.r.syncDispatcherJobMode(ctx, agent, nil); err != nil {
 		t.Fatal(err)
 	}
 	if f.statusWrites != 0 {
 		t.Errorf("sync with no verdict wrote status %d times", f.statusWrites)
 	}
 	// Removed once, then nothing left to remove.
-	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
 	for i, want := range []int{1, 0} {
 		f.statusWrites = 0
-		if err := f.r.syncDispatcherJobMode(ctx, agent, true, nil); err != nil {
+		if err := f.r.syncDispatcherJobMode(ctx, agent, jobModeTornDown); err != nil {
 			t.Fatal(err)
 		}
 		if f.statusWrites != want {
 			t.Errorf("removal %d wrote status %d times, want %d", i+1, f.statusWrites, want)
 		}
 	}
+}
+
+// A pass that returns before the dispatcher step tears nothing down, so it
+// leaves the condition as it was, even with the signal or the dispatcher
+// gone or the mode flipped to today: the Jobs Role and the templates are
+// still live, and an absent condition would say Job mode is off. The first
+// pass that does tear it down removes it.
+func TestARefusedPassLeavesDispatcherJobModeStanding(t *testing.T) {
+	for name, turnOff := range map[string]func(t *testing.T, f *jobModeFixture){
+		"the signal off":     func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherJobPolicyEnvVar, "") },
+		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherImageEnvVar, "") },
+		"the mode back to today": func(t *testing.T, f *jobModeFixture) {
+			agent := f.agent(t)
+			agent.Spec.Mode = nil
+			if err := f.c.Update(context.Background(), agent); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			f := newJobModeFixture(t, sandboxKeysSecret(agent))
+			f.mustReconcile(t)
+			f.mustReconcile(t)
+			wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
+			// A spec.security.serviceAccountName naming one of the
+			// operator's own ServiceAccounts: refused at 2z, above the A2A
+			// step.
+			setReservedServiceAccount := func(name string) {
+				t.Helper()
+				a := f.agent(t)
+				if a.Spec.Security == nil {
+					a.Spec.Security = &agentv1alpha1.SecuritySpec{}
+				}
+				a.Spec.Security.ServiceAccountName = name
+				if err := f.c.Update(context.Background(), a); err != nil {
+					t.Fatal(err)
+				}
+			}
+			setReservedServiceAccount(operatorServiceAccountNames(f.agent(t))[0])
+			if ReservedServiceAccountOverride(f.agent(t)) == "" {
+				t.Fatal("precondition: the override is not refused")
+			}
+			turnOff(t, f)
+			_ = f.reconcile(t)
+			jobsRole := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherJobsRoleName(agent)}
+			if err := f.c.Get(context.Background(), jobsRole, &rbacv1.Role{}); err != nil {
+				t.Fatalf("precondition: the refused pass tore the Jobs Role down: %v", err)
+			}
+			wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
+			// The refusal lifted, the teardown runs and the condition goes.
+			setReservedServiceAccount("")
+			_ = f.reconcile(t)
+			if got := f.condition(t); got != nil {
+				t.Errorf("%s survived the teardown after %s: %+v", dispatcherJobModeCondition, name, got)
+			}
+		})
+	}
+}
+
+// A pass that revokes the Role and then fails at a later dispatcher step
+// still reports the revoke: True left standing over a revoked Role is the
+// worst wrong value.
+func TestALaterDispatcherFailureStillReportsTheRevoke(t *testing.T) {
+	agent := a2aTestAgent()
+	f := newJobModeFixture(t, sandboxKeysSecret(agent))
+	f.mustReconcile(t)
+	f.mustReconcile(t)
+	wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
+	if err := f.c.Delete(context.Background(), &admissionregistrationv1.ValidatingAdmissionPolicyBinding{ObjectMeta: metav1.ObjectMeta{Name: dispatcherJobPolicyName}}); err != nil {
+		t.Fatal(err)
+	}
+	f.patchErr = func(obj client.Object) error {
+		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment && obj.GetName() == a2aDispatcherName(agent) {
+			return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), errors.New("refused"))
+		}
+		return nil
+	}
+	if err := f.reconcile(t); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("precondition: want the dispatcher Deployment's apply to fail the pass, got %v", err)
+	}
+	wantJobMode(t, f.condition(t), metav1.ConditionFalse, jobModeReasonPolicyMissing)
 }

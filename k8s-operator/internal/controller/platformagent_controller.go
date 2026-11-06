@@ -912,7 +912,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// knows what it describes. Both are worse than leaving it.
 	//
 	// DispatcherJobMode is written on the way out for the same reasons, from
-	// the dispatcher step's verdict (syncDispatcherJobMode).
+	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
+	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
 	var dispatcherJobMode *metav1.Condition
 	if modeErr == nil {
@@ -937,7 +938,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		defer func() {
 			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
-			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, wantNext, dispatcherJobMode))
+			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
 
@@ -1226,6 +1227,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		// The dispatcher and its Job mode went with the stack.
+		dispatcherJobMode = jobModeTornDown
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
