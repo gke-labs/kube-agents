@@ -74,15 +74,22 @@ def tearDownModule():
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 
+def build_dir(kind="nightly", root=None, build="b1", day="2026-11-05"):
+    """`<root>/<kind>/<day>/<build>/`, where the collector files a build's manifest."""
+    path = os.path.join(root or tempfile.mkdtemp(dir=TEMP_DIR), kind, day, build)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def kind_dir(kind="nightly", root=None):
-    """A `<kind>/` folder, as the bucket files a job kind's logs."""
-    path = os.path.join(root or tempfile.mkdtemp(dir=TEMP_DIR), kind)
+    """A build's `logs/` folder under `<kind>/`, where the collector files its segments."""
+    path = os.path.join(build_dir(kind, root), "logs")
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def write(lines, suffix=".jsonl", directory=None):
-    """Lines into one file, under a `nightly/` folder unless `directory` says otherwise."""
+    """Lines into one segment file, at the layout under `nightly/` unless `directory` says otherwise."""
     handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, dir=directory or kind_dir())
     with handle:
         for entry in lines:
@@ -596,8 +603,10 @@ class SecondReview(unittest.TestCase):
     EPOCH = 1_700_000_000
 
     def window_dir(self):
-        root = kind_dir()
-        write([line("a", self.EPOCH + 100, build="old"), line("b", self.EPOCH + 200, build="new")], directory=root)
+        root = build_dir()
+        logs = os.path.join(root, "logs")
+        os.makedirs(logs)
+        write([line("a", self.EPOCH + 100, build="old"), line("b", self.EPOCH + 200, build="new")], directory=logs)
         for build, seconds in (("old", 100), ("new", 200), ("quiet-old", 50), ("quiet-new", 210)):
             # quiet-*: builds that logged nothing, started outside and inside the window.
             write_json({"kind": "nightly", "build": build}, name=f"job-{(self.EPOCH + seconds) * 1000}.json",
@@ -736,31 +745,87 @@ class KindFromFolder(unittest.TestCase):
         # A presubmit's proxy tags its lines nightly; the bucket filed them under presubmit/.
         write([line("a", 1, kind="nightly", build="p1"), line("b", 2, kind="presubmit", build="p1", pr="3")],
               directory=kind_dir("presubmit", root))
-        write([line("c", 3, kind="nightly", build="n1")], directory=os.path.join(kind_dir("nightly", root)))
+        write([line("c", 3, kind="nightly", build="n1")], directory=kind_dir("nightly", root))
         quality = br.Quality()
         lines, _ = br.load_lines([root], quality)
         self.assertEqual([(l.kind, l.build) for l in lines], [("presubmit", "p1"), ("nightly", "n1")])
         self.assertEqual(quality.skipped.get("kind_mismatch"), 1)
 
-    def test_the_nearest_kind_folder_wins(self):
-        outer = kind_dir("presubmit")
-        inner = kind_dir("nightly-untrusted", os.path.join(outer, "2026-11-05"))
-        self.assertEqual(br.folder_kind(os.path.join(inner, "b1", "logs", "x.jsonl")), "nightly-untrusted")
-        self.assertEqual(br.folder_kind(os.path.join(outer, "x.jsonl")), "presubmit")
-        self.assertIsNone(br.folder_kind(os.path.join(TEMP_DIR, "x.jsonl")))
-        self.assertIsNone(br.folder_kind(os.path.join(TEMP_DIR, "nightlyish", "x.jsonl")))
+    def test_a_nightly_folder_planted_under_presubmit_is_never_nightly(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        presubmit = os.path.join(root, "presubmit")
+        # What a presubmit's own uploader may write below its prefix.
+        forged = os.path.join(presubmit, "2026-11-05", "nightly", "2026-11-05", "b1", "logs")
+        os.makedirs(forged)
+        write([line("a", 1, kind="nightly", build="n1")], directory=forged)
+        write_json({"kind": "nightly", "build": "n1"}, name="job-1.json", directory=os.path.dirname(forged))
+        honest = kind_dir("presubmit", root)
+        write([line("b", 2, kind="presubmit", build="p1", pr="3")], directory=honest)
+        for folder in (root, presubmit):
+            quality = br.Quality()
+            lines, manifests = br.load_lines([folder], quality)
+            self.assertEqual([l.kind for l in lines], ["presubmit"], folder)
+            self.assertEqual(manifests, [], folder)
+            self.assertEqual(quality.off_layout_files, 2, folder)
 
-    def test_an_input_under_no_kind_folder_needs_kind(self):
+    def test_filed_kind_is_analyze_shadows_rule(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        good = os.path.join(root, "nightly-untrusted", "2026-11-05", "b1", "logs", "seg.jsonl")
+        self.assertEqual(br.filed_kind(good), "nightly-untrusted")
+        self.assertEqual(br.filed_kind(os.path.join(root, "presubmit", "2026-11-05", "b1", "job-1.json")),
+                         "presubmit")
+        for bad in (
+            os.path.join(root, "presubmit", "2026-11-05", "nightly", "2026-11-05", "b1", "logs", "seg.jsonl"),
+            os.path.join(root, "nightly", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "b1", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "b1", "store", "seg.jsonl"),
+            os.path.join(root, "nightly", "20261105", "b1", "logs", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "presubmit", "logs", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "replay-shadow", "logs", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "-b1", "logs", "seg.jsonl"),
+            os.path.join(root, "nightly", "2026-11-05", "b1", "logs", "seg.jsonl.open"),
+            os.path.join(root, "nightly", "2026-11-05", "b1", "logs", "job-1.json"),
+            os.path.join(root, "nightly", "2026-11-05", "b1", "notes.json"),
+        ):
+            self.assertIsNone(br.filed_kind(bad), bad)
+
+    def test_off_layout_files_under_a_folder_are_skipped_and_counted(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        write([line("a", 1)], directory=kind_dir("nightly", root))
+        write([line("b", 2)], directory=os.path.join(root, "nightly"))
+        quality = br.Quality()
+        lines, _ = br.load_lines([root], quality)
+        self.assertEqual([l.ts for l in lines], [1])
+        self.assertEqual(quality.off_layout_files, 1)
+
+    def test_a_missing_path_is_an_error(self):
+        missing = os.path.join(TEMP_DIR, "no-such-dir")
+        code, _, err = run_main([missing])
+        self.assertEqual(code, 2)
+        self.assertIn(f"{missing} does not exist", err)
+
+    def test_a_named_off_layout_file_or_an_all_off_layout_folder_needs_kind(self):
         loose = tempfile.mkdtemp(dir=TEMP_DIR)
         path = write([line("a", 1_700_000_000, kind="presubmit", pr="3")], directory=loose)
         code, _, err = run_main([path])
         self.assertEqual(code, 2)
-        self.assertIn("is under no nightly, nightly-untrusted, presubmit folder", err)
+        self.assertIn("is not at the bucket's layout", err)
+        code, _, err = run_main([loose])
+        self.assertEqual(code, 2)
+        self.assertIn("holds no log file or manifest at the bucket's layout", err)
         code, out, err = run_main([path, "--kind", "presubmit", "--json"])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out)["scopes"]["presubmit"]["requests"], 1)
         code, out, _ = run_main([path, "--kind", "nightly", "--json"])
         self.assertEqual(json.loads(out)["data_quality"]["skipped_lines"], {"kind_mismatch": 1})
+
+    def test_kind_reads_every_file_under_a_folder_as_that_kind(self):
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        write([line("a", 1, kind="presubmit", pr="3")], directory=loose)
+        quality = br.Quality()
+        lines, _ = br.load_lines([loose], quality, kind="presubmit")
+        self.assertEqual([l.kind for l in lines], ["presubmit"])
+        self.assertEqual(quality.off_layout_files, 0)
 
     def test_kind_overrides_the_folder(self):
         path = write([line("a", 1, kind="nightly")], directory=kind_dir("presubmit"))
@@ -768,16 +833,20 @@ class KindFromFolder(unittest.TestCase):
         lines, _ = br.load_lines([path], quality, kind="nightly")
         self.assertEqual([l.kind for l in lines], ["nightly"])
 
-    def test_a_manifest_takes_its_folders_kind_too(self):
+    def test_a_manifest_takes_its_filed_kind_too(self):
         root = tempfile.mkdtemp(dir=TEMP_DIR)
-        write_json({"kind": "nightly", "build": "p9"}, name="job-1.json", directory=kind_dir("presubmit", root))
-        write_json({"kind": "presubmit", "build": "p8"}, name="job-2.json", directory=kind_dir("presubmit", root))
+        write_json({"kind": "nightly", "build": "p9"}, name="job-1.json", directory=build_dir("presubmit", root))
+        write_json({"kind": "presubmit", "build": "p8"}, name="job-2.json", directory=build_dir("presubmit", root))
+        # Inside logs/ is no manifest's place.
+        write_json({"kind": "presubmit", "build": "p7"}, name="job-3.json", directory=kind_dir("presubmit", root))
         quality = br.Quality()
         _, manifests = br.load_lines([root], quality)
         self.assertEqual([(m.kind, m.build) for m in manifests], [("presubmit", "p8")])
-        self.assertEqual(quality.manifest_kind_mismatches, 1)
+        self.assertEqual((quality.manifest_kind_mismatches, quality.off_layout_files), (1, 1))
         loose = tempfile.mkdtemp(dir=TEMP_DIR)
-        write_json({"kind": "nightly", "build": "n1"}, name="job-3.json", directory=loose)
+        named = write_json({"kind": "nightly", "build": "n1"}, name="job-4.json", directory=loose)
+        with self.assertRaises(ValueError):
+            br.load_lines([named], br.Quality())
         with self.assertRaises(ValueError):
             br.load_lines([loose], br.Quality())
 
@@ -826,8 +895,10 @@ class MalformedInput(unittest.TestCase):
         quality = br.Quality()
         lines, manifests = br.load_lines([root], quality)
         r = br.build_report(lines, manifests, {}, prices(), quality)
-        self.assertEqual(r["scopes"]["total"]["requests"], 2)
-        self.assertEqual((r["data_quality"]["log_files"], r["data_quality"]["manifests"]), (2, 4))
+        # A .jsonl.open segment is not a name the collector uploads: off the layout.
+        self.assertEqual(r["scopes"]["total"]["requests"], 1)
+        self.assertEqual((r["data_quality"]["log_files"], r["data_quality"]["manifests"]), (1, 4))
+        self.assertEqual(r["data_quality"]["off_layout_files"], 1)
         self.assertEqual(r["data_quality"]["bad_manifests"], 2)
         self.assertEqual(r["data_quality"]["manifest_builds_without_lines"], ["presubmit/b9"])
 

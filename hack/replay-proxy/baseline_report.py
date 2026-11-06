@@ -10,11 +10,14 @@ the same way (examples/inference-replay/eval-design.md, Rollout).
 
 Inputs:
 
-- LOG paths: JSONL files (read whatever their suffix), or directories
-  searched for `*.jsonl` and `*.jsonl.open` log segments and
-  `job-<ms>.json` run manifests. Each file's job kind is its nearest
-  enclosing `nightly`, `nightly-untrusted` or `presubmit` folder (or
-  `--kind`), never its lines' own tags; a line whose tag disagrees is dropped;
+- LOG paths: segment files and job manifests, or directories searched for
+  `*.jsonl` and `*.jsonl.open` segments and `job-<ms>.json` manifests. A
+  file's job kind is the kind folder it was filed under at the collector's
+  layout (filed_kind: `<kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl` or
+  `<kind>/<YYYY-MM-DD>/<build>/job-<ms>.json`, with no other kind-named
+  directory in its path), or `--kind`; never its lines' own tags, and a line
+  whose tag disagrees is dropped. A file found under a directory off that
+  layout is skipped and counted;
 - `--eval-data data.json` (repeatable): the dashboard's runs, joined to the
   lines on the Prow build id (`job.build` == `runs[].build_id`);
 - `--prices`: the dated price table (default: model-prices.json beside this
@@ -90,6 +93,20 @@ PROVIDER_SEPARATOR = "/"
 
 SEGMENT_SUFFIXES = (".jsonl", ".jsonl.open")
 MANIFEST_NAME = re.compile(r"^job-(\d+)\.json$")
+# Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
+# <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl and the job manifest at
+# <kind>/<YYYY-MM-DD>/<build>/job-<ms>.json. The build is BUILD_ID's shape
+# (hack/ci-env.sh, REPLAY_SHADOW_BUILD_RE), the segment name the logs/ form of
+# collect_shadow.SAFE_NAME, and the manifest collect_shadow.write_manifest's.
+# The same values as analyze_shadow's (kube-agents#4982), for filed_kind.
+BUCKET_ROOT = "replay-shadow"
+LOGS_DIR = "logs"
+DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+BUILD_DIR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SEGMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
+FILED_DEPTH = 5
+MANIFEST_DEPTH = 4
+LAYOUT = f"<{'|'.join(JOB_KINDS)}>/<YYYY-MM-DD>/<build>/{LOGS_DIR}/<segment>.jsonl or <build>/job-<ms>.json"
 # The listing of lines without a build id: they are no build, and stay out of
 # `builds` and every per-build figure.
 NO_BUILD = "(lines without a build id; not a build)"
@@ -392,6 +409,8 @@ class Quality:
     """What the report could not count, and why."""
 
     files: int = 0
+    # Files found under a directory argument but not at the bucket's layout.
+    off_layout_files: int = 0
     manifests: int = 0
     bad_manifests: int = 0
     manifest_kind_mismatches: int = 0
@@ -596,37 +615,83 @@ def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[L
     )
 
 
-def folder_kind(path: str) -> Optional[str]:
-    """The job kind a file was filed under: its nearest enclosing directory named for one.
+def filed_kind(path: str) -> Optional[str]:
+    """The kind a segment or job manifest was filed under, when it sits at the collector's layout, else None.
 
-    Mirrors analyze_shadow.folder_kind (kube-agents#4982) with this report's
-    JOB_KINDS; replace it with that import once both are on main.
+    The kind directory must be the only component of the whole absolute path
+    named for a kind, since everything below a kind prefix is the uploader's
+    choice; the build directory may not be named for a kind or the bucket root.
+
+    Mirrors analyze_shadow.filed_kind (kube-agents#4982), copied with its
+    constants; replace it with that import once both are on main.
     """
-    for part in reversed(os.path.normpath(os.path.abspath(os.path.dirname(path))).split(os.sep)):
-        if part in JOB_KINDS:
-            return part
-    return None
+    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
+    name = parts[-1]
+    if SEGMENT_NAME.match(name):
+        depth = FILED_DEPTH
+        if len(parts) < depth or parts[-2] != LOGS_DIR:
+            return None
+    elif MANIFEST_NAME.match(name):
+        depth = MANIFEST_DEPTH
+        if len(parts) < depth:
+            return None
+    else:
+        return None
+    kind, day, build = parts[-depth:][:3]
+    if kind not in JOB_KINDS or not DAY_DIR.match(day) or not BUILD_DIR.match(build) or build in (*JOB_KINDS, BUCKET_ROOT):
+        return None
+    if any(part in JOB_KINDS for part in parts[:-depth]):
+        return None
+    return kind
 
 
-def kind_of(path: str, kind: Optional[str]) -> str:
-    """A file's job kind: `kind` when given, else its folder's; never its lines' own tags, which the proxy
-    built from the commit under test writes."""
-    found = kind or folder_kind(path)
-    if found is None:
-        raise ValueError(f"{path} is under no {', '.join(JOB_KINDS)} folder; copy the bucket's"
-                         " replay-shadow/<kind>/ folders as they are, or pass --kind")
-    return found
+def filed_inputs(
+    paths: Iterable[str], kind: Optional[str], quality: Quality
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    """(log files, job manifests), each with its job kind: `kind` when given, else filed_kind's, never the
+    lines' own tags, which the proxy built from the commit under test writes.
+
+    A file found under a directory but off the layout is skipped and counted
+    in off_layout_files. Raises ValueError for a path that does not exist, a
+    file named outright that is off the layout, or a directory whose log files
+    and manifests are all off it: each a mistake in the arguments rather than a
+    planted file.
+    """
+    logs: List[Tuple[str, str]] = []
+    manifests: List[Tuple[str, str]] = []
+    for path in paths:
+        if not os.path.exists(path):
+            raise ValueError(f"{path} does not exist")
+        if not os.path.isdir(path):
+            file_kind = kind or filed_kind(path)
+            if file_kind is None:
+                raise ValueError(f"{path} is not at the bucket's layout ({LAYOUT}, with no other directory in its"
+                                 " path named for a kind); pass --kind to name its kind")
+            (manifests if MANIFEST_NAME.match(os.path.basename(path)) else logs).append((path, file_kind))
+            continue
+        found_logs, found_manifests = expand_paths([path])
+        found = 0
+        for names, out in ((found_logs, logs), (found_manifests, manifests)):
+            for name in names:
+                file_kind = kind or filed_kind(name)
+                if file_kind is None:
+                    quality.off_layout_files += 1
+                    continue
+                out.append((name, file_kind))
+                found += 1
+        if (found_logs or found_manifests) and not found:
+            raise ValueError(f"{path} holds no log file or manifest at the bucket's layout ({LAYOUT}, with no other"
+                             " directory in its path named for a kind); pass a kind folder or its parent, or --kind")
+    return logs, manifests
 
 
 def load_lines(
     paths: Iterable[str], quality: Quality, kind: Optional[str] = None
 ) -> Tuple[List[Line], List[Manifest]]:
-    """The request lines in time order, and each readable manifest, each of the kind kind_of() gives."""
-    logs, manifest_paths = expand_paths(paths)
-    quality.files = len(logs)
-    quality.manifests = len(manifest_paths)
-    log_kinds = [(path, kind_of(path, kind)) for path in logs]
-    manifest_kinds = [(path, kind_of(path, kind)) for path in manifest_paths]
+    """The request lines in time order, and each readable manifest, each of the kind filed_inputs() gives."""
+    log_kinds, manifest_kinds = filed_inputs(paths, kind, quality)
+    quality.files = len(log_kinds)
+    quality.manifests = len(manifest_kinds)
     lines: List[Line] = []
     seen: set = set()
     for path, file_kind in log_kinds:
@@ -990,6 +1055,7 @@ def build_report(
         REPORT_CASES: cases,
         REPORT_DATA_QUALITY: {
             "log_files": quality.files,
+            "off_layout_files": quality.off_layout_files,
             "manifests": quality.manifests,
             "bad_manifests": quality.bad_manifests,
             "manifest_kind_mismatches": quality.manifest_kind_mismatches,
