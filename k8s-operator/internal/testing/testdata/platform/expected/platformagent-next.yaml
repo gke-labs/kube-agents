@@ -2094,6 +2094,8 @@ spec:
                 resourceFieldRef:
                   divisor: "0"
                   resource: limits.memory
+            - name: BRIDGE_DEBUG_ERROR_TEXT
+              value: "false"
             - name: A2A_CAPABILITY_REQUIRED
               value: "true"
           image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
