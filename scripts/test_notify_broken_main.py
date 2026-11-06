@@ -54,10 +54,10 @@ def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="
         "head_branch": "main",
         "head_sha": sha or f"{number:040x}",
         "head_commit": {"message": f"{subject}\n\nbody", "author": {"name": "A Contributor"}},
-        # What Tide leaves behind on every merge here, and the reason the
-        # attribution is read off the commit rather than the run.
-        "actor": {"login": "google-oss-prow[bot]"},
-        "triggering_actor": {"login": "google-oss-prow[bot]"},
+        # What the merge queue leaves behind on every merge here, and the
+        # reason the attribution is read off the commit rather than the run.
+        "actor": {"login": "github-merge-queue[bot]"},
+        "triggering_actor": {"login": "github-merge-queue[bot]"},
         "html_url": f"https://github.com/gke-labs/kube-agents/actions/runs/{1000 + number}",
         "workflow_id": 77,
         "created_at": "2026-09-01T00:00:00Z",
@@ -271,12 +271,28 @@ class RenderTest(unittest.TestCase):
         decision = notifier.decide(run(10, "failure"), [run(9, "success")])
         self.assertIn(notifier.episode_marker(decision, 77), self._body(decision))
 
-    def test_the_change_is_attributed_to_its_author_not_to_tide(self):
-        """`actor` is `google-oss-prow[bot]` on every merge here, so a body
+    def test_the_change_is_attributed_to_its_author_not_to_the_merge_queue(self):
+        """`actor` is `github-merge-queue[bot]` on every merge here, so a body
         built from it names the robot on every breakage and nobody else."""
         body = self._body(notifier.decide(run(10, "failure"), [run(9, "success")]))
         self.assertIn("A Contributor", body)
-        self.assertNotIn("prow", body)
+        self.assertNotIn("merge-queue", body)
+
+    def test_a_real_queue_merge_names_the_pull_request_author(self):
+        """The fields of a real push to main that the merge queue made: run
+        42277127360 (Operator Tests) for #4802. Both actors are the queue's bot;
+        the squash commit keeps the pull request's author, with GitHub as the
+        committer."""
+        queue_merge = run(10, "failure", sha="f0ad3a3ec4a5b3c7a0e1d2c3b4a5968778695a4b",
+                          subject="feat(incident-triage): fold the pods of one Job, StatefulSet or DaemonSet into one incident (#4802)")
+        queue_merge["head_commit"]["author"] = {"name": "Fuxiao G", "email": "116308835+Fuxiao-Gao@users.noreply.github.com"}
+        queue_merge["head_commit"]["committer"] = {"name": "GitHub", "email": "noreply@github.com"}
+        queue_merge["actor"] = queue_merge["triggering_actor"] = {"login": "github-merge-queue[bot]"}
+        self.assertEqual(notifier._author(queue_merge), "Fuxiao G")
+        body = self._body(notifier.decide(queue_merge, [run(9, "success")]))
+        self.assertIn("Fuxiao G", body)
+        self.assertIn("| #4802 |", body)
+        self.assertNotIn("merge-queue", body)
 
     def test_the_pull_request_is_named_so_github_autolinks_it(self):
         """Bare `#733` rather than a URL: it renders as a link and leaves a
@@ -764,14 +780,14 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn(notifier.FIXED_BY_STAMP.format(number=12, run_id=1012), api.closed_issues[0]["body"])
 
     def test_a_green_stamps_an_issue_a_merge_closed_before_it_finished(self):
-        """Red 98 opened #A; a "Fixes #A" merge closed it through Prow before
+        """Red 98 opened #A; a "Fixes #A" merge closed it through the merge queue before
         its own run, 99, went green. Nothing is open when 99 reconciles, but
         #A is the streak's issue and carries no fixed-by stamp; without one a
         later page lacking 99 would read 98 and a new red as one streak and
         re-file episode 98 over the correct issue. The green stamps it, closed
         as it is."""
         red = decided(run(98, "failure"), [run(97, "success")])
-        closed_by_merge = rendered(red, 880, state="closed", closed_at="2026-09-02T00:00:00Z", closed_by={"login": "google-oss-prow[bot]"})
+        closed_by_merge = rendered(red, 880, state="closed", closed_at="2026-09-02T00:00:00Z", closed_by={"login": "kube-agents-merge-queue[bot]"})
         api = FakeAPI(closed_issues=[closed_by_merge])
         result = self._reconcile(api, decided(run(99, "success"), [run(98, "failure"), run(97, "success")]))
         self.assertEqual(api.kinds(), ["stamp"])
@@ -1009,7 +1025,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
 
     def test_a_red_that_finished_after_the_close_is_filed_again(self):
         """A merged pull request that says `Fixes #901` closes the issue through
-        Prow and then goes red itself. That run changed after the close, so
+        the merge queue and then goes red itself. That run changed after the close, so
         the close is not a dismissal of it, whoever performed the close."""
         earlier = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(earlier, self.AFTER)])
