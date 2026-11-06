@@ -23675,9 +23675,13 @@ def _close_from_stored_document(
     """Run `finish --scheduled` on the stored document and this run's manifest.
 
     None when `finish` published (it printed its own JSON line, with
-    `PRECHECK_KEY`); otherwise the reason the SOP continues. On every outcome
-    but a publish the findings file is put back as it was, so a `draft` the
-    collector command wrote is still the one the worker fills. A rejected
+    `PRECHECK_KEY`); otherwise the reason the SOP continues. The document
+    goes in with each remediation's note as the worker wrote it
+    (`_strip_route_notes`): the route notes and the Config Connector
+    paragraph are `finish`'s to write again from this run's manifest. On
+    every outcome but a publish the findings file is put back as it was, so
+    a `draft` the collector command wrote is still the one the worker fills.
+    A rejected
     document is that reason: the manifest digested the same, but `finish` is
     the judge of whether the document still fits it. A broker outage, and any
     other failure of the close, is raised as it is from any command; the same
@@ -23687,6 +23691,16 @@ def _close_from_stored_document(
     """
     path = Path(findings_path_for(audit_id))
     previous = path.read_bytes() if path.is_file() else None
+    document = copy.deepcopy(document)
+    for finding in document.get("findings") or []:
+        if isinstance(finding, dict):
+            # The note as the worker wrote it, before the route notes and the
+            # cut `finish` made to fit them (`ROUTE_UNCUT_NOTE_FIELD`), as the
+            # carry puts it back: `validate_findings` drops the field, and a
+            # finding whose evidence moved is not carried, so the cut text
+            # would otherwise pass for the worker's own and the uncut note
+            # would leave the store for good.
+            _strip_route_notes(finding.get("remediation"))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     close = argparse.Namespace(

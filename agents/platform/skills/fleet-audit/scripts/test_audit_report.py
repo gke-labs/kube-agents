@@ -35746,6 +35746,38 @@ class TestPrecheck(BaseTestCase):
         self.assertEqual(ids, [f["id"] for f in json.loads(json.dumps(self.latest()["document"]))["findings"]])
         self.assertEqual(len(ids), 1)
 
+    def test_a_cut_note_is_replayed_as_the_worker_wrote_it(self):
+        """`finish` cut the worker's note to fit the route notes and kept the uncut one; the
+        replay gives it the uncut note, so a finding the carry skips (its excerpt moved)
+        does not pass the cut text off as the worker's and lose the uncut note for good."""
+        candidate = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments, AGE=12d",
+        }
+        finding = make_finding(remediation=dict(REPLAYABLE_REMEDIATION))
+        self.finish(make_doc(findings=[finding]), self.manifest_file("day1", candidates=[candidate]))
+        whole = "Write a default-deny policy for every namespace that has none; the runbook names the exceptions."
+
+        def cut(document):
+            document["findings"][0]["remediation"] = {
+                "kind": "manual",
+                "note": "Write a default-deny policy" + audit_report.ROUTE_NOTE_TRUNCATED + "\n\nDeclared in clusters/prod/payments.yaml.",
+                audit_report.ROUTE_UNCUT_NOTE_FIELD: whole,
+            }
+
+        self.rewrite_stored_document(cut)
+        aged = {**candidate, "excerpt": "zero NetworkPolicies in payments, AGE=13d"}
+        rc = self.precheck(self.manifest_file("day2", candidates=[aged]))
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()[audit_report.PRECHECK_KEY], "unchanged")
+        remediation = self.latest()["document"]["findings"][0]["remediation"]
+        self.assertEqual(remediation["note"], whole)
+        self.assertNotIn(audit_report.ROUTE_UNCUT_NOTE_FIELD, remediation)
+
     def test_without_the_flag_an_unchanged_run_is_not_closed(self):
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
         stored = self.latest()
