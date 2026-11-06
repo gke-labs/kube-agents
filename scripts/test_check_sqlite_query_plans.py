@@ -42,6 +42,8 @@ from scripts.check_sqlite_query_plans import (  # noqa: E402
     scan,
     scan_index,
     scanned_table,
+    sql_text,
+    statement_tables,
     table_aliases,
 )
 
@@ -454,6 +456,33 @@ FIXTURE_SERVER = textwrap.dedent(
 
         def method(self, conn):
             return conn.execute(shadowed, (1,)).fetchall()
+
+        def nested(self, conn):
+            # The default is evaluated in the method, which never sees the class attribute: the module's `shadowed`.
+            def run(query=shadowed):
+                return conn.execute(query).fetchall()
+
+            return run()
+
+
+    def values_marks(conn, row):
+        return conn.execute(f"INSERT INTO notes (author, body) VALUES ({', '.join('?' * len(row))})", row)
+
+
+    def values_marks_counted(conn, author, body):
+        return conn.execute(f"INSERT INTO notes (author, body) VALUES ({', '.join('?' * 2)})", (author, body))
+
+
+    def through_format_helper_values(conn, row):
+        return run_in(conn, "INSERT INTO notes (author, body) VALUES ({marks})", row)
+
+
+    def prose():
+        """Hermes runs CREATE TABLE sessions at its own start; this module never does."""
+
+
+    QUALIFIED_SCHEMA = "CREATE TABLE IF NOT EXISTS main.qualified (id TEXT PRIMARY KEY) -- not CREATE TABLE commented"
+    TEMP_SCHEMA = "CREATE TABLE temp.scratch_rows (id TEXT)"
     '''
 )
 
@@ -528,6 +557,9 @@ FIXTURE_DYNAMIC_BASELINE = textwrap.dedent(
     fixture_server.py run_rebound (dynamic) 1
     fixture_server.py through_nested_helper.newest (dynamic) 1
     fixture_server.py count_events (dynamic) 1
+    fixture_server.py Body.nested.run (dynamic) 1
+    fixture_server.py values_marks (dynamic) 1
+    fixture_server.py through_format_helper_values (dynamic) 1
     """
 )
 FIXTURE_BASELINE = FIXTURE_SCAN_BASELINE + FIXTURE_DYNAMIC_BASELINE
@@ -648,6 +680,15 @@ class FixtureTests(unittest.TestCase):
         # A statement in a class body reads the class body's names; a method does not see them.
         self.assertEqual(kinds[server + "Body"], [KIND_FINDING])
         self.assertEqual(kinds[server + "Body.method"], [KIND_OK])
+        # A helper nested in a method has its default evaluated in the method, which never sees the class body:
+        # the module's `shadowed` (the lookup), not the class attribute (the scan).
+        self.assertEqual(kinds[server + "Body.nested"], [KIND_OK])
+        self.assertEqual(kinds[server + "Body.nested.run"], [KIND_DYNAMIC])
+        # `"?" * n` stands for one `?` inside `IN (` only: a VALUES row built that way is dynamic, bare or through the
+        # formatting helper, and a literal count expands to that many marks.
+        self.assertEqual(kinds[server + "values_marks"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "values_marks_counted"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_format_helper_values"], [KIND_DYNAMIC])
         # A derived table the plan declares (CO-ROUTINE or MATERIALIZE) is no table under its alias either.
         self.assertEqual(kinds[server + "aliased_subquery"], [KIND_OK])
         self.assertEqual(kinds[server + "aliased_cte"], [KIND_OK])
@@ -722,12 +763,17 @@ class FixtureTests(unittest.TestCase):
     def test_concatenated_statement_keeps_the_constant_value(self) -> None:
         _write_fixture(self.root)
         statements, _, _, created = scan(self.root, FIXTURE_TARGETS)
-        # Every `CREATE TABLE` in a target's strings names a table of this repository's, with the DDL's site.
-        self.assertEqual(set(created), {"events", "data_volume_warning", "notes", "side"})
+        # Every `CREATE TABLE` in a target's DDL strings names a table of this repository's, with the DDL's site; a
+        # schema qualifier is not the name, a `temp.` table, a docstring that mentions one and a `--` comment are not read.
+        self.assertEqual(set(created), {"events", "data_volume_warning", "notes", "side", "qualified"})
         self.assertEqual(created["side"], "fixture_server.py:11")
         by_function = {s.function: s.sql for s in statements}
         self.assertEqual(by_function["in_marks"], "SELECT id FROM events WHERE cluster IN (?)")
         self.assertEqual(by_function["in_marks_list"], "SELECT id FROM events WHERE id IN (?)")
+        self.assertIsNone(by_function["values_marks"])
+        self.assertEqual(by_function["values_marks_counted"], "INSERT INTO notes (author, body) VALUES (?, ?)")
+        self.assertIsNone(by_function["through_format_helper_values"])
+        self.assertEqual(by_function["Body.nested"], "SELECT id FROM events WHERE id = ?")
         self.assertEqual(by_function["through_default"], "SELECT COUNT(*) FROM events")
         self.assertEqual(by_function["concatenated"], "SELECT id FROM events WHERE backlog = 1 AND created_at > ?")
         self.assertEqual(by_function["partial_literal"], "SELECT id FROM events WHERE reason = 'drift' AND object_uid = ?")
@@ -906,7 +952,7 @@ class FixtureTests(unittest.TestCase):
         (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
         code, out, err = _run(self.root, baseline)
         self.assertEqual(code, EXIT_OK, err)
-        self.assertIn("19 not readable, no full scan or unreadable statement beyond the 43 baseline entr(y/ies)", out)
+        self.assertIn("22 not readable, no full scan or unreadable statement beyond the 46 baseline entr(y/ies)", out)
 
     def test_old_sqlite_is_a_problem_not_a_pass(self) -> None:
         baseline = _write_fixture(self.root)
@@ -1013,6 +1059,8 @@ class FixtureTests(unittest.TestCase):
         code, _, err = _run(self.root, baseline)
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("fixture_server.py: the schema module does not import: RuntimeError: boom", err)
+        # A bare interpreter fails here on the server's third-party imports; the message names the remedy.
+        self.assertIn("(a bare interpreter needs the test imports: make test-python-deps)", err)
 
     def test_schema_module_missing_an_attribute_fails(self) -> None:
         baseline = _write_fixture(self.root)
@@ -1020,6 +1068,85 @@ class FixtureTests(unittest.TestCase):
         code, _, err = _run(self.root, baseline, schema=schema)
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("fixture_server.py: the schema module has no attribute no_such_init", err)
+
+    def test_alias_named_like_a_table_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        # The planner prints the alias, and the schema's names are tried first, so `SCAN data_volume_warning` would
+        # be placed as the bounded table while the statement walks `events`: the binding is refused instead.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def shadow_table_alias(conn):
+                return conn.execute("SELECT id FROM events AS data_volume_warning WHERE created_at > ?", ("x",)).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "shadow_table_alias: `SELECT id FROM events AS data_volume_warning WHERE created_at > ?` binds the alias "
+            "'data_volume_warning', the name of a table the schema defines, so a `SCAN data_volume_warning` line cannot "
+            "be placed; give it another alias",
+            err,
+        )
+        self.assertIn("shadow_table_alias error table=events", out)
+        self.assertNotIn("shadow_table_alias bounded", out)
+        self.assertNotIn("shadow_table_alias ok", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_owned_table_beside_a_foreign_one_is_a_problem_not_a_skip(self) -> None:
+        baseline = _write_fixture(self.root)
+        # The prepare stops at the foreign name, so the owned table's scan is never planned: a problem, not a skip.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def mixed(conn, cluster):
+                return conn.execute(
+                    "SELECT s.id FROM events e JOIN sessions s ON s.id = e.id WHERE e.cluster = ?", (cluster,)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "mixed: `SELECT s.id FROM events e JOIN sessions s ON s.id = e.id WHERE e.cluster = ?` names 'events', a "
+            "table the schema builds, beside 'sessions', a table another process owns, so the read of 'events' cannot "
+            "be planned here; split the statement, or build 'sessions' in the schema on purpose",
+            err,
+        )
+        self.assertIn("mixed error table=sessions plan=no such table: sessions", out)
+        self.assertNotIn("mixed skipped", out)
+        # The plain Hermes read beside it is still skipped.
+        self.assertIn("hermes skipped table=sessions", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_targets_sharing_a_file_name_are_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        (self.root / "other").mkdir()
+        (self.root / "other" / "fixture_helper.py").write_text(FIXTURE_HELPER, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, targets=FIXTURE_TARGETS + ("other/fixture_helper.py",))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "other/fixture_helper.py: a target with the same file name as fixture_helper.py is not read, since a sibling "
+            "constant names a module by its bare name; rename one or drop it from the targets",
+            err,
+        )
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_narrowed_run_leaves_entries_for_unread_targets_alone(self) -> None:
+        # A `--target` run reads one file; the baseline's entries for the configured targets it left out are out of
+        # scope, not stale, and only an entry for a file in neither set is reported.
+        baseline = _write_fixture(self.root, baseline=FIXTURE_BASELINE + "other.py unindexed events 1\n")
+        code, out, err = _run(self.root, baseline, targets=("fixture_helper.py",), configured=FIXTURE_TARGETS)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertNotIn("fixture_server.py is not a file this check reads", err)
+        self.assertIn("other.py is not a file this check reads; remove the entry", err)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+        baseline = _write_fixture(self.root)
+        code, out, err = _run(self.root, baseline, targets=("fixture_helper.py",), configured=FIXTURE_TARGETS)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("statement(s) read across 1 file(s)", out)
 
 
 class PlanLineTests(unittest.TestCase):
@@ -1065,6 +1192,21 @@ class PlanLineTests(unittest.TestCase):
             frozenset({"g", "a"}),
         )
         self.assertEqual(derived_names(["SEARCH events USING INDEX idx (created_at>?)"]), frozenset())
+
+    def test_comments_and_literals_are_not_read(self) -> None:
+        tables = frozenset({"events", "notes"})
+        # Blanking keeps the length, so offsets into the blanked text index the original.
+        sql = "SELECT id FROM events e -- from notes e\n WHERE body = 'from notes n' /* join notes x */ AND id = ?"
+        self.assertEqual(len(sql_text(sql)), len(sql))
+        self.assertEqual(sql_text("a = 'it''s' -- c\nb"), "a = " + " " * len("'it''s'") + " " + " " * len("-- c") + "\nb")
+        self.assertEqual(table_aliases(sql, tables), {"e": "events"})
+        self.assertEqual(statement_tables(sql, tables), frozenset({"events"}))
+        self.assertEqual(statement_tables("SELECT s.id FROM events e JOIN sessions s ON s.id = e.id", tables), frozenset({"events"}))
+        self.assertEqual(cte_names("SELECT 'x AS (' FROM events -- y AS (\n"), frozenset())
+        self.assertEqual(cte_names("WITH c AS (SELECT 1) SELECT * FROM c"), frozenset({"c"}))
+        # An `AS SELECT` in a column default or a comment is no query; one after the DDL is, sliced from the original.
+        self.assertIsNone(planned_text("CREATE TABLE t (a TEXT DEFAULT 'as select') -- as select\n"))
+        self.assertEqual(planned_text("CREATE TABLE t -- as with\n AS SELECT 'as with' FROM events"), "SELECT 'as with' FROM events")
 
     def test_partial_indexes(self) -> None:
         conn = sqlite3.connect(":memory:")

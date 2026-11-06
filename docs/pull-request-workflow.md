@@ -150,10 +150,14 @@ schema the server builds and fails a plan that reads a whole table this reposito
 grows with the fleet; a scan through a partial index passes as bounded only when the script's
 `BOUNDED_INDEXES` vouches for that index's `WHERE` as a bound (the pending drift backlog today).
 A statement handed to a helper that executes its parameter (`_ids_where_in`) is read at the call
-site, an `IN` list's `",".join("?" * n)` marks as one parameter. Statements on the Hermes tables the
-script's `FOREIGN_TABLES` lists are skipped; a statement on any other table the schema does not
-build, or on a table any target creates itself, fails the check until the table is built in the
-schema or listed there with its owner. The scans already in the tree, and the statements the check
+site, an `IN` list's `",".join("?" * n)` marks as one parameter (a `VALUES` row built that way is
+dynamic, since its count is the statement's shape). Statements on the Hermes tables the script's
+`FOREIGN_TABLES` lists are skipped; a statement on any other table the schema does not build fails
+the check until the table is built in the schema or listed there with its owner; a statement on a
+table any target creates itself fails until that table is built in the schema (a `FOREIGN_TABLES`
+entry for a created table is itself a problem); and a statement that names an owned table beside a
+Hermes one fails rather than skipping, since the owned read cannot be planned here. The scans
+already in the tree, and the statements the check
 cannot read statically (one `(dynamic)` entry per function), are pinned with a reason in
 `scripts/sqlite_query_plan_baseline.txt`: a rise against an entry fails, so a new scan or a new
 dynamic statement needs a baseline hunk the reviewer sees. CI runs the same check through
