@@ -503,8 +503,8 @@ The GitLab CE lane runs the forge table's `gitlab-ce` row: GitLab CE itself (`gi
 
 `ci-kube-agents-certification-1` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs the
 certification suite's first roster part (`hack/eval/certification-cases.txt`, `# part 1`) under
-`EVAL_TIER=certification`, weekly on Saturday 14:00 UTC and on Deck's Rerun, at three repetitions,
-on a leased pool project, with the nightlies' identity, decoration and log bucket
+`EVAL_TIER=certification`, weekly on Saturday 14:00 UTC and on Deck's Rerun, at 60 repetitions per
+case against the newest GA release's published images, on a leased pool project, with the nightlies' identity, decoration and log bucket
 (`gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-certification-1/`). The lane is the
 record behind the certified-capabilities page: the page reads its case files from that bucket, the
 tier appends nothing to the evidence store, and no case on it is on the blocking roster, so rung 4
