@@ -5341,7 +5341,8 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the usage poll (its four groups share three distinct selectors, every
 // usageCountersPollInterval), one per reconcile while the CR has plugins, and
 // three more per reconcile while the agent is not Ready — five of those where
-// the A2A stack renders. Each is namespace-scoped and label-selected
+// the A2A stack renders — and one per reconcile while the exec tier is short
+// of its count (credentialProxyExecUnschedulablePod). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
@@ -5702,8 +5703,8 @@ const (
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded
-// condition, which is not gated on the render.
+// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded and
+// CredentialProxyExecReady conditions, which are not gated on the render.
 func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||

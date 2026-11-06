@@ -283,9 +283,10 @@ shim always takes the fallback and nothing reports it.
   its limit to 2 CPU and, on Autopilot only, its requests to 2 CPU / 2 GiB.
   Decided (#4536): the request stays at 2 CPU, equal to the limit. A lower request would let more
   node pools schedule the tier, but a replica could then be throttled under the load §8.4 sizes
-  it for. A small node pool shows the cost instead: each replica needs a node with 2 free CPU, the
-  shell sandbox restarts when the tier turns on and needs room too, and the operator reports a
-  replica that does not schedule in the `CredentialProxyExecReady` condition.
+  it for. A small node pool shows the cost instead: each replica needs a node with 2 free CPU, and
+  the operator reports a replica that does not schedule in the `CredentialProxyExecReady`
+  condition. Once callers are given the tier's URL (§9), the shell sandbox also restarts when the
+  tier turns on, and needs room on the node pool too.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
   only under the cluster-view flag (the condition the stateful broker has today), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a

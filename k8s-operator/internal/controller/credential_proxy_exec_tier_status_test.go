@@ -100,7 +100,7 @@ func TestAReplicaTheSchedulerCannotPlaceIsNamedWithItsReason(t *testing.T) {
 	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != credentialProxyExecUnschedulableReason {
 		t.Fatalf("condition = %+v", c)
 	}
-	for _, want := range []string{"1 of 2", "exec-b", why, "2 CPU", "shell sandbox"} {
+	for _, want := range []string{"1 of 2", "exec-b", why, "2 CPU"} {
 		if !strings.Contains(c.Message, want) {
 			t.Errorf("message %q does not name %q", c.Message, want)
 		}
