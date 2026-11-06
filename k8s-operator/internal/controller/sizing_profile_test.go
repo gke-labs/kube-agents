@@ -2477,3 +2477,58 @@ func TestSizingPodFigures(t *testing.T) {
 		t.Errorf("pod memory request with no template = %s, want 384Mi", got.String())
 	}
 }
+
+// TestSizingPodFiguresLeavesTheTemplateAlone reads a template whose
+// restartable sidecar runs before a plain init container twice, as the gate
+// does once per candidate tier and per Pod-type item: the second read is the
+// first, the template's own limits map is as it was, and a plain init
+// container that sets no limits (a nil map) is summed rather than written
+// into.
+func TestSizingPodFiguresLeavesTheTemplateAlone(t *testing.T) {
+	t.Parallel()
+	mem := func(request, limit string) corev1.ResourceRequirements {
+		rr := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+		if request != "" {
+			rr.Requests[corev1.ResourceMemory] = resource.MustParse(request)
+		}
+		if limit != "" {
+			rr.Limits[corev1.ResourceMemory] = resource.MustParse(limit)
+		}
+		return rr
+	}
+	sidecarFirst := corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{Name: agentAPIAuthContainerName, Resources: mem("384Mi", "2Gi"), RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways)},
+			{Name: "setup", Resources: mem("1Gi", "3Gi")},
+		},
+		Containers: []corev1.Container{
+			{Name: platformAgentContainerName, Resources: mem("", "1Gi")},
+		},
+	}}
+	// The swapped-in 8Gi and the agent's 1Gi sum to 9Gi; the setup
+	// container's 3Gi with the sidecar's 8Gi before it floors the pod at
+	// 11Gi. A sum written into the setup container's map would read 19Gi
+	// the second time.
+	_, first := sizingPodFigures(sidecarFirst, agentAPIAuthContainerName, mem("384Mi", "8Gi"), false)
+	_, second := sizingPodFigures(sidecarFirst, agentAPIAuthContainerName, mem("384Mi", "8Gi"), false)
+	if got := first[corev1.ResourceMemory]; got.Cmp(resource.MustParse("11Gi")) != 0 {
+		t.Errorf("pod memory limit = %s, want 11Gi", got.String())
+	}
+	if got, want := second[corev1.ResourceMemory], first[corev1.ResourceMemory]; got.Cmp(want) != 0 {
+		t.Errorf("pod memory limit on the second read = %s, want the first read's %s", got.String(), want.String())
+	}
+	if got := sidecarFirst.Spec.InitContainers[1].Resources.Limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("3Gi")) != 0 {
+		t.Errorf("setup container's limit after two reads = %s, want 3Gi as written", got.String())
+	}
+	// No limits on the plain init container: a nil map, which the sum
+	// must not write into; the pod's 9Gi stands above its 8Gi floor.
+	noLimits := sidecarFirst.DeepCopy()
+	noLimits.Spec.InitContainers[1].Resources = corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}}
+	_, limits := sizingPodFigures(*noLimits, agentAPIAuthContainerName, mem("384Mi", "8Gi"), false)
+	if got := limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("9Gi")) != 0 {
+		t.Errorf("pod memory limit with an unlimited init container = %s, want 9Gi", got.String())
+	}
+	if noLimits.Spec.InitContainers[1].Resources.Limits != nil {
+		t.Errorf("unlimited init container's limits after the read = %v, want nil as written", noLimits.Spec.InitContainers[1].Resources.Limits)
+	}
+}

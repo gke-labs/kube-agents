@@ -1462,11 +1462,14 @@ a served CRD that predates them.
 `effectiveSizingTier` is the tier the operator last rendered the three sized containers at,
 `small`, `medium` or `fleet`, written before the render on every pass that reaches it, whatever
 status the pass ends on. Under [`spec.deployment.sizingProfile`](#specdeployment) `auto` it is also
-the latch the tier only rises from; under an explicit profile it repeats that profile. Under a
-served CRD that predates the field, the five-minute rule above applies. The operator notices the
-pruning from the write's echo, and writes and logs the tier once per interval rather than on every
-pass. It renders `auto` at `small`, since the latch cannot be stored, and lands the field with the
-first probe after this release's CRD is applied.
+the latch: the tier rises from it with the cluster count. It is stepped back one tier when
+admission refuses the pod a step recreated, and the `SizingCappedByQuota` condition then names the
+quota. Under an explicit profile it repeats that profile.
+
+Under a served CRD that predates the field, the five-minute rule above applies. The operator
+notices the pruning from the write's echo, and writes and logs the tier once per interval rather
+than on every pass. It renders `auto` at `small`, since the latch cannot be stored, and lands the
+field with the first probe after this release's CRD is applied.
 
 These condition types appear in `conditions`; only `Ready` is always present:
 

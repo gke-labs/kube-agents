@@ -1315,8 +1315,16 @@ func sizingPodFigures(template corev1.PodTemplateSpec, name string, rendered cor
 			floor(initLimits, restartableLimits)
 			continue
 		}
-		add(req, restartableRequests)
+		// lim is the template's own map when not clamped (clampedLimits
+		// hands limits back as given, nil when the container sets none),
+		// so the sum goes into a fresh map: the template is read once per
+		// candidate tier and per Pod-type item, and a sum written into it
+		// would be read again by the next call.
+		own := lim
+		lim = corev1.ResourceList{}
+		add(lim, own)
 		add(lim, restartableLimits)
+		add(req, restartableRequests)
 		floor(initRequests, req)
 		floor(initLimits, lim)
 	}

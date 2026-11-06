@@ -928,8 +928,9 @@ predates the field.
 the `agent-api-auth` sidecar and the shell container start from, forwarded to the
 CR's `spec.deployment.sizingProfile` when set: `small` (the operator's defaults,
 and what an unset value means), `medium`, `fleet`, or `auto`, which steps the
-tier up with the cluster count the operator polls and never down, holding a step
-the namespace's ResourceQuota has no room for. The
+tier up with the cluster count the operator polls, holding a step the
+namespace's ResourceQuota has no room for, and steps it back one tier when
+admission refuses the pod a step recreated; a count that falls never lowers it. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
 has each row's figures and the auto rules. The three per-key overrides (the two
 above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are

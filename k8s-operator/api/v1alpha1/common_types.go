@@ -2570,9 +2570,12 @@ type AgentStatus struct {
 	// EffectiveSizingTier is the sizing tier the operator last rendered the
 	// credential proxy, the agent-api-auth sidecar and the shell container at:
 	// "small", "medium" or "fleet". Under spec.deployment.sizingProfile "auto"
-	// it is also the latch: the tier only ever rises from the value here, and
-	// a recreated CR starts again at small. Under an explicit profile it
-	// repeats that profile. Absent before the first pass that resolved it.
+	// it is also the latch: the tier rises from the value here with the
+	// cluster count, is stepped back one tier when admission refuses the pod
+	// a step recreated (the SizingCappedByQuota condition beside it says
+	// which quota), and a recreated CR starts again at small. Under an
+	// explicit profile it repeats that profile. Absent before the first pass
+	// that resolved it.
 	// +optional
 	EffectiveSizingTier string `json:"effectiveSizingTier,omitempty"`
 

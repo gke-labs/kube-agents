@@ -1393,10 +1393,11 @@ platformAgent:
     # container start from, forwarded to the CR as spec.deployment.sizingProfile
     # when set: small (the operator's defaults, and what an unset value means),
     # medium, fleet, or auto, which steps the tier up as the fleet the operator
-    # counts grows, never down, from the tier the CR's status last recorded,
-    # holding a step the namespace's ResourceQuota has no room for or a
-    # LimitRange bound refuses and saying so in the CR's SizingCappedByQuota
-    # condition. The three
+    # counts grows, from the tier the CR's status last recorded (a count that
+    # falls never lowers it), holding a step the namespace's ResourceQuota has
+    # no room for or a LimitRange bound refuses, stepping back one tier when
+    # admission refuses the pod a step recreated, and saying so in the CR's
+    # SizingCappedByQuota condition. The three
     # resources overrides above and in harness.experimental.shellSandbox are
     # applied per key over the preset, so an explicit key always wins. The
     # quota preflight counts medium and fleet at their rows and auto at the
