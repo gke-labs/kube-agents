@@ -290,6 +290,16 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Its stack is not written: it plants a node pool and a cluster-scoped
+    # ComputeClass with auto-creation off on a Standard cluster, which the
+    # lane's Autopilot hosts refuse, and it needs the teardown sweep for
+    # cluster-scoped plants first. #4943 is the sibling ComputeClass gap on
+    # the same host constraint; the fixture issue is filed with the fixture.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#4943 is the sibling gap; the stack needs a Standard cluster with manual node "
+        "pools under a ComputeClass whose auto-creation is off, and the lane's host "
+        "clusters are Autopilot; the fixture issue is filed with the fixture"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
