@@ -34,6 +34,10 @@ const (
 	// as busy is re-offered after the pause until the bound runs out.
 	reofferPause = 50 * time.Millisecond
 	reofferBound = 5 * time.Second
+	// busyWindowHold is how long TestEachTaskGetsItsOwnConfigAndAFreshHarness
+	// holds the first after-task reset, so the second offer is declined as
+	// busy and re-offered on every run.
+	busyWindowHold = 500 * time.Millisecond
 )
 
 // fakeDispatcher is the dispatcher's side of the hand-off: it offers,
@@ -681,15 +685,34 @@ echo "$CLAUDE_CONFIG_DIR $*" >> %s/runs
 echo '{"type":"result","subtype":"success","result":"ok"}'
 `, root))
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
 	ln, addr := readyListener(t)
+	// The first after-task reset is held, so task-two's offer lands while
+	// the worker still holds task-one and is declined as busy on every run,
+	// not only on a loaded runner: the re-offer is what the test exercises.
+	var slowOnce sync.Once
+	configRoot, resetDir := t.TempDir(), t.TempDir()
+	done := make(chan error, 1)
 	go func() {
-		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
+		done <- RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
 			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
-			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
+			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: configRoot,
+			ResetPaths: []string{resetDir},
+			resetHook: func(phase string) {
+				if phase == "after-task" {
+					slowOnce.Do(func() { time.Sleep(busyWindowHold) })
+				}
+			},
 		})
 	}()
+	// Registered after the temp dirs, so it runs before they are removed:
+	// task-two's after-task reset may still be reading resetDir.
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("the worker ended with an error: %v", err)
+		}
+	})
 	waitReady(t, addr)
 	for _, task := range []string{"task-one", "task-two"} {
 		d.offerAccepted(task, profileSubmission(t, task, "go", nil), 5)
