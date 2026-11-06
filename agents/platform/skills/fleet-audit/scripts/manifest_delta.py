@@ -83,6 +83,13 @@ VOLATILE_COMMAND_KEYS = frozenset({"command", "duration_s", "output_sha256"})
 # route and triage fields), and `finish` adopts the fresh manifest's excerpt
 # and authoritative impact on a close, so the ledger shows today's text.
 VOLATILE_CANDIDATE_KEYS = frozenset({"excerpt", "impact"})
+# Except the impact a collector marks authoritative: on a check with more than
+# one arm that sentence reports which arm fired (`adopt_arm_impact` in
+# audit_report), and on some of those checks it is the only key that does, so
+# an object that moved arm would otherwise digest the same and be closed with
+# the previous arm's title and remediation under this arm's impact.
+IMPACT_KEY = "impact"
+IMPACT_AUTHORITATIVE_KEY = "impact_authoritative"
 CANDIDATES_KEY = "candidates"
 COMMANDS_KEY = "commands"
 CLUSTERS_KEY = "clusters"
@@ -116,6 +123,13 @@ def _normalized_commands(commands: object) -> list:
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
 
 
+def _volatile_candidate_keys(candidate: dict) -> frozenset[str]:
+    """The keys of `candidate` that do not count: its prose, less an impact that names the arm."""
+    if candidate.get(IMPACT_AUTHORITATIVE_KEY) is True:
+        return VOLATILE_CANDIDATE_KEYS - {IMPACT_KEY}
+    return VOLATILE_CANDIDATE_KEYS
+
+
 def _normalized_candidates(candidates: object) -> list:
     """Each candidate without its prose keys, sorted so order does not count."""
     if not isinstance(candidates, list):
@@ -123,7 +137,8 @@ def _normalized_candidates(candidates: object) -> list:
     rows = []
     for candidate in candidates:
         if isinstance(candidate, dict):
-            rows.append({k: v for k, v in candidate.items() if k not in VOLATILE_CANDIDATE_KEYS})
+            volatile = _volatile_candidate_keys(candidate)
+            rows.append({k: v for k, v in candidate.items() if k not in volatile})
         else:
             rows.append(candidate)
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
@@ -172,9 +187,10 @@ def manifest_digest(manifest: dict) -> str:
     Two manifests of an unchanged fleet digest the same whatever their
     timestamps, command durations, output hashes, command strings, candidate
     excerpts and impacts, and cluster, command or candidate order; a candidate
-    added or removed, a severity, an outcome, a limitation, a
-    `checks_not_applicable` or `checks_unevaluated` entry, or a new
-    `checks_revision` digests differently.
+    added or removed, a severity, an impact the collector marked
+    authoritative, an outcome, a limitation, a `checks_not_applicable` or
+    `checks_unevaluated` entry, or a new `checks_revision` digests
+    differently.
     """
     canonical = json.dumps(normalized_manifest(manifest), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.new(DIGEST_ALGORITHM, canonical.encode("utf-8")).hexdigest()
