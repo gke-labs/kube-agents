@@ -1056,6 +1056,35 @@ class PreflightDecisionTest(unittest.TestCase):
                {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
         self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
 
+    def _mcp_server_delta(self, env: list) -> dict:
+        base = self._requirements(["platformAgent.mode=next"])
+        req = self._requirements(["platformAgent.mode=next"],
+                                 values={"operator": {"mcpServer": {"enabled": True}, "extraEnv": env}})
+        return {key: req[key] - base[key] for key in base}
+
+    def test_mode_next_counts_the_mcp_server_when_operator_mcp_server_enabled_is_true(self) -> None:
+        """operator.mcpServer.enabled sets A2A_MCP_DOOR=true, so the count follows it, and an
+        extraEnv entry that does not turn the flag off leaves it counted."""
+        mcp = self._flagged()["mcp"]
+        for name, env in (
+            ("the value alone", []),
+            ("beside extraEnv true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
+            ("beside an unrelated extraEnv entry", [{"name": "GOMEMLIMIT", "value": "100MiB"}]),
+        ):
+            with self.subTest(name):
+                self._assert_counts(self._mcp_server_delta(env), mcp)
+        self.assertEqual(self._requirements(values={"operator": {"mcpServer": {"enabled": True}}}),
+                         self._requirements(), "under today the operator renders no MCP server")
+
+    def test_an_extra_env_false_turns_off_the_mcp_server_the_value_turned_on(self) -> None:
+        """extraEnv is rendered after the value and wins, in the Deployment and in the count."""
+        for name, env in (
+            ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
+            ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(set(self._mcp_server_delta(env).values()), {0})
+
     def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
         bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]

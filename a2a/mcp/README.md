@@ -6,7 +6,7 @@ It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `
 
 ## Turn it on
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's. With it set, the operator renders, beside the console server:
+The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;

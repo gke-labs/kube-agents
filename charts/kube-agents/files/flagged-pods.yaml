@@ -1,7 +1,8 @@
 # Standing pods the operator renders into the release namespace only while an
 # operator env flag is on, under platformAgent.mode: next. No golden sets those
 # flags, so footprint.yaml has no entry for them, and the quota preflight adds
-# each one here when operator.extraEnv sets its flag.
+# each one here when its flag is set: by operator.extraEnv, or for the MCP
+# server by operator.mcpServer.enabled.
 #
 # Hand-kept, and held to the operator by TestTheChartCountsEveryFlaggedPod
 # (k8s-operator/internal/controller): every workload in the operator's
