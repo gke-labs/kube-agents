@@ -58,7 +58,7 @@ logger = logging.getLogger("session_kv_server")
 # `spec.deployment.env` (the operator renders them on the container). The PVC
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
-_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
+_OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS")
 # The home channel a today-era `/sethome` or first chat mirrored into that
 # `.env` (Hermes' persist_home_channel). Under `next` with the operator's
 # projection mounted, the projected file is the channel the gateway posts
@@ -395,6 +395,45 @@ TRIAGE_NOTICE_BY_SOURCE = {
 INCIDENT_TRIAGE_OPEN_PR_ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
 # The value the operator writes. Anything else, unset included, is off.
 INCIDENT_TRIAGE_OPEN_PR_ON = "true"
+# The most triage pull requests open or being opened at once, with the opt-in
+# above on. At the limit a triage still runs, but the front door gets the
+# default query, whose report asks for an `apply`, and the alert's thread gets
+# TRIAGE_PR_CAP_NOTE. Set like the opt-in (chart:
+# `platformAgent.deployment.incidentMaxOpenPullRequests`). 0, unset, negative or not a
+# number is no limit. Read per call, so a test can change it.
+INCIDENT_TRIAGE_MAX_OPEN_PR_ENV = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
+# A triage pull request is one whose source branch starts with
+# INCIDENT_PR_BRANCH_PREFIX. Counted with the forge's open list, a page of
+# TRIAGE_PR_LIST_PAGE_SIZE at a time, up to TRIAGE_PR_LIST_MAX_PAGES pages per
+# managed repository, within TRIAGE_PR_COUNT_TIMEOUT_S for the whole count.
+TRIAGE_PR_LIST_PAGE_SIZE = 100
+TRIAGE_PR_LIST_MAX_PAGES = 10
+TRIAGE_PR_COUNT_TIMEOUT_S = 10.0
+# A branch a triage was routed to open counts from the routing on, before its
+# pull request exists: a node failure breaks many pods at once, and their
+# diagnoses finish minutes later. One reservation per triage and branch. It
+# ends when the branch shows an open pull request (counted as open from then),
+# when the triage's pull-request card (title TRIAGE_PR_CARD_TITLE_PREFIX) is
+# done or archived, when the triage does not start, or after
+# TRIAGE_PR_RESERVATION_MAX_S: for a card never filed, and for a card blocked,
+# or held behind a blocked triage card, that long.
+TRIAGE_PR_RESERVATION_MAX_S = 86400
+TRIAGE_PR_CARD_TITLE_PREFIX = "Open GitOps PR for "
+TRIAGE_PR_CARD_SETTLED_STATUSES = ("done", "archived")
+# When the open list cannot be read (a forge error, the timeout, more pages
+# than TRIAGE_PR_LIST_MAX_PAGES), the count is unknown. True treats it as at
+# the limit: a limit a forge outage could lift does not hold in an outage, and
+# a human can still `apply`.
+TRIAGE_PR_UNCOUNTED_AT_LIMIT = True
+# Posted in the alert's thread when the limit holds a triage's pull request back.
+TRIAGE_PR_CAP_NOTE = (
+    "ℹ️ **No automatic Pull Request for this incident.** This install already has {count} triage Pull Requests "
+    "open or being opened, and its limit is {limit}. The triage report proposes the fix and says how to open it."
+)
+TRIAGE_PR_UNCOUNTED_NOTE = (
+    "ℹ️ **No automatic Pull Request for this incident.** The open triage Pull Requests could not be counted "
+    "against this install's limit of {limit}. The triage report proposes the fix and says how to open it."
+)
 # The profile that holds the GitOps write path. The triage card goes to a
 # Cluster Agent, whose persona forbids `submit-suggestion`, so the pull request
 # is a second card for this profile, queued behind the triage card.
@@ -1661,6 +1700,29 @@ def init_db() -> None:
                     PRIMARY KEY (profile, job_id)
                 )
                 """
+            )
+            # The branches triages were routed to open a pull request on, which
+            # count against INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS until their
+            # pull request is open or their card settles (_claim_triage_pull_request).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS triage_pr_reservations (
+                    branch      TEXT NOT NULL,
+                    session_id  TEXT NOT NULL,
+                    reserved_at REAL NOT NULL,
+                    PRIMARY KEY (branch, session_id)
+                )
+                """
+            )
+            # A reservation is written before its triage starts, and a process
+            # that died in between leaves it with no turn behind it and nothing
+            # else to release it, as the fold anchors below. A triage that
+            # started keeps its reservation: its card may still open the pull
+            # request.
+            conn.execute(
+                "DELETE FROM triage_pr_reservations WHERE session_id NOT IN "
+                "(SELECT session_id FROM intercepted_events WHERE triage_state = ?)",
+                (TRIAGE_STATE_STARTED,),
             )
             # The origin each cron job id was created or last changed under,
             # written from trusted context by the `cronjob` tool's handler
@@ -3349,6 +3411,215 @@ def _incident_triage_opens_pull_request() -> bool:
     return os.environ.get(INCIDENT_TRIAGE_OPEN_PR_ENV, "").strip().lower() == INCIDENT_TRIAGE_OPEN_PR_ON
 
 
+def _incident_triage_pull_request_limit() -> int:
+    """INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, or 0 for no limit."""
+    return _alert_daily_limit(INCIDENT_TRIAGE_MAX_OPEN_PR_ENV, 0)
+
+
+# Held from the count to the reservation, so triages that start together
+# (TRIAGE_START_WORKERS) count each other.
+_TRIAGE_PR_CLAIM_LOCK = threading.Lock()
+# The forge count's thread, at most one at a time: a count abandoned at its
+# deadline keeps its thread until the forge answers, and a count that finds one
+# still running is uncounted rather than starting another.
+_TRIAGE_PR_COUNT_THREAD: Optional[threading.Thread] = None
+_TRIAGE_PR_COUNT_THREAD_LOCK = threading.Lock()
+
+
+def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
+    """The source branches of the open triage pull requests in the managed repositories, or None when unknown.
+
+    Unknown is any forge error, no answer within ``timeout``, a repository
+    with more than TRIAGE_PR_LIST_MAX_PAGES pages of open proposals, or an
+    earlier count still waiting on the forge. Read on a daemon thread, so a
+    forge call past the timeout is abandoned rather than waited on, and only
+    one such thread runs at a time (_TRIAGE_PR_COUNT_THREAD).
+    """
+    global _TRIAGE_PR_COUNT_THREAD
+    answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def _list() -> None:
+        try:
+            import forge
+
+            branches: Set[str] = set()
+            for repo in gitops_workspace.get_managed_repos():
+                # A fork's proposal names its own repository in `sourceRepo`;
+                # only a branch on this repository is the install's.
+                here = "/".join(repo.casefold().split("/")[-2:])
+                for page in range(1, TRIAGE_PR_LIST_MAX_PAGES + 1):
+                    listing = forge.call(
+                        "proposal-list",
+                        {"state": PROPOSAL_OPEN_STATE, "limit": TRIAGE_PR_LIST_PAGE_SIZE, "page": page},
+                        repo,
+                        retry_transient=True,
+                    )
+                    for proposal in listing.get("proposals") or []:
+                        if not isinstance(proposal, dict):
+                            continue
+                        source = proposal.get("source")
+                        source_repo = str(proposal.get("sourceRepo") or "").casefold()
+                        if source_repo and "/".join(source_repo.split("/")[-2:]) != here:
+                            continue
+                        if isinstance(source, str) and source.startswith(INCIDENT_PR_BRANCH_PREFIX):
+                            branches.add(source)
+                    if not listing.get("truncated"):
+                        break
+                else:
+                    raise RuntimeError(f"{repo} has more than {TRIAGE_PR_LIST_MAX_PAGES} pages of open proposals")
+            answer.put((True, branches))
+        except Exception as exc:
+            answer.put((False, exc))
+
+    with _TRIAGE_PR_COUNT_THREAD_LOCK:
+        if _TRIAGE_PR_COUNT_THREAD is not None and _TRIAGE_PR_COUNT_THREAD.is_alive():
+            logger.warning("Could not count the open triage pull requests: an earlier count is still waiting on the forge")
+            return None
+        _TRIAGE_PR_COUNT_THREAD = threading.Thread(target=_list, name="triage-pr-count", daemon=True)
+        _TRIAGE_PR_COUNT_THREAD.start()
+    try:
+        ok, result = answer.get(timeout=timeout)
+    except queue.Empty:
+        logger.warning(f"Could not count the open triage pull requests within {timeout:.1f}s")
+        return None
+    if not ok:
+        logger.warning(f"Could not count the open triage pull requests: {result!r}")
+        return None
+    return result
+
+
+def _settled_triage_pull_request_sessions(session_ids: Sequence[str], listed_at: float) -> Set[str]:
+    """Those of ``session_ids`` whose pull-request card is done or archived, and
+    opened no pull request after ``listed_at``, when the forge list was read.
+
+    A card that opened one after that read keeps its reservation: the read did
+    not see the pull request, so the reservation is what still counts it.
+    Best-effort: a board that cannot be read settles none, so their
+    reservations hold until the backstop.
+    """
+    if not session_ids:
+        return set()
+    marks = ",".join("?" * len(session_ids))
+    statuses = ",".join("?" * len(TRIAGE_PR_CARD_SETTLED_STATUSES))
+    try:
+        with closing(_read_only(_kanban_db_path())) as conn:
+            rows = conn.execute(
+                f"SELECT DISTINCT t.session_id FROM tasks t WHERE t.session_id IN ({marks}) "
+                f"AND t.assignee = ? AND t.title LIKE ? AND t.status IN ({statuses}) "
+                "AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = t.id AND e.kind = ? AND e.created_at >= ?)",
+                (
+                    *session_ids,
+                    INCIDENT_PR_ASSIGNEE,
+                    f"{TRIAGE_PR_CARD_TITLE_PREFIX}%",
+                    *TRIAGE_PR_CARD_SETTLED_STATUSES,
+                    PR_OPENED_EVENT_KIND,
+                    listed_at,
+                ),
+            ).fetchall()
+    except Exception as exc:
+        logger.warning(f"Could not read the board for the triage pull-request cards: {exc!r}")
+        return set()
+    return {row[0] for row in rows}
+
+
+def _claim_triage_pull_request(session_id: str, payload: Dict[str, Any], limit: int) -> Optional[str]:
+    """Reserve the incident's branch against ``limit``; None when reserved, else the note for its thread.
+
+    The count is the branches with an open triage pull request plus the
+    branches reserved and not yet released (TRIAGE_PR_RESERVATION_MAX_S says
+    when a reservation ends). An incident whose branch is already among them
+    adds nothing, because its card revises that pull request, so it is always
+    reserved.
+    """
+    branch = _incident_branch(session_id, payload)
+    # Read before the lock, so a slow forge does not hold the other starts.
+    # A pull request that opens after this read is still counted, through
+    # the reservation that routed it (_settled_triage_pull_request_sessions).
+    listed_at = time.time()
+    open_branches = _open_triage_pull_request_branches(TRIAGE_PR_COUNT_TIMEOUT_S)
+    if open_branches is None and TRIAGE_PR_UNCOUNTED_AT_LIMIT:
+        logger.warning(f"Triage {session_id} files no pull-request card: the open triage pull requests could not be counted")
+        return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
+    with _TRIAGE_PR_CLAIM_LOCK:
+        try:
+            with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
+                now = time.time()
+                rows = conn.execute("SELECT branch, session_id, reserved_at FROM triage_pr_reservations").fetchall()
+                settled = _settled_triage_pull_request_sessions([row[1] for row in rows], listed_at)
+                released = [
+                    (row[0], row[1])
+                    for row in rows
+                    if (open_branches is not None and row[0] in open_branches)
+                    or row[1] in settled
+                    or now - float(row[2]) >= TRIAGE_PR_RESERVATION_MAX_S
+                ]
+                conn.executemany("DELETE FROM triage_pr_reservations WHERE branch = ? AND session_id = ?", released)
+                counted = set(open_branches or ()) | {row[0] for row in rows if (row[0], row[1]) not in released}
+                if branch not in counted and len(counted) >= limit:
+                    conn.commit()
+                    logger.info(
+                        f"Triage {session_id} files no pull-request card: {len(counted)} triage pull requests "
+                        f"open or reserved, limit {limit}"
+                    )
+                    return TRIAGE_PR_CAP_NOTE.format(count=len(counted), limit=limit)
+                conn.execute(
+                    "INSERT INTO triage_pr_reservations (branch, session_id, reserved_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(branch, session_id) DO UPDATE SET reserved_at = excluded.reserved_at",
+                    (branch, session_id, now),
+                )
+                conn.commit()
+        except Exception as exc:
+            # The ledger is the daemon's own; a write it refuses is reported and
+            # read as the uncounted case.
+            logger.error(f"Could not reserve {branch} for triage {session_id}: {exc!r}")
+            if TRIAGE_PR_UNCOUNTED_AT_LIMIT:
+                return TRIAGE_PR_UNCOUNTED_NOTE.format(limit=limit)
+    return None
+
+
+def _release_triage_pull_request(session_id: str) -> None:
+    """Drop the session's reservations; for a triage that did not start. Best-effort."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
+            conn.execute("DELETE FROM triage_pr_reservations WHERE session_id = ?", (session_id,))
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"Could not release triage {session_id}'s pull-request reservation: {exc!r}")
+
+
+def _triage_pull_request_decision(start: _TriageStart) -> tuple[Optional[bool], Optional[str]]:
+    """``open_pull_request`` for _build_agent_query, and the note to post once the turn starts.
+
+    (None, None) unless this is an event triage on an install that opens the
+    pull request with a limit set: _build_agent_query then decides as before.
+    """
+    if start.payload.get("kind") in (INJECT_KIND_DRIFT, INJECT_KIND_STALL) or not _incident_triage_opens_pull_request():
+        return None, None
+    limit = _incident_triage_pull_request_limit()
+    if limit <= 0:
+        return None, None
+    note = _claim_triage_pull_request(start.session_id, start.payload, limit)
+    return note is None, note
+
+
+def _post_triage_pull_request_note(start: _TriageStart, note: str) -> None:
+    """Post ``note`` where _triage_not_started posts its notice: in the alert's
+    thread, or with no thread under the alert's first line, quoted. With no
+    chat platform, log it."""
+    notice = start.notice
+    if notice is None:
+        logger.info(f"Triage {start.session_id} has no chat for its pull-request limit note: {note}")
+        return
+    if notice.thread_id:
+        chat_id = _thread_chat_id(notice.platform, notice.thread_id)
+        sent = _send_to_chat(notice.platform, note, chat_id, notice.thread_id)
+    else:
+        quoted = notice.alert.splitlines()[0] if notice.alert else ""
+        sent = _send_to_chat(notice.platform, f"{note}\n> {quoted}" if quoted else note)
+    if not sent:
+        logger.error(f"Pull-request limit note for {start.session_id} was not delivered to '{notice.platform}'")
+
+
 def _incident_branch_workload(kind: str, raw_name: str) -> str:
     """The workload name an incident's pull-request branch is keyed on.
 
@@ -3460,7 +3731,7 @@ def _triage_pr_task_body(payload: Dict[str, Any], session_id: str) -> str:
     )
 
 
-def _build_agent_query(payload: Dict[str, Any], session_id: str = "") -> str:
+def _build_agent_query(payload: Dict[str, Any], session_id: str = "", open_pull_request: Optional[bool] = None) -> str:
     """The turn sent to the gateway, which is always the Planning Agent's.
 
     `_create_gateway_session` cannot choose a profile, so the reader is the
@@ -3497,13 +3768,15 @@ def _build_agent_query(payload: Dict[str, Any], session_id: str = "") -> str:
     An install that set INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true takes
     `_build_agent_query_with_pull_request`, which files the same triage card
     and a second one that opens the pull request. The text below is the
-    default and stays as it was.
+    default and stays as it was. ``open_pull_request``, when given, replaces
+    that setting: False is how the open pull-request limit
+    (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS) sends a triage the default.
     """
     if payload.get("kind") == INJECT_KIND_DRIFT:
         return _drift_agent_query(payload)
     if payload.get("kind") == INJECT_KIND_STALL:
         return _stall_agent_query(payload)
-    if _incident_triage_opens_pull_request():
+    if _incident_triage_opens_pull_request() if open_pull_request is None else open_pull_request:
         return _build_agent_query_with_pull_request(payload, session_id)
 
     event_reason = payload.get("reason") or "Unknown"
@@ -4388,7 +4661,8 @@ def _attempt_triage_start(start: _TriageStart) -> None:
     api_url = os.environ.get("PLATFORM_API_URL", PLATFORM_API_URL_DEFAULT)
     # The session lands on the default profile — the front door — which
     # delegates it to the failing cluster's own agent; see _build_agent_query.
-    agent_query = _build_agent_query(start.payload, session_id)
+    open_pull_request, limit_note = _triage_pull_request_decision(start)
+    agent_query = _build_agent_query(start.payload, session_id, open_pull_request=open_pull_request)
     need_session = True
     recreated = False
     answered = 0
@@ -4409,6 +4683,8 @@ def _attempt_triage_start(start: _TriageStart) -> None:
                 # running, so it is neither retried nor reported as not started.
                 mark_triage_state(start.event_row_id, TRIAGE_STATE_STARTED)
                 logger.info(f"TRIAGE_STARTED session={session_id} answer={attempt.outcome} {attempt.detail}".rstrip())
+                if limit_note:
+                    _post_triage_pull_request_note(start, limit_note)
                 return
             if attempt.detail == GATEWAY_SESSION_LOST:
                 if recreated:
@@ -4451,6 +4727,7 @@ def _triage_not_started(start: _TriageStart, reason: str) -> None:
     mark_triage_state(start.event_row_id, TRIAGE_STATE_ABORTED)
     # Nobody is working on this alert now: let the next sibling start a triage.
     mark_triage_not_started(start.event_row_id)
+    _release_triage_pull_request(start.session_id)
     notice = start.notice
     if notice is None:
         return
