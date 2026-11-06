@@ -21,8 +21,8 @@ This document settles how the operator turns the other series into the status fi
 that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
 rule that admits the operator's pods and nothing else new, accumulates per-pod deltas into
 totals it keeps beside their baseline in a ConfigMap, so the counters stay monotonic across pod,
-process and operator restarts, and patches the status at most once per interval, only when the
-status is behind. `toolExecutionsTotal`, `toolExecutionsBlockedTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`,
+process and operator restarts, and patches the status at most once per interval per projection
+(the counters, the data volume, the scope condition), each only when the status is behind. `toolExecutionsTotal`, `toolExecutionsBlockedTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`,
 `chatMessagesInboundTotal`, `sessionsTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `lastActiveTime` and `lastHumanActiveTime` land this way, the proposals counter from the
 broker's version-control series, and `clustersRegistered` and `clustersMonitored` ride the same
 poll as gauges: the watcher's `k8s_event_watcher_cluster_up` series counted and projected as the

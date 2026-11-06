@@ -176,15 +176,68 @@ func TestScopeUndeclared_HostOnlyWritesNothing(t *testing.T) {
 	}
 }
 
-// Without the host's name on the CR the operator cannot tell a neighbour from
-// the host, so it says nothing rather than naming the host as adopted.
+// Without the host's name on the CR, or with its project given by number where
+// the watcher labels by ID, the operator cannot tell a neighbour from the host,
+// so it says nothing rather than naming the host as adopted.
 func TestScopeUndeclared_UnknownHostWritesNothing(t *testing.T) {
-	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
-	agent.Spec.Harness.ClusterName = ""
-	h := scopeHarness(t, agent, scopeTestHost, scopeTestNeighbourA)
+	for name, edit := range map[string]func(h *agentv1alpha1.HarnessSpec){
+		"no cluster name":   func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" },
+		"no project":        func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" },
+		"project by number": func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "123456789012" },
+		"no harness at all": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+			if edit == nil {
+				agent.Spec.Harness = nil
+			} else {
+				edit(agent.Spec.Harness)
+			}
+			h := scopeHarness(t, agent, scopeTestHost, scopeTestNeighbourA)
+			h.poll(5)
+			if cond := scopeCondition(t, h); cond != nil {
+				t.Fatalf("condition = %+v, want none", cond)
+			}
+		})
+	}
+}
+
+// A registered cluster in another project is a profile somebody made by hand
+// (or one a dropped declaration still carries), not one the management project
+// adopted, so it is neither counted nor named; the management project's own
+// neighbours still are.
+func TestScopeUndeclared_IgnoresClustersInOtherProjects(t *testing.T) {
+	foreign := usageClusterRef{Name: "payments-prod", Project: "payments", Location: "us-central1"}
+	h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, foreign)
 	h.poll(5)
 	if cond := scopeCondition(t, h); cond != nil {
-		t.Fatalf("condition = %+v, want none without a host name", cond)
+		t.Fatalf("condition = %+v, want none for a foreign-project profile alone", cond)
+	}
+	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, foreign, scopeTestNeighbourA)
+	h.poll(10)
+	cond := scopeCondition(t, h)
+	if cond == nil || !strings.Contains(cond.Message, "1 cluster(s)") || strings.Contains(cond.Message, "payments-prod") {
+		t.Fatalf("condition = %+v, want the management project's neighbour alone", cond)
+	}
+}
+
+func TestScopeUndeclaredRemovalCause(t *testing.T) {
+	agent := usageTestAgent(usageClock(0))
+	if got := scopeUndeclaredRemovalCause(agent, nil); !strings.Contains(got, "no current reading") {
+		t.Errorf("no reading: %q", got)
+	}
+	if got := scopeUndeclaredRemovalCause(agent, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "no cluster beyond the host") {
+		t.Errorf("host only: %q", got)
+	}
+	declared := usageTestAgent(usageClock(0))
+	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{Projects: []string{"p"}}
+	if got := scopeUndeclaredRemovalCause(declared, []usageClusterRef{scopeTestHost, scopeTestNeighbourA}); !strings.Contains(got, "declares a membership") {
+		t.Errorf("declared: %q", got)
+	}
+	numeric := usageTestAgent(usageClock(0))
+	numeric.Spec.Harness.ProjectID = "123456789012"
+	if got := scopeUndeclaredRemovalCause(numeric, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "by ID") {
+		t.Errorf("numeric project: %q", got)
 	}
 }
 
