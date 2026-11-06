@@ -19,7 +19,19 @@ answer" and Rollout step 1):
   the request without its messages, plus the LiteLLM setup and normalizer
   version the fingerprint also covers), the same number of messages, the same
   role at each position, and the same message hash at every position that is
-  not an assistant message. An exact match always counts as well.
+  not a generated answer. An exact match always counts as well.
+
+  A generated answer is an assistant message the logs show the model gave in
+  this conversation: an earlier request of the same build whose messages were
+  exactly the ones before it got an answer that reached the client. Only those
+  would have come from the recording under replay. Any other assistant message
+  (a few-shot example, a prefill, a resumed transcript, an empty reply's
+  continuation) is prompt and keeps its hash. The logged `answer_hash` can't
+  confirm the message is that answer: it hashes the answer's words and tool
+  calls in its own request's mapping, while a message hash covers the whole
+  normalized message in the later request's mapping, so the two never compare.
+  A client that swaps the model's answer for its own text before sending it
+  back is still taken as having sent the answer.
 
   It is an estimate both ways. Where the live model took a different action,
   shadow mode sees a different tool result and counts a miss, while replay
@@ -84,8 +96,8 @@ import hashlib
 import json
 import os
 import sys
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional, Tuple
 
 import request_store
 import schema as F
@@ -117,6 +129,9 @@ UNRANKED_NO_SHARED_WORDS = "no_shared_words"
 UNRANKED_OWN_TEXT_EMPTY = "own_text_empty"
 UNRANKED_ALL_MATCHED = "all_messages_matched"
 ASSISTANT_ROLE = "assistant"
+# Unstorable reasons meaning the client never got the model's answer, so the
+# request is no evidence that the next assistant message was generated.
+ANSWER_NOT_DELIVERED = (F.UNSTORABLE_NO_ANSWER, F.UNSTORABLE_CLIENT_DISCONNECTED)
 # Stands in for an assistant message's content in the replayed key: its place
 # in the conversation counts, its words do not.
 ANSWER_PLACEHOLDER = "assistant-message"
@@ -130,7 +145,8 @@ REPLAYED_ESTIMATES = (REPLAYED_LOW, REPLAYED_HIGH)
 NIGHTLY_ONLY_ESTIMATES = (LOW, REPLAYED_LOW)
 # What the replayed rows leave out, printed under the estimate table.
 REPLAYED_CAVEAT = (
-    "replayed rows are an estimate: a different live action gave a different tool result here, where replay would"
+    "replayed rows are an estimate, holding to the recording only the answers the logs show the model gave in the"
+    " conversation: a different live action gave a different tool result here, where replay would"
     " have run the saved one, and a live answer naming a new ID, IP or CIDR shifted later messages' hashes, where"
     " the saved answer would not have (so low there); each request is judged alone, though an earlier miss in its"
     " conversation, or answers from two recordings, would end a real replay (so high there)."
@@ -179,10 +195,19 @@ class Record:
     completion_tokens: int
     latency_ms: int
     unstorable: List[str]
+    answer_hash: Optional[str] = None
+    # Positions of the assistant messages the logs show were generated in this
+    # conversation; set by mark_generated_answers, which load runs.
+    generated_answers: FrozenSet[int] = field(default_factory=frozenset)
 
     @property
     def storable(self) -> bool:
         return not self.unstorable
+
+    @property
+    def answer_delivered(self) -> bool:
+        """Whether the model's answer reached the client, so its next request may carry it."""
+        return self.answer_hash is not None and not any(r in ANSWER_NOT_DELIVERED for r in self.unstorable)
 
     @classmethod
     def from_line(cls, entry: Dict[str, Any]) -> "Record":
@@ -209,6 +234,7 @@ class Record:
             completion_tokens=int(entry.get(F.COMPLETION_TOKENS) or 0),
             latency_ms=int(entry.get(F.LATENCY_MS) or 0),
             unstorable=[str(r) for r in entry.get(F.UNSTORABLE) or []],
+            answer_hash=str(entry[F.ANSWER_HASH]) if entry.get(F.ANSWER_HASH) else None,
         )
 
     @property
@@ -242,21 +268,22 @@ class Record:
     def replayed_chain(self) -> Iterator[str]:
         """Prefix hashes of the replayed key: element k covers the settings and messages 0..k.
 
-        Each message counts by its role, and by its hash unless it is an
-        assistant message, whose words replay would have taken from the
-        recording. Empty without message hashes. A generator, so a search that
+        Each message counts by its role, and by its hash unless it is a
+        generated answer (`generated_answers`), whose words replay would have
+        taken from the recording. Empty without message hashes. A generator, so a search that
         stops at the first difference hashes no further.
         """
         current = self.settings_hash
         for index, message_hash in enumerate(self.message_hashes or []):
             role = self.roles[index] if index < len(self.roles) else ""
-            part = f"{role}{ROLE_SEPARATOR}{ANSWER_PLACEHOLDER if role == ASSISTANT_ROLE else message_hash}"
+            held = role == ASSISTANT_ROLE and index in self.generated_answers
+            part = f"{role}{ROLE_SEPARATOR}{ANSWER_PLACEHOLDER if held else message_hash}"
             current = hashlib.sha256(f"{current}|{part}".encode()).hexdigest()
             yield current
 
     @functools.cached_property
     def replayed_key(self) -> str:
-        """The settings and every message, assistant messages by their place only."""
+        """The settings and every message, generated answers by their place only."""
         key = self.settings_hash
         for key in self.replayed_chain():
             pass
@@ -392,10 +419,11 @@ class ReplayedPrefixSources(Sources):
         return [record.settings_hash, *record.replayed_chain()]
 
     def first_difference(self, request: Record) -> str:
-        """The role of the first message no allowed high source matches, assistant words not compared.
+        """The role of the first message no allowed high source matches, generated answers' words not compared.
 
-        `assistant`: no allowed source has an answer at that position; `none`:
-        a longer allowed recording passes through, but none stopped here.
+        `assistant`: no allowed source matches at that assistant position (none
+        has a generated answer there, or the message is prompt and differs);
+        `none`: a longer allowed recording passes through, but none stopped here.
         """
         if request.message_hashes is None or self.find(request.settings_hash, request, nightly_only=False) is None:
             return difference_role(request, request.message_hashes, False, 0)
@@ -577,7 +605,38 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                     continue
                 records.append(Record.from_line(entry))
     records.sort(key=lambda r: r.ts)
+    mark_generated_answers(records)
     return records, skipped
+
+
+def mark_generated_answers(records: List[Record]) -> None:
+    """Set each record's `generated_answers`, from records in time order.
+
+    Position i holds a generated answer when it is an assistant message and an
+    earlier request of the same build, whose message hashes are exactly this
+    request's first i, got an answer that reached the client before this
+    request was made.
+    """
+    # Requests whose answer reached the client, by build, message count and
+    # last message hash; a candidate still has to match every earlier hash.
+    answered: Dict[Tuple[Tuple[str, str, str], int, str], List[Record]] = {}
+    for record in records:
+        hashes = record.message_hashes
+        if hashes is None:
+            continue
+        generated = []
+        for index, role in enumerate(record.roles[:len(hashes)]):
+            if role != ASSISTANT_ROLE:
+                continue
+            last = hashes[index - 1] if index else ""
+            for asked in answered.get((record.build_key, index, last), ()):
+                if asked.available_at <= record.ts and asked.message_hashes == hashes[:index]:
+                    generated.append(index)
+                    break
+        record.generated_answers = frozenset(generated)
+        if record.answer_delivered:
+            key = (record.build_key, len(hashes), hashes[-1] if hashes else "")
+            answered.setdefault(key, []).append(record)
 
 
 def iter_hits(
@@ -751,7 +810,8 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
         )
     lines += [REPLAYED_CAVEAT, "",
               f"miss tokens by first differing message: {report['miss_tokens_by_first_difference']}",
-              "replayed_high miss tokens by role of first differing message (assistant: no recording answered there;"
+              "replayed_high miss tokens by role of first differing message (assistant: no recording matches that answer"
+              " position;"
               " none: only longer recordings pass through):"
               f" {report['replayed_miss_tokens_by_first_difference']}", "",
               "top misses (prompt tokens, matched/total messages, first difference, closest earlier request):"]

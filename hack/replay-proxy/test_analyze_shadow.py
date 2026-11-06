@@ -13,7 +13,7 @@ import analyze_shadow
 
 
 def line(request_id, ts, kind, build, fingerprint, messages, roles=None, project="p1", tokens=100, unstorable=(),
-         pr="", latency_ms=0):
+         pr="", latency_ms=0, answer_hash="answered"):
     entry = {
         "event": "replay_shadow_request",
         "request_id": request_id,
@@ -27,6 +27,8 @@ def line(request_id, ts, kind, build, fingerprint, messages, roles=None, project
         "latency_ms": latency_ms,
         "unstorable": list(unstorable),
     }
+    if answer_hash is not None:
+        entry["answer_hash"] = answer_hash
     if messages is not None:
         entry["message_hashes"] = list(messages)
     return entry
@@ -282,6 +284,9 @@ class ReplayedTest(unittest.TestCase):
         self.assertEqual(hit_ids(lines, "replayed_high", require_storable=False), ["b0", "b1"])
 
     def test_settings_length_and_roles_must_match(self):
+        # Each build's request for the first answer, so the answers are generated ones.
+        asked = [presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=["system", "user"]),
+                 presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=["system", "user"])]
         source = presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"],
                            roles=["system", "user", "assistant", "tool"])
         cases = {
@@ -297,10 +302,10 @@ class ReplayedTest(unittest.TestCase):
                 request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"],
                                     roles=["system", "user", "assistant", "tool"])
                 request.update(change)
-                self.assertEqual(hit_ids([source, request], "replayed_high"), [])
+                self.assertNotIn("b", hit_ids(asked + [source, request], "replayed_high"))
         request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"],
                             roles=["system", "user", "assistant", "tool"])
-        self.assertEqual(hit_ids([source, request], "replayed_high"), ["b"])
+        self.assertEqual(hit_ids(asked + [source, request], "replayed_high"), ["b-ask", "b"])
 
     def test_an_exact_match_without_message_hashes_still_counts(self):
         lines = [line("n1", 1, "nightly", "n", "A", None), presubmit("p1", 2, "10", "b1", "A", None),
@@ -335,17 +340,21 @@ class ReplayedTest(unittest.TestCase):
         roles = ["system", "user", "assistant", "tool"]
         cases = {
             # An earlier finished build of the same pull request.
-            "earlier build": ([presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=roles)], {}),
+            "earlier build": ("10", {}),
             # Another pull request's last build, once it merged.
-            "merge copy": ([presubmit("a", 1, "11", "b1", "A", ["sys", "task", "ans", "out"], roles=roles)],
-                           {"11": 10.0}),
+            "merge copy": ("11", {"11": 10.0}),
         }
-        for name, (sources, merged) in cases.items():
+        for name, (source_pr, merged) in cases.items():
             with self.subTest(name):
-                request = presubmit("b", 20, "10", "b2", "B", ["sys", "task", "ANS", "OTHER"], roles=roles)
-                rep, _ = report(sources + [request], merged=merged)
-                # The source's own request has nothing earlier: settings.
-                self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"tool": 100, "settings": 100})
+                lines = [
+                    presubmit("a-ask", 0.5, source_pr, "b1", "AQ", ["sys", "task"], roles=roles[:2]),
+                    presubmit("a", 1, source_pr, "b1", "A", ["sys", "task", "ans", "out"], roles=roles),
+                    presubmit("b-ask", 19, "10", "b2", "AQ", ["sys", "task"], roles=roles[:2]),
+                    presubmit("b", 20, "10", "b2", "B", ["sys", "task", "ANS", "OTHER"], roles=roles),
+                ]
+                rep, _ = report(lines, merged=merged)
+                # The source build's own requests have nothing earlier: settings.
+                self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"tool": 100, "settings": 200})
 
     def test_a_longer_recording_with_no_request_stopping_here_is_none(self):
         source = line("a", 1, "nightly", "n1", "A", ["sys", "task", "ans", "out"],
@@ -362,6 +371,64 @@ class ReplayedTest(unittest.TestCase):
         self.assertIn("replayed_high", text)
         self.assertIn("replayed rows are an estimate", text)
         self.assertIn("by role of first differing message", text)
+
+
+FEW_SHOT_ROLES = ["system", "user", "assistant", "user"]
+ANSWER_ROLES = ["system", "user", "assistant", "tool"]
+
+
+class GeneratedAnswerTest(unittest.TestCase):
+    """Only assistant messages the logs show the model gave in the conversation are held to the recording."""
+
+    def test_a_prompt_borne_assistant_message_that_differs_misses(self):
+        # A few-shot example arrives in the first request: no earlier request asked for it.
+        for example, expected in (("example-2", []), ("example-1", ["b"])):
+            with self.subTest(example):
+                lines = [presubmit("a", 1, "10", "b1", "A", ["sys", "task", "example-1", "go"], roles=FEW_SHOT_ROLES),
+                         presubmit("b", 10, "10", "b2", "B", ["sys", "task", example, "go"], roles=FEW_SHOT_ROLES)]
+                self.assertEqual(hit_ids(lines, "replayed_high"), expected)
+
+    def test_a_sources_prompt_borne_message_is_not_blanked_either(self):
+        lines = [
+            presubmit("a", 1, "10", "b1", "A", ["sys", "task", "example-1", "out"], roles=ANSWER_ROLES),
+            # In b2 the message at position 2 is a generated answer; in the source it was prompt.
+            presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), [])
+
+    def test_a_generated_answer_that_differs_is_still_a_hit(self):
+        lines = [
+            presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES),
+            presubmit("b-ask", 9, "10", "b2", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b-ask", "b"])
+
+    def test_without_evidence_of_the_answer_the_message_keeps_its_hash(self):
+        source = [presubmit("a-ask", 0.5, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+                  presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES)]
+        request = presubmit("b", 10, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES)
+        cases = {
+            # The request that got the answer is not in the logs.
+            "no asking request": [],
+            # Same build, length and last message, but an earlier message differs.
+            "asked a different conversation": [
+                presubmit("b-ask", 9, "10", "b2", "BQ", ["other-sys", "task"], roles=ANSWER_ROLES[:2])],
+            "asked in another build": [presubmit("c-ask", 8, "10", "b3", "CQ", ["sys", "task"], roles=ANSWER_ROLES[:2])],
+            "answer arrived after the request": [
+                presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2], latency_ms=5_000)],
+            "no answer": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                    unstorable=["no_answer"])],
+            "client disconnected": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                              unstorable=["client_disconnected"])],
+            "no answer hash": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
+                                         answer_hash=None)],
+        }
+        for name, asked in cases.items():
+            with self.subTest(name):
+                self.assertNotIn("b", hit_ids(source + asked + [request], "replayed_high"))
 
 
 class EarliestSourceTest(unittest.TestCase):
