@@ -3911,6 +3911,69 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
 
 
 
+class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
+    """#3615. A full upgrade applies the chat keys from install.env, so its
+    end prints the chat setup checklist for the mode the CR is left on, as
+    install.sh does after each of its applies. The tail of main(), lifted as
+    written over the real installer_common.sh with the helper and gcloud
+    stubbed, calls the helper on the full arm only, under a declare -F guard
+    an older target's installer_common.sh fails, with the project number read
+    only when Google Chat is on, before the home-channel summary."""
+
+    def _tail(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index('  print_step "🎉 Upgrade Complete!"\n')
+        return source[start:source.index("\n}\n", start)]
+
+    def _run(self, mode, keys, older_common=False):
+        """Runs the tail; returns the process and the gcloud calls it made."""
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        helper = (
+            "unset -f print_chat_setup_checklists\n" if older_common else
+            'print_chat_setup_checklists() { echo "CHECKLIST mode=$1 number=${PROJECT_NUMBER:-} env=${INSTALL_ENV_FILE:-}"; }\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                f"{helper}"
+                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
+                "print_step() { :; }\n"
+                'print_next_home_channel_unset_summary() { echo "SUMMARY"; }\n'
+                "set -Eeuo pipefail\n"
+                f"{exports}"
+                f"PARAM_UPGRADE_MODE={mode}; PROJECT_ID=proj; DEFAULT_PLATFORM_AGENT_MODE=today\n"
+                f"_tail() {{\nlocal install_env_file=/x/install.env\n{self._tail()}\n}}\n"
+                "_tail\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env())
+            calls = gcloud_log.read_text() if gcloud_log.exists() else ""
+        return proc, calls
+
+    def test_a_full_upgrade_prints_the_checklist_for_the_mode_after_the_apply(self):
+        proc, calls = self._run("full", {"GOOGLE_CHAT_ENABLED": "true", "PLATFORM_AGENT_MODE": "today",
+                                         "PLATFORM_AGENT_MODE_AFTER_APPLY": "next"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST mode=next number=123456 env=/x/install.env", "SUMMARY"])
+        self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
+
+    def test_the_mode_falls_back_to_the_key_and_the_number_is_read_for_google_chat_only(self):
+        proc, calls = self._run("full", {"SLACK_ENABLED": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), ["CHECKLIST mode=today number= env=/x/install.env", "SUMMARY"])
+        self.assertEqual(calls, "")
+
+    def test_the_retag_arms_and_an_older_target_print_no_checklist(self):
+        for mode, older in (("harness", False), ("operator", False), ("full", True)):
+            with self.subTest(mode=mode, older_common=older):
+                proc, calls = self._run(mode, {"GOOGLE_CHAT_ENABLED": "true"}, older_common=older)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout.splitlines(), ["SUMMARY"])
+                self.assertEqual(calls, "")
+                self.assertNotIn("command not found", proc.stderr)
+
+
 class DowngradeCheckTest(unittest.TestCase):
     """check_downgrade: a move that leaves behind a commit marked as a breaking
     change is refused, naming it, and completes when nothing it leaves is marked."""

@@ -2423,6 +2423,21 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
+  # A full apply renders the chat keys from install.env, so a key edited since
+  # the last apply turns a chat platform on, or moves it between the agent and
+  # the A2A gateway, with nothing after it to say what the chat app still
+  # needs. The retag arms reuse the recorded values and change neither.
+  # Guarded: an older target's installer_common.sh lacks the helper. The DM
+  # link in the Google Chat checklist is the project's number, which
+  # install.env never records.
+  if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
+    local project_number=""
+    if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+      project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
+    fi
+    PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
+      print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+  fi
   if declare -F print_next_home_channel_unset_summary >/dev/null; then
     print_next_home_channel_unset_summary
   fi
