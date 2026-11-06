@@ -31,15 +31,19 @@ reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py`
 At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed,
 and none once :data:`CLAIMS_BUDGET_SECONDS` have passed since the hook began on
 that output: Hermes skips a ``transform_terminal_output`` hook that runs past
-its 30 s callback timeout and hands the model the original output, tokens
-included. A record with no ``repo`` and a url :data:`PROPOSAL_URL` cannot read
+its callback timeout (:data:`HOOK_CALLBACK_SECONDS`) and hands the model the
+original output, tokens included. A record with no ``repo`` and a url :data:`PROPOSAL_URL` cannot read
 names no repository to send the claim to and takes none of those slots. Every
 record line the hook does not claim (no repository, past the cap or the
 budget, a repeated url, a refused claim, a broker hop that is down) keeps its
 text but loses its ``claim`` field, so no live token reaches what the model
-reads, unless one claim alone outlasts Hermes' timeout. The claim is one broker
-call through the sandbox (``forge.call``), made in line rather than on a thread
-because a worker leaves through ``os._exit``, which would drop a thread still
+reads. Each claim's ``forge.call`` ceiling is what is left before the hook must
+answer: the callback timeout less :data:`CLAIM_RESERVE_SECONDS` for the ledger
+write, the card record and the strip that follow the last claim. So no claim on
+the sandbox hop outlasts the hook, and a claim that times out is an unanswered
+hop. The claim is one broker call through the sandbox
+(``forge.call``), made in line rather than on a thread because a worker leaves
+through ``os._exit``, which would drop a thread still
 waiting on the broker. A claim or a write that fails is logged: the PR is open
 either way, and it counts as missed. Background processes are not covered,
 since this hook runs on foreground output only. Design:
@@ -152,12 +156,23 @@ RECORD_SEPARATORS = (",", ":")
 #: staged, as ``vcs_client`` finds its siblings there.
 SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 
-#: A GitHub-shaped pull request url (``…/pull/<n>``) or a merge request url
-#: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
-#: Read only for a record with no ``repo`` (one an older client wrote), and for
-#: the card event's number when the broker's answer has none. The Session KV
-#: server pins its own pattern equal to this one.
-PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+#: A pull request url on every forge the broker serves
+#: (``providers/registry.py`` ``AVAILABLE``): the repository url the broker
+#: resolves to that forge, then the number. GitHub ``…/pull/<n>``, GitLab
+#: ``…/-/merge_requests/<n>``, Gitea ``…/pulls/<n>``, and Bitbucket Cloud and
+#: Data Center ``…/pull-requests/<n>`` (Data Center's repository is
+#: ``…/projects/KEY/repos/slug``). A trailing page (``/overview``,
+#: ``/_/diff``), query or fragment is allowed; an issue url is not a match.
+#: ``http`` is a forge the broker serves too: an in-cluster Gitea (a ``.svc``
+#: host). The repository is greedy, so a GitLab subgroup named ``pulls`` or
+#: ``pull-requests`` before a numeric subgroup stays in the repository and
+#: the last marker before the number is the pull request. The tail after the
+#: number carries no further marker, ``/-/`` or ``/issues/``, so an issue under
+#: such a subgroup is not a pull request either. Read only for a
+#: record with no ``repo`` (one an older client wrote), and for the card
+#: event's number when the broker's answer has none. The Session KV server
+#: pins its own pattern equal to this one.
+PROPOSAL_URL = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 
 #: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
 #: does not parse as a whole line (one ``2>&1`` merged after other text). Its
@@ -185,6 +200,15 @@ RECORDS_CHECKED_MAX = 5
 #: the model the raw output, so the budget leaves room for the ledger writes,
 #: the card record and the strip that follow the last claim.
 CLAIMS_BUDGET_SECONDS = 20
+#: Hermes' ``hook_callback_timeout``: a hook still running at this point is
+#: skipped, and the model reads the output the hook was handed.
+HOOK_CALLBACK_SECONDS = 30
+#: What the hook keeps for itself after its last claim answers: the ledger
+#: write (:data:`LEDGER_TIMEOUT_SECONDS`), the card record and the strip. Each
+#: claim's ceiling is what is left before the callback timeout less this, so a
+#: claim started at the end of the budget still has several seconds, and the
+#: one-use token a killed hop may have burned is a claim that is never counted.
+CLAIM_RESERVE_SECONDS = 4
 
 #: Where Hermes installs ``deploy/docker/patches/kanban_origin.py``, and the name
 #: a test loads it under.
@@ -307,8 +331,11 @@ class ClaimUnanswered(Exception):
     """The claim did not reach the broker: no forge module here, or the hop is down."""
 
 
-def claim(record):
+def claim(record, timeout_s=None):
     """The forge's ``{url, number, title}`` when the broker accepts ``record``'s token, else None.
+
+    ``timeout_s`` is the ceiling on the broker call, passed to ``forge.call``;
+    None keeps its default. A call that times out is an unanswered hop.
 
     The broker burns the token whatever it then finds, so a claim is never
     retried here; the broker itself asks the forge once more on a transient
@@ -329,6 +356,7 @@ def claim(record):
             {CLAIM_FIELD: record[CLAIM_FIELD], "url": record["url"]},
             claim_repository(record),
             retry_transient=False,
+            timeout_s=timeout_s,
         )
     except Exception as exc:  # noqa: BLE001 — sorted into a refusal or an unanswered hop below
         reason = getattr(exc, "reason", None)
@@ -421,7 +449,8 @@ def on_terminal_output(command="", output="", **_):
     """Claim each proposal record in ``output``, count it in the ledger, and strip every token.
 
     At most :data:`RECORDS_CHECKED_MAX` distinct urls carrying a token are
-    claimed, and no claim starts once :data:`CLAIMS_BUDGET_SECONDS` have passed.
+    claimed, no claim starts once :data:`CLAIMS_BUDGET_SECONDS` have passed, and
+    each claim's ceiling is what is left before the hook must answer.
     A claimed proposal goes to the ledger under :func:`resolve_origin`;
     in a kanban worker it also goes on the card and its line, with every line
     repeating its url, leaves the output. Every other line naming a record stays
@@ -445,23 +474,26 @@ def _claim_output(output):
     """:func:`on_terminal_output`'s work, for an output that names a record. May raise."""
     task_id = os.environ.get(TASK_ENV, "").strip()
     asked, removed, kept, unanswered, origin, changed = set(), set(), [], False, None, False
-    deadline = time.monotonic() + CLAIMS_BUDGET_SECONDS
+    began = time.monotonic()
+    budget_end = began + CLAIMS_BUDGET_SECONDS
+    answer_by = began + HOOK_CALLBACK_SECONDS - CLAIM_RESERVE_SECONDS
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
         if proposal is not None and proposal["url"] in removed:
             changed = True
             continue
+        now = time.monotonic()
         if (
             proposal is not None
             and claimable(proposal)
             and proposal["url"] not in asked
             and len(asked) < RECORDS_CHECKED_MAX
             and not unanswered
-            and time.monotonic() < deadline
+            and now < budget_end
         ):
             asked.add(proposal["url"])
             try:
-                confirmed = claim(proposal)
+                confirmed = claim(proposal, timeout_s=answer_by - now)
             except ClaimUnanswered as exc:
                 logger.warning("pr_opened: %s was not answered (%s); this output is not claimed further",
                                PROPOSAL_CLAIM_VERB, exc)

@@ -21,13 +21,14 @@
 # `audit_report.py start` and `finish`, since a recoverable safeguard does
 # not gate.
 #
-# Fixture: the startup-fail-vm role (docs/designs/fleet-fixtures.yaml), the
+# Fixture: the startup-fail-vm role (bench/tf/fleet/fixtures.json), the
 # standalone VM startup-fail-<prefix> from bench/tf/fleet/main.tf
 # `google_compute_instance.startup_fail`. Its startup script exits 1 on every
 # boot, so the collector's gce-startup-script-status check (critical) flags
 # it with no age gate. The role is project-scoped, with no cluster slot.
-# CI: no pool project has the VM until #2483's fleet re-apply, so no CI tier
-# can run the case. Dev: a targeted apply of bench/tf/fleet plants it in the
+# CI: every pool project has the VM (#2483), and the case waits in
+# FIXTURE_NOT_READY until the fixture-state scan reads the role healthy on
+# every pool project. Dev: a targeted apply of bench/tf/fleet plants it in the
 # dev project. The dev install declares a scope, so the chat command passes
 # the fleet_scope tool's collector_args and the collector sweeps only the
 # declared projects; the VM has to be in one of them. Every candidate this

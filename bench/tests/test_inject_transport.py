@@ -573,6 +573,24 @@ def test_the_opening_task_is_timed_to_its_terminal(
     assert 0 <= timing["turn1_s"] <= took
 
 
+def test_the_replys_shape_counts_the_tasks_posts(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The status placeholder the relay edited is still a message in the
+    thread; the answer is the post that carries it."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "**Two pods are OOMKilled.**")
+
+    result = KubeAgentsHarness().run("anything failing?")
+
+    assert not result.errors
+    shape = json.loads(target.read_text(encoding="utf-8"))
+    assert shape["bot_messages"] == 2
+    assert shape["opens_on_verdict"] is True
+    assert shape["answer_words"] == 4
+
+
 def test_an_opening_task_at_its_budget_writes_no_timing(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

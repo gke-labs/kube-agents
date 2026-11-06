@@ -69,10 +69,6 @@ const (
 	// rated a card answer for (claimCardAnswer), oldest forgotten first.
 	feedbackCardAnswersMax = 1024
 
-	// feedbackRetryInterval is how often the gateway looks again for a
-	// feedback bucket it did not find at start: on an upgrade the provision
-	// Job that creates it can finish after the new gateway starts.
-	feedbackRetryInterval = time.Minute
 	// feedbackRetries is how many times it looks before it stops: the
 	// upgrade's Job finishes within minutes, and an install whose NATS
 	// server never grants the gateway the bucket (an older operator's
@@ -83,6 +79,12 @@ const (
 	// told it is kept.
 	feedbackDay = 24 * time.Hour
 )
+
+// feedbackRetryInterval is how often the gateway looks again for a feedback
+// bucket it did not find at start: on an upgrade the provision Job that
+// creates it can finish after the new gateway starts. Each Gateway carries
+// its own copy (feedbackRetry), which a test shortens on its own gateway.
+const feedbackRetryInterval = time.Minute
 
 var (
 	// errFeedbackUnverified is a rating from a sender the gateway would not
@@ -202,21 +204,27 @@ func (d *feedbackDesk) lockKey(key string) func() {
 	return mu.Unlock
 }
 
-// startFeedback turns answer feedback on (tryFeedback), or, when it cannot
-// yet, tries again every feedbackRetryInterval until it can, ctx ends or
-// feedbackRetries tries have failed.
-// The first try is made before it returns, so the relay marks every answer
-// alike from the start on an install that already has the bucket.
-func (g *Gateway) startFeedback(ctx context.Context) {
+// startFeedback makes the first try to turn answer feedback on
+// (tryFeedback), and reports whether that settled it: on, or turned off on
+// this install. Run calls it before the relay binds, so the relay marks every
+// answer alike from the start on an install that already has the bucket, and
+// calls retryFeedback after the bind when it did not.
+func (g *Gateway) startFeedback(ctx context.Context) bool {
 	if g.cfg.AnswerFeedbackOff {
 		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback)")
-		return
+		return true
 	}
-	if g.tryFeedback(ctx, false) {
-		return
-	}
+	return g.tryFeedback(ctx, false)
+}
+
+// retryFeedback tries again every g.feedbackRetry until feedback is on,
+// ctx ends or feedbackRetries tries have failed. Run starts it once the relay
+// has bound rather than before: the provision Job creates the bucket with
+// TASKS, and a relay that waited for TASKS longer than the retries last would
+// otherwise come up with feedback given up on for good.
+func (g *Gateway) retryFeedback(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(feedbackRetryInterval)
+		ticker := time.NewTicker(g.feedbackRetry)
 		defer ticker.Stop()
 		for range feedbackRetries {
 			select {

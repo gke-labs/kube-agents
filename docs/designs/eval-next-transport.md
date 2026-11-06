@@ -741,7 +741,7 @@ listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking 
 the batch runs Tide started, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
-under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),

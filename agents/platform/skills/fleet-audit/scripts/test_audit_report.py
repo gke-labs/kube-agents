@@ -21919,6 +21919,38 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertTrue(audit_report.decline_names_a_pull_request(
             "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
         ))
+        # Gitea's and both Bitbucket editions' proposal URLs count too; their
+        # issue URLs do not.
+        for carried in (
+            "https://gitea.example.com/acme/fleet/pulls/12",
+            "https://bitbucket.org/acme/fleet/pull-requests/12",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        ):
+            with self.subTest(url=carried):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {carried}"))
+        for issue in (
+            "https://gitea.example.com/acme/fleet/issues/12",
+            "https://bitbucket.org/acme/fleet/issues/12",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=issue):
+                self.assertFalse(audit_report.decline_names_a_pull_request(f"see {issue}"))
+
+    def test_the_decline_check_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/fleet/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/fleet/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/fleet/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {url}"))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
