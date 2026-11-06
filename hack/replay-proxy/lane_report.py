@@ -15,8 +15,9 @@ It writes, into `--out`:
   whether its run's verdict matched the recording's. Only answers from runs
   that passed are published (publish_cache.py), so a recording's verdict is a
   pass, and a mismatch is a replayed run that failed. A conversation whose run
-  can't be told (run_attribution.py) or whose nightly left no record is
-  `unknown`;
+  can't be told (run_attribution.py), whose run bench-gate graded as neither a
+  pass nor a fail (infra, blocked, not_applicable), or whose nightly left no
+  record is `unknown`;
 - `summary.txt`: the counts, for the job log.
 
 Both JSON files hold hashes and scrubbed snippets of requests, so they go to the
@@ -131,7 +132,9 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             continue
         key = next(iter(keys))
         run = by_key.get(key)  # type: ignore[arg-type]
-        if run is None:
+        # Only a pass or a fail is a verdict; infra, blocked and not_applicable
+        # say nothing about what replay served (bench-gate's RepResult outcomes).
+        if run is None or run.outcome not in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL):
             conversation_counts[UNKNOWN] += 1
         elif run.passed:
             conversation_counts[MATCH] += 1

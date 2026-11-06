@@ -62,6 +62,15 @@ class LaneReportTest(unittest.TestCase):
         for name in ("replay.json", "verdicts.json", "summary.txt"):
             self.assertTrue(os.path.isfile(os.path.join(self.out, name)))
 
+    def test_a_served_run_with_no_verdict_is_unknown_not_a_mismatch(self):
+        for outcome in ("infra", "blocked", "not_applicable"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.world.run("case-a", 1, outcome, ["t_00000001"])
+                self.conversation("t_00000001", (True, True))
+                report, _ = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
+                self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
+
     def test_a_conversation_whose_recording_left_no_record_is_unknown(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.conversation("t_00000001", (True, True), recorded_from="1790000000000000999")
