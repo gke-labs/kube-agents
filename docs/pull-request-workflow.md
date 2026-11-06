@@ -465,8 +465,9 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   ([resolving conversations](#resolving-conversations)).
 - **Who counts, and what a ruling is.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
-  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
-  the author's own approval already covers), or a requested or `OWNERS`-listed reviewer has replied
+  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, once the approvals with the author's
+  own together cover every changed file, or an `OWNERS` reviewer's on a change the author's own approval already
+  covers), or a requested or `OWNERS`-listed reviewer has replied
   in one of its threads. The author's own replies, a bystander's comment, an approval from outside
   `OWNERS`, `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never
   count. A
@@ -624,9 +625,9 @@ The two labels are the two people:
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
   [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
-  and the inject lane's exclusions and safeguards under `hack/eval/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/replay-proxy/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
-  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  to what the presubmit runs, what blocks, or what replay serves ([`eval-gate-roster.md`](eval-gate-roster.md)); the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
@@ -640,12 +641,17 @@ for. Its pool for an ordinary change is the `repository-owners` group, root appr
 `repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
 between them by what the author's own approval already covers (#1075): an approver's own change opens with `approved` on it and needs
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
-approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
+approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
+`approved` is per file, so it takes as many of them as it needs to cover every file: first one for
+the file with the fewest approvers, then one more for whatever that person cannot approve, from
+the default reviewers when nobody the glob matched can approve it. A change
+to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
+unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
-settles a self-approved change and nothing else. The entries for the two presubmit roster files and the inject lane's two files under `hack/eval/` send a change there to its own `eval-crew` group, so the
-reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
-member is a root approver, so a change that also touches root-owned paths still waits on a root
-approver's `/approve` after that review. The bot never requests the author, so a member's own case
+settles a self-approved change and nothing else, and on any other change the approvals count only
+once together they cover every file; an approval that covers some of them leaves the draw to the
+rest. The entries for the two presubmit roster files and the inject lane's two files under `hack/eval/` send a change there to its own `eval-crew` group, so for a change confined to those files the
+reviewer the workflow summons can clear both labels in one action. The bot never requests the author, so a member's own case
 or roster change goes to the rest of the group, with the author's `approved` already on it. That
 is a property of the lists agreeing today — the alias in `OWNERS_ALIASES`, the `reviewers` list in
 `OWNERS` and the groups in the bot's config — which `scripts/test_request_reviewers.py` pins; none
@@ -882,9 +888,10 @@ Four states that look like somebody else's problem and are not:
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when no `OWNERS` approver covers
 the change and the author's own approval does not either (a pull request with no changed files),
-when an `OWNERS` approver for one of the changed files has submitted `APPROVED` (or, on a pull
-request the author's own approval already covers, anyone `OWNERS` lists under `reviewers` for
-them), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
+when `OWNERS` approvers, the author's implicit approval among them, have approved every changed
+file between them (an approval
+that covers only some leaves a draw for the rest; on a pull request the author's own approval
+already covers, one from anyone `OWNERS` lists under `reviewers` for them is enough), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
 latest verdict, as GitHub counts them. An account
 `.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
 robot that reviews under a user account re-reviews every push and files its follow-ups as
