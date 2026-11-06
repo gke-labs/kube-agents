@@ -297,7 +297,8 @@ manifest says about the fleet (every cluster's outcome, its checks and their exi
 candidates by identity and severity, its limitations, `checks_not_applicable`,
 `checks_unevaluated` and the collector's `checks_revision`; not its timestamps, durations, output
 hashes, command strings, or a candidate's excerpt and impact text, which carry ages and counts and
-which `finish` takes from the fresh manifest on a close) and compares the digest with the
+which `finish` takes from the fresh manifest on a close, except an impact the collector marks
+authoritative, which says which arm of a check fired) and compares the digest with the
 one the last scheduled `finish` of the stream recorded at
 `/opt/data/scratch/last_scheduled_digest_<audit-id>.json`. Its one JSON line gives the `verdict`:
 `first-run` (no record), `findings-changed` (the digest differs, a target was not collected, or a

@@ -552,7 +552,11 @@ every run (`PRECHECK_STREAMS` in the fleet-audit test suite pins the set).
 `started_at` and `finished_at` at the top, each command's `command`, `duration_s` and
 `output_sha256` (the `check` and `rc` pairs stay, because §3.1 reads them), and each candidate's
 `excerpt` and `impact`, which the collectors fill with ages (`AGE=12d`), log-window stamps and
-counts that move on a static fleet, and which §3.2 takes from the fresh manifest on a close.
+counts that move on a static fleet, and which §3.2 takes from the fresh manifest on a close. An
+`impact` the candidate marks `impact_authoritative` stays: on a check with more than one arm it
+says which arm fired (§3.2), and on `single-zone-nodepool`, `public-control-plane` and
+`upgrade-blocked` nothing else in the candidate does, so an object that moved arm would otherwise
+be closed with the previous arm's title and remediation under this arm's sentence.
 Everything else is in it — every cluster's `outcome`, candidates by identity, severity and their
 route and triage fields,
 `checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config

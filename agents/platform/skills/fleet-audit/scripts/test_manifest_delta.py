@@ -121,6 +121,25 @@ class DigestTest(unittest.TestCase):
         reordered["clusters"][0]["candidates"].insert(0, {"check": "x", "namespace": "", "object": "Namespace/x", "severity": "minor"})
         self.assertEqual(manifest_delta.manifest_digest(shuffled), manifest_delta.manifest_digest(reordered))
 
+    def test_an_authoritative_impact_counts(self):
+        """On a check with more than one arm the collector's impact says which arm fired,
+        and on some of them nothing else does: a pool that moved from zone-locked to its
+        ceiling, with the same severity, is a changed fleet."""
+        pool = {"check": "single-zone-nodepool", "namespace": "", "object": "NodePool/default", "severity": "major", "excerpt": "e", "impact": "zone-locked", "impact_authoritative": True}
+        locked = manifest()
+        locked["clusters"][0]["candidates"].append(dict(pool))
+        ceiling = manifest()
+        ceiling["clusters"][0]["candidates"].append({**pool, "impact": "at its ceiling", "excerpt": "e2"})
+        self.assertNotEqual(manifest_delta.manifest_digest(locked), manifest_delta.manifest_digest(ceiling))
+        excerpt_only = manifest()
+        excerpt_only["clusters"][0]["candidates"].append({**pool, "excerpt": "e2"})
+        self.assertEqual(manifest_delta.manifest_digest(locked), manifest_delta.manifest_digest(excerpt_only))
+        unmarked = manifest()
+        unmarked["clusters"][0]["candidates"].append({**pool, "impact_authoritative": False})
+        reworded = manifest()
+        reworded["clusters"][0]["candidates"].append({**pool, "impact_authoritative": False, "impact": "idle for 13 days"})
+        self.assertEqual(manifest_delta.manifest_digest(unmarked), manifest_delta.manifest_digest(reworded))
+
     def test_a_check_that_stopped_running_changes_the_digest(self):
         self.assert_changes(lambda m: m["clusters"][0]["commands"].pop(), "dropped command")
         self.assert_changes(lambda m: m["clusters"][0]["commands"][0].update(rc=1), "rc")
