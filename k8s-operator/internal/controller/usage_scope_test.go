@@ -265,12 +265,31 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 	if again := scopeCondition(t, h); again != nil {
 		t.Fatalf("condition under a malformed project label = %+v, want none", again)
 	}
+
+	// A host series labelled with a project number (a profile made by hand with
+	// the number) is no candidate either: spec.scope.projects refuses a number,
+	// so the message must never tell the reader to declare one.
+	h.stub.setClusterRefs(gatewayAddr(), usageClusterRef{Name: "c", Project: "123456789012", Location: "l"}, usageClusterRef{Name: "n", Project: "123456789012", Location: "l"})
+	h.poll(25)
+	if again := scopeCondition(t, h); again != nil {
+		t.Fatalf("condition under a numeric project label = %+v, want none", again)
+	}
 }
 
 func TestScopeUndeclaredRemovalCause(t *testing.T) {
 	agent := usageTestAgent(usageClock(0))
 	if got := scopeUndeclaredRemovalCause(agent, nil); !strings.Contains(got, "no current reading") {
 		t.Errorf("no reading: %q", got)
+	}
+	// A reading with no series is a reading, not the absence of one: the poll
+	// hands it on as an empty list, and the cause says the host side, not the
+	// watcher, is why.
+	empty, known := usageClusterRefsForPoll(agent, []usageScrapedPod{{Clusters: &usageClusterGauges{}}}, true, false)
+	if !known || empty == nil || len(empty) != 0 {
+		t.Fatalf("a reading with no series = (%v, %v), want an empty, non-nil list", empty, known)
+	}
+	if got := scopeUndeclaredRemovalCause(agent, empty); !strings.Contains(got, "no cluster beyond the host") {
+		t.Errorf("empty reading: %q", got)
 	}
 	if got := scopeUndeclaredRemovalCause(agent, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "no cluster beyond the host") {
 		t.Errorf("host only: %q", got)
