@@ -352,6 +352,23 @@ class ThrottleTest(PolicyCase):
             self.assertEqual(self.next_run("wide"), iso(NOW - timedelta(minutes=1)), minutes)
             self.assertNotIn("wide", self.state()["held"], minutes)
 
+    def test_a_period_below_a_microsecond_is_no_period_and_costs_no_release(self):
+        # `1e-9` passes a `> 0` check on the number, but the timedelta it makes
+        # is zero: held by it, the job's release divides by that period and
+        # aborts the store's release. No period, so never held, and the rest
+        # of the store releases.
+        self.write(
+            interval_job("sub-micro", 1e-9, NOW - timedelta(minutes=1), days_ago(2)),
+            interval_job("two-hourly", 120, NOW, NOW - timedelta(hours=2)),
+        )
+        lines = self.run_policy(Reader(days_ago(15)))
+        self.assertEqual([line for line in lines if "held" in line], ["platform: held two-hourly until 2026-08-07T06:20:30+00:00 (hibernate)"])
+        self.assertEqual(self.next_run("sub-micro"), iso(NOW - timedelta(minutes=1)))
+        later = NOW + timedelta(minutes=50)
+        lines = self.run_policy(Reader(later), now=later)
+        self.assertIn("released two-hourly", "\n".join(lines))
+        self.assertEqual(self.state()["held"], {})
+
     def test_a_period_past_the_calendars_end_releases_without_a_next_slot(self):
         # The release adds the period to the last run; a period that lands past
         # year 9999 has no next slot, so the job keeps the hold's timestamp and

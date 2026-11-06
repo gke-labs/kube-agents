@@ -340,12 +340,14 @@ def _interval(job: dict) -> timedelta | None:
     if not isinstance(schedule, dict) or schedule.get("kind") != SCHEDULE_KIND_INTERVAL:
         return None
     # A `minutes` the JSON grammar admits but a timedelta cannot hold (`1e400`,
-    # an integer wider than a float) is no period, not a fault for the store.
+    # an integer wider than a float), or holds as zero (below a microsecond, so
+    # a release would divide by it), is no period, not a fault for the store.
     try:
         minutes = float(schedule.get("minutes") or 0)
-        return timedelta(seconds=minutes * SECONDS_PER_MINUTE) if minutes > 0 else None
+        period = timedelta(seconds=minutes * SECONDS_PER_MINUTE)
     except (TypeError, ValueError, OverflowError):
         return None
+    return period if period > timedelta(0) else None
 
 
 def _due(job: dict, now: datetime) -> bool:
