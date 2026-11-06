@@ -70,12 +70,25 @@ class LaneReportTest(unittest.TestCase):
                 self.conversation("t_00000001", (True, True))
                 report, _ = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
                 self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
+                self.assertEqual(report["unknown_reasons"], {"no_verdict": 1})
 
-    def test_a_conversation_whose_recording_left_no_record_is_unknown(self):
+    def test_a_conversation_whose_recording_night_is_in_no_record_is_unknown_and_says_why(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.conversation("t_00000001", (True, True), recorded_from="1790000000000000999")
-        report, _ = self.report({NIGHT: []})
+        report, summary = self.report({NIGHT: []})
         self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
+        self.assertEqual(report["unknown_reasons"], {"recording_build_unrecorded": 1})
+        self.assertIn("recording_build_unrecorded", summary)
+
+    def test_an_answer_first_written_by_an_older_night_still_gets_a_verdict(self):
+        # The fetch reads runs back to the lifecycle (fetch_cache.py), so a night
+        # older than the 30-hour object window is still in nightly_runs.
+        old_night = "1780000000000000000"
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.conversation("t_00000001", (True, True), recorded_from=old_night)
+        report, _ = self.report({NIGHT: [], old_night: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
+        self.assertEqual(report["served_conversations"], {"match": 1, "mismatch": 0, "unknown": 0})
+        self.assertEqual(report["cases"]["case-a"]["nightly"], {old_night: {"passes": 1, "scored": 1, "outcomes": ["pass"]}})
 
     def test_a_front_doors_opening_counts_for_the_run_its_conversation_names(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])

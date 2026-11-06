@@ -28,6 +28,9 @@ class FakeBucket:
         self.root = root
         self.created = {}
         self.extra_listing = ""
+        # The listing's outcome when not a plain success: (status, stderr), or None for a timed-out call.
+        self.ls_result = ("ok",)
+        self.copied = []
 
     def put(self, key, content, created=NOW):
         path = os.path.join(self.root, key)
@@ -39,6 +42,10 @@ class FakeBucket:
     def __call__(self, kind, cmd, timeout, input=None, env=None):
         prefix = f"gs://{BUCKET}/"
         if cmd[:4] == ["gcloud", "storage", "ls", "-l"]:
+            if self.ls_result is None:
+                return None
+            if self.ls_result[0] != "ok":
+                return subprocess.CompletedProcess(cmd, self.ls_result[0], b"", self.ls_result[1])
             listed = cmd[4][len(prefix):].rstrip("*")
             lines = []
             for key, created in sorted(self.created.items()):
@@ -53,6 +60,7 @@ class FakeBucket:
         dest = cmd[-1]
         os.makedirs(dest, exist_ok=True)
         for url in filter(None, input.decode().split("\n")):
+            self.copied.append(url[len(prefix):])
             src = os.path.join(self.root, url[len(prefix):])
             if os.path.exists(src):
                 shutil.copyfile(src, os.path.join(dest, os.path.basename(url)))
@@ -218,6 +226,67 @@ class FetchTest(unittest.TestCase):
         self.record("101", 1, {VERSION: [f"answers/{fp(1)}.json", (f"answers/{fp(2)}.json", 10, "")]})
         result = self.fetcher().fetch(self.dest)
         self.assertEqual((result.objects, result.downloaded), (2, 1))
+
+    def test_an_empty_bucket_lists_empty_and_a_failed_listing_says_so(self):
+        self.bucket.ls_result = (1, b"ERROR: (gcloud.storage.ls) One or more URLs matched no objects.")
+        self.assertEqual(self.fetcher().fetch(self.dest).records, 0)
+        for result, cls in (((1, b"ERROR: 403 caller does not have storage.objects.list access to gs://b"),
+                             "list_failed_permission_denied"),
+                            ((1, b"ERROR: (gcloud.storage.ls) Your credentials are invalid. Please run reauthenticate"),
+                             "list_failed_unauthenticated"),
+                            (None, "list_failed")):
+            with self.subTest(cls=cls):
+                self.bucket.ls_result = result
+                with self.assertRaises(FC.ListFailed) as raised:
+                    self.fetcher().fetch(self.dest)
+                self.assertEqual(raised.exception.args[0], cls)
+
+    def test_main_names_a_failed_listing_and_reads_an_empty_one_as_empty(self):
+        import contextlib
+        import io
+        for result, error in (((1, b"ERROR: 403 AccessDenied on gs://secret-bucket-name"), "list_failed_permission_denied"),
+                              ((1, b"ERROR: One or more URLs matched no objects."), None),
+                              (("ok",), None)):
+            with self.subTest(error=error, result=result[0]):
+                self.bucket.ls_result = result
+                original = FC.default_run
+                FC.default_run = self.bucket
+                out = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(out):
+                        status = FC.main(["--bucket", BUCKET, "--dest", self.dest, "--version", VERSION])
+                finally:
+                    FC.default_run = original
+                summary = json.loads(out.getvalue())
+                self.assertEqual(summary.get("error"), error)
+                self.assertEqual(status, 1, "nothing to replay either way")
+                self.assertNotIn("secret-bucket-name", out.getvalue())
+                if error is None:
+                    self.assertEqual(summary["records"], 0)
+
+    def test_runs_come_from_records_back_to_the_lifecycle_and_objects_from_the_window(self):
+        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
+        old_runs = [{"case": "a", "rep": 1, "outcome": "pass"}]
+        self.record("100", 1, {VERSION: [f"answers/{fp(1)}.json"]}, runs=old_runs[:0], created=NOW - 48 * HOUR)
+        self.record("100", 2, {VERSION: []}, runs=old_runs, created=NOW - 47 * HOUR)
+        self.record("99", 1, {}, runs=old_runs, created=NOW - 40 * 24 * HOUR)
+        self.record("101", 1, {VERSION: [f"answers/{fp(2)}.json"]}, runs=old_runs)
+        result = self.fetcher(max_age_hours=30).fetch(self.dest, self.runs_out)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "answers")), [f"{fp(2)}.json"], "objects: the window only")
+        self.assertEqual((result.records, result.verdict_records), (1, 1))
+        with open(self.runs_out) as handle:
+            runs = json.load(handle)
+        self.assertEqual(sorted(runs), ["100", "101"], "build 99 is past the lifecycle")
+        self.assertEqual(runs["100"], old_runs, "an older build's newest record")
+        self.assertEqual([k for k in self.bucket.copied if "builds/100/" in k],
+                         ["replay-cache/builds/100/publish-2.json"], "one record per older build: its newest")
+
+    def test_the_real_runner_hands_back_a_failed_listing_for_the_fetcher_to_class(self):
+        import sys
+        failing = [sys.executable, "-c", "import sys; sys.stderr.write('matched no objects'); sys.exit(1)"]
+        proc = FC.default_run("list_records", failing, 30)
+        self.assertEqual((proc.returncode, proc.stderr), (1, b"matched no objects"))
+        self.assertIsNone(FC.default_run("upload", failing, 30), "other kinds still fail as None")
 
     def test_a_build_with_a_dot_is_a_record_like_any_other(self):
         self.objects(VERSION, f"answers/{fp(1)}.json")

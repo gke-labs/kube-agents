@@ -16,8 +16,11 @@ It writes, into `--out`:
   that passed are published (publish_cache.py), so a recording's verdict is a
   pass, and a mismatch is a replayed run that failed. A conversation whose run
   can't be told (run_attribution.py), whose run bench-gate graded as neither a
-  pass nor a fail (infra, blocked, not_applicable), or whose nightly left no
-  record is `unknown`;
+  pass nor a fail (infra, blocked, not_applicable), or whose recording night
+  is in no record the fetch read is `unknown`, each counted by reason in
+  `unknown_reasons`. The recording night is the one that first wrote the
+  answer, which can be as old as the bucket's lifecycle; the fetch reads runs
+  that far back;
 - `summary.txt`: the counts, for the job log.
 
 Both JSON files hold hashes and scrubbed snippets of requests, so they go to the
@@ -42,6 +45,10 @@ SUMMARY = "summary.txt"
 MATCH = analyze_replay.VERDICT_MATCH
 MISMATCH = analyze_replay.VERDICT_MISMATCH
 UNKNOWN = analyze_replay.VERDICT_UNKNOWN
+# Why a served conversation's comparison is unknown, counted in the report.
+RUN_UNATTRIBUTED = "run_unattributed"
+RECORDING_BUILD_UNRECORDED = "recording_build_unrecorded"
+NO_VERDICT = "no_verdict"
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
 TEXT_ENCODING = "utf-8"
@@ -121,21 +128,32 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
             case["nightly"][build] = outcomes if outcomes is not None else UNKNOWN
     # Per served conversation: the lane run's verdict against the recording's.
     conversation_counts = {MATCH: 0, MISMATCH: 0, UNKNOWN: 0}
+    unknown_reasons: Dict[str, int] = {}
     mismatched: List[Dict[str, Any]] = []
+
+    def unknown(reason: str) -> None:
+        conversation_counts[UNKNOWN] += 1
+        unknown_reasons[reason] = unknown_reasons.get(reason, 0) + 1
+
     for conv in convs:
         if not any(l.served for l in conv.lines):
             continue
         keys = {run_of.get(l.request_id) for l in conv.lines} - {None}
         recorded = conv.recorded_build()
-        if len(keys) != 1 or not recorded or recorded not in nightly_runs:
-            conversation_counts[UNKNOWN] += 1
+        if len(keys) != 1:
+            unknown(RUN_UNATTRIBUTED)
+            continue
+        # The night that first wrote the answer, which can be weeks old: the
+        # fetch reads runs back to the bucket's lifecycle (fetch_cache.py).
+        if not recorded or recorded not in nightly_runs:
+            unknown(RECORDING_BUILD_UNRECORDED)
             continue
         key = next(iter(keys))
         run = by_key.get(key)  # type: ignore[arg-type]
         # Only a pass or a fail is a verdict; infra, blocked and not_applicable
         # say nothing about what replay served (bench-gate's RepResult outcomes).
         if run is None or run.outcome not in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL):
-            conversation_counts[UNKNOWN] += 1
+            unknown(NO_VERDICT)
         elif run.passed:
             conversation_counts[MATCH] += 1
         else:
@@ -145,6 +163,7 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
     return {
         "cases": cases,
         "served_conversations": conversation_counts,
+        "unknown_reasons": unknown_reasons,
         "mismatched_conversations": mismatched,
         "unattributed_prompt_tokens": unattributed_tokens,
         "lost_lines": logs.lost,
@@ -157,7 +176,8 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
         f" {replay['served_via_answer_slots_token_percent']}% through answer slots)",
-        f"served conversations against the recording's verdict: {report['served_conversations']}",
+        f"served conversations against the recording's verdict: {report['served_conversations']}"
+        f" (unknown because: {report['unknown_reasons'] or 'none'})",
     ]
     for name, case in sorted(report["cases"].items()):
         lane = case["lane"]

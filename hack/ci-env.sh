@@ -1049,7 +1049,7 @@ prepare_replay_lane_cache() {
   if ! python3 "${REPLAY_CACHE_FETCH_SCRIPT}" --bucket "${REPLAY_CACHE_BUCKET}" --dest "${REPLAY_LANE_SEED_DIR}" \
     --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
     --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" < /dev/null; then
-    echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, or refused what it found (the line above says which)." >&2
+    echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
   fi
   local args=(
