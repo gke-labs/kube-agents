@@ -86,8 +86,15 @@ verification_spec:
       fold_decoration: true
       required_patterns:
         # The one-line heading: the form calls it the summary and says it
-        # becomes the issue title, and the agent labels it either way.
-        - '(?i)\b(?:summary|title)\b'
+        # becomes the issue title, and the agent labels it either way. Graded
+        # as a labelled line on the folded surface (fold_decoration turns
+        # `- **Summary:** ...` into `summary: ...` at the start of a line;
+        # the label is followed by a colon, a table bar, a dash, or nothing
+        # else on its line): since docs/designs/chat-feedback-command.md §8 every draft also
+        # offers to "add the usage summary" mid-sentence, and a bare word
+        # match would pass a reply with no heading on that offer alone.
+        # bench/tests/test_chat_feedback_heading_pattern.py holds the corpus.
+        - '(?im)^(?:summary|title)\s*(?:[:|–—-]|$)'
         - '(?i)\bbug\b'
         - "(?i)what happened"
         - "(?i)posted twice"

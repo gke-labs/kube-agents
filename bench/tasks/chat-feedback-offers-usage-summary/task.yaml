@@ -68,10 +68,16 @@ verification_spec:
       fold_decoration: true
       required_patterns:
         # The one-line heading: the form calls it the summary and says it
-        # becomes the issue title, and the agent labels it either way. The
-        # offer's own "usage summary" is excluded, or the heading could never
-        # be missing from a reply that makes the offer.
-        - '(?i)\b(?<!usage )(?:summary|title)\b'
+        # becomes the issue title, and the agent labels it either way. Graded
+        # as a labelled line on the folded surface (fold_decoration turns
+        # `- **Summary:** ...` into `summary: ...` at the start of a line;
+        # the label is followed by a colon, a table bar, a dash, or nothing
+        # else on its line), because the offer this reply must also make
+        # says "usage summary" mid-sentence and would otherwise satisfy the
+        # heading check on its own, in every spelling ("usage-summary", a
+        # wrap, "a summary of the install's usage").
+        # bench/tests/test_chat_feedback_heading_pattern.py holds the corpus.
+        - '(?im)^(?:summary|title)\s*(?:[:|–—-]|$)'
         # The kind. The prompt's "once a day would do" reads as a bug or as a
         # request, and the red run on main labelled it Feature request with
         # the rest of the draft in order; either label is the composed kind,
