@@ -486,6 +486,12 @@ def _cell(value) -> str:
     return str(value).replace("|", "/").replace("\n", " ")
 
 
+def _workload_rows(meta: dict) -> list[dict]:
+    """The workloads an audit listed as objects: what the Coverage cell counts and the
+    inventory table shows. A list of booleans (a relayed list one level down) counts none."""
+    return [w for w in _list(meta.get("workloads")) if isinstance(w, dict)]
+
+
 def _named(meta) -> bool:
     """An audit the report can list: it names its project and cluster."""
     return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
@@ -501,11 +507,17 @@ def _malformed(meta: dict) -> list[tuple[str, str]]:
     """The list fields the audit SOP prescribes that a card set to something else.
 
     An empty value of the wrong type (``{}``, ``""``, ``0``) says "none" and
-    loses nothing, so it is not reported.
+    loses nothing, so it is not reported. A boolean is reported even when it is
+    ``False``: a worker that relays a list as ``false`` has lost the list, and
+    an audit read as complete with no workloads would stand as a clean cluster.
     """
-    bad = [(f, type(meta[f]).__name__) for f in LIST_FIELDS if meta.get(f) and not isinstance(meta[f], list)]
+    bad = [
+        (f, type(meta[f]).__name__)
+        for f in LIST_FIELDS
+        if (meta.get(f) or isinstance(meta.get(f), bool)) and not isinstance(meta[f], list)
+    ]
     gaps = meta.get("gaps")
-    if gaps and not isinstance(gaps, (list, str)):
+    if (gaps or isinstance(gaps, bool)) and not isinstance(gaps, (list, str)):
         bad.append(("gaps", type(gaps).__name__))
     return bad
 
@@ -581,6 +593,12 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
                 f"{_cell(meta.get('cluster'))} ({card_id}): {dropped} reported finding(s) had no `issue` "
                 "or `title` to list, so they are not in the plan or the findings block"
             )
+        unlisted = len(_list(meta.get("workloads"))) - len(_workload_rows(meta))
+        if unlisted:
+            gaps.append(
+                f"{_cell(meta.get('cluster'))} ({card_id}): {unlisted} reported workload(s) were not objects, "
+                "so they are neither counted nor listed"
+            )
     for gap in _gap_list(sweep["metadata"]):
         gaps.append(f"sweep {sweep['id']}: {_cell(gap)}")
     if sweep["status"] in (BLOCKED, TRIAGE):
@@ -639,10 +657,14 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :------ | :------- | :--- | ----------------: | :-------------- |",
     ]
     for meta, card_id in audits:
-        complete = not _gap_list(meta) and not _malformed(meta)
+        complete = (
+            not _gap_list(meta)
+            and not _malformed(meta)
+            and len(_workload_rows(meta)) == len(_list(meta.get("workloads")))
+        )
         out.append(
             f"| {_cell(meta.get('cluster'))} | {_cell(meta.get('project'))} | {_cell(meta.get('location'))} "
-            f"| {card_id} | {len(_list(meta.get('workloads')))} | {'yes' if complete else 'no — see Gaps'} |"
+            f"| {card_id} | {len(_workload_rows(meta))} | {'yes' if complete else 'no — see Gaps'} |"
         )
     out += [
         "",
@@ -679,9 +701,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |",
     ]
     for meta, _ in audits:
-        for w in _list(meta.get("workloads")):
-            if not isinstance(w, dict):
-                continue
+        for w in _workload_rows(meta):
             row = f"| {_cell(meta.get('cluster'))} | {_cell(w.get('namespace'))} | {_cell(w.get('name'))} "
             row += f"| {_cell(w.get('kind'))} | {_cell(w.get('replicas'))} "
             row += (

@@ -728,7 +728,28 @@ class HandOffTest(unittest.TestCase):
         clusters = [("t_1", "running", None, ""), ("t_2", "archived", None, "")]
         self.assertEqual(self._carded_run(carded, clusters, ["t_0", "t_1", "t_2"], cap=2), [])
 
+    def test_a_boolean_where_a_list_belongs_is_malformed(self):
+        # Green 1 of #4115: a worker relayed the collector's object with
+        # `workloads: false` and `findings: [false, ...]`; a falsy bool must not
+        # read as "none" and leave the Coverage row saying scanned in full.
+        meta = {"project": "p", "cluster": "c", "workloads": False, "findings": [False, False], "gaps": False}
+        bad = dict(h._malformed(meta))
+        self.assertEqual(bad.get("workloads"), "bool")
+        self.assertEqual(bad.get("gaps"), "bool")
+        self.assertNotIn("findings", bad)  # a list, its items dropped as unnamed findings
+        self.assertEqual(h._malformed({"project": "p", "cluster": "c", "workloads": 0, "findings": ""}), [])
+
+    def test_workloads_that_are_not_objects_are_not_counted(self):
+        meta = {"project": "p", "cluster": "c", "location": "l", "workloads": [False, "x", {"namespace": "n", "name": "w"}],
+                "findings": [], "topology": {}}
+        state = {"sweep": {"id": "t_s", "status": "done", "block_reason": "", "metadata": {"clusters": [meta], "fleet": []}},
+                 "clusters": [], "archived_clusters": 0}
+        raw = h.compose(state, timed_out=False, now=NOW)
+        self.assertIn("| c | p | l | t_s | 1 | no — see Gaps |", raw)
+        self.assertIn("c (t_s): 2 reported workload(s) were not objects, so they are neither counted nor listed", raw)
+
     def test_a_malformed_carded_list_narrows_and_never_widens(self):
+
         # Entries that are not cluster card keys are dropped; a list with none
         # left files nothing rather than falling back to the cap alone.
         roster = ["t_0", "t_1", "t_2"]

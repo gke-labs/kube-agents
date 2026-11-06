@@ -105,9 +105,11 @@ class FakeRun:
         self.describe = describe
         self.fail_kinds = set(fail_kinds)
         self.calls = []
+        self.timeouts = []
 
     def __call__(self, argv, **kwargs):
         self.calls.append((argv, kwargs.get("env", {}).get("KUBECONFIG")))
+        self.timeouts.append(kwargs.get("timeout"))
         if argv[:4] == ["gcloud", "container", "clusters", "get-credentials"]:
             return collector_run.Run(argv, self.credentials_rc, "", "denied" if self.credentials_rc else "", 0.1)
         if argv[:4] == ["gcloud", "container", "clusters", "describe"]:
@@ -235,6 +237,63 @@ class Gaps(unittest.TestCase):
         self.assertFalse(any(argv[0] == "kubectl" for argv, _ in fake.calls))
         # The description still answered, so the topology is there for the fleet table.
         self.assertEqual(meta["topology"]["k8s_version"], "1.34.1-gke.1829001")
+        # Nothing was read from the cluster itself: no workload verdict, no finding about one.
+        self.assertIsNone(meta["topology"]["observability"])
+        self.assertIsNone(meta["topology"]["deployment_toolchain"])
+        self.assertEqual(_checks(meta, "no-otel-collector"), [])
+        self.assertEqual({f["check"] for f in meta["findings"]}, {"shielded-nodes", "datapath-provider", "no-autoupgrade"})
+
+    def test_a_failed_describe_leaves_the_settings_unknown_not_off(self):
+        meta, _ = _collect(describe=None)
+        topo = meta["topology"]
+        self.assertIsNone(topo["k8s_version"])
+        self.assertIsNone(topo["workload_identity"])
+        self.assertIsNone(topo["dataplane_v2"])
+        self.assertEqual(topo["node_pools"], [])
+        self.assertEqual(_checks(meta, "datapath-provider"), [])
+        self.assertEqual(_checks(meta, "shielded-nodes"), [])
+        self.assertEqual(bootstrap_handoff._cell(topo["dataplane_v2"]), "n/a")
+
+    def test_a_failed_workload_dump_raises_no_collector_finding(self):
+        meta, _ = _collect(fail_kinds=("deployments",))
+        self.assertIsNone(meta["topology"]["observability"])
+        # The namespaces were read and name no toolchain; "none observed" would be a
+        # verdict on the workload dump, which was not read.
+        self.assertIsNone(meta["topology"]["deployment_toolchain"])
+        self.assertEqual(_checks(meta, "no-otel-collector"), [])
+        self.assertEqual(_checks(meta, "probes-startup"), [])
+        self.assertEqual(len(meta["namespace_governance"]), 2)
+
+    def test_the_read_budget_bounds_the_run(self):
+        # A clock that is already past the budget: the credential and describe
+        # reads run with the one-second floor, the two dumps are gaps, nothing hangs.
+        fake = FakeRun()
+        ticks = iter([0.0] + [1000.0] * 50)
+        budget = cic._Budget(seconds=cic.READ_BUDGET_SECONDS, clock=lambda: next(ticks))
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), redirect_stderr(io.StringIO()):
+            meta = cic.collect_cluster_inventory(PROJECT, LOCATION, CLUSTER, run=fake, budget=budget)
+        self.assertEqual(meta["workloads"], [])
+        self.assertEqual([g for g in meta["gaps"] if "read budget" in g].__len__(), 2)
+        self.assertFalse(any(argv[0] == "kubectl" for argv, _ in fake.calls))
+        self.assertEqual(cic.READ_BUDGET_SECONDS < cic.TERMINAL_TIMEOUT_SECONDS, True)
+
+    def test_each_read_gets_the_time_the_budget_has_left(self):
+        # A clock at 0, then 450 s into a 480 s budget: the first reads get the
+        # 60 s cap, the later ones the 30 s left, and after the deadline 1 s.
+        fake = FakeRun()
+        ticks = iter([0.0, 0.0, 0.0, 450.0, 450.0, 450.0] + [1000.0] * 50)
+        budget = cic._Budget(seconds=480, clock=lambda: next(ticks))
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), redirect_stderr(io.StringIO()):
+            cic.collect_cluster_inventory(PROJECT, LOCATION, CLUSTER, run=fake, budget=budget)
+        self.assertEqual(fake.timeouts[:2], [60, 60])
+        self.assertIn(30, fake.timeouts)
+        self.assertEqual(fake.timeouts[-1], 1)
+
+    def test_a_failed_page_gap_carries_no_continue_token(self):
+        gap = cic._gap("Step 3", ["kubectl", "get", "--raw", "/apis/apps/v1/deployments?limit=500&continue=eyJ2IjoibWV0YSJ9"],
+                       collector_run.Run(["kubectl"], 1, "", "boom", 0.1))
+        self.assertNotIn("eyJ2", gap)
+        self.assertIn("deployments", gap)
 
     def test_failed_dump_is_a_gap_not_a_clean_cluster(self):
         meta, _ = _collect(fail_kinds=("deployments",))
@@ -249,7 +308,7 @@ class Gaps(unittest.TestCase):
         meta, _ = _collect(describe=None)
         self.assertEqual(len(meta["gaps"]), 1)
         self.assertIn("Step 2", meta["gaps"][0])
-        self.assertEqual(meta["topology"]["k8s_version"], "")
+        self.assertIsNone(meta["topology"]["k8s_version"])
         self.assertEqual(len(meta["workloads"]), 7)
         self.assertEqual(_checks(meta, "shielded-nodes"), [])
 
@@ -267,7 +326,7 @@ class Gaps(unittest.TestCase):
         meta, _ = _collect(describe=["not", "an", "object"])
         self.assertEqual(len(meta["gaps"]), 1)
         self.assertIn("not a JSON object", meta["gaps"][0])
-        self.assertEqual(meta["topology"]["k8s_version"], "")
+        self.assertIsNone(meta["topology"]["k8s_version"])
         self.assertEqual(len(meta["workloads"]), 7)
 
 

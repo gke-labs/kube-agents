@@ -17,10 +17,12 @@ the credential proxy's gcloud shim; a paged workload dump (Deployments,
 StatefulSets, DaemonSets, Jobs) and a paged dump of namespaces with their
 ResourceQuotas and LimitRanges, as ``kubectl get --raw`` pages through the
 kube-proxy kubeconfig the sandbox's ``get-credentials`` writes (#3760), which
-needs the sandbox image's kubectl 1.34 or later (#4739). Up to ten calls of
-60 s each, so the terminal that runs it needs a 600 s timeout. A read that
-fails is a ``gaps`` entry, never a guess: the object still names its project
-and cluster, so the hand-off lists the cluster with its gap rather than losing it.
+needs the sandbox image's kubectl 1.34 or later (#4739). Nine reads plus one
+page per 500 objects of a kind, each up to 60 s, under a run-wide budget of
+READ_BUDGET_SECONDS, so the script returns inside the terminal's 600 s cap. A
+read that fails, or finds no budget left, is a ``gaps`` entry, never a guess:
+the unread fields are null, and the object still names its project and
+cluster, so the hand-off lists the cluster with its gap rather than losing it.
 
 Findings carry the SOP's own slugs and nothing the first-run audits own.
 Workloads in provider namespaces (kube-system and the ``gke-``/``gmp-``
@@ -37,6 +39,7 @@ import functools
 import json
 import shlex
 import sys
+import time
 from pathlib import Path
 
 if str(Path(__file__).resolve().parent) not in sys.path:
@@ -124,11 +127,21 @@ TRUE_WORD = "true"
 DESCRIBE_NOT_AN_OBJECT = "the cluster description was not a JSON object"
 # How much of a failed command's stderr a gap quotes.
 GAP_STDERR_CHARS = 200
+# The whole run's read budget: the terminal that runs this script is capped at
+# TERMINAL_TIMEOUT_SECONDS (agents/platform/AGENTS.md, the foreground maximum),
+# and nine reads plus one page per 500 objects of a kind, each up to
+# collect.DEFAULT_TIMEOUT_S, can pass it on a large, slow cluster. Every read
+# gets the time left under this budget, and a read that finds none left is a
+# gap, so the script always returns before the terminal gives up on it.
+TERMINAL_TIMEOUT_SECONDS = 600
+READ_BUDGET_SECONDS = 480
+BUDGET_EXHAUSTED = "the read budget of {budget} s was spent before this read, so it did not run"
 EXIT_OK = 0
 
 Run = collector_run.Run
 RunFn = collect.RunFn
 default_run = functools.partial(collector_run.default_run, timeout=collect.DEFAULT_TIMEOUT_S)
+failed_page_text = collector_run.failed_page_text
 
 
 def _describe_argv(project: str, location: str, cluster: str) -> list[str]:
@@ -140,7 +153,7 @@ def _describe_argv(project: str, location: str, cluster: str) -> list[str]:
 
 def _gap(step: str, argv: list[str], result: Run) -> str:
     text = result.stderr.strip() or result.stdout.strip()
-    return f"{step}: `{shlex.join(argv)}` failed (rc={result.rc}): {text[:GAP_STDERR_CHARS]}"
+    return f"{step}: `{failed_page_text(argv)}` failed (rc={result.rc}): {text[:GAP_STDERR_CHARS]}"
 
 
 def _provider_managed(namespace: str) -> bool:
@@ -290,7 +303,10 @@ def namespace_governance(dump: dict | None) -> tuple[list[dict], list[dict]]:
     return rows, findings
 
 
-def _observability(workloads: list[dict]) -> str:
+def _observability(workloads: list[dict] | None) -> str | None:
+    """Step 4.1's verdict from the workload dump, or None when the dump was not read."""
+    if workloads is None:
+        return None
     for w in workloads:
         meta = w.get("metadata") or {}
         if meta.get("namespace") == OTEL_MANAGED_NAMESPACE:
@@ -302,10 +318,15 @@ def _observability(workloads: list[dict]) -> str:
     return OBSERVABILITY_NONE
 
 
-def _deployment_toolchain(namespaces: list[str], workloads: list[dict]) -> str:
+def _deployment_toolchain(namespaces: list[str] | None, workloads: list[dict] | None) -> str | None:
+    """Step 3.3's toolchain column: a toolchain's namespace when the namespace dump
+    was read and names one, else what the workloads say, else None when the
+    workload dump was not read ("none observed" is a verdict only on a dump that was)."""
     for ns, toolchain in TOOLCHAIN_NAMESPACES:
-        if ns in namespaces:
+        if ns in (namespaces or []):
             return toolchain
+    if workloads is None:
+        return None
     for w in workloads:
         meta = w.get("metadata") or {}
         managed_by = str((meta.get("labels") or {}).get(MANAGED_BY_LABEL, "")).lower()
@@ -332,13 +353,24 @@ def _node_pools(describe: dict) -> list[dict]:
     return pools
 
 
-def topology(describe: dict, namespaces: list[str], workloads: list[dict]) -> dict:
-    """Step 2 and the Step 3.3 toolchain column, from the cluster description and the dumps."""
+def topology(describe: dict | None, namespaces: list[str] | None, workloads: list[dict] | None) -> dict:
+    """Step 2 and the Step 3.3 toolchain column, from the cluster description and the dumps.
+
+    A field whose read failed is None, which the report renders as n/a; a
+    False here would state a setting as off that was never read.
+    """
+    if describe is None:
+        version, pools, identity, dataplane = None, [], None, None
+    else:
+        version = describe.get("currentMasterVersion", "")
+        pools = _node_pools(describe)
+        identity = bool((describe.get("workloadIdentityConfig") or {}).get("workloadPool"))
+        dataplane = (describe.get("networkConfig") or {}).get("datapathProvider") == DATAPATH_V2
     return {
-        "k8s_version": describe.get("currentMasterVersion", ""),
-        "node_pools": _node_pools(describe),
-        "workload_identity": bool((describe.get("workloadIdentityConfig") or {}).get("workloadPool")),
-        "dataplane_v2": (describe.get("networkConfig") or {}).get("datapathProvider") == DATAPATH_V2,
+        "k8s_version": version,
+        "node_pools": pools,
+        "workload_identity": identity,
+        "dataplane_v2": dataplane,
         "observability": _observability(workloads),
         "deployment_toolchain": _deployment_toolchain(namespaces, workloads),
     }
@@ -353,7 +385,7 @@ def cluster_findings(describe: dict, topo: dict) -> list[dict]:
             CHECK_SHIELDED_NODES, SEVERITY_MEDIUM, AREA_SECURITY, "", "",
             "Shielded GKE Nodes are not enabled", "Enable Shielded GKE Nodes on the cluster",
         ))
-    if not topo["dataplane_v2"]:
+    if topo["dataplane_v2"] is False:
         out.append(_finding(
             CHECK_DATAPATH_PROVIDER, SEVERITY_LOW, AREA_SECURITY, "", "",
             "The cluster does not use Dataplane V2", "Migrate to Dataplane V2 for eBPF networking and NetworkPolicy logging",
@@ -384,17 +416,22 @@ def build_metadata(
     describe: dict | None, workload_dump: dict | None, governance_dump: dict | None, gaps: list[str],
 ) -> dict:
     """The SOP's Step 5 object. ``None`` for a read that failed; its gap is already in ``gaps``."""
-    workloads = [w for kind in WORKLOAD_KINDS for w in _items(workload_dump, kind)]
-    namespaces = [(n.get("metadata") or {}).get("name", "") for n in _items(governance_dump, KIND_NAMESPACE)]
-    entries = [workload_entry(w) for w in workloads]
+    # None for a dump that was not read: no workload, namespace or verdict is
+    # derived from it, and the gap already in ``gaps`` says why.
+    workloads = None if workload_dump is None else [w for kind in WORKLOAD_KINDS for w in _items(workload_dump, kind)]
+    namespaces = (
+        None if governance_dump is None
+        else [(n.get("metadata") or {}).get("name", "") for n in _items(governance_dump, KIND_NAMESPACE)]
+    )
+    entries = [workload_entry(w) for w in workloads or []]
     governance, governance_findings = namespace_governance(governance_dump)
-    topo = topology(describe or {}, namespaces, workloads)
+    topo = topology(describe, namespaces, workloads)
     findings: list[dict] = []
     if describe is not None:
         findings += cluster_findings(describe, topo)
     for entry in entries:
         findings += workload_findings(entry)
-    findings += static_key_findings(workloads)
+    findings += static_key_findings(workloads or [])
     findings += governance_findings
     return {
         "cluster": cluster,
@@ -408,11 +445,36 @@ def build_metadata(
     }
 
 
-def collect_cluster_inventory(project: str, location: str, cluster: str, *, run: RunFn = default_run) -> dict:
+class _Budget:
+    """The seconds left for the next read under READ_BUDGET_SECONDS; 0 means none."""
+
+    def __init__(self, seconds: int = READ_BUDGET_SECONDS, clock=time.monotonic) -> None:
+        self._deadline = clock() + seconds
+        self._clock = clock
+        self.seconds = seconds
+
+    def left(self) -> int:
+        return max(0, int(min(collect.DEFAULT_TIMEOUT_S, self._deadline - self._clock())))
+
+
+def _run_within(budget: "_Budget", run: RunFn) -> RunFn:
+    """``run`` with each call's timeout cut to what the budget has left."""
+
+    def within(argv: list[str], **kwargs) -> Run:
+        return run(argv, **{**kwargs, "timeout": max(1, budget.left())})
+
+    return within
+
+
+def collect_cluster_inventory(
+    project: str, location: str, cluster: str, *, run: RunFn = default_run, budget: "_Budget | None" = None
+) -> dict:
+    budget = budget or _Budget()
+    paced = _run_within(budget, run)
     gaps: list[str] = []
     describe_argv = _describe_argv(project, location, cluster)
-    kubeconfig, cred = collect.fetch_credentials(project, cluster, location, run=run)
-    describe, result = collect.run_and_gate(describe_argv, kubeconfig, run=run)
+    kubeconfig, cred = collect.fetch_credentials(project, cluster, location, run=paced)
+    describe, result = collect.run_and_gate(describe_argv, kubeconfig, run=paced)
     if describe is None:
         gaps.append(_gap(STEP_TOPOLOGY, describe_argv, result))
     elif not isinstance(describe, dict):
@@ -421,13 +483,19 @@ def collect_cluster_inventory(project: str, location: str, cluster: str, *, run:
     if cred.rc != 0:
         gaps.append(_gap(STEP_WORKLOADS, cred.argv, cred))
         return build_metadata(project, location, cluster, describe, None, None, gaps)
-    workload_dump, result = collect.paged_and_gate(WORKLOAD_RESOURCES, kubeconfig, run=run)
-    if workload_dump is None:
-        gaps.append(_gap(STEP_WORKLOADS, result.argv, result))
-    governance_dump, result = collect.paged_and_gate(GOVERNANCE_RESOURCES, kubeconfig, run=run)
-    if governance_dump is None:
-        gaps.append(_gap(STEP_WORKLOADS, result.argv, result))
-    return build_metadata(project, location, cluster, describe, workload_dump, governance_dump, gaps)
+    dumps: dict[str, dict | None] = {}
+    for resources in (WORKLOAD_RESOURCES, GOVERNANCE_RESOURCES):
+        if budget.left() <= 0:
+            dumps[resources] = None
+            gaps.append(f"{STEP_WORKLOADS}: `kubectl get {resources}`: " + BUDGET_EXHAUSTED.format(budget=budget.seconds))
+            continue
+        dump, result = collect.paged_and_gate(resources, kubeconfig, run=paced, timeout=max(1, budget.left()))
+        dumps[resources] = dump
+        if dump is None:
+            gaps.append(_gap(STEP_WORKLOADS, result.argv, result))
+    return build_metadata(
+        project, location, cluster, describe, dumps[WORKLOAD_RESOURCES], dumps[GOVERNANCE_RESOURCES], gaps
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
