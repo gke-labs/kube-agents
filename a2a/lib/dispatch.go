@@ -143,12 +143,27 @@ type DispatchMessage struct {
 	AcceptSeconds int `json:"acceptSeconds,omitempty"`
 	// Reason says why a task is abandoned. An abandon only.
 	Reason string `json:"reason,omitempty"`
+	// TaskCredential and ProxyToken are the task's own credentials (#3889,
+	// a2a/taskcred), minted for the confirmed pod. A confirm only, and only
+	// when the dispatcher has a task-signing key; without them the worker
+	// keeps its pod-level grants. TaskCredential (audience nats) is what the
+	// worker presents on its task connection to the bus. ProxyToken
+	// (audience credential-proxy) confines the task to the cluster the
+	// dispatcher checked at admission, and is absent when the task names no
+	// cluster. Both name the task, its profile and tier, the pod and its UID,
+	// and expire at the task's deadline plus a clock-skew allowance, never
+	// past the configured maximum lifetime.
+	TaskCredential string `json:"taskCredential,omitempty"`
+	ProxyToken     string `json:"proxyToken,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
 func (m DispatchMessage) Validate() error {
 	if !ValidSubjectToken(m.TaskID) {
 		return fmt.Errorf("dispatch %s: task id %q is not one subject token", m.Type, m.TaskID)
+	}
+	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
+		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
 	}
 	switch m.Type {
 	case DispatchOffer:
@@ -325,6 +340,14 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
+	// submission (the operator renders it from the same value as the
+	// stream's max age). A durable re-created over the stream replays
+	// everything inside it, so the dispatcher is to keep a finished task's
+	// tombstone at least this long (it reads this from #4873 on; until then
+	// it keeps its own default). Zero is from an operator that predates the
+	// field; the dispatcher then uses its own default.
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -368,6 +391,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case c.SubmitRetentionSeconds < 0:
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {

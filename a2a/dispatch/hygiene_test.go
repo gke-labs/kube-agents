@@ -303,7 +303,7 @@ func TestARetryNamingAnotherTargetOrCapabilityIsCheckedAgain(t *testing.T) {
 	admit := func(capKey string, params map[string]string) {
 		t.Helper()
 		del := &envDelivery{env: submissionEnv(t, "tse", "task-1", capKey, params)}
-		if ref, err := d.admit(context.Background(), del, snap, prof, hk, now); err != nil || ref != nil {
+		if _, ref, err := d.admit(context.Background(), del, snap, prof, hk, now); err != nil || ref != nil {
 			t.Fatalf("admit: refusal %+v, err %v", ref, err)
 		}
 	}

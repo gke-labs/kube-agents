@@ -80,7 +80,10 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     came from has been deleted -- the same reading GitHub's translation gives,
     and for the same reason: a caller deciding whether it opened this from its
     own branch must not take a stranger's same-named branch for it.
-    `sourceRevision` is the head sha as of this read.
+    `sourceRevision` is the head sha as of this read. `mergeCommit` is
+    `merge_commit_sha`, `None` unless merged: the merge or squash commit;
+    after a rebase or fast-forward merge, the target's tip, which may not hold
+    the whole change -- a revert must check.
     """
     if node.get("merged") or node.get("merged_at"):
         state = "merged"
@@ -103,6 +106,9 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
         "closed": node.get("closed_at") or node.get("merged_at") or "",
+        "mergeCommit": (node.get("merge_commit_sha") or None)
+        if state == "merged"
+        else None,
         "body": node.get("body") or "",
     }
 

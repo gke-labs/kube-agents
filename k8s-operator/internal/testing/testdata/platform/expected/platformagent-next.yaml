@@ -761,8 +761,6 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
-            - name: KUBE_PROXY_DEFAULT_CLUSTER
-              value: gke_example-project_us-central1-a_cluster-a
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -1773,6 +1771,8 @@ spec:
               value: /etc/a2a-nats-ca/ca.crt
             - name: A2A_BUS_USER
               value: agent
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: A2A_ACTIVITY_SECRET
@@ -2047,6 +2047,8 @@ spec:
               value: example-project
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: PATH
@@ -2809,7 +2811,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "8074ba90e1da2a3d",
+      "version": "4b0b34d2bf914fb8",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2837,6 +2839,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_people",
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+              "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -2848,6 +2851,7 @@ data:
               "$JS.API.STREAM.INFO.KV_people",
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+              "$JS.API.STREAM.INFO.DISPATCH_STOPS",
               "_INBOX.provision.>"
             ],
             "subscribe": [
@@ -2917,7 +2921,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 8074ba90e1da2a3d
+    kubeagents.x-k8s.io/a2a-authmap-version: 4b0b34d2bf914fb8
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3586,6 +3590,8 @@ stringData:
                   "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
                   "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+                  "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+                  "$JS.API.STREAM.INFO.DISPATCH_STOPS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -3662,7 +3668,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -3705,7 +3712,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -3837,7 +3845,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -4639,7 +4648,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "27"
+    pods: "34"
 status: {}
 ---
 apiVersion: v1
@@ -4800,7 +4809,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-75f02ec0
+  name: platformagent-a2a-provision-8573af72
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5015,41 +5024,52 @@ spec:
               stream add PROFILE_SUBMITS --allow-direct \\\n  --subjects='a2a.submit.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=1073741824
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=1 --dupe-window=2m
-              \\\n  --max-consumers=64 --defaults\n\n# TASKS older than this render: the
-              limits the create above could not apply.\n#\n# Provisioning is create-only
-              convergence - the info-then-add guards never\n# edit an existing stream,
-              which buildA2AProvisionJob says in terms - so an\n# install whose TASKS
-              predates a limit keeps the stream it was created with\n# and gains nothing
-              from a re-run. Both limits this render puts on TASKS are\n# in exactly that
-              position on every install that already has the stream, and\n# the two gaps
-              are not the same kind:\n#\n#   max_consumers short is a capacity shortfall
-              with a load-time failure\n#   attached. A legitimate session's consumer
-              create is refused, surfaced as\n#   a task failure, with nothing in it pointing
-              at the stream. Worth\n#   refusing over here, where the number that caused
-              it is in hand.\n#\n#   max_msgs_per_subject absent is a missing bound, not
-              a broken one: the\n#   install behaves exactly as it did before this render
-              carried the flag.\n#   Applying it would be a TIGHTENING, and a tightening
-              evicts: a\n#   stream edit that lowers max_msgs_per_subject drops every
-              message over\n#   the new limit on every subject the moment it lands. Truncating
-              a running\n#   install's task history as an automatic side effect of an
-              operator\n#   upgrade is not a decision this script takes on an operator's
-              behalf. It\n#   reports, names the edit and what the edit costs, and moves
-              on.\n#\n# This runs LAST, after every other stream and bucket, so the refusal
-              below\n# leaves a fully provisioned bus short one limit rather than a bus
-              missing\n# DIRECTORY, the topic streams and the KV buckets. The refusal
-              is reached on\n# an operator upgrade alone, with no CR edit involved - an
-              install already\n# running maxSessions above what its stream holds has been
-              under-provisioned\n# the whole time, and this is the first thing that says
-              so.\n#\n# Parsed with grep rather than jq: nats-box is the image, and grep
-              is in\n# busybox for certain. An unparseable answer FAILS - a check that
-              silently\n# skips when its extractor stops matching is not a check.\ntasks_json=\"$($NATS
-              stream info TASKS --json | tr -d ' \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf
-              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}'
-              | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ];
-              then\n  echo \"could not read max_msgs_per_subject off the TASKS stream;
-              refusing to report this install as provisioned\" >&2\n  exit 1\nfi\n#\n#
-              Unbounded and merely different are not the same report. An unbounded stream\n#
-              is the gap: nothing stops one task evicting another session's history, which\n#
+              \\\n  --max-consumers=64 --defaults\n\n# DISPATCH_STOPS: the gateway's stop
+              records for AgentProfile tasks, one per\n# task (a2a.stop.<profile>.<task>),
+              read by the dispatcher by subject (contract\n# addendum 9). It is outside
+              a2a.dispatch. on purpose: the dispatcher publishes\n# there, and a stop
+              must have one writer, the gateway (granted with #4127). A\n# record outlives
+              any task (24h against the 6h deadline cap). Nothing makes a\n# consumer
+              here; --max-consumers=1 is the tightest cap JetStream has, since 0\n# means
+              unlimited.\n$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream
+              add DISPATCH_STOPS --allow-direct \\\n  --subjects='a2a.stop.>' --storage=file
+              --retention=limits \\\n  --max-age=24h --max-bytes=67108864 --discard=old
+              --replicas=1 \\\n  --max-msgs-per-subject=1 --max-consumers=1 --defaults\n\n#
+              TASKS older than this render: the limits the create above could not apply.\n#\n#
+              Provisioning is create-only convergence - the info-then-add guards never\n#
+              edit an existing stream, which buildA2AProvisionJob says in terms - so an\n#
+              install whose TASKS predates a limit keeps the stream it was created with\n#
+              and gains nothing from a re-run. Both limits this render puts on TASKS are\n#
+              in exactly that position on every install that already has the stream, and\n#
+              the two gaps are not the same kind:\n#\n#   max_consumers short is a capacity
+              shortfall with a load-time failure\n#   attached. A legitimate session's
+              consumer create is refused, surfaced as\n#   a task failure, with nothing
+              in it pointing at the stream. Worth\n#   refusing over here, where the number
+              that caused it is in hand.\n#\n#   max_msgs_per_subject absent is a missing
+              bound, not a broken one: the\n#   install behaves exactly as it did before
+              this render carried the flag.\n#   Applying it would be a TIGHTENING, and
+              a tightening evicts: a\n#   stream edit that lowers max_msgs_per_subject
+              drops every message over\n#   the new limit on every subject the moment
+              it lands. Truncating a running\n#   install's task history as an automatic
+              side effect of an operator\n#   upgrade is not a decision this script takes
+              on an operator's behalf. It\n#   reports, names the edit and what the edit
+              costs, and moves on.\n#\n# This runs LAST, after every other stream and
+              bucket, so the refusal below\n# leaves a fully provisioned bus short one
+              limit rather than a bus missing\n# DIRECTORY, the topic streams and the
+              KV buckets. The refusal is reached on\n# an operator upgrade alone, with
+              no CR edit involved - an install already\n# running maxSessions above what
+              its stream holds has been under-provisioned\n# the whole time, and this
+              is the first thing that says so.\n#\n# Parsed with grep rather than jq:
+              nats-box is the image, and grep is in\n# busybox for certain. An unparseable
+              answer FAILS - a check that silently\n# skips when its extractor stops matching
+              is not a check.\ntasks_json=\"$($NATS stream info TASKS --json | tr -d '
+              \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf '%s' \"${tasks_json}\" \\\n
+              \ | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}' | head -n1
+              | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ]; then\n  echo
+              \"could not read max_msgs_per_subject off the TASKS stream; refusing to
+              report this install as provisioned\" >&2\n  exit 1\nfi\n#\n# Unbounded and
+              merely different are not the same report. An unbounded stream\n# is the
+              gap: nothing stops one task evicting another session's history, which\n#
               is the whole reason the render carries the flag. A stream carrying some
               other\n# finite cap is bounded already, and telling the operator who chose
               it that\n# their stream \"predates the limit\" is telling them something
@@ -5311,6 +5331,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -5401,6 +5422,11 @@ spec:
           ports:
             - containerPort: 9096
               name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
           resources:
             limits:
               cpu: 500m

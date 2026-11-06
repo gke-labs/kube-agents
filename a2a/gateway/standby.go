@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // A standby's doors (docs/designs/gateway-replicas.md, "Reaching the active
@@ -143,6 +145,15 @@ func standbyHandler(namespace, port string, view *LeaseView) http.Handler {
 		if holder == "" {
 			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
 				Error: "this gateway replica is the standby, and no replica holds the lease right now; retry in a few seconds",
+			})
+			return
+		}
+		// The Lease's holder is a string anyone who can write the Lease sets,
+		// and the standby puts it into a command a person is told to copy
+		// and run, so only a pod's name (a DNS-1123 subdomain) goes in.
+		if len(validation.IsDNS1123Subdomain(holder)) > 0 {
+			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
+				Error: "this gateway replica is the standby, and the lease names a holder that isn't a pod name; read the Lease to see who holds it",
 			})
 			return
 		}

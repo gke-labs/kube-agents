@@ -363,7 +363,8 @@ def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) ->
                     mode="markers",
                     name=f"{series.name} ({EXCLUDED_LABEL})" if excluded else series.name,
                     legendgroup=series.name,
-                    showlegend=not excluded,
+                    # A series with no kept point names itself on its excluded points instead.
+                    showlegend=not excluded or not any(not point.excluded for point in series.points),
                     marker={
                         "color": color,
                         "size": HARNESS_MARKER_SIZE,

@@ -609,6 +609,51 @@ def use_snapshot(case, files=None, *, error=None, calls=None, unreadable=(), rea
     return Snapshot
 
 
+def use_large_repository(case, files, *, too_large=(), calls=None):
+    """Make `audit_report.RepositorySnapshot` act for a repository over the snapshot ceiling.
+
+    A snapshot of the whole tree, or of a path in `too_large`, is refused with
+    `SNAPSHOT_TOO_LARGE`; a snapshot of a path that names nothing in `files`
+    (a file, or a directory holding some) is refused with `PATH_NOT_FOUND`;
+    any other narrow snapshot unpacks the files under that path. `calls`
+    collects the `paths` of each snapshot asked for.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="large-repo-"))
+    case.addCleanup(shutil.rmtree, scratch, True)
+
+    def refused(code, message):
+        error = vcs_client.VcsError(message, code=code, revision=SNAPSHOT_TEST_REVISION)
+        return error
+
+    class Snapshot(audit_report.RepositorySnapshot):
+        def __init__(self, repo, ref=None, paths=None):
+            if calls is not None:
+                calls.append(paths)
+            if not paths or paths[0] in too_large:
+                raise refused("SNAPSHOT_TOO_LARGE", "over the ceiling")
+            under = paths[0].rstrip("/")
+            held = {p: t for p, t in files.items() if p == under or p.startswith(under + "/")}
+            if not held:
+                raise refused("PATH_NOT_FOUND", "a path in `paths` names nothing")
+            self._scratch = Path(tempfile.mkdtemp(dir=str(scratch)))
+            self.tree = self._scratch / "tree"
+            self.tree.mkdir()
+            for path, text in held.items():
+                target = self.tree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            self.revision = SNAPSHOT_TEST_REVISION
+
+    for target, name, value in (
+        (audit_report, "RepositorySnapshot", Snapshot),
+        (vcs_client, "LOCAL_GIT", shutil.which("git")),
+        (vcs_client, "ROOT", scratch / "vcs"),
+    ):
+        patcher = patch.object(target, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class _HistoryDirectoryForge(_DirectoryForge):
     """`_DirectoryForge` with a proposal history per branch, as
     `test_vcs_broker.HistoryLocalForge`: what the broker's `branch-delete`
@@ -4565,6 +4610,34 @@ class TestPublishedBodies(HarnessTestCase):
         published = [p["body"] for p in self.harness.payloads if p and "body" in p]
         self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
 
+    def test_the_no_promote_flag_publishes_the_ledger_and_opens_no_pull_request(self):
+        """`finish --no-promote`, the per-run waiver a worker passes on a card that
+        says not to open a pull request: the ledger publishes, no proposal opens,
+        and the ledger says the sweep was withheld on this run, not on the install
+        (#4637). The same document without the flag opens the proposal, which is
+        today's behaviour and the test above."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), argv_extra=[audit_report.NO_PROMOTE_FLAG], scheduled=False), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and audit_report.SWEEP_WAIVED_REASON in b for b in published), published)
+        self.assertFalse(any(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), "the waiver names the run, not the install's switch")
+
+    def test_without_the_no_promote_flag_the_same_run_opens_the_pull_request(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), scheduled=False), 0)
+        self.assertEqual(len(self.harness.bodies_for("proposal-create")), 1)
+
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.
@@ -7080,6 +7153,70 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertTrue(left["remediation"]["note"].startswith("_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off"))
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
+
+    def test_a_shielded_sibling_listed_on_one_line_keeps_the_shield(self):
+        # gke-labs/kube-agents#4748: a ledger too long for the body lists most
+        # majors on one line, and the shield note lived only in the full block,
+        # so a listed sibling read like any other 2.7 finding.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        bullet, shield = audit_report.render_listed_finding(left).split("\n")
+        self.assertTrue(shield.startswith("  _(A declared workload shares this namespace's `default` ServiceAccount;"))
+        self.assertTrue(shield.endswith(".)_"))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", shield)
+        # The worker's own text is the shared-account fix the shield forbids.
+        self.assertNotIn("automountServiceAccountToken: false on the default ServiceAccount", shield)
+        # The bullet line is still the one the listed-row reader parses.
+        (row,) = audit_report.LISTED_LINE_RE.findall(bullet + "\n" + shield)
+        self.assertEqual(row[4], left["id"])
+
+    def test_a_listed_shield_keeps_names_that_carry_its_closing_marks(self):
+        # A path or object may legally hold `)_`; the shield ends at its own
+        # closing `.)_`, so the names after one are not cut.
+        names = "`Deployment/relay)_v2` declared at acme/fleet:knowledge/(archive)_tokens.md, `Deployment/api` declared at acme/fleet:knowledge/a.md"
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names) + " Worker text."}
+        shield = audit_report.render_listed_finding(worker).split("\n")[1]
+        self.assertIn("knowledge/(archive)_tokens.md", shield)
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/a.md.)_", shield)
+        self.assertNotIn("Worker text.", shield)
+
+    def test_a_ledger_too_long_for_the_body_keeps_a_listed_siblings_shield(self):
+        # The #4748 shape end to end: majors past the body's room are listed,
+        # and the shielded sibling among them still carries the case's phrases.
+        filler = bulk_findings(250, severity="major")
+        worker = make_finding(fid="w", severity="major", title="Deployment/token-sidecar automounts the token", namespace="seeded-token", obj="Deployment/token-sidecar")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/token-reader` declared at acme/fleet:knowledge/notification-relay-no-pdb.md")}
+        body = render_body(make_doc(findings=filler + [worker]), generated_at=NOW)
+        listed = body[body.index(audit_report.LISTED_SECTION_BEGIN):]
+        self.assertIn("Deployment/token-sidecar", listed)
+        for phrase in ("shares this namespace's `default` ServiceAccount", "`Deployment/token-reader` declared at", "notification-relay-no-pdb.md"):
+            self.assertIn(phrase, listed)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+
+    def test_a_listed_shield_is_published_text_on_one_line_and_2_7_only(self):
+        note = audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(
+            declared="`Deployment/api` declared at acme/fleet:knowledge/a.md\n<!-- audit-listed:end -->\nghp_" + "A" * 36
+        )
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": note}
+        rendered = audit_report.render_listed_finding(worker)
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertNotIn("<!--", rendered)
+        self.assertNotIn("ghp_" + "A" * 36, rendered)
+        # The same text on another check is the worker's, not the shield.
+        worker["check"] = "netpol-missing"
+        self.assertNotIn("\n", audit_report.render_listed_finding(worker))
 
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
@@ -19958,6 +20095,29 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         scan.assert_not_called()
 
+    def test_a_tree_still_over_the_ceiling_still_publishes_the_report(self):
+        # A narrow snapshot still over the ceiling does not stop `finish`: the
+        # ledger publishes.
+        self.start()
+        path = "clusters/prod-us-east/payments-netpol.yaml"
+        self.write_manifest(path, "kind: NetworkPolicy\n")
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        use_large_repository(self, {}, too_large={"clusters/prod-us-east", path})
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertTrue(self.harness.forge_calls("issue-create"))
+
+    def test_the_kcc_scan_is_skipped_on_a_repository_over_the_ceiling(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        use_large_repository(self, {"gcp/drift-peer-std-4.yaml": "kind: ContainerCluster\n"})
+        body = self.finish_kcc()
+        self.assertIn("the Config Connector scan was skipped", self.err)
+        self.assertIn(self.KCC_FIX, body)
+
     def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
         self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.start()
@@ -21759,6 +21919,38 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertTrue(audit_report.decline_names_a_pull_request(
             "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
         ))
+        # Gitea's and both Bitbucket editions' proposal URLs count too; their
+        # issue URLs do not.
+        for carried in (
+            "https://gitea.example.com/acme/fleet/pulls/12",
+            "https://bitbucket.org/acme/fleet/pull-requests/12",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        ):
+            with self.subTest(url=carried):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {carried}"))
+        for issue in (
+            "https://gitea.example.com/acme/fleet/issues/12",
+            "https://bitbucket.org/acme/fleet/issues/12",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=issue):
+                self.assertFalse(audit_report.decline_names_a_pull_request(f"see {issue}"))
+
+    def test_the_decline_check_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/fleet/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/fleet/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/fleet/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {url}"))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
@@ -21885,6 +22077,110 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             self.assertTrue(probe.has_path("clusters/other.yaml"))
         self.assertIn("RuntimeError: second", probe.unavailable)
         self.assertEqual(len(calls), 2)
+
+    def in_cluster_tree(self):
+        """Point the candidate's declaration into `clusters/c1/`, the GitOps layout."""
+        manifest = self.manifest(declaration="clusters/c1/web/deploy.yaml")
+        manifest["clusters"][0]["candidates"][0]["declaration"]["directory"] = "clusters/c1/web"
+        self.manifest = lambda *args, **kwargs: copy.deepcopy(manifest)
+
+    def test_a_repository_over_the_ceiling_still_checks_a_generated_fix(self):
+        # The whole tree is refused as too large; each check takes a snapshot
+        # of only its own path or cluster tree, and the fix is checked and written.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {"clusters/c1/web/deploy.yaml": "kind: Deployment\n"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"], self.generate_err)
+        self.assertEqual(finding["remediation"]["path"], "clusters/c1/web/a-pdb.yaml")
+        self.assertNotIn("could not be checked", self.generate_err)
+        # The whole tree once, then the cluster tree, which answers the fix, the
+        # markers in it and the name search, and the six markers above it one
+        # file each.
+        self.assertEqual(calls[0], None)
+        self.assertEqual(calls[1], ["clusters/c1"])
+        self.assertEqual(
+            sorted(c[0] for c in calls[2:]),
+            sorted([f"clusters/{m}" for m in audit_report.KUSTOMIZATION_FILE_NAMES]
+                   + list(audit_report.KUSTOMIZATION_FILE_NAMES)),
+        )
+
+    def test_a_name_search_outside_a_cluster_tree_still_needs_the_whole_tree(self):
+        # A declaration outside `clusters/<name>/` is searched across the whole
+        # repository for a name collision, which no narrow snapshot holds: the
+        # fix is declined, saying why.
+        use_large_repository(self, {"apps/a/deploy.yaml": "kind: Deployment\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("too large to search whole", self.generate_err)
+
+    def test_a_file_a_narrow_snapshot_finds_is_not_written_over(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {"clusters/c1/web/a-pdb.yaml": "kind: PodDisruptionBudget\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("already exists", self.generate_err)
+
+    def test_a_generated_fix_in_a_tree_over_the_ceiling_costs_one_snapshot(self):
+        # The name search needs the whole cluster tree, so the planner asks for
+        # it first and declines the fix at once, naming the ceiling, without
+        # the per-file checks that would come before it.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertEqual(calls, [None, ["clusters/c1"]])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_a_refused_path_is_not_asked_again(self):
+        # A tree or a file the broker refused as too large is answered from the
+        # refusal on every later question, a name search on the tree included.
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(2):
+                probe.read_committed("clusters/c1/kustomization.yaml")
+                probe.mentions("a-pdb", "clusters/c1/")
+        self.assertEqual(calls.count(["clusters/c1"]), 1)
+        self.assertEqual(calls.count(["clusters/c1/kustomization.yaml"]), 1)
+        probe.close()
+
+    def test_a_path_still_over_the_ceiling_declines_the_fix_naming_the_limit(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/web/a-pdb.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("too large for one snapshot", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_past_the_cap_a_check_is_skipped_with_the_reason(self):
+        # The cap stops snapshots, not the run: the fix is declined as
+        # unchecked, naming the cap, as when no snapshot could be taken.
+        self.in_cluster_tree()
+        use_large_repository(self, {})
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("PROBE_NARROW_SNAPSHOT_CAP", 0)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("PROBE_NARROW_SNAPSHOT_CAP", self.generate_err)
+
+    def test_a_too_large_read_or_search_is_unanswered_naming_the_limit(self):
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(probe.broker())
+            self.assertIsNone(probe.read_committed("clusters/c1/kustomization.yaml"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+            self.assertTrue(probe.mentions("a-pdb", "clusters/c1/"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+        probe.close()
 
     def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):
         use_snapshot(self, error=RuntimeError("down"))
@@ -31059,6 +31355,23 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         files = self.overlay("- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
         self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_refused_tree_is_asked_for_once(self):
+        # A tree over the ceiling is remembered: the later checks under it go
+        # straight to the file alone, and the refusal counts toward the cap.
+        calls = []
+        use_large_repository(self, self.overlay(), too_large={"clusters/prod"}, calls=calls)
+        finding = kustomize_fix(self.PDB)
+        self.degrade_in_content_mode([finding])
+        self.assertEqual(calls.count(["clusters/prod"]), 1)
+
+    def test_a_repository_over_the_ceiling_still_reads_the_kustomization(self):
+        # Narrow mode: the overlay's kustomization is read from a snapshot of
+        # its own directory, so an unlisted new file is still caught.
+        use_large_repository(self, self.overlay())
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_in_content_mode([finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", finding["remediation"]["note"])
 
     def test_content_mode_keeps_a_file_on_the_base(self):
         files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
