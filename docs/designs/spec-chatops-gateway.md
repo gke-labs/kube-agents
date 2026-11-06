@@ -1551,8 +1551,9 @@ time may still post, so `a2a notify` exits with its own status then, and the ale
 treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
 a request that fails or is refused after it has nobody to tell and is already recorded as
 possibly posted, so the gateway logs it as lost, at error, with its first line. When the
-route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
-a third status, nothing posted; the alert path, which has one shot, waits through about
+route is not there (no gateway subscribed, or the bus unreachable), or the gateway refuses
+with `retry` (it is stopping, or couldn't read the conversation's record in time), `a2a notify`
+exits with a third status, nothing posted; the alert path, which has one shot, waits through about
 half a minute of those before giving up. A home post the gateway refused and kept answers
 with `kept` beside the error, and `a2a notify` exits with a fourth status for it: the
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
@@ -1605,7 +1606,9 @@ The bound is the set of live records rather than a secret: the agent principal, 
 can read every live conversation's context id (its Hermes sessions are named for them), so the
 check refuses a conversation with no record, a made-up key and a stale route, not a post into
 another conversation the agent holds a session for. No record, another
-context, or a record that cannot be read gets one refusal whatever the reason; a malformed request (a key on another backend, a thread and a conversation
+context, or a record that doesn't decode gets one refusal whatever the reason. A record that
+couldn't be read in time (the bucket unreachable, the lookup's 5s) is refused with `retry`, which
+the CLI reports as the route not there, so a card's subscription isn't charged for it; a malformed request (a key on another backend, a thread and a conversation
 together, a conversation with no context id) is refused by name. Nothing is posted in either
 case. The subjects and grants are the same as for a home post; a route the
 bridge cannot record is said at the end of the turn's answer, since the card's report will not

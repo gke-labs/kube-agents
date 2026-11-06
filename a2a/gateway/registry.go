@@ -880,10 +880,15 @@ func (r *Registry) Get(ctx context.Context, sessionKey string) (*SessionRecord, 
 	}
 	var rec SessionRecord
 	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-		return nil, fmt.Errorf("session %s: %w", sessionKey, err)
+		return nil, fmt.Errorf("session %s: %w: %w", sessionKey, errRecordUndecodable, err)
 	}
 	return &rec, nil
 }
+
+// errRecordUndecodable marks a session record that exists and doesn't decode:
+// a fault in one key, unlike an unreachable bucket or a timeout, which no
+// retry fixes.
+var errRecordUndecodable = errors.New("session record doesn't decode")
 
 // ErrSessionExists reports a Create that lost the first-contact race: a
 // record for the key already exists, and the caller adopts it.

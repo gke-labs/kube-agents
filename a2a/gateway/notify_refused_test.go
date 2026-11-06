@@ -532,6 +532,9 @@ func TestNotify_StopAnswersQueuedKeeps(t *testing.T) {
 			case notifyNoHomeKept:
 				kept++
 			case notifyStoppingRefusal:
+				if !r.Retry {
+					t.Fatalf("a stopping refusal not marked retry: %+v", r)
+				}
 				stopping++
 			default:
 				t.Fatalf("answer %+v", r)
