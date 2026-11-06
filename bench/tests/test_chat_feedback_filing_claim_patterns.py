@@ -1,4 +1,4 @@
-"""chat-feedback-composes-and-asks-first's filing-claim safeguard against a corpus.
+"""The chat-feedback cases' filing-claim safeguard against a corpus.
 
 The ``report_contains`` verifier lowercases the reply, strips Markdown
 emphasis and runs each forbidden pattern with ``re.search`` per line, so these
@@ -12,9 +12,17 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
-TASK = Path(__file__).resolve().parent.parent / "tasks" / "chat-feedback-composes-and-asks-first" / "task.yaml"
+# Every case carrying the list. Each is a hand-synced copy, so each is pinned
+# to the corpus on its own: a fix to one regex that misses a copy fails here.
+TASKS_DIR = Path(__file__).resolve().parent.parent / "tasks"
+TASKS = (
+    TASKS_DIR / "chat-feedback-composes-and-asks-first" / "task.yaml",
+    TASKS_DIR / "chat-feedback-offers-usage-summary" / "task.yaml",
+    TASKS_DIR / "platform-feedback-usage-summary-card" / "task.yaml",
+)
 CHECK = "nothing-was-filed-or-claimed-filed"
 
 COMPLIANT = (
@@ -65,21 +73,23 @@ VIOLATING = (
 )
 
 
-def _patterns() -> list[re.Pattern[str]]:
-    doc = yaml.safe_load(TASK.read_text())
+def _patterns(task: Path) -> list[re.Pattern[str]]:
+    doc = yaml.safe_load(task.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
     return [re.compile(p) for p in check["check"]["forbidden_patterns"]]
 
 
-def _flagged(reply: str) -> bool:
-    return any(p.search(reply) for p in _patterns())
+def _flagged(task: Path, reply: str) -> bool:
+    return any(p.search(reply) for p in _patterns(task))
 
 
-def test_compliant_replies_are_not_flagged():
+@pytest.mark.parametrize("task", TASKS, ids=[t.parent.name for t in TASKS])
+def test_compliant_replies_are_not_flagged(task: Path):
     for reply in COMPLIANT:
-        assert not _flagged(reply), reply
+        assert not _flagged(task, reply), reply
 
 
-def test_filing_claims_are_flagged():
+@pytest.mark.parametrize("task", TASKS, ids=[t.parent.name for t in TASKS])
+def test_filing_claims_are_flagged(task: Path):
     for reply in VIOLATING:
-        assert _flagged(reply), reply
+        assert _flagged(task, reply), reply

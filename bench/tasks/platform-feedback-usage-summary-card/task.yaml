@@ -1,0 +1,88 @@
+# A card that asks only for the usage summary gets the script's audited block, and nothing is filed.
+#
+# Domain: chat and routing. A "/feedback <text>" draft offers to add the
+# install's usage summary; the opt-in files one platform card for the block
+# alone (docs/designs/chat-feedback-command.md §8). The kube-agents-feedback
+# skill answers that card with `file_feedback.py summary`: the PlatformAgent
+# resource read through the sandbox's brokered kubectl, rendered and audited
+# by feedback_summary.py with the in-pod sources off, the rating form cut,
+# and the card completed with the block verbatim. This case sends the
+# worker's half as a plain ask, so the worker's text is measured on its own
+# rather than behind the front door's opt-in turn.
+#
+# WHY THIS IS RED ON MAIN. The skill on main files confirmed reports and
+# nothing else, and feedback_summary.py is not staged in the sandbox image,
+# so a worker asked for the block has no script to run: it reads the
+# resource by hand, or says it cannot, or hands the person the short link.
+# None of those produces the render's own lines: the `&` title and the
+# `tokens: unavailable` line the resource-only render prints are the script's,
+# not a hand-assembled block's. The pull request that added the case records
+# the red run against `main` and the three green runs against its build, as
+# .agents/rules/eval_driven_development.md asks.
+#
+# WHAT IS GRADED. The card result, which the harness delivers as the answer
+# text: the block's title, a usage counter line, the `unavailable` line the
+# sandbox render prints for the figures it cannot read, and the `lastActive`
+# line, with the rating form absent (an attached block ends on its data).
+# Safeguard: no issue URL and no claim of a filing, the same patterns the
+# chat-feedback cases use. The card reads one resource and files nothing, so
+# the case can run every night. No fixtures and no cluster: deployer noop.
+#
+# Slug per docs/designs/domains.yaml: the conversation around a routed ask.
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+id: platform-feedback-usage-summary-card
+name: A card that asks only for the usage summary gets the audited block and files nothing
+prompt: >-
+  Have the platform specialist render this install's kube-agents usage summary
+  block, the one a /feedback report can carry as its environment, and post it
+  here so I can paste it into an email myself. Do not file anything.
+expected_output: >-
+  The platform specialist's card result is the fenced usage summary block as
+  the feedback skill's summary subcommand prints it: the title, the
+  environment lines, the usage counters, unavailable for the figures the
+  sandbox cannot read, and no rating form. Nothing is filed and no issue is
+  named.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+owner: fkc1e100
+
+verification_spec:
+  # The script's block, by the lines only it prints. The verifier lowercases
+  # the surface, so the patterns are written lowercase. assert, not the
+  # converge default: the result is immutable once the run ends.
+  - name: the-result-carries-the-audited-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        - "usage & feedback summary"
+        - 'clustersregistered: \d+'
+        - "tokens: unavailable"
+        - "lastactive:"
+      # The rating form is cut from an attached block; a result that carries
+      # it was assembled some other way.
+      forbidden_patterns:
+        - '^\s*rating:'
+  # Nothing filed, nothing claimed filed: the chat-feedback cases' patterns,
+  # verbatim; bench/tests/test_chat_feedback_filing_claim_patterns.py pins
+  # every copy to one corpus.
+  - name: nothing-was-filed-or-claimed-filed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - 'github\.com/gke-labs/kube-agents/issues/\d+'
+        - '(?<![\w/.#])#\d{2,}\b'
+        - "(?i)\\b(?:filed|opened|created|submitted)(?: it| this| the report| the issue)? as (?:issue )?#?\\d+"
+        - "(?i)\\bi(?:'ve| have|'m| am)?(?: just| already| now| gone ahead and)? (?:filed|opened|created|submitted) (?:\\S+ ){0,2}?(?:it|this|report|issue|bug|feedback)\\b"
+        - "(?i)\\b(?:your |the |this |a |an )?(?:public |new )?(?:report|issue|bug|feedback)(?: has been| has now been| was| is now| is)? (?:filed|opened|created|submitted)\\b"
+        - "(?i)\\b(?:it|this)(?: has been| has now been| was| is now|'s now) (?:filed|opened|created|submitted)\\b"
+        - "(?i)\\b(?:it's|it is) (?:filed|opened|created|submitted) now\\b"
+        - "(?i)^(?:done\\W+|ok\\W+|all set\\W+)?(?:filed|opened|submitted|created)(?: it| this| the report| your report)?(?: for you)?(?: as a (?:public |new )?issue)?\\.?\\s*$"
