@@ -255,7 +255,7 @@ is true when the text after the word is exactly `summary`, and `IsCommand` repor
 chat message's button may not carry it either. The dispatch case sits beside the bare form,
 ahead of `/session`, status, stop and steer, and changes nothing about the record's task
 state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
-deterministically, with the environment, usage and feedback sections `scripts/feedback-summary.sh`
+deterministically, with the environment, usage, performance and feedback sections `scripts/feedback-summary.sh`
 prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
 counts, LiteLLM's live figures and recent task rows): environment (tag, mode, model from
 `status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
