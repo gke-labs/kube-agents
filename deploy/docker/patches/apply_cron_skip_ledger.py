@@ -480,6 +480,19 @@ JOBS_CATCH_UP_PATCHED = '''    record_catch_up_occurrence()
     return False
 '''
 
+# The grace window the catch-up decision above turns on. The ticker's
+# catch-up policy (agents/chat/scripts/cron_catch_up_policy.py) mirrors these
+# two numbers and the halving so that "catch-up" means the same thing on both
+# sides of the store; the anchor pins them, so a base-image bump that moves
+# them fails the build here instead of quietly moving one side.
+JOBS_GRACE = """_MIN_GRACE_SECONDS = 120
+_MAX_GRACE_SECONDS = 7200
+"""
+
+JOBS_GRACE_PATCHED = """_MIN_GRACE_SECONDS = 120  # kube-agents: mirrored by cron_catch_up_policy.MIN_GRACE
+_MAX_GRACE_SECONDS = 7200  # kube-agents: mirrored by cron_catch_up_policy.MAX_GRACE
+"""
+
 # --- agent/monitoring/cron_health.py: do not launder a skip into "unknown" --
 
 HEALTH_STATUSES = (
@@ -655,7 +668,10 @@ PATCHES = (
     ),
     (
         "cron/jobs.py",
-        ((JOBS_CATCH_UP, JOBS_CATCH_UP_PATCHED, 1),),
+        (
+            (JOBS_CATCH_UP, JOBS_CATCH_UP_PATCHED, 1),
+            (JOBS_GRACE, JOBS_GRACE_PATCHED, 1),
+        ),
     ),
     (
         "agent/monitoring/cron_health.py",

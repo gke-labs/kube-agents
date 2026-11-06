@@ -678,7 +678,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Those are `cluster-agent-reconcile`, which scaffolds a profile for a newly onboarded cluster and
   prunes one for a deleted cluster; `oobe`, which runs first-run onboarding (the
   `bootstrap-inventory-*` entries ship disabled); and `profile-cron-tick`, the only thing that ticks
-  a **named** profile's own store — so every `cluster-*` roster goes quiet with it, and so does the [idle-install hold](/kube-agents/concepts/autonomous-watchdogs/#idle-installs) on the Platform Agent's model-run jobs, which runs inside that job. Nothing errors
+  a **named** profile's own store — so every `cluster-*` roster goes quiet with it, and so do the [idle-install hold](/kube-agents/concepts/autonomous-watchdogs/#idle-installs) on the Platform Agent's model-run jobs and the [catch-up policy](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause) that thins them after a pause, which run inside that job. Nothing errors
   and nothing is logged: a job that is never ticked stays `scheduled` with a `next_run_at` in the
   past.
 
@@ -822,7 +822,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   the whole status write — `Ready`, the phase and every other condition with it.
 
 - `podAnnotations` — annotations applied to the generated pod template.
-- `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
+- `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving). On the way back the Platform Agent's scheduled audits do not all start at once: [Catch-ups after a pause](/kube-agents/concepts/autonomous-watchdogs/#catch-ups-after-a-pause).
 - `sizingProfile` — the preset row the credential-proxy container, the `agent-api-auth` sidecar and the shell container start from, before the per-key overrides above and under [`shellSandbox`](#shellsandbox) are applied over it; an explicit key always wins. One of `small` (the default, and what an absent field means: the operator's defaults as documented above), `medium`, `fleet` or `auto`. The agent container's own `resources` are not part of a profile.
 
   | Tier     | Credential proxy                                                                                     | `agent-api-auth`   | Shell            |
