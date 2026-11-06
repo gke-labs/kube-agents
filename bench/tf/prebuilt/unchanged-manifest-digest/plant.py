@@ -26,10 +26,15 @@ with <mark>, and `finish --scheduled --manifest-file`. `finish` stores the run's
 envelope and, on an image that ships the precheck, records the manifest's
 digest; on an image that does not, nothing reads the digest and the case goes
 red for that reason. Exits 1 when the collector gives no candidate: the mark
-is what the teardown removes by, so a clean plant would stay in the store.
+is what the teardown removes by, so a clean plant would stay in the store. A
+plant that fails after its `start` releases the stream's in-flight note, so
+the next apply and the install's own run are not refused for two hours.
 
-teardown: removes the digest record, the planted manifest, and each stored
-envelope of the stream that holds <mark>.
+teardown: removes the digest record, the planted manifest, each stored
+envelope of the stream that holds <mark>, and every envelope of the planted
+repository stored at or after the planted run's `finished_at`: the scheduled
+run the stack fires closes from the planted document, and where `finish`
+carried the previous run's wording, neither envelope shows the mark.
 
 Run as root (a `kubectl exec`), it first becomes the owner of the scratch
 directory, so what it leaves behind -- the GitOps clone `finish` makes, the
@@ -132,10 +137,13 @@ def run_cli(audit_report, argv: list[str]) -> tuple[int, str]:
 
 def collect(scripts: str, collector_args: list[str]) -> tuple[dict | None, str]:
     collector = Path(scripts) / COLLECTOR
-    run = subprocess.run(
-        [sys.executable, str(collector), *collector_args, *COLLECTOR_FLAGS],
-        capture_output=True, text=True, check=False, timeout=COLLECTOR_TIMEOUT_S,
-    )
+    try:
+        run = subprocess.run(
+            [sys.executable, str(collector), *collector_args, *COLLECTOR_FLAGS],
+            capture_output=True, text=True, check=False, timeout=COLLECTOR_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"{COLLECTOR} did not finish within {COLLECTOR_TIMEOUT_S}s"
     try:
         manifest = json.loads(run.stdout)
     except ValueError:
@@ -186,6 +194,18 @@ def stored_envelope(audit_report) -> tuple[dict | None, str]:
     return (envelope if isinstance(envelope, dict) else None), repo
 
 
+def abandon(audit_report, why: str) -> int:
+    """A plant that fails after its `start`: say why, release the note `start` left, exit 1.
+
+    `start` claimed the stream's in-flight note for two hours. The run it
+    opened is over here, and a note left behind refuses the next apply at its
+    own `start` and the install's real tick at its.
+    """
+    print(why, file=sys.stderr)
+    audit_report.release_in_flight(AUDIT)
+    return 1
+
+
 def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> int:
     started = datetime.now(timezone.utc)
     code, line = run_cli(audit_report, ["start", "--audit", AUDIT])
@@ -194,12 +214,10 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
         return 1
     manifest, why = collect(scripts, collector_args)
     if manifest is None:
-        print(why, file=sys.stderr)
-        return 1
+        return abandon(audit_report, why)
     document = filled_document(audit_report, manifest, mark)
     if not document["findings"]:
-        print(f"{COLLECTOR} gave no candidate; nothing to plant.", file=sys.stderr)
-        return 1
+        return abandon(audit_report, f"{COLLECTOR} gave no candidate; nothing to plant.")
     manifest_path = planted_manifest_path(audit_report)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -216,9 +234,10 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
         ],
     )
     if code != 0:
-        print(f"finish exited {code}; the previous run was not planted.", file=sys.stderr)
+        # An exit 2 (a rejected document, a lost broker) keeps the note for
+        # the re-run a worker would make; this run makes none.
         teardown(audit_report, mark)
-        return 1
+        return abandon(audit_report, f"finish exited {code}; the previous run was not planted.")
     try:
         payload = json.loads(line.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -231,8 +250,9 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
         finished = None
     if envelope is None or not envelope.get("scheduled") or finished is None or finished < started:
         teardown(audit_report, mark)
-        print(f"the report store of {repo} does not hold this scheduled run (newest: {finished_at or 'none'}).", file=sys.stderr)
-        return 1
+        return abandon(
+            audit_report, f"the report store of {repo} does not hold this scheduled run (newest: {finished_at or 'none'})."
+        )
     plant_state_path(audit_report).write_text(json.dumps({"repo": repo, "finished_at": finished_at}), encoding="utf-8")
     recorded = digest_record_path(audit_report).is_file()
     print(
@@ -252,26 +272,50 @@ def _store_files(audit_report) -> list[Path]:
         return []
 
 
+def _parsed(stamp: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(stamp or ""))
+    except ValueError:
+        return None
+
+
+def _stored_since(path: Path, repo_dir: Path | None, since: datetime | None, text: str) -> bool:
+    """Whether `path` is an envelope of the planted repository stored at or after the planted run.
+
+    The scheduled run the stack fires closes from the planted document and
+    stores its own envelope after it; where `finish` carried the previous
+    run's wording forward, neither shows the mark, so the time is the join.
+    """
+    if repo_dir is None or since is None or not path.is_relative_to(repo_dir):
+        return False
+    try:
+        finished = _parsed(json.loads(text).get("finished_at"))
+    except (ValueError, AttributeError):
+        return False
+    return finished is not None and finished >= since
+
+
 def teardown(audit_report, mark: str) -> int:
-    """Remove the planted run: the envelope the state names, any envelope with the mark, and the scratch files."""
+    """Remove the planted run and what it led to: any envelope with the mark, every envelope of the
+    planted repository stored at or after the planted run, and the scratch files."""
     try:
         state = json.loads(plant_state_path(audit_report).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
-    planted_finished_at = str(state.get("finished_at") or "")
+    since = _parsed(state.get("finished_at"))
+    repo_dir = None
+    if state.get("repo") and since is not None:
+        try:
+            repo_dir = Path(audit_report.reports_dir_for(AUDIT, str(state["repo"]))).resolve()
+        except (ValueError, OSError):
+            repo_dir = None
     removed = 0
     for path in _store_files(audit_report):
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             continue
-        planted = mark in text
-        if not planted and planted_finished_at:
-            try:
-                planted = json.loads(text).get("finished_at") == planted_finished_at
-            except ValueError:
-                planted = False
-        if planted:
+        if mark in text or _stored_since(path.resolve(), repo_dir, since, text):
             path.unlink()
             removed += 1
     extra = 0
@@ -281,7 +325,7 @@ def teardown(audit_report, mark: str) -> int:
             extra += 1
         except FileNotFoundError:
             continue
-    print(f"removed {removed} stored envelope(s) that hold the planted run and {extra} scratch file(s).")
+    print(f"removed {removed} stored envelope(s) of the planted run and the runs closed from it, and {extra} scratch file(s).")
     return 0
 
 
