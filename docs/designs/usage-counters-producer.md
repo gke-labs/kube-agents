@@ -163,6 +163,15 @@ conflict waits for the next poll. The byte fields are rewritten only when free s
 hundredth of the volume, so a working agent does not wake the reconciler every poll, and they have
 a pruning record of their own for a CRD that predates them.
 
+The `cluster_up` series' labels, the triple each registered cluster's profile names, are read
+beside the gauges into the `ScopeUndeclared` condition (`usage_scope.go`): True, naming the
+clusters other than `spec.harness`'s, while `spec.scope` names no project, folder, organisation or
+selector; removed otherwise, and on the data volume reading's terms when there is no reading. The
+union across replicas, each triple once, sorted, so an unchanged fleet rewrites nothing. A third
+status patch, on the same terms as the second. The reconcile that adopted the clusters cannot
+write the CR, which is why the operator surfaces it from the watcher's reading
+(`docs/designs/multi-project-scope.md` §7).
+
 The same body also carries the fleet's shape, which no status field projects yet: gauges with
 no cluster label, `k8s_event_watcher_fleet_nodes`, `_fleet_max_cluster_nodes`,
 `_fleet_controllers`, `_fleet_pods`, `_fleet_max_cluster_pods` and
