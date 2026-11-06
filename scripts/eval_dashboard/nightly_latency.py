@@ -40,6 +40,9 @@ shift that wide has one cause (the model, the mode, quota), not one per
 case. A list's worth is always named, so a night that timed few cases
 still names its slow one.
 
+Both count dates, not runs (``one_per_date``): a same-date re-run of the
+main job is one night here, the newest run of the date.
+
 All of it is advisory, like the turn-1 target: no verdict, state or gate
 reads it. A backtest on the history of 2026-10-15 to 10-28 set the case
 rule: at 1.5× a night flagged 4 to 35 cases, too many to act on.
@@ -118,6 +121,28 @@ def whole(night: dict) -> bool:
     return not any(part.get("truncated") for part in night.get("parts") or [])
 
 
+def one_per_date(nights: list[dict]) -> list[dict]:
+    """``nights`` (newest first) with one night per date, the newest run of
+    each, dated as ``nightly_bugs.graded_nights`` dates its nights.
+    ``night_reports`` makes a same-date re-run of the main job a night of
+    its own, and counted as two it would make a case's typical span one date
+    fewer, a sustained streak reach two from one date, and the night typical
+    count the date twice. Unlike ``graded_nights``, which keeps the newest
+    run that graded each case, this keeps the newest whole night: a re-run
+    cut short, or one that timed fewer cases, stands for its date. A night
+    with no start time is kept."""
+    seen: set = set()
+    out = []
+    for night in nights:
+        day = nightly.night_day(nightly.parse_iso(night.get("started")))
+        if day is not None:
+            if day in seen:
+                continue
+            seen.add(day)
+        out.append(night)
+    return out
+
+
 def median_case_agent(night: dict) -> float | None:
     """The median of the night's cases' agent p50, None when no case has one."""
     values = [v for v in (_number(c.get(CASE_AGENT_P50)) for c in night.get("cases") or []) if v is not None]
@@ -151,6 +176,7 @@ def _marked(value: float, base: float | None, text: str) -> str:
 def night_line(nights: list[dict]) -> str | None:
     """The night line for ``nights[0]`` (``nights`` newest first), or None
     when last night carried no timing at all."""
+    nights = one_per_date(nights)
     if not nights:
         return None
     night = nights[0]
@@ -200,6 +226,7 @@ def slow_cases(nights: list[dict], keep: set[str] | None = None) -> tuple[list[d
     a row it was slow, last night included), largest ratio first; ``timed``
     the cases last night with timing and a typical. With ``keep``, only the
     cases it names are judged or counted."""
+    nights = one_per_date(nights)
     if not nights:
         return [], 0
     history = _case_history(nights[1:])

@@ -1005,7 +1005,9 @@ Nightly report's.
   with timing and a typical are slow, and more than 5, one "broad slowdown" line replaces the
   list: a shift that wide has one cause. A night cut off at the deadline,
   or with a part missing or still running, carries the block too, labelled as
-  covering only the cases or parts on record. It is advisory and moves no
+  covering only the cases or parts on record. Nights here are dates: a
+  same-date re-run of the main job counts once, by its newest run. It is
+  advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - A footer asking owners to reply in the thread.
 
