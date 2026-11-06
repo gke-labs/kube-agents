@@ -1222,13 +1222,16 @@ class PreflightDecisionTest(unittest.TestCase):
         for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
             self.assertEqual(three[key], base[key], key)
 
-    def test_a_max_surge_that_is_not_a_whole_number_or_percentage_fails_the_render(self) -> None:
+    def test_a_max_surge_that_is_not_a_whole_number_or_percentage_counts_as_the_replicas(self) -> None:
+        """The schema admits any string, and validate.yml requires such a value to render
+        (it must not be refused), so the count bounds it from above: as many surge pods as
+        the workload has replicas, the most a rollout can add."""
+        base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
         for bad in ("abc", "1.5", "50 %", "-1", "%"):
             with self.subTest(bad=bad):
-                res = self._render({"probe": {"emitRequirements": True}},
-                                   ["platformAgent.mode=next", f"operator.rollingUpdate.maxSurge={bad}"])
-                self.assertNotEqual(res.returncode, 0, f"maxSurge={bad} rendered")
-                self.assertIn("is not a whole number or a whole percentage", res.stderr)
+                req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3",
+                                          f"operator.rollingUpdate.maxSurge={bad}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
 
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the

@@ -2071,9 +2071,10 @@ The surge pods a rollout of one workload can add, from its maxSurge and its repl
 (#4876): an integer as written, or a percentage of the replicas rounded up, as the
 Deployment controller rounds it, and never more than the replicas, since the controller
 never scales the new ReplicaSet past the desired count. None for a workload scaled to zero.
-A maxSurge that is neither a whole number nor a whole percentage fails the render, which
-the API server would refuse at apply time anyway. Takes a dict with "maxSurge" and
-"replicas".
+A maxSurge that is neither a whole number nor a whole percentage counts as the replicas, the
+most a rollout can add: the schema admits it, and validate.yml requires such a value to
+render rather than be refused, so the count bounds it from above. Takes a dict with
+"maxSurge" and "replicas".
 */}}
 {{- define "kube-agents.surgePods" -}}
 {{- $replicas := .replicas | int64 -}}
@@ -2085,11 +2086,10 @@ the API server would refuse at apply time anyway. Takes a dict with "maxSurge" a
 {{- else -}}
   {{- $raw = trim (toString $v) -}}
 {{- end -}}
-{{- if not (regexMatch "^[0-9]+%?$" $raw) -}}
-  {{- fail (printf "quota preflight: maxSurge %q is not a whole number or a whole percentage" $raw) -}}
-{{- end -}}
 {{- $n := 0 -}}
-{{- if hasSuffix "%" $raw -}}
+{{- if not (regexMatch "^[0-9]+%?$" $raw) -}}
+  {{- $n = $replicas -}}
+{{- else if hasSuffix "%" $raw -}}
   {{- $n = ceil (divf (mulf (trimSuffix "%" $raw | float64) (float64 $replicas)) 100.0) | int64 -}}
 {{- else -}}
   {{- $n = $raw | int64 -}}
