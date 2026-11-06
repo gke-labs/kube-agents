@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -46,16 +47,28 @@ def tearDownModule():
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 
-def write(lines):
-    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+def write_file(lines, kind):
+    """One segment under a fresh replay-shadow/<kind>/<day>/<build>/logs/, as the collector files it."""
+    logs = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "replay-shadow", kind, "2026-11-05", "1", "logs")
+    os.makedirs(logs)
+    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=logs)
     with handle:
         for entry in lines:
             handle.write((entry if isinstance(entry, str) else json.dumps(entry)) + "\n")
     return handle.name
 
 
+def write(lines):
+    """Each line into the folder its own tag names, as an honest run files it; untagged ones under presubmit/."""
+    by_kind = {}
+    for entry in lines:
+        tag = (entry.get("job") or {}).get("kind") if isinstance(entry, dict) else None
+        by_kind.setdefault(tag if tag in analyze_shadow.JOB_KINDS else "presubmit", []).append(entry)
+    return [write_file(kind_lines, kind) for kind, kind_lines in by_kind.items()] or [write_file([], "presubmit")]
+
+
 def report(lines, **kwargs):
-    records, skipped = analyze_shadow.load([write(lines)])
+    records, skipped = analyze_shadow.load(write(lines))
     return analyze_shadow.summarize(records, **kwargs), skipped
 
 
@@ -105,7 +118,7 @@ class EstimateTest(unittest.TestCase):
         rep, _ = report(lines, merged={"10": 10.0})
         self.assertEqual(rep["estimates"]["high"]["hits"], 1)
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
     def test_a_build_finishing_after_the_merge_is_not_copied(self):
@@ -117,7 +130,7 @@ class EstimateTest(unittest.TestCase):
             presubmit("p5", 21, "12", "b3", "B", ["b"]),
         ]
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
     def test_presubmit_lines_without_a_pr_are_counted(self):
@@ -317,7 +330,7 @@ class MissTest(unittest.TestCase):
 
 class HealthTest(unittest.TestCase):
     def test_health_counts(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             line("n1", 1, "nightly", "n", "A", ["a"]),
             presubmit("p1", 2, "", "b1", "A", None, unstorable=["upstream_incomplete"]),
             presubmit("p2", 3, "10", "b1", "B", ["b"], unstorable=["observe_failed"]),
@@ -325,7 +338,7 @@ class HealthTest(unittest.TestCase):
             presubmit("p4", 4, "10", "b1", "D", ["d"], unstorable=["observe_too_large"]),
             {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 6, "error": "analysis_dropped", "job": {"kind": "presubmit"}},
-        ])])
+        ]))
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
         self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4})
@@ -342,34 +355,85 @@ class HealthTest(unittest.TestCase):
 
 class LoadTest(unittest.TestCase):
     def test_skips_other_lines_and_untagged_jobs(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             "not json",
             {"event": "replay_shadow_start"},
             line("x", 1, "", "b", "A", ["a"]),
             {"event": "replay_shadow_request", "ts": 1, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 1, "job": {"kind": "presubmit"}},
             presubmit("p", 2, "10", "b", "A", ["a"]),
-        ])])
+        ]))
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
-        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1})
+        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1,
+                                   "kind_mismatch": 0})
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])
         b = write([line("n1", 1, "nightly", "n", "A", ["a"])])
-        records, _ = analyze_shadow.load([a, b])
+        records, _ = analyze_shadow.load(a + b)
         self.assertEqual([r.request_id for r in records], ["n1", "p2"])
 
     def test_main_prints_text_and_json_and_reads_merge_times(self):
         path = write([presubmit("p1", 1, "10", "b", "A", ["a"]), presubmit("p2", 5, "11", "c", "A", ["a"])])
-        merged = write([])
+        merged = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "merged.json")
         with open(merged, "w") as handle:
             json.dump({"10": 2}, handle)
-        for args in ([path, "--merged", merged], [path, "--merged", merged, "--json"]):
+        for args in ([*path, "--merged", merged], [*path, "--merged", merged, "--json"]):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(analyze_shadow.main(args), 0)
             self.assertIn("50.0", out.getvalue())
+
+
+class FolderKindTest(unittest.TestCase):
+    """The folder a line was filed under is its kind; its own tag is only checked against it."""
+
+    def test_a_presubmit_line_tagged_nightly_is_never_a_nightly_source(self):
+        forged = line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000)
+        files = [write_file([forged], "presubmit"), write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")]
+        records, skipped = analyze_shadow.load(files)
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["kind_mismatch"], 1)
+        rep = analyze_shadow.summarize(records, skipped=skipped, merged={"10": 1.5})
+        for estimate in analyze_shadow.ESTIMATES:
+            self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+        self.assertEqual((rep["nightly_requests"], rep["health"]["kind_mismatch_lines"]), (0, 1))
+
+    def test_a_nightly_untrusted_line_tagged_nightly_is_dropped(self):
+        records, skipped = analyze_shadow.load([write_file([line("f1", 1, "nightly", "n", "A", ["a"])], "nightly-untrusted")])
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+
+    def test_the_kind_is_the_nearest_kind_folder(self):
+        path = write_file([line("n1", 1, "nightly", "n", "A", ["a"])], "nightly")
+        nested = os.path.join(TEMP_DIR, "presubmit", "copy")
+        shutil.copytree(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path)))),
+                        os.path.join(nested, "nightly"))
+        records, _ = analyze_shadow.load([nested])
+        self.assertEqual([(r.request_id, r.kind) for r in records], [("n1", "nightly")])
+
+    def test_a_directory_is_searched_for_segments(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        with open(os.path.join(os.path.dirname(path), "job-1.json"), "w") as handle:
+            handle.write("{}")
+        records, skipped = analyze_shadow.load([os.path.dirname(path)])
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["not_json"], 0)
+
+    def test_a_file_under_no_kind_folder_is_refused_unless_a_kind_is_given(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+        with handle:
+            handle.write(json.dumps(line("n1", 1, "nightly", "n", "A", ["a"])) + "\n")
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([handle.name])
+        records, _ = analyze_shadow.load([handle.name], kind="nightly")
+        self.assertEqual([r.kind for r in records], ["nightly"])
+        records, skipped = analyze_shadow.load([handle.name], kind="presubmit")
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            analyze_shadow.main([handle.name])
+        self.assertIn("--kind", err.getvalue())
 
 
 if __name__ == "__main__":

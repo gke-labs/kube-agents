@@ -17,7 +17,12 @@ answer" and Rollout step 1):
   under replay those answers would have been the recorded ones. It assumes the
   recorded answer's tool calls would have returned the results this run saw.
 
-A `nightly-untrusted` line (a scheduled run that uploaded as an account
+A line's job kind is the bucket folder it was copied from
+(`replay-shadow/<kind>/`, kept as the nearest enclosing directory named for a
+kind, or `--kind`), never the line's own `job.kind` tag: the proxy that stamps
+the tag is built from the commit under test, while IAM decides who may write
+each folder. A line whose tag names another kind is dropped and counted. A
+`nightly-untrusted` line (a scheduled run that uploaded as an account
 presubmits can also run as, hack/ci-env.sh) is counted and never a source:
 pull-request code could have written it.
 
@@ -44,8 +49,10 @@ A collision audit (did two requests that matched lead to different results?)
 is a later step: it joins each `Hit` from `iter_hits` with run verdicts and the
 stored text. Nothing here reads verdicts yet.
 
-Usage: python3 analyze_shadow.py LOG [LOG ...] [--merged MERGED.json] [--top N] [--json] [--ignore-storable]
-MERGED.json maps a pull request number to its merge time in epoch seconds.
+Usage: python3 analyze_shadow.py PATH [PATH ...] [--kind KIND] [--merged MERGED.json] [--top N] [--json]
+       [--ignore-storable]
+Each PATH is a `.jsonl` file or a directory searched for them. MERGED.json maps
+a pull request number to its merge time in epoch seconds.
 """
 
 from __future__ import annotations
@@ -53,6 +60,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -63,6 +71,8 @@ NIGHTLY = "nightly"
 NIGHTLY_UNTRUSTED = "nightly-untrusted"
 PRESUBMIT = "presubmit"
 JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
+# The proxy's segment files (spool.py); a directory argument is searched for these.
+LOG_SUFFIX = ".jsonl"
 ASSISTANT_ROLE = "assistant"
 # Stands in for an assistant message's content in the simulated key: its place
 # in the conversation counts, its words do not.
@@ -82,7 +92,10 @@ SKIP_ERROR = "error"
 # The proxy's queue was full and it dropped the request's analysis.
 SKIP_ANALYSIS_DROPPED = "analysis_dropped"
 SKIP_NO_FINGERPRINT = "no_fingerprint"
-SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT)
+# The line's job.kind tag names a kind other than the folder it was filed under.
+SKIP_KIND_MISMATCH = "kind_mismatch"
+SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT,
+                SKIP_KIND_MISMATCH)
 # Labels in Miss.first_difference_role besides a message role.
 DIFF_UNHASHED = "unhashed"
 DIFF_SETTINGS = "settings"
@@ -117,14 +130,15 @@ class Record:
         return not self.unstorable
 
     @classmethod
-    def from_line(cls, entry: Dict[str, Any]) -> "Record":
+    def from_line(cls, entry: Dict[str, Any], kind: str) -> "Record":
+        """`kind` is the folder's, which load() has checked the line's tag against."""
         job = entry.get(F.JOB) or {}
         hashes = entry.get(F.MESSAGE_HASHES)
         diag = entry.get(F.DIAG_MESSAGE_HASHES)
         return cls(
             request_id=str(entry.get(F.REQUEST_ID, "")),
             ts=float(entry[F.TS]),
-            kind=str(job.get(F.JOB_KIND) or ""),
+            kind=kind,
             project=str(job.get(F.JOB_PROJECT) or ""),
             build=str(job.get(F.JOB_BUILD) or ""),
             pr=str(job.get(F.JOB_PR) or ""),
@@ -308,11 +322,39 @@ class PrefixSources(Sources):
         return best, matched
 
 
-def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
-    """Read JSON lines from each path; returns the records in time order and skip counts."""
+def folder_kind(path: str) -> Optional[str]:
+    """The job kind a file was filed under: its nearest enclosing directory named for one."""
+    for part in reversed(os.path.normpath(os.path.abspath(os.path.dirname(path))).split(os.sep)):
+        if part in JOB_KINDS:
+            return part
+    return None
+
+
+def log_files(paths: Iterable[str], kind: Optional[str] = None) -> List[Tuple[str, str]]:
+    """Each log file under `paths` with its job kind: `kind` when given, else its folder's.
+
+    Raises ValueError for a file with neither, rather than trusting its lines' tags.
+    """
+    found: List[Tuple[str, str]] = []
+    for path in paths:
+        files = [path]
+        if os.path.isdir(path):
+            files = sorted(os.path.join(root, name) for root, _, names in os.walk(path)
+                           for name in names if name.endswith(LOG_SUFFIX))
+        for name in files:
+            file_kind = kind or folder_kind(name)
+            if file_kind is None:
+                raise ValueError(f"{name} is under no {', '.join(JOB_KINDS)} folder; copy the bucket's "
+                                 "replay-shadow/<kind>/ folders as they are, or pass --kind")
+            found.append((name, file_kind))
+    return found
+
+
+def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record], Dict[str, int]]:
+    """Read JSON lines from each path (log_files); returns the records in time order and skip counts."""
     records: List[Record] = []
     skipped = {reason: 0 for reason in SKIP_REASONS}
-    for path in paths:
+    for path, file_kind in log_files(paths, kind):
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -335,10 +377,14 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                 if not entry.get(F.FINGERPRINT):
                     skipped[SKIP_NO_FINGERPRINT] += 1
                     continue
-                if (entry.get(F.JOB) or {}).get(F.JOB_KIND) not in JOB_KINDS:
+                tag = (entry.get(F.JOB) or {}).get(F.JOB_KIND)
+                if tag not in JOB_KINDS:
                     skipped[SKIP_UNTAGGED] += 1
                     continue
-                records.append(Record.from_line(entry))
+                if tag != file_kind:
+                    skipped[SKIP_KIND_MISMATCH] += 1
+                    continue
+                records.append(Record.from_line(entry, file_kind))
     records.sort(key=lambda r: r.ts)
     return records, skipped
 
@@ -391,6 +437,8 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
         "error_lines": skipped.get(SKIP_ERROR, 0),
         "lines_without_fingerprint": skipped.get(SKIP_NO_FINGERPRINT, 0),
         "untagged_lines": skipped.get(SKIP_UNTAGGED, 0),
+        # Tagged with a kind other than their folder's: dropped, never trusted.
+        "kind_mismatch_lines": skipped.get(SKIP_KIND_MISMATCH, 0),
         "unstorable_lines": sum(1 for r in records if not r.storable),
         "unstorable_percent_by_reason": {
             reason: percent(count, len(records)) for reason, count in sorted(by_reason.items(), key=lambda kv: -kv[1])
@@ -500,13 +548,18 @@ def load_merged(path: Optional[str]) -> Dict[str, float]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    parser.add_argument("logs", nargs="+", help="JSONL files written by replay_proxy.py")
+    parser.add_argument("logs", nargs="+", help="JSONL files written by replay_proxy.py, or directories of them")
+    parser.add_argument("--kind", choices=JOB_KINDS,
+                        help="the job kind of every input, instead of the replay-shadow/<kind>/ folder each is under")
     parser.add_argument("--merged", help="JSON file mapping a pull request number to its merge time (epoch seconds)")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_MISSES, help="misses to list")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
-    records, skipped = load(args.logs)
+    try:
+        records, skipped = load(args.logs, args.kind)
+    except ValueError as exc:
+        parser.error(str(exc))
     report = summarize(
         records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped
     )
