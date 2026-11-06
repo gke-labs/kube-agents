@@ -8580,7 +8580,7 @@ func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
 		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
 		// The operator reads the ConfigMap from its own namespace only.
 		{"a ConfigMap outside the operator's namespace: the default, said", nil, cm("11"), "kubeagents-system", a2aDefaultChartPods, "only from its own namespace"},
-		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "only from its own namespace"},
+		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "own namespace is unknown"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()

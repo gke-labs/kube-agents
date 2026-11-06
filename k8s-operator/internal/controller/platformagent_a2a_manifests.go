@@ -4111,7 +4111,10 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
 			return agent, "", nil
 		}
-		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%q), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+		if r.OperatorNamespace == "" {
+			return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator's own namespace is unknown (%s is unset or not a namespace name), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, OperatorNamespaceEnv, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+		}
+		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%s), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
 	}
 	err := r.a2aReader().Get(ctx, key, cm)
 	if errors.IsNotFound(err) {
