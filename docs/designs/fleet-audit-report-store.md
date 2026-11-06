@@ -113,7 +113,10 @@ dropped under a gap, or with no forge the ids that left under a gap, until a run
 run (`scheduled_coverage_gaps`), the ids the last scheduled run published (`scheduled_published_ids`), and the
 ids a scheduled run reported under a gap (`scheduled_reported_under_gap`) ([ledger design §7.5](fleet-audit-issue-ledger.md)).
 The `scheduled_*` keys are the record of the last scheduled run, not this run's own answer: an
-on-demand run copies them from the record before it. The envelope also carries the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
+on-demand run copies them from the record before it. A run that `precheck` closed from the stored
+document of the last scheduled run, because the collector manifest digested the same
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7), carries
+`precheck: unchanged`; a run whose document a worker drafted carries no `precheck` key. The envelope also carries the collector keys and the phase timers (`inspect_s`, `publish_s`, `collect_s`)
 the JSON line carried, the delta as id lists (`new_ids`,
 `resolved_ids`, `current_ids`, `id_scheme`), `ledger_body` — the body this run left on the issue —
 and `document`, this run's validated findings document, whole rather than clipped to the body's
@@ -201,6 +204,13 @@ under a root-owned ancestor; the next run's warning names the path and both uids
 operator restoring ownership clears it.
 
 ## 4. `finish`'s own memory
+
+A scheduled `finish` with a collector manifest also leaves a second, smaller memory outside the
+store: `/opt/data/scratch/last_scheduled_digest_<audit-id>.json`, the digest of its manifest with
+the `finished_at` of the envelope it stored, which the next scheduled run's `precheck` reads
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). It is checked only
+by its `audit` and that `finished_at` against the store's newest envelope; losing it costs one
+full run (`first-run`), and nothing rebuilds it from the store.
 
 The previous run's memory is the `latest.json` in this run's repository directory, trusted when its
 `issue_number` is the open ledger `find_existing_issue` just returned and its `repo` is this run's.

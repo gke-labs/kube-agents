@@ -1105,6 +1105,18 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A scheduled audit over a fleet that did not change since the last scheduled
+# run is closed by `audit_report.py precheck` from that run's stored findings
+# document, with no document drafted by hand (gke-labs/kube-agents#4724).
+# prebuilt/unchanged-manifest-digest runs the previous scheduled run of the
+# fleet-consistency-drift stream itself (collector, draft, finish --scheduled),
+# then fires the stream's real cron job and waits for it, so the turn is a
+# one-line answer and the grade reads the store. Fixture: drift-outlier. A
+# tofu case, so it holds the infra lock; its stack carries a full drift audit
+# on main (red) and a collector plus precheck on the gate (green), priced at
+# the 900s audit band plus the plant.
+./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
+
 # A drift run over a coverage gap keeps the previous finding on the cluster it
 # did not compare as a held row, with its id in the ledger's hidden block.
 # prebuilt/unread-target-ledger opens a fleet-consistency-drift ledger with
