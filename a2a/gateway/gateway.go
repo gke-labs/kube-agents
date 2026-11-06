@@ -175,6 +175,9 @@ func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 
 // Gateway wires the adapter, the session manager, and the bus client.
 type Gateway struct {
+	// profiles is the AgentProfiles this gateway can address, kept from
+	// their cards on DIRECTORY (startProfileDirectory).
+	profiles *profileDirectory
 	// relayInFlight counts the relay batches rendering (relayBatch), which a
 	// stop waits for.
 	relayInFlight inFlight
@@ -540,6 +543,7 @@ func New(o Options) (*Gateway, error) {
 		log:              log,
 		runCtx:           context.Background(),
 		sessionLocks:     map[string]*sessionLockEntry{},
+		profiles:         newProfileDirectory(),
 		taskSessions:     map[string]string{},
 		relays:           map[string]*relayState{},
 		cardStopTimers:   map[string]*time.Timer{},
@@ -763,6 +767,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		closeAdapter(g.adapter)
 	}()
 
+	g.startProfileDirectory(ctx)
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
@@ -1288,6 +1293,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		default:
 			g.post(rec.Key, nothingRunningNotice)
 		}
+	case active != nil && !active.Detached && msg.Profile != "":
+		// A turn naming an AgentProfile is a new task for it, never a
+		// follow-up to whatever runs here; steering it in would drop the
+		// profile and its parameters without a word.
+		g.post(rec.Key, noticeTurnNotStarted+noticeProfileWhileRunning)
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
 		// "ingress", a heal logs itself, but a steer used to be silent, and
@@ -1297,7 +1307,29 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
 		g.steerTask(ctx, rec, msg, backend, authority)
 	default:
-		if rest, ok := chattext.IsDelegate(msg.Text); ok && g.spawner != nil {
+		// A turn a client addressed to an AgentProfile (the console's frame
+		// can name one) is resolved, scoped and minted for it
+		// before anything about the conversation's route moves, so a refusal
+		// leaves the record as it was.
+		var route *profileRoute
+		if msg.Profile != "" {
+			requester := TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}
+			tier, err := requesterTier(requester)
+			if err == nil {
+				route, err = g.profileRouteFor(msg.Profile, msg.Parameters, tier, lib.SubmitKindTop)
+			}
+			if err != nil {
+				g.log.Warn("profile task refused", "conversation", rec.Key, "profile", truncateRunes(msg.Profile, delegateAddresseeLogCap), "err", err)
+				g.post(rec.Key, refusalNotice(noticeTurnNotStarted, err))
+				return
+			}
+		}
+		if route != nil {
+			// Steers and a stop reach the task on its own .in, under the
+			// profile it resolved to; the next plain ask re-homes as after a
+			// delegated task.
+			rec.Addressee = route.Profile
+		} else if rest, ok := chattext.IsDelegate(msg.Text); ok && g.spawner != nil {
 			// The Delegate flow (W4 amendment): this ONE task goes to a
 			// freshly spawned session worker - the addressee is the new
 			// session name, the rest of the text is the task. On a
@@ -1376,7 +1408,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// task itself out, and shown on the task's status line (showBusy).
 		// fixedRouteAhead answers false off the fixed route. Informational:
 		// the turn has already started either way.
-		if taskID := g.startTask(ctx, rec, msg, backend, principal, authority); taskID != "" {
+		if taskID := g.startTask(ctx, rec, msg, backend, principal, authority, route); taskID != "" {
 			if ahead, busy := g.fixedRouteAhead(ctx, rec, backend, taskID); busy {
 				g.showBusy(rec, taskID, ahead)
 			}
@@ -1553,6 +1585,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
+		// One thing is published, for a task submitted to an AgentProfile:
+		// its stop record. The dispatcher may still hold the submission
+		// queued (over a cap, or with no free worker), and would run it
+		// later into a conversation that has moved on, or for a parent
+		// that was told its child never started. The record drops it
+		// there; a worker that had taken it would have produced a first
+		// event. No cancel goes on .in, which nothing reads before a
+		// worker takes the task.
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok {
+			g.publishDispatchStop(ctx, ref)
+		}
 		// A pod that never started this task is not handed the next one:
 		// it may yet run the abandoned task first, after the person has
 		// moved on, or never run anything. Unmarked, the next turn retires
@@ -1615,12 +1658,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
+			// A parent addressed to an AgentProfile waits open for this.
+			if g.deliverChildResult(ctx, rec, ref, healedTask.State, result, reason) {
+				break
+			}
 			// false: the heal's status card above carries no result text.
 			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
-			g.observeChildEnd(rec, ref, lib.StateFailed, TerminalNeverStarted, "", "the delegated task never started")
+			if g.deliverChildResult(ctx, rec, ref, lib.StateFailed, "", childNeverStarted) {
+				break
+			}
+			g.observeChildEnd(rec, ref, lib.StateFailed, TerminalNeverStarted, "", childNeverStarted)
 		}
 		// Write the release now, not at the end of the turn: a turn that
 		// returns early — a cap refusal, on exactly the Delegate that
@@ -2187,7 +2237,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
-	g.startTask(ctx, rec, msg, backend, principal, authority)
+	g.startTask(ctx, rec, msg, backend, principal, authority, nil)
 	return true
 }
 
@@ -2667,12 +2717,20 @@ type taskStart struct {
 	// stored record holds the child without its parent's link (observedAs
 	// and chainLast read the link). Set for a child only.
 	LinkParent bool
+	// Route, when set, addresses the task to an AgentProfile: the grant is
+	// minted against the resolved profile at the requester's tier with the
+	// target in scope, and the submission goes on the profile's submission
+	// subject with the parameters as a part (spec-profiles-dispatch.md,
+	// "Addressing"). rec.Addressee is the resolved profile. Nil for every
+	// task addressed to platform or a session.
+	Route *profileRoute
 }
 
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
-func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority) string {
+func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
+		Route:     route,
 		Text:      msg.Text,
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
@@ -2718,9 +2776,16 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A mint that fails refuses the turn. The alternative is a submission
 	// with no capability, which the executor refuses anyway, one round trip
 	// and a pod later, with the reason in a different component's log.
-	capRef, err := g.mintCapability(ctx, taskID, rec.Addressee)
+	capRef, err := g.mintTaskCapability(ctx, taskID, rec.Addressee, ts.Route)
 	if err != nil {
 		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
+		// A profile task never goes without its grant, whatever the switch
+		// says: the grant carries the tier and the target the dispatcher
+		// admits it on.
+		if ts.Route != nil {
+			g.post(rec.Key, noticeProfileNoCapability)
+			return "", false
+		}
 		if !g.cfg.CapabilityOptional {
 			g.post(rec.Key, "⚠️ not started: could not mint this task's capability")
 			return "", false
@@ -2733,7 +2798,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		capRef = nil
 	}
 
-	payload, err := messagePayload(ts.Text, taskID, rec.ContextID)
+	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
 		return "", false
@@ -2805,6 +2870,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 	}
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
+	if ts.Route != nil {
+		ref.Tier = string(ts.Route.Tier)
+	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
 		for i := range rec.Tasks {
@@ -2839,7 +2907,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// per-subject cap, and past that cap a worker scanning the subject
 	// cannot tell the evicted submission's replacement from the real thing
 	// (lib.EnvOriginSeq).
-	originSeq, err := g.client.PublishSeq(ctx, lib.TaskInSubject(rec.Addressee, taskID), env)
+	originSeq, err := g.client.PublishSeq(ctx, submissionSubject(rec.Addressee, taskID, ts.Route), env)
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
@@ -2958,7 +3026,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		if rule := g.authorRefusal(rec.Addressee, author, ruleDelegationChildSteer); rule != "" {
 			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
 				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
-			g.post(rec.Key, noticeDelegationNotAllowed)
+			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
 			return
 		}
 	}
@@ -3078,6 +3146,10 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
 	}
 	g.observeCancel(rec, active.TaskID)
+	if ref, ok := rec.TaskRefFor(active.TaskID); ok {
+		g.publishDispatchStop(ctx, ref)
+	}
+	g.cancelWaitingProfileParents(ctx, rec, active.TaskID, authority)
 	return true
 }
 
@@ -3127,6 +3199,10 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	rec.MarkCanceled(taskID)
+	// And its stop record, for a task submitted to an AgentProfile: the
+	// heal released it, so the dispatcher may still hold the submission
+	// queued, and the cancel on .in is not something it reads.
+	g.publishDispatchStop(ctx, ref)
 	g.log.Info("cancel published for a task the conversation no longer holds",
 		"conversation", rec.Key, "taskId", taskID, "addressee", ref.Addressee)
 	// The post before the signal, as in cancelTask.
