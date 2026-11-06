@@ -510,9 +510,11 @@ applied by a workflow so that the enqueue sweep keeps it out of the merge queue 
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
-# Every unresolved thread, with both ids you need: resolveReviewThread takes the
-# thread's node id, while the reply endpoint above takes the first comment's
-# databaseId. REST returns only the latter, which is why this one is GraphQL.
+# Every unresolved thread, and every resolved one whose last comment is not
+# yours (a reviewer's reply does not reopen a resolved thread), with both ids you
+# need: resolveReviewThread and unresolveReviewThread take the thread's node id,
+# while the reply endpoint above takes the first comment's databaseId. REST
+# returns only the latter, which is why this one is GraphQL.
 gh api graphql -f query='
 query($pr: Int!) {
   repository(owner: "gke-labs", name: "kube-agents") {
@@ -521,13 +523,14 @@ query($pr: Int!) {
         nodes {
           id isResolved isOutdated viewerCanResolve path line
           comments(first: 20) { nodes { databaseId author { login } body } }
+          last: comments(last: 1) { nodes { author { login } } }
         }
       }
     }
   }
 }' -F pr=<number> --jq '.data.repository.pullRequest.reviewThreads.nodes[]
-  | select(.isResolved | not)
-  | "\(.path):\(.line // "outdated") thread \(.id) canResolve=\(.viewerCanResolve)
+  | select((.isResolved | not) or (.last.nodes[0].author.login != "<your-login>"))
+  | "\(.path):\(.line // "outdated") thread \(.id) resolved=\(.isResolved) canResolve=\(.viewerCanResolve)
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
