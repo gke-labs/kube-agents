@@ -1304,3 +1304,24 @@ func TestBuildSwarmStateInputRequiredMemberShowsQuestion(t *testing.T) {
 		t.Errorf("workstream note = %q, want the question", note)
 	}
 }
+
+func TestDeriveSessionMemberNamePreservesSessionPrefixedSlug(t *testing.T) {
+	cases := []struct {
+		alias string
+		want  string
+	}{
+		{alias: "session-fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "session_fleet_explorer_session", want: "session-fleet-explorer-session"},
+		{alias: "kube-agents-session-fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "session-default", want: "session-default"},
+		{alias: "session-s-fleet", want: "session-s-fleet"},
+		{alias: "s-fleet", want: "s-fleet"},
+		{alias: "default", want: "session-tok-flee"},
+	}
+	for _, tc := range cases {
+		if got := deriveSessionMemberName(tc.alias, "", "tok-fleet"); got != tc.want {
+			t.Errorf("deriveSessionMemberName(%q) = %q, want %q", tc.alias, got, tc.want)
+		}
+	}
+}
