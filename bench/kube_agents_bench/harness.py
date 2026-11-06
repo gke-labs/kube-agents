@@ -67,6 +67,10 @@ Environment:
         presubmit sets it per repetition), on either transport: under
         ``inject`` the opening task from the door accepting it to its
         terminal. Unset, nothing is written.
+    KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES: ``1`` turns off devops-bench's
+        ``ToolInvocation`` and ``Checklist`` judge scores for the process the
+        harness is built in (:func:`_skip_report_only_judges`). The presubmit
+        sets it on a pull request; unset, every score runs.
     KUBE_AGENTS_SHAPE_FILE: When set, the shape of the reply the run
         delivered is written there (best effort; the presubmit sets it per
         repetition): whether it opens on its answer, whether it apologizes,
@@ -153,6 +157,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -166,7 +171,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from devops_bench.agents import AgentHarness, AgentResult
+from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
@@ -204,6 +209,15 @@ SERVICE_API_PORT = 8642
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# Set to ``1`` by the presubmit on a pull request (hack/ci-eval-pr.sh). The two
+# judge scores it turns off gate nothing: the verdict reads the deterministic
+# Verification* scores and OutcomeValidity, ``RepetitionRecord.judged`` keeps
+# ToolInvocation "for reporting only", and ChecklistScore only feeds
+# OutcomeScore when a record has no VerificationCorrectness. A pull request
+# never records a baseline, so the nightly, which keeps both, is where their
+# trend lives.
+SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
 # The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
@@ -2622,6 +2636,34 @@ class _DelegationTransportExhausted(Exception):
     """
 
 
+def _never_applies(self: object, ctx: object) -> bool:
+    return False
+
+
+def _skip_report_only_judges() -> None:
+    """Turn off devops-bench's ToolInvocation and Checklist evaluators in this process.
+
+    devops-bench scores a run in the process that built its harness, after the
+    run, from every evaluator in its metrics registry whose ``applies`` is true.
+    It has no switch for leaving one out, so the two classes' ``applies`` is
+    replaced: they stay registered and are skipped on every record, as a
+    checklist with no bullets already is. Importing the classes here does not
+    register them twice; the scoring pass imports the same modules.
+    """
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        evaluator.applies = _never_applies  # type: ignore[method-assign]
+    # stderr, not ``_log``: nothing configures a handler that shows INFO here
+    # (devops-bench attaches only a NullHandler), and the unit log the
+    # presubmit keeps (eval_<case>_rep<n>.log) captures stderr.
+    print(
+        f"{SKIP_REPORT_ONLY_JUDGES_ENV}=1: ToolInvocation and Checklist judge scores are off for this run",
+        file=sys.stderr,
+    )
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -2629,6 +2671,11 @@ class KubeAgentsHarness(AgentHarness):
     return an ``AgentResult`` with ``errors`` populated; the base class's safety
     net covers anything unexpected.
     """
+
+    def __init__(self, config: AgentConfig | None = None) -> None:
+        super().__init__(config)
+        if os.environ.get(SKIP_REPORT_ONLY_JUDGES_ENV) == "1":
+            _skip_report_only_judges()
 
     # The purge's floor (:func:`_pod_start`), set by :meth:`run`; ``None`` for
     # a run that could not read it, or an ``_execute`` called without ``run``.

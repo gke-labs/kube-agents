@@ -1,0 +1,171 @@
+# The resource-parity violations the rendered manifests carried when
+# tests/test_manifest_resource_parity.py landed (2026-11-02), each with the
+# issue that removes it. The file may only shrink: the test fails on a
+# violation not listed here, on a listed one no longer observed (remove the
+# line), on a figure larger than `measure` (a regression), on a smaller one
+# (lower `measure` to it, so the gain holds), and on the same `measure` with a
+# different `detail` (one missing declaration swapped for another). Never add a
+# line for a new violation; fix the manifest.
+# `python3 tests/test_manifest_resource_parity.py` prints the entries as
+# observed, in this form.
+#
+# `workload` is `<source> <Kind>/<name>`: `chart` for the rendered chart,
+# `golden` for the operator goldens (one key for every golden fixture that
+# renders the workload), or the kustomize manifest's path. `container` is
+# omitted for a pod-level rule. `measure` is the rule's figure: the number of
+# missing declarations for resources-declared, bytes over the limit for the
+# emptyDir rules, MiB per vCPU outside the band for pod-memory-per-vcpu.
+entries:
+  # The chart's Hindsight API and operator render no ephemeral-storage figures.
+  - workload: "chart Deployment/hindsight-api"
+    container: api
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "chart Deployment/t-controller-manager"
+    container: manager
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  # The GitHub token minter and the web console, both off by default and
+  # rendered under the reader's value sets: neither declares ephemeral-storage,
+  # and the console's 32Mi against 50m sits under the 1Gi-per-vCPU floor.
+  - workload: "chart Deployment/github-token-minter"
+    container: token-minter
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "chart Deployment/t-web-console"
+    container: web-console
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "chart Deployment/t-web-console"
+    rule: pod-memory-per-vcpu
+    measure: 384
+    detail: "32Mi memory per 50m CPU requested = 640Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
+  # LiteLLM requests 2Gi of memory against 100m of CPU, 20 GiB per vCPU;
+  # Autopilot raises the CPU request into the band.
+  - workload: "chart Deployment/litellm"
+    rule: pod-memory-per-vcpu
+    measure: 13824
+    detail: "2Gi memory per 100m CPU requested = 20480Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
+  - workload: "k8s-operator/config/integrations/litellm/base/deployment.yaml Deployment/litellm"
+    rule: pod-memory-per-vcpu
+    measure: 13824
+    detail: "2Gi memory per 100m CPU requested = 20480Mi per vCPU; Autopilot admits 1Gi to 6656Mi"
+    issue: 4341
+  # The gateway pod: agent-api-auth mounts the proxy's 2Gi /tmp writable under
+  # a 2Gi limit, so the allowance does not fit; the agent, its dashboard and the
+  # sandbox credential cleanup declare no ephemeral-storage figures.
+  - workload: "golden Deployment/platformagent-gateway"
+    container: agent-api-auth
+    rule: container-emptydir-fit
+    measure: 67108864
+    detail: "writable emptyDirs credential-proxy-tmp sum 2Gi + allowance 64Mi = 2112Mi, over limits.ephemeral-storage 2Gi by 64Mi"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-gateway"
+    container: platform-agent
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "golden Deployment/platformagent-gateway"
+    container: platform-agent-dashboard
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "golden Deployment/platformagent-gateway"
+    container: sandbox-credential-cleanup
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  # The kube-proxy that fronts the sandbox's kubectl declares cpu and memory
+  # but no ephemeral-storage figures.
+  - workload: "golden Deployment/platformagent-kube-proxy"
+    container: kube-proxy
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  # The next-mode golden's A2A stack: the callout, the console, the verifier,
+  # the A2A gateway and the NATS server declare cpu and memory but no
+  # ephemeral-storage figures, and the hermes-bridge sidecar the gateway pod
+  # carries in that mode declares no ephemeral-storage.
+  - workload: "golden Deployment/platformagent-a2a-callout"
+    container: callout
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-a2a-console"
+    container: console
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-a2a-gateway"
+    container: gateway
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-a2a-verifier"
+    container: verifier
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "golden StatefulSet/platformagent-a2a-nats"
+    container: nats
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  - workload: "golden Deployment/platformagent-gateway"
+    container: hermes-bridge
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
+  # The shell sandbox and its image-tree init container.
+  - workload: "golden StatefulSet/platformagent-shell"
+    container: prepare-image-trees
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4337
+  - workload: "golden StatefulSet/platformagent-shell"
+    container: shell
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4337
+  # The kustomize copies of the Hindsight API and the operator, and the
+  # inference-replay proxy.
+  - workload: "k8s-operator/config/integrations/hindsight/api.yaml Deployment/hindsight-api"
+    container: api
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "k8s-operator/config/manager/manager.yaml Deployment/controller-manager"
+    container: manager
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4433
+  - workload: "k8s-operator/config/integrations/inference-replay/base/deployment.yaml Deployment/standalone-replay"
+    container: replay-proxy-container
+    rule: resources-declared
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
+    issue: 4341
