@@ -8,6 +8,7 @@ The last class runs collect_shadow.py as a process with fake `kubectl` and
 `gcloud` executables on PATH, to cover the signal handling and the exit status.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -590,6 +591,16 @@ class ProcessTest(unittest.TestCase):
         parent.wait()
         out, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 0, err)
+
+    def test_a_build_or_bucket_that_could_make_a_dot_segment_is_refused(self):
+        base = ["--namespace", NAMESPACE, "--selector", SELECTOR, "--container", CONTAINER, "--kind", "presubmit"]
+        for bucket, build in ((BUCKET, ".."), (BUCKET, "."), (BUCKET, "../../nightly/2026-11-05/1"), (BUCKET, "a/b"),
+                              (BUCKET, ""), ("b/../x", "1"), ("gs://b", "1")):
+            with self.subTest(bucket=bucket, build=build):
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    C.parse_args([*base, "--bucket", bucket, "--build", build])
+        args = C.parse_args([*base, "--bucket", BUCKET, "--build", "1790000000000000000"])
+        self.assertNotRegex(C.job_prefix(args.bucket, args.kind, "2026-11-05", args.build), r"/\.\.?(/|$)")
 
     def test_bad_arguments_still_exit_0(self):
         proc = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--kind", "weekly"],

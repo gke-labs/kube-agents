@@ -51,14 +51,28 @@ It uploads to `kube-agents-replay-shadow` (`EVAL_REPLAY_SHADOW_BUCKET` points it
 Each run writes under `gs://<bucket>/replay-shadow/<nightly|nightly-untrusted|presubmit>/<YYYY-MM-DD>/<BUILD_ID>/`, the date being the collector's start in UTC: `logs/*.jsonl` (the lines), `store/requests/*.json` and `store/blobs/*.json` (the scrubbed text), and `job-<ms>.json` (kind, project, build and pull request, written even when the run logged nothing). Every name is written once, so a merged copy of many runs loses nothing:
 
 ```bash
-for kind in nightly nightly-untrusted presubmit; do
-  mkdir -p "week/${kind}"
-  for day in 2026-11-01 2026-11-02 2026-11-03 2026-11-04 2026-11-05 2026-11-06 2026-11-07; do
-    gcloud storage cp -r "gs://<bucket>/replay-shadow/${kind}/${day}" "week/${kind}" || true
+kinds="nightly nightly-untrusted presubmit"
+days="2026-11-01 2026-11-02 2026-11-03 2026-11-04 2026-11-05 2026-11-06 2026-11-07"
+mkdir -p week && : > week/objects.txt
+for kind in ${kinds}; do
+  for day in ${days}; do
+    gcloud storage ls "gs://<bucket>/replay-shadow/${kind}/${day}/**" >> week/objects.txt 2>/dev/null || true
   done
 done
-python3 hack/replay-proxy/analyze_shadow.py week/nightly week/nightly-untrusted week/presubmit --by-text
+if grep -E '^gs://[^/]+/(/|\.\.?(/|$)|.*(//|/\.\.?(/|$)))' week/objects.txt; then
+  echo "Refusing to download: the object keys above have an empty, '.' or '..' segment." >&2
+else
+  for kind in ${kinds}; do
+    mkdir -p "week/${kind}"
+    for day in ${days}; do
+      gcloud storage cp -r "gs://<bucket>/replay-shadow/${kind}/${day}" "week/${kind}" || true
+    done
+  done
+  python3 hack/replay-proxy/analyze_shadow.py week/nightly week/nightly-untrusted week/presubmit --by-text
+fi
 ```
+
+The listing comes first because the folders' trust depends on the downloader: IAM matches a key's prefix as text, so `replay-shadow/presubmit/x/../../nightly/...` is a presubmit's object, and a tool that resolved the `..` would write it into `week/nightly`. gcloud 576 skips such keys, older versions and other tools may not, and `collect_shadow.py` refuses a bucket or build that could produce one.
 
 Keep the bucket's layout: `analyze_shadow.py` takes a line's kind from the top-level `nightly`, `nightly-untrusted` or `presubmit` folder its file was copied from, not from the line's own `job.kind` tag, which comes from the proxy and so from the commit under test. IAM decides who may create objects under each `replay-shadow/<kind>/` prefix but not what the uploader names below it, so a log file counts only at `<kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl`, with that `<kind>` the only directory in its path named for a kind; a segment anywhere else under a folder you pass, even a whole folder of them, is skipped and counted as `off_layout_files`, with a note for a folder that holds nothing at the layout. Pass the kind folders, their parent, or segments inside them. A path that doesn't exist, or a named file that isn't a `.jsonl` segment, is always an error; a named segment off the layout, or a run whose segments are all off it, is an error unless `--kind` names the kind of every input, which also skips the layout check. A run that finds no segments at all reports nothing. A line whose tag names another kind than its file is dropped and counted as `kind_mismatch_lines`. `nightly-untrusted` lines are counted and are never a source or a miss's closest request, since pull-request code could have written them. `--by-text` ranks a miss's closest request by text read from each request's own build, `<kind>/<YYYY-MM-DD>/<build>/store/`, never from a store merged across runs: a presubmit can read the bucket, learn a nightly's request ids and upload text under them in its own prefix. A request's stored text is `store/requests/<request_id>.json` in its build, whose entries name files in that build's `store/blobs/`. `--store DIR` reads one store for every input and so works only with `--kind`, for logs from outside the bucket.
 

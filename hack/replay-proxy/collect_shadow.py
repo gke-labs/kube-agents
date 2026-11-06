@@ -122,6 +122,12 @@ ERROR_CLASSES = (
     ("network", re.compile(r"connection refused|connection reset|i/o timeout|no route|EOF", re.I)),
 )
 ERROR_CLASS_OTHER = "other"
+# The shapes the bucket and build must have (hack/ci-env.sh's REPLAY_SHADOW_BUCKET_RE
+# and REPLAY_SHADOW_BUILD_RE), so no object key this writes holds a `.` or `..`
+# segment: the bucket's IAM conditions match a key's prefix as text, and a
+# downloader that resolved `presubmit/x/../../nightly/` would file it elsewhere.
+BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
+BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 GCLOUD_ENV = {
     # A composite upload writes and deletes temporary objects, which needs a
     # delete grant the presubmit's identity should not hold.
@@ -578,6 +584,14 @@ def run_loop(collector: Collector, interval: float, final_deadline: float, paren
     one_pass(final=True)
 
 
+def _shaped(pattern: "re.Pattern[str]", what: str) -> Callable[[str], str]:
+    def check(value: str) -> str:
+        if not pattern.match(value):
+            raise argparse.ArgumentTypeError(f"not a {what}")
+        return value
+    return check
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--namespace", required=True)
@@ -585,9 +599,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--selector", required=True, help="label selector of the proxy pods")
     parser.add_argument("--container", required=True, help="the proxy container's name")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="the proxy's data volume, in the pod")
-    parser.add_argument("--bucket", required=True)
+    parser.add_argument("--bucket", required=True, type=_shaped(BUCKET_SHAPE, "bucket name"))
     parser.add_argument("--kind", required=True, choices=JOB_KINDS)
-    parser.add_argument("--build", required=True)
+    parser.add_argument("--build", required=True, type=_shaped(BUILD_SHAPE, "build id"))
     parser.add_argument("--project", default="")
     parser.add_argument("--pr", default="")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_SECONDS)
