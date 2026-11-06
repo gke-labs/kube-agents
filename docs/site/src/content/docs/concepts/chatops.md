@@ -49,7 +49,9 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 
 When no home channel is set and the install's first chat message, on either platform, comes from Google Chat, it makes its space the Planning Agent's home channel, the same write `/sethome` makes. Scheduled `deliver: chat` reports reach that space from then on. That is often a one-person DM: send the first message from the space the team watches, or run `/sethome` there later. The specialists above still read only the pod environment. Like `/sethome`, the write also goes to the profile's `.env`, which outranks a `homeChannel` set on the CR afterwards. After the first message, a CR value still reaches the specialists, but the Planning Agent's home channel moves only with `/sethome`.
 
-Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
+Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies,.
+
+The gateway keeps the posts it refused, up to fifty for thirty days, then posts one digest once a home channel is set. With Slack enabled too, they go to the Slack Hermes platform instead, which delivers them only if Slack has its own home channel.
 
 ### What it looks like end to end
 
@@ -147,6 +149,8 @@ Paste the output into your app's **App Manifest** page in the Slack App Console 
 It is optional at install time. Leave the prompt empty and, if the install's first chat message on either platform comes from Slack, it makes its channel or DM the home channel. Otherwise Slack has none until you run `/sethome` (or `/hermes sethome`) in the channel you want, which is also how you move it. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 Under `spec.mode: next` the home channel is `spec.integration.slack.homeChannel` on the PlatformAgent, or, with the field empty, the channel the gateway learns from the first mention (below). The operator hands it to the A2A gateway, which posts the agent's proactive messages (alerts, scheduled reports, and the fleet audit's report card) into that channel and nowhere else, as new threads or as replies in them. `/sethome` does not reach it: an allowed member moves it from the app's Home tab (below). The field must be a channel ID (`C...`, or `G...` for a private channel), not a name; with it set to something else the agent posts nothing to Slack unprompted.
+
+Until a home channel exists, the gateway keeps the posts it refused, up to fifty for thirty days, and posts one digest into the channel once one is set.
 
 With it unset and `spec.integration.slack.homeChannelPolicy` `auto` (the default), the first top-level mention of the agent in a channel makes that channel the home channel. The gateway checks the channel first: not a direct message, not archived, not shared through Slack Connect, and the app a member. It then records the channel in the `<agent>-home-channel` ConfigMap beside the gateway and posts one line in the mention's thread. The operator projects the recorded channel into a file it mounts in the agent pod and the gateway pod; both read it within about a minute, and no pod restarts. Until the learn the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
@@ -467,7 +471,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the top five credential broker tools, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -631,6 +635,8 @@ The daily recap has the line "N alerts from M workloads withheld by the daily ce
 
 Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
 
+The recap line "N events from M workloads were silenced by alert-exclude rules" counts the events that the [alert-exclude rules](/kube-agents/operator/platformagent-crd/#specharnesseventwatcher) held back, and names the five workloads that sent the most. These events never reached the ceiling, and `GET /v1/intercepted-events` lists them with the status `excluded`.
+
 The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
 
 #### Sizing a bucket
@@ -689,6 +695,20 @@ A human still reviews and merges the pull request, and nothing is written to the
 StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch of their own, because the pod name alone cannot prove they belong to one workload. With the fold on, a Deployment's repeat events inside the window start no triage, so they file no pull-request card either. The second card's result, the pull request URL, is posted in the same thread as the report.
 
 The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
+
+### Limiting the open triage pull requests
+
+A failure that breaks many workloads at once, such as a node or storage fault, starts many triages, and with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` on each one opens a pull request. Set `platformAgent.deployment.incidentMaxOpenPullRequests` to limit how many are open or being opened at once. The chart renders it as `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`. `0`, the default, is no limit.
+
+```yaml
+platformAgent:
+  deployment:
+    incidentMaxOpenPullRequests: 5
+```
+
+A triage whose pull request would pass the limit still runs, but its report asks for a reply, as without the setting, and a note in the alert's thread says that the limit held its pull request back. An incident whose branch already has a pull request is not held: its card revises that pull request. If the open pull requests cannot be counted, because the forge fails or does not answer in time, the triage is held the same way, with a note that says so. As with the switch, the agent ignores the variable in its own `.env` file.
+
+The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. The count goes by that branch prefix alone, so a pull request opened by a reply counts only when its branch takes the prefix. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours. A card that is `blocked`, or waits behind a blocked triage card, keeps counting until then, because it can still open its pull request.
 
 ## First-run onboarding
 

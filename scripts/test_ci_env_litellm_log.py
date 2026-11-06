@@ -25,8 +25,9 @@ FUNCTION = "collect_litellm_log"
 # The byte cap the function bounds the log with (hack/ci-env.sh, "Byte caps").
 HELPER = "last_bytes"
 ARTIFACT = "litellm.log"
-# The chart's pod label and container name (charts/kube-agents/templates/litellm.yaml).
-POD_SELECTOR = "app=litellm"
+# The chart's pod label and container name (charts/kube-agents/templates/litellm.yaml),
+# less the shadow-mode replay proxy, which carries app: litellm too.
+POD_SELECTOR = "app=litellm,kubeagents.x-k8s.io/inference-role!=replay-shadow"
 CONTAINER = "litellm-container"
 
 # A kubectl that answers `get` for the Deployment (or refuses it with

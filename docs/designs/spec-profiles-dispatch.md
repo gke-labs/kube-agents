@@ -344,6 +344,22 @@ leave open:
   nobody can read counts as a running one: its task is treated as started, and the sweep
   waits as long from the record's last write. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
+- **Task credentials.** With a task-signing key (a cluster seed, read from the file
+  `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
+  mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
+  `taskCredential` (audience `nats`) is the password of the worker's task connection.
+  `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
+  admission, and a task that names no cluster gets none. Both name the task, its profile and
+  tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
+  offer's deadline plus the callout's 30s clock skew, and never later than
+  `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
+  never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
+  offered the task. The credentials are minted on the accept, before the lease is recorded.
+  If the pod's UID changed since the offer, or the mint fails, the offer is withdrawn as a
+  declined one is, and the task is offered again. With the variable unset, confirms carry neither, workers keep their
+  pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
+  or holds another key type stops the dispatcher at startup. The dispatcher logs a
+  credential's `jti`, never the token.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -394,6 +410,22 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
+- **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. While it is open, for
+  `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
+  cap, never refused: a refusal would let one input that keeps killing workers fail every
+  other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
+  the oldest held submission is admitted alone as the probe of that opening, and the rest
+  wait while it runs; a child of the probe (sharing its correlationId) is part of its attempt
+  and is admitted. The next expiry opens it again. Below the threshold any finished task
+  resets the run; once it has opened, only that opening's probe closes it, by finishing or
+  by running to its deadline still renewing. A stop never opens or closes the breaker by
+  itself, but its worker's silence counts as a loss: a worker that stops renewing, after a
+  stop or not, is counted, whether the lease runs out first or the stop's grace does (the
+  grace is never shorter than a renewal and two ticks, so one silent since before the stop is
+  always past the count's threshold when it ends). The
+  state is in memory, and the dispatcher's health lists open and half-open breakers. A held
+  task isn't told it is held yet (#4362).
 
 ### Execution
 

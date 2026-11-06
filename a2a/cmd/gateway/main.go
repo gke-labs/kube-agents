@@ -249,6 +249,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// Under the election it runs only while this replica holds the lease.
 	lead := func(ctx context.Context, opts gateway.RunOptions) error {
 		if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
+			// Home posts refused for want of a home channel are kept in the
+			// session-state bucket and digested when a channel arrives
+			// (gateway/notify_refused.go), whatever the backend.
+			notifier.SetKept(gateway.NewRefusedStore(client, notifier.Backend()))
 			// The home source is wired before the route starts: Start's boot
 			// line reads it, and nothing writes it after.
 			armHomeLearn(cfg, backendAdapter, notifier, log)

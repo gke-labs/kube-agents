@@ -976,7 +976,7 @@ under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification
 registers its own cases, each a top-level case under
 `bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
 `hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
-one Prow periodic per section, rerun from Deck and never on a cron. The script refuses an entry
+one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses an entry
 that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
 refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
 above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
