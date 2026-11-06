@@ -924,11 +924,12 @@ class GatewayCopyTest(unittest.TestCase):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
 
     def test_the_gateway_prints_the_same_totals_since_install(self):
-        """The Go list names its fields through constants; each constant's value is read."""
+        """The fields the gateway's render reads, in the order it reads them, through the
+        constants it names; the test reads the render itself, not a list beside it."""
         source = self.GO_FILE.read_text()
-        start = source.index("var usageSummaryTotalFields = ")
-        body = source[start : source.index("}", start)]
-        names = re.findall(r"usageSummary\w+Field\b", body)
+        start = source.index("func renderUsageSummary(")
+        body = source[start : source.index("\nfunc ", start + 1)]
+        names = re.findall(r"usage\[(usageSummary\w+Field)\]", body)
         values = [re.search(rf'{name}\s*=\s*"([A-Za-z0-9]+)"', source).group(1) for name in names]
         self.assertEqual(list(fs.PERFORMANCE_TOTAL_FIELDS), values)
         self.assertEqual(fs.MICROS_PER_USD, int(float(re.search(r'usageSummaryMicrosPerUSD\s*=\s*([0-9_.]+)', source).group(1).replace("_", ""))))
