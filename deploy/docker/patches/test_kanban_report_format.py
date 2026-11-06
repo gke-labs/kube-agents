@@ -231,6 +231,12 @@ class StanzaTest(unittest.TestCase):
         self.assertIn("=== Title ===", REPORT_FORMAT_STANZA)
         self.assertIn("pipe table", REPORT_FORMAT_STANZA)
 
+    def test_a_yes_or_no_answer_carries_no_claims_unless_the_card_asks(self):
+        # The same condition as verified_claims' tool description; a why-question keeps its claims.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn("On a yes-or-no question or a status check, leave `verified_claims` empty", flat)
+        self.assertIn("unless the card asks for verified claims", flat)
+
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
 
