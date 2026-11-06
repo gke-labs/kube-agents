@@ -61,8 +61,14 @@ const (
 	// a line at a time: what answers on the port is input, and Go's default
 	// would hold ten mebibytes of headers from it.
 	usageScrapeMaxHeaderBytes = 16 * 1024
-	usageMetricsPath          = "/metrics"
-	usageScrapeScheme         = "http://"
+	// usageMetricsPath is the path every kube-agents listener serves its
+	// exposition at. usageLiteLLMMetricsPath is LiteLLM's: its router mounts
+	// the exposition under a trailing slash and answers the bare path with a
+	// 307 to it, which the client below does not follow, so the target names
+	// the slashed path and the scrape never depends on a redirect.
+	usageMetricsPath        = "/metrics"
+	usageLiteLLMMetricsPath = "/metrics/"
+	usageScrapeScheme       = "http://"
 
 	// The series the poller reads, and the gauge every listener exports so that
 	// a restart is seen whatever the sample did.
@@ -238,6 +244,25 @@ const (
 	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
 	// a handful of boards; a body past this is a broken one.
 	usageDispatcherBoardCeiling = 1000
+	// The inference gateway's (LiteLLM's) token and spend families, summed
+	// over every label set (model, provider, key, team, user, requested
+	// model) into the three inference totals. LiteLLM has named each with and
+	// without the counter suffix across its releases, as the workstation
+	// summary's TOKEN_FAMILIES and SPEND_FAMILIES record, so the bare name is
+	// each counter's sibling (usageSiblingsFor); a body carries one or the
+	// other. tests/test_usage_counters_series_names.py pins these to the
+	// script's tuples.
+	litellmInputTokensSeries      = "litellm_input_tokens_metric_total"
+	litellmInputTokensBareSeries  = "litellm_input_tokens_metric"
+	litellmOutputTokensSeries     = "litellm_output_tokens_metric_total"
+	litellmOutputTokensBareSeries = "litellm_output_tokens_metric"
+	litellmSpendSeries            = "litellm_spend_metric_total"
+	litellmSpendBareSeries        = "litellm_spend_metric"
+	// usageSpendMicrosPerUSD scales LiteLLM's dollar figure to the integer
+	// micro-dollars status.usage.spendMicrosUSDTotal keeps: the sum over the
+	// body is scaled and rounded once, before the int64 conversion, so a
+	// fraction of a micro is never truncated per label set.
+	usageSpendMicrosPerUSD = 1_000_000
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -392,9 +417,26 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatFeedbackNegativeSeries, nil
 	case usageCounterPositiveFeedback:
 		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
+	case usageCounterInputTokens:
+		return litellmInputTokensSeries, nil
+	case usageCounterOutputTokens:
+		return litellmOutputTokensSeries, nil
+	case usageCounterSpendMicros:
+		return litellmSpendSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
+}
+
+// usageSampleScaleFor is the factor a counter's summed sample is multiplied
+// by, and rounded, before it becomes the integer the document keeps: the
+// spend counter's dollars to micro-dollars; every other counter is a count
+// already and is taken as it is.
+func usageSampleScaleFor(counter string) float64 {
+	if counter == usageCounterSpendMicros {
+		return usageSpendMicrosPerUSD
+	}
+	return 1
 }
 
 // usageSiblingsFor is the other families a counter is read from, on pods
@@ -404,7 +446,9 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 // pod, under the same label set; the errored counter comes from the plugin
 // whole and from the A2A gateway's task terminals under the errored states;
 // the thumbs-downs come from the plugin whole and from the A2A gateway's
-// answer ratings under the down rating.
+// answer ratings under the down rating; each inference total comes from
+// LiteLLM's suffixed family or, on a release that names it without the
+// suffix, the bare one, summed whole either way.
 func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
@@ -415,6 +459,12 @@ func usageSiblingsFor(counter string) []usageSibling {
 		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
 	case usageCounterNegativeFeedback:
 		return []usageSibling{{family: a2aAnswerFeedbackSeries, filter: usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}}}
+	case usageCounterInputTokens:
+		return []usageSibling{{family: litellmInputTokensBareSeries}}
+	case usageCounterOutputTokens:
+		return []usageSibling{{family: litellmOutputTokensBareSeries}}
+	case usageCounterSpendMicros:
+		return []usageSibling{{family: litellmSpendBareSeries}}
 	}
 	return nil
 }
@@ -687,14 +737,18 @@ func usageTimedOut(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 
-// usageSource reads a listener. The pod scraper is its one implementation; a
-// test supplies a stub, and a deployment that cannot admit operator-to-pod
-// traffic could gain another without changing the accumulation or the writer.
+// usageSource reads a listener at a pod address and the path its exposition
+// is served at (usageMetricsPath for every kube-agents listener,
+// usageLiteLLMMetricsPath for LiteLLM). The pod scraper is its one
+// implementation; a test supplies a stub, and a deployment that cannot admit
+// operator-to-pod traffic could gain another without changing the
+// accumulation or the writer.
 type usageSource interface {
-	Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error)
+	Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error)
 }
 
-// podUsageSource reads /metrics at a pod IP and port over the pod network.
+// podUsageSource reads the exposition at a pod IP and port over the pod
+// network.
 type podUsageSource struct {
 	client *http.Client
 }
@@ -719,11 +773,12 @@ func newPodUsageSource() *podUsageSource {
 	}}
 }
 
-// Scrape GETs the listener at addr and folds the body for each of counters,
-// one sample per counter from the one body, and for each of kinds. Any status
-// other than 200 is a failed scrape.
-func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
+// Scrape GETs path on the listener at addr and folds the body for each of
+// counters, one sample per counter from the one body, and for each of kinds.
+// Any status other than 200 is a failed scrape, a redirect included: the
+// target names the path the listener serves, and the client follows nothing.
+func (s *podUsageSource) Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+path, nil)
 	if err != nil {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
@@ -939,6 +994,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	}
 	samples := make(map[string]int64, len(sums))
 	for counter, sum := range sums {
+		// The spend counter's dollars become micro-dollars here, rounded once
+		// over the whole body; a count's scale is one and leaves it exact.
+		if scale := usageSampleScaleFor(counter); scale != 1 {
+			sum = math.Round(sum * scale)
+		}
 		if sum >= float64(math.MaxInt64) {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 		}

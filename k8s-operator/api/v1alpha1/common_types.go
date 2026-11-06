@@ -2863,7 +2863,8 @@ type AgentStatus struct {
 // ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
 // ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
-// listeners, and the six proposal readings (RemediationsMergedTotal,
+// listeners, InputTokensTotal, OutputTokensTotal and SpendMicrosUSDTotal from
+// the inference gateway's (LiteLLM's), and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
 // ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
 // the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
@@ -3083,6 +3084,37 @@ type AgentUsageStatus struct {
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
+	// InputTokensTotal is the cumulative count of prompt tokens the inference
+	// gateway (LiteLLM) billed for the install's model calls, every model and
+	// every caller together. Read every five minutes from each LiteLLM pod's
+	// litellm_input_tokens_metric_total (or litellm_input_tokens_metric on a
+	// release that names it so), summed over its labels and across pods, and
+	// kept monotonic the same way as ToolExecutionsTotal, so a LiteLLM restart,
+	// which starts the pod's own counter at zero again, does not reset it. A
+	// per-poll delta ceiling sized for tokens applies, far above the one the
+	// other counters take. Does not move LastActiveTime: memory consolidation
+	// and the scheduled jobs bill through LiteLLM with nobody asking. Absent
+	// while the served CRD predates it.
+	// +optional
+	InputTokensTotal int64 `json:"inputTokensTotal,omitempty"`
+	// OutputTokensTotal is the cumulative count of completion tokens the
+	// inference gateway billed for the install's model calls: LiteLLM's
+	// litellm_output_tokens_metric_total (or litellm_output_tokens_metric),
+	// read, summed and kept monotonic as InputTokensTotal is. Does not move
+	// LastActiveTime. Absent while the served CRD predates it.
+	// +optional
+	OutputTokensTotal int64 `json:"outputTokensTotal,omitempty"`
+	// SpendMicrosUSDTotal is the cumulative spend the inference gateway
+	// attributes to the install's model calls, in micro-dollars (one USD is
+	// 1,000,000 micros), so the field stays an integer: LiteLLM's
+	// litellm_spend_metric_total (or litellm_spend_metric), a dollar figure
+	// LiteLLM computes from its own price map, summed over its labels, scaled
+	// and rounded to micros before it is folded, and kept monotonic as
+	// InputTokensTotal is. A model LiteLLM has no price for adds nothing here
+	// while its tokens still count above. Does not move LastActiveTime. Absent
+	// while the served CRD predates it.
+	// +optional
+	SpendMicrosUSDTotal int64 `json:"spendMicrosUSDTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -3265,8 +3297,9 @@ type AgentUsageStatus struct {
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
 	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
-	// was, and the six proposal readings never move it.
+	// NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
+	// totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
+	// leave it where it was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

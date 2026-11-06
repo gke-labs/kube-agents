@@ -195,6 +195,37 @@ func TestUsageGauges_PointerRowsForTheNineOriginReadings(t *testing.T) {
 	}
 }
 
+// The three inference totals share one pruning record, and each is a counter
+// row published as the status holds it, zero included.
+func TestUsageGauges_CounterRowsForTheThreeInferenceTotals(t *testing.T) {
+	got := usageExportFieldsOfRecord(usageNewerFieldInference)
+	if !reflect.DeepEqual(got, []string{"inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal"}) {
+		t.Fatalf("record fields = %v", got)
+	}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range got {
+		if f, ok := rows[name]; !ok || f.pointer {
+			t.Errorf("%s: row %+v, want a counter row", name, f)
+		}
+	}
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	agent.Status.Usage.InputTokensTotal = 1200100
+	agent.Status.Usage.SpendMicrosUSDTotal = 3030457
+	g.publishUsage(agent)
+	for field, want := range map[string]float64{"inputTokensTotal": 1200100, "outputTokensTotal": 0, "spendMicrosUSDTotal": 3030457} {
+		if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", field)); got != want {
+			t.Errorf("%s = %v, want %v", field, got, want)
+		}
+	}
+}
+
 // Every counter and gauge of status.usage lands as one sample of the usage
 // family, labelled by the field's JSON name; the times land as unix seconds in
 // the time family; an absent pointer or time has no sample.

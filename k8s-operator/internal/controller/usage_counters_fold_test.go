@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -1316,4 +1317,91 @@ func TestMigrateUsageDocument_FlagsNameTheMigrationApplied(t *testing.T) {
 			t.Errorf("added=%v retired=%v rekeyed=%v migrated=%v, want none", doc.added, doc.retired, doc.rekeyed, doc.migrated)
 		}
 	})
+}
+
+// The three inference totals take their own per-poll ceilings, far above the
+// one every other counter keeps: a token delta of tens of thousands folds
+// where the same delta on the tool counter is refused, a token delta past
+// the token ceiling is refused the same way, the spend total takes the spend
+// ceiling in micro-dollars, and a new LiteLLM pod's whole sample folds under
+// the token ceiling. None of the three stamps LastMoved: they are quiet.
+func TestFoldUsage_TheInferenceTotalsTakeTheirOwnCeilingsAndMoveNothing(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	const litellmPod = "litellm"
+	t.Run("a fifty-thousand-token delta folds and is quiet", func(t *testing.T) {
+		doc := foldDoc(first, foldEntry(litellmPod, usageCounterInputTokens, 1_000_000, ptr.To(1.0), first))
+		runFoldSteps(t, doc, usageCounterInputTokens, []foldStep{
+			{minute: 5, scraped: []usageScrapedPod{scrapedPod(litellmPod, usageCounterInputTokens, created, 1_050_000, ptr.To(1.0))}, want: 50_000, moved: false},
+		})
+	})
+	t.Run("the same delta on the tool counter is refused", func(t *testing.T) {
+		doc := foldDoc(first, foldEntry(foldPodBroker, usageCounterToolExecutions, 100, ptr.To(1.0), first))
+		runFoldSteps(t, doc, usageCounterToolExecutions, []foldStep{
+			{minute: 5, scraped: []usageScrapedPod{scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 100+usageDeltaCeiling+1, ptr.To(1.0))}, want: 0},
+		})
+	})
+	t.Run("the token ceiling is the token counters' bound", func(t *testing.T) {
+		doc := foldDoc(first,
+			foldEntry(litellmPod, usageCounterInputTokens, 0, ptr.To(1.0), first),
+			foldEntry(litellmPod, usageCounterOutputTokens, 0, ptr.To(1.0), first))
+		res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+			scrapedPod(litellmPod, usageCounterInputTokens, created, usageTokenDeltaCeiling, ptr.To(1.0)),
+			scrapedPod(litellmPod, usageCounterOutputTokens, created, usageTokenDeltaCeiling+1, ptr.To(1.0)),
+		}, foldClock(5))
+		if got := res.Document.Totals[usageCounterInputTokens]; got != usageTokenDeltaCeiling {
+			t.Errorf("exactly the token ceiling: input = %d, want %d", got, usageTokenDeltaCeiling)
+		}
+		if got := res.Document.Totals[usageCounterOutputTokens]; got != 0 {
+			t.Errorf("one past the token ceiling: output = %d, want 0 (refused)", got)
+		}
+		if entry := res.Document.Pods[usagePodEntryKey(litellmPod, usageCounterOutputTokens)]; entry.Sample != usageTokenDeltaCeiling+1 {
+			t.Errorf("the refused body did not advance the baseline: %+v", entry)
+		}
+		if res.Document.LastMoved != nil {
+			t.Errorf("a token advance stamped LastMoved %v", res.Document.LastMoved)
+		}
+	})
+	t.Run("the spend ceiling is in micro-dollars", func(t *testing.T) {
+		doc := foldDoc(first, foldEntry(litellmPod, usageCounterSpendMicros, 0, ptr.To(1.0), first))
+		runFoldSteps(t, doc, usageCounterSpendMicros, []foldStep{
+			{minute: 5, scraped: []usageScrapedPod{scrapedPod(litellmPod, usageCounterSpendMicros, created, usageSpendDeltaCeiling, ptr.To(1.0))}, want: usageSpendDeltaCeiling, moved: false},
+			{minute: 10, scraped: []usageScrapedPod{scrapedPod(litellmPod, usageCounterSpendMicros, created, 2*usageSpendDeltaCeiling+1, ptr.To(1.0))}, want: usageSpendDeltaCeiling, moved: false},
+		})
+	})
+	t.Run("a replacement pod's whole sample folds under the token ceiling", func(t *testing.T) {
+		doc := foldDoc(first)
+		doc.Totals[usageCounterInputTokens] = 60_000
+		runFoldSteps(t, doc, usageCounterInputTokens, []foldStep{
+			{minute: 5, live: []string{litellmPod}, scraped: []usageScrapedPod{scrapedPod(litellmPod, usageCounterInputTokens, first.Add(time.Minute), 70_000, ptr.To(2.0))}, want: 130_000, moved: false},
+		})
+	})
+}
+
+// The quiet set and the ceilings agree on which counters are the inference
+// totals, and every counter the document keeps has a ceiling.
+func TestUsageDeltaCeilingFor_NamesTheInferenceTotalsAlone(t *testing.T) {
+	for _, counter := range usageCounters {
+		ceiling := usageDeltaCeilingFor(counter)
+		switch counter {
+		case usageCounterInputTokens, usageCounterOutputTokens:
+			if ceiling != usageTokenDeltaCeiling {
+				t.Errorf("%s: ceiling %d, want the token ceiling", counter, ceiling)
+			}
+		case usageCounterSpendMicros:
+			if ceiling != usageSpendDeltaCeiling {
+				t.Errorf("%s: ceiling %d, want the spend ceiling", counter, ceiling)
+			}
+		default:
+			if ceiling != usageDeltaCeiling {
+				t.Errorf("%s: ceiling %d, want the common ceiling", counter, ceiling)
+			}
+		}
+		if slices.Contains(usageLiteLLMCounters, counter) != (ceiling != usageDeltaCeiling) {
+			t.Errorf("%s: in the LiteLLM group %v but ceiling %d", counter, slices.Contains(usageLiteLLMCounters, counter), ceiling)
+		}
+		if slices.Contains(usageLiteLLMCounters, counter) && !usageQuietCounters[counter] {
+			t.Errorf("%s: an inference total that moves lastActiveTime", counter)
+		}
+	}
 }
