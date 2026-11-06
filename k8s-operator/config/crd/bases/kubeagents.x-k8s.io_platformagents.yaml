@@ -9245,10 +9245,11 @@ spec:
                         is upward only, latched in that status field, so a count that falls
                         never lowers the tier; and before each step up the operator checks
                         every ResourceQuota in the namespace that counts these pods for the
-                        cpu, memory and ephemeral-storage the step adds, and every
-                        Container-type LimitRange max and min in the namespace against the
-                        three containers' figures at the higher row, takes the highest tier
-                        both admit (the running one when they admit none) and sets the
+                        cpu, memory and ephemeral-storage the step adds, and every LimitRange
+                        max, min and maxLimitRequestRatio in the namespace against the three
+                        containers' figures at the higher row, per container and summed per
+                        pod, takes the highest tier both admit (the running one when they
+                        admit none) and sets the
                         SizingCappedByQuota condition for the step refused, naming the quota
                         or the LimitRange, rather than rolling out pods admission would refuse.
                         A pod the namespace admits between that check and the recreated

@@ -102,7 +102,7 @@ func sizedWorkloadsOn(agent *agentv1alpha1.PlatformAgent, tier sizingTier, autop
 	gateway := &appsv1.Deployment{
 		ObjectMeta: meta(agent.Name + gatewayWorkloadNameSuffix),
 		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-			InitContainers: []corev1.Container{{Name: agentAPIAuthContainerName, Resources: renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier)}},
+			InitContainers: []corev1.Container{{Name: agentAPIAuthContainerName, Resources: renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier), RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways)}},
 			Containers:     []corev1.Container{{Name: platformAgentContainerName}},
 		}}},
 		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1},
@@ -1921,16 +1921,103 @@ func TestResolveSizingTierLimitRangeGate(t *testing.T) {
 			}
 		}
 	})
-	t.Run("a Pod-type item is not read", func(t *testing.T) {
+	t.Run("a Pod-type max is read against the pod's sum with the candidate's render", func(t *testing.T) {
 		t.Parallel()
-		// A Pod-type max sums the pod's containers, which the gate does not
-		// render; the three sized containers are the only figures a tier
-		// moves, and the check reads Container-type items alone.
+		// The gateway pod runs its agent container beside the sidecar; give
+		// it a 1Gi memory limit. A per-pod max of 4Gi admits the broker's
+		// pod at medium (4Gi alone) and refuses the gateway's (the medium
+		// sidecar's 4Gi plus 1Gi), so the step to medium is refused on the
+		// sidecar's pod rather than on any one container, and fleet with it.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+		gateway := workloads[1].(*appsv1.Deployment)
+		gateway.Spec.Template.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+			Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		}
+		podBound := sizingLimitRange("pod-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi")
+		podBound.Spec.Limits[0].Type = corev1.LimitTypePod
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, podBound}, workloads...)...).WithStatusSubresource(agent).Build()
+		recorder := record.NewFakeRecorder(8)
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: the gate promoted past a per-pod max the gateway pod's sum crosses", agent.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Reason != sizingCappedByLimitRangeReason {
+			t.Fatalf("SizingCappedByQuota = %+v, want the LimitRange reason", cond)
+		}
+		for _, want := range []string{"LimitRange pod-bounds sets a per-pod max on memory that the agent-api-auth container's pod crosses", "step up from small", "the small tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+		if event := <-recorder.Events; !strings.Contains(event, "the max is 4Gi, the row's figure 5Gi") {
+			t.Errorf("event does not carry the pod's sum: %s", event)
+		}
+	})
+	t.Run("a Pod-type max every pod's sum admits lets the step through", func(t *testing.T) {
+		t.Parallel()
+		// The fixtures' pods carry the sized container alone, so a per-pod
+		// 4Gi max admits medium (4Gi) and refuses fleet (8Gi), as the
+		// per-container max above does.
 		podBound := sizingLimitRange("pod-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi")
 		podBound.Spec.Limits[0].Type = corev1.LimitTypePod
 		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil), podBound)
-		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
-			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a Pod-type item capped the tier", stored.Status.EffectiveSizingTier)
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium", stored.Status.EffectiveSizingTier)
+		}
+	})
+	t.Run("a maxLimitRequestRatio the row crosses refuses the step", func(t *testing.T) {
+		t.Parallel()
+		// The sidecar requests 384Mi of memory at every tier over a 2Gi
+		// limit at small (a ratio of 5.3), 4Gi at medium (10.7) and 8Gi at
+		// fleet (21.3): a per-container ratio of 10 admits small alone. The
+		// broker's rows keep limit and request equal on memory.
+		ratio := &corev1.LimitRange{
+			ObjectMeta: metav1.ObjectMeta{Name: "tenant-ratio", Namespace: "kubeagents-system"},
+			Spec: corev1.LimitRangeSpec{Limits: []corev1.LimitRangeItem{{
+				Type:                 corev1.LimitTypeContainer,
+				MaxLimitRequestRatio: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("10")},
+			}}},
+		}
+		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil), ratio)
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: the gate promoted past a ratio the sidecar's medium row crosses", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || !strings.Contains(cond.Message, "LimitRange tenant-ratio sets a per-container maxLimitRequestRatio on memory that the agent-api-auth container crosses") {
+			t.Fatalf("SizingCappedByQuota = %+v, want the ratio named on the sidecar", cond)
+		}
+		if event := <-recorder.Events; !strings.Contains(event, "the maxLimitRequestRatio is 10, the row's figure 10.7") {
+			t.Errorf("event does not carry the ratio: %s", event)
+		}
+	})
+	t.Run("a ratio is one under the Autopilot clamp", func(t *testing.T) {
+		t.Parallel()
+		// Without bursting Autopilot lowers every limit to its request, so
+		// a limit-to-request ratio read after the rewrite is one and a ratio
+		// bound admits every row.
+		ratio := &corev1.LimitRange{
+			ObjectMeta: metav1.ObjectMeta{Name: "tenant-ratio", Namespace: "kubeagents-system"},
+			Spec: corev1.LimitRangeSpec{Limits: []corev1.LimitRangeItem{{
+				Type:                 corev1.LimitTypeContainer,
+				MaxLimitRequestRatio: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2")},
+			}}},
+		}
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, ratio}, autopilotClamped(sizedWorkloadsOn(agent, sizingTierSmall, true))...)...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), autopilot: true, autopilotResolved: true}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		if agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Errorf("status.effectiveSizingTier = %q, want fleet: a ratio bound capped a clamped row", agent.Status.EffectiveSizingTier)
 		}
 	})
 	t.Run("the cap names the check that refused the lowest step", func(t *testing.T) {
@@ -2134,5 +2221,51 @@ func TestResourceQuotaNamedIn(t *testing.T) {
 		if got != want || named != (want != "") {
 			t.Errorf("resourceQuotaNamedIn(%q) = %q, %v; want %q", message, got, named, want)
 		}
+	}
+}
+
+func TestSizingPodFigures(t *testing.T) {
+	t.Parallel()
+	mem := func(request, limit string) corev1.ResourceRequirements {
+		rr := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
+		if request != "" {
+			rr.Requests[corev1.ResourceMemory] = resource.MustParse(request)
+		}
+		if limit != "" {
+			rr.Limits[corev1.ResourceMemory] = resource.MustParse(limit)
+		}
+		return rr
+	}
+	// A sidecar init container adds to the sum; a plain init container,
+	// with the sidecars before it, is a floor on it; a limit set alone is
+	// read as the request too.
+	template := corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{Name: "setup", Resources: mem("3Gi", "3Gi")},
+			{Name: agentAPIAuthContainerName, Resources: mem("384Mi", "2Gi"), RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways)},
+		},
+		Containers: []corev1.Container{
+			{Name: platformAgentContainerName, Resources: mem("", "1Gi")},
+		},
+	}}
+	requests, limits := sizingPodFigures(template, agentAPIAuthContainerName, mem("384Mi", "8Gi"), false)
+	// Requests: the agent's 1Gi (from its limit) plus the sidecar's 384Mi,
+	// floored by the setup container's 3Gi, which runs before the sidecar.
+	if got := requests[corev1.ResourceMemory]; got.Cmp(resource.MustParse("3Gi")) != 0 {
+		t.Errorf("pod memory request = %s, want 3Gi", got.String())
+	}
+	// Limits: 1Gi plus the swapped-in 8Gi.
+	if got := limits[corev1.ResourceMemory]; got.Cmp(resource.MustParse("9Gi")) != 0 {
+		t.Errorf("pod memory limit = %s, want 9Gi", got.String())
+	}
+	// Under the clamp every limit is its request: 1Gi plus 384Mi.
+	_, clamped := sizingPodFigures(template, agentAPIAuthContainerName, mem("384Mi", "8Gi"), true)
+	if got := clamped[corev1.ResourceMemory]; got.Cmp(resource.MustParse("3Gi")) != 0 {
+		t.Errorf("clamped pod memory limit = %s, want 3Gi (the setup container's floor)", got.String())
+	}
+	// A template without the container is the container alone.
+	alone, _ := sizingPodFigures(corev1.PodTemplateSpec{}, agentAPIAuthContainerName, mem("384Mi", "8Gi"), false)
+	if got := alone[corev1.ResourceMemory]; got.Cmp(resource.MustParse("384Mi")) != 0 {
+		t.Errorf("pod memory request with no template = %s, want 384Mi", got.String())
 	}
 }

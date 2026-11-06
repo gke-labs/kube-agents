@@ -98,9 +98,8 @@ const (
 
 	// The condition reporting that the auto profile earned a higher tier
 	// than the namespace's admission has room for: a ResourceQuota short of
-	// the step (sizingCappedByQuotaReason), or a LimitRange whose
-	// per-container bound the earned row crosses
-	// (sizingCappedByLimitRangeReason). Written only in that state, on the
+	// the step (sizingCappedByQuotaReason), or a LimitRange whose bound the
+	// earned row crosses (sizingCappedByLimitRangeReason). Written only in that state, on the
 	// ReplicasLimited pattern, by resolveSizingTier alone; the Ready and
 	// Degraded writers carry it through as they read it. The message names
 	// the quota and the dimension, or the LimitRange, the bound and the
@@ -124,13 +123,27 @@ const (
 		"but ResourceQuota %s has no room on %s for the step up from %s; the %s tier stays until the quota is raised " +
 		"or sizingProfile names the tier, which the operator applies without this check"
 	// sizingCappedByLimitRangeMessageFormat takes the tier earned, the
-	// LimitRange's name, the bound (sizingLimitRangeMax or Min), the resource
-	// name, the sized container, the running tier the refused step was
-	// measured from, and the tier that stays, as the quota format does.
+	// LimitRange's name, the item's scope (sizingLimitRangeScopeContainer or
+	// Pod), the bound (sizingLimitRangeMax, Min or Ratio), the resource
+	// name, what crosses it (sizingLimitRangeContainerSubjectFormat or
+	// PodSubjectFormat on the sized container), the running tier the
+	// refused step was measured from, and the tier that stays, as the quota
+	// format does.
 	sizingCappedByLimitRangeMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
-		"but LimitRange %s sets a per-container %s on %s that the %s container crosses at the step up from %s; " +
+		"but LimitRange %s sets a per-%s %s on %s that the %s crosses at the step up from %s; " +
 		"the %s tier stays until the LimitRange admits the row or sizingProfile names the tier, " +
 		"which the operator applies without this check"
+	// The two item scopes the step-up check reads, as the LimitRange spec's
+	// type field names them in lower case, and what each is read against:
+	// a Container item against the sized container, a Pod item against the
+	// pod the sized container runs in.
+	sizingLimitRangeScopeContainer         = "container"
+	sizingLimitRangeScopePod               = "pod"
+	sizingLimitRangeContainerSubjectFormat = "%s container"
+	sizingLimitRangePodSubjectFormat       = "%s container's pod"
+	// sizingLimitRangeRatioFigureFormat prints the limit-to-request ratio a
+	// render carries, for the event and the log.
+	sizingLimitRangeRatioFigureFormat = "%.3g"
 	// sizingStepRefusedMessageFormat is the SizingCappedByQuota message the
 	// back-out writes (sizingRefusedStep): a step the quota check admitted
 	// whose recreated pod admission then refused on a ResourceQuota, because
@@ -159,11 +172,12 @@ const (
 	// event: the message, the cluster count, the bound, its quantity and the
 	// container's figure at the refused row.
 	sizingCappedByLimitRangeEventFormat = "%s (at %d clusters: the %s is %s, the row's figure %s)"
-	// sizingLimitRangeMax and sizingLimitRangeMin name the two bounds of a
-	// Container-type LimitRange item the step-up check reads, as the
-	// LimitRange spec spells them.
-	sizingLimitRangeMax = "max"
-	sizingLimitRangeMin = "min"
+	// sizingLimitRangeMax, sizingLimitRangeMin and sizingLimitRangeRatio
+	// name the three bounds of a LimitRange item the step-up check reads, as
+	// the LimitRange spec spells them.
+	sizingLimitRangeMax   = "max"
+	sizingLimitRangeMin   = "min"
+	sizingLimitRangeRatio = "maxLimitRequestRatio"
 	// sizingTierChangedReason is the Normal event a tier change records, and
 	// sizingCappedByQuotaEventReason and sizingCappedByLimitRangeEventReason
 	// the Warning the first capped pass records.
@@ -241,19 +255,30 @@ type sizingShortfall struct {
 	need  resource.Quantity
 }
 
-// sizingBound is one Container-type LimitRange bound a candidate tier's
-// render crosses: the LimitRange, the bound (sizingLimitRangeMax or Min), the
-// resource name, the sized container, the bound's quantity and the figure
-// the container's render carries against it. As with sizingShortfall, the
-// condition message is built from the names alone; the quantities reach the
-// event and the log.
+// sizingBound is one LimitRange bound a candidate tier's render crosses: the
+// LimitRange, the item's scope (sizingLimitRangeScopeContainer or Pod), the
+// bound (sizingLimitRangeMax, Min or Ratio), the resource name, the sized
+// container, the bound's quantity and the figure the render carries against
+// it (a quantity, or a ratio printed with sizingLimitRangeRatioFigureFormat).
+// As with sizingShortfall, the condition message is built from the names
+// alone; the quantities reach the event and the log.
 type sizingBound struct {
 	limitRange string
+	scope      string
 	bound      string
 	key        corev1.ResourceName
 	container  string
 	quantity   resource.Quantity
-	figure     resource.Quantity
+	figure     string
+}
+
+// subject is what the condition message says crosses the bound: the sized
+// container for a Container item, its pod for a Pod item.
+func (b *sizingBound) subject() string {
+	if b.scope == sizingLimitRangeScopePod {
+		return fmt.Sprintf(sizingLimitRangePodSubjectFormat, b.container)
+	}
+	return fmt.Sprintf(sizingLimitRangeContainerSubjectFormat, b.container)
 }
 
 // sizingRefusal is a sized Deployment whose pod admission refused on a
@@ -1164,55 +1189,175 @@ func (r *PlatformAgentReconciler) sizingLimitRanges(ctx context.Context, agent *
 	return ranges.Items, nil
 }
 
-// sizingLimitRangeBound is nil when every Container-type item of every
-// LimitRange in ranges (the namespace's, in name order) admits the three
-// sized containers as tier to renders them, or the first bound one of them
-// crosses: ranges, items, containers (renderedSizedContainersAt's order) and
-// resource names each in a fixed order, so the condition message is stable
-// across passes. It reads the two checks the LimitRanger admission plugin
-// makes of a container against a Container-type item, after the pod's own
-// defaulting has copied a limit set alone into the request
-// (effectiveRequests): a limit or a request above max, and a request or a
-// limit under min. A name the container does not set is not read: the
-// plugin fills it from the item's default, which the API server sets to max
-// where none is given, so it admits, and a min with no default refuses the
-// running pods' recreation the same whatever the tier. The limits side is
-// read through clamped (sizingRunningLimitsClamped), since the plugin's
-// validation runs after Autopilot's rewrite and sees the clamped limit. A
-// Pod-type item, which sums the pod's containers, and an item's
-// maxLimitRequestRatio are not read; only the three sized containers move
-// with the tier, so the rest of each pod admits at the candidate as it does
-// at the running tier.
-func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, ranges []corev1.LimitRange, to sizingTier) *sizingBound {
+// sizedPodTemplates is the pod template each sized container runs in, keyed
+// by the container's name (renderedSizedContainersAt's names), read off the
+// three sized workloads; a workload that cannot be read has no entry. The
+// reads are the cache hits sizingTierUnsettledWorkload makes.
+func (r *PlatformAgentReconciler) sizedPodTemplates(ctx context.Context, agent *agentv1alpha1.PlatformAgent) map[string]corev1.PodTemplateSpec {
+	templates := map[string]corev1.PodTemplateSpec{}
+	proxy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err == nil {
+		templates[credentialProxyContainerName] = proxy.Spec.Template
+	}
+	shell := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}, shell); err == nil {
+		templates[shellSandboxContainerName] = shell.Spec.Template
+	}
+	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
+	if useStatefulSet(agent) {
+		gateway := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, gatewayKey, gateway); err == nil {
+			templates[agentAPIAuthContainerName] = gateway.Spec.Template
+		}
+		return templates
+	}
+	gateway := &appsv1.Deployment{}
+	if err := r.Get(ctx, gatewayKey, gateway); err == nil {
+		templates[agentAPIAuthContainerName] = gateway.Spec.Template
+	}
+	return templates
+}
+
+// sizingPodFigures is the pod-level requests and limits the LimitRanger
+// plugin checks a Pod-type item against, for the pod template the sized
+// container named name runs in, with that container's resources replaced by
+// rendered (the candidate's render) and every container read as admission
+// reads it (effectiveRequests, the limits through clamped). The sum is the
+// scheduler's: the containers and the restartable init containers added up,
+// and each other init container, with the restartable ones before it, taken
+// as a floor on each name. A template that is not there is read as the sized
+// container alone.
+func sizingPodFigures(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements, clamped bool) (corev1.ResourceList, corev1.ResourceList) {
+	figures := func(container corev1.Container) (corev1.ResourceList, corev1.ResourceList) {
+		rr := container.Resources
+		if container.Name == name {
+			rr = rendered
+		}
+		requests := effectiveRequests(rr)
+		return requests, clampedLimits(rr.Limits, requests, clamped)
+	}
+	add := func(total, more corev1.ResourceList) {
+		for key, quantity := range more {
+			sum := total[key]
+			sum.Add(quantity)
+			total[key] = sum
+		}
+	}
+	floor := func(total, more corev1.ResourceList) {
+		for key, quantity := range more {
+			if current, ok := total[key]; !ok || current.Cmp(quantity) < 0 {
+				total[key] = quantity.DeepCopy()
+			}
+		}
+	}
+	requests, limits := corev1.ResourceList{}, corev1.ResourceList{}
+	if sizedContainer(template, name) == nil {
+		return figures(corev1.Container{Name: name})
+	}
+	for _, container := range template.Spec.Containers {
+		req, lim := figures(container)
+		add(requests, req)
+		add(limits, lim)
+	}
+	restartableRequests, restartableLimits := corev1.ResourceList{}, corev1.ResourceList{}
+	initRequests, initLimits := corev1.ResourceList{}, corev1.ResourceList{}
+	for _, container := range template.Spec.InitContainers {
+		req, lim := figures(container)
+		if container.RestartPolicy != nil && *container.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			add(requests, req)
+			add(limits, lim)
+			add(restartableRequests, req)
+			add(restartableLimits, lim)
+			floor(initRequests, restartableRequests)
+			floor(initLimits, restartableLimits)
+			continue
+		}
+		add(req, restartableRequests)
+		add(lim, restartableLimits)
+		floor(initRequests, req)
+		floor(initLimits, lim)
+	}
+	floor(requests, initRequests)
+	floor(limits, initLimits)
+	return requests, limits
+}
+
+// sizingLimitRangeBound is nil when every item of every LimitRange in ranges
+// (the namespace's, in name order) admits the three sized containers, and
+// the pods they run in, as tier to renders them, or the first bound one of
+// them crosses: ranges, items, containers (renderedSizedContainersAt's
+// order) and resource names each in a fixed order, so the condition message
+// is stable across passes. It reads the checks the LimitRanger admission
+// plugin makes against the recreated pod, after the pod's own defaulting has
+// copied a limit set alone into the request (effectiveRequests): on a
+// Container-type item, the sized container's limit or request above max, its
+// request or limit under min, and its limit-to-request ratio above
+// maxLimitRequestRatio; on a Pod-type item, the same three on the pod's
+// sums (sizingPodFigures), the sized container swapped for the candidate's
+// render in the running template read off templates (sizedPodTemplates),
+// since the pod's sum moves by exactly the sized container's step. A name
+// the container, or the pod, does not set is not read: the plugin fills a
+// container's from the item's default, which the API server sets to max
+// where none is given, so it admits, and a min, a ratio or a Pod-type bound
+// with no figure to read refuses the running pods' recreation the same
+// whatever the tier. The limits side is read through clamped
+// (sizingRunningLimitsClamped), since the plugin's validation runs after
+// Autopilot's rewrite and sees the clamped limit, and a clamped ratio is one.
+// The ratio is compared as the plugin compares it, limit over request in
+// milli-units against the item's figure.
+func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, ranges []corev1.LimitRange, templates map[string]corev1.PodTemplateSpec, to sizingTier) *sizingBound {
 	if len(ranges) == 0 {
 		return nil
 	}
 	containers := renderedSizedContainersAt(agent, autopilot, to)
 	for i := range ranges {
 		for _, item := range ranges[i].Spec.Limits {
-			if item.Type != corev1.LimitTypeContainer {
+			var scope string
+			switch item.Type {
+			case corev1.LimitTypeContainer:
+				scope = sizingLimitRangeScopeContainer
+			case corev1.LimitTypePod:
+				scope = sizingLimitRangeScopePod
+			default:
 				continue
 			}
 			for _, rendered := range containers {
-				requests := effectiveRequests(rendered.resources)
-				limits := clampedLimits(rendered.resources.Limits, requests, clamped)
-				crossed := func(bound string, key corev1.ResourceName, quantity, figure resource.Quantity) *sizingBound {
-					return &sizingBound{limitRange: ranges[i].Name, bound: bound, key: key, container: rendered.container, quantity: quantity, figure: figure}
+				var requests, limits corev1.ResourceList
+				if scope == sizingLimitRangeScopePod {
+					requests, limits = sizingPodFigures(templates[rendered.container], rendered.container, rendered.resources, clamped)
+				} else {
+					requests = effectiveRequests(rendered.resources)
+					limits = clampedLimits(rendered.resources.Limits, requests, clamped)
+				}
+				crossed := func(bound string, key corev1.ResourceName, quantity resource.Quantity, figure string) *sizingBound {
+					return &sizingBound{limitRange: ranges[i].Name, scope: scope, bound: bound, key: key, container: rendered.container, quantity: quantity, figure: figure}
 				}
 				for _, key := range sortedResourceNames(item.Max) {
 					if limit, set := limits[key]; set && limit.Cmp(item.Max[key]) > 0 {
-						return crossed(sizingLimitRangeMax, key, item.Max[key], limit)
+						return crossed(sizingLimitRangeMax, key, item.Max[key], limit.String())
 					}
 					if request, set := requests[key]; set && request.Cmp(item.Max[key]) > 0 {
-						return crossed(sizingLimitRangeMax, key, item.Max[key], request)
+						return crossed(sizingLimitRangeMax, key, item.Max[key], request.String())
 					}
 				}
 				for _, key := range sortedResourceNames(item.Min) {
 					if request, set := requests[key]; set && request.Cmp(item.Min[key]) < 0 {
-						return crossed(sizingLimitRangeMin, key, item.Min[key], request)
+						return crossed(sizingLimitRangeMin, key, item.Min[key], request.String())
 					}
 					if limit, set := limits[key]; set && limit.Cmp(item.Min[key]) < 0 {
-						return crossed(sizingLimitRangeMin, key, item.Min[key], limit)
+						return crossed(sizingLimitRangeMin, key, item.Min[key], limit.String())
+					}
+				}
+				for _, key := range sortedResourceNames(item.MaxLimitRequestRatio) {
+					request, requested := requests[key]
+					limit, limited := limits[key]
+					if !requested || !limited || request.Sign() <= 0 {
+						continue
+					}
+					enforced := item.MaxLimitRequestRatio[key]
+					ratio := float64(limit.MilliValue()) / float64(request.MilliValue())
+					if ratio > enforced.AsApproximateFloat64() {
+						return crossed(sizingLimitRangeRatio, key, enforced, fmt.Sprintf(sizingLimitRangeRatioFigureFormat, ratio))
 					}
 				}
 			}
@@ -1339,8 +1484,8 @@ func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 // refused on a quota (sizingRefusedStep) is stepped back: the latch moves
 // down one tier and the condition names the quota and admission's message,
 // so the latch records what the pods run and the broker comes back at the
-// lower row. A step is also refused when a Container-type LimitRange in
-// the namespace bounds a figure the candidate's render crosses
+// lower row. A step is also refused when a LimitRange in the namespace
+// bounds a figure the candidate's render, or the pod's sum with it, crosses
 // (sizingLimitRangeBound), since that admission plugin refuses the recreated
 // pod the way a short quota does; the LimitRange is read before the quota,
 // the order admission evaluates them in, so the condition names the LimitRange
@@ -1443,6 +1588,10 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 				default:
 					autopilot := r.clusterAutopilot()
 					clamped := r.sizingRunningLimitsClamped(ctx, agent)
+					templates := map[string]corev1.PodTemplateSpec{}
+					if len(ranges) > 0 {
+						templates = r.sizedPodTemplates(ctx, agent)
+					}
 					// The earned tier first, then each tier between it and
 					// the running one, every step measured from the running
 					// tier against the same used totals: the highest step the
@@ -1454,7 +1603,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// and the check that refused it.
 					running := tier
 					for candidate := earned; candidate > running; candidate-- {
-						if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, candidate); crossed != nil {
+						if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, templates, candidate); crossed != nil {
 							bound, short = crossed, nil
 							continue
 						}
@@ -1473,7 +1622,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					switch {
 					case bound != nil:
 						capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(sizingCappedByLimitRangeMessageFormat,
-							earned, bound.limitRange, bound.bound, bound.key, bound.container, running, tier)}
+							earned, bound.limitRange, bound.scope, bound.bound, bound.key, bound.subject(), running, tier)}
 					case short != nil:
 						capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingCappedByQuotaMessageFormat,
 							earned, short.quota, short.key, running, tier)}
@@ -1518,10 +1667,10 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	}
 	if bound != nil && !sizingCappedConditionCurrent(agent, capped) {
 		log.Info("sizing tier capped by LimitRange", "name", agent.Name, "namespace", agent.Namespace,
-			"limitRange", bound.limitRange, "bound", bound.bound, "key", bound.key, "container", bound.container,
-			"quantity", bound.quantity.String(), "figure", bound.figure.String(), "clusters", count)
+			"limitRange", bound.limitRange, "scope", bound.scope, "bound", bound.bound, "key", bound.key, "container", bound.container,
+			"quantity", bound.quantity.String(), "figure", bound.figure, "clusters", count)
 		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByLimitRangeEventReason,
-			fmt.Sprintf(sizingCappedByLimitRangeEventFormat, capped.message, count, bound.bound, bound.quantity.String(), bound.figure.String()))
+			fmt.Sprintf(sizingCappedByLimitRangeEventFormat, capped.message, count, bound.bound, bound.quantity.String(), bound.figure))
 	}
 	agent.Status.EffectiveSizingTier = tier.String()
 	setSizingCappedCondition(agent, capped, metav1.Now())
