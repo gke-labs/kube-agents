@@ -1,6 +1,7 @@
-# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
-# FIXTURE_NOT_READY (#2686), in no roster file under hack/eval/ until its
-# stack has run on the pool. Red on main and green on the branch that adds
+# NIGHTLY-TIER: registered in hack/eval/nightly-cases.txt (#2686). It has no
+# pool fixture: its stack plants the fixture for each run, so its first
+# nightly run is the proof that the plant and the teardown work on the pool.
+# Red on main and green on the branch that adds
 # `degrade_unlisted_kustomize_additions` to `audit_report.py finish`, on a dev
 # install that carries the fixture below.
 #
