@@ -12,12 +12,14 @@ own planner instead, offline, and fails a pull request that adds another.
 `TARGETS` are read by AST. A statement is the first argument of any
 `.execute(...)` or `.executemany(...)` call that resolves without running the
 module: a string literal, a module-level constant, an f-string or `+`
-concatenation of those with `str(...)` of one allowed (so a partial index's
-literal keeps its value), a
-constant of another target module named through it (`findings_queue.X`), or a
-name assigned exactly once in the enclosing function to such an expression.
-Anything else (`.format(...)`, `%`, a joined list, a name assigned in a branch)
-is listed as `dynamic` and not judged.
+concatenation of those with `str(...)` of one or `", ".join(...)` over a tuple
+of them allowed (so a partial index's literal and a column list keep their
+values; a list can be appended to after its literal, so it does not count), a constant of another target module named through it
+(`findings_queue.X`), or a name bound exactly once in the enclosing function,
+by a plain assignment (`a = x`, or `a, b = x, y` element-wise), to such an
+expression (a name bound any other way, or in two places, resolves to
+nothing, never to a module constant of the same name). Anything else (`.format(...)`, `%`, a join over a comprehension, a name
+assigned in a branch) is listed as `dynamic` and not judged.
 
 The schema is the real one, not a replay of the DDL: `SCHEMA_SOURCE` names the
 server module, the attribute that holds its database path, the function that
@@ -36,11 +38,13 @@ missing column, a syntax error) is a problem that fails the check. A plan line
 `SCAN <table>` on a table the schema defines, without `USING INDEX` or
 `USING COVERING INDEX` (an `AUTOMATIC` index is built by scanning the table
 and does not count; the planner names an aliased table by its alias, which
-the check maps back from the statement's FROM, JOIN, UPDATE and INTO words),
-is a finding, unless the table is in `BOUNDED_TABLES`:
+the check maps back from the statement's FROM, JOIN, UPDATE, INTO and comma
+list words), is a finding, unless the table is in `BOUNDED_TABLES`:
 tables that hold one row, or a daily-pruned or capped handful, by design. A
-scan of `sqlite_master`, of a constant row, of a subquery or a CTE is not a
-table scan.
+scan of `sqlite_master`, of a constant row, of a subquery or of a CTE the
+statement declares is not a table scan; a scan of any other name the
+statement does not declare is a problem that fails the check, so an alias
+shape the check does not read cannot pass as clean.
 
 ``scripts/sqlite_query_plan_baseline.txt``: one line per (file, function,
 table) that carried a full scan when the check arrived,
@@ -157,19 +161,33 @@ SCAN_RE = re.compile(r"^SCAN (?:TABLE )?(?P<name>\S+)(?: AS \S+)?(?P<rest>.*)$")
 INDEXED_SCAN_MARKERS = (" USING INDEX ", " USING COVERING INDEX ")
 # The planner names a table by its alias when the statement gives one
 # (`FROM intercepted_events e` plans as `SCAN e`), so the aliases are read
-# from the statement: the word after FROM, JOIN, UPDATE, INTO or a comma in a
-# FROM list, then an optional `AS` and the alias, unless the next word is a
-# clause keyword.
+# from the statement: the word after FROM, JOIN, UPDATE (with an optional
+# `OR <conflict>`), INTO or a comma (a FROM list), optionally double-quoted,
+# then an optional `AS` and the alias, unless the next word is a clause
+# keyword. A comma also follows a column in a SELECT list or an ORDER BY, so
+# a column named like a table may map a keyword as its alias; the planner
+# never prints a keyword as a scan's name, so such an entry is inert.
 SQL_CLAUSE_KEYWORDS = (
-    "AS|CROSS|DEFAULT|EXCEPT|GROUP|HAVING|INDEXED|INNER|INTERSECT|JOIN|LEFT|LIMIT|NATURAL|NOT|ON|ORDER|OUTER|"
-    "RETURNING|RIGHT|SELECT|SET|UNION|USING|VALUES|WHERE|WINDOW"
+    "AND|AS|ASC|BY|COLLATE|CROSS|DEFAULT|DESC|ELSE|END|EXCEPT|FROM|GROUP|HAVING|IN|INDEXED|INNER|INTERSECT|IS|JOIN|"
+    "LEFT|LIMIT|NATURAL|NOT|ON|OR|ORDER|OUTER|RETURNING|RIGHT|SELECT|SET|THEN|UNION|USING|VALUES|WHEN|WHERE|WINDOW"
 )
 ALIAS_RE = re.compile(
-    r"\b(?:FROM|JOIN|UPDATE|INTO)\s+(?P<table>\w+)(?:\s+(?:AS\s+)?(?!(?:" + SQL_CLAUSE_KEYWORDS + r")\b)(?P<alias>\w+))?",
+    r"(?:\b(?:FROM|JOIN|INTO|UPDATE(?:\s+OR\s+\w+)?)|,)\s*\"?(?P<table>\w+)\"?"
+    r"(?:\s+(?:AS\s+)?(?!(?:" + SQL_CLAUSE_KEYWORDS + r")\b)\"?(?P<alias>\w+)\"?)?",
     re.IGNORECASE,
 )
-# The one call a statement may be built with: `str(CONSTANT)` in a concatenation.
+# A common table expression: `WITH [RECURSIVE] name [(columns)] AS (`, and
+# `, name [(columns)] AS (` for the next one. The planner names a CTE's rows
+# by that name, which is no table.
+CTE_RE = re.compile(r"\b(?P<name>\w+)(?:\s*\([\w\s,]*\))?\s+AS\s*\(", re.IGNORECASE)
+# Scan names that are no table and no alias: `SCAN CONSTANT ROW`, `SCAN 2
+# CONSTANT ROWS`, and a subquery the planner did not flatten.
+NON_TABLE_SCAN_NAMES = frozenset({"CONSTANT"})
+SUBQUERY_SCAN_PREFIXES = ("(", "SUBQUERY")
+# The two calls a statement may be built with: `str(CONSTANT)` in a
+# concatenation, and `", ".join(COLUMNS)` over a tuple of constants.
 STR_CALL = "str"
+JOIN_METHOD = "join"
 # The detail column of an EXPLAIN QUERY PLAN row.
 PLAN_DETAIL_COLUMN = 3
 # How a function is named: `Class.method`, `outer.inner`, and this for a
@@ -193,6 +211,10 @@ KIND_ERROR = "error"
 FINDING_LINE = "{file}:{line}: {function} scans {table}: `{plan}` for `{statement}`; index it or pin it in {baseline}"
 LIST_LINE = "{file}:{line}: {function} {kind} table={table} plan={plan} statement={statement}"
 PREPARE_ERROR = "{file}:{line}: {function}: `{statement}` does not prepare: {error}"
+PLAN_NAME_ERROR = (
+    "{file}:{line}: {function}: `{plan}` names {name!r}, which is neither a table the schema defines nor an alias or "
+    "CTE the statement declares; teach {script} the shape"
+)
 TARGET_MISSING_ERROR = "{target}: a configured target this check reads is missing; move the entry in {script} with the file"
 SCHEMA_IMPORT_ERROR = "{module}: the schema module does not import: {error}"
 SCHEMA_ATTR_ERROR = "{module}: the schema module has no attribute {attr}; update {script}"
@@ -214,6 +236,8 @@ SUMMARY_OK = (
 )
 SCRIPT_NAME = "scripts/check_sqlite_query_plans.py"
 STATEMENT_PREVIEW_CHARS = 120
+# What `--list` prints for a field a verdict has no value for.
+LIST_ABSENT = "-"
 EXIT_OK = 0
 EXIT_FAIL = 1
 
@@ -231,7 +255,7 @@ class Statement:
     @property
     def preview(self) -> str:
         if self.sql is None:
-            return "-"
+            return LIST_ABSENT
         first = next((part.strip() for part in self.sql.splitlines() if part.strip()), "")
         return first[:STATEMENT_PREVIEW_CHARS]
 
@@ -292,51 +316,68 @@ def _module_constants(module: ast.Module) -> dict[str, ast.expr]:
 
 
 def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
-    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-        return [(node.targets[0].id, node.value)]
+    """The (name, expression) pairs a plain assignment binds: `a = x`, `a: T = x`, or `a, b = x, y` element-wise."""
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target = node.targets[0]
+        if isinstance(target, ast.Name):
+            return [(target.id, node.value)]
+        if (
+            isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(node.value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(node.value.elts)
+            and all(isinstance(elt, ast.Name) for elt in target.elts)
+        ):
+            return [(elt.id, value) for elt, value in zip(target.elts, node.value.elts)]  # type: ignore[union-attr]
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
         return [(node.target.id, node.value)]
     return []
 
 
-def _local_constants(function: ast.AST) -> dict[str, ast.expr]:
-    """Names assigned exactly once anywhere in the function, by a plain assignment, with the expression."""
+def _local_constants(function: ast.AST) -> dict[str, ast.expr | None]:
+    """Every name the function binds: the expression, when bound exactly once by a plain assignment, else None.
+
+    Every binding counts against the name: a store to it (an assignment, an
+    unpacking, a loop or `with` target, a walrus, an augmented assignment), a
+    parameter, an `except ... as`, an `import ... as`, a `global` or
+    `nonlocal`, a `match` capture, or a nested `def` or `class`. A name bound
+    any other way, or twice, is in the map with None, so it resolves to
+    nothing rather than to the module constant of the same name.
+    """
     counts: dict[str, int] = defaultdict(int)
     values: dict[str, ast.expr] = {}
     for node in ast.walk(function):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
             for name, value in _assigned(node):
-                counts[name] += 1
                 values[name] = value
-        elif isinstance(node, (ast.AugAssign, ast.For, ast.AsyncFor, ast.comprehension, ast.NamedExpr, ast.With)):
-            # Any other binding of a name makes it dynamic.
-            for target in _bound_names(node):
-                counts[target] += 2
-    if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        for arg in function.args.args + function.args.posonlyargs + function.args.kwonlyargs:
-            counts[arg.arg] += 2
-    return {name: value for name, value in values.items() if counts[name] == 1}
+        for name in _bound_names(node):
+            counts[name] += 1
+    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
 
 
 def _bound_names(node: ast.AST) -> list[str]:
-    targets: list[ast.expr] = []
-    if isinstance(node, ast.AugAssign):
-        targets.append(node.target)
-    elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
-        targets.append(node.target)
-    elif isinstance(node, ast.NamedExpr):
-        targets.append(node.target)
-    elif isinstance(node, ast.With):
-        targets.extend(item.optional_vars for item in node.items if item.optional_vars is not None)
-    names: list[str] = []
-    for target in targets:
-        for sub in ast.walk(target):
-            if isinstance(sub, ast.Name):
-                names.append(sub.id)
-    return names
+    """The names one node binds, if any."""
+    if isinstance(node, ast.Name):
+        return [node.id] if isinstance(node.ctx, ast.Store) else []
+    if isinstance(node, ast.arg):
+        return [node.arg]
+    if isinstance(node, ast.ExceptHandler):
+        return [node.name] if node.name else []
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or alias.name.split(QUALIFIED_SEPARATOR)[0] for alias in node.names]
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+        return [node.name] if node.name else []
+    if isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    return []
 
 
-def _resolve(expr: ast.expr, constants: _Constants, local: dict[str, ast.expr], depth: int = 0) -> str | int | float | None:
+def _resolve(
+    expr: ast.expr, constants: _Constants, local: dict[str, ast.expr | None], depth: int = 0
+) -> str | int | float | None:
     """The static value of an expression, or None when it has none."""
     if depth > RESOLVE_DEPTH:
         return None
@@ -344,7 +385,8 @@ def _resolve(expr: ast.expr, constants: _Constants, local: dict[str, ast.expr], 
         return expr.value
     if isinstance(expr, ast.Name):
         if expr.id in local:
-            return _resolve(local[expr.id], constants, local, depth + 1)
+            bound = local[expr.id]
+            return None if bound is None else _resolve(bound, constants, local, depth + 1)
         source = constants.names.get(expr.id)
         return None if source is None else _resolve(source, constants, {}, depth + 1)
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
@@ -369,12 +411,49 @@ def _resolve(expr: ast.expr, constants: _Constants, local: dict[str, ast.expr], 
             return None
         inner = _resolve(expr.args[0], constants, local, depth + 1)
         return None if inner is None else str(inner)
+    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and expr.func.attr == JOIN_METHOD:
+        if len(expr.args) != 1 or expr.keywords:
+            return None
+        separator = _resolve(expr.func.value, constants, local, depth + 1)
+        items = _sequence_items(expr.args[0], constants, local, depth + 1)
+        if not isinstance(separator, str) or items is None:
+            return None
+        parts = [_resolve(item, constants, local, depth + 1) for item in items]
+        if not all(isinstance(part, str) for part in parts):
+            return None
+        return separator.join(parts)  # type: ignore[arg-type]
     if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
         left = _resolve(expr.left, constants, local, depth + 1)
         right = _resolve(expr.right, constants, local, depth + 1)
         if isinstance(left, str) and isinstance(right, str):
             return left + right
         return None
+    return None
+
+
+def _sequence_items(
+    expr: ast.expr, constants: _Constants, local: dict[str, ast.expr | None], depth: int
+) -> list[ast.expr] | None:
+    """The elements of a tuple literal, named directly or through a constant, or None.
+
+    A tuple only: a list literal bound once can still be appended to before
+    the join (`assignments = []` ... `assignments.append(...)`), so its
+    literal is not its value.
+    """
+    if depth > RESOLVE_DEPTH:
+        return None
+    if isinstance(expr, ast.Tuple):
+        return list(expr.elts)
+    if isinstance(expr, ast.Name):
+        if expr.id in local:
+            bound = local[expr.id]
+            return None if bound is None else _sequence_items(bound, constants, local, depth + 1)
+        source = constants.names.get(expr.id)
+        return None if source is None else _sequence_items(source, constants, {}, depth + 1)
+    if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
+        sibling = constants.siblings.get(expr.value.id)
+        source = None if sibling is None else sibling.get(expr.attr)
+        return None if source is None else _sequence_items(source, constants, {}, depth + 1)
     return None
 
 
@@ -385,10 +464,10 @@ class _Collector(ast.NodeVisitor):
         self.shown = shown
         self.constants = constants
         self.stack: list[str] = []
-        self.locals: list[dict[str, ast.expr]] = []
+        self.locals: list[dict[str, ast.expr | None]] = []
         self.statements: list[Statement] = []
 
-    def _scoped(self, node: ast.AST, name: str, local: dict[str, ast.expr] | None) -> None:
+    def _scoped(self, node: ast.AST, name: str, local: dict[str, ast.expr | None] | None) -> None:
         self.stack.append(name)
         if local is not None:
             self.locals.append(local)
@@ -407,7 +486,7 @@ class _Collector(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in EXECUTE_METHODS and node.args:
-            local = self.locals[-1] if self.locals else {}
+            local: dict[str, ast.expr | None] = self.locals[-1] if self.locals else {}
             value = _resolve(node.args[0], self.constants, local)
             sql = value if isinstance(value, str) else None
             function = QUALIFIED_SEPARATOR.join(self.stack) or MODULE_LEVEL
@@ -506,15 +585,24 @@ def leading_keyword(sql: str) -> str:
 
 
 def explain(conn: sqlite3.Connection, sql: str) -> list[str]:
-    """The plan lines of one statement, prepared with NULL bound to every parameter."""
+    """The plan lines of one statement, prepared with NULL bound to every parameter.
+
+    Named parameters take a mapping that answers NULL to every name; sqlite3
+    refuses a mapping for `?` parameters, so those are bound by position, with
+    the count read from the error a bare prepare raises. The mapping goes
+    first because a sequence bound to named parameters is a deprecation on
+    Python 3.12 and an error on 3.14.
+    """
     text = EXPLAIN_PREFIX + sql
     try:
-        rows = conn.execute(text, ()).fetchall()
-    except sqlite3.ProgrammingError as exc:
-        match = BINDINGS_RE.search(str(exc))
-        if match is None:
-            rows = conn.execute(text, _NullBindings()).fetchall()
-        else:
+        rows = conn.execute(text, _NullBindings()).fetchall()
+    except sqlite3.ProgrammingError:
+        try:
+            rows = conn.execute(text, ()).fetchall()
+        except sqlite3.ProgrammingError as exc:
+            match = BINDINGS_RE.search(str(exc))
+            if match is None:
+                raise
             rows = conn.execute(text, (None,) * int(match.group(1))).fetchall()
     return [row[PLAN_DETAIL_COLUMN] for row in rows]
 
@@ -538,6 +626,16 @@ def table_aliases(sql: str, tables: frozenset[str]) -> dict[str, str]:
         if alias is not None and table in tables:
             found[alias] = table
     return found
+
+
+def cte_names(sql: str) -> frozenset[str]:
+    """The common table expressions the statement declares."""
+    return frozenset(match.group("name") for match in CTE_RE.finditer(sql))
+
+
+def _non_table_scan(name: str, ctes: frozenset[str]) -> bool:
+    """Whether a scan name is a constant row, an unflattened subquery or a CTE rather than a table."""
+    return name in NON_TABLE_SCAN_NAMES or name.isdecimal() or name.startswith(SUBQUERY_SCAN_PREFIXES) or name in ctes
 
 
 def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[list[Verdict], list[str]]:
@@ -570,19 +668,37 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
                     )
                 )
             continue
-        scans = 0
+        judged = 0
         aliases = table_aliases(statement.sql, tables)
+        ctes = cte_names(statement.sql)
         for plan in plans:
             name = scanned_table(plan)
             if name is None or name in SCHEMA_TABLES:
                 continue
             table = name if name in tables else aliases.get(name)
             if table is None:
+                if _non_table_scan(name, ctes):
+                    continue
+                # A name the statement did not declare is a scan the check
+                # cannot place: loud, so an alias form the regex does not
+                # read cannot pass as clean.
+                judged += 1
+                verdicts.append(Verdict(statement, KIND_ERROR, plan=plan))
+                problems.append(
+                    PLAN_NAME_ERROR.format(
+                        file=statement.file,
+                        line=statement.line,
+                        function=statement.function,
+                        plan=plan,
+                        name=name,
+                        script=SCRIPT_NAME,
+                    )
+                )
                 continue
-            scans += 1
+            judged += 1
             kind = KIND_BOUNDED if table in BOUNDED_TABLES else KIND_FINDING
             verdicts.append(Verdict(statement, kind, table=table, plan=plan))
-        if scans == 0:
+        if judged == 0:
             verdicts.append(Verdict(statement, KIND_OK))
     return verdicts, problems
 
@@ -699,8 +815,8 @@ def check(
                     line=verdict.statement.line,
                     function=verdict.statement.function,
                     kind=verdict.kind,
-                    table=verdict.table or "-",
-                    plan=verdict.plan or "-",
+                    table=verdict.table or LIST_ABSENT,
+                    plan=verdict.plan or LIST_ABSENT,
                     statement=verdict.statement.preview,
                 ),
                 file=out,

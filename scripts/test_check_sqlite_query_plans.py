@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 import sys
 import tempfile
 import textwrap
@@ -29,10 +30,13 @@ from scripts.check_sqlite_query_plans import (  # noqa: E402
     TARGETS,
     SchemaSource,
     check,
+    explain,
     leading_keyword,
     main,
+    cte_names,
     scan,
     scanned_table,
+    table_aliases,
 )
 
 # A module shaped like the server: a database-path hook, an `init_db` that
@@ -51,6 +55,9 @@ FIXTURE_SERVER = textwrap.dedent(
     ALERT_LIMIT = 5
     SIDE_SCHEMA = "CREATE TABLE IF NOT EXISTS side (id TEXT PRIMARY KEY, note TEXT)"
     RECENT_SQL = "SELECT id FROM events WHERE created_at > ?"
+    COLUMNS = ("id", "cluster", "reason")
+    SELECT_COLUMNS = f"SELECT {', '.join(COLUMNS)} FROM events"
+    shadowed = "SELECT id FROM events WHERE id = ?"
 
 
     def init_db():
@@ -116,6 +123,49 @@ FIXTURE_SERVER = textwrap.dedent(
 
     def sibling_constant(conn):
         return conn.execute(fixture_helper.HELPER_SQL, ("x",)).fetchall()
+
+
+    def joined_columns(conn):
+        return conn.execute(f"{SELECT_COLUMNS} WHERE created_at > ?", ("x",)).fetchall()
+
+
+    def joined_comprehension(conn):
+        return conn.execute(f"SELECT {', '.join(c for c in COLUMNS)} FROM events WHERE id = ?", (1,)).fetchall()
+
+
+    def joined_list(conn):
+        assignments = []
+        assignments.append("cluster = ?")
+        return conn.execute(f"UPDATE events SET {', '.join(assignments)} WHERE id = ?", ("x", 1)).rowcount
+
+
+    def unpacked_shadow(conn):
+        shadowed, params = "SELECT id FROM events WHERE cluster = ?", ("x",)
+        return conn.execute(shadowed, params).fetchall()
+
+
+    def except_shadow(conn):
+        try:
+            return conn.execute(shadowed, (1,)).fetchall()
+        except ValueError as shadowed:
+            raise RuntimeError(str(shadowed))
+
+
+    def comma_list(conn, cluster):
+        return conn.execute(
+            "SELECT e.id FROM notes n, events e WHERE e.cluster = ? AND n.id = e.id", (cluster,)
+        ).fetchall()
+
+
+    def quoted_alias(conn, cluster):
+        return conn.execute('SELECT "e".id FROM events AS "e" WHERE "e".cluster = ?', (cluster,)).fetchall()
+
+
+    def cte(conn, cluster):
+        return conn.execute(
+            "WITH RECURSIVE chain(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM chain WHERE n < 3) "
+            "SELECT n FROM chain",
+        ).fetchall()
 
 
     def named_parameters(conn):
@@ -198,6 +248,9 @@ FIXTURE_BASELINE = textwrap.dedent(
     fixture_server.py partial_bound events 1
     fixture_server.py aliased notes 1
     fixture_server.py twice events 2
+    fixture_server.py unpacked_shadow events 1
+    fixture_server.py comma_list events 1
+    fixture_server.py quoted_alias events 1
     fixture_server.py Store.method notes 1
     fixture_server.py Store.outer.inner notes 1
     fixture_server.py many notes 1
@@ -265,6 +318,21 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(kinds[server + "local_once"], [KIND_OK])
         self.assertEqual(kinds[server + "local_twice"], [KIND_DYNAMIC])
         self.assertEqual(kinds[server + "sibling_constant"], [KIND_OK])
+        # `", ".join(COLUMNS)` over a tuple constant resolves; over a comprehension it does not.
+        self.assertEqual(kinds[server + "joined_columns"], [KIND_OK])
+        self.assertEqual(kinds[server + "joined_comprehension"], [KIND_DYNAMIC])
+        # A list literal can be appended to after it is bound, so a join over it does not resolve.
+        self.assertEqual(kinds[server + "joined_list"], [KIND_DYNAMIC])
+        # A local bound by unpacking is the statement judged, not the module constant it shadows.
+        self.assertEqual(kinds[server + "unpacked_shadow"], [KIND_FINDING])
+        # A name also bound by `except ... as` resolves to nothing, not to the module constant.
+        self.assertEqual(kinds[server + "except_shadow"], [KIND_DYNAMIC])
+        # The second table of a comma list, and a double-quoted alias, map back to their tables.
+        self.assertEqual(kinds[server + "comma_list"], [KIND_FINDING])
+        self.assertIn("comma_list finding table=events plan=SCAN e ", out)
+        self.assertEqual(kinds[server + "quoted_alias"], [KIND_FINDING])
+        # A recursive CTE scans its own rows, which is no table.
+        self.assertEqual(kinds[server + "cte"], [KIND_OK])
         self.assertEqual(kinds[server + "named_parameters"], [KIND_OK])
         self.assertEqual(kinds[server + "hermes"], [KIND_SKIPPED])
         self.assertEqual(kinds[server + "dynamic"], [KIND_DYNAMIC])
@@ -293,6 +361,10 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(by_function["partial_literal"], "SELECT id FROM events WHERE reason = 'drift' AND object_uid = ?")
         self.assertEqual(by_function["local_once"], "SELECT id, cluster FROM events WHERE created_at > ?")
         self.assertEqual(by_function["sibling_constant"], "SELECT id FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["joined_columns"], "SELECT id, cluster, reason FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["unpacked_shadow"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertIsNone(by_function["except_shadow"])
+        self.assertIsNone(by_function["joined_comprehension"])
         self.assertIsNone(by_function["local_twice"])
         self.assertIsNone(by_function["dynamic"])
 
@@ -309,6 +381,31 @@ class FixtureTests(unittest.TestCase):
         code, _, err = _run(self.root, baseline)
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("broken: `SELECT missing_column FROM events WHERE id = ?` does not prepare: no such column", err)
+
+    def test_unmapped_scan_name_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def odd_alias(conn, cluster):
+                return conn.execute("SELECT x.id FROM main.events x WHERE x.cluster = ?", (cluster,)).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("odd_alias: `SCAN x` names 'x', which is neither a table the schema defines nor an alias", err)
+        self.assertIn("odd_alias error table=- plan=SCAN x", out)
+        self.assertNotIn("odd_alias ok", out)
+
+    def test_explain_binds_null_to_named_and_positional_parameters(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        self.assertEqual(explain(conn, "SELECT a FROM t WHERE id = :id AND a = :a"), ["SEARCH t USING INTEGER PRIMARY KEY (rowid=?)"])
+        self.assertEqual(explain(conn, "SELECT a FROM t WHERE id = ? AND a = ?"), ["SEARCH t USING INTEGER PRIMARY KEY (rowid=?)"])
+        self.assertEqual(explain(conn, "SELECT a FROM t"), ["SCAN t"])
+        with self.assertRaises(sqlite3.ProgrammingError):
+            explain(conn, "SELECT 1; SELECT 2")
 
     def test_baseline_rise_drop_stale_unscanned_malformed_duplicate(self) -> None:
         baseline = _write_fixture(
@@ -338,9 +435,9 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("baseline.txt:10: expected `<file> <function> <table> <count>`", err)
         self.assertIn("baseline.txt:11: expected `<file> <function> <table> <count>`", err)
         self.assertIn("baseline.txt:12: fixture_server.py unindexed events already has an entry at line 2", err)
-        # `many` has no entry and is reported as a finding beside the problems.
+        # `many`, `comma_list`, `quoted_alias` and `unpacked_shadow` have no entry and are reported beside the problems.
         self.assertIn("many scans notes: `SCAN notes`", err)
-        self.assertIn("1 finding(s) not pinned and 7 problem(s)", err)
+        self.assertIn("4 finding(s) not pinned and 7 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
         baseline = _write_fixture(self.root)
@@ -376,6 +473,17 @@ class PlanLineTests(unittest.TestCase):
         # A constant row and a subquery are names the schema does not hold, which judge() drops.
         self.assertEqual(scanned_table("SCAN CONSTANT ROW"), "CONSTANT")
         self.assertEqual(scanned_table("SCAN (subquery-1)"), "(subquery-1)")
+
+    def test_aliases_and_ctes(self) -> None:
+        tables = frozenset({"events", "notes"})
+        self.assertEqual(table_aliases("SELECT e.id FROM events e JOIN notes AS n ON n.id = e.id", tables), {"e": "events", "n": "notes"})
+        self.assertEqual(table_aliases("SELECT * FROM notes n, events e WHERE e.id = n.id", tables), {"n": "notes", "e": "events"})
+        self.assertEqual(table_aliases('UPDATE OR REPLACE events AS "e" SET cluster = ? WHERE "e".id = ?', tables), {"e": "events"})
+        self.assertEqual(table_aliases("SELECT id FROM events WHERE id = ? ORDER BY id DESC LIMIT ?", tables), {})
+        self.assertEqual(table_aliases("INSERT INTO events (id, cluster) VALUES (?, ?)", tables), {})
+        self.assertEqual(table_aliases("SELECT id FROM other o", tables), {})
+        self.assertEqual(cte_names("WITH RECURSIVE c(n) AS (SELECT 1), d AS (SELECT 2) SELECT * FROM c, d"), frozenset({"c", "d"}))
+        self.assertEqual(cte_names("SELECT id FROM events WHERE id = ?"), frozenset())
 
     def test_leading_keyword(self) -> None:
         self.assertEqual(leading_keyword("\n  -- a note\n  select 1"), "SELECT")

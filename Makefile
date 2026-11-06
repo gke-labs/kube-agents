@@ -897,7 +897,7 @@ cluster-reads-check: ## Fail when a file under agents/ adds a whole-cluster kube
 concurrency-check: ## Fail when a request handler in the broker, the KV server or the auth callout can start an unbounded thread or goroutine (CI runs this via scripts/test_check_bounded_concurrency.py).
 	@python3 scripts/check_bounded_concurrency.py
 
-sqlite-plan-check: ## Fail when a fixed SQL statement in the KV server or its state.db helpers would scan a whole table the repository defines (pinned backlog: scripts/sqlite_query_plan_baseline.txt; CI runs this via scripts/test_check_sqlite_query_plans.py).
+sqlite-plan-check: ## Fail when a fixed SQL statement in the KV server, the findings queue or the state.db helpers would scan a whole table the repository defines (pinned backlog: scripts/sqlite_query_plan_baseline.txt; CI runs this via scripts/test_check_sqlite_query_plans.py).
 	@python3 scripts/check_sqlite_query_plans.py
 
 # The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
