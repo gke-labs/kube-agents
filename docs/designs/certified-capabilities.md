@@ -72,7 +72,6 @@ check-in carries.
 | `WINDOW_RUNS`              | 60       | scored repetitions per scenario per release                                                                |
 | `CERTIFIED_PASSES_FULL`    | 57       | passes of 60 at which the Wilson lower bound first clears the row rule                                     |
 | `ROW_LOWER_BOUND`          | 0.85     | the 95 percent Wilson lower bound a row's tests must reach                                                 |
-| `ROW_TEST_FLOOR`           | 0.80     | no single test in the row below this pass rate                                                             |
 | `LAPSE_LOWER_BOUND`        | 0.70     | the prototype's lapse bound; per release, Lapsed is two consecutive release windows that both miss the bar |
 | `WILSON_Z`                 | 1.959964 | the 95 percent two-sided normal quantile                                                                   |
 | `CERTIFIED_PASSES_FILLING` | 24       | the prototype certifies at 24 of 24 while a window fills; **to remove**                                    |
@@ -93,7 +92,7 @@ States of a cell (one scenario, one release):
 | Started to pass on `<release>`       | a declared gap passed every scored repetition of the release window, infra set aside; the marker is stale (the lane's build reds on the scorer's own rung 5, one complete build, which is the build's reading, not the cell's) |
 
 A row is certified on a release when every non-gap test of the row is certified on that release
-and none is below the floor; the row's status cell carries the gap count ("certified, 3 known
+the row's status cell carries the gap count ("certified, 3 known
 gaps"). Nothing is inferred from a neighbouring release, from `main`, or from a prototype's
 24-of-24 fill rule, which the per-release "not enough runs" state replaces.
 
@@ -104,20 +103,30 @@ flowchart LR
     GA["GA release published<br/>(version tag, published images)"] --> L["Certification lane<br/>ci-kube-agents-certification-1<br/>newest GA, two builds a week, 30 repetitions each"]
     L --> V["Per-release verdict<br/>k of n scored on release"]
     V --> C["Page cell<br/>count, date, state"]
+    C --> G["Gate on the next promotion<br/>holds while the newest GA reads Not certified<br/>without a recorded waiver"]
     N["Nightly eval on main<br/>engineering signal"] -.-> C
 ```
 
-| Lane               | Grades                                                      | Feeds                                                               |
-| ------------------ | ----------------------------------------------------------- | ------------------------------------------------------------------- |
-| Nightly eval       | `main`'s head, every night, the nightly roster              | the nightly dashboard, the evidence store, a "passes on main" badge |
-| Certification lane | the newest GA release's published images, two builds a week | the per-release cell; the only input to a certificate               |
+| Lane               | Grades                                                      | Feeds                                                                                     |
+| ------------------ | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Nightly eval       | `main`'s head, every night, the nightly roster              | the nightly dashboard, the evidence store, a "passes on main" badge                       |
+| Certification lane | the newest GA release's published images, two builds a week | the per-release cell, the only input to a certificate, and the gate on the next promotion |
 
 The nightly never certifies. Its badge is labelled as `main`, reads "Passes on main", and is
 supporting evidence a reader can open; the certificate names the build the customer installs.
 
-The page gates nothing. A red lane build (rungs 1 to 3, or rung 5) is a failed build the CI
-health digest reports and a record the page shows; it blocks no release and no merge. Nobody
-signs a certificate: the page computes it from the record, and the record is the evidence.
+The certification is a process, not a signature. The lane's record plus the rule decide the
+cell; no person approves a certificate by hand. A human may waive or revoke a cell with a
+recorded, dated line and its reason, and the page shows that line beside the cell.
+
+A failing certification gates the release it ran on. The lane runs after GA publish, so the gate
+acts on the next promotion: the release pipeline does not promote the next candidate while the
+newest GA carries a "Not certified" row (a scored miss or a safety violation) without a recorded
+waiver. The page shows the gate state: which release holds the next promotion, or the waiver
+that released it. A red lane build (rungs 1 to 3, or rung 5) is a failed build the CI health
+digest reports and a record the page shows; the build itself blocks nothing, the row it produces
+does. A certification run at candidate time, before publish, is the stronger form and is an open
+item with its cost.
 
 ## The lane
 
@@ -141,9 +150,12 @@ signs a certificate: the page computes it from the record, and the record is the
   (`EVAL_REPETITIONS=30`, `EVAL_TASK_PARALLELISM=1`: every scenario plants a stack, and the
   harness runs stack-bearing units one at a time). Builds are sized to finish inside the
   timeout because a build cut by its deadline records nothing for the scenario it was inside:
-  the case file is written only after the scenario's last repetition. Thirty repetitions at
-  the measured median of about 7.5 minutes, plus 45 to 60 minutes of setup, fit a 720-minute
-  timeout with room for the slow tail. A Rerun on the same release pools into its window.
+  the case file is written only after the scenario's last repetition. Thirty repetitions at the lane's planning unit of about 11 minutes per repetition
+  (`hack/ci-eval-pr.sh`; the nightly record of 2026-10-29 to 11-05 measured 7.5 minutes at the
+  median and 15.6 at the slowest), plus 45 to 60 minutes of setup, fit a 720-minute timeout for
+  one scenario. The sizing is per scenario, and a slice runs every scenario of its roster part
+  serially, so a part's size is bounded by the timeout; the rule that bounds it is an open
+  item. A Rerun on the same release pools into its window.
 - **Artifacts.** The lane's logs bucket, `logs/ci-kube-agents-certification-1/<build>/`:
   `case-<id>.json` per scenario per build, written by `hack/ci-eval-pr.sh` when the scenario's
   last repetition has finished (one result per repetition inside it; a cut build has none for
@@ -185,6 +197,8 @@ The page is not checked in; when it is, it shows:
   the word certified.
 - A build run by hand against a release is marked as such or left out; the page shows lane
   builds by default.
+- The gate state: the release that holds the next promotion, or the recorded waiver or
+  revocation line beside a cell.
 
 ## Decisions and their dates
 
@@ -207,7 +221,9 @@ The page is not checked in; when it is, it shows:
 | A model change mid-release starts a new window                                                                                                                                              | 2026-11-06 |
 | No certificate when more than about a third of a window's repetitions are infra; the share is shown                                                                                         | 2026-11-06 |
 | The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                              | 2026-11-06 |
-| The page is informational and never gates a release                                                                                                                                         | 2026-11-06 |
+| A failing certification gates the next promotion: no promotion while the newest GA carries a "Not certified" row without a recorded waiver                                                  | 2026-11-06 |
+| No named sign-off: the lane's record plus the rule certify; a human may waive or revoke a cell with a recorded, dated line and reason                                                       | 2026-11-06 |
+| The 0.80 weakest-test floor is dropped: under 57-of-60 per test it cannot fire                                                                                                              | 2026-11-06 |
 | 30 repetitions per build, two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish                         | 2026-11-06 |
 | Cell states on the scorer's outcome: a safety violation (rung 1) counts as a fail; no valid run (rungs 2 and 3) and infra sit outside the rate, listed by cause, toward the infra-share cap | 2026-11-06 |
 
@@ -226,9 +242,18 @@ The page is not checked in; when it is, it shows:
   once the harness writes the case file per repetition so a cut build keeps what it graded;
   until then two builds of 30. The lane's job (`EVAL_REPETITIONS`, the cron) follows this
   document in GoogleCloudPlatform/oss-test-infra#2768.
-- **Rule questions open on 2026-11-06.** Whether the 0.80 floor stays when a 0.85 bound already
-  implies it; and whether a named person signs off each new certificate and how the page records
-  that. Both are answered on the pull request and are decided before the page check-in.
+- **Part capacity.** A slice runs every scenario of its roster part serially, so a build costs
+  scenarios times 30 times the unit; at the 11-minute unit one scenario fits a 720-minute build
+  with margin, two at the median only, and nothing today measures or enforces a part's size.
+  Remedies on the table: one scenario per part, each case pull request opening its slice job;
+  fewer repetitions per build on more builds; or the per-repetition case-file write first, then
+  one 60-build. One is decided before the next case lands in part 1 and recorded above.
+- **The gate on the pipeline side.** The release scheduler reads the page's record for the
+  newest GA before it promotes; a waiver file with a dated line and reason per waived cell; the
+  gate state rendered on the page.
+- **Certification at candidate time.** The stronger form of the gate: the lane runs on every
+  candidate before publish, so a failing certification stops the release it ran on. Cost: one
+  more lane on every candidate, 30 to 60 repetitions per scenario.
 - **The mixed-tree alternative.** `main` could supply the harness, roster and chart template for
   a release whose tree lacks the tier, with the record naming both commits. Recommended against:
   `main`'s cases grade `main`'s skills, a release ships its own, and a miss would blur a version
