@@ -485,26 +485,35 @@ def _record_rank(record: dict) -> int:
 
 def _apply_locked(
     store_path: Path,
+    state_path: Path,
     state: dict,
     stage: str,
     now: datetime,
     throttle_days: int,
     label: str,
     zone: tzinfo,
-) -> tuple[bool, list[str]]:
-    """Rewrite the store for ``stage``; returns whether it changed and the lines."""
+) -> tuple[str | None, list[str]]:
+    """Rewrite the store for ``stage``; returns the state as saved and the lines.
+
+    The state is saved before the store is replaced, so a crash between the
+    two leaves at worst a record the store never took, which the release
+    check skips, and never a hold in the store that no wake can rewind. A
+    released job's record is dropped only after the store write for the same
+    reason: until then the record is what lets the next tick release it.
+    """
     try:
         store = json.loads(store_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False, []
+        return None, []
     jobs = _jobs_of(store)
     if jobs is None:
-        return False, []
+        return None, []
 
     held: dict[str, dict] = state["held"]
     lines: list[str] = []
     changed = False
     seen: set[str] = set()
+    released: list[str] = []
     for job in jobs:
         job_id = _job_id(job)
         if not job_id or not _prompt_driven(job):
@@ -512,7 +521,7 @@ def _apply_locked(
         seen.add(job_id)
         record = held.get(job_id)
         if record is not None and STAGE_RANK[stage] < _record_rank(record):
-            held.pop(job_id, None)
+            released.append(job_id)
             if job.get("next_run_at") == record.get("next_run_at"):
                 target = _release_target(job, now, zone)
                 if target is not None:
@@ -540,9 +549,20 @@ def _apply_locked(
         if job_id not in seen:
             held.pop(job_id)
 
+    saved = None
     if changed:
+        try:
+            _write_json(state_path, state)
+        except OSError as exc:
+            # Nothing reaches the store without its record on disk first.
+            return json.dumps(state, sort_keys=True), [
+                f"{label}: cron idle policy could not save its state ({exc}); nothing held"
+            ]
+        saved = json.dumps(state, sort_keys=True)
         _write_json(store_path, store)
-    return changed, lines
+    for job_id in released:
+        held.pop(job_id, None)
+    return saved, lines
 
 
 def apply_profile(
@@ -619,10 +639,12 @@ def apply_profile(
                 if watch.fell_open:
                     lines.append(f"{label}: cron idle policy skipped this tick, the store lock is held ({watch.message})")
                 else:
-                    _, held_lines = _apply_locked(
-                        store_path, state, stage, now, throttle_days, label, zone
+                    saved, held_lines = _apply_locked(
+                        store_path, state_path, state, stage, now, throttle_days, label, zone
                     )
                     lines.extend(held_lines)
+                    if saved is not None:
+                        before = saved  # already on disk; save again only if it moves
 
     if json.dumps(state, sort_keys=True) != before:
         try:
@@ -632,15 +654,38 @@ def apply_profile(
     return lines
 
 
+def _shared_reader(reader: Callable[[], tuple[datetime, str]]) -> Callable[[], tuple[datetime, str]]:
+    """One reading, or one failure, per call of :func:`apply`.
+
+    The signal is the install's, not a profile's, so the profiles visited in
+    one tick share a single ``kubectl`` and a single timeout between them.
+    """
+    readings: list[tuple[datetime, str]] = []
+    failures: list[Exception] = []
+
+    def read() -> tuple[datetime, str]:
+        if not readings and not failures:
+            try:
+                readings.append(reader())
+            except Exception as exc:
+                failures.append(exc)
+        if failures:
+            raise failures[0]
+        return readings[0]
+
+    return read
+
+
 def apply(home: Path, now: datetime, environ: dict | None = None) -> list[str]:
     """Run the policy over every named profile that has a store."""
     base = home / PROFILES_DIR
     if not base.is_dir():
         return []
     lines: list[str] = []
+    reader = _shared_reader(read_signal)
     for profile in sorted(p for p in base.iterdir() if p.is_dir()):
         try:
-            lines.extend(apply_profile(profile, now, environ))
+            lines.extend(apply_profile(profile, now, environ, reader))
         except Exception as exc:  # never the reason a tick does not happen
             lines.append(f"{profile.name}: cron idle policy failed ({_excerpt(f'{type(exc).__name__}: {exc}')})")
     return lines

@@ -587,6 +587,71 @@ class StoreLockTest(PolicyCase):
         self.assertTrue((self.profile / "cron" / ".jobs.lock").exists())
 
 
+class WriteOrderTest(PolicyCase):
+    """The record reaches disk before the store does, so a crash between the
+    two never leaves a hold no wake can rewind."""
+
+    def writes(self, fail_on=None):
+        order = []
+        real = cip._write_json
+
+        def recording(path, payload):
+            order.append(path.name)
+            if fail_on is not None and path.name == fail_on:
+                raise OSError(28, "No space left on device")
+            real(path, payload)
+
+        cip._write_json = recording
+        self.restore_writes = lambda: setattr(cip, "_write_json", real)
+        self.addCleanup(self.restore_writes)
+        return order
+
+    def test_the_record_is_saved_before_the_store(self):
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        order = self.writes()
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(order, [cip.STATE_FILE_NAME, cip.JOBS_FILE_NAME])
+        self.assertEqual(self.state()["held"]["compliance-audit"]["next_run_at"], self.next_run("compliance-audit"))
+
+    def test_a_crash_before_the_store_write_leaves_a_record_the_next_tick_overwrites(self):
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self.writes(fail_on=cip.JOBS_FILE_NAME)
+        with self.assertRaises(OSError):
+            self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
+        self.assertEqual(self.state()["held"]["compliance-audit"]["next_run_at"], "2026-08-07T06:20:00+00:00")
+        self.restore_writes()
+        lines = self.run_policy(Reader(days_ago(15)), now=NOW + timedelta(seconds=10))
+        self.assertEqual(lines, ["platform: held compliance-audit until 2026-08-07T06:20:00+00:00 (hibernate)"])
+        self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T06:20:00+00:00")
+
+    def test_a_crash_before_the_store_write_on_release_keeps_the_record(self):
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self.run_policy(Reader(days_ago(15)))
+        held = self.next_run("compliance-audit")
+        self.writes(fail_on=cip.JOBS_FILE_NAME)
+        with self.assertRaises(OSError):
+            self.run_policy(Reader(NOW + timedelta(minutes=1)), now=NOW + timedelta(minutes=6))
+        self.assertEqual(self.next_run("compliance-audit"), held)
+        self.assertEqual(self.state()["held"]["compliance-audit"]["next_run_at"], held)
+        self.restore_writes()
+        lines = self.run_policy(Reader(NOW + timedelta(minutes=1)), now=NOW + timedelta(minutes=12))
+        self.assertIn("released compliance-audit", "\n".join(lines))
+        self.assertEqual(self.state()["held"], {})
+
+    def test_a_state_that_cannot_be_saved_holds_nothing(self):
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self.writes(fail_on=cip.STATE_FILE_NAME)
+        lines = self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(
+            [line for line in lines if "could not save its state" in line],
+            ["platform: cron idle policy could not save its state ([Errno 28] No space left on device); nothing held"],
+        )
+        self.assertEqual([line for line in lines if "held compliance-audit" in line], [])
+        self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
+        self.assertFalse(self.state_path.exists())
+
+
 class ApplyTest(PolicyCase):
     def test_apply_visits_every_profile_with_a_store_and_survives_a_fault(self):
         home = Path(self._tmp.name)
@@ -612,6 +677,26 @@ class ApplyTest(PolicyCase):
 
     def test_no_profiles_dir_is_nothing(self):
         self.assertEqual(cip.apply(Path(self._tmp.name) / "nope", NOW, {}), [])
+
+    def test_one_reading_serves_every_profile_in_a_tick(self):
+        home = Path(self._tmp.name)
+        other = home / "profiles" / "cluster-a"
+        (other / "cron").mkdir(parents=True)
+        for store in (self.store, other / "cron" / "jobs.json"):
+            store.write_text(json.dumps({"jobs": [prompt_job("audit", "20 6 * * *", NOW, days_ago(1))]}))
+        reader = Reader(days_ago(15))
+        original = cip.read_signal
+        cip.read_signal = reader
+        self.addCleanup(setattr, cip, "read_signal", original)
+        lines = cip.apply(home, NOW, {})
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(sorted(line.split(":")[0] for line in lines if "held audit" in line), ["cluster-a", "platform"])
+        # A failure is shared the same way: one kubectl, one timeout, both told.
+        failing = Reader(error=RuntimeError("kubectl exited 1: forbidden"))
+        cip.read_signal = failing
+        lines = cip.apply(home, NOW + timedelta(minutes=6), {})
+        self.assertEqual(failing.calls, 1)
+        self.assertEqual(len([line for line in lines if "cannot read the PlatformAgent" in line]), 2)
 
 
 class ReadSignalTest(unittest.TestCase):
