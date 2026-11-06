@@ -157,6 +157,11 @@ _NO_TIME_WINDOW_REASON = (
 )
 # report_times_in_window, when a stated time matches no output it could read.
 _NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+# The Coverage row cell the capped check reads, as onboarding.parse_raw_coverage
+# keys it (the last column's header lowercased): the count of workloads an audit listed.
+COVERAGE_WORKLOADS_COLUMN = onboarding.COVERAGE_COLUMNS[-1].lower()
+# A count is ASCII digits only; int() would also take "²" and fullwidth digits.
+_DIGITS_RE = re.compile(r"[0-9]+")
 _UNSOURCED_WITH_GAPS_REASON = (
     "observation time(s) {times} match no tool output this check could read, but the read "
     "was not whole ({gaps}), so the output that shows them may be in the part it missed"
@@ -3783,10 +3788,14 @@ class BootstrapFanoutVerifier(BaseVerifier):
       carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
       itself: a Coverage row whose card is the sweep (or the hand-off's "the
       sweep audited it itself" gap line), not a row from a card of its own and
-      not the gap line for a fleet cluster no audit reported on. The cap's
-      risk is a cluster nobody audits, which reads as clean; this is the half
-      that catches it. It reads a second pod, so it is a requirement of its own
-      and a broken report does not hide behind, or get blamed on, the cards.
+      not the gap line for a fleet cluster no audit reported on, and the audit
+      reached the report: the row lists at least one workload, or the findings
+      block carries at least one line for the cluster. The cap's risk is a
+      cluster nobody audits, which reads as clean; this is the half that
+      catches it, and the second leg catches an audit the worker relayed empty
+      (a row saying 0 workloads under the sweep's card, #4115). It reads a
+      second pod, so it is a requirement of its own and a broken report does
+      not hide behind, or get blamed on, the cards.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, a sweep card the board does not know, or an empty roster is
@@ -3967,18 +3976,33 @@ class BootstrapFanoutVerifier(BaseVerifier):
             return "fail", f"{where}: there is no {raw_file} on {pod}, so no cluster past the cap is shown audited", raw
         if read.get("rows") is None:
             return "fail", f"{where}: {raw_file} on {pod}: {read.get('error')}", raw
+        if read.get("findings_block") == onboarding.FINDINGS_BLOCK_CUT:
+            return "error", f"{where}: the read of {raw_file} stopped before its findings block ended", raw
         sweep_id = str((payload.get("sweep") or {}).get("id") or "")
         audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
         unreported = {tuple(p) for p in read.get("unreported") or []}
+        finding_counts = {(c, p): n for c, p, n in read.get("finding_counts") or []}
         problems = []
         for r in rest:
             ident = (r.get("cluster"), r.get("project"))
             label = f"{r['profile']} ({ident[0]} in {ident[1]})"
             rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            sweep_rows = [row for row in rows if row.get("card") == sweep_id]
             if ident in unreported:
                 problems.append(f"{label} is listed in the fleet but no audit reported on it")
-            elif any(row.get("card") == sweep_id for row in rows) or ident in audited_by_line:
-                continue
+            elif sweep_rows or ident in audited_by_line:
+                # The cap's second risk: a row that says the sweep audited the
+                # cluster while nothing was read from it (an object the worker
+                # relayed empty). One workload listed or one finding line is
+                # the proof that the audit reached the report.
+                cells = [row.get(COVERAGE_WORKLOADS_COLUMN, "") for row in sweep_rows]
+                workloads = max((int(c) for c in cells if _DIGITS_RE.fullmatch(str(c))), default=0)
+                findings = finding_counts.get(ident, 0)
+                if workloads == 0 and findings == 0:
+                    problems.append(
+                        f"{label} is in the report as the sweep's with 0 workloads audited and no finding line, "
+                        "so nothing was read from it"
+                    )
             elif rows:
                 problems.append(f"{label} was audited on card(s) {[row.get('card') for row in rows]}, not by the sweep")
             else:

@@ -173,7 +173,16 @@ RAW_TEXT_ABSENT = "__ONBOARDING_RAW_TEXT_ABSENT__"
 MAX_RAW_BYTES = 1 << 22
 COVERAGE_HEADING = "## Coverage"
 GAPS_HEADING = "## Gaps"
-COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card")
+COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card", "Workloads audited")
+# The machine-readable block at the end of the raw file (bootstrap_handoff.compose):
+# one JSON object per finding line, each naming its cluster and project. The
+# capped check counts them per cluster, so a Coverage row with no workload and
+# no finding line reads as a cluster nothing was read from.
+FINDINGS_FENCE_OPEN = "```findings"
+FINDINGS_FENCE_CLOSE = "```"
+FINDINGS_BLOCK_ABSENT = "absent"
+FINDINGS_BLOCK_PRESENT = "present"
+FINDINGS_BLOCK_CUT = "cut"
 SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent card, so the sweep audited it itself$"
 UNREPORTED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), [^()]*\): listed in the fleet but no audit reported on it$"
 
@@ -575,7 +584,10 @@ def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
     as audited by the sweep itself and as never reported on.
     """
     lines = text.splitlines()
-    out: dict[str, Any] = {"rows": None, "sweep_audited": [], "unreported": [], "error": None}
+    out: dict[str, Any] = {
+        "rows": None, "sweep_audited": [], "unreported": [], "error": None,
+        "finding_counts": [], "findings_block": FINDINGS_BLOCK_ABSENT,
+    }
     coverage = _section(lines, COVERAGE_HEADING)
     if coverage is None:
         if truncated:
@@ -601,6 +613,27 @@ def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
             m = re.match(pattern, line.strip())
             if m:
                 out[field].append([m.group("cluster"), m.group("project")])
+    counts: dict[tuple[str, str], int] = {}
+    opened = next((i for i, line in enumerate(lines) if line.strip() == FINDINGS_FENCE_OPEN), None)
+    if opened is None and truncated:
+        # The block sits at the end of the file; a read that stopped before its
+        # fence says nothing about the lines it holds.
+        out["findings_block"] = FINDINGS_BLOCK_CUT
+    if opened is not None:
+        # Cut until the closing fence is seen, whether the read was capped or the file ends inside the block.
+        out["findings_block"] = FINDINGS_BLOCK_CUT
+        for line in lines[opened + 1 :]:
+            if line.strip() == FINDINGS_FENCE_CLOSE:
+                out["findings_block"] = FINDINGS_BLOCK_PRESENT
+                break
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(item, dict):
+                key = (str(item.get("cluster", "")), str(item.get("project", "")))
+                counts[key] = counts.get(key, 0) + 1
+    out["finding_counts"] = [[c, p, n] for (c, p), n in sorted(counts.items())]
     return out
 
 
@@ -615,7 +648,10 @@ def read_raw_coverage(shell: Callable[[str, float], str], timeout: float) -> dic
     marker = reply.find(RAW_TEXT_PRESENT)
     if marker < 0:
         if reply.strip() == RAW_TEXT_ABSENT:
-            return {"raw": "absent", "rows": None, "sweep_audited": [], "unreported": [], "error": None}
+            return {
+                "raw": "absent", "rows": None, "sweep_audited": [], "unreported": [], "error": None,
+                "finding_counts": [], "findings_block": FINDINGS_BLOCK_ABSENT,
+            }
         return None
     text = reply[marker + len(RAW_TEXT_PRESENT) :].lstrip("\n")
     truncated = len(text.encode("utf-8", errors="replace")) > MAX_RAW_BYTES
