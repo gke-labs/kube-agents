@@ -609,6 +609,51 @@ def use_snapshot(case, files=None, *, error=None, calls=None, unreadable=(), rea
     return Snapshot
 
 
+def use_large_repository(case, files, *, too_large=(), calls=None):
+    """Make `audit_report.RepositorySnapshot` act for a repository over the snapshot ceiling.
+
+    A snapshot of the whole tree, or of a path in `too_large`, is refused with
+    `SNAPSHOT_TOO_LARGE`; a snapshot of a path that names nothing in `files`
+    (a file, or a directory holding some) is refused with `PATH_NOT_FOUND`;
+    any other narrow snapshot unpacks the files under that path. `calls`
+    collects the `paths` of each snapshot asked for.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="large-repo-"))
+    case.addCleanup(shutil.rmtree, scratch, True)
+
+    def refused(code, message):
+        error = vcs_client.VcsError(message, code=code, revision=SNAPSHOT_TEST_REVISION)
+        return error
+
+    class Snapshot(audit_report.RepositorySnapshot):
+        def __init__(self, repo, ref=None, paths=None):
+            if calls is not None:
+                calls.append(paths)
+            if not paths or paths[0] in too_large:
+                raise refused("SNAPSHOT_TOO_LARGE", "over the ceiling")
+            under = paths[0].rstrip("/")
+            held = {p: t for p, t in files.items() if p == under or p.startswith(under + "/")}
+            if not held:
+                raise refused("PATH_NOT_FOUND", "a path in `paths` names nothing")
+            self._scratch = Path(tempfile.mkdtemp(dir=str(scratch)))
+            self.tree = self._scratch / "tree"
+            self.tree.mkdir()
+            for path, text in held.items():
+                target = self.tree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            self.revision = SNAPSHOT_TEST_REVISION
+
+    for target, name, value in (
+        (audit_report, "RepositorySnapshot", Snapshot),
+        (vcs_client, "LOCAL_GIT", shutil.which("git")),
+        (vcs_client, "ROOT", scratch / "vcs"),
+    ):
+        patcher = patch.object(target, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class _HistoryDirectoryForge(_DirectoryForge):
     """`_DirectoryForge` with a proposal history per branch, as
     `test_vcs_broker.HistoryLocalForge`: what the broker's `branch-delete`
@@ -2726,6 +2771,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "upgrade-readiness-watch",
                 "upgrade-readiness-weekly-review",
                 "sa-role-watch",
+                "leeway-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -4411,6 +4457,22 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         "metadata:\n  name: {name}\nspec:\n  loggingService: none\n"
     )
 
+    def test_a_declaration_in_any_namespace_still_holds_the_field(self):
+        """The index now keys on the namespace too; a `gcloud` fix, which names
+        no namespace, still meets the first declaration of its cluster."""
+        declarations = {}
+        for namespace in ("team-a", "team-b"):
+            audit_report._index_kcc_text(
+                declarations, __import__("yaml"), self.KCC_TEXT.format(name="prod").replace("metadata:\n", f"metadata:\n  namespace: {namespace}\n"),
+                "", f"{namespace}/prod.yaml",
+            )
+        self.assertEqual(len(declarations), 2)
+        finding = make_finding(fid="g", cluster="acme/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --logging=SYSTEM"})
+        problem = audit_report.reverted_gcloud_problem(finding, declarations)
+        self.assertIsNotNone(problem)
+        self.assertEqual(problem[0].path, "team-a/prod.yaml")
+
     def test_the_scan_indexes_every_declaration_in_the_snapshot(self):
         files = {
             "gcp/a.yaml": self.KCC_TEXT.format(name="a"),
@@ -4421,9 +4483,9 @@ class TestRevertedGcloudRemediations(HarnessTestCase):
         index = audit_report.kcc_declarations_via_broker("acme/fleet", self.FakeSnapshot(files))
         self.assertEqual(
             sorted(index),
-            [("ContainerCluster", "a", "a", ""), ("ContainerCluster", "b", "b", "")],
+            [("ContainerCluster", "a", "a", "", "", ""), ("ContainerCluster", "b", "b", "", "", "")],
         )
-        self.assertEqual(index[("ContainerCluster", "b", "b", "")].path, "gcp/b.yml")
+        self.assertEqual(index[("ContainerCluster", "b", "b", "", "", "")].path, "gcp/b.yml")
 
     def test_a_snapshot_that_cannot_be_read_disables_the_check(self):
         files = {"gcp/a.yaml": self.KCC_TEXT.format(name="a")}
@@ -4547,6 +4609,34 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertEqual(self.harness.bodies_for("proposal-create"), [])
         published = [p["body"] for p in self.harness.payloads if p and "body" in p]
         self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
+
+    def test_the_no_promote_flag_publishes_the_ledger_and_opens_no_pull_request(self):
+        """`finish --no-promote`, the per-run waiver a worker passes on a card that
+        says not to open a pull request: the ledger publishes, no proposal opens,
+        and the ledger says the sweep was withheld on this run, not on the install
+        (#4637). The same document without the flag opens the proposal, which is
+        today's behaviour and the test above."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), argv_extra=[audit_report.NO_PROMOTE_FLAG], scheduled=False), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and audit_report.SWEEP_WAIVED_REASON in b for b in published), published)
+        self.assertFalse(any(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), "the waiver names the run, not the install's switch")
+
+    def test_without_the_no_promote_flag_the_same_run_opens_the_pull_request(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), scheduled=False), 0)
+        self.assertEqual(len(self.harness.bodies_for("proposal-create")), 1)
 
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
@@ -7063,6 +7153,70 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertTrue(left["remediation"]["note"].startswith("_(A declared workload shares this namespace's `default` ServiceAccount; turning automount off"))
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
+
+    def test_a_shielded_sibling_listed_on_one_line_keeps_the_shield(self):
+        # gke-labs/kube-agents#4748: a ledger too long for the body lists most
+        # majors on one line, and the shield note lived only in the full block,
+        # so a listed sibling read like any other 2.7 finding.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        bullet, shield = audit_report.render_listed_finding(left).split("\n")
+        self.assertTrue(shield.startswith("  _(A declared workload shares this namespace's `default` ServiceAccount;"))
+        self.assertTrue(shield.endswith(".)_"))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", shield)
+        # The worker's own text is the shared-account fix the shield forbids.
+        self.assertNotIn("automountServiceAccountToken: false on the default ServiceAccount", shield)
+        # The bullet line is still the one the listed-row reader parses.
+        (row,) = audit_report.LISTED_LINE_RE.findall(bullet + "\n" + shield)
+        self.assertEqual(row[4], left["id"])
+
+    def test_a_listed_shield_keeps_names_that_carry_its_closing_marks(self):
+        # A path or object may legally hold `)_`; the shield ends at its own
+        # closing `.)_`, so the names after one are not cut.
+        names = "`Deployment/relay)_v2` declared at acme/fleet:knowledge/(archive)_tokens.md, `Deployment/api` declared at acme/fleet:knowledge/a.md"
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names) + " Worker text."}
+        shield = audit_report.render_listed_finding(worker).split("\n")[1]
+        self.assertIn("knowledge/(archive)_tokens.md", shield)
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/a.md.)_", shield)
+        self.assertNotIn("Worker text.", shield)
+
+    def test_a_ledger_too_long_for_the_body_keeps_a_listed_siblings_shield(self):
+        # The #4748 shape end to end: majors past the body's room are listed,
+        # and the shielded sibling among them still carries the case's phrases.
+        filler = bulk_findings(250, severity="major")
+        worker = make_finding(fid="w", severity="major", title="Deployment/token-sidecar automounts the token", namespace="seeded-token", obj="Deployment/token-sidecar")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/token-reader` declared at acme/fleet:knowledge/notification-relay-no-pdb.md")}
+        body = render_body(make_doc(findings=filler + [worker]), generated_at=NOW)
+        listed = body[body.index(audit_report.LISTED_SECTION_BEGIN):]
+        self.assertIn("Deployment/token-sidecar", listed)
+        for phrase in ("shares this namespace's `default` ServiceAccount", "`Deployment/token-reader` declared at", "notification-relay-no-pdb.md"):
+            self.assertIn(phrase, listed)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+
+    def test_a_listed_shield_is_published_text_on_one_line_and_2_7_only(self):
+        note = audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(
+            declared="`Deployment/api` declared at acme/fleet:knowledge/a.md\n<!-- audit-listed:end -->\nghp_" + "A" * 36
+        )
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": note}
+        rendered = audit_report.render_listed_finding(worker)
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertNotIn("<!--", rendered)
+        self.assertNotIn("ghp_" + "A" * 36, rendered)
+        # The same text on another check is the worker's, not the shield.
+        worker["check"] = "netpol-missing"
+        self.assertNotIn("\n", audit_report.render_listed_finding(worker))
 
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
@@ -19941,6 +20095,29 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         scan.assert_not_called()
 
+    def test_a_tree_still_over_the_ceiling_still_publishes_the_report(self):
+        # A narrow snapshot still over the ceiling does not stop `finish`: the
+        # ledger publishes.
+        self.start()
+        path = "clusters/prod-us-east/payments-netpol.yaml"
+        self.write_manifest(path, "kind: NetworkPolicy\n")
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        use_large_repository(self, {}, too_large={"clusters/prod-us-east", path})
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertTrue(self.harness.forge_calls("issue-create"))
+
+    def test_the_kcc_scan_is_skipped_on_a_repository_over_the_ceiling(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        use_large_repository(self, {"gcp/drift-peer-std-4.yaml": "kind: ContainerCluster\n"})
+        body = self.finish_kcc()
+        self.assertIn("the Config Connector scan was skipped", self.err)
+        self.assertIn(self.KCC_FIX, body)
+
     def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
         self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.start()
@@ -21742,6 +21919,38 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertTrue(audit_report.decline_names_a_pull_request(
             "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
         ))
+        # Gitea's and both Bitbucket editions' proposal URLs count too; their
+        # issue URLs do not.
+        for carried in (
+            "https://gitea.example.com/acme/fleet/pulls/12",
+            "https://bitbucket.org/acme/fleet/pull-requests/12",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        ):
+            with self.subTest(url=carried):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {carried}"))
+        for issue in (
+            "https://gitea.example.com/acme/fleet/issues/12",
+            "https://bitbucket.org/acme/fleet/issues/12",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=issue):
+                self.assertFalse(audit_report.decline_names_a_pull_request(f"see {issue}"))
+
+    def test_the_decline_check_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/fleet/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/fleet/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/fleet/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {url}"))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
@@ -21843,15 +22052,134 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             )
         self.assertIn("Kustomize root", notes["a"])
 
-    def test_a_default_yes_taken_without_a_snapshot_is_not_kept_after_a_retry(self):
-        use_snapshot(self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, error=[RuntimeError("down"), None])
+    def test_a_retry_that_works_answers_the_question_that_asked(self):
+        calls = []
+        use_snapshot(
+            self, {"clusters/c1/kustomization.yaml": "resources: []\n"}, error=[RuntimeError("down"), None], calls=calls
+        )
         self.patch_attr("content_mode", lambda: True)
         probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertTrue(probe.has_path("clusters/new.yaml"))  # no snapshot: a default yes
-            self.assertFalse(probe.has_path("clusters/new.yaml"))  # the retry's snapshot answers
-        self.assertFalse(probe.known_absent("clusters/other.yaml"))
+            self.assertFalse(probe.has_path("clusters/new.yaml"))
+            self.assertTrue(probe.has_path("clusters/c1/kustomization.yaml"))
+        self.assertEqual(probe.take_unanswered(), "")
         self.assertTrue(probe.known_absent("clusters/new.yaml"))
+        self.assertEqual(len(calls), 2)
+        probe.close()
+
+    def test_both_attempts_failing_answer_with_a_default_yes_and_the_reason(self):
+        calls = []
+        use_snapshot(self, error=[RuntimeError("first"), RuntimeError("second")], calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(probe.has_path("clusters/new.yaml"))
+            self.assertTrue(probe.has_path("clusters/other.yaml"))
+        self.assertIn("RuntimeError: second", probe.unavailable)
+        self.assertEqual(len(calls), 2)
+
+    def in_cluster_tree(self):
+        """Point the candidate's declaration into `clusters/c1/`, the GitOps layout."""
+        manifest = self.manifest(declaration="clusters/c1/web/deploy.yaml")
+        manifest["clusters"][0]["candidates"][0]["declaration"]["directory"] = "clusters/c1/web"
+        self.manifest = lambda *args, **kwargs: copy.deepcopy(manifest)
+
+    def test_a_repository_over_the_ceiling_still_checks_a_generated_fix(self):
+        # The whole tree is refused as too large; each check takes a snapshot
+        # of only its own path or cluster tree, and the fix is checked and written.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {"clusters/c1/web/deploy.yaml": "kind: Deployment\n"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"], self.generate_err)
+        self.assertEqual(finding["remediation"]["path"], "clusters/c1/web/a-pdb.yaml")
+        self.assertNotIn("could not be checked", self.generate_err)
+        # The whole tree once, then the cluster tree, which answers the fix, the
+        # markers in it and the name search, and the six markers above it one
+        # file each.
+        self.assertEqual(calls[0], None)
+        self.assertEqual(calls[1], ["clusters/c1"])
+        self.assertEqual(
+            sorted(c[0] for c in calls[2:]),
+            sorted([f"clusters/{m}" for m in audit_report.KUSTOMIZATION_FILE_NAMES]
+                   + list(audit_report.KUSTOMIZATION_FILE_NAMES)),
+        )
+
+    def test_a_name_search_outside_a_cluster_tree_still_needs_the_whole_tree(self):
+        # A declaration outside `clusters/<name>/` is searched across the whole
+        # repository for a name collision, which no narrow snapshot holds: the
+        # fix is declined, saying why.
+        use_large_repository(self, {"apps/a/deploy.yaml": "kind: Deployment\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("too large to search whole", self.generate_err)
+
+    def test_a_file_a_narrow_snapshot_finds_is_not_written_over(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {"clusters/c1/web/a-pdb.yaml": "kind: PodDisruptionBudget\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("already exists", self.generate_err)
+
+    def test_a_generated_fix_in_a_tree_over_the_ceiling_costs_one_snapshot(self):
+        # The name search needs the whole cluster tree, so the planner asks for
+        # it first and declines the fix at once, naming the ceiling, without
+        # the per-file checks that would come before it.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertEqual(calls, [None, ["clusters/c1"]])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_a_refused_path_is_not_asked_again(self):
+        # A tree or a file the broker refused as too large is answered from the
+        # refusal on every later question, a name search on the tree included.
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(2):
+                probe.read_committed("clusters/c1/kustomization.yaml")
+                probe.mentions("a-pdb", "clusters/c1/")
+        self.assertEqual(calls.count(["clusters/c1"]), 1)
+        self.assertEqual(calls.count(["clusters/c1/kustomization.yaml"]), 1)
+        probe.close()
+
+    def test_a_path_still_over_the_ceiling_declines_the_fix_naming_the_limit(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/web/a-pdb.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("too large for one snapshot", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_past_the_cap_a_check_is_skipped_with_the_reason(self):
+        # The cap stops snapshots, not the run: the fix is declined as
+        # unchecked, naming the cap, as when no snapshot could be taken.
+        self.in_cluster_tree()
+        use_large_repository(self, {})
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("PROBE_NARROW_SNAPSHOT_CAP", 0)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("PROBE_NARROW_SNAPSHOT_CAP", self.generate_err)
+
+    def test_a_too_large_read_or_search_is_unanswered_naming_the_limit(self):
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(probe.broker())
+            self.assertIsNone(probe.read_committed("clusters/c1/kustomization.yaml"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+            self.assertTrue(probe.mentions("a-pdb", "clusters/c1/"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
         probe.close()
 
     def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):
@@ -21886,7 +22214,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 if target.exists():
                     target.unlink()
                 self.assertEqual(self.generate()[0], expected)
-                self.assertEqual(len(calls), 1)
+                # A failed snapshot is retried once, inside the same question.
+                self.assertEqual(len(calls), 2 if error else 1)
 
     def test_two_clusters_each_get_their_own_budget_of_one_name(self):
         """A PodDisruptionBudget's name is unique per namespace per cluster, and
@@ -22940,6 +23269,1570 @@ class TestManualRemediationRoutesInFinish(HarnessTestCase):
         body = "".join(self.harness.bodies_for("issue-*"))
         self.assertIn("did not write it", body)
         self.assertFalse(audit_report.RECONCILED_NOTE_LEDE in body)
+
+
+# The Config Connector objects `kcc_health.py` records, as one manifest entry
+# carries them: a topic short of an IAM role, and a cluster waiting on it.
+KCC_TOPIC = {
+    "kind": "PubSubTopic",
+    "namespace": "infra",
+    "name": "fleet-events",
+    "why": "UpdateFailed: Error 403: roles/pubsub.editor is missing",
+}
+KCC_CLUSTER = {
+    "kind": "ContainerCluster",
+    "namespace": "infra",
+    "name": "prod-usc1",
+    "why": "DependencyNotReady: reference PubSubTopic infra/fleet-events is not ready",
+}
+KCC_CLUSTER_FILE = "clusters/prod-usc1/cluster.yaml"
+KCC_CLUSTER_DECLARATION = """\
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: prod-usc1
+  namespace: infra
+spec:
+  location: us-central1
+  releaseChannel:
+    channel: REGULAR
+"""
+
+
+def kcc_manifest(*unready, unread=None):
+    """A manifest whose first entry carries `kcc_unready`, and `kcc_unread` when given."""
+    entry = {"name": "acme/us-central1/hub", "outcome": "collected", "commands": [], "candidates": []}
+    if unready:
+        entry["kcc_unready"] = [dict(record) for record in unready]
+    if unread:
+        entry["kcc_unread"] = unread
+    return {"clusters": [entry]}
+
+
+def kcc_finding(note="Set the release channel to REGULAR.", path=KCC_CLUSTER_FILE, kind="manifest", **fields):
+    remediation = {"kind": kind, "note": note}
+    if kind == "manifest":
+        remediation["path"] = path
+    return make_finding(
+        fid="release-channel",
+        check="release-channel-unenrolled",
+        cluster="acme/us-central1/prod-usc1",
+        namespace="",
+        obj="Cluster/prod-usc1",
+        remediation=remediation,
+        **fields,
+    )
+
+
+class TestStalledKccRemediations(unittest.TestCase):
+    """`disclose_stalled_kcc_remediations`: a `manifest` fix whose file
+    declares an object Config Connector does not apply says so."""
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION)
+
+    def write(self, relative, text):
+        target = self.root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def disclose(self, findings, manifest):
+        return audit_report.disclose_stalled_kcc_remediations(findings, manifest, self.root)
+
+    def test_a_fix_whose_file_declares_an_unready_object_says_so_and_stays_manifest(self):
+        finding = kcc_finding()
+        changed = self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed: Error 403")))
+        self.assertEqual(changed, ["release-channel"])
+        remediation = finding["remediation"]
+        self.assertEqual(remediation["kind"], "manifest")
+        self.assertEqual(remediation["path"], KCC_CLUSTER_FILE)
+        note = remediation["note"]
+        self.assertTrue(note.startswith("Set the release channel to REGULAR.\n\n"), note)
+        last = note.split("\n\n")[-1]
+        self.assertTrue(last.startswith("**Config Connector is not applying this file.**"), last)
+        self.assertIn("`Ready=False` on `ContainerCluster infra/prod-usc1` (`UpdateFailed: Error 403`)", last)
+        self.assertIn("does not change after the merge", last)
+        # The reason can reject the change itself, so the note does not call it correct.
+        self.assertNotIn("is correct", last)
+        self.assertIn("If the reason rejects the change in this file, correct the declaration.", last)
+        self.assertIn("ContainerCluster infra/prod-usc1", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_fix_whose_file_declares_nothing_unready_gets_no_note(self):
+        self.write("clusters/prod-use1/cluster.yaml", KCC_CLUSTER_DECLARATION.replace("prod-usc1", "prod-use1"))
+        finding = kcc_finding(path="clusters/prod-use1/cluster.yaml")
+        finding.update(cluster="acme/us-east1/prod-use1", object="Cluster/prod-use1")
+        self.assertEqual(self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC)), [])
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_workload_fix_gets_no_note(self):
+        self.write("clusters/prod-usc1/netpol.yaml", "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: prod-usc1\n")
+        finding = make_finding(remediation={"kind": "manifest", "path": "clusters/prod-usc1/netpol.yaml", "note": "x"})
+        self.assertEqual(self.disclose([finding], kcc_manifest(KCC_CLUSTER)), [])
+
+    def test_the_note_names_the_unready_object_the_declaration_waits_on(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC))
+        note = finding["remediation"]["note"]
+        self.assertIn(
+            "`Ready=False` on `ContainerCluster infra/prod-usc1` (`DependencyNotReady: reference PubSubTopic "
+            "infra/fleet-events is not ready`), which waits on `PubSubTopic infra/fleet-events` "
+            "(`UpdateFailed: Error 403: roles/pubsub.editor is missing`)",
+            note,
+        )
+
+    def test_a_dependency_on_an_object_that_is_ready_names_only_the_declaration(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+        self.assertNotIn("which waits on", finding["remediation"]["note"])
+        self.assertIn("DependencyNotReady", finding["remediation"]["note"])
+
+    def test_the_namespace_must_agree_when_the_file_sets_one(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, namespace="other")))
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION.replace("  namespace: infra\n", ""))
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, namespace="other")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_an_unread_cluster_gives_no_note_and_says_why_in_the_log(self):
+        finding = kcc_finding()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(unread="timed out"), self.root)
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertIn("could not read Config Connector on acme/us-central1/hub", err.getvalue())
+
+    def test_a_copied_note_is_removed_and_written_once(self):
+        finding = kcc_finding()
+        manifest = kcc_manifest(KCC_CLUSTER)
+        self.disclose([finding], manifest)
+        once = finding["remediation"]["note"]
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_NOTE_MARK), 1)
+        # The stall has cleared; the worker copied the old note.
+        self.assertEqual(self.disclose([finding], kcc_manifest()), ["release-channel"])
+        self.assertEqual(finding["remediation"]["note"], "Set the release channel to REGULAR.")
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_only_a_manifest_fix_gets_the_note(self):
+        for kind in ("gcloud", "manual"):
+            with self.subTest(kind=kind):
+                finding = kcc_finding(note="gcloud container clusters update prod-usc1", kind=kind)
+                self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+                self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+                # The finding's own object is unready, which the persists texts read.
+                self.assertIn("prod-usc1", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_node_pool_matches_only_on_its_own_cluster(self):
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "c1-default", "why": "UpdateFailed",
+                "resource": "default-pool", "cluster": "prod-usc1"}
+        mine = make_finding(fid="p", cluster="acme/us-central1/prod-usc1", obj="NodePool/default-pool",
+                            remediation={"kind": "gcloud", "note": "x"})
+        other = make_finding(fid="q", cluster="acme/us-east1/prod-use1", obj="NodePool/default-pool",
+                             remediation={"kind": "gcloud", "note": "x"})
+        self.disclose([mine, other], kcc_manifest(pool))
+        self.assertIn("c1-default", mine[audit_report.KCC_STALLED_FINDING_FIELD])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, other)
+
+    def gpu_pool_fix(self):
+        """A fix whose file declares `config-control/gpu-pool` for `prod-a`."""
+        self.write(
+            "pools/gpu-pool.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+            "  name: gpu-pool\n  namespace: config-control\nspec:\n  location: us-central1\n"
+            "  clusterRef:\n    name: prod-a\n",
+        )
+        finding = kcc_finding(path="pools/gpu-pool.yaml")
+        finding.update(cluster="acme/us-central1/prod-a", object="NodePool/gpu-pool")
+        return finding
+
+    @staticmethod
+    def two_hosts(*entries):
+        """A manifest of one entry per `(host, unready)` pair."""
+        return {
+            "clusters": [
+                {"name": host, "outcome": "collected", "commands": [], "candidates": [], "kcc_unready": list(unready)}
+                for host, unready in entries
+            ]
+        }
+
+    def test_a_pool_stalled_for_another_cluster_on_another_host_gives_no_note(self):
+        """Config Controller puts every instance's objects in `config-control`,
+        so the same name on another host is another object."""
+        finding = self.gpu_pool_fix()
+        staging = {"kind": "ContainerNodePool", "namespace": "config-control", "name": "gpu-pool",
+                   "why": "UpdateFailed: quota", "cluster": "staging-a"}
+        manifest = self.two_hosts(("acme/us-central1/cc-prod", []), ("acme/us-central1/cc-staging", [staging]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_pool_stalled_for_its_own_cluster_gives_the_note(self):
+        finding = self.gpu_pool_fix()
+        prod = {"kind": "ContainerNodePool", "namespace": "config-control", "name": "gpu-pool",
+                "why": "UpdateFailed: quota", "cluster": "prod-a", "project": "acme"}
+        staging = dict(prod, cluster="staging-a")
+        manifest = self.two_hosts(("acme/us-central1/cc-prod", [prod]), ("acme/us-central1/cc-staging", [staging]))
+        self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
+        self.assertIn("config-control/gpu-pool", finding["remediation"]["note"])
+
+    def test_the_same_object_unready_on_two_hosts_with_nothing_to_tell_them_apart_gives_no_note(self):
+        finding = kcc_finding()
+        manifest = self.two_hosts(
+            ("acme/us-central1/hub", [dict(KCC_CLUSTER, why="UpdateFailed")]),
+            ("acme/us-east1/hub2", [dict(KCC_CLUSTER, why="UpdateFailed")]),
+        )
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_file_with_no_namespace_matches_only_one_fitting_object(self):
+        self.write(KCC_CLUSTER_FILE, KCC_CLUSTER_DECLARATION.replace("  namespace: infra\n", ""))
+        finding = kcc_finding()
+        manifest = kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed"), dict(KCC_CLUSTER, namespace="other", why="UpdateFailed"))
+        self.assertEqual(self.disclose([finding], manifest), [])
+
+    def test_a_dependency_is_followed_only_on_the_host_that_recorded_the_stall(self):
+        finding = kcc_finding()
+        manifest = self.two_hosts(("acme/us-central1/hub", [dict(KCC_CLUSTER, project="acme")]), ("acme/us-east1/hub2", [KCC_TOPIC]))
+        self.disclose([finding], manifest)
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+        self.assertNotIn("which waits on", note)
+
+    CONFIG_CONTROL_PROD = """\
+apiVersion: container.cnrm.cloud.google.com/v1beta1
+kind: ContainerCluster
+metadata:
+  name: prod
+  namespace: config-control
+{annotations}spec:
+  location: us-central1
+"""
+
+    def config_control_fix(self, annotations=""):
+        self.write("clusters/prod/cluster.yaml", self.CONFIG_CONTROL_PROD.format(annotations=annotations))
+        finding = kcc_finding(path="clusters/prod/cluster.yaml")
+        finding.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        return finding
+
+    def test_a_name_unready_on_one_host_and_ready_on_another_is_not_certain(self):
+        """Host A runs Config Connector and its `config-control/prod` is
+        ready, so A lists nothing; host B's object of the same name is not
+        ready. Without a project, nothing tells the fix which one it edits."""
+        finding = self.config_control_fix()
+        stalled = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed: quota"}
+        manifest = self.two_hosts(("pa/us-central1/cc-a", []), ("pb/us-central1/cc-b", [stalled]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        # The finding's own object, with the fix file gone: no stall either.
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        self.disclose([own], manifest)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
+    def test_with_two_hosts_a_known_project_decides(self):
+        stalled = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed: quota"}
+        for record_project, annotations, expected in (
+            ("pb", "", False),  # B's object manages pb; the finding is in pa.
+            ("pa", "", True),  # it manages the finding's project.
+            ("pa", "  annotations:\n    cnrm.cloud.google.com/project-id: pb\n", False),  # the file names pb.
+            ("pb", "  annotations:\n    cnrm.cloud.google.com/project-id: pb\n", True),
+        ):
+            with self.subTest(record=record_project, annotations=bool(annotations)):
+                finding = self.config_control_fix(annotations)
+                manifest = self.two_hosts(("pa/us-central1/cc-a", []), ("pb/us-central1/cc-b", [dict(stalled, project=record_project)]))
+                self.disclose([finding], manifest)
+                self.assertEqual(audit_report.KCC_STALLED_NOTE_MARK in finding["remediation"]["note"], expected)
+
+    def test_a_cluster_finding_never_takes_a_stall_of_another_project(self):
+        """With one host, a known project still has to agree."""
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="pa/us-central1/prod", object="Cluster/prod")
+        record = {"kind": "ContainerCluster", "namespace": "config-control", "name": "prod", "why": "UpdateFailed", "project": "pb"}
+        self.disclose([own], kcc_manifest(record))
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+        self.disclose([own], kcc_manifest(dict(record, project="pa")))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
+    def test_one_host_never_matches_an_object_of_another_project(self):
+        """One management cluster, one namespace per project, the same names.
+        The file leaves the namespace to Kustomize and names proj-a; the only
+        unready object is team-b's, which manages proj-b."""
+        self.write(
+            "teams/a/gke.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: gke\n"
+            "  annotations:\n    cnrm.cloud.google.com/project-id: proj-a\nspec:\n  location: us-central1\n",
+        )
+        finding = kcc_finding(path="teams/a/gke.yaml")
+        finding.update(cluster="proj-a/us-central1/gke", object="Cluster/gke")
+        record = {"kind": "ContainerCluster", "namespace": "team-b", "name": "gke", "why": "UpdateFailed", "project": "proj-b"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(record)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.disclose([finding], kcc_manifest(dict(record, namespace="team-a", project="proj-a")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_an_object_with_no_project_does_not_match_when_a_namesake_cluster_is_in_another_project(self):
+        """The finding's own `Cluster/gke` in proj-a; the manifest also holds a
+        `gke` in proj-b; the unready object records no project, so its name
+        and `clusterRef` cannot tell the two clusters apart."""
+        own = kcc_finding(note="x", kind="gcloud")
+        own.update(cluster="proj-a/us-central1/gke", object="Cluster/gke")
+        record = {"kind": "ContainerCluster", "namespace": "infra", "name": "gke", "why": "UpdateFailed"}
+        manifest = kcc_manifest(record)
+        manifest["clusters"].append({"name": "proj-b/us-central1/gke", "outcome": "collected", "commands": [], "candidates": []})
+        self.disclose([own], manifest)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+        # Without the namesake, the one object of that name is the finding's.
+        self.disclose([own], kcc_manifest(record))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, own)
+
+    TWO_POOLS = "\n---\n".join(
+        "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+        f"  name: {pool}\n  namespace: infra\nspec:\n  location: us-central1\n  clusterRef:\n    name: prod-usc1\n"
+        for pool in ("pool-a", "pool-b")
+    )
+
+    def pool_fix(self, pool):
+        self.write("pools.yaml", self.TWO_POOLS)
+        return make_finding(
+            fid=pool, cluster="acme/us-central1/prod-usc1", obj=f"NodePool/{pool}",
+            remediation={"kind": "manifest", "path": "pools.yaml", "note": "Raise the ceiling."},
+        )
+
+    def pool_stall(self, pool):
+        return {"kind": "ContainerNodePool", "namespace": "infra", "name": pool, "why": "UpdateFailed", "cluster": "prod-usc1"}
+
+    def test_a_stall_of_another_object_in_the_same_file_gives_no_note(self):
+        """The file declares pool-a and pool-b; the fix is for pool-a; only
+        pool-b is stalled. That says nothing about pool-a's fix."""
+        finding = self.pool_fix("pool-a")
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-b"))), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_stall_of_the_findings_own_object_in_a_shared_file_gives_the_note(self):
+        finding = self.pool_fix("pool-b")
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-b"))), ["pool-b"])
+        note = finding["remediation"]["note"]
+        self.assertIn("`ContainerNodePool infra/pool-b`", note)
+        self.assertNotIn("pool-a", note)
+
+    def test_a_shared_file_with_no_object_of_the_finding_gives_no_note(self):
+        finding = self.pool_fix("pool-a")
+        finding["object"] = "Namespace/infra"
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.pool_stall("pool-a"), self.pool_stall("pool-b"))), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_host_whose_read_failed_still_counts_as_a_host(self):
+        """hub-1 lists ContainerCluster infra/prod-usc1 with no project; the
+        fix declares it. When hub-2's read succeeds with everything
+        ready, there are two hosts and no note. When hub-2's read times out,
+        hub-2 is unknown, not absent, and the answer must be the same."""
+        topic = dict(KCC_CLUSTER)
+        for hub2 in ({"kcc_unready": []}, {"kcc_unread": "`kubectl get gcp -A` did not finish in 240s"}):
+            with self.subTest(hub2=list(hub2)):
+                finding = kcc_finding()
+                manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
+                del manifest["clusters"][1]["kcc_unready"]
+                manifest["clusters"][1].update(hub2)
+                self.assertEqual(self.disclose([finding], manifest), [])
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_cluster_that_was_never_read_counts_as_a_possible_host(self):
+        """hub-1 lists infra/prod-usc1 with no project. hub-2 was unreachable, so
+        nothing is known about its Config Connector: no note. A cluster of
+        another status, or a STOPPING one, is not a host."""
+        topic = dict(KCC_CLUSTER)
+        for hub2, expected in (
+            ({"outcome": "unreachable", "error": "get-credentials rc=1"}, []),
+            ({"outcome": "gate-failed", "error": "dump failed"}, []),
+            ({"outcome": "unreachable", "cluster_status": "STOPPING"}, ["release-channel"]),
+            ({"outcome": "out-of-scope"}, ["release-channel"]),
+        ):
+            with self.subTest(hub2=hub2):
+                finding = kcc_finding()
+                manifest = self.two_hosts(("acme/us-central1/hub-1", [topic]), ("acme/us-east1/hub-2", []))
+                del manifest["clusters"][1]["kcc_unready"]
+                manifest["clusters"][1].update(hub2)
+                self.assertEqual(self.disclose([finding], manifest), expected)
+
+    def test_a_project_whose_clusters_list_failed_counts_as_a_possible_host(self):
+        """A `gate-failed` `project/<id>` entry hides clusters that may run
+        Config Connector, so the match needs a known project."""
+        topic = dict(KCC_CLUSTER)
+        for entry, expected in (
+            ({"name": "project/other", "outcome": "gate-failed", "error": "clusters list rc=1"}, []),
+            ({"name": "project/other", "outcome": "collected", "location": "global"}, ["release-channel"]),
+        ):
+            with self.subTest(outcome=entry["outcome"]):
+                finding = kcc_finding()
+                manifest = kcc_manifest(topic)
+                manifest["clusters"].append(entry)
+                self.assertEqual(self.disclose([finding], manifest), expected)
+
+    def test_the_namespace_project_brings_the_note_back(self):
+        """With an unreachable hub-2, the object's recorded project (from its
+        namespace) agrees with the project the file declares through its
+        Namespace, and the note is certain. A `PubSubTopic` finding is on the
+        Config Connector host, so the finding's own cluster gives no project."""
+        self.write(
+            "topics/events.yaml",
+            "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
+            "    cnrm.cloud.google.com/project-id: acme\n---\n"
+            "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n",
+        )
+        finding = kcc_finding(path="topics/events.yaml")
+        finding.update(object="PubSubTopic/events", check="kcc-object-wedged", cluster="acme/us-central1/hub-1")
+        manifest = self.two_hosts(("acme/us-central1/hub-1", [dict(KCC_TOPIC, name="events", project="acme")]), ("acme/us-east1/hub-2", []))
+        del manifest["clusters"][1]["kcc_unready"]
+        manifest["clusters"][1]["outcome"] = "unreachable"
+        self.assertEqual(self.disclose([finding], manifest), ["release-channel"])
+
+    def eu_prod_fix(self, namespace=""):
+        """A fix for `proj-b/europe-west1/prod` whose file declares that
+        ContainerCluster, project proj-b, with or without a namespace."""
+        ns = f"  namespace: {namespace}\n" if namespace else ""
+        self.write(
+            "clusters/prod-eu.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: prod\n" + ns +
+            "  annotations:\n    cnrm.cloud.google.com/project-id: proj-b\nspec:\n  location: europe-west1\n",
+        )
+        finding = kcc_finding(path="clusters/prod-eu.yaml")
+        finding.update(cluster="proj-b/europe-west1/prod", object="Cluster/prod")
+        return finding
+
+    US_PROD = {"kind": "ContainerCluster", "namespace": "us", "name": "prod", "why": "UpdateFailed", "project": "proj-b", "location": "us-central1"}
+
+    def test_a_stall_in_another_location_is_not_a_match(self):
+        finding = self.eu_prod_fix()
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.US_PROD)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.disclose([finding], kcc_manifest(dict(self.US_PROD, location="europe-west1")))
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+
+    def test_the_own_object_fallback_needs_the_files_namespace(self):
+        """The file sets namespace `eu`; the in-file match refuses `us/prod`,
+        and the fallback to the finding's own object must refuse it too."""
+        no_location = {key: value for key, value in self.US_PROD.items() if key != "location"}
+        for stall in (self.US_PROD, no_location):
+            with self.subTest(location=stall.get("location")):
+                finding = self.eu_prod_fix(namespace="eu")
+                self.disclose([finding], kcc_manifest(stall))
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_default_pool_of_another_location_is_not_the_findings(self):
+        """Every cluster has a `default-pool`; two clusters named prod in two
+        locations differ only by location."""
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "prod-default", "why": "UpdateFailed",
+                "resource": "default-pool", "cluster": "prod", "location": "us-central1"}
+        mine = make_finding(fid="p", cluster="acme/europe-west1/prod", obj="NodePool/default-pool",
+                            remediation={"kind": "gcloud", "note": "x"})
+        self.disclose([mine], kcc_manifest(pool))
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, mine)
+        mine["cluster"] = "acme/us-central1/prod"
+        self.disclose([mine], kcc_manifest(pool))
+        self.assertIn(audit_report.KCC_STALLED_FINDING_FIELD, mine)
+
+    def test_a_single_config_connector_object_that_is_not_the_findings_gives_no_note(self):
+        """apps/web.yaml holds Deployment shop/web and IAMServiceAccount
+        shop/web-sa; the fix is for the Deployment; web-sa is stalled. The fix
+        did not change the account, so no Config Connector text."""
+        self.write(
+            "apps/web.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: shop\n---\n"
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: web-sa\n  namespace: shop\n",
+        )
+        finding = make_finding(fid="w", cluster="acme/us-central1/prod-usc1", obj="Deployment/web",
+                               remediation={"kind": "manifest", "path": "apps/web.yaml", "note": "Add a probe."})
+        account = {"kind": "IAMServiceAccount", "namespace": "shop", "name": "web-sa", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        self.assertNotIn("Config Connector", audit_report.render_persists_comment(AUDIT, finding, NOW))
+
+    def test_a_finding_of_a_kind_config_connector_does_not_hold_has_no_config_connector_object(self):
+        """apps/api.yaml declares Deployment api and IAMServiceAccount api in
+        payments; the finding is on Deployment/api; the account is stalled.
+        The same name does not make the account the finding's own object."""
+        self.write(
+            "apps/api.yaml",
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\n  namespace: payments\n---\n"
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: api\n  namespace: payments\n",
+        )
+        finding = make_finding(fid="d", cluster="acme/us-central1/prod-usc1", obj="Deployment/api",
+                               remediation={"kind": "manifest", "path": "apps/api.yaml", "note": "Add a probe."})
+        account = {"kind": "IAMServiceAccount", "namespace": "payments", "name": "api", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_single_config_connector_object_that_is_the_findings_gives_the_note(self):
+        self.write(
+            "iam/web-sa.yaml",
+            "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMServiceAccount\nmetadata:\n  name: web-sa\n  namespace: shop\n",
+        )
+        finding = make_finding(fid="a", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="IAMServiceAccount/web-sa",
+                               remediation={"kind": "manifest", "path": "iam/web-sa.yaml", "note": "Grant the role."})
+        account = {"kind": "IAMServiceAccount", "namespace": "shop", "name": "web-sa", "why": "UpdateFailed: Error 403"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(account)), ["a"])
+        self.assertIn("`IAMServiceAccount shop/web-sa`", finding["remediation"]["note"])
+
+    def test_a_deep_dependency_chain_names_the_root_cause_and_the_paragraph_fits_whole(self):
+        """An 8-deep `DependencyNotReady` chain under a long worker note: the
+        note names the deepest object, counts the rest, and keeps the whole
+        Config Connector paragraph inside the cap."""
+        chain = [dict(KCC_CLUSTER, why=f"DependencyNotReady: reference PubSubTopic infra/t1 is not ready")]
+        for depth in range(1, 8):
+            chain.append({"kind": "PubSubTopic", "namespace": "infra", "name": f"t{depth}",
+                          "why": f"DependencyNotReady: reference PubSubTopic infra/t{depth + 1} is not ready " + "x" * 120})
+        chain.append({"kind": "PubSubTopic", "namespace": "infra", "name": "t8", "why": "UpdateFailed: Error 403: roles/pubsub.editor is missing"})
+        for head in ("", audit_report.GENERATED_FIX_NOTE + " "):
+            with self.subTest(head=bool(head)):
+                finding = kcc_finding(note=head + "Raise the channel. " * 300)
+                self.disclose([finding], kcc_manifest(*chain))
+                note = finding["remediation"]["note"]
+                paragraph = note.split("\n\n")[-1]
+                self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:80])
+                self.assertTrue(paragraph.endswith("until then."), paragraph[-80:])
+                self.assertIn("which waits on `PubSubTopic infra/t8` (`UpdateFailed: Error 403", paragraph)
+                self.assertIn("(and 7 more unready object(s) between them)", paragraph)
+                self.assertNotIn("infra/t3`", paragraph)
+                self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+                self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+
+    def test_the_same_object_unready_on_two_hosts_with_a_known_project_gives_no_note(self):
+        """hub-a and hub-b both report ContainerCluster infra/prod, project
+        proj, at UpdateFailed. The project agrees with the fix, but nothing
+        tells the fix which host's object it declares, so no note."""
+        self.write(
+            "clusters/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n  name: prod\n"
+            "  namespace: infra\nspec:\n  location: us-central1\n",
+        )
+        finding = kcc_finding(path="clusters/prod.yaml")
+        finding.update(cluster="proj/us-central1/prod", object="Cluster/prod")
+        stall = {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "why": "UpdateFailed", "project": "proj"}
+        manifest = self.two_hosts(("proj/us-central1/hub-a", [stall]), ("proj/us-east1/hub-b", [stall]))
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_dependency_of_a_kind_the_read_did_not_list_is_named_as_not_read(self):
+        """The flag collectors read only the container kinds. The cluster waits
+        on a PubSubTopic, which the read did not list: the note names the
+        topic from the message and says its state was not read, and never
+        claims a reason for it."""
+        manifest = kcc_manifest(KCC_CLUSTER)
+        manifest["clusters"][0]["kcc_kinds_read"] = ["ContainerCluster", "ContainerNodePool"]
+        finding = kcc_finding()
+        self.disclose([finding], manifest)
+        note = finding["remediation"]["note"]
+        self.assertIn("which waits on `PubSubTopic infra/fleet-events` (its state was not read)", note)
+        # With every kind read, a ready topic is not named.
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(KCC_CLUSTER))
+        self.assertNotIn("which waits on", finding["remediation"]["note"])
+
+    FIREWALL = (
+        "apiVersion: compute.cnrm.cloud.google.com/v1beta1\nkind: ComputeFirewall\nmetadata:\n"
+        "  name: allow-ssh\n  namespace: app\nspec:\n  networkRef:\n    name: default\n"
+    )
+
+    def firewall_fix(self, text):
+        self.write("network/allow-ssh.yaml", text)
+        # A kcc-object-wedged finding carries its object's namespace (collect.py).
+        return make_finding(fid="fw", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub", obj="ComputeFirewall/allow-ssh",
+                            namespace="app",
+                            remediation={"kind": "manifest", "path": "network/allow-ssh.yaml", "note": "Close port 22."})
+
+    def test_a_config_connector_kind_finding_takes_its_project_from_the_declaration_not_the_host(self):
+        """The hub in hub-proj holds ComputeFirewall app/allow-ssh, which manages
+        app-proj. The finding's cluster is the hub, which says nothing about
+        the project the object manages."""
+        stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
+        finding = self.firewall_fix(self.FIREWALL)
+        self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), ["fw"])
+        # The stall is on the finding's own cluster, so a second host does
+        # not make the match uncertain.
+        two = self.two_hosts(("hub-proj/us-central1/hub", [stall]), ("hub-proj/us-east1/hub-2", []))
+        finding = self.firewall_fix(self.FIREWALL)
+        self.assertEqual(self.disclose([finding], two), ["fw"])
+        namespace = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: app\n  annotations:\n    cnrm.cloud.google.com/project-id: app-proj\n---\n"
+        finding = self.firewall_fix(namespace + self.FIREWALL)
+        self.assertEqual(self.disclose([finding], two), ["fw"])
+        finding = self.firewall_fix(namespace.replace("app-proj", "other-proj") + self.FIREWALL)
+        self.assertEqual(self.disclose([finding], self.two_hosts(("hub-proj/us-central1/hub", [stall]))), [])
+
+    def test_a_repository_declaration_for_another_project_blocks_the_wedged_match(self):
+        """Review finding: the generic match dropped the declaration that
+        disagreed with the stall before it looked, so a declaration for
+        another project could never block. The clone index also takes the
+        project of a Namespace the same file declares."""
+        namespace = "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: app\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n---\n"
+        stall = {"kind": "ComputeFirewall", "namespace": "app", "name": "allow-ssh", "why": "UpdateFailed", "project": "app-proj"}
+        manifest = self.two_hosts(("hub-proj/us-central1/hub", [stall]))
+        for project, expected in (("other-proj", []), ("app-proj", ["fw"])):
+            with self.subTest(project=project):
+                self.write("network/allow-ssh.yaml", namespace.format(project=project) + self.FIREWALL)
+                declarations = audit_report.kcc_declarations(self.root)
+                self.assertEqual([d.project for k, d in declarations.items() if k[0] == "ComputeFirewall"], [project])
+                finding = make_finding(fid="fw", check="kcc-object-wedged", cluster="hub-proj/us-central1/hub",
+                                       obj="ComputeFirewall/allow-ssh", namespace="app",
+                                       remediation={"kind": "manual", "note": "Close port 22."})
+                self.assertEqual(
+                    audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), expected
+                )
+
+    def test_a_kcc_object_wedged_finding_on_a_container_cluster_takes_nothing_from_the_host(self):
+        """Compliance's finding on `ContainerCluster/prod` sits on the hub in
+        acme/us-central1; the object manages app-proj in europe-west1.
+        The hub's project and location say nothing about the object."""
+        self.write(
+            "clusters/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            "  name: prod\n  namespace: app-proj\nspec:\n  location: europe-west1\n",
+        )
+        finding = make_finding(fid="w", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="ContainerCluster/prod",
+                               remediation={"kind": "manifest", "path": "clusters/prod.yaml", "note": "Fix the reference."})
+        stall = {"kind": "ContainerCluster", "namespace": "app-proj", "name": "prod", "why": "UpdateFailed",
+                 "project": "app-proj", "location": "europe-west1"}
+        self.assertEqual(self.disclose([finding], kcc_manifest(stall)), ["w"])
+
+    PLANTED = "clusters/fa2-seeded-a/provisioning/pinned-inference-pool.yaml"
+    PLANTED_POOL = {
+        "kind": "ContainerNodePool", "namespace": "eval-kcc-stalled", "name": "pinned-inference-pool",
+        "why": "DependencyNotFound: reference ContainerCluster eval-kcc-stalled/fa2-seeded-a is not found",
+        "cluster": "fa2-seeded-a", "location": "us-central1-a", "project": "agentic-harness-demo",
+    }
+    PLANTED_DECLARATION = json.dumps({
+        "apiVersion": "container.cnrm.cloud.google.com/v1beta1", "kind": "ContainerNodePool",
+        "metadata": {"name": "pinned-inference-pool", "namespace": "eval-kcc-stalled",
+                     "annotations": {"cnrm.cloud.google.com/project-id": "agentic-harness-demo"}},
+        "spec": {"location": "us-central1-a", "clusterRef": {"name": "fa2-seeded-a"}, "nodeCount": 1},
+    }, indent=2) + "\n"
+
+    def live_manifest(self):
+        """The fa2 live run's manifest: two Config Connector hosts, the pool
+        stalled on kube-agents-fa2, two seeded clusters with no Config Connector."""
+        return {"clusters": [
+            {"name": "agentic-harness-demo/us-central1/kage-management", "outcome": "collected", "kcc_unready": []},
+            {"name": "agentic-harness-demo/us-central1/kube-agents-fa2", "outcome": "collected", "kcc_unready": [self.PLANTED_POOL]},
+            {"name": "agentic-harness-demo/us-central1-a/fa2-seeded-a", "outcome": "collected"},
+            {"name": "agentic-harness-demo/us-central1-a/brad-2", "outcome": "collected"},
+        ]}
+
+    def pool_finding(self, remediation):
+        return make_finding(fid="pool", cluster="agentic-harness-demo/us-central1-a/fa2-seeded-a",
+                            obj="NodePool/pinned-inference-pool", remediation=remediation)
+
+    def test_the_live_run_a_degraded_fix_names_the_planted_declaration(self):
+        """The worker named a file it never wrote, so the fix degraded to
+        `manual`; the planted declaration was in the repository. The paragraph
+        keeps the eval's first sentence and names the planted file."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        finding = self.pool_finding({"kind": "manifest", "path": "clusters/fa2-seeded-a/pinned-inference-pool.tf", "note": "Append zones."})
+        audit_report.degrade_missing_remediations([finding], self.root)
+        self.assertEqual(finding["remediation"]["kind"], "manual")
+        declarations = audit_report.kcc_declarations(self.root)
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), ["pool"])
+        paragraph = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:120])
+        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertIn("`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`", paragraph)
+        self.assertIn("DependencyNotFound", paragraph)
+        self.assertIn("pinned-inference-pool", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_no_declaration_found_gives_the_sibling_sentence(self):
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})
+        paragraph = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, paragraph)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, paragraph)
+        self.assertNotIn("found no declaration", paragraph)
+
+    def test_two_declaring_files_are_ambiguous(self):
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        self.write("legacy/pinned-inference-pool.yaml", self.PLANTED_DECLARATION)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
+        paragraph = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK))
+        self.assertIn("more than one declaration (2 files)", paragraph)
+
+    def test_a_gcloud_fix_gets_the_paragraph_after_its_command(self):
+        """A `gcloud` note is the command, rendered in a bash block, so the
+        paragraph goes in its own field and renders after the block."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        command = "gcloud container node-pools update pinned-inference-pool --cluster fa2-seeded-a --node-locations us-central1-a,us-central1-b"
+        finding = self.pool_finding({"kind": "gcloud", "note": command})
+        changed = audit_report.disclose_stalled_kcc_remediations(
+            [finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root)
+        )
+        self.assertEqual(changed, ["pool"])
+        self.assertEqual(finding["remediation"]["note"], command)
+        paragraph = finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD]
+        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        rendered = "\n".join(audit_report.render_finding(finding))
+        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_NOTE_MARK))
+        self.assertIn("```\n\n" + audit_report.KCC_STALLED_NOTE_MARK, rendered)
+        # A worker's copy of the field is dropped.
+        finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD] = "made up"
+        validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertNotIn(audit_report.KCC_STALLED_PARAGRAPH_FIELD, validated["findings"][0])
+
+    @staticmethod
+    def broker(files):
+        """A snapshot of the repository over `files`, as `RepositorySnapshot`
+        reads one."""
+        class FakeSnapshot:
+            def files(self, prefix=None):
+                return sorted(files)
+
+            def read_bytes(self, path):
+                return files[path].encode()
+
+        return FakeSnapshot()
+
+    def test_content_mode_names_the_declaration_from_the_brokers_index(self):
+        """In content mode the repository is read from a snapshot
+        (`kcc_declarations_via_broker`), as the gcloud check reads it."""
+        files = {self.PLANTED: self.PLANTED_DECLARATION, "apps/web.yaml": "kind: Deployment\nmetadata:\n  name: web\n"}
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan)
+        self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+
+    def test_content_mode_indexes_every_config_connector_kind(self):
+        """A PubSubTopic, not only the container kinds, and a file whose only
+        Config Connector text is a project annotation is not read as one."""
+        topic = ("apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n"
+                 "  name: events\n  namespace: infra\n")
+        annotated = ("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: infra\n  annotations:\n"
+                     "    cnrm.cloud.google.com/project-id: acme\n")
+        scan = audit_report.kcc_declarations_via_broker(
+            "acme/fleet", self.broker({"pubsub/events.yaml": topic, "ns.yaml": annotated}), every_kind=True
+        )
+        self.assertEqual([declaration.path for declaration in scan.values()], ["pubsub/events.yaml"])
+        finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
+                               namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan)
+        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+
+    def test_the_gcloud_check_reads_the_container_kinds_and_the_paragraph_every_kind(self):
+        """The gcloud check reads only the files that name the container
+        group; the paragraph's read (`every_kind`) reads every group."""
+        files = {
+            "iam/m.yaml": "apiVersion: iam.cnrm.cloud.google.com/v1beta1\nkind: IAMPolicyMember\nmetadata:\n  name: m\n",
+            "clusters/prod.yaml": (
+                "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+                "  name: prod\nspec:\n  loggingService: none\n"
+            ),
+        }
+        gcloud = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files))
+        self.assertEqual([key[0] for key in gcloud], ["ContainerCluster"])
+        finding = make_finding(fid="g", cluster="acme/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --logging=SYSTEM"})
+        problem = audit_report.reverted_gcloud_problem(finding, gcloud)
+        self.assertEqual((problem[0].path, problem[1]), ("clusters/prod.yaml", "loggingService"))
+        every = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
+        self.assertEqual(sorted(key[0] for key in every), ["ContainerCluster", "IAMPolicyMember"])
+
+    def test_a_single_quoted_api_version_is_indexed(self):
+        topic = "apiVersion: 'pubsub.cnrm.cloud.google.com/v1beta1'\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: infra\n"
+        scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({"t.yaml": topic}), every_kind=True)
+        self.assertEqual([key[0] for key in scan], ["PubSubTopic"])
+
+    def test_a_templated_declaration_gives_no_absence_claim(self):
+        """Review finding: a file the audit cannot parse (a Helm or Kustomize
+        template) was skipped, and the paragraph then said that no file
+        declares the object. The paragraph only says it names no file."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION.replace('"nodeCount": 1', '"nodeCount": {{ .Values.count }}').replace("{\n", "{{- /* t */ -}}\n{\n", 1))
+        self.write("templated.yaml", "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+                   "  name: {{ .Values.name }}\n  {{ if .Values.x }}bad: [\n")
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+        for claim in ("found no declaration", "no declaration of this object", "could not search"):
+            self.assertNotIn(claim, note)
+
+    def test_a_json_declaration_is_indexed(self):
+        """Config Sync applies `.json` files, and the paragraph's broker search
+        matches a JSON `apiVersion` key, so both modes read them."""
+        path = self.PLANTED.replace(".yaml", ".json")
+        self.write(path, self.PLANTED_DECLARATION.replace("  ", "\t"))
+        for label, declarations in (
+            ("clone", audit_report.kcc_declarations(self.root)),
+            ("broker", audit_report.kcc_declarations_via_broker(
+                "acme/fleet", self.broker({path: self.PLANTED_DECLARATION}), every_kind=True)),
+        ):
+            with self.subTest(mode=label):
+                finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+
+    def test_the_absence_sentence_is_gone(self):
+        """No text the audit writes says that no file declares an object."""
+        source = Path(audit_report.__file__).read_text(encoding="utf-8")
+        for sentence in ("found no declaration", "could not search the whole GitOps repository"):
+            self.assertNotIn(sentence, source)
+        self.assertFalse(hasattr(audit_report, "_kcc_clone_searched"))
+
+    def test_without_pyyaml_the_snapshot_read_indexes_nothing(self):
+        real_import = __import__
+
+        def no_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("no yaml")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=no_yaml):
+            scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker({self.PLANTED: self.PLANTED_DECLARATION}),
+                                                            every_kind=True)
+        self.assertEqual(scan, {})
+
+    def test_a_snapshot_that_cannot_be_read_gives_an_empty_index(self):
+        class Broken:
+            def files(self, prefix=None):
+                raise OSError("snapshot gone")
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.kcc_declarations_via_broker("acme/fleet", Broken(), every_kind=True), {})
+
+    @staticmethod
+    def project_cluster(project, extra=""):
+        """`ContainerCluster prod` in us-central1 for `project`, with no namespace."""
+        return (
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            f"  name: prod\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n"
+            f"spec:\n  location: us-central1\n{extra}"
+        )
+
+    def test_two_projects_with_one_cluster_name_are_two_declarations(self):
+        """Review finding: the index key had no project, so the proj-b file
+        was kept under the proj-a file's fields and the paragraph found none."""
+        self.write("projects/a/cluster.yaml", self.project_cluster("proj-a", "  releaseChannel:\n    channel: STABLE\n"))
+        self.write("projects/b/cluster.yaml", self.project_cluster("proj-b"))
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = make_finding(fid="b", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "manual", "note": "Fix the cluster."})
+        stall = {"kind": "ContainerCluster", "namespace": "cfg", "name": "prod", "why": "UpdateFailed",
+                 "project": "proj-b", "location": "us-central1"}
+        self.assertEqual(
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
+        )
+        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        # The gcloud check still takes the first declaration of the name, as before.
+        command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
+                               remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
+        problem = audit_report.reverted_gcloud_problem(command, declarations)
+        self.assertEqual(problem[0].path, "projects/a/cluster.yaml")
+
+    def test_each_file_of_one_object_is_matched_on_its_own_fields(self):
+        """A file kept in `also` keeps its own `metadata.name` and namespace."""
+        self.write("one/pool.yaml", self.project_cluster("proj-b").replace("  name: prod\n", "  name: other\n") + "  resourceID: prod\n")
+        self.write("two/pool.yaml", self.project_cluster("proj-b"))
+        declarations = audit_report.kcc_declarations(self.root)
+        stall = audit_report.KccStall(
+            kind="ContainerCluster", namespace="cfg", name="prod", why="x", resource="", cluster="", host="h",
+            project="proj-b", location="us-central1",
+        )
+        found = audit_report._declarations_of(stall, declarations)
+        self.assertEqual([declaration.path for _, declaration in found], ["two/pool.yaml"])
+
+    def test_a_manifest_fix_of_the_declaring_file_keeps_its_paragraph(self):
+        """Regression: a `manifest` fix whose file declares the object keeps
+        the paragraph that does not name another file."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        finding = self.pool_finding({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
+        paragraph = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertEqual(paragraph, audit_report.KCC_STALLED_NOTE.format(objects=finding[audit_report.KCC_STALLED_FINDING_FIELD]))
+        self.assertNotIn("The declaration is", paragraph)
+
+    def test_both_first_sentences_are_stripped_and_written_again(self):
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        manifest = self.live_manifest()
+        self.disclose([finding], manifest)
+        once = finding["remediation"]["note"]
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(self.disclose([finding], kcc_manifest()), ["pool"])
+        self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_two_namespaces_with_one_object_name_are_two_declarations(self):
+        """team-a/events and team-b/events are two objects in two files; each
+        finding's paragraph names its own file."""
+        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n  namespace: {ns}\n"
+        self.write("a/topic.yaml", topic.format(ns="team-a"))
+        self.write("b/topic.yaml", topic.format(ns="team-b"))
+        declarations = audit_report.kcc_declaration_index([("", self.root)])
+        for ns, path in (("team-a", "a/topic.yaml"), ("team-b", "b/topic.yaml")):
+            with self.subTest(namespace=ns):
+                finding = make_finding(fid=ns, check="kcc-object-wedged", cluster="hubp/us-central1/hub", obj="PubSubTopic/events",
+                                       namespace=ns, remediation={"kind": "manual", "note": "Fix the IAM role."})
+                manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
+                    {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
+                audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
+                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+
+    POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
+                  "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
+
+    def harness_finding(self, note):
+        return make_finding(fid="f1", cluster="p/us-central1/c1", obj="NodePool/pinned-inference-pool",
+                            remediation={"kind": "manual", "note": note})
+
+    def test_a_full_kustomize_block_is_shortened_by_lines_for_the_paragraph(self):
+        """The Kustomize note's copied file fills the cap. The block is made
+        shorter by whole lines, with its fences closed, so the paragraph's
+        core fits under the cap; the Kustomize note's own text stays whole."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap.")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn("- provisioning/pool.yaml", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        paragraph = note.split("\n\n")[-1]
+        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+        self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
+
+    def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
+        worker = ("Raise the pool's max node count and add a second zone. " * 24).strip()
+        degraded = (f"{audit_report.DEGRADED_REMEDIATION_LEDE}did not find the file `clusters/a/provisioning/x.yaml` that "
+                    f"the fix names. {audit_report.DEGRADED_REMEDIATION_TAIL}")
+        finding = self.harness_finding(worker + " " + degraded)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(degraded, note)
+        self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+        self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, note)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+
+    def test_the_reconciler_note_stays_when_the_paragraph_is_added(self):
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `web`")
+        worker = ("Scale the pool by hand. " * 70).strip()
+        finding = self.harness_finding(worker + "\n\n" + reconciled)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(reconciled, note)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+        # The paragraph comes off whole, and the reconciler note with it stays.
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, {})
+        self.assertIn(reconciled, finding["remediation"]["note"])
+
+    def test_a_cut_worker_note_comes_back_after_the_stall_clears(self):
+        """Run 1 cuts the worker's note for the paragraph and keeps the whole
+        note; run 2 has no stall, and the carry publishes the whole note."""
+        worker = ("Raise the pool's max node count by hand in the console. " * 26).strip()
+
+        def finding():
+            return make_finding(fid="pool-skew-p-us-central1-c1-pool-a", check="pool-skew", cluster="p/us-central1/c1",
+                                obj="NodePool/pool-a", remediation={"kind": "manual", "note": worker})
+
+        stall = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pool-a", "cluster": "c1", "project": "p",
+                 "why": "UpdateFailed: googleapi: Error 400: total_max_node_count and max_node_count both set"}
+        first = finding()
+        audit_report.disclose_stalled_kcc_remediations([first], kcc_manifest(stall), self.root, {})
+        self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, first["remediation"]["note"])
+        self.assertEqual(first["remediation"][audit_report.ROUTE_UNCUT_NOTE_FIELD], worker)
+        second = finding()
+        audit_report.carry_unchanged_findings([second], {"findings": [copy.deepcopy(first)]})
+        audit_report.disclose_stalled_kcc_remediations([second], kcc_manifest(), self.root, {})
+        self.assertEqual(second["remediation"]["note"], worker)
+
+    def test_a_copied_paragraph_in_a_cut_worker_note_does_not_come_back(self):
+        """Review finding: the route-note pass kept the worker's note, with a
+        Config Connector paragraph copied from an earlier ledger, as the
+        uncut note, and the paragraph pass rebuilt the note from it. The old
+        paragraph, with its old reason, came back beside this run's."""
+        host = "acme/us-central1/prod"
+        candidate = {**_cand("release-channel", host, "Cluster/prod"), "reconciler": "the Argo CD Application `infra`"}
+        manifest = _manifest((host, [candidate]))
+        manifest["clusters"][0].update(outcome="collected", kcc_unready=[
+            {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "project": "acme", "why": "UpdateFailed: NEW"}])
+        old = (f"{audit_report.KCC_STALLED_OBJECT_MARK} When the audit ran, Config Connector reported `Ready=False` on "
+               "`ContainerCluster infra/prod` (`UpdateFailed: OLD`). The audit names no declaration file for this object.")
+        worker = ("Set the release channel by hand in the console. " * 45).strip()
+        self.assertGreater(len(worker), audit_report.MAX_NOTE_CHARS)
+        finding = _pub("rc", "release-channel", host, "Cluster/prod")
+        finding["remediation"] = {"kind": "manual", "note": old + "\n\n" + worker}
+        audit_report.disclose_manual_remediation_routes([finding], manifest, set())
+        audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, {})
+        note = finding["remediation"]["note"]
+        uncut = finding["remediation"].get(audit_report.ROUTE_UNCUT_NOTE_FIELD, "")
+        self.assertNotIn("OLD", note)
+        self.assertNotIn("OLD", uncut)
+        self.assertIn("UpdateFailed: NEW", note)
+        self.assertEqual(note.count(audit_report.KCC_STALLED_OBJECT_MARK), 1)
+
+    TOPIC_FILE = ("apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n"
+                  "  namespace: infra\n  annotations:\n    cnrm.cloud.google.com/project-id: p\n")
+    TOPIC_STALL = {"kind": "PubSubTopic", "namespace": "infra", "name": "events", "project": "p", "why": "UpdateFailed: 403"}
+
+    def wedged(self, host, kind="manifest"):
+        remediation = {"kind": kind, "note": "Grant the role."}
+        if kind == "manifest":
+            remediation["path"] = "pubsub/events.yaml"
+        return make_finding(fid="w", check="kcc-object-wedged", cluster=host, obj="PubSubTopic/events", namespace="infra",
+                            remediation=remediation)
+
+    def test_a_wedged_finding_takes_no_stall_of_its_file_from_another_host(self):
+        """Review finding: the in-file match of a `kcc-object-wedged` finding
+        on hub-a took the same object's stall on hub-b."""
+        self.write("pubsub/events.yaml", self.TOPIC_FILE)
+        manifest = self.two_hosts(("p/us-central1/hub-a", []), ("p/us-central1/hub-b", [self.TOPIC_STALL]))
+        finding = self.wedged("p/us-central1/hub-a")
+        self.assertEqual(self.disclose([finding], manifest), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+        finding = self.wedged("p/us-central1/hub-b")
+        self.assertEqual(self.disclose([finding], manifest), ["w"])
+
+    def test_an_unreachable_cluster_does_not_drop_a_wedged_paragraph(self):
+        """Review finding: the multi-host project rule dropped every
+        `kcc-object-wedged` paragraph when one cluster was unreachable,
+        although the stall is on the finding's own cluster. A file that
+        declares the object for another project still blocks it."""
+        self.write("pubsub/events.yaml", self.TOPIC_FILE)
+        manifest = self.two_hosts(("p/us-central1/hub-a", [dict(self.TOPIC_STALL, project="")]))
+        manifest["clusters"].append({"name": "p/us-east1/far", "outcome": "unreachable"})
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.wedged("p/us-central1/hub-a", kind="manual")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
+        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        # The fix of the declaring file gets the paragraph about that file.
+        finding = self.wedged("p/us-central1/hub-a")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
+        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
+        finding = self.wedged("p/us-central1/hub-a", kind="manual")
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
+
+    SERVICE_STALL = {"kind": "Service", "namespace": "billing", "name": "billing", "project": "acme", "why": "UpdateFailed: 403"}
+
+    def lb_finding(self, remediation):
+        return make_finding(fid="lb", check="lb-world-open", cluster="acme/us-central1/hub", obj="Service/billing",
+                            namespace="billing", remediation=remediation)
+
+    def test_a_kubernetes_service_finding_takes_no_paragraph_from_a_config_connector_service(self):
+        """A `Service` finding is about a Kubernetes Service. A Config
+        Connector `Service` (serviceusage) of the same name, unready in the
+        same namespace on the same cluster, is not its object."""
+        finding = self.lb_finding({"kind": "manual", "note": "Restrict the load balancer source ranges."})
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.SERVICE_STALL)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_kubernetes_service_fix_whose_file_declares_a_config_connector_service_gets_no_paragraph(self):
+        self.write(
+            "billing/service.yaml",
+            "apiVersion: v1\nkind: Service\nmetadata:\n  name: billing\n  namespace: billing\n---\n"
+            "apiVersion: serviceusage.cnrm.cloud.google.com/v1beta1\nkind: Service\nmetadata:\n"
+            "  name: billing\n  namespace: billing\n  annotations:\n    cnrm.cloud.google.com/project-id: acme\n",
+        )
+        finding = self.lb_finding({"kind": "manifest", "path": "billing/service.yaml", "note": "Set loadBalancerSourceRanges."})
+        self.assertEqual(self.disclose([finding], kcc_manifest(self.SERVICE_STALL)), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_a_declaration_in_another_location_or_for_another_cluster_is_not_named(self):
+        """`clusters/eu/prod.yaml` declares `prod` in europe-west1; the stall is
+        `prod` in us-central1. A node pool file for cluster c2 is not the
+        declaration of c1's pool."""
+        self.write(
+            "clusters/eu/prod.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+            "  name: prod\n  namespace: infra\nspec:\n  location: europe-west1\n",
+        )
+        self.write(
+            "pools/pool.yaml",
+            "apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerNodePool\nmetadata:\n"
+            "  name: pool\n  namespace: infra\nspec:\n  location: us-central1\n  clusterRef:\n    name: c2\n",
+        )
+        declarations = audit_report.kcc_declarations(self.root)
+        cases = (
+            (make_finding(fid="c", cluster="acme/us-central1/prod", obj="Cluster/prod", remediation={"kind": "manual", "note": "x"}),
+             {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "project": "acme", "location": "us-central1",
+              "why": "UpdateFailed"}, "clusters/eu/prod.yaml"),
+            (make_finding(fid="c", cluster="acme/us-central1/c1", obj="NodePool/pool", remediation={"kind": "manual", "note": "x"}),
+             {"kind": "ContainerNodePool", "namespace": "infra", "name": "pool", "project": "acme", "location": "us-central1",
+              "cluster": "c1", "why": "UpdateFailed"}, "pools/pool.yaml"),
+        )
+        for finding, stall, path in cases:
+            with self.subTest(path=path):
+                self.assertEqual(
+                    audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["c"]
+                )
+                note = finding["remediation"]["note"]
+                self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+                self.assertNotIn(path, note)
+
+    def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
+        """A note of a reverted gcloud command (about 1,400 characters), which
+        `finish` wrote and never cuts, leaves room for the reconciler note or
+        the whole paragraph but not both: the reconciler note stays, and the
+        paragraph takes a shorter step."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * 32
+        reverted = f"{prose}\n\n```bash\n{command.strip()}\n```"
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        finding = self.harness_finding(reverted + "\n\n" + reconciled)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+        note = finding["remediation"]["note"]
+        self.assertIn(reconciled, note)
+        self.assertIn(command.strip(), note)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+
+    def test_a_declaration_of_another_project_or_location_is_not_named(self):
+        """A proj-a/us-central1 file is not the declaration of a
+        proj-b/europe-west1 stall of the same name."""
+        cluster = ("apiVersion: container.cnrm.cloud.google.com/v1beta1\nkind: ContainerCluster\nmetadata:\n"
+                   "  name: prod\n  namespace: infra\n  annotations:\n    cnrm.cloud.google.com/project-id: {project}\n"
+                   "spec:\n  location: {location}\n")
+        self.write("a/prod.yaml", cluster.format(project="proj-a", location="us-central1"))
+        stall = {"kind": "ContainerCluster", "namespace": "infra", "name": "prod", "why": "UpdateFailed",
+                 "project": "proj-b", "location": "europe-west1"}
+        finding = make_finding(fid="c", cluster="proj-b/europe-west1/prod", obj="Cluster/prod",
+                               remediation={"kind": "manual", "note": "Set the channel."})
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
+        note = finding["remediation"]["note"]
+        self.assertNotIn("a/prod.yaml", note)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+        self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
+        finding["remediation"]["note"] = "Set the channel."
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
+        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+
+    def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
+        """A compliance `lb-world-open` finding on the Kubernetes Service
+        `billing` in the app cluster is not the Config Connector `Service`
+        (serviceusage) `payments/billing` stalled on the hub."""
+        service = {"kind": "Service", "namespace": "payments", "name": "billing", "why": "UpdateFailed: 403", "project": "p1"}
+        manifest = self.two_hosts(("p1/us-central1/hub", [service]), ("p1/us-central1/app", []))
+        # The app cluster runs no Config Connector: neither key.
+        del manifest["clusters"][1]["kcc_unready"]
+        lb = make_finding(fid="lb", check="lb-world-open", cluster="p1/us-central1/app", namespace="payments",
+                          obj="Service/billing", remediation={"kind": "manual", "note": "Restrict the source ranges."})
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([lb], manifest, self.root, {}), [])
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, lb)
+        # The Config Connector object's own finding is raised on the hub that
+        # holds it, and gets the paragraph; the same check on another cluster
+        # does not.
+        for cluster, expected in (("p1/us-central1/hub", ["w"]), ("p1/us-central1/app", [])):
+            with self.subTest(cluster=cluster):
+                wedged = make_finding(fid="w", check="kcc-object-wedged", cluster=cluster, namespace="payments",
+                                      obj="Service/billing", remediation={"kind": "manual", "note": "Grant the role."})
+                self.assertEqual(audit_report.disclose_stalled_kcc_remediations([wedged], manifest, self.root, {}), expected)
+
+    def test_the_cycle_guard_ends_a_chain_that_waits_on_itself(self):
+        """A waits on B and B waits on A: the chain ends."""
+        a = audit_report.KccStall("PubSubTopic", "infra", "a", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
+        b = audit_report.KccStall("PubSubTopic", "infra", "b", "DependencyNotReady: reference PubSubTopic infra/a is not ready", "", "", "h")
+        self.assertEqual(audit_report._kcc_dependencies(a, [a, b]), [b])
+        # A waits on B, B on C, and C on B: a cycle that does not pass
+        # through A still ends.
+        b2 = b._replace(why="DependencyNotReady: reference PubSubTopic infra/c is not ready")
+        c = audit_report.KccStall("PubSubTopic", "infra", "c", "DependencyNotReady: reference PubSubTopic infra/b is not ready", "", "", "h")
+        self.assertEqual(audit_report._kcc_dependencies(a, [a, b2, c]), [b2, c])
+
+    def test_a_fix_path_outside_the_repository_declares_nothing(self):
+        finding = kcc_finding(path="../../x.yaml")
+        self.assertEqual(audit_report._remediation_file_index(finding, self.root), {})
+
+    def test_the_copied_constants_equal_the_collectors(self):
+        """audit_report.py does not import the collectors, so it copies two of
+        kcc_health.py's constants; this holds the copies equal."""
+        import kcc_health  # noqa: PLC0415
+
+        self.assertEqual(audit_report.KCC_TRANSIENT_REASONS, kcc_health.TRANSIENT_REASONS)
+        self.assertEqual(audit_report.KCC_PROJECT_ANNOTATION, kcc_health.KCC_PROJECT_ANNOTATION)
+        self.assertEqual(audit_report.KCC_UNREADY_FIELD, kcc_health.UNREADY_FIELD)
+        self.assertEqual(audit_report.KCC_UNREAD_FIELD, kcc_health.UNREAD_FIELD)
+        self.assertEqual(audit_report.KCC_KINDS_READ_FIELD, kcc_health.KINDS_READ_FIELD)
+        self.assertEqual(audit_report.KCC_CLUSTER_STATUS_FIELD, kcc_health.CLUSTER_STATUS_FIELD)
+        self.assertEqual(audit_report.KCC_READABLE_STATUSES, kcc_health.READABLE_STATUSES)
+
+    def test_a_fix_to_a_file_with_no_config_connector_object_names_the_object_instead(self):
+        """The finding's node pool is unready, but the fix edits a
+        `ComputeClass`: the note goes on any fix, so it says that Config
+        Connector is not applying the declaration of the finding's object,
+        and the persists comment does not say the fix changed it."""
+        self.write("classes/gpu.yaml", "apiVersion: cloud.google.com/v1\nkind: ComputeClass\nmetadata:\n  name: gpu\n")
+        finding = make_finding(
+            fid="p", cluster="acme/us-central1/prod-usc1", obj="NodePool/gpu-pool",
+            remediation={"kind": "manifest", "path": "classes/gpu.yaml", "note": "Add a fallback."},
+        )
+        pool = {"kind": "ContainerNodePool", "namespace": "infra", "name": "gpu-pool", "why": "UpdateFailed", "cluster": "prod-usc1"}
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(pool), self.root, {}), ["p"])
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith("Add a fallback."))
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, note)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
+        comment = audit_report.render_persists_comment(AUDIT, finding, NOW)
+        self.assertNotIn("this fix changed", comment)
+
+    def test_a_transient_reason_is_not_a_stall(self):
+        """Config Connector sets `Updating` and `Deleting` while it still
+        applies the object, so the note must not say it is not applying."""
+        for reason in ("Updating", "Deleting"):
+            with self.subTest(reason=reason):
+                finding = kcc_finding()
+                self.assertEqual(self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why=f"{reason}: in progress"))), [])
+                self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, finding)
+
+    def test_the_note_fits_the_cap_by_cutting_the_workers_note_and_keeps_harness_text(self):
+        long_note = "Raise the channel. " * 300
+        for head in ("", audit_report.GENERATED_FIX_NOTE + " "):
+            with self.subTest(head=bool(head)):
+                finding = kcc_finding(note=head + long_note)
+                self.disclose([finding], kcc_manifest(KCC_CLUSTER, KCC_TOPIC))
+                note = finding["remediation"]["note"]
+                self.assertLessEqual(len(audit_report.publishable_text(note)), audit_report.MAX_NOTE_CHARS)
+                self.assertIn(audit_report.ROUTE_NOTE_TRUNCATED, note)
+                self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+                self.assertTrue(note.endswith("until then."), note[-80:])
+                if head:
+                    self.assertTrue(note.startswith(audit_report.GENERATED_FIX_NOTE))
+                # The renderer's clip then leaves the note whole.
+                self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+
+    def test_a_file_of_many_unready_objects_names_two_and_counts_the_rest(self):
+        # Three objects that are all the finding's own: `ComputeAddress
+        # events` in three regions, for a finding on `ComputeAddress/events`.
+        regions = ("us-central1", "us-east1", "europe-west1")
+        declaration = (
+            "apiVersion: compute.cnrm.cloud.google.com/v1beta1\nkind: ComputeAddress\nmetadata:\n"
+            "  name: events\n  namespace: infra\nspec:\n  location: {region}\n"
+        )
+        self.write(KCC_CLUSTER_FILE, "\n---\n".join(declaration.format(region=region) for region in regions))
+        finding = kcc_finding()
+        finding.update(object="ComputeAddress/events", check="kcc-object-wedged", cluster="acme/us-central1/hub")
+        self.disclose([finding], kcc_manifest(*(
+            {"kind": "ComputeAddress", "namespace": "infra", "name": "events", "why": "UpdateFailed", "location": region}
+            for region in regions
+        )))
+        last = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertEqual(last.count("`ComputeAddress infra/events`"), 2)
+        self.assertIn("and 1 more unready object(s) in this file", last)
+
+    def test_a_controller_message_cannot_break_out_of_its_code_span(self):
+        finding = kcc_finding()
+        self.disclose([finding], kcc_manifest(dict(KCC_CLUSTER, why="UpdateFailed: `@team` <!-- x --> [l](http://e)")))
+        last = finding["remediation"]["note"].split("\n\n")[-1]
+        self.assertIn("(`UpdateFailed: '@team' <!-- x --> [l](http://e)`)", last)
+
+    def test_the_carry_strips_a_copied_note(self):
+        remediation = {"kind": "manual", "note": "Do it.\n\n" + audit_report.KCC_STALLED_NOTE.format(objects="x")}
+        audit_report._strip_route_notes(remediation)
+        self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_carried_note_loses_a_stall_this_run_does_not_show(self):
+        stale = kcc_finding(note="gcloud container clusters update prod-usc1 --release-channel=regular", kind="gcloud")
+        stale["remediation"]["note"] += "\n\n" + audit_report.KCC_STALLED_NOTE.format(objects="x")
+        previous = {"findings": [audit_report._redact_document(copy.deepcopy(stale))]}
+        now = kcc_finding(note="Run the update.", kind="manual")
+        self.assertEqual(audit_report.carry_unchanged_findings([now], previous), ["release-channel"])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, now["remediation"]["note"])
+
+    def test_a_workers_copy_of_the_finding_field_is_dropped(self):
+        finding = make_finding()
+        finding[audit_report.KCC_STALLED_FINDING_FIELD] = "`Ready=False` on something"
+        validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
+        self.assertNotIn(audit_report.KCC_STALLED_FINDING_FIELD, validated["findings"][0])
+
+
+class TestStalledKccPersists(unittest.TestCase):
+    """The merged-but-persisting line and comment state a stall in place of
+    their guess at a cause."""
+
+    GUESS = "remediation was incomplete"
+
+    def stalled_finding(self):
+        finding = make_finding(fid="a")
+        finding[audit_report.KCC_STALLED_FINDING_FIELD] = "`Ready=False` on `ContainerCluster infra/prod-usc1` (`UpdateFailed: Error 403`)"
+        return finding
+
+    def test_the_ledger_row_states_the_stall(self):
+        lines = "\n".join(
+            audit_report.render_finding(self.stalled_finding(), state=audit_report.STATE_PR_MERGED_PERSISTS)
+        )
+        self.assertIn("If that reason rejects the change this fix made, correct the declaration", lines)
+        self.assertIn("Config Connector is not applying the declaration", lines)
+        self.assertIn("`ContainerCluster infra/prod-usc1`", lines)
+        self.assertNotIn(self.GUESS, lines)
+
+    def test_the_ledger_row_keeps_the_guess_without_a_stall(self):
+        lines = "\n".join(audit_report.render_finding(make_finding(fid="a"), state=audit_report.STATE_PR_MERGED_PERSISTS))
+        self.assertIn(self.GUESS, lines)
+        self.assertNotIn("Config Connector", lines)
+
+    def test_the_comment_states_the_stall(self):
+        text = audit_report.render_persists_comment(AUDIT, self.stalled_finding(), NOW)
+        self.assertIn("Config Connector is not applying the declaration of this finding's object", text)
+        # Posted once and never updated, so it states the reason and both outcomes.
+        self.assertIn("If that reason rejects the change this fix made, correct the declaration", text)
+        self.assertNotIn("The change stays in the repository", text)
+        self.assertIn("**not** reopened", text)
+        self.assertNotIn(self.GUESS, text)
+        self.assertIn(audit_report.persists_marker("a"), text)
+
+    def test_the_comment_keeps_the_guess_without_a_stall(self):
+        text = audit_report.render_persists_comment(AUDIT, make_finding(fid="a"), NOW)
+        self.assertIn(self.GUESS, text)
+
+
+class TestStalledKccInFinish(HarnessTestCase):
+    """The wiring: the note reaches the ledger, the pull request and the
+    merged-but-persisting comment on the forge path."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def stalled_manifest(self):
+        # The candidate the sweep needs to open the fix on its own.
+        # The finding is on `Cluster/prod-usc1`, the one object of the fix's file.
+        candidate = {
+            "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments",
+            "object": "Cluster/prod-usc1", "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments", "impact": "x", "needs_triage": None,
+        }
+        manifest = _full_manifest(candidates=[candidate])
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        return manifest
+
+    def doc_and_file(self):
+        target = self.workspace / KCC_CLUSTER_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        finding = make_finding(
+            obj="Cluster/prod-usc1",
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."},
+        )
+        return make_doc(findings=[finding])
+
+    def test_the_ledger_and_the_pull_request_carry_the_note(self):
+        rc = self.run_finish(self.doc_and_file(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, body)
+        self.assertIn("which waits on `PubSubTopic infra/fleet-events`", body)
+        self.assertIn("Config Connector is not applying", self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
+    def test_the_dry_run_previews_the_note(self):
+        rc = self.run_finish(
+            self.doc_and_file(), ["--dry-run", "--manifest-file", self.manifest_file(self.stalled_manifest())]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+        self.assertIn("DRY RUN: ", self.err)
+
+    def test_a_dry_run_with_no_clone_claims_no_absence(self):
+        """A content-mode dry run has no clone and opens no broker session;
+        the paragraph names no file and makes no claim about the repository."""
+        finding = make_finding(obj="Cluster/prod-usc1", remediation={"kind": "manual", "note": "Set the release channel."})
+        self.patch_attr("kcc_declaration_roots", lambda *args, **kwargs: [])
+        rc = self.run_finish(make_doc(findings=[finding]), ["--dry-run", "--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_OBJECT_MARK, self.out)
+        self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, self.out)
+        self.assertNotIn("could not search", self.out)
+
+    def test_no_index_is_built_when_no_finding_can_match_a_stall(self):
+        """Review finding: `finish` built the whole declaration index whenever
+        any object was not ready. It builds it only for a finding whose own
+        object can be stalled."""
+        built = []
+        real = audit_report.kcc_declaration_index
+
+        def spy(*args, **kwargs):
+            built.append(args)
+            return real(*args, **kwargs)
+
+        self.patch_attr("kcc_declaration_index", spy)
+        workload = make_finding(remediation={"kind": "manual", "note": "Add a NetworkPolicy."})
+        rc = self.run_finish(make_doc(findings=[workload]), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(built, [])
+        rc = self.run_finish(self.doc_and_file(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(built), 1)
+
+    def test_which_findings_need_the_index(self):
+        manifest = self.stalled_manifest()
+        cluster = make_finding(obj="Cluster/prod-usc1")
+        other = make_finding(obj="Cluster/prod-use1")
+        wedged = make_finding(check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/fleet-events")
+        elsewhere = make_finding(check="kcc-object-wedged", cluster="acme/us-east1/other", obj="PubSubTopic/fleet-events")
+        host = manifest["clusters"][0]["name"]
+        wedged["cluster"] = host
+        self.assertTrue(audit_report.kcc_index_needed([cluster], manifest))
+        self.assertTrue(audit_report.kcc_index_needed([wedged], manifest))
+        self.assertFalse(audit_report.kcc_index_needed([other, elsewhere, make_finding()], manifest))
+        self.assertFalse(audit_report.kcc_index_needed([cluster], _full_manifest()))
+
+    def remediate(self, *extra):
+        doc = self.doc_and_file()
+        path = self.write_findings(doc)
+        fid = audit_report.derive_finding_id(doc["findings"][0])
+        return self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid,
+                              "--manifest-file", self.manifest_file(self.stalled_manifest()), *extra])
+
+    def test_remediate_dry_run_previews_the_paragraph(self):
+        """Review finding: `remediate` opened and previewed pull requests with
+        no Config Connector pass, and `finish` skips a finding whose pull
+        request is open, so that pull request never got the paragraph."""
+        self.assertEqual(self.remediate("--dry-run"), 0, self.err)
+        self.assertIn("WOULD OPEN: platform-agent/fix-", self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+
+    def test_remediate_opens_the_pull_request_with_the_paragraph(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.assertEqual(self.remediate(), 0, self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
+    def copied_paragraph_argv(self):
+        """`remediate` argv for a fix whose note carries a Config Connector
+        paragraph copied from an earlier ledger, with no `--manifest-file`."""
+        copied = (f"{audit_report.KCC_STALLED_NOTE_MARK} When the audit ran, Config Connector reported `Ready=False` on "
+                  "`ContainerCluster infra/prod-usc1` (`UpdateFailed: OLD`).")
+        doc = self.doc_and_file()
+        doc["findings"][0]["remediation"]["note"] += "\n\n" + copied
+        path = self.write_findings(doc)
+        fid = audit_report.derive_finding_id(doc["findings"][0])
+        return ["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid]
+
+    def test_remediate_dry_run_without_a_manifest_removes_a_copied_paragraph(self):
+        """Review finding: with no `--manifest-file`, `remediate` ran no
+        Config Connector pass, so a paragraph the worker copied from an
+        earlier ledger went into the pull request and claimed a stall."""
+        self.assertEqual(self.run_main([*self.copied_paragraph_argv(), "--dry-run"]), 0, self.err)
+        self.assertIn("WOULD OPEN: platform-agent/fix-", self.err)
+        self.assertNotIn("UpdateFailed: OLD", self.out)
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, self.out)
+
+    def test_remediate_without_a_manifest_opens_no_copied_paragraph(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.assertEqual(self.run_main(self.copied_paragraph_argv()), 0, self.err)
+        proposals = self.harness.forge_calls("proposal-create")
+        self.assertTrue(proposals, self.err)
+        self.assertNotIn("UpdateFailed: OLD", proposals[0]["body"])
+        self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, proposals[0]["body"])
+
+    def gcloud_and_stall_doc(self):
+        """The stalled cluster's manifest fix, and a gcloud fix of the same
+        cluster that changes `releaseChannel`, which its declaration holds."""
+        doc = self.doc_and_file()
+        doc["findings"].append(make_finding(
+            fid="g", namespace="billing", cluster="acme/us-central1/prod-usc1", obj="Cluster/prod-usc1",
+            remediation={"kind": "gcloud", "note": "gcloud container clusters update prod-usc1 --release-channel regular"},
+        ))
+        return doc
+
+    def test_the_gcloud_check_and_the_paragraph_read_the_clone_once(self):
+        """Review finding: with a gcloud fix and a possible stall, the clone
+        was walked twice, once for each index. The gcloud check now takes the
+        paragraph's index, and its answer is the same: the gcloud fix that
+        changes a field the declaration holds still becomes manual."""
+        walks = []
+        real = audit_report.kcc_declarations
+
+        def spy(root, repo=""):
+            walks.append(str(root))
+            return real(root, repo)
+
+        self.patch_attr("kcc_declarations", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(len(walks), 1, walks)
+
+    def test_the_gcloud_check_and_the_paragraph_read_the_snapshot_once(self):
+        """In content mode, the snapshot is read and parsed once."""
+        self.patch_attr("content_mode", lambda: True)
+        use_snapshot(self, {KCC_CLUSTER_FILE: KCC_CLUSTER_DECLARATION})
+        reads = []
+        real = audit_report.kcc_declarations_via_broker
+
+        def spy(repo, snap=None, every_kind=False):
+            reads.append(every_kind)
+            return real(repo, snap, every_kind)
+
+        self.patch_attr("kcc_declarations_via_broker", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(reads, [True])
+
+    def test_with_no_possible_stall_the_gcloud_check_reads_only_its_kinds(self):
+        self.patch_attr("content_mode", lambda: True)
+        use_snapshot(self, {KCC_CLUSTER_FILE: KCC_CLUSTER_DECLARATION})
+        reads = []
+        real = audit_report.kcc_declarations_via_broker
+
+        def spy(repo, snap=None, every_kind=False):
+            reads.append(every_kind)
+            return real(repo, snap, every_kind)
+
+        self.patch_attr("kcc_declarations_via_broker", spy)
+        rc = self.run_finish(self.gcloud_and_stall_doc(), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
+        self.assertEqual(reads, [False])
+
+    def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
+        doc = self.doc_and_file()
+        branch = audit_report.group_branch_for(AUDIT, doc["findings"])
+        merged = pr(5, branch, state="MERGED", merged_at="2026-07-01T00:00:00Z")
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-list": proposals_view([merged]),
+            "*-view comments": comments_view({"comments": []}),
+        }
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        comments = [c["body"] for c in self.harness.forge_calls("proposal-comment")]
+        persists = [c for c in comments if "still reproduces" in c]
+        self.assertTrue(persists, comments)
+        self.assertIn("Config Connector is not applying the declaration of this finding's object", persists[0])
+        self.assertNotIn("remediation was incomplete", persists[0])
+        body = self.harness.bodies_for("issue-create")[0]
+        self.assertIn("Config Connector is not applying the declaration: it reported", body)
 
 
 class TestTriageMarkedFindings(BaseTestCase):
@@ -29194,8 +31087,9 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
                     self.degrade_with_snapshot(broker_refusal(status, "busy"))
 
     def test_a_retried_snapshot_that_succeeds_clears_the_outage(self):
-        """The Config Connector scan takes the probe's snapshot twice when the
-        first fails; a second one that is taken answers for the first."""
+        """An outage on the first attempt and a snapshot on the second, both
+        inside the pass's first question: the retry answers for the outage, so
+        the pass goes on rather than stopping the command."""
         import urllib.error
 
         use_snapshot(
@@ -29206,9 +31100,35 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
         finding = kustomize_fix(self.PDB)
         with contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNotNone(probe.broker() or probe.broker())
             self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        self.assertIsNone(probe.outage)
         self.assertIn("does not list it", finding["remediation"]["note"])
+
+    def test_the_paragraph_scan_takes_the_probes_attempts_once(self):
+        """The paragraph scan asks the probe, which makes its attempts
+        (`PROBE_OPEN_ATTEMPTS`) in that one call; a later question makes
+        none, so the run asks the broker no more than the probe allows."""
+        self.patch_attr("content_mode", lambda: True)
+        calls = []
+        refused = broker_refusal(403, "repository not managed")
+        use_snapshot(self, {}, error=[refused] * audit_report.PROBE_OPEN_ATTEMPTS, calls=calls)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(audit_report._kcc_paragraph_scan("acme/fleet", probe))
+            self.assertEqual(len(calls), audit_report.PROBE_OPEN_ATTEMPTS)
+            self.assertIsNone(probe.broker())
+        self.assertEqual(len(calls), audit_report.PROBE_OPEN_ATTEMPTS)
+
+    def test_the_paragraph_scan_reuses_the_probes_snapshot(self):
+        self.patch_attr("content_mode", lambda: True)
+        calls = []
+        topic = "apiVersion: pubsub.cnrm.cloud.google.com/v1beta1\nkind: PubSubTopic\nmetadata:\n  name: events\n"
+        use_snapshot(self, {"t.yaml": topic}, calls=calls)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        self.assertIsNotNone(probe.broker())
+        scanned = audit_report._kcc_paragraph_scan("acme/fleet", probe)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([key[0] for key in scanned], ["PubSubTopic"])
 
     def test_a_broker_that_does_not_answer_the_snapshot_stops_the_command(self):
         """An outage, as at publish: nothing is published or degraded, and
@@ -29436,10 +31356,37 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
         self.assertEqual(finding["remediation"]["kind"], "manifest")
 
+    def test_a_refused_tree_is_asked_for_once(self):
+        # A tree over the ceiling is remembered: the later checks under it go
+        # straight to the file alone, and the refusal counts toward the cap.
+        calls = []
+        use_large_repository(self, self.overlay(), too_large={"clusters/prod"}, calls=calls)
+        finding = kustomize_fix(self.PDB)
+        self.degrade_in_content_mode([finding])
+        self.assertEqual(calls.count(["clusters/prod"]), 1)
+
+    def test_a_repository_over_the_ceiling_still_reads_the_kustomization(self):
+        # Narrow mode: the overlay's kustomization is read from a snapshot of
+        # its own directory, so an unlisted new file is still caught.
+        use_large_repository(self, self.overlay())
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_in_content_mode([finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", finding["remediation"]["note"])
+
     def test_content_mode_keeps_a_file_on_the_base(self):
         files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
         finding = kustomize_fix(self.PDB)
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+
+    def test_an_edit_on_the_base_is_kept_when_the_retry_takes_the_snapshot(self):
+        # The first attempt is refused (a 403 during a credential refresh) and
+        # the second works: the edit's question is answered from the snapshot,
+        # so the fix is kept rather than degraded as unchecked.
+        files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
+        use_snapshot(self, files, error=[broker_refusal(403, "repository not managed"), None])
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_in_content_mode([finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
 
     def test_content_mode_reads_the_nearest_of_nested_roots(self):
         nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"
@@ -33336,6 +35283,35 @@ class TestStoreLedger(HarnessTestCase):
         """A merged fix whose finding still reproduces did not fix it."""
         body = self.finish_manual_with_reconciler(proposals=[(8, "merged")])
         self.assertIn(audit_report.RECONCILED_NOTE_LEDE, body)
+
+    def test_the_stored_ledger_and_the_fix_carry_the_config_connector_note(self):
+        """The store ledger plans its fixes through the same step as the forge
+        path, so a fix whose file declares an object Config Connector does not
+        apply says so in the stored ledger and in its pull request."""
+        self.claim()
+        target = self.workspace / KCC_CLUSTER_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # The finding is on `Cluster/prod-usc1`, the one object of the fix's file.
+        target.write_text(KCC_CLUSTER_DECLARATION, encoding="utf-8")
+        finding = make_finding(
+            obj="Cluster/prod-usc1",
+            remediation={"kind": "manifest", "path": KCC_CLUSTER_FILE, "note": "Set the release channel to REGULAR."},
+        )
+        manifest = _full_manifest(candidates=[{**self.netpol_candidate(), "severity": "critical", "object": "Cluster/prod-usc1"}])
+        manifest["clusters"][0]["kcc_unready"] = [KCC_CLUSTER, KCC_TOPIC]
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[finding])), encoding="utf-8")
+        self.new_process()
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, self.latest()["ledger_body"])
+        [create] = self.harness.forge_calls("proposal-create")
+        self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, create["body"])
 
     # -- not re-checked ------------------------------------------------------------
 

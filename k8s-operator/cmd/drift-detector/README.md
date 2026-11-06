@@ -244,7 +244,7 @@ deadline could not be read). The hold is time-keyed because an empty pull proves
 Pub/Sub holds the refused batch for its lease and then its retry backoff, the pulls in between
 deliver whatever arrived meanwhile, and a window restored on one of them would ask for the same
 oversize batch again when it is redelivered, at every deadline. On a profile cluster the join's
-read goes through the same broker, which reads only the kinds in its table
+read goes through the same broker, which relays a named read only for the kinds in its table
 (`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
 the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
 comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`

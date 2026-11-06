@@ -17,7 +17,7 @@ Your `KUBECONFIG` is pinned to this cluster, so there is nothing to configure:
 leeway report --topology-tier-c-signals --namespace <namespace>
 ```
 
-Drop `--namespace` to read every namespace. `--topology-tier-c-signals` adds the Tier C rows — workloads with no declared or assumed spread intent that are nonetheless skewed — which is where a StatefulSet on zonal disks shows up. Never pass `--clusters` here; the credential-proxy shim reads the pinned kubeconfig and would answer for this cluster under whatever name you gave.
+Drop `--namespace` to read every namespace. `--topology-tier-c-signals` adds the Tier C rows — workloads with no declared or assumed spread intent that are nonetheless skewed — which is where a StatefulSet on zonal disks shows up. Never pass `--clusters` here; your `KUBECONFIG` is pinned to this cluster alone.
 
 The output is one JSON document (`leeway.report/v1alpha1`) on stdout. A real one, from a four-cluster sweep, is at `references/report-example.json`; its first cluster is the one the worked example below reads. If `leeway` is not on `PATH`, the sandbox image predates it: `kanban_block(kind="needs_input")` naming the missing binary rather than substituting a hand survey.
 
@@ -100,7 +100,7 @@ The other clusters show the remaining rows: `prod-east`'s `Deployment/web/fronte
 
 ## Recording the finding
 
-You are a Cluster Agent under a strict read-only boundary: no patches applied, no `rollout restart` run, nothing passed back through the chat reply. Complete the kanban task you were spawned on. A card that gives a report format wins: format `result` exactly as the card says (the `<workload>: cause is …` summary lines, when asked for them, go in `result` verbatim). Otherwise, follow the shape in `gke-workload-troubleshooting`:
+You are a Cluster Agent under a strict read-only boundary: no patches applied, no `rollout restart` run, nothing passed back through the chat reply. Complete the kanban task you were spawned on. A card that gives a report format wins: format `result` exactly as the card says (the `<workload>: cause is …` summary lines, when asked for them, go in `result` verbatim). Otherwise, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md):
 
 ```
 kanban_complete(

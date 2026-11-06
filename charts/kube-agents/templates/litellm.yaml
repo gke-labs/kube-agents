@@ -149,7 +149,18 @@
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
-{{- $callbackList := ternary (list "otel" "prometheus") (list "prometheus") .Values.litellm.otel }}
+{{- /*
+  Every callback entry, named once in kube-agents.litellmCallbacks and sorted
+  there by whether it is in the shadow replay proxy's key: $keyedHook entries
+  change what the model is sent or what comes back, $unkeyedHook entries only
+  export telemetry, fetch a credential or pick a serving replica. A keyed
+  hook's source goes in $replayBehaviourSources where it is registered.
+*/}}
+{{- $callbackClasses := include "kube-agents.litellmCallbacks" . | fromJson }}
+{{- $keyedHook := $callbackClasses.replayKeyed }}
+{{- $unkeyedHook := $callbackClasses.replayUnkeyed }}
+{{- $callbackList := ternary (list $unkeyedHook.otel $unkeyedHook.prometheus) (list $unkeyedHook.prometheus) .Values.litellm.otel }}
+{{- $replayBehaviourSources := list }}
 {{- /*
   The thinking-replay hook runs on every install: it acts only on a request
   bound for a Gemini model, and leaves every other model's request as sent.
@@ -159,7 +170,8 @@
 {{- if empty $thinkingReplaySource }}
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.thinkingReplay }}
+{{- $replayBehaviourSources = append $replayBehaviourSources $thinkingReplaySource }}
 {{- /*
   The cache-marker hook runs on every install too: it drops a caller's own
   cache_control markers from a request bound for a Gemini model, which LiteLLM
@@ -170,9 +182,11 @@
 {{- if empty $cacheControlStripSource }}
 {{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.cacheControlStrip }}
+{{- $replayBehaviourSources = append $replayBehaviourSources $cacheControlStripSource }}
 {{- if $redactionEnabled }}
-{{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $keyedHook.redaction }}
+{{- $replayBehaviourSources = concat $replayBehaviourSources (list $redactionConfig $redactorSource $redactionCallbackSource) }}
 {{- end }}
 {{- /*
   The OAuth2 client-credentials hook, for an openai_compatible gateway that
@@ -189,7 +203,28 @@
 {{- if empty $oauthHookSource }}
 {{- fail "the chart's files/litellm_oauth2_callback.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $unkeyedHook.oauth2 }}
+{{- end }}
+{{- /*
+  The session-affinity hook gives each Gemini conversation a Vertex session_id
+  so turn 1 can read another conversation's warm prefix cache. Off by default,
+  and vertex_ai only: session_id is a Vertex field, honoured on a project with
+  Vertex's LLM_SESSION_ID label and ignored elsewhere. Registered after the
+  redaction hook, so the id is a hash of redacted text only: hashed before
+  redaction, it would let anyone holding the request recover a short value
+  redaction removed by guessing. Redaction's pseudonyms then have to match on
+  every replica, which needs SESSION_KV_SALT set; without it each pod salts
+  its own and one conversation can get two ids.
+*/}}
+{{- $sessionAffinity := $vertex.sessionAffinity | default dict }}
+{{- $sessionAffinityEnabled := and (eq $provider "vertex_ai") (default false $sessionAffinity.enabled) }}
+{{- $sessionAffinitySource := "" }}
+{{- if $sessionAffinityEnabled }}
+{{- $sessionAffinitySource = .Files.Get "files/litellm_session_affinity_callback.py" }}
+{{- if empty $sessionAffinitySource }}
+{{- fail "litellm.vertex.sessionAffinity is enabled but the chart's files/litellm_session_affinity_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList $unkeyedHook.sessionAffinity }}
 {{- end }}
 {{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
 {{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
@@ -213,7 +248,7 @@
 {{- if empty $traceLogSource }}
 {{- fail "the chart's files/llm_trace_logger.py is missing" }}
 {{- end }}
-{{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
+{{- $callbackList = append $callbackList $unkeyedHook.traceLog }}
 {{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
@@ -233,13 +268,35 @@
 {{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2 hook and the
-  optional trace logger are subPath mounts too, so an edit to any of them has
-  to roll the pods the same way an edit to config.yaml does. With redaction or
-  trace logging off their extras are empty strings, as is the OAuth2 hook's
-  source while the hook is not shipped.
+  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2
+  hook, the session-affinity hook and the optional trace logger are subPath
+  mounts too, so an edit to any of them has to roll the pods the same way an
+  edit to config.yaml does. With redaction or trace logging off their extras
+  are empty strings, as are the OAuth2 and session-affinity hooks' sources
+  while those hooks are not shipped. The slot count reaches the pod as an env
+  var, which rolls it by itself.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource }}
+{{- /*
+  The shadow-mode replay proxy (litellm.replayShadow; values.yaml says what it
+  is). On, it and the LiteLLM pods are told apart by one label key with two
+  values: the proxy keeps app: litellm, which the worker pods' egress policies
+  admit, and inference-gateway selects role replay-shadow while
+  inference-gateway-upstream selects role litellm. Off, nothing below renders
+  differently.
+*/}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict }}
+{{- $replayShadowEnabled := default false $replayShadow.enabled }}
+{{- $replayModelBehaviourChecksum := "" }}
+{{- if $replayShadowEnabled }}
+{{- $replayBehaviourCallbacks := list }}
+{{- range $callbackList }}
+{{- if has . (values $keyedHook) }}
+{{- $replayBehaviourCallbacks = append $replayBehaviourCallbacks . }}
+{{- end }}
+{{- end }}
+{{- $replayModelBehaviourChecksum = include "kube-agents.replayModelBehaviourChecksum" (dict "config" $config "callbacks" $replayBehaviourCallbacks "sources" $replayBehaviourSources) }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -273,6 +330,10 @@ data:
   {{- if $oauthHookEnabled }}
   litellm_oauth2_callback.py: |
     {{- $oauthHookSource | nindent 4 }}
+  {{- end }}
+  {{- if $sessionAffinityEnabled }}
+  litellm_session_affinity_callback.py: |
+    {{- $sessionAffinitySource | nindent 4 }}
   {{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
@@ -320,6 +381,9 @@ spec:
     metadata:
       labels:
         app: litellm
+        {{- if $replayShadowEnabled }}
+        kubeagents.x-k8s.io/inference-role: litellm
+        {{- end }}
       annotations:
         # Hashes the rendered config itself, not the inputs it was rendered
         # from: an edit to the config template has to roll the pods too, and
@@ -418,6 +482,10 @@ spec:
               {{- end }}
             - name: VERTEXAI_LOCATION
               value: {{ $vertexLocation | quote }}
+            {{- if $sessionAffinityEnabled }}
+            - name: KUBE_AGENTS_SESSION_AFFINITY_SLOTS
+              value: {{ $sessionAffinity.slots | default 2 | quote }}
+            {{- end }}
             {{- if $vertexCredentials.name }}
             - name: GOOGLE_APPLICATION_CREDENTIALS
               value: {{ printf "%s/%s" $vertexCredentialsDir $vertexCredentialsFile | quote }}
@@ -538,6 +606,11 @@ spec:
               mountPath: /app/litellm_oauth2_callback.py
               subPath: litellm_oauth2_callback.py
             {{- end }}
+            {{- if $sessionAffinityEnabled }}
+            - name: config-volume
+              mountPath: /app/litellm_session_affinity_callback.py
+              subPath: litellm_session_affinity_callback.py
+            {{- end }}
             {{- if $redactionEnabled }}
             # Beside config.yaml, because LiteLLM resolves a custom callback
             # module relative to the config file's directory and the callback
@@ -618,12 +691,247 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   selector:
+    {{- if $replayShadowEnabled }}
+    {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 4 }}
+    {{- else }}
     app: litellm
+    {{- end }}
   ports:
     - protocol: TCP
       port: 80
       targetPort: 8080
   type: ClusterIP
+{{- if $replayShadowEnabled }}
+{{- $replayShadowImage := $replayShadow.image | default dict }}
+{{- $replayShadowJob := $replayShadow.job | default dict }}
+{{- $replayShadowRollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" $replayShadow.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "litellm.replayShadow.rollingUpdate") | fromYaml }}
+{{- /*
+  The data volume, and the budget the proxy holds its files to inside it
+  (REPLAY_DATA_MAX_BYTES, 1.5 GiB): the collector empties each file it has
+  uploaded, so the volume holds minutes of output while uploads work, and the
+  budget stops the proxy writing well before the kubelet would evict the pod
+  for an upload that never works. values.yaml's replayShadow.resources sizes
+  ephemeral storage from the volume.
+*/}}
+{{- $replayShadowDataSize := "2Gi" }}
+{{- $replayShadowDataMaxBytes := 1610612736 }}
+{{- /*
+  The proxy closes a log segment this long after its first line, and a pod
+  being replaced keeps running this long after it leaves the Service
+  (preStop). While it drains, its segments close 5 s after their first line
+  (spool.py's DRAIN_MAX_AGE_SECONDS), so a line written in the first 40 s of
+  the wait is in a closed segment the collector's next pass
+  (hack/replay-proxy/collect_shadow.py, every 30 s) copies before the pod and
+  its emptyDir are gone. A request still running after that can lose its line.
+*/}}
+{{- $replayShadowSegmentSeconds := 30 }}
+{{- $replayShadowPreStopSeconds := 75 }}
+{{- $replayShadowGraceSeconds := 90 }}
+---
+# LiteLLM alone, for the replay proxy to forward to. inference-gateway
+# selects the proxy while litellm.replayShadow is on.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway-upstream
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: litellm
+    kubeagents.x-k8s.io/inference-role: litellm
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-replay-shadow
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: inference-replay-shadow
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.litellm.replayShadow.replicaCount }}
+  # Surge first by default (values.yaml, replayShadow.rollingUpdate): every
+  # model call goes through the proxy and there is no fallback to LiteLLM.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $replayShadowRollingUpdate.maxSurge }}
+      maxUnavailable: {{ $replayShadowRollingUpdate.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 8 }}
+    spec:
+      {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replayShadow.replicaCount "selectorLabels" (include "kube-agents.replayShadowSelectorLabels" .))) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      serviceAccountName: "default"
+      # The proxy calls no Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with (include "kube-agents.imagePullSecrets" .) }}
+      {{- . | nindent 6 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $replayShadowGraceSeconds }}
+      # The image's own user (hack/replay-proxy/Dockerfile).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # Never litellm-container: hack/ci-env.sh's collect_litellm_log
+        # reads that container from every app=litellm pod into the job's
+        # public artifacts, and the proxy's lines belong in the private bucket.
+        - name: replay-shadow-proxy
+          image: "{{ $replayShadowImage.repository }}:{{ $replayShadowImage.tag }}"
+          imagePullPolicy: {{ $replayShadowImage.pullPolicy | default "IfNotPresent" }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml $replayShadow.resources | nindent 12 }}
+          env:
+            - name: REPLAY_LISTEN_PORT
+              value: "8080"
+            - name: REPLAY_UPSTREAM_HOST
+              value: inference-gateway-upstream
+            - name: REPLAY_UPSTREAM_PORT
+              value: "80"
+            - name: REPLAY_STORE_DIR
+              value: /data/store
+            - name: REPLAY_LOG_DIR
+              value: /data/logs
+            - name: REPLAY_LOG_SEGMENT_SECONDS
+              value: {{ $replayShadowSegmentSeconds | quote }}
+            - name: REPLAY_DATA_MAX_BYTES
+              value: {{ $replayShadowDataMaxBytes | quote }}
+            # What the LiteLLM pods are running, part of every fingerprint:
+            # a checksum of the config that treats the Gemini API and Vertex
+            # AI routes as one (kube-agents.replayModelBehaviourChecksum says
+            # why, and what else it leaves out), and their image. A change to
+            # either rolls the proxy.
+            - name: REPLAY_MODEL_BEHAVIOUR_CHECKSUM
+              value: {{ $replayModelBehaviourChecksum | quote }}
+            - name: REPLAY_LITELLM_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
+            - name: REPLAY_JOB_KIND
+              value: {{ $replayShadowJob.kind | default "" | quote }}
+            - name: REPLAY_JOB_PROJECT
+              value: {{ $replayShadowJob.project | default "" | quote }}
+            - name: REPLAY_JOB_BUILD
+              value: {{ $replayShadowJob.build | default "" | quote }}
+            - name: REPLAY_JOB_PR
+              value: {{ $replayShadowJob.pr | default "" | quote }}
+          ports:
+            - containerPort: 8080
+          # Forwarded through the proxy to LiteLLM's own readiness endpoint, so
+          # a proxy is Ready only while it reaches a Ready LiteLLM, and
+          # inference-gateway never sends an agent to one that cannot.
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Answered by the proxy itself: a LiteLLM outage must not restart it.
+          livenessProbe:
+            httpGet:
+              path: /replay/healthz
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Tells the proxy it is draining (hack/replay-proxy/spool.py,
+                # DRAIN_MARKER_NAME): segments then close a few seconds after
+                # their first line, so the collector copies late lines in time.
+                command: ["python3", "-c", "import time; open('/data/logs/.draining', 'w').close(); time.sleep({{ $replayShadowPreStopSeconds }})"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: {{ $replayShadowDataSize }}
+---
+# The proxy's one destination beside DNS. The operator's litellm-policy
+# selects the proxy too (app: litellm) and adds its own egress, so this cannot
+# confine the proxy to LiteLLM alone; it is what lets it reach LiteLLM at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inference-replay-shadow-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: inference-replay-shadow
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kube-agents.replayShadowSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # The DNS rule litellm-policy carries above, copied whole
+    # (scripts/check_iac_parity.py holds the copies in step).
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+              kubeagents.x-k8s.io/inference-role: litellm
+{{- end }}
 {{- if and .Values.litellm.networkPolicy (not (and .Values.platformAgent.enabled .Values.operator.enabled)) }}
 ---
 apiVersion: networking.k8s.io/v1

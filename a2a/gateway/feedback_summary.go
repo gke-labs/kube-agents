@@ -28,11 +28,14 @@ import (
 // Role) and its own task records, which count chat turns, not the kanban
 // cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
-// refuses a block that does.
+// refuses a block that does, outside the model line, which is printed by design.
 
 const (
-	usageSummaryTitle    = "kube-agents usage & feedback summary"
-	usageSummaryMaxLines = 40
+	usageSummaryTitle = "kube-agents usage & feedback summary"
+	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
+	//: matches its own block's shape (the script adds the performance figures and
+	//: task rows this block does not carry); nothing holds the two in step, by design.
+	usageSummaryMaxLines = 47
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -84,8 +87,16 @@ const (
 	//: a2aGatewayName); the resource name is what precedes the suffix.
 	a2aGatewayNameSuffix = "-a2a-gateway"
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
-	usageNoReading       = "no reading"
-	usageReadingSuffix   = " (as the forge reports)"
+	//: The model line's start: the audit runs over the block without this one line.
+	usageSummaryModelLinePrefix = "  model: "
+	//: status.inference, the operator's reading of the install's default model.
+	inferenceStatusKey        = "inference"
+	inferenceProviderField    = "provider"
+	inferenceModelField       = "model"
+	inferenceSeparator        = "/"
+	usageNoReading            = "no reading"
+	usageForgeReadingSuffix   = " (as the forge reports)"
+	usageGatewayReadingSuffix = " (as the gateway reports)"
 )
 
 // : status.usage fields, in the order the block prints them; a missing counter
@@ -93,17 +104,31 @@ const (
 // : The script's USAGE_COUNTERS verbatim.
 var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
-	"toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal", "remediationsMergedTotal",
-	"proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal", "proposalHumanTouches",
-	"proposalsMergedUntouched",
+	"chatSessionsTotal", "toolExecutionsTotal", "toolExecutionsBlockedTotal", "brokerFailuresTotal",
+	"eventsIngestedTotal", "chatTurnsErroredTotal", "backgroundTasksGaveUpTotal", "negativeFeedbackTotal",
+	"remediationsProposedTotal", "remediationsMergedTotal", "proposalsAuthored", "remediationsOpen",
+	"remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched",
+	"peopleSeen7d", "peopleSeen30d",
 }
 
-// : The fields the broker reads off the forge rather than counts: absent means
-// : it has no reading yet, which is not 0. The script's USAGE_READINGS.
-var usageSummaryReadings = map[string]bool{
-	"remediationsMergedTotal": true, "proposalsAuthored": true, "remediationsOpen": true,
-	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true, "proposalsMergedUntouched": true,
+// : The fields read off a source rather than counted, each to the suffix naming
+// : that source: absent means no reading yet, which is not 0. The broker reads
+// : the six off the forge; the operator reads the two people readings off this
+// : gateway. The script's USAGE_READINGS.
+var usageSummaryReadings = map[string]string{
+	"remediationsMergedTotal":         usageForgeReadingSuffix,
+	"proposalsAuthored":               usageForgeReadingSuffix,
+	"remediationsOpen":                usageForgeReadingSuffix,
+	"remediationsClosedUnmergedTotal": usageForgeReadingSuffix,
+	"proposalHumanTouches":            usageForgeReadingSuffix,
+	"proposalsMergedUntouched":        usageForgeReadingSuffix,
+	"peopleSeen7d":                    usageGatewayReadingSuffix,
+	"peopleSeen30d":                   usageGatewayReadingSuffix,
 }
+
+// : The environment lines, in the order the block prints them: the script's
+// : ENVIRONMENT_KEYS verbatim.
+var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "kubernetes", "installed", "interfaces"}
 
 // : Spec subtrees whose string leaves name the install and must not reach the
 // : block: the script's list verbatim, so the two audits read the same (chat
@@ -332,6 +357,18 @@ func readyState(cr map[string]any) string {
 	return usageSummaryUnknown
 }
 
+// inferenceModelLine is status.inference as provider/model, or unavailable when
+// the key is absent or lacks either field. The gateway reads no LiteLLM config,
+// so unlike the script it has nothing to fall back to.
+func inferenceModelLine(cr map[string]any) string {
+	inference, _ := nested(cr, "status", inferenceStatusKey).(map[string]any)
+	provider, model := asString(inference[inferenceProviderField]), asString(inference[inferenceModelField])
+	if provider == "" || model == "" {
+		return usageSummaryUnavailable
+	}
+	return provider + inferenceSeparator + model
+}
+
 // renderUsageSummary is the block: the script's shape, from what the gateway sees.
 func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, window time.Duration, tasks taskRollup, haveTasks bool) string {
 	usage, _ := nested(cr, "status", "usage").(map[string]any)
@@ -347,12 +384,6 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	if serverVersion == "" {
 		serverVersion = usageSummaryUnavailable
 	}
-	lines = append(lines,
-		"  version: "+tag,
-		"  mode: "+mode,
-		"  kubernetes: "+serverVersion,
-		fmt.Sprintf("  installed: %s; ready: %s", installAge(cr, now), readyState(cr)),
-	)
 	var interfaces []string
 	if raw, ok := usage["activeInterfaces"].([]any); ok {
 		for _, item := range raw {
@@ -364,10 +395,22 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	if joined == "" {
 		joined = usageSummaryNone
 	}
-	lines = append(lines, "  interfaces: "+joined, "usage:")
+	environment := map[string]string{
+		"version":    tag,
+		"mode":       mode,
+		"model":      inferenceModelLine(cr),
+		"kubernetes": serverVersion,
+		"installed":  fmt.Sprintf("%s; ready: %s", installAge(cr, now), readyState(cr)),
+		"interfaces": joined,
+	}
+	for _, key := range usageSummaryEnvironmentKeys {
+		lines = append(lines, "  "+key+": "+environment[key])
+	}
+	lines = append(lines, "usage:")
 	for _, counter := range usageSummaryCounters {
 		value, present := usage[counter]
-		if !usageSummaryReadings[counter] {
+		suffix, isReading := usageSummaryReadings[counter]
+		if !isReading {
 			lines = append(lines, fmt.Sprintf("  %s: %d", counter, asInt(value)))
 			continue
 		}
@@ -375,13 +418,17 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		if present && value != nil {
 			shown = strconv.FormatInt(asInt(value), 10)
 		}
-		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, usageReadingSuffix))
+		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, suffix))
 	}
 	last := asString(usage["lastActiveTime"])
 	if last == "" {
 		last = usageSummaryNever
 	}
-	lines = append(lines, "  lastActive: "+last)
+	lastHuman := asString(usage["lastHumanActiveTime"])
+	if lastHuman == "" {
+		lastHuman = usageSummaryNever
+	}
+	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
 	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
 	days := windowDays(window)
 	if !haveTasks {
@@ -445,6 +492,20 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
+// usageSummaryWithoutModelLine is the block less its first model line, the one
+// line printed by design: a deployment name can carry a spec identifier as a
+// segment, and the line is never the reason a block is refused. Every other
+// line stays audited.
+func usageSummaryWithoutModelLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, usageSummaryModelLinePrefix) {
+			return strings.Join(append(lines[:i:i], lines[i+1:]...), "\n")
+		}
+	}
+	return text
+}
+
 // auditUsageSummary returns the identifiers that appear in text as whole
 // tokens, skipping the template's own vocabulary (a cluster named "today" is
 // not told apart from the mode line, and is not refused for it).
@@ -490,7 +551,7 @@ func (g *Gateway) feedbackSummary(ctx context.Context, rec *SessionRecord) {
 		g.log.Warn("feedback summary: task records unavailable", "err", err)
 	}
 	text := renderUsageSummary(now, cr, version, window, tasks, haveTasks)
-	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) > 0 {
+	if leaked := auditUsageSummary(usageSummaryWithoutModelLine(text), usageIdentifiers(cr)); len(leaked) > 0 {
 		g.log.Warn("feedback summary refused: the block named identifiers of the install", "conversation", rec.Key, "count", len(leaked))
 		g.post(rec.Key, usageSummaryRefusedNotice)
 		return

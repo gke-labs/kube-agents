@@ -58,9 +58,10 @@ on:
       # keep the bridge's copy of its frame and token list in step; an edit
       # to the hook alone has to run that test.
       - "agents/platform/plugins/incident_context/**"
-      # lib/chatmsg validates every shared chat case, so a case-only change
-      # has to run it.
+      # lib/chatmsg validates every shared chat case, and lints every shared
+      # lint case, so a case-only change has to run it.
       - "tests/conformance/chat/**"
+      - "tests/conformance/chat-ux/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -75,6 +76,13 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
 
 jobs:
   test:
@@ -111,6 +119,7 @@ jobs:
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
+              - "tests/conformance/chat-ux/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'

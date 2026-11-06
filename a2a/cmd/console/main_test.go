@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
+	"strings"
 	"testing"
 	"time"
 )
@@ -135,5 +138,35 @@ func TestServeStopsOnCancel(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("serve did not return after cancel")
+	}
+}
+
+// The process applies the limit, not just the helper: realMain has to reach
+// memlimit.Apply before anything that can fail. A static dir that does not
+// exist stops the run right after it, and the runtime's limit and the startup
+// line show whether the call happened. memlimit reads the process
+// environment, not the getenv realMain is handed, so the variable is set with
+// t.Setenv.
+func TestRealMainAppliesTheMemoryLimitBeforeReadingTheConfig(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv(envMemoryLimit, "268435456")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	err := realMain(context.Background(), log, env(map[string]string{
+		"CONSOLE_BUS_URL":    "http://nats:9222",
+		"CONSOLE_STATIC_DIR": filepath.Join(t.TempDir(), "absent"),
+	}))
+	if err == nil {
+		t.Fatal("realMain started with a static dir that does not exist")
+	}
+	if got := debug.SetMemoryLimit(-1); got != 241591910 {
+		t.Errorf("runtime soft limit after realMain = %d, want 241591910, nine tenths of %s", got, envMemoryLimit)
+	}
+	if !strings.Contains(logs.String(), "Go soft memory limit set from the container's memory limit") ||
+		!strings.Contains(logs.String(), `"bytes":241591910`) {
+		t.Errorf("realMain logged %q, want the soft-limit line with the derived byte count", logs.String())
 	}
 }

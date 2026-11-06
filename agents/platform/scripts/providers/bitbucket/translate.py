@@ -78,12 +78,22 @@ def source_repo(node: dict[str, Any], repo: str) -> str:
     return full
 
 
+def _merge_commit(node: dict[str, Any]) -> str | None:
+    merged = node.get("merge_commit")
+    return (str(merged.get("hash") or "") or None) if isinstance(merged, dict) else None
+
+
 def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
     """A pull request as a proposal.
 
     `closed` is when it stopped being open. Bitbucket Cloud records no close
     time, so it is the last update of a pull request that is no longer open,
     and "" while it is open.
+
+    `mergeCommit` is `merge_commit.hash`, `None` unless merged: the merge or
+    squash commit, or after a fast-forward merge the target's tip, which may
+    not hold the whole change. Bitbucket abbreviates it to 12 characters, as
+    it does the source revision, and the translation keeps what it was given.
     """
     state = STATES.get(str(node.get("state") or ""), "closed")
     source = _endpoint(node, "source")
@@ -106,6 +116,7 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
         "created": node.get("created_on") or "",
         "updated": node.get("updated_on") or "",
         "closed": "" if state == "open" else (node.get("updated_on") or ""),
+        "mergeCommit": _merge_commit(node) if state == "merged" else None,
         "body": body or "",
     }
 

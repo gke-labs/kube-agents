@@ -336,7 +336,8 @@ class NamesTest(unittest.TestCase):
     def test_the_pod_and_container_are_the_operators(self):
         manifests = OPERATOR_MANIFESTS.read_text(encoding="utf-8")
         self.assertIn('return agent.Name + "-shell"', manifests)
-        self.assertRegex(manifests, r'Name:\s+"shell",')
+        self.assertRegex(manifests, r'shellSandboxContainerName\s*=\s*"shell"')
+        self.assertRegex(manifests, r"Name:\s+shellSandboxContainerName,")
         self.assertIn("statefulset/platform-agent-shell", DEPLOY.read_text(encoding="utf-8"))
         self.assertEqual(lifted_line(CONSTANT_LINES[0]), 'readonly EVAL_SANDBOX_CONTAINER="shell"')
 

@@ -1,46 +1,53 @@
-"""Record each pull request a kanban worker opens as a ``pr_opened`` event on its card.
+"""Claim each proposal the agent opens, count it per origin, and record a worker's on its card.
 
-A worker opens a pull request or merge request only through the credential
+The agent opens a pull request or merge request only through the credential
 broker's ``proposal-create`` verb: the sandbox's ``/v1/exec`` runs neither
 ``git`` nor a forge CLI, and every caller (``vcs.py``, submit-suggestion, the
 fleet audit) reaches the broker through ``vcs_client.call``. When the broker
 answers with a new proposal, ``call`` writes one JSON line to stderr naming it
-(``vcs_client.PROPOSAL_OPENED_KEY``). That line comes back to the worker as part
-of its terminal output, in the process whose ``HERMES_KANBAN_TASK`` names the
-card it is working.
+(``vcs_client.PROPOSAL_OPENED_KEY``), with the one-time claim token the broker
+minted for that answer in its ``claim`` field and the managed repository the
+broker resolved in its ``repo`` field. That line comes back as part of the
+terminal output of the process that ran the command.
 
 This hook sees that output before the model does. A line that has the record's
 shape is not proof by itself: terminal output also carries text nobody here
-wrote (a commit message, a file, a pod's log), and such text could hold a line
-naming someone else's pull request on the install's own repository, or one the
-agent opened weeks ago. So each record is checked with the forge first
-(:meth:`Checker.ours`): the broker must serve the pull request at that url on a
-repository this install manages, open, created within
-:data:`CREATED_WITHIN_SECONDS`, and authored by the account the broker's
-credential authenticates as, the identity every pull request the agent opens
-carries. Only then is a ``pr_opened`` event, carrying the forge's own ``url``,
-``number`` and ``title`` and never the line's, appended to the card and the
-line taken out of the output. At most :data:`RECORDS_CHECKED_MAX` distinct urls
-in one output are checked, since each check costs broker reads and the output
-can be text nobody here wrote. So the model's view of the
-command is what it was before the record existed. A line that fails the check
-is left where it was, for the model to read as the text it is. The gateway's
-notifier claims the kind and, with ``KAGE_SLACK_UX`` on, posts the PR as its
-own message in the thread the card reports to
-(``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``),
-whatever the worker goes on to say about it.
+wrote (a commit message, a file, a pod's log, another session's record). So each
+record's token is presented to the broker's ``proposal-claim`` verb
+(:func:`claim`), addressed to the record's ``repo`` whatever shape the forge
+gives its url (``…/pull/7``, ``…/pulls/7``, ``…/pull-requests/7``,
+``…/-/merge_requests/7``). The broker burns the token, checks with the forge
+that the proposal the token was minted for is open, recent and authored by the
+broker's own account, and answers the forge's ``url``, ``number`` and ``title``. Only a claimed
+proposal counts: it is written to the Session KV ledger
+(``POST /v1/proposals/opened``) with the origin of this process
+(:func:`resolve_origin`), and in a kanban worker it is also appended to the card
+as a ``pr_opened`` event, carrying the forge's fields and never the line's, and
+the line is taken out of the output. Outside a worker the line stays, without
+its token. The gateway's notifier claims the event kind and, with
+``KAGE_SLACK_UX`` on, posts the PR as its own message in the thread the card
+reports to (``gateway/kanban_progress_lines.py``, ``gateway/slack_ux_moments.py``).
 
-The check is two broker reads through the sandbox (``forge.call``), made in the
-terminal call that opened the pull request, so that call returns a few seconds
-later; it happens once per pull request. It is made in line rather than on a
-thread because a worker leaves through ``os._exit``, which would drop a thread
-still waiting on the broker.
-
-Outside a kanban worker there is no card, so nothing is checked, recorded or
-taken out. A check or a record that fails is logged and the line left in: the
-PR is open either way, and the thread falls back to reading the worker's own
-note. Background processes are not covered, since this hook runs on
-foreground output only.
+At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed,
+and none once :data:`CLAIMS_BUDGET_SECONDS` have passed since the hook began on
+that output: Hermes skips a ``transform_terminal_output`` hook that runs past
+its callback timeout (:data:`HOOK_CALLBACK_SECONDS`) and hands the model the
+original output, tokens included. A record with no ``repo`` and a url :data:`PROPOSAL_URL` cannot read
+names no repository to send the claim to and takes none of those slots. Every
+record line the hook does not claim (no repository, past the cap or the
+budget, a repeated url, a refused claim, a broker hop that is down) keeps its
+text but loses its ``claim`` field, so no live token reaches what the model
+reads. Each claim's ``forge.call`` ceiling is what is left before the hook must
+answer: the callback timeout less :data:`CLAIM_RESERVE_SECONDS` for the ledger
+write, the card record and the strip that follow the last claim. So no claim on
+the sandbox hop outlasts the hook, and a claim that times out is an unanswered
+hop. The claim is one broker call through the sandbox
+(``forge.call``), made in line rather than on a thread because a worker leaves
+through ``os._exit``, which would drop a thread still
+waiting on the broker. A claim or a write that fails is logged: the PR is open
+either way, and it counts as missed. Background processes are not covered,
+since this hook runs on foreground output only. Design:
+``docs/designs/proposal-origin.md`` §2.2.
 
 The plugin also refuses ``submit_suggestion.py prepare`` and ``submit`` from a
 kanban worker whose own run on its card has ended (:func:`on_pre_tool_call`).
@@ -65,12 +72,14 @@ write path from a live card. Same rule as
 ``kanban_complete`` and ``kanban_block``.
 """
 
+import importlib
 import json
 import logging
 import os
 import re
 import sys
-from datetime import datetime, timezone
+import time
+import urllib.request
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +88,20 @@ logger = logging.getLogger(__name__)
 #: path. ``test_pr_opened.py`` fails when the two drift.
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title")
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo")
+
+#: The record's field that holds the broker's one-time claim token
+#: (``vcs_client.CLAIM_TOKEN_FIELD``).
+CLAIM_FIELD = "claim"
+
+#: The record's field that names the managed repository the broker resolved for
+#: the create (``vcs_client.REPO_FIELD``). The claim is sent to it; the broker
+#: checks what it kept with the token, never this.
+REPO_FIELD = "repo"
+#: A record's ``repo`` travels as one argv element of the sandbox hop, so a
+#: value an option parser could read as a flag, or one with whitespace, is
+#: not a repository and the record falls back to its url, or takes no claim.
+REPO_ARGV_SAFE = re.compile(r"^[^-\s][^\s]*$")
 
 #: ``kanban_progress_lines.PR_OPENED_KIND``: the event kind the notifier claims for it.
 PR_OPENED_KIND = "pr_opened"
@@ -119,47 +141,90 @@ RUNNING_STATUS = "running"
 #: The card's status and current run, as ``kanban_ended_run.ended_run_refusal`` reads them.
 CARD_RUN_SQL = "SELECT status, current_run_id FROM tasks WHERE id = ?"
 
+
 #: The longest title kept on the event; the thread shows it clipped shorter.
 TITLE_MAX = 300
 
 #: What a record line starts with once stripped.
 JSON_OBJECT_START = "{"
 
+#: How a record line is written back once its token is taken out, as
+#: ``vcs_client._say_opened`` writes it.
+RECORD_SEPARATORS = (",", ":")
+
 #: Where the agent pod's shared scripts (``forge.py`` and what it imports) are
 #: staged, as ``vcs_client`` finds its siblings there.
 SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 
-#: A pull request url on any forge (``…/pull/<n>``) or a merge request url
-#: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
-PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+#: A pull request url on every forge the broker serves
+#: (``providers/registry.py`` ``AVAILABLE``): the repository url the broker
+#: resolves to that forge, then the number. GitHub ``…/pull/<n>``, GitLab
+#: ``…/-/merge_requests/<n>``, Gitea ``…/pulls/<n>``, and Bitbucket Cloud and
+#: Data Center ``…/pull-requests/<n>`` (Data Center's repository is
+#: ``…/projects/KEY/repos/slug``). A trailing page (``/overview``,
+#: ``/_/diff``), query or fragment is allowed; an issue url is not a match.
+#: ``http`` is a forge the broker serves too: an in-cluster Gitea (a ``.svc``
+#: host). The repository is greedy, so a GitLab subgroup named ``pulls`` or
+#: ``pull-requests`` before a numeric subgroup stays in the repository and
+#: the last marker before the number is the pull request. The tail after the
+#: number carries no further marker, ``/-/`` or ``/issues/``, so an issue under
+#: such a subgroup is not a pull request either. Read only for a
+#: record with no ``repo`` (one an older client wrote), and for the card
+#: event's number when the broker's answer has none. The Session KV server
+#: pins its own pattern equal to this one.
+PROPOSAL_URL = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 
-#: The verb that reads one proposal back from the broker.
-PROPOSAL_VIEW_VERB = "proposal-view"
+#: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
+#: does not parse as a whole line (one ``2>&1`` merged after other text). Its
+#: value is blanked, so the line keeps its shape and loses the token.
+CLAIM_MEMBER = re.compile(r'("claim"\s*:\s*)"[^"]*"')
+CLAIM_MEMBER_BLANKED = r'\1""'
 
-#: The neutral state a forge reports for a proposal still open (``providers/*/translate.py``).
-OPEN_STATE = "open"
+#: The broker verb that burns a claim token and confirms its proposal with the forge.
+PROPOSAL_CLAIM_VERB = "proposal-claim"
 
-#: How long before the check a proposal may have been created and still be the
-#: one this command opened. The hook runs as the command returns, but one
-#: command can run for a while before its last proposal: a fleet audit lands
-#: one remediation pull request per group. A pull request quoted from anywhere
-#: older than this (a log, an issue body, a file) is refused.
-CREATED_WITHIN_SECONDS = 900
+#: ``forge.REASON_SANDBOX_UNREACHABLE`` and ``forge.REASON_UNREACHABLE``: the
+#: reasons that mean the claim never reached the broker, rather than the broker
+#: refusing it. An exception without a reason is read the same way.
+HOP_DOWN_REASONS = frozenset({"SANDBOX_UNREACHABLE", "BROKER_UNREACHABLE"})
 
-#: How far ahead of this pod's clock the forge's ``created`` may read.
-CLOCK_SKEW_SECONDS = 60
-
-#: The most distinct record urls one output is checked for. Each check is two
-#: broker reads through the sandbox, and terminal output can carry text the
-#: worker read rather than wrote, so the count is bounded. An ordinary
+#: The most distinct record urls one output is claimed for. Each claim is one
+#: broker call through the sandbox, and terminal output can carry text the
+#: process read rather than wrote, so the count is bounded. An ordinary
 #: ``proposal create`` prints one record; a fleet audit prints one per group
-#: it opened, and a group past this count falls back to the worker's note.
+#: it opened, and a group past this count is missed.
 RECORDS_CHECKED_MAX = 5
 
-#: ``created`` as forges spell UTC, and the offset ``datetime.fromisoformat``
-#: accepted before Python 3.11.
-ISO_UTC_SUFFIX = "Z"
-ISO_UTC_OFFSET = "+00:00"
+#: No claim starts once this long has passed since the hook began on one
+#: output. Hermes skips the hook at 30 s (``hook_callback_timeout``) and hands
+#: the model the raw output, so the budget leaves room for the ledger writes,
+#: the card record and the strip that follow the last claim.
+CLAIMS_BUDGET_SECONDS = 20
+#: Hermes' ``hook_callback_timeout``: a hook still running at this point is
+#: skipped, and the model reads the output the hook was handed.
+HOOK_CALLBACK_SECONDS = 30
+#: What the hook keeps for itself after its last claim answers: the ledger
+#: write (:data:`LEDGER_TIMEOUT_SECONDS`), the card record and the strip. Each
+#: claim's ceiling is what is left before the callback timeout less this, so a
+#: claim started at the end of the budget still has several seconds, and the
+#: one-use token a killed hop may have burned is a claim that is never counted.
+CLAIM_RESERVE_SECONDS = 4
+
+#: Where Hermes installs ``deploy/docker/patches/kanban_origin.py``, and the name
+#: a test loads it under.
+KANBAN_ORIGIN_MODULES = ("hermes_cli.kanban_origin", "kanban_origin")
+
+#: The origin when nothing resolves one (``kanban_origin.NO_ORIGIN``).
+NO_ORIGIN = ("other", "")
+
+#: The Session KV server's loopback address, key and ledger route, as
+#: ``kanban_origin`` spells the first two. The server binds 127.0.0.1 only.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+LEDGER_PATH = "/v1/proposals/opened"
+
+#: The ledger write waits at most this long, on loopback.
+LEDGER_TIMEOUT_SECONDS = 2.0
 
 
 def register(ctx):
@@ -167,23 +232,67 @@ def register(ctx):
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
 
-def opened(line):
-    """The ``{url, number, title}`` a proposal-opened record on ``line`` names, else None."""
+def _record_of(line):
+    """The proposal-opened record object on ``line``, else None."""
     text = line.strip()
     if not text.startswith(JSON_OBJECT_START) or PROPOSAL_OPENED_KEY not in text:
         return None
     try:
         record = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):  # not JSON, or nested past the parser's depth
         return None
     if not isinstance(record, dict) or record.get(PROPOSAL_OPENED_KEY) != PROPOSAL_OPENED_EVENT:
         return None
     proposal = record.get("proposal")
     if not isinstance(proposal, dict) or not isinstance(proposal.get("url"), str) or not proposal["url"]:
         return None
-    found = {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS}
+    return record
+
+
+def opened(line):
+    """The ``{url, number, title, claim, repo}`` a proposal-opened record on ``line`` names, else None.
+
+    ``claim`` is None when the line carries no token (a broker older than the
+    token); ``repo`` is None when the line names no repository (an older client).
+    """
+    record = _record_of(line)
+    if record is None:
+        return None
+    found = {field: record["proposal"].get(field) for field in PROPOSAL_OPENED_FIELDS}
     found["title"] = str(found.get("title") or "")[:TITLE_MAX]
     return found
+
+
+def without_claim(line):
+    """``line`` with the record's ``claim`` field taken out; ``line`` itself when it has none."""
+    record = _record_of(line)
+    if record is None or CLAIM_FIELD not in record["proposal"]:
+        return line
+    record["proposal"].pop(CLAIM_FIELD)
+    lead = line[: len(line) - len(line.lstrip())]
+    trail = line[len(line.rstrip()):]
+    return lead + json.dumps(record, separators=RECORD_SEPARATORS) + trail
+
+
+def strip_tokens(line):
+    """``line`` with every claim token taken out: the record's field, else any ``"claim"`` member."""
+    stripped = without_claim(line)
+    if PROPOSAL_OPENED_KEY in stripped:
+        stripped = CLAIM_MEMBER.sub(CLAIM_MEMBER_BLANKED, stripped)
+    return stripped
+
+
+def _strip_all(output):
+    """``output`` with :func:`strip_tokens` applied to every line naming a record. Never raises."""
+    kept = []
+    for line in output.splitlines(keepends=True):
+        if PROPOSAL_OPENED_KEY in line:
+            try:
+                line = strip_tokens(line)
+            except Exception:  # noqa: BLE001 — the member regex alone still takes the token out
+                line = CLAIM_MEMBER.sub(CLAIM_MEMBER_BLANKED, line)
+        kept.append(line)
+    return "".join(kept)
 
 
 def _forge():
@@ -196,53 +305,125 @@ def _forge():
     return forge
 
 
-def _age_seconds(created, now):
-    """Seconds since the forge's ``created`` timestamp, or None when it cannot be read."""
+def claim_repository(record):
+    """The repository a claim for ``record`` is sent to, else None.
+
+    The record's ``repo``, whatever the url looks like, when it can travel as
+    one argv element (:data:`REPO_ARGV_SAFE`); for a record with none, or one a
+    parser could read as a flag (an older client, or a forged line), the
+    repository url :data:`PROPOSAL_URL` reads off its url. A record with neither
+    takes no claim.
+    """
+    repo = record.get(REPO_FIELD)
+    if isinstance(repo, str) and REPO_ARGV_SAFE.match(repo):
+        return repo
+    match = PROPOSAL_URL.match(record.get("url") or "")
+    return match.group(1) if match else None
+
+
+def claimable(record):
+    """True when ``record`` carries a token and names a repository to send its claim to."""
+    token = record.get(CLAIM_FIELD)
+    return isinstance(token, str) and bool(token) and claim_repository(record) is not None
+
+
+class ClaimUnanswered(Exception):
+    """The claim did not reach the broker: no forge module here, or the hop is down."""
+
+
+def claim(record, timeout_s=None):
+    """The forge's ``{url, number, title}`` when the broker accepts ``record``'s token, else None.
+
+    ``timeout_s`` is the ceiling on the broker call, passed to ``forge.call``;
+    None keeps its default. A call that times out is an unanswered hop.
+
+    The broker burns the token whatever it then finds, so a claim is never
+    retried here; the broker itself asks the forge once more on a transient
+    failure. A refusal (an unknown, replayed or expired token, a proposal the
+    forge does not confirm, a repository no longer managed) is logged by its code
+    alone, never with the token or the url. Raises :class:`ClaimUnanswered` when
+    the broker could not be asked.
+    """
+    if not claimable(record):
+        return None
     try:
-        when = datetime.fromisoformat(str(created).replace(ISO_UTC_SUFFIX, ISO_UTC_OFFSET))
-    except ValueError:
+        forge = _forge()
+    except Exception as exc:  # noqa: BLE001 — no forge here; the proposal is missed
+        raise ClaimUnanswered(type(exc).__name__) from None
+    try:
+        answer = forge.call(
+            PROPOSAL_CLAIM_VERB,
+            {CLAIM_FIELD: record[CLAIM_FIELD], "url": record["url"]},
+            claim_repository(record),
+            retry_transient=False,
+            timeout_s=timeout_s,
+        )
+    except Exception as exc:  # noqa: BLE001 — sorted into a refusal or an unanswered hop below
+        reason = getattr(exc, "reason", None)
+        if not reason or reason in HOP_DOWN_REASONS:
+            raise ClaimUnanswered(reason or type(exc).__name__) from None
+        logger.warning("pr_opened: %s refused: %s", PROPOSAL_CLAIM_VERB, reason)
         return None
-    if when.tzinfo is None:
+    if not isinstance(answer, dict) or not isinstance(answer.get("url"), str) or not answer["url"]:
+        logger.warning("pr_opened: %s answered without a url", PROPOSAL_CLAIM_VERB)
         return None
-    return (now - when).total_seconds()
+    number = answer.get("number")
+    if number is None:
+        match = PROPOSAL_URL.match(answer["url"])
+        number = int(match.group(2)) if match else None
+    return {"url": answer["url"], "number": number, "title": str(answer.get("title") or "")[:TITLE_MAX]}
 
 
-class Checker:
-    """Asks the forge about record-shaped lines, sharing one provider so the credential's login is read once."""
+def _first_module(names):
+    for name in names:
+        try:
+            return importlib.import_module(name)
+        except Exception:  # noqa: BLE001 — absent, or failing at import: either way not here
+            continue
+    return None
 
-    def __init__(self):
-        self.forge = _forge()
-        self.provider = self.forge.BrokerProvider()
 
-    def ours(self, proposal, now=None):
-        """The forge's ``{url, number, title}`` when it says the agent just opened ``proposal``, else None.
+def resolve_origin():
+    """This process's ``(origin, platform)``; ``("other", "")`` when nothing resolves one. Never raises.
 
-        The broker must answer ``proposal-view`` for that number on the
-        repository in its url (a repository this install does not manage is
-        refused there), the answer must carry the same url, be open, have been
-        created within :data:`CREATED_WITHIN_SECONDS`, and its author must be the
-        account the broker's credential authenticates as on that forge. What is
-        recorded is the forge's answer, never the line's own fields.
-        """
-        match = PROPOSAL_URL.match(proposal["url"])
-        if match is None:
-            return None
-        repository, number = match.group(1), int(match.group(2))
-        viewer = self.provider.viewer_login(repository)
-        answer = self.forge.call(PROPOSAL_VIEW_VERB, {"number": number}, repository, retry_transient=True)
-        view = answer.get("proposal") or {}
-        age = _age_seconds(view.get("created"), now or datetime.now(timezone.utc))
-        if not (
-            viewer
-            and view.get("url") == proposal["url"]
-            and view.get("number") == number
-            and view.get("state") == OPEN_STATE
-            and age is not None
-            and -CLOCK_SKEW_SECONDS <= age <= CREATED_WITHIN_SECONDS
-            and self.forge.normalise_login(view.get("author")) == self.forge.normalise_login(viewer)
-        ):
-            return None
-        return {"url": view["url"], "number": number, "title": str(view.get("title") or "")[:TITLE_MAX]}
+    ``kanban_origin.turn_origin``, the one resolver the board and the cron
+    patches share: the worker's card stamp, then the tick-started run's
+    context, then the session record for the trusted Hermes session id, then
+    the console id convention on that id.
+    """
+    origins = _first_module(KANBAN_ORIGIN_MODULES)
+    if origins is None:
+        return NO_ORIGIN
+    try:
+        found = origins.turn_origin()
+        return tuple(found) if found else NO_ORIGIN
+    except Exception as exc:  # noqa: BLE001 — never fail the command over its origin
+        logger.warning("pr_opened: the turn's origin is unreadable: %r", exc)
+        return NO_ORIGIN
+
+
+def _session_kv_post(path, payload):
+    """POST ``payload`` to the Session KV server with the pod's key; the JSON answer. Raises on failure."""
+    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
+    if not token:
+        raise PermissionError(f"no {SESSION_KV_KEY_ENV}")
+    request = urllib.request.Request(
+        SESSION_KV_URL + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=LEDGER_TIMEOUT_SECONDS) as response:
+        loaded = json.loads(response.read() or b"{}")
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def write_ledger(url, origin):
+    """Write the claimed proposal at ``url`` to the ledger under ``origin``. Logged, never raised."""
+    try:
+        _session_kv_post(LEDGER_PATH, {"url": url, "origin": origin[0], "platform": origin[1]})
+    except Exception as exc:  # noqa: BLE001 — the PR is open; this url's count is lost
+        logger.warning("pr_opened: the ledger did not record %s: %r", url, exc)
 
 
 def record(task_id, proposal):
@@ -254,56 +435,80 @@ def record(task_id, proposal):
         kb._append_event(conn, task_id, PR_OPENED_KIND, proposal, run_id=kb._current_run_id(conn, task_id))
 
 
-def _recorded(checker, task_id, proposal):
-    """Check ``proposal`` with the forge and record the forge's answer on the card.
-
-    True when recorded, False when the forge says it is not one the agent just
-    opened, None when the check or the record failed (the broker or the sandbox
-    hop did not answer, or the board refused the write).
-    """
+def _recorded(task_id, proposal):
+    """Record the claimed ``proposal`` on card ``task_id``; True when written, False (logged) when not."""
     try:
-        confirmed = checker.ours(proposal)
-        if confirmed is None:
-            logger.warning("pr_opened: %s is not a pull request this agent just opened; not recorded", proposal["url"])
-            return False
-        record(task_id, confirmed)
+        record(task_id, proposal)
         return True
     except Exception as exc:  # noqa: BLE001 — the PR is open; the thread falls back to the note
         logger.warning("pr_opened: recording %s on %s failed: %s", proposal.get("url"), task_id, exc)
-        return None
+        return False
 
 
 def on_terminal_output(command="", output="", **_):
-    """Record each proposal the agent opened on the worker's card, and take its line out of ``output``.
+    """Claim each proposal record in ``output``, count it in the ledger, and strip every token.
 
-    At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are asked
-    about; a line repeating a url already asked about follows that answer, and
-    lines past the cap are left as they are, unasked. The first check that fails
-    rather than answers ends the asking for this output, so a broker or sandbox
-    hop that is down costs one timeout, not one per url. Returns the output
-    without the recorded lines, or None (unchanged) when none was recorded.
+    At most :data:`RECORDS_CHECKED_MAX` distinct urls carrying a token are
+    claimed, no claim starts once :data:`CLAIMS_BUDGET_SECONDS` have passed, and
+    each claim's ceiling is what is left before the hook must answer.
+    A claimed proposal goes to the ledger under :func:`resolve_origin`;
+    in a kanban worker it also goes on the card and its line, with every line
+    repeating its url, leaves the output. Every other line naming a record stays
+    without its token. The first claim the broker does not answer ends the
+    claiming for this output, so a hop that is down costs one timeout, not one
+    per url. Returns the changed output, or None (unchanged) when no line was
+    removed or stripped. Once a record is seen, nothing raises: a fault returns
+    the output with every token stripped, since the seam would otherwise hand
+    the model the original.
     """
     if not isinstance(output, str) or PROPOSAL_OPENED_KEY not in output:
         return None
+    try:
+        return _claim_output(output)
+    except Exception as exc:  # noqa: BLE001 — the seam would hand the model the original, tokens and all
+        logger.warning("pr_opened: claiming this output failed (%s); its tokens are stripped", type(exc).__name__)
+        return _strip_all(output)
+
+
+def _claim_output(output):
+    """:func:`on_terminal_output`'s work, for an output that names a record. May raise."""
     task_id = os.environ.get(TASK_ENV, "").strip()
-    if not task_id:
-        return None
-    checker, verdicts, kept, failed = None, {}, [], False
+    asked, removed, kept, unanswered, origin, changed = set(), set(), [], False, None, False
+    began = time.monotonic()
+    budget_end = began + CLAIMS_BUDGET_SECONDS
+    answer_by = began + HOOK_CALLBACK_SECONDS - CLAIM_RESERVE_SECONDS
     for line in output.splitlines(keepends=True):
         proposal = opened(line)
-        url = proposal["url"] if proposal else None
-        if url is not None and url not in verdicts and len(verdicts) < RECORDS_CHECKED_MAX and not failed:
+        if proposal is not None and proposal["url"] in removed:
+            changed = True
+            continue
+        now = time.monotonic()
+        if (
+            proposal is not None
+            and claimable(proposal)
+            and proposal["url"] not in asked
+            and len(asked) < RECORDS_CHECKED_MAX
+            and not unanswered
+            and now < budget_end
+        ):
+            asked.add(proposal["url"])
             try:
-                checker = checker or Checker()
-            except Exception as exc:  # noqa: BLE001 — no forge here; the thread falls back to the note
-                logger.warning("pr_opened: the forge is not reachable from this process: %s", exc)
-                return None
-            verdict = _recorded(checker, task_id, proposal)
-            failed = verdict is None
-            verdicts[url] = bool(verdict)
-        if not verdicts.get(url):
-            kept.append(line)
-    return "".join(kept) if any(verdicts.values()) else None
+                confirmed = claim(proposal, timeout_s=answer_by - now)
+            except ClaimUnanswered as exc:
+                logger.warning("pr_opened: %s was not answered (%s); this output is not claimed further",
+                               PROPOSAL_CLAIM_VERB, exc)
+                unanswered, confirmed = True, None
+            if confirmed is not None:
+                origin = origin or resolve_origin()
+                write_ledger(confirmed["url"], origin)
+                if task_id and _recorded(task_id, confirmed):
+                    removed.add(proposal["url"])
+                    changed = True
+                    continue
+        stripped = strip_tokens(line) if PROPOSAL_OPENED_KEY in line else line
+        changed = changed or stripped != line
+        kept.append(stripped)
+    return "".join(kept) if changed else None
 
 
 def _own_run_id():

@@ -30,6 +30,7 @@ import tempfile
 import shutil
 import unittest
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -678,6 +679,44 @@ class RepositoryVerbTest(unittest.TestCase):
     def test_clone_leaves_nothing_behind(self):
         self.broker.clone({"repository": "local.test/acme/infra"})
         self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), [])
+
+    def test_the_bundle_lives_inside_the_scratch_tree_so_its_removal_takes_it(self):
+        # A broker killed between writing the bundle and unlinking it leaves
+        # it behind. Inside the scratch tree, the start sweep and the
+        # reclaimer remove it with the tree; a sibling under the root matches
+        # neither's listing and would hold the state volume's quota for good.
+        seen: dict[str, tuple[Path, Path]] = {}
+
+        def recording_git(argv, cwd, check=True, config=()):
+            if argv[1] == "bundle" and argv[2] in ("create", "list-heads"):
+                seen[argv[2]] = (Path(argv[3]), cwd)
+            return git_runner(argv, cwd, check, config)
+
+        broker = VcsBroker(self.scratch / "bundles", git_runner=recording_git)
+        broker.registry.hosts["local.test"] = self.forge
+        answer = broker.clone({"repository": "local.test/acme/infra"})
+        work = Path(self.tmp.name) / "bundled"
+        bundle = Path(self.tmp.name) / "bundled.bundle"
+        bundle.write_bytes(base64.b64decode(answer["bundleBase64"]))
+        git(self.tmp.name, "clone", "--quiet", "--branch", answer["branch"], str(bundle), str(work))
+        git(work, "checkout", "--quiet", "-b", "fix/inside")
+        self.commit_in(work, "README.md", "inside\n", "change it")
+        broker.publish(
+            {
+                "repository": "local.test/acme/infra",
+                "branch": "fix/inside",
+                "target": "main",
+                "baseRevision": answer["revision"],
+                "bundleBase64": self.bundle_of(work, "fix/inside", answer["revision"]),
+            }
+        )
+        self.assertEqual({"create", "list-heads"}, set(seen))
+        for verb, (path, cwd) in seen.items():
+            self.assertEqual(cwd, path.parent, verb)
+            self.assertEqual(broker.scratch_root, cwd.parent, verb)
+            self.assertTrue(vcs_broker.SCRATCH_NAME_RE.match(cwd.name), cwd.name)
+            self.assertEqual(f"{cwd.name}.bundle", path.name, verb)
+        self.assertEqual([], sorted(broker.scratch_root.iterdir()))
 
     def test_clone_makes_the_credential_current_before_it_spends(self):
         self.broker.clone({"repository": "local.test/acme/infra"})
@@ -2336,6 +2375,113 @@ class CollaborationTest(unittest.TestCase):
             ),
             recorder,
         )
+
+    def _claim_node(self, **overrides):
+        created = datetime.now(timezone.utc) - timedelta(seconds=60)
+        node = {
+            "number": 7,
+            "title": "Bump replicas",
+            "state": "open",
+            "user": {"login": "kube-agents[bot]"},
+            "head": {"ref": "platform-agent/bump"},
+            "base": {"ref": "main"},
+            "html_url": "https://github.com/acme/infra/pull/7",
+            "created_at": created.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        node.update(overrides)
+        return node
+
+    CLAIM_STATUS = subprocess.CompletedProcess(
+        ["gh"], 0, "", "github.com\n  ✓ Logged in to github.com account kube-agents[bot] (keyring)\n"
+    )
+    CLAIM = {"repository": "acme/infra", "url": "https://github.com/acme/infra/pull/7", "number": 7}
+
+    def test_proposal_claim_confirms_an_open_recent_proposal_of_its_own(self):
+        broker, recorder = self.broker(self.CLAIM_STATUS, self._claim_node())
+        answer = broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(
+            {"url": "https://github.com/acme/infra/pull/7", "number": 7, "title": "Bump replicas"}, answer
+        )
+        self.assertEqual(recorder.calls[0][1:3], ["auth", "status"])
+        self.assertEqual(recorder.path, "repos/acme/infra/pulls/7")
+        self.assertIn("proposal-claim", vcs_broker.VCS_VERBS)
+        self.assertNotIn("proposal-claim", vcs_broker.WRITE_VERBS)
+
+    def test_proposal_claim_refuses_each_failed_forge_check_with_409(self):
+        old = (datetime.now(timezone.utc) - timedelta(seconds=vcs_broker.CLAIM_WINDOW_SECONDS + 120))
+        ahead = (datetime.now(timezone.utc) + timedelta(seconds=vcs_broker.CLAIM_CLOCK_SKEW_SECONDS + 120))
+        for case, node in (
+            ("closed", self._claim_node(state="closed")),
+            ("merged", self._claim_node(state="closed", merged_at="2026-11-03T00:00:00Z")),
+            ("too old", self._claim_node(created_at=old.strftime("%Y-%m-%dT%H:%M:%SZ"))),
+            ("from the future", self._claim_node(created_at=ahead.strftime("%Y-%m-%dT%H:%M:%SZ"))),
+            ("no created time", self._claim_node(created_at="")),
+            ("someone else's", self._claim_node(user={"login": "stranger"})),
+            ("another url", self._claim_node(html_url="https://github.com/acme/infra/pull/8")),
+            ("another number", self._claim_node(number=8)),
+        ):
+            with self.subTest(case=case):
+                broker, _ = self.broker(self.CLAIM_STATUS, node)
+                with self.assertRaises(WorkspaceError) as caught:
+                    broker.proposal_claim(dict(self.CLAIM))
+                self.assertEqual(409, caught.exception.status)
+                self.assertEqual("CLAIM_NOT_CONFIRMED", caught.exception.fields.get("code"))
+        # A credential that names nobody confirms nothing.
+        nameless = subprocess.CompletedProcess(["gh"], 0, "", "github.com\n")
+        broker, _ = self.broker(nameless, self._claim_node())
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(409, caught.exception.status)
+
+    def test_proposal_claim_on_a_forge_that_cannot_name_its_account_answers_identity_unknown(self):
+        # Not a 409: the forge gave no verdict, and the code names the fix.
+        broker, recorder = self.broker(self._claim_node())
+        whoami = mock.Mock(side_effect=providers.IdentityUnknown("bitbucket"))
+        with mock.patch.object(broker, "_viewer", whoami):
+            with self.assertRaises(providers.IdentityUnknown) as caught:
+                broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(502, caught.exception.status)
+        self.assertEqual("FORGE_IDENTITY_UNKNOWN", caught.exception.fields.get("code"))
+        self.assertIn("Configure the forge's identity", str(caught.exception))
+        self.assertEqual(1, whoami.call_count, "not retried as transient")
+        self.assertEqual([], recorder.calls, "no proposal-view after the refusal")
+
+    BAD_GATEWAY = subprocess.CompletedProcess(["gh"], 1, "", "gh: Bad Gateway (HTTP 502)")
+
+    def test_proposal_claim_asks_the_forge_once_more_after_a_transient_failure(self):
+        # The token is spent before the check, so one 502 must not lose the claim.
+        for case, answers in (
+            ("proposal-view", (self.CLAIM_STATUS, self.BAD_GATEWAY, self._claim_node())),
+            ("whoami", (self.BAD_GATEWAY, self.CLAIM_STATUS, self._claim_node())),
+        ):
+            with self.subTest(case=case):
+                broker, recorder = self.broker(*answers)
+                answer = broker.proposal_claim(dict(self.CLAIM))
+                self.assertEqual(7, answer["number"])
+                self.assertEqual(3, len(recorder.calls))
+
+    def test_proposal_claim_fails_with_the_forges_error_after_two_transient_failures(self):
+        broker, recorder = self.broker(self.CLAIM_STATUS, self.BAD_GATEWAY, self.BAD_GATEWAY, self._claim_node())
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual(503, caught.exception.status)
+        self.assertEqual("FORGE_UNAVAILABLE", caught.exception.fields.get("code"))
+        self.assertEqual(3, len(recorder.calls), "one retry, not two")
+
+    def test_proposal_claim_does_not_retry_a_refusal_that_is_not_transient(self):
+        not_found = subprocess.CompletedProcess(["gh"], 1, "", "gh: Not Found (HTTP 404)")
+        broker, recorder = self.broker(self.CLAIM_STATUS, not_found, self._claim_node())
+        with self.assertRaises(WorkspaceError) as caught:
+            broker.proposal_claim(dict(self.CLAIM))
+        self.assertEqual("FORGE_NOT_FOUND", caught.exception.fields.get("code"))
+        self.assertEqual(2, len(recorder.calls))
+
+    def test_the_claims_transient_codes_are_the_agent_sides(self):
+        try:
+            import forge
+        except ImportError as exc:  # pragma: no cover -- forge imports the sandbox helpers
+            self.skipTest(f"forge is not importable here: {exc}")
+        self.assertEqual(forge.TRANSIENT_CODES, vcs_broker.CLAIM_TRANSIENT_CODES)
 
     def test_only_the_api_subcommand_is_ever_invoked(self):
         # A forge CLI's higher-level subcommands infer a repository from a

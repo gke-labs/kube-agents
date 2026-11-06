@@ -31,15 +31,20 @@ func summaryCR() map[string]any {
 		},
 		"status": map[string]any{
 			"conditions": []any{map[string]any{"type": "Ready", "status": "True"}},
+			"inference":  map[string]any{"provider": "vertex_ai", "model": "claude-opus-5"},
 			"usage": map[string]any{
 				"clustersRegistered": int64(3), "clustersMonitored": int64(2),
 				"chatMessagesInboundTotal": int64(41), "sessionsTotal": int64(7),
-				"toolExecutionsTotal": int64(19127), "eventsIngestedTotal": int64(10),
+				"chatSessionsTotal":   int64(4),
+				"toolExecutionsTotal": int64(19127), "toolExecutionsBlockedTotal": int64(142), "brokerFailuresTotal": int64(3),
+				"eventsIngestedTotal": int64(10), "chatTurnsErroredTotal": int64(2), "backgroundTasksGaveUpTotal": int64(1), "negativeFeedbackTotal": int64(0),
 				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
 				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
 				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
-				"lastActiveTime":   "2026-10-21T11:34:06Z",
-				"activeInterfaces": []any{"slack", "googlechat"},
+				"peopleSeen7d": int64(3), "peopleSeen30d": int64(11),
+				"lastActiveTime":      "2026-10-21T11:34:06Z",
+				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
+				"activeInterfaces":    []any{"slack", "googlechat"},
 			},
 		},
 	}
@@ -128,13 +133,16 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 	}
 	for _, want := range []string{
 		"kube-agents usage & feedback summary (2026-10-21)",
-		"  version: 0.14.0", "  mode: next", "  kubernetes: v1.33.4-gke.1234000",
+		"  version: 0.14.0", "  mode: next", "\n  model: vertex_ai/claude-opus-5\n", "  kubernetes: v1.33.4-gke.1234000",
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
-		"  toolExecutionsTotal: 19127", "  sessionsTotal: 7", "  remediationsProposedTotal: 4\n",
+		"  toolExecutionsTotal: 19127\n  toolExecutionsBlockedTotal: 142\n  brokerFailuresTotal: 3\n",
+		"  eventsIngestedTotal: 10\n  chatTurnsErroredTotal: 2\n  backgroundTasksGaveUpTotal: 1\n  negativeFeedbackTotal: 0\n",
+		"  sessionsTotal: 7\n  chatSessionsTotal: 4\n", "  remediationsProposedTotal: 4\n",
 		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
 		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
 		"  proposalHumanTouches: 5 (as the forge reports)\n",
-		"  lastActive: 2026-10-21T11:34:06Z",
+		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
+		"  lastActive: 2026-10-21T11:34:06Z\n  lastHumanActive: 2026-10-20T09:15:00Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
@@ -155,17 +163,23 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 
 func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 	cr := summaryCR()
-	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0)}
+	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0), "peopleSeen7d": int64(0)}
 	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
 	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"} {
 		if want := "  " + reading + ": no reading (as the forge reports)\n"; !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
 	}
-	if want := "  remediationsOpen: 0 (as the forge reports)\n"; !strings.Contains(text, want) {
-		t.Errorf("block lacks %q:\n%s", want, text)
+	for _, want := range []string{
+		"  remediationsOpen: 0 (as the forge reports)\n",
+		"  peopleSeen7d: 0 (as the gateway reports)\n",
+		"  peopleSeen30d: no reading (as the gateway reports)\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
 	}
-	for _, counter := range []string{"clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"} {
+	for _, counter := range []string{"clustersRegistered", "chatSessionsTotal", "toolExecutionsTotal", "remediationsProposedTotal"} {
 		if want := "  " + counter + ": 0\n"; !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -182,13 +196,74 @@ func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  lastActive: never", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
 	}
 	if len(strings.Split(text, "\n")) > usageSummaryMaxLines {
 		t.Fatal("block over the cap")
+	}
+}
+
+// TestRenderUsageSummaryModelLineReadsStatusInference: the line is the
+// status pair; a present-but-empty key and an absent key both print
+// unavailable, since the gateway reads no LiteLLM config to fall back to.
+func TestRenderUsageSummaryModelLineReadsStatusInference(t *testing.T) {
+	for name, inference := range map[string]any{
+		"empty":         map[string]any{},
+		"provider only": map[string]any{"provider": "vertex_ai"},
+		"not a map":     "vertex_ai/claude-opus-5",
+		"absent":        nil,
+	} {
+		cr := summaryCR()
+		status := cr["status"].(map[string]any)
+		if inference == nil {
+			delete(status, "inference")
+		} else {
+			status["inference"] = inference
+		}
+		text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+		if !strings.Contains(text, "\n  model: unavailable\n") {
+			t.Errorf("%s: block lacks the unavailable model line:\n%s", name, text)
+		}
+	}
+	if text := renderUsageSummary(summaryNow, map[string]any{}, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\n  model: unavailable\n") {
+		t.Errorf("an empty resource must print the unavailable model line:\n%s", text)
+	}
+}
+
+// TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys: the environment
+// block prints usageSummaryEnvironmentKeys in order, one line each, and the
+// whole block stays under the cap with the model line in it.
+func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryCR(), "v1", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	env := strings.SplitN(strings.SplitN(text, "environment:\n", 2)[1], "\nusage:", 2)[0]
+	var keys []string
+	for _, line := range strings.Split(env, "\n") {
+		keys = append(keys, strings.TrimSpace(strings.SplitN(line, ":", 2)[0]))
+	}
+	if strings.Join(keys, ",") != strings.Join(usageSummaryEnvironmentKeys, ",") {
+		t.Fatalf("environment keys = %v, want %v", keys, usageSummaryEnvironmentKeys)
+	}
+	if n := len(strings.Split(text, "\n")); n > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines, cap %d", n, usageSummaryMaxLines)
+	}
+}
+
+// TestUsageSummaryWithoutModelLineDropsExactlyThatLine: the audit's input is
+// the block less the one model line; every other line stays audited.
+func TestUsageSummaryWithoutModelLineDropsExactlyThatLine(t *testing.T) {
+	text := "```\n  mode: today\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutModelLine(text)
+	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
+		t.Fatalf("usageSummaryWithoutModelLine = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 1; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped more than one line: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
 	}
 }
 
@@ -354,6 +429,25 @@ func TestFeedbackSummaryRefusesALeakAndSaysWhyWithoutNamingIt(t *testing.T) {
 	waitFor(t, "refusal", postedContaining(r, usageSummaryRefusedNotice))
 	if postedContaining(r, usageSummaryTitle)() {
 		t.Fatal("the block was posted although it named an identifier")
+	}
+}
+
+// TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName: the
+// model line is printed by design, so a deployment name that carries a spec
+// identifier as a segment does not stop the block.
+func TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName(t *testing.T) {
+	r := startRig(t)
+	cr := summaryCR()
+	cr["status"].(map[string]any)["inference"] = map[string]any{"provider": "hosted_vllm", "model": "prod-eu-1/llama-8b"}
+	r.g.usage = fakeUsageSource{cr: cr, version: "v1"}
+	conv := "discord:g1/thread-fbs4"
+	sessionRigTurn(r, conv, "fbs-130", "/feedback summary")
+	waitFor(t, "summary", postedContaining(r, usageSummaryTitle))
+	if !postedContaining(r, "  model: hosted_vllm/prod-eu-1/llama-8b")() {
+		t.Fatal("the block must carry the model line from status.inference")
+	}
+	if postedContaining(r, usageSummaryRefusedNotice)() {
+		t.Fatal("the model line must not be the reason a block is refused")
 	}
 }
 

@@ -958,8 +958,11 @@ func TestBuildDeployment(t *testing.T) {
 	if _, ok := volumesMap["fluent-bit-config"]; !ok {
 		t.Errorf("expected fluent-bit-config volume, not found")
 	}
-	if _, ok := volumesMap["fluent-bit-state"]; !ok {
-		t.Errorf("expected fluent-bit-state volume, not found")
+	if _, ok := volumesMap["fluent-bit-state"]; ok {
+		// The tail cursors live on the system-metadata claim now
+		// (TestFluentBitKeepsItsCursorsOnTheMetadataClaim); an emptyDir here would
+		// lose them with the pod again.
+		t.Errorf("fluent-bit-state emptyDir is back; the tail cursors belong on the system-metadata claim")
 	}
 	if _, ok := volumesMap["system-metadata"]; !ok {
 		t.Errorf("expected system-metadata volume, not found")
@@ -1264,6 +1267,36 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
+	// The site documents CRON_IDLE_THROTTLE_DAYS and CRON_IDLE_HIBERNATE_DAYS
+	// as spec.deployment.env entries, and the opt-out for an install driven
+	// only through the A2A inject door is the throttle at 0; neither reaches
+	// the ticker except through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_IDLE_THROTTLE_DAYS", Value: "0"},
+		{Name: "CRON_IDLE_HIBERNATE_DAYS", Value: "30"},
+	})
+	if len(got) != 2 || got[0].Name != "CRON_IDLE_THROTTLE_DAYS" || got[0].Value != "0" ||
+		got[1].Name != "CRON_IDLE_HIBERNATE_DAYS" || got[1].Value != "30" {
+		t.Fatalf("expected both cron idle thresholds to survive the allowlist, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
+	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
+	// reconcile run scaffolds; the site documents it as a spec.deployment.env
+	// entry, which only reaches the agent container through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", Value: "25"},
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "BOOTSTRAP_MAX_CREATES_PER_TICK" || got[0].Value != "25" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal BOOTSTRAP_MAX_CREATES_PER_TICK=25 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1475,6 +1508,71 @@ func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
 	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
 	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
 		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
+	// agent_roster.py reads the threshold from the agent container's own
+	// environment (and the router MCP child's, through the chat config's env
+	// block); off the allowlist, the documented spec.deployment.env entry never
+	// reaches either.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD", Value: "1"}})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD" || got[0].Value != "1" {
+		t.Errorf("expected KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD=1 to pass, got %#v", got)
+	}
+	// Literal values only, as for every name on the list.
+	got = safeSandboxEnvOverrides([]corev1.EnvVar{{
+		Name:      "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "n"}},
+	}})
+	if len(got) != 0 {
+		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
+	}
+}
+
+// dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
+// the platform container's env, in order.
+func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
+	t.Helper()
+	pod := buildPodTemplateSpec(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{})
+	container := containerByName(t, pod.Spec.Containers, "platform-agent")
+	var values []string
+	for _, env := range container.Env {
+		if env.Name == "INCIDENT_WORKLOAD_DEDUP_SECONDS" {
+			values = append(values, env.Value)
+		}
+	}
+	return values
+}
+
+func TestPlatformContainerFoldsWorkloadEventsByDefault(t *testing.T) {
+	// The window is on for every install at an hour, as the daemon's own
+	// fallback and the chart's key both say; the Deployment shows the value.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "3600" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=3600 entry, got %v", got)
+	}
+}
+
+func TestPlatformContainerDedupWindowOverrideReplacesTheDefault(t *testing.T) {
+	// A spec.deployment.env entry replaces the default rather than joining it:
+	// the API server refuses a duplicate env name, and "0" has to turn it off.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "0"}},
+			},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "0" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=0 entry, got %v", got)
 	}
 }
 
@@ -2553,6 +2651,86 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+// The tail cursors survive the pod. The sidecar keeps both DB files in a
+// per-agent directory on the system-metadata claim, read-write, and the
+// rendered config points each input at that directory; an emptyDir would start
+// every replacement pod from byte zero, and the agent's data claim is mounted
+// at its root by containers that run model-authored code, which could rewrite
+// a cursor into a file SQLite cannot open. So the claim's only other mounts
+// stay at subPath session, which is the isolation this test holds.
+func TestFluentBitKeepsItsCursorsOnTheMetadataClaim(t *testing.T) {
+	// The dashboard is on by default, so the isolation check below sees it.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	if !isDashboardEnabled(agent) {
+		t.Fatal("the dashboard must render here for the isolation check to cover it")
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	pod := dep.Spec.Template.Spec
+
+	const wantSubPath = "fluent-bit-state/my-agent"
+	fb := containerByName(t, pod.Containers, "fluent-bit")
+	var stateMounts []corev1.VolumeMount
+	for _, m := range fb.VolumeMounts {
+		if m.Name == "system-metadata" {
+			stateMounts = append(stateMounts, m)
+		}
+	}
+	if len(stateMounts) != 1 {
+		t.Fatalf("fluent-bit mounts system-metadata %d times, want 1: %+v", len(stateMounts), fb.VolumeMounts)
+	}
+	got := stateMounts[0]
+	if got.MountPath != "/var/lib/fluent-bit" || got.SubPath != wantSubPath || got.ReadOnly {
+		t.Errorf("fluent-bit's system-metadata mount is %+v, want /var/lib/fluent-bit at subPath %s, read-write", got, wantSubPath)
+	}
+
+	// The per-agent directory is reached by this container alone. Every other
+	// container in the pod, init containers included, mounts the claim at
+	// subPath session or not at all; a root mount or a second subPath into
+	// fluent-bit-state would hand the cursors to a container the sidecar does not
+	// trust.
+	all := append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...)
+	for _, c := range all {
+		if c.Name == "fluent-bit" {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if m.Name == "system-metadata" && m.SubPath != "session" {
+				t.Errorf("container %s mounts system-metadata at subPath %q; only fluent-bit may leave session", c.Name, m.SubPath)
+			}
+		}
+	}
+
+	// Both inputs keep their positions under the mount, each in its own locked
+	// file; a DB on the read-only root or on a path that is not mounted would
+	// fail to open at start. The journal mode is the rollback journal, not WAL:
+	// the claim is a gofer-backed mount under a runtime class, where WAL mode
+	// corrupts (sqliteJournalModeDelete), and a corrupt cursor on a claim
+	// outlives the pod.
+	fbConf := buildFluentBitConfigMap(agent).Data["fluent-bit.conf"]
+	inputs := fluentBitSections(fbConf, "[INPUT]")
+	if len(inputs) != 2 {
+		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2:\n%s", len(inputs), fbConf)
+	}
+	wantDB := map[string]string{
+		"agent.logs":  "/var/lib/fluent-bit/fluent-bit.db",
+		"agent.audit": "/var/lib/fluent-bit/fluent-bit-audit.db",
+	}
+	for _, section := range inputs {
+		tag := fluentBitField(section, "Tag")
+		if db := fluentBitField(section, "DB"); db != wantDB[tag] {
+			t.Errorf("the %s input's DB is %q, want %q:\n%s", tag, db, wantDB[tag], section)
+		}
+		if locking := fluentBitField(section, "DB.locking"); locking != "true" {
+			t.Errorf("the %s input's DB.locking is %q, want true:\n%s", tag, locking, section)
+		}
+		if mode := fluentBitField(section, "DB.journal_mode"); mode != "delete" {
+			t.Errorf("the %s input's DB.journal_mode is %q, want delete:\n%s", tag, mode, section)
+		}
 	}
 }
 
@@ -5927,6 +6105,34 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
 			}
 		})
+	}
+}
+
+// The chart's platformAgent.deployment.eventWatcher renders the watcher's tuning
+// settings as WATCHER_* entries in spec.deployment.env, and
+// deploy/shared/start-services.sh reads them in this container. So each entry,
+// a valueFrom entry included, has to arrive here once and unchanged: a reserved
+// name or a prefix filter would make every chart setting do nothing.
+func TestDeploymentEnvReachesTheEventWatcherSettings(t *testing.T) {
+	fromConfigMap := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "watcher"}, Key: "span",
+	}}
+	custom := []corev1.EnvVar{
+		{Name: "WATCHER_SETTLE", Value: "3m"},
+		{Name: "WATCHER_BACKOFF_MIN_COUNT", Value: "4"},
+		{Name: "WATCHER_FAILEDSCHEDULING_MIN_SPAN", ValueFrom: fromConfigMap},
+	}
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: custom}
+
+	got := map[string][]corev1.EnvVar{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		got[e.Name] = append(got[e.Name], e)
+	}
+	for _, want := range custom {
+		if entries := got[want.Name]; len(entries) != 1 || !reflect.DeepEqual(entries[0], want) {
+			t.Errorf("agent-api-auth env %s = %+v, want exactly %+v", want.Name, entries, want)
+		}
 	}
 }
 

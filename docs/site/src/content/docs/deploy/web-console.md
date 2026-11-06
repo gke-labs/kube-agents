@@ -5,9 +5,13 @@ sidebar:
   order: 9
 ---
 
-The web console is a browser workspace for reviewing incident triage and talking to the agent inside your cluster. Use it on evaluation clusters, workshops, or environments where Slack or Google Chat is not set up yet. It is off by default and reached over `kubectl port-forward`. It is distinct from the A2A console, which a `spec.mode: next` install serves without a flag; [User interfaces](/kube-agents/reference/user-interfaces/) compares the two and the other browser pages.
+The web console is a browser workspace for reviewing incident triage and talking to the agent inside your cluster. Use it on evaluation clusters, workshops, or environments where Slack or Google Chat is not set up yet. It is off by default and reached over `kubectl port-forward`.
 
 <video controls loop muted playsinline preload="metadata" style="width: 100%; border-radius: 8px; border: 1px solid var(--sl-color-hairline);" src="/kube-agents/web-console-demo.mp4"></video>
+
+:::note
+The web console is distinct from the A2A console, which a `spec.mode: next` install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
+:::
 
 ## Turn it on and open it
 
@@ -76,6 +80,8 @@ Select **Feedback** or **Bugs** to draft a bug report, feature request, or quest
 ## Access control and privacy
 
 The chart exposes the console only as a `ClusterIP` Service and blocks pod-network traffic to the console pod with a `NetworkPolicy`. Apart from its health check, the server refuses HTTP requests whose `Host` header is not `localhost`, `127.0.0.1`, or `::1`, and requires `X-Kube-Agents-Console: 1` plus a matching `Origin` on `POST` routes. Never expose the console through an unauthenticated LoadBalancer, Ingress, or NodePort. The console holds the agent's API key on the server and (when `webConsole.environment.enabled` is true, the default) `get` and `patch` permissions on the `PlatformAgent` resource. Anyone who can reach it can drive the agent and change repository or model settings.
+
+On Kubernetes 1.30 and later, with `admissionPolicy.enabled` (the default), an admission policy holds the console to those settings. It may change only its own annotations and `spec.integration.forges`, `repositories` and `github`, and any other change it makes to the resource is refused.
 
 Because `kubectl port-forward` carries no end-user identity, the console has no login screen and runs every browser turn as the console itself. Access is governed by Kubernetes RBAC: opening the port-forward requires `pods/portforward` on the install namespace, which the built-in `edit` and `admin` roles grant alongside `pods/exec`.
 

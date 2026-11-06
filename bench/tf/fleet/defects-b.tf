@@ -452,10 +452,11 @@ resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
 # The price: every default-pool node recreate on seeded-b waits out the whole
 # drain before the old VM goes, which is the mechanism the entry describes and
 # is what the readiness report must flag. Compute Engine holds the delete for
-# the full drainingTimeoutSec, not GKE's 600 seconds. The reconcile pays it on
-# every patch roll, because the default pool follows local.lagging_version
-# (main.tf), and so does GKE's own auto-upgrade, which a REGULAR cluster cannot
-# turn off. So the value has to stay inside what that roll survives, and 3600
+# the full drainingTimeoutSec, not GKE's 600 seconds. The reconcile pays it
+# whenever the pool's version moves, at a minor roll and after GKE's own
+# auto-upgrade moves the master, because the default pool follows
+# local.lagging_version (main.tf); GKE's node auto-upgrade, which a REGULAR
+# cluster cannot turn off, pays it too. So the value has to stay inside what that roll survives, and 3600
 # did not: on 2026-10-27 the instance group manager flagged the old node at
 # 09:25:40 UTC, Compute Engine deleted it at 10:26:42, and GKE had already
 # ended the UPGRADE_NODES `Failed to update node pool` at 09:55:52, about 30

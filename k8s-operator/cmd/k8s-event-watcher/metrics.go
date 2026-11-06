@@ -120,10 +120,30 @@ type metrics struct {
 	// CAs), so watching only one of them leaves half the surface dark.
 	clusterDiscoveryErrors *prometheus.CounterVec
 	clusterUp              *prometheus.GaugeVec
+	// relists counts the backlog re-reads a cluster's reflector made after its
+	// initial delivery, paged lists and watch-list streams alike; before it
+	// nothing distinguished a relist loop from a quiet cluster.
+	relists *prometheus.CounterVec
 	// processStart is processStartTimeMetric, set once in newMetrics, which
 	// runs at process start, and constant for the life of the process by
 	// construction.
 	processStart prometheus.Gauge
+	// The fleet's shape, set by the fleet-shape probe (fleetshape.go) every
+	// --fleet-shape-interval and read between probes: plain gauges rather
+	// than per-cluster ones, because what they exist to answer is the size
+	// of the whole fleet (published for an automatic sizing profile the
+	// operator will read; nothing projects them yet), and
+	// per-cluster series would be one more family that grows with the
+	// fleet. fleetShapeClusters{outcome} says how many clusters the totals
+	// hold (counted) and how many they leave out (failed), so a total read
+	// beside a failed count above zero is read as partial. All six are 0
+	// until the first probe finishes, which counted=0 says.
+	fleetNodes           prometheus.Gauge
+	fleetMaxClusterNodes prometheus.Gauge
+	fleetControllers     prometheus.Gauge
+	fleetPods            prometheus.Gauge
+	fleetMaxClusterPods  prometheus.Gauge
+	fleetShapeClusters   *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -180,7 +200,7 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_settle_outcomes_total",
-			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting in the family was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
@@ -241,12 +261,44 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_up",
 			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server), while the API server refuses its events list or watch with 403 Forbidden and the informer is held between attempts, or once it has stopped.",
 		}, []string{"cluster", "project", "location"}),
+		relists: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_relists_total",
+			Help: "Full re-reads of a cluster's Event backlog after its initial sync, as a paged list or a new watch-list stream: the watch could not be resumed or the stream failed.",
+		}, []string{"cluster", "project", "location"}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeMetric,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
+		fleetNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_nodes",
+			Help: "Nodes across the clusters counted in the last fleet-shape probe: each cluster's currentNodeCount from its GKE description, summed. The direct cluster contributes 0 until a profile names it. 0 until the first probe finishes.",
+		}),
+		fleetMaxClusterNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_nodes",
+			Help: "The largest single cluster's node count in the last fleet-shape probe.",
+		}),
+		fleetControllers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_controllers",
+			Help: "Deployments, StatefulSets, DaemonSets and CronJobs across the clusters counted in the last fleet-shape probe, read as one-item metadata-only lists plus the server's remainingItemCount.",
+		}),
+		fleetPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_pods",
+			Help: "Pods across the clusters counted in the last fleet-shape probe, read the same way.",
+		}),
+		fleetMaxClusterPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_pods",
+			Help: "The largest single cluster's pod count in the last fleet-shape probe.",
+		}),
+		fleetShapeClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_shape_clusters",
+			Help: "Clusters in the last fleet-shape probe by outcome: counted (every read answered; in the totals) or failed (a describe or a list failed or timed out; left out of the totals, so a failed count above 0 means the totals are partial). counted=0 and failed=0 is no probe finished yet.",
+		}, []string{"outcome"}),
 	}
 	m.processStart.Set(processStartSeconds(time.Now()))
+	// Both children from the first scrape, so a reader finds counted=0
+	// before the first probe rather than an absent series.
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(0)
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(0)
 	reg.MustRegister(
 		m.eventsSeen,
 		m.eventsFiltered,
@@ -265,9 +317,27 @@ func newMetrics() *metrics {
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,
+		m.relists,
 		m.processStart,
+		m.fleetNodes,
+		m.fleetMaxClusterNodes,
+		m.fleetControllers,
+		m.fleetPods,
+		m.fleetMaxClusterPods,
+		m.fleetShapeClusters,
 	)
 	return m
+}
+
+// publishFleetShape sets the six fleet gauges from one probe's reading.
+func (m *metrics) publishFleetShape(shape fleetShape) {
+	m.fleetNodes.Set(float64(shape.nodes))
+	m.fleetMaxClusterNodes.Set(float64(shape.maxClusterNodes))
+	m.fleetControllers.Set(float64(shape.controllers))
+	m.fleetPods.Set(float64(shape.pods))
+	m.fleetMaxClusterPods.Set(float64(shape.maxClusterPods))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(float64(shape.counted))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(float64(shape.failed))
 }
 
 // deleteClusterGauges drops the two gauge series labelled with one cluster's

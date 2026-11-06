@@ -426,7 +426,7 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
 		"a2a gateway":        buildA2AGatewayRole(agent).Rules,
-		"a2a callout":        buildA2ACalloutRole(agent).Rules,
+		"a2a callout":        buildA2ACalloutRole(agent, 1).Rules,
 		"broker tokenreview": buildCredentialBrokerTokenReviewRole(agent).Rules,
 		"platform minimal":   buildMinimalPlatformRole(agent).Rules,
 		"platform local":     buildPlatformLocalRole(agent).Rules,
@@ -590,6 +590,43 @@ func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 	}
 }
 
+// TestPeopleSeenOffIsTheOnlyRenderedState: telemetry.peopleSeen=false
+// reaches the gateway as its off switch on a gateway with Slack not armed,
+// so the env does not hang off a backend; unset or true renders nothing.
+func TestPeopleSeenOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name    string
+		value   *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", ptr.To(true), "", false},
+		{"false", ptr.To(false), "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", false)
+			if tc.value != nil {
+				agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: tc.value}
+			}
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aPeopleSeenEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aPeopleSeenEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+	t.Run("false with Slack armed", func(t *testing.T) {
+		agent := slackTestAgent("next", true)
+		agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: ptr.To(false)}
+		env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+		if got, ok := env[a2aPeopleSeenEnvVar]; !ok || got.Value != "false" {
+			t.Errorf("%s = %q (rendered %v), want \"false\" (rendered true)", a2aPeopleSeenEnvVar, got.Value, ok)
+		}
+	})
+}
+
 // TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
 // to "is every Slack member allowed", whichever consumer the mode renders.
 func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
@@ -744,7 +781,9 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed: the agent is told
 // to route Slack's proactive posts through chat.notify exactly when the
-// gateway holds Slack AND the home channel is a channel id, and the kanban
+// gateway holds Slack AND the home channel is a channel id or unset (Slack is
+// then the only chat platform, and the gateway keeps the refused posts for
+// the digest), and the kanban
 // notifier to send a card's report back to its conversation whenever the
 // gateway arms Slack's route (home channel unset or a channel id). Otherwise
 // posts would go to a subject nobody answers. Chat holding the gateway routes
@@ -763,7 +802,7 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), false, false},
 		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), true, true},
 		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), true, true},
-		{"next with slack, no home channel", slackTestAgent("next", true), false, true},
+		{"next with slack, no home channel", slackTestAgent("next", true), true, true},
 		{"next with slack, a DM", withSlackHome(slackTestAgent("next", true), "D0DM"), false, false},
 		{"next with slack, a name", withSlackHome(slackTestAgent("next", true), "#ops"), false, false},
 		{"next without slack", withSlackHome(slackTestAgent("next", false), "C0HOME"), false, false},
@@ -784,9 +823,13 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 				t.Error("the notify route and the legacy Hermes slack platform both render")
 			}
 			// The audit relay reads the home channel from the agent's env; under
-			// next it rides with the home route, trimmed and validated.
-			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
+			// next it rides with the home route, trimmed and validated, and is
+			// absent rather than empty when the CR names none.
+			crHome := strings.TrimSpace(tc.agent.Spec.Integration.Slack.HomeChannel)
+			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && crHome != "" && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
 				t.Errorf("SLACK_HOME_CHANNEL = %q (present=%v), want the home channel id beside %s", home.Value, ok, a2aNotifyPlatformEnvVar)
+			} else if ok && crHome == "" {
+				t.Errorf("SLACK_HOME_CHANNEL = %q rendered with no channel in the CR", home.Value)
 			}
 		})
 	}

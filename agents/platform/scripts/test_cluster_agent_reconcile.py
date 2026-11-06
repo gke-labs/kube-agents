@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import random
 import time
 from datetime import datetime, timezone
 import os
@@ -25,6 +26,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
+
+
+def _delete_each(names):
+    """The prune's batch, forwarded to delete_profile one name at a time in the
+    batch's order, so these tests' patches of delete_profile see every prune.
+    delete_profiles itself is tested in test_cluster_agent_profile.py, and
+    PruneBatchTest below checks the reconcile hands it the whole prune at once."""
+    return {name: rec.delete_profile(name) or "deleted" for name in sorted(set(names))}
+
+
+rec.delete_profiles = _delete_each
 
 # The ScopeTest timing tests prove "these lookups overlapped" and "the run went on without
 # this one" by synchronising with the stubbed lookups rather than timing them: a stub meets
@@ -216,6 +228,27 @@ def _name_for(identity_kwargs, identities):
             return name
     raise KeyError(identity_kwargs)
 
+
+class PruneBatchTest(HomesMixin):
+    """The reconcile hands its whole prune to delete_profiles in one call (#4574)."""
+
+    def test_every_pruned_name_goes_in_one_batch(self):
+        profiles = ["cluster-a", "cluster-b", "cluster-c", "cluster-live"]
+        identities = {n: _identity(cluster=n.split("-", 1)[1]) for n in profiles}
+        existence = {"cluster-a": False, "cluster-b": False, "cluster-c": False, "cluster-live": True}
+        batches = []
+        with mock.patch.object(rec, "delete_profiles", side_effect=lambda names: batches.append(list(names)) or {}):
+            report, deleted = ReconcileTest._run(self, profiles, identities, existence)
+        self.assertEqual(batches, [["cluster-a", "cluster-b", "cluster-c"]])
+        self.assertEqual(deleted, [])  # not one delete_profile per name
+        self.assertEqual(sorted(report["pruned"]), ["cluster-a", "cluster-b", "cluster-c"])
+
+    def test_a_dry_run_deletes_nothing(self):
+        profiles = ["cluster-a"]
+        identities = {"cluster-a": _identity(cluster="a")}
+        with mock.patch.object(rec, "delete_profiles", side_effect=AssertionError("a dry run deleted")):
+            report, _ = ReconcileTest._run(self, profiles, identities, {"cluster-a": False}, dry_run=True)
+        self.assertEqual(report["pruned"], ["cluster-a"])
 
 class CreateDirectionTest(HomesMixin):
     def test_creates_missing_including_the_management_cluster(self):
@@ -602,6 +635,32 @@ class ClusterExistsTest(unittest.TestCase):
     def test_unknown_on_timeout(self):
         with self._stub(side_effect=subprocess.TimeoutExpired("gcloud", 30)):
             self.assertIsNone(rec._cluster_exists("p", "c", "us-central1"))
+
+    def test_the_describe_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # The cap holds no admission wait, but the watermark gate's 429 is answered
+        # at once and the shim's default admits three or four of its waits, so the
+        # describe passes its cap less the broker's gcloud run bound: 0 at the
+        # default and at any prune budget under the run bound, and the gate's
+        # refusal is logged with its reason instead of as a timeout.
+        client = rec.credential_proxy_client
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            self.assertIs(rec._cluster_exists("p", "c", "us-central1"), True)
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.DESCRIBE_TIMEOUT_SECONDS)
+        deadline = max(0, rec.DESCRIBE_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: str(deadline)}, run.call_args.kwargs["remote_env"])
+        self.assertEqual("0", run.call_args.kwargs["remote_env"][client.RETRY_DEADLINE_ENV])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # The gate's shortest wait, half a 5 s Retry-After, does not fit it either.
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # A describe under the prune budget derives the deadline from the cap it is given.
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=7.5)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=rec.BROKER_GCLOUD_RUN_SECONDS + 20)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "20"}, run.call_args.kwargs["remote_env"])
 
 
 class ReadClusterIdentityTest(unittest.TestCase):
@@ -2030,6 +2089,14 @@ class ScopeTest(HomesMixin):
         with mock.patch.object(rec.sandbox_exec, "run", return_value=cut), mock.patch.object(rec, "log") as logged:
             self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
         self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        # The shipped shim exits 74 on a cut reply, which `check=True` raises; the marker is
+        # still read first, so the log names the cap rather than a failed call.
+        cut_74 = subprocess.CalledProcessError(74, ["gcloud"], output='[{"name": "//container.googleapis.com/projects/a/locations/l/clu',
+                                               stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+        with mock.patch.object(rec.sandbox_exec, "run", side_effect=cut_74), mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
+        self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        self.assertNotIn("Cloud Asset Inventory failed", " ".join(str(c) for c in logged.call_args_list))
         for stderr, want in (("PERMISSION_DENIED", rec.OUTCOME_DENIED),
                              ("Cloud Asset API has not been used in project 1 before or it is disabled", rec.OUTCOME_API_DISABLED),
                              ("connection reset", rec.OUTCOME_UNREACHABLE)):
@@ -2061,11 +2128,27 @@ class ScopeTest(HomesMixin):
                 lookup()
             self.assertEqual(runner.call_args[0][0], argv)
             self.assertTrue(runner.call_args[1]["check"])
+            # A COMMAND_RUNNER sets the shim's deadline in its own environment (scope_publisher).
+            self.assertNotIn("remote_env", runner.call_args[1])
             sandboxed.assert_not_called()
             with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="", stderr="")) as sandboxed, \
                     mock.patch.object(rec, "log"):
                 lookup()
             self.assertEqual(sandboxed.call_args[0][0], argv)
+            self.assertEqual(
+                {rec.credential_proxy_client.RETRY_DEADLINE_ENV: str(rec.SHIM_RETRY_DEADLINE_SECONDS)},
+                sandboxed.call_args[1]["remote_env"],
+            )
+
+    def test_the_lookups_cap_leaves_the_shim_no_retry(self):
+        # The cap holds one admission wait and part of one gcloud run, so the
+        # deadline the lookups pass admits not even a refusal answered at once.
+        client = rec.credential_proxy_client
+        deadline = float(rec.SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, rec.LIST_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
     def test_the_notification_counts_unlisted_projects_past_a_limit_and_names_containers(self):
         report = {"created": ["cluster-x"], "pruned": [], "create_failed": [], "skipped_error": [],
@@ -3489,6 +3572,176 @@ class ProjectSourceTest(unittest.TestCase):
                     mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
                     mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
                 self.assertEqual(rec._project_source(), (None, False))
+
+    def test_the_gcloud_config_fallback_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # With no operator project the fallback asks the broker's gcloud config under a
+        # 30 s cap, which holds no admission wait; the watermark gate's 429 chain would
+        # still carry it past the cap on a high Retry-After draw, so the lookup passes
+        # its cap less the broker's gcloud run bound and a refusal fails at once.
+        client = rec.credential_proxy_client
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="from-config\n")) as run:
+            self.assertEqual(rec._project_source(), ("from-config", False))
+        self.assertEqual(run.call_args.args[0], ["gcloud", "config", "get-value", "project"])
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.PROJECT_LOOKUP_TIMEOUT_SECONDS)
+        deadline = rec.PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS
+        self.assertEqual(max(0, rec.PROJECT_LOOKUP_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
+
+
+class CreateCapTest(unittest.TestCase):
+    """The per-run create cap: a fleet too large for one run arrives in batches.
+
+    The bootstrap gate runs this script under a ceiling and SIGKILLs it on expiry,
+    so a run that tries to scaffold every missing profile at once on a large fleet
+    dies mid-run every tick. The cap bounds the run; the rest is deferred to the
+    next one, which finds those clusters still without a profile. Under
+    `--require-create-pass` a run that deferred exits EXIT_CREATES_DEFERRED, which
+    the gate reads as "ask again", never as a failed attempt.
+    """
+
+    CAP = 100
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.created: list[str] = []
+        self.clusters = [("p", f"c{i:03d}", "us-central1") for i in range(250)]
+
+    def _identity_of(self, home: Path):
+        name = home.name
+        if name not in self.created:
+            return None
+        return _identity(cluster=name[len("cluster-"):])
+
+    def _run(self, argv=("x", "--require-create-pass"), create=None, dry_run=False):
+        """One reconcile over the fleet, with the profiles earlier runs made still there.
+
+        Returns (exit code or None, report); `create` may replace the scaffold stub.
+        """
+        report: dict = {}
+        real = rec.reconcile
+
+        def recording(dry_run=False):
+            report.update(real(dry_run=dry_run))
+            return report
+
+        def scaffold(pr, c, l):
+            name = f"cluster-{c}"
+            self.created.append(name)
+            return name
+
+        with mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp}), \
+             mock.patch.object(rec, "MAX_CREATES_PER_RUN", self.CAP), \
+             mock.patch.object(rec, "list_profiles", side_effect=lambda: list(self.created)), \
+             mock.patch.object(rec, "profile_home", side_effect=lambda name: Path(self.tmp) / name), \
+             mock.patch.object(rec, "read_cluster_identity", side_effect=self._identity_of), \
+             mock.patch.object(rec, "_scaffold_gaps", return_value=[]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing(self.clusters)), \
+             mock.patch.object(rec, "_cluster_exists", return_value=True), \
+             mock.patch.object(rec, "delete_profile", side_effect=AssertionError("nothing is pruned here")), \
+             mock.patch.object(rec, "create_profile", side_effect=create or scaffold), \
+             mock.patch.object(rec, "reconcile", side_effect=recording), \
+             mock.patch.object(rec.sys, "argv", list(argv) + (["--dry-run"] if dry_run else [])), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            try:
+                rec.main()
+            except SystemExit as e:
+                return e.code, report
+        return None, report
+
+    def test_250_missing_clusters_arrive_100_100_50_over_three_runs(self):
+        outcomes = [self._run() for _ in range(3)]
+        self.assertEqual([code for code, _ in outcomes], [rec.EXIT_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED, None])
+        self.assertEqual([len(report["created"]) for _, report in outcomes], [100, 100, 50])
+        self.assertEqual([len(report["create_deferred"]) for _, report in outcomes], [150, 50, 0])
+        self.assertEqual(len(set(self.created)), 250, "a cluster was scaffolded twice or not at all")
+        # The deferred list names the clusters the next run will take, in listing order.
+        self.assertEqual(outcomes[0][1]["create_deferred"][:2], ["c100/us-central1", "c101/us-central1"])
+        self.assertEqual(outcomes[0][1]["create_failed"], [])
+
+    def test_a_run_under_the_cap_defers_nothing_and_exits_zero(self):
+        self.clusters = self.clusters[:self.CAP]
+        code, report = self._run()
+        self.assertIsNone(code)
+        self.assertEqual(len(report["created"]), self.CAP)
+        self.assertEqual(report["create_deferred"], [])
+
+    def test_failed_creates_do_not_take_a_place_in_the_batch(self):
+        # Every create fails: all 250 are attempted, as they were before the cap, none is
+        # deferred, and the exit is the failed-roster one, which the gate counts as an
+        # attempt and can give up on.
+        def failing(pr, c, l):
+            raise SystemExit("ERROR: failed to fetch credentials")
+
+        code, report = self._run(create=failing)
+        self.assertEqual(len(report["create_failed"]), 250)
+        self.assertEqual(report["create_deferred"], [])
+        self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_a_failing_batch_beside_a_kept_profile_does_not_starve_the_rest(self):
+        # The starvation shape: one profile already on the roster, the first hundred clusters
+        # in listing order fail for good, and the rest can be made. The failures must not
+        # fill the batch, or the rest would be deferred on every run, each run exiting 5,
+        # and the gate would wait forever without spending an attempt.
+        self.created.append("cluster-kept")
+        self.clusters = [("p", "kept", "us-central1")] + self.clusters[:150]
+        scaffolded: list[str] = []
+
+        def failing_first_hundred(pr, c, l):
+            if int(c[1:]) < 100:
+                raise SystemExit("ERROR: failed to fetch credentials")
+            name = f"cluster-{c}"
+            self.created.append(name)
+            scaffolded.append(name)
+            return name
+
+        code, report = self._run(create=failing_first_hundred)
+        self.assertEqual(len(report["create_failed"]), 100)
+        self.assertEqual(len(scaffolded), 50, "the clusters behind the failing ones were never tried")
+        self.assertEqual(report["create_deferred"], [])
+        self.assertIsNone(code, "a partial failure beside a scaffolded roster reconciles, as before the cap")
+
+    def test_the_cron_path_exits_zero_and_defers_the_same(self):
+        code, report = self._run(argv=("x",))
+        self.assertIsNone(code)
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_a_dry_run_shows_the_cap_and_names_the_deferred(self):
+        code, report = self._run(dry_run=True)
+        self.assertEqual(code, rec.EXIT_CREATES_DEFERRED)
+        self.assertEqual(self.created, [], "a dry run scaffolded a profile")
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_the_notification_names_the_deferred_and_counts_the_rest(self):
+        text = rec._format_notification({"created": ["cluster-a"],
+                                         "create_deferred": [f"c{i}/us-central1" for i in range(rec.NOTIFY_UNLISTED_LIMIT + 2)]})
+        self.assertIn(f"{rec.NOTIFY_UNLISTED_LIMIT + 2} cluster(s) deferred to the next run", text)
+        self.assertIn("and 2 more", text)
+
+    def test_the_cap_is_read_from_the_environment_and_falls_back_on_nonsense(self):
+        # Read at import, so each value is checked in a fresh interpreter.
+        def cap_under(value):
+            env = {k: v for k, v in os.environ.items() if k != rec.MAX_CREATES_PER_RUN_ENV}
+            if value is not None:
+                env[rec.MAX_CREATES_PER_RUN_ENV] = value
+            proc = subprocess.run(
+                [sys.executable, "-c", "import cluster_agent_reconcile as r; print(r.MAX_CREATES_PER_RUN)"],
+                cwd=Path(__file__).parent, capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return int(proc.stdout.strip())
+
+        self.assertEqual(cap_under(None), rec.MAX_CREATES_PER_RUN_DEFAULT)
+        self.assertEqual(cap_under("25"), 25)
+        for nonsense in ("", "many", "0", "-3"):
+            with self.subTest(value=nonsense):
+                self.assertEqual(cap_under(nonsense), rec.MAX_CREATES_PER_RUN_DEFAULT)
 
 
 if __name__ == "__main__":

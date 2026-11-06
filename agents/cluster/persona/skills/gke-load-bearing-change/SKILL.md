@@ -156,4 +156,4 @@ A request that gives a report format wins: format your answer exactly as the req
 
 What this skill decides is the content, not the shape. The evidence belongs in `Why`, quoted — the revision that carries the declared template, the kubelet's own sentence, the container's command, the consumer that would break — and the conclusion above decides which option is recommended where the request asks for one.
 
-Without a format from the request, follow the shape in `gke-workload-troubleshooting`, with the classification and its evidence leading the answer.
+Without a format from the request, follow the shape in [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md), with the classification and its evidence leading the answer.

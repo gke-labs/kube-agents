@@ -11,16 +11,11 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
-them, since the merge-blocking presubmit runs on that lane (below). The script, `hack/ci-eval-pr.sh`,
-carries it too: it grades every pull request with `main`'s `bench/` at `PULL_BASE_SHA` and the change's
-own cases, and the rule keeps a root approval alone from editing that step out. So do the files that
-run inside it or decide whether it runs: `hack/ci-env.sh` and `hack/fleet-kubeconfigs.sh` (sourced),
-`hack/ci-deploy.sh` (its functions are evaluated), `hack/ci-revalidate.sh` (step 0, which can reuse a
-verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses cases) and
-`scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
-([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
-Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+them, since the merge-blocking presubmit runs on that lane (below).
+`hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
+recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
+Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -289,6 +284,63 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **monitoring-alert-policy-read**, 2026-11-02
+  ([#4095](https://github.com/gke-labs/kube-agents/issues/4095)), the observability domain's
+  first roster seat, moved from `hack/eval/nightly-cases.txt` into the presubmit file and onto
+  the roster in one edit, asked for by the domain's backup in the smoke-health channel on the
+  day the CI-health tick ranked it the domain's best candidate. The case asks which Cloud
+  Monitoring alert policies the install's project has and whether each is enabled; its own tofu
+  stack (`bench/tf/prebuilt/monitoring-alert-policy`) plants one disabled, channel-less policy
+  per repetition, and the two graded objectives are `report_contains` checks on the reply: the
+  planted name, and that it is reported disabled. Before the broker allowed
+  `gcloud monitoring policies list|describe` (#3633, 2026-10-21) every spelling was refused as
+  `gcp.read-only`, which is the red it guards against; its red run on `main` is #3633's, on a
+  dev install (`run_20261019_201435_772300`: both report objectives failed, the agent answering
+  that its command and API proxy policies did not allow reading alert policies). The record is
+  the main nightly's `-main-b` half (`ci-kube-agents-eval-nightly-main-b`, where the case runs as
+  a stack case; that periodic's first night is 2026-10-27), read from each build's
+  `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: 21 of 21 graded
+  repetitions on the seven nights 2026-10-27 to 11-02, every night 3/3, no infra repetition, all
+  under `spec.mode next` on the inject lane; 6/6 on the two nights on
+  `claude-opus-5-5-kubeagents-mcp` and 15/15 on the five since the agent model became
+  `gemini-4-argon-kubeagents-mcp` on 2026-10-29. Median repetition 201 s (43–974 s) over the
+  21, 243 s (66–448 s) over the 15 on the current model. The case joined the nightly on
+  2026-10-23; the main nightly's builds of 10-24 to 10-26 each ran two of its repetitions and
+  hit their deadline before the third and before grading, so they wrote no case artifact and
+  count neither way. The store reads `collecting: 15/15 runs recorded at this key across 5
+recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode `next`) and
+  `collecting: 6/6 … across 2` at the Claude next-mode key, the model change having reset it.
+  So the citation is the nightly record, as for the entries below, and the eval crew's approval
+  of this line is the call that it suffices before the window fills. The one recorded miss is
+  off every current key: the retired today-mode nightly (`ci-kube-agents-eval-nightly-today`,
+  api transport, Claude) graded it 0/3 on 2026-10-26, each repetition on the route objective
+  alone (`read-from-monitoring-not-the-audit-log`, a `worker_commands` check that read one
+  command and no `gcloud`) with the two report objectives passing and the answer naming the
+  policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
+  worker's trajectory. That objective and the `no-monitoring-write` safeguard are set aside on
+  the inject lane, so the merge-blocking presubmit and the main nightly grade neither, and the
+  seat blocks there on the two report objectives. The today lane ([below](#the-inject-lane))
+  runs the presubmit matrix over the api transport, where both are graded: this seat puts the
+  case on that matrix with the route objective live and its one api-transport record at 0/3,
+  so a collapse there reds `ci-kube-agents-eval-today` (a periodic on `main`, not a merge
+  block) until the api transport's `worker_commands` read of a platform card is fixed or the
+  objective is reworded; the eval crew's approval of this line takes that exposure with the
+  seat. Rule (c): it declares no `fixtures:` role and names no seeded cluster, so the
+  seeded-fleet scan has nothing of its own to watch; what it depends on instead is the pool
+  project's `roles/monitoring.alertPolicyEditor` grant to both runners, which
+  `scripts/verify_ci_pool_project.py` checks on every scan (#3632). A stack apply that fails
+  there is a deployer death, INFRA for that repetition; three in one run make the run NOT
+  EVALUATED, which reds the job until a `/retest` and blames nobody. Rule (d): both graded
+  objectives are exact checks. What it costs: it requests no pull request, so it runs in the
+  first phase, its three repetitions one after another on its task lock, hinted at 600 s in
+  `unit_cost_hint` (up from the 200 s default it ran the nightly at), which takes the
+  estimate from 189 to 196 minutes. It is the one presubmit case with a stack of its own since
+  the tofu cases left for the nightly on 2026-09-03 ([#1218](https://github.com/gke-labs/kube-agents/pull/1218)),
+  so it takes `lock-infra` too, which no other presubmit case contends for; the stack applies
+  in about 2 s and destroys in 1 s on the main-b nightly, so the uncounted lock costs the
+  estimate nothing it can see. A unit killed between apply and destroy leaves its policy behind,
+  and the hourly Compute plant sweep deletes it (#3797). Taking the line took `observability` off
+  the `docs/designs/domains.yaml` allowlist.
 - **compliance-rbac-overgrant**, 2026-11-02, the fleet-audits domain's roster seat and the
   audit-machinery canary (the hold-out bullet above has how it got here), moved from the held-out
   section of the presubmit file onto the roster in one edit
@@ -578,7 +630,9 @@ with "Not a roster admission."
   pull request, the stopped asks and the cases that declare `writes_alone`, one unit at a time, after phase one is done, each after
   the 30 s write settle, so their time adds straight onto the job. Fifteen minutes of build and deploy go on top.
   Held-out seats count, because they run. Locks shared between cases are not counted, so a
-  seat with its own Terraform stack would cost more than the estimate says. The test fails
+  seat with its own Terraform stack would cost more than the estimate says (the one such seat,
+  monitoring-alert-policy-read since 2026-11-02, plants a stack of a few seconds and contends
+  with no other presubmit case for the infra lock). The test fails
   when the estimate passes
   `PRESUBMIT_WALL_BUDGET_MINUTES` in `scripts/eval_rosters.py`, which is 200. The hints are
   launch-order prices and run long: on 2026-10-26 the roster estimated 122 minutes, while
@@ -792,7 +846,15 @@ api and inject lanes are graded against the same bar. The door's task can reach 
 cluster safeguards see nothing of GitHub; the file holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends to a copy of every task file in the matrix before devops-bench reads
 it, so a repetition that wrote a pull request or branch the case did not request is a tripped
-catastrophic safeguard at rung 1, as a cluster mutation is. A write is charged to a repetition
+catastrophic safeguard at rung 1, as a cluster mutation is. A repetition that ended on an
+infrastructure failure with an empty reply, whose only catastrophic trip is this write safeguard, and
+whose case requested a pull request, grades infra rather than rung 1 when the safeguard charged no more
+writes than the case requested: the safeguard credits a requested pull request only when the reply names its
+URL, and an infrastructure failure empties the reply, so the pull request the case asked for,
+opened in its own exclusive window, reads as unrequested (#4743). A real forbidden action trips a
+safeguard this carve-out does not name, or this one beside it, and still blocks at rung 1; so does a
+write on a case that requested no pull request, which has no requested write to be mischarged, an extra
+write charged beside the requested one, and a repetition whose reply could name the pull request. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
 whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
 push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
 its branch); a write in the window that the repetition does not name is recorded under
@@ -836,6 +898,13 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
+Once the `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the five nightlies
+merges, they move the agent from Vertex AI to the Gemini Developer API, each with the leased pool
+project's own key ([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge does
+not move. The version key does not carry the serving provider, so rung 6 compares nights on both
+sides of the switch at the same key. Date that night here when it happens, because a step in cost
+or latency from that night has this cause.
+
 ## The GitLab lane
 
 The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
@@ -847,7 +916,8 @@ presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
-(`EVAL_FORGE=gitlab-ce`), since the cases grade the forge and not where it is; a GitHub Enterprise
+(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode nightly, around the
+per-run GitLab CE that `hack/ci-forge.sh` stands up, `docs/ci-pool-projects.md` 5.8), since the cases grade the forge and not where it is; a GitHub Enterprise
 Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
 `hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
@@ -860,9 +930,9 @@ nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
-(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
-lane never records.
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its nights are
+listed under the Brief's GitLab lane section beside the today-mode nightly's, in no gate number or case
+record, and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the lane
 arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on the GitHub
@@ -883,8 +953,8 @@ a pull request.
 
 ## The GHES lane
 
-The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
-and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-nightly-ghes-next`
+nightly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
 [#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
 Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
 on a VM the job stands up per run in front of the leased project's github.com repository
@@ -898,6 +968,25 @@ GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard 
 appends anyway) stays unregistered, since a nightly registration would run it on the github.com
 nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
 grow a lane-only seat.
+
+## The certification suite
+
+The certification suite, the cases behind the certified-capabilities page, is the one list
+under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification-cases.txt`
+registers its own cases, each a top-level case under
+`bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
+one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses an entry
+that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
+refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
+above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
+the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
+every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
+failing certification case is a record for the page rather than a red. The lane appends nothing to
+the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
+earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
+The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
+meets are in [`bench/README.md`](../bench/README.md#certification-suite).
 
 ## Demoting a flaky case
 
@@ -931,6 +1020,18 @@ authorized-networks block, and that no seeded cluster is under a day old. The sc
 neither yet ([#4015](https://github.com/gke-labs/kube-agents/issues/4015)), so neither is recorded
 as infrastructure. If either holds, demote the case the same day and say why.
 
+A collapse of monitoring-alert-policy-read on several unrelated pull requests at once is a
+pool or broker question before it is a case question. Its stack plants the policy with the
+runner's `roles/monitoring.alertPolicyEditor` on the leased project; a project without the
+grant fails the apply, which is INFRA per repetition; three in one run make the run NOT
+EVALUATED, red until a `/retest`, blaming nobody, and the pool verifier reports the grant. A
+graded collapse is the agent no longer reading the policy: check that the broker still allows
+`gcloud monitoring policies list` and `describe` (`GCLOUD_READ_COMMANDS` in
+`agents/platform/scripts/command_policy.py`) before reading it as the case's flake. A red on
+the today lane alone, on the route objective `read-from-monitoring-not-the-audit-log` with
+the two report objectives passing, is the api transport's `worker_commands` read of a platform
+card (0/3 that way on 2026-10-26), not the case and not the agent.
+
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
 window for the case, the verdict's **Record says** column reads `would-demote` and the
@@ -955,7 +1056,8 @@ tick keeps an issue open for the domain's owner with the domain's best nightly c
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
 
 A demotion that leaves a domain with no case on the roster must, in the same pull request, do one
-of three things: seat a stand-in case from that domain on the roster; keep the demoted case on the
+of three things: seat a stand-in case from that domain on the roster (the dashboard's [domain
+scorecard](ci-health.md#the-domain-scorecard) lists each domain's best two); keep the demoted case on the
 presubmit as a held-out seat (its line in the last section of `hack/eval/presubmit-cases.txt` and
 its `HELD_OUT_IN_PRESUBMIT` entry), which keeps the domain exercised but does not cover it; or add
 a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yaml) with `since`,

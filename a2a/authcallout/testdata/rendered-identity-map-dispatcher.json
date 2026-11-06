@@ -1,10 +1,12 @@
 {
-  "version": "b410f03c5a5cf23f",
+  "version": "d2ddfe274714eeac",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
@@ -22,8 +24,10 @@
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
           "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_people",
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -32,8 +36,10 @@
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
           "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_people",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -81,7 +87,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",
@@ -99,7 +105,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager",
       "user": "operator",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.agents.*",
@@ -128,7 +134,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
       "user": "dispatcher",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-tse-read-top",
@@ -138,6 +144,7 @@
           "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-tse-read-child",
           "$JS.ACK.PROFILE_SUBMITS.profile-tse-read-child.>",
           "a2a.tasks.tse.*.supervisor",
+          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.tse.*",
           "$KV.PROFILE_LEASES.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
@@ -149,6 +156,7 @@
           "_INBOX.dispatcher.>"
         ],
         "subscribe": [
+          "a2a.stop.tse.*",
           "a2a.dispatch.*.*.*.accept",
           "a2a.dispatch.*.*.*.lease",
           "a2a.cap.reply.dispatcher.>",

@@ -73,8 +73,9 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
 # Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
-# in agents/platform/scripts/session_kv_server.py), on so that
-# incident-triage-workload-fold can see three replicas become one incident.
+# in agents/platform/scripts/session_kv_server.py; on by default at an hour),
+# set shorter here so that incident-triage-workload-fold can see three replicas
+# become one incident without one case's window reaching the next repetition.
 # Like the ceilings above it is install-wide, so it reaches every case, and the
 # value is bounded on both sides by measurements, not medians:
 #
@@ -214,33 +215,76 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
 readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
 
-# The credential-proxy container's memory limit on the eval install. The broker
-# admits a request only while its child memory reservation fits the budget it
-# derives from this limit (agents/platform/scripts/credential_proxy.py,
-# docs/designs/credential-proxy-child-memory-budget.md): at the operator's 1Gi
-# default that is four requests at once, under its slot cap of eight. The eval
-# runs EVAL_TASK_PARALLELISM lanes of Platform Agents, each fanning Cluster
-# Agents out over the seeded fleet, and on the default the queue behind those
-# four reached p50 waits of 8-22s and a longest wait of 56.7s against the
-# broker's 60s refusal: Cluster Agents' commands timed out and the judge graded
-# the answers as regressions on pull requests that never touched the path
-# (#2632). At 2Gi the budget admits nine, so the slot cap is the binding bound
-# again and the queue is the one the broker had before the budget existed,
-# with the OOM the budget exists to prevent still held off by the budget
-# (#2455's live test ran this figure: the broker's startup line read "admits 9
-# requests at once beside the slot cap of 8"). Set on this install only, through
-# spec.deployment.credentialProxy.resources, so the production default stays
-# where the CRD reference argues it should and an install that outgrows it
-# raises the same field. A string, because the CRD's quantity is int-or-string.
+# The credential-proxy container's memory limit on the eval install, pinned.
+# The broker admits a request only while its child memory reservation fits the
+# budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
+# docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
+# admits nine, so the slot cap of eight is the binding bound. The operator's
+# default limit is 2Gi as well, and so is its default memory request on GKE
+# Autopilot, so today this override changes nothing. It stays as a pin: if the
+# operator default moves, the eval install keeps the budget its cases were
+# measured at. The cost is that the eval does not run the operator default;
+# to run it there, drop this constant, its echo and --set-string below, and the
+# three limit tests in tests/test_ci_deploy_credential_proxy_limit.py (that
+# file's CRD-order test guards step 5b' and stays).
+# The figure comes from #2632: at the 1Gi limit the operator defaulted to then,
+# the budget admitted four, and the eval's EVAL_TASK_PARALLELISM lanes of
+# Platform Agents, each fanning Cluster Agents out over the seeded fleet, queued
+# behind those four at p50 waits of 8-22s and a longest wait of 56.7s against
+# the broker's 60s refusal: Cluster Agents' commands timed out and the judge
+# graded the answers as regressions on pull requests that never touched the
+# path. #2455's live test ran this figure: the broker's startup line read
+# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# only, through spec.deployment.credentialProxy.resources. A string, because
+# the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a
 # limit above its request stands (the #2454 presubmit's proxy pod rendered
 # limits.memory 1Gi over a 512Mi request, QoS Burstable, and its broker read
 # the 1Gi), so requests.memory stays at the operator's default. On an Autopilot
-# cluster without bursting this override would be inert, as the CRD field doc
-# says, and requests.memory is the figure to raise there.
+# cluster without bursting the limit equals the request, and requests.memory is
+# the figure to set there.
 # tests/test_ci_deploy_credential_proxy_limit.py pins the flag, that the limit
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
+
+# The gateway's session-affinity hook (litellm.vertex.sessionAffinity) routes
+# each Gemini conversation to one of a few replicas per prompt, so a worker's
+# first turn can read the system prompt and tools another worker warmed. It
+# takes effect only on a project with Vertex's LLM_SESSION_ID label, which is
+# granted outside this repository (docs/ci-pool-projects.md, section 1.1); on
+# one without it Vertex ignores the field and the run routes as before.
+# Override with EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
+readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
+# One id per prompt, not the chart's two: a profile's sessions start every few
+# minutes, about as long as a replica keeps the prompt, so splitting them over
+# two ids lets more of them land on a replica that has already dropped it.
+readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# The Secret Manager secret, in the leased project, that holds the agent's Gemini
+# Developer API key under MODEL_PROVIDER=gemini. scripts/provision_ci_pool_gemini_key.sh
+# writes it.
+readonly EVAL_AGENT_GEMINI_KEY_SECRET="${EVAL_AGENT_GEMINI_KEY_SECRET:-kube-agents-eval-gemini-api-key}"
+# The MODEL_PROVIDER value under which the agent reads that key.
+readonly MODEL_PROVIDER_GEMINI="gemini"
+# Both reach `helm --set` and the chart's schema, which refuses anything but a
+# boolean and a positive integer only at step 5c, after the image build. This
+# check is stricter than Helm: lowercase true/false, at most three digits.
+# Checked here, before anything runs, the way EVAL_TASK_PARALLELISM is below.
+check_session_affinity_settings() {
+  case "${EVAL_LITELLM_SESSION_AFFINITY}" in
+  true | false) ;;
+  *)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY='${EVAL_LITELLM_SESSION_AFFINITY}' must be true or false." >&2
+    return 1
+    ;;
+  esac
+  case "${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" in
+  '' | *[!0-9]* | 0* | ????*)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY_SLOTS='${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}' must be a positive integer of at most three digits, without leading zeros." >&2
+    return 1
+    ;;
+  esac
+}
+check_session_affinity_settings
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
@@ -340,15 +384,17 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # three parts on main (the main part's two halves, main-a and main-b, and
 # the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
-# hack/eval/gitlab-cases.txt) and the GHES lane's (EVAL_FORGE=ghes,
-# hack/eval/ghes-cases.txt), each beside its today-mode nightly; and the
+# hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
+# GitLab CE lanes' only nightlies (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
+# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a batch Tide ran, the nightlies and the RC
+# one by the first on a batch Tide ran, the nightlies, the certification
+# lane's first slice (EVAL_TIER=certification) and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
@@ -357,7 +403,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -408,6 +454,10 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The gateway's election: the operator renders its Lease, the grant on it and
+# the gateway's election env only with this set.
+readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
+readonly A2A_GATEWAY_ELECTION_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -447,7 +497,10 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR), where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
+# AgentProfile durables when the operator renders the dispatcher, which this
+# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
+# does - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -553,8 +606,10 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # The operator's override variables (a2aGatewayImage and a2aWorkerImage in
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
-# platformagent_a2a_console.go) and the repository names
-# step 4 pushes the builds under.
+# platformagent_a2a_console.go) and the repository names step 4 pushes the
+# builds under. The AgentProfile dispatcher's image is built and pushed too
+# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
+# set: the dispatcher is off by default until profiles dispatch end to end.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
@@ -575,6 +630,7 @@ readonly A2A_CALLOUT_IMAGE_NAME="a2a-authcallout"
 readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
+readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -621,8 +677,10 @@ readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED
 readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
-# Still required with the agent path on vertex_ai below: the judge reads it
-# (JUDGE_API_KEY in ci-eval-pr.sh) and the chart's credentials secret carries it.
+# Required on every provider: the judge reads it (JUDGE_API_KEY in
+# ci-eval-pr.sh). Under vertex_ai the chart's credentials secret also carries it;
+# under gemini the agent uses the leased project's own key instead
+# (resolve_agent_gemini_api_key below).
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
   exit 1
@@ -642,6 +700,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
+# ci-env.sh), checked before anything is built, the way the session-affinity
+# settings are above.
+resolve_replay_shadow || exit 1
 # The failure dump first, because it reads the exit status; then the lease
 # heartbeat started below is stopped (a no-op until it starts).
 DEPLOY_HEARTBEAT_PID=""
@@ -715,13 +777,31 @@ A2A_OPERATOR_ENV_ARGS=()
 # It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
 # scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
 # release stays byte-for-byte the same.
+# env[3], set on every lane in the install below, turns the broker's proposal
+# readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
+# budget is sized for one install per GitHub App installation, and every eval
+# project shares one, so concurrent lanes drained its quota and the cases' own
+# forge calls failed with FORGE_RATE_LIMITED (#4611). Hence env[4] here.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[3].value=false"
+    --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
+fi
+
+# The shadow-mode replay proxy (on by default; resolved above): the
+# image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
+# chart values step 5 installs it with. Both empty when it is off, so the build
+# and the release are byte-for-byte what they were. resolve_replay_shadow
+# refuses it on the release-candidate path, which builds nothing.
+REPLAY_SHADOW_PROXY_URI=""
+REPLAY_SHADOW_HELM_ARGS=()
+if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
+  REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"
+  replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
+  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
@@ -825,19 +905,51 @@ else
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
-# vertex_ai, not gemini. On 2026-09-02 every smoke run redded on 429s from the
-# Gemini Developer API key's fixed paid-tier-3 quota -- 8,000,000 input
-# tokens/minute for gemini-3.1-pro, named in the error body -- with five
-# concurrent builds drawing ~94k-token turns from one shared minute window
-# (#1097; the full diagnosis with build artifacts is on #1184). Vertex AI
-# serves the same Gemini models under dynamic shared quota, with no fixed
-# per-minute wall, and authenticates the LiteLLM pod through Workload Identity
-# (the kubeagents-litellm KSA annotation below) instead of the API key.
+# vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
+# every smoke run redded on 429s from one shared Gemini Developer API key's
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# named in the error body -- with five concurrent builds drawing ~94k-token
+# turns from one shared minute window (#1097; the full diagnosis with build
+# artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic
+# shared quota, with no fixed per-minute wall, and authenticates the LiteLLM pod
+# through Workload Identity (the kubeagents-litellm KSA annotation below)
+# instead of an API key.
+# When a job exports MODEL_PROVIDER=gemini, the agent reads the leased
+# project's own key from that project's Secret Manager
+# (resolve_agent_gemini_api_key below). Each project's key has its own quota,
+# so the shared-minute 429 storm cannot recur there. The job env's
+# GEMINI_API_KEY stays the judge's key.
 # Overridable so a rollout problem is a job-env flip rather than a revert.
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
+# --- agent key: begin
+# Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.
+# Under gemini it is the leased project's own key, and an unreadable or empty
+# secret stops the deploy here, before any Helm call: no fallback to the job
+# env's key, whose shared quota is what the per-project key replaces. Under any
+# other provider it is GEMINI_API_KEY unchanged. The key is never echoed. A
+# whitespace-only value counts as empty, and the surrounding whitespace of a
+# stored value (a trailing newline, a CRLF's \r) is dropped.
+resolve_agent_gemini_api_key() {
+  if [ "${MODEL_PROVIDER}" != "${MODEL_PROVIDER_GEMINI}" ]; then
+    AGENT_GEMINI_API_KEY="${GEMINI_API_KEY}"
+    return 0
+  fi
+  local key=""
+  if ! key="$(gcloud secrets versions access latest --secret="${EVAL_AGENT_GEMINI_KEY_SECRET}" --project="${PROJECT_ID}")" || [[ -z "${key//[[:space:]]/}" ]]; then
+    echo "FATAL: MODEL_PROVIDER=gemini but Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} cannot be read as this runner or is empty. Run scripts/provision_ci_pool_gemini_key.sh ${PROJECT_ID} to mint the project's key and grant the runner access." >&2
+    exit 1
+  fi
+  # A real key holds no whitespace: drop what surrounds it, a CRLF's \r included.
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  AGENT_GEMINI_API_KEY="${key}"
+  echo "Agent key: Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} (MODEL_PROVIDER=${MODEL_PROVIDER})"
+}
+# --- agent key: end
+resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
@@ -1606,6 +1718,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_VERIFIER_URI="${A2A_IMAGE_PREFIX}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
+  A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1632,6 +1745,15 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
     --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
     --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
+    # The gateway's election (k8s-operator platformagent_a2a_gateway_lease.go):
+    # off by default for installs, on here so the next lane runs the gateway
+    # the way it will run with replicas.
+    --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
+    --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
+    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
+    # until profiles dispatch end to end, and the lane installs what a
+    # default install does. Its image is still built (step 4) so the build
+    # stays green; setting the override here is how the lane would turn it on.
   )
 fi
 
@@ -1643,7 +1765,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1670,9 +1792,14 @@ else
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
+  REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
+  if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
+    REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
+    echo "Shadow replay proxy: also building its image"
+  fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
   # --async, `gcloud builds submit` tails the build log from storage and
@@ -1693,7 +1820,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1934,7 +2061,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     "${GITHUB_MINTER_ARGS[@]}" \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
-    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
@@ -1942,6 +2069,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "litellm.vertex.sessionAffinity.enabled=${EVAL_LITELLM_SESSION_AFFINITY}" \
+    --set "litellm.vertex.sessionAffinity.slots=${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
     --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \
@@ -1951,6 +2080,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
     --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
+    --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
+    --set-string "platformAgent.deployment.env[3].value=off" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
@@ -1958,6 +2089,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
+    ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e

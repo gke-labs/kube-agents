@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -109,6 +110,13 @@ func scrape(t *testing.T, method, url string) (int, string) {
 // base URL.
 func startMetricsServer(t *testing.T, m *Metrics) string {
 	t.Helper()
+	return startMetricsServerWith(t, m, nil)
+}
+
+// startMetricsServerWith is startMetricsServer answering ReadyzPath from
+// readiness (nil answers ready).
+func startMetricsServerWith(t *testing.T, m *Metrics, readiness func() (bool, string)) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +125,7 @@ func startMetricsServer(t *testing.T, m *Metrics) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	srv.SetReadiness(readiness)
 	srv.listener = ln
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -784,4 +793,38 @@ func TestMetricsListenerCapsItsConnections(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	})
+}
+
+func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
+	var none *Metrics
+	none.setPeopleSource(func() (int, int, bool) { return 1, 2, true })
+
+	m := NewMetrics()
+	url := startMetricsServer(t, m)
+	_, body := scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "kubeagents_a2a_gateway_people_seen") {
+		t.Fatalf("a sample with no source:\n%s", body)
+	}
+	var loaded atomic.Bool
+	m.setPeopleSource(func() (int, int, bool) { return 1, 2, loaded.Load() })
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "people_seen") {
+		t.Fatalf("a sample while the map is not loaded:\n%s", body)
+	}
+	loaded.Store(true)
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	for _, want := range []string{
+		`kubeagents_a2a_gateway_people_seen{window="7d"} 1`,
+		`kubeagents_a2a_gateway_people_seen{window="30d"} 2`,
+		"# TYPE kubeagents_a2a_gateway_people_seen gauge",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body lacks %q:\n%s", want, body)
+		}
+	}
+	loaded.Store(false)
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "people_seen") {
+		t.Fatalf("a sample after the map was unloaded:\n%s", body)
+	}
 }

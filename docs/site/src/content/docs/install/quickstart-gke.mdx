@@ -188,15 +188,16 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
      -o jsonpath='{range .status.conditions[*]}{.type}{"\t"}{.status}{"\t"}{.reason}{"\n"}{end}'
    ```
 
-   A healthy `next` install shows the three rows below, and the `Ready` message reads `Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready`:
+   A healthy `next` install shows the rows below, and the `Ready` message reads `Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready`:
 
    | Type                  | Status | Reason                 |
    | --------------------- | ------ | ---------------------- |
    | `Ready`               | `True` | `Reconciled`           |
    | `BusProvisioned`      | `True` | `ProvisionJobComplete` |
    | `BusCredentialsReady` | `True` | `CalloutServing`       |
+   | `NoChatPlatform`      | `True` | `NoChatPlatform`       |
 
-   `A2AGateway` and `A2AVerifier` appear only when something needs a look. With no chat backend enabled the A2A gateway runs on the console door alone. `A2AGateway` `False` with `WaitingForReplica` appears only after an upgrade from an operator that ran no A2A gateway without a chat backend: the gateway is back at one replica, and that replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused.
+   `NoChatPlatform` is there because this install enabled no chat platform: it says where the agent's findings go instead, and goes away once you enable Google Chat or Slack. `A2AGateway` and `A2AVerifier` appear only when something needs a look. With no chat backend enabled the A2A gateway runs on the console door alone. `A2AGateway` `False` with `WaitingForReplica` appears only after an upgrade from an operator that ran no A2A gateway without a chat backend: the gateway is back at one replica, and that replica is not ready yet. `A2AVerifier` `False` with `VerifierNotReady` means no verifier replica is ready, and every task submitted meanwhile is refused.
 
    `BusCredentialsReady` `False` with `CalloutAbsent` means no auth callout is deployed and nothing can authenticate to the bus. With `CalloutUnavailable`, fewer than all callout replicas are ready on the current spec, which every rollout of the callout passes through; the message gives the counts, and only with none ready does the bus refuse every new connection. The [status reference](/kube-agents/operator/platformagent-crd/#status) has every condition.
 

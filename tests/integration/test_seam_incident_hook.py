@@ -22,7 +22,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from _seams import API_KEY, KVServer, REPO_ROOT, free_port, http_json
+from _seams import API_KEY, KVServer, REPO_ROOT, http_json
 
 CHAT_ID = "spaces/AAA-space"
 THREAD_ID = "spaces/AAA-space/threads/thr-1"

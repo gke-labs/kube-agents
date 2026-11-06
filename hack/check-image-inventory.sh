@@ -143,19 +143,24 @@ check_base_image() {
 
 check_base_image envoy deploy/docker/Dockerfile ENVOY_IMAGE ENVOY_VERSION
 check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image golang deploy/kube-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static deploy/kube-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 # The a2a images. All parameterize their builder bases: the auth callout and
 # the gateway already did, the worker arrived with #1334, and the capability
-# verifier and the console are added here.
+# verifier and the console are added here, and the AgentProfile dispatcher
+# beside them.
 check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.verifier GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.verifier DISTROLESS_IMAGE DISTROLESS_VERSION
+check_base_image golang a2a/Dockerfile.dispatcher GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.dispatcher DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.web-console GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.web-console DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
@@ -174,6 +179,9 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # deployed by hand or by an eval lane, never by an install.
 check_base_image golang hack/ghes-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
+# The shadow-mode replay proxy, an eval fixture (hack/replay-proxy/README.md):
+# built by hand or by an eval lane, never by an install.
+check_base_image python hack/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
 # rather than an ARG pair, so the ARG check above never reaches them. This
@@ -296,10 +304,12 @@ check_go_directive() {
 }
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
+check_go_directive deploy/kube-proxy/Dockerfile GOLANG_VERSION k8s-api-proxy/go.mod
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
+check_go_directive a2a/Dockerfile.dispatcher GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
@@ -335,7 +345,7 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
-#    verifier, console, and the Hermes bridge sidecar) are release images with no fixed tag in the inventory,
+#    verifier, console, AgentProfile dispatcher, and the Hermes bridge sidecar) are release images with no fixed tag in the inventory,
 #    so the operator compiles in the bare image name and takes registry and tag
 #    from its own or the agent image; the second check below holds each name to
 #    the inventory's entry, and that entry's repository to the name under the
@@ -390,8 +400,10 @@ check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platforma
 check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName
 check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName
 check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platformagent_a2a_verifier.go a2aVerifierImageName
+check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
+check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
