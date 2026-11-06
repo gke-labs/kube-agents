@@ -1310,10 +1310,11 @@ STALE_CLOSED_BODY_MARKER = "<!-- audit:stale-closed -->"
 # slug is `ledger_scope()`'s: the host cluster's name, then a digest of the
 # full identity, so two clusters of one name in two projects differ.
 SCOPE_LABEL_PREFIX = "audit-scope:"
-# An operator's own scope identity, used in place of the derived one: for an
-# install whose host cluster the operator did not declare (`spec.harness`),
-# or for two installs that should share one ledger on purpose. The whole
-# string is the identity; the slug and the digest come from it.
+# A scope set in the shell pod's own environment, in place of the derived
+# one; the whole string is the identity and the name, and the slug and the
+# digest come from it. No operator setting reaches the shell pod with it
+# today (the pod forwards a fixed list of variables), so it is for a test or
+# a hand-driven run in that pod, where it stands in for a second install.
 LEDGER_SCOPE_ENV = "FLEET_AUDIT_LEDGER_SCOPE"
 # The install's identity when no override is set: the host cluster that the
 # operator declares on the shell pod and the agent pod. All three, or none:
@@ -1350,6 +1351,9 @@ RELATIVE_AGE_RE = re.compile(
 RELATIVE_AGE_ANCHOR = " as of "
 # The date the pass writes after the anchor: the day of the run, in UTC.
 RELATIVE_AGE_DATE_FORMAT = "%Y-%m-%d"
+# What opens and closes a Markdown code span; text inside one is a command
+# or an identifier, which the pass leaves as written.
+CODE_SPAN_DELIMITER = "`"
 # The finding fields whose text the pass dates: the free text a reader sees in
 # the ledger body. The evidence is left as the collector or the worker wrote
 # it: a command is reproduced, not read, and the excerpt is what
@@ -3303,13 +3307,23 @@ def anchor_relative_age_text(text: str, generated_at: datetime) -> str:
     """
     stamp = generated_at.strftime(RELATIVE_AGE_DATE_FORMAT)
 
-    def dated(match: re.Match) -> str:
-        after = text[match.end() : match.end() + len(RELATIVE_AGE_ANCHOR)]
-        if after.lower() == RELATIVE_AGE_ANCHOR:
-            return match.group(0)
-        return f"{match.group(0)}{RELATIVE_AGE_ANCHOR}{stamp}"
+    def dated(segment: str) -> str:
+        def one(match: re.Match) -> str:
+            after = segment[match.end() : match.end() + len(RELATIVE_AGE_ANCHOR)]
+            if after.lower() == RELATIVE_AGE_ANCHOR:
+                return match.group(0)
+            return f"{match.group(0)}{RELATIVE_AGE_ANCHOR}{stamp}"
 
-    return RELATIVE_AGE_RE.sub(dated, text)
+        return RELATIVE_AGE_RE.sub(one, segment)
+
+    # Prose only: a `--since "2 days ago"` inside a code span is a command,
+    # and a date in it breaks the command. Splitting on the backtick leaves
+    # the odd segments inside spans (and fenced blocks, whose fences are
+    # three of them) as written.
+    segments = text.split(CODE_SPAN_DELIMITER)
+    return CODE_SPAN_DELIMITER.join(
+        dated(segment) if index % 2 == 0 else segment for index, segment in enumerate(segments)
+    )
 
 
 def anchor_relative_ages(findings: list[dict], generated_at: datetime) -> list[str]:
@@ -4723,6 +4737,12 @@ def render_chat_report(
         )
     if unaccounted:
         lines.append("- Not accounted for: " + ", ".join(unaccounted))
+    retired = list(payload.get(RETIRED_UNLISTED_KEY) or [])
+    if retired:
+        lines.append(
+            f"- {len(retired)} finding(s) retired with the ledger, not confirmed fixed: their "
+            "cluster is no longer in the fleet listing: " + ", ".join(retired)
+        )
     dropped = list(payload.get(UNPUBLISHED_CANDIDATES_KEY) or [])
     if dropped:
         lines.append(
@@ -12352,8 +12372,9 @@ def _render_header(audit_id: str, noun: str = "pull request") -> list[str]:
     return [
         f"This issue is the ledger for the `{audit_id}` audit. It is rewritten in "
         "full on every run — hand edits to this description will be lost, and the "
-        "audit will never open a second ledger for this stream. It closes when the "
-        "audit comes back clean.",
+        "audit will never open a second ledger for this stream"
+        + (" from this install" if scope else "")
+        + ". It closes when the audit comes back clean.",
         *(
             [
                 "",
@@ -15612,18 +15633,22 @@ def find_existing_issue(
     scope = ledger_scope()
     stream_label = f"audit:{audit_id}"
     issues = _open_ledgers_labelled(repo, audit_id, [stream_label] + ([scope.label] if scope else []))
-    adopted = False
     if not issues and scope:
+        # The stream listing less other installs' ledgers: one with no scope
+        # label is adopted below, and one already carrying this install's
+        # label is the ledger the two-label listing left out (the forge's
+        # label index can lag a write; `_ledger_the_listing_left_out`), used
+        # as it is.
         issues = [
             issue
             for issue in _open_ledgers_labelled(repo, audit_id, [stream_label])
-            if scope_label_of(issue.get("labels")) is None
+            if belongs_to_scope(issue.get("labels"), scope)
         ]
-        adopted = bool(issues)
     if not issues:
         return _ledger_the_listing_left_out(repo, audit_id, scope)
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
+    adopted = scope is not None and scope_label_of(chosen.get("labels")) is None
     if len(issues) > 1:
         others = ", ".join(f"#{i.get('number')}" for i in issues[:-1])
         log(
@@ -23350,6 +23375,21 @@ def _finish_store_ledger(
             f"stored ledger and this run says `{entry['check']}` ran there again, but it is "
             "neither reported nor in resolved_because; no fix is closed over it."
         )
+    # As the forge path's close: a previous finding on a cluster this run
+    # listed nowhere leaves the stored ledger, but is not resolved, its fix
+    # stays open, and the JSON line names it.
+    retired = (
+        unlisted_previous_findings(previous_body, data)
+        if not findings and delta_known and not gaps and not unaccounted
+        else []
+    )
+    retired_ids = {entry["id"] for entry in retired}
+    for entry in retired:
+        log(
+            f"RETIRED UNLISTED: {entry['id']} ({entry['object']} in {entry['cluster']}) is on "
+            "the stored ledger and this run listed its cluster in neither scope.clusters nor "
+            "scope.skipped; it leaves the ledger, not confirmed fixed, and its fix stays open."
+        )
     # A clean run that did not account for the stored ledger leaves it as it
     # was, as the forge path leaves an issue it holds open. Over a lost memory
     # it holds a ledger it cannot read: the envelope then carries no ledger
@@ -23362,9 +23402,10 @@ def _finish_store_ledger(
         set(previous_ids) if held_open else set(current_ids) | set(held) | unread_ids
     )
     new_ids = sorted(set(current_ids) - set(previous_ids)) if delta_known else []
-    # Over a coverage gap an absence means "not checked", not fixed.
+    # Over a coverage gap an absence means "not checked", not fixed; nor is
+    # a finding retired unread.
     resolved_ids = (
-        sorted(set(previous_ids) - set(stored_ids))
+        sorted(set(previous_ids) - set(stored_ids) - retired_ids)
         if delta_known and not gaps and not (stale_scheme and findings)
         else []
     )
@@ -23486,9 +23527,9 @@ def _finish_store_ledger(
             audit_id,
             remediation_prs,
             # And every previous finding on a target this run did not check,
-            # the ones past `MAX_HELD_IDS` too: absence there is not evidence
-            # of a fix.
-            set(current_ids) | still_flagged | unchecked_ids,
+            # the ones past `MAX_HELD_IDS` too, and every one retired unread:
+            # absence there is not evidence of a fix.
+            set(current_ids) | still_flagged | unchecked_ids | retired_ids,
             previous_titles,
             {},
             now,
@@ -23607,6 +23648,7 @@ def _finish_store_ledger(
         or prs_opened
         or prs_closed
         or unaccounted
+        or retired
         or collector_speaks
         or listing_refusal
     )
@@ -23626,6 +23668,7 @@ def _finish_store_ledger(
         UNACCOUNTED_KEY: unaccounted_ids,
         **({REMEDIATION_REFUSED_KEY: listing_refusal} if listing_refusal else {}),
         **({UNREPORTED_UNDER_GAP_KEY: unreported_under_gap} if unreported_under_gap else {}),
+        **({RETIRED_UNLISTED_KEY: sorted(retired_ids)} if retired else {}),
         **since_scheduled,
         **collector_payload(plan.uncorroborated),
         "findings": len(findings),
@@ -24522,22 +24565,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             if existing_issue and delta_known and not gaps
             else []
         )
-        # On the same condition, the previous findings on a cluster this run
-        # listed nowhere. The close retires them with the ledger, since the
-        # run's fleet listing has no such cluster, but it says so and does not
-        # count them as resolved: nobody read them this run (#4901).
-        retired = (
-            unlisted_previous_findings(previous_body, data)
-            if existing_issue and delta_known and not gaps
-            else []
-        )
-        for entry in retired:
-            log(
-                f"RETIRED UNLISTED: {entry['id']} ({entry['object']} in {entry['cluster']}) "
-                "is on the ledger and this run listed its cluster in neither "
-                "scope.clusters nor scope.skipped; it is retired with the ledger, "
-                "not confirmed fixed."
-            )
         # And, on the same condition, every previous finding the collector
         # still emits a candidate for: an explanation under `resolved_because`
         # satisfies the rule above and contradicts the collector, and the
@@ -24575,6 +24602,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 f"`{entry['check']}` ran there again, but it is neither reported "
                 "nor in resolved_because; the ledger stays open."
             )
+        # The previous findings on a cluster this run listed nowhere, when
+        # the close is otherwise going ahead. It retires them with the
+        # ledger, since the run's fleet listing has no such cluster, but it
+        # says so, keeps their fixes open and does not count them as
+        # resolved: nobody read them this run (#4901). Emptied below when the
+        # conversation could not be read, because then nothing closes.
+        retired = (
+            unlisted_previous_findings(previous_body, data)
+            if existing_issue and delta_known and not gaps and not unaccounted
+            else []
+        )
+        retired_ids = {entry["id"] for entry in retired}
         prs_closed = (
             []
             if (gaps or unaccounted) and not shielded_namespaces
@@ -24585,7 +24624,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # body budget dropped — is still a fix for a live condition.
                 # Nor is a previous finding on a target this run did not
                 # check (`unread_ids`): absence there is not evidence of a fix.
-                repo, audit_id, remediation_prs, still_flagged | unread_ids, previous_titles, {}, now,
+                # Nor is one retired unread (`retired_ids`): its close would
+                # say the finding no longer reproduces, which nobody checked.
+                repo, audit_id, remediation_prs, still_flagged | unread_ids | retired_ids, previous_titles, {}, now,
                 # Over a gap or an unaccounted finding the close acts on the
                 # namespaces `start`'s file declares and on nothing the
                 # worker wrote; a complete run keeps the shield's ids too.
@@ -24713,6 +24754,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # The body `refresh_coverage_ledger` wrote, when it wrote one.
         refreshed_body: str | None = None
         held_unread = bool(existing_issue and conversation_unread)
+        if held_unread:
+            # Nothing closes, so nothing is retired.
+            retired = []
+        for entry in retired:
+            log(
+                f"RETIRED UNLISTED: {entry['id']} ({entry['object']} in {entry['cluster']}) "
+                "is on the ledger and this run listed its cluster in neither "
+                "scope.clusters nor scope.skipped; it is retired with the ledger, "
+                "not confirmed fixed, and its fix stays open."
+            )
         if held_unread and not gaps and not unaccounted:
             # A clean run that could not read the ledger's conversation cannot
             # tell whether a `/remediate` stands on it, and closing would leave
