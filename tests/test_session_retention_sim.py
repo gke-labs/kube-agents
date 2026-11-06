@@ -12,6 +12,7 @@ import os
 import pathlib
 import sqlite3
 import sys
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -42,7 +43,10 @@ class FakeSessionDB:
         )
 
     def create_session(self, sid, source):
-        self._conn.execute("INSERT INTO sessions (id, source, started_at) VALUES (?, ?, 0)", (sid, source))
+        # Hermes stamps a new session with the wall clock.
+        self._conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)", (sid, source, time.time())
+        )
 
     def append_message(self, sid, role, content, timestamp=None):
         self._conn.execute(
@@ -114,8 +118,9 @@ class SimulationTest(unittest.TestCase):
     def test_the_ceiling_is_derived_from_the_stated_inputs(self):
         _, out = self.run_sim("--retention-days", "3", "--days", "90", "--slack", "2.5")
         window = 3 * 3 * out["stored_bytes_per_card"]
-        self.assertAlmostEqual(out["window_bytes"], window, delta=3)
-        self.assertAlmostEqual(out["ceiling_bytes"], out["overhead_bytes"] + window * 2.5, delta=8)
+        # stored_bytes_per_card is rounded to the byte, so nine of them can be off by 4.5.
+        self.assertAlmostEqual(out["window_bytes"], window, delta=5)
+        self.assertAlmostEqual(out["ceiling_bytes"], out["overhead_bytes"] + window * 2.5, delta=12)
         self.assertIn(out["verdict"], ("under the ceiling", "OVER the ceiling"))
 
     def test_a_plateau_over_the_ceiling_fails_the_run(self):
@@ -132,6 +137,32 @@ class SimulationTest(unittest.TestCase):
         with patch.object(FakeSessionDB, "prune_sessions", lambda self, *a, **k: 0):
             code, out = self.run_sim("--retention-days", "3", "--days", "45")
         self.assertEqual("not settled", out["verdict"])
+        self.assertEqual(0, code)
+
+    def test_every_session_is_moved_into_the_simulated_past_the_day_it_is_written(self):
+        sim = self.sim
+        seen = []
+        original = FakeSessionDB.prune_sessions
+
+        def prune(db, *args, **kwargs):
+            seen.append(db._conn.execute("SELECT MAX(started_at) FROM sessions").fetchone()[0])
+            return original(db, *args, **kwargs)
+
+        with patch.object(FakeSessionDB, "prune_sessions", prune):
+            self.run_sim("--retention-days", "3", "--days", "6")
+        self.assertTrue(all(stamp < sim.time.time() - sim.DAY / 4 for stamp in seen), seen)
+
+    def test_counts_below_one_are_refused_at_the_parser(self):
+        for flag in ("--cards-per-day", "--messages-per-card", "--retention-days", "--bytes-per-card"):
+            with self.subTest(flag=flag), self.assertRaises(SystemExit), patch("sys.stderr"):
+                self.sim.main(["--cards-per-day", "3", "--bytes-per-card", "2000", flag, "0"])
+
+    def test_a_warm_up_that_adds_no_page_gives_no_verdict(self):
+        with patch.object(self.sim, "store_bytes", lambda conn, home: {"total": 4096, "live": 4096,
+                                                                       "freelist_ratio": 0.0, "wal": 0}):
+            code, out = self.run_sim("--retention-days", "3", "--days", "45")
+        self.assertIn("no per-card growth measured", out["verdict"])
+        self.assertIsNone(out["plateau_factor"])
         self.assertEqual(0, code)
 
     def test_vacuum_runs_only_when_asked(self):

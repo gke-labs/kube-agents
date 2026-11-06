@@ -60,8 +60,17 @@ from pathlib import Path
 
 DAY = 86400
 LOG_CAP_BYTES_PER_NAME = 4 * 5 * 1024 * 1024
-# The last 30 days count as settled when they vary by no more than this.
+# The settled size is read over the run's last SETTLE_WINDOW_DAYS, which count as
+# settled when they vary by no more than SETTLED_SPREAD. A default run is
+# SETTLE_RETENTIONS x retention + SETTLE_WINDOW_DAYS days long.
+SETTLE_WINDOW_DAYS = 30
 SETTLED_SPREAD = 0.02
+SETTLE_RETENTIONS = 4
+# The month mark the report quotes alongside the settled size.
+MONTH_DAY = 30
+STATE_DB = "state.db"
+SESSIONS_DIR = "sessions"
+SQLITE_TIMEOUT_SECONDS = 30
 WORDS = (
     "cluster node pod deployment namespace service ingress replica rollout image tag "
     "quota limit request memory cpu disk volume claim storage class event warning error "
@@ -78,13 +87,24 @@ def store_bytes(conn: sqlite3.Connection, home: Path) -> dict:
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     pages = conn.execute("PRAGMA page_count").fetchone()[0]
     free = conn.execute("PRAGMA freelist_count").fetchone()[0]
-    wal = home / "state.db-wal"
+    wal = home / f"{STATE_DB}-wal"
     return {
         "total": pages * page_size,
         "live": (pages - free) * page_size,
         "freelist_ratio": round(free / pages, 3) if pages else 0.0,
         "wal": wal.stat().st_size if wal.exists() else 0,
     }
+
+
+def default_days(retention_days: int) -> int:
+    return SETTLE_RETENTIONS * retention_days + SETTLE_WINDOW_DAYS
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
+    return number
 
 
 def text_of(rng: random.Random, nbytes: int) -> str:
@@ -104,17 +124,17 @@ def run(args) -> dict:
     rng = random.Random(args.seed)
     home = Path(tempfile.mkdtemp(prefix="retention-sim-"))
     try:
-        (home / "sessions").mkdir()
-        db = SessionDB(db_path=home / "state.db")
+        (home / SESSIONS_DIR).mkdir()
+        db = SessionDB(db_path=home / STATE_DB)
         journal = db._conn.execute("PRAGMA journal_mode").fetchone()[0] if hasattr(db, "_conn") else "unknown"
-        raw = sqlite3.connect(home / "state.db", timeout=30, isolation_level=None)
+        raw = sqlite3.connect(home / STATE_DB, timeout=SQLITE_TIMEOUT_SECONDS, isolation_level=None)
         overhead = store_bytes(raw, home)["total"]
-        days = args.days or 4 * args.retention_days + 30
-        start = time.time() - days * DAY
+        days = args.days or default_days(args.retention_days)
+        wall_clock_start = time.time()
+        start = wall_clock_start - days * DAY
         per_message = max(1, args.bytes_per_card // args.messages_per_card)
         series, pruned_total, n, vacuums = [], 0, 0, 0
         for day in range(days):
-            ids = []
             stamp = start + day * DAY + DAY / 2
             for _ in range(args.cards_per_day):
                 n += 1
@@ -128,20 +148,19 @@ def run(args) -> dict:
                         sid, "assistant" if i % 2 else "user", content=text_of(rng, per_message), timestamp=stamp
                     )
                 db.end_session(sid, "completed")
-                ids.append(sid)
             # Sessions carry no such trigger. Hermes' prune ages a session by its newest
-            # message, else started_at; the session columns are set to match.
-            raw.execute("BEGIN IMMEDIATE")
-            marks = ",".join("?" * len(ids))
+            # message, else started_at; the session columns are set to match. Today's
+            # sessions are the only ones Hermes stamped with the wall clock, since every
+            # earlier one has been moved into the simulated past, so a predicate picks
+            # them out without binding one parameter per card.
             raw.execute(
-                f"UPDATE sessions SET started_at=?, ended_at=?, last_activity_at=? WHERE id IN ({marks})",
-                (stamp, stamp, stamp, *ids),
+                "UPDATE sessions SET started_at=?, ended_at=?, last_activity_at=? WHERE started_at >= ?",
+                (stamp, stamp, stamp, wall_clock_start),
             )
-            raw.execute("COMMIT")
             end_of_day = start + (day + 1) * DAY
             pruned = db.prune_sessions(
                 older_than_days=None,
-                sessions_dir=home / "sessions",
+                sessions_dir=home / SESSIONS_DIR,
                 exclude_active_write_guards=True,
                 last_active_before=end_of_day - args.retention_days * DAY,
             )
@@ -164,12 +183,17 @@ def run(args) -> dict:
     stored_per_card = (series[warmup - 1]["live"] - overhead) / (warmup * args.cards_per_day)
     window = args.retention_days * args.cards_per_day * stored_per_card
     ceiling = overhead + window * args.slack
-    tail = [s["total"] for s in series[-30:]] if len(series) >= 4 * args.retention_days + 30 else []
+    long_enough = len(series) >= default_days(args.retention_days)
+    tail = [s["total"] for s in series[-SETTLE_WINDOW_DAYS:]] if long_enough else []
     plateau = max(tail) if tail else None
     spread = round((max(tail) - min(tail)) / max(tail), 3) if tail else None
     settled = spread is not None and spread <= SETTLED_SPREAD
-    day30 = next((s["total"] for s in series if s["day"] == 30), None)
-    if plateau is None:
+    day30 = next((s["total"] for s in series if s["day"] == MONTH_DAY), None)
+    if stored_per_card <= 0:
+        # The warm-up's rows fit in pages the empty store already had: nothing was
+        # measured, so there is no window to derive a ceiling from.
+        verdict = "no per-card growth measured; raise --warmup-days or --bytes-per-card"
+    elif plateau is None:
         verdict = "too short to settle"
     elif not settled:
         verdict = "not settled"
@@ -193,7 +217,7 @@ def run(args) -> dict:
         "day30_bytes": day30,
         "plateau_bytes": plateau,
         "last_30_days_spread": spread,
-        "plateau_factor": None if plateau is None else round((plateau - overhead) / window, 2),
+        "plateau_factor": None if plateau is None or window <= 0 else round((plateau - overhead) / window, 2),
         "pruned_total": pruned_total,
         "vacuums": vacuums,
         "logs_cap_bytes_per_log_name": LOG_CAP_BYTES_PER_NAME,
@@ -205,12 +229,14 @@ def run(args) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--retention-days", type=int, default=90)
-    parser.add_argument("--cards-per-day", type=int, required=True)
-    parser.add_argument("--bytes-per-card", type=int, required=True, help="text bytes per card's transcript")
-    parser.add_argument("--messages-per-card", type=int, default=20)
-    parser.add_argument("--days", type=int, help="default: 4 x retention + 30")
-    parser.add_argument("--warmup-days", type=int, default=5, help="days used to measure stored bytes per card")
+    parser.add_argument("--retention-days", type=positive_int, default=90)
+    parser.add_argument("--cards-per-day", type=positive_int, required=True)
+    parser.add_argument("--bytes-per-card", type=positive_int, required=True, help="text bytes per card's transcript")
+    parser.add_argument("--messages-per-card", type=positive_int, default=20)
+    parser.add_argument("--days", type=positive_int, help="default: 4 x retention + 30")
+    parser.add_argument(
+        "--warmup-days", type=positive_int, default=5, help="days used to measure stored bytes per card"
+    )
     parser.add_argument("--slack", type=float, default=4.0)
     parser.add_argument("--seed", type=int, default=3704)
     parser.add_argument(
