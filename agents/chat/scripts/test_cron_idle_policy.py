@@ -903,9 +903,21 @@ class ReadSignalTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exited 1: Error from server"):
             cip.read_signal({})
 
-    def test_unreachable_sandbox_propagates(self):
-        self.stub(raises=subprocess.TimeoutExpired(["kubectl"], 30))
-        with self.assertRaises(subprocess.TimeoutExpired):
+    def test_a_hanging_sandbox_names_the_read_and_the_timeout(self):
+        # subprocess raises with the ssh wrapper's argv, whose first 160
+        # characters are ssh options: the line the ticker prints has to name
+        # kubectl, the resource and the limit instead.
+        ssh = ["ssh", "-F", "/dev/null", "-T", "-o", "BatchMode=yes"] + ["-o", "x=y"] * 20 + ["kubectl"]
+        self.stub(raises=subprocess.TimeoutExpired(ssh, cip.KUBECTL_TIMEOUT_SECONDS))
+        with self.assertRaises(RuntimeError) as caught:
+            cip.read_signal({})
+        line = cip._excerpt(str(caught.exception))
+        self.assertIn(f"kubectl get {cip.PLATFORM_AGENT_RESOURCE} timed out after {cip.KUBECTL_TIMEOUT_SECONDS}s", line)
+        self.assertNotIn("ssh", line)
+
+    def test_an_unreachable_sandbox_propagates(self):
+        self.stub(raises=RuntimeError("could not reach the shell sandbox: Connection refused"))
+        with self.assertRaisesRegex(RuntimeError, "could not reach the shell sandbox"):
             cip.read_signal({})
 
     def test_neither_field_raises(self):

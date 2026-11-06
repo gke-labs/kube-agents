@@ -85,6 +85,7 @@ import importlib
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -254,7 +255,15 @@ def read_signal(environ: dict | None = None) -> tuple[datetime, str]:
     sandbox_exec = _platform_module(SANDBOX_MODULE)
     namespace = str(env.get(NAMESPACE_ENV, "") or "").strip() or DEFAULT_NAMESPACE
     argv = ["kubectl", "get", PLATFORM_AGENT_RESOURCE, "-n", namespace, "-o", "json"]
-    completed = sandbox_exec.run(argv, timeout=KUBECTL_TIMEOUT_SECONDS, check=False)
+    try:
+        completed = sandbox_exec.run(argv, timeout=KUBECTL_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired as exc:
+        # Its own text is the ssh wrapper's argv, with the cause past any
+        # excerpt; name the read and the limit, as the exit branch names what failed.
+        raise RuntimeError(
+            f"kubectl get {PLATFORM_AGENT_RESOURCE} timed out after {KUBECTL_TIMEOUT_SECONDS}s "
+            "through the shell sandbox"
+        ) from exc
     if completed.returncode != 0:
         raise RuntimeError(
             f"kubectl get {PLATFORM_AGENT_RESOURCE} exited {completed.returncode}: "
