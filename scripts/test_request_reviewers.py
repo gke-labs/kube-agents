@@ -983,6 +983,16 @@ class MainTest(_MainHarness):
             self.assertEqual(len(self.requested()), 1, seed)
             self.assertIn(self.requested()[0], ("jayantid", "lapis2002"), seed)
 
+    def test_the_override_skips_files_an_approval_already_clears(self):
+        # lapis2002 approved the replay-proxy half; `/request-review` asks for
+        # the doc half alone, never lapis2002 again.
+        files = ("examples/inference-replay/eval-design.md", "hack/replay-proxy/normalizer.py")
+        for seed in range(20):
+            self.run_main(pull_request(), [review("lapis2002", "APPROVED")], "--react-to", str(self.COMMENT_ID), "--seed", str(seed), files=files)
+            self.assertEqual(self.code, 0)
+            self.assertEqual(len(self.requested()), 1, seed)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
+
     def test_the_override_narrows_the_pool_too(self):
         # `/request-review` skips the verdict check, not the narrowing: the
         # person asking wants a reviewer now, and a non-approver's pull request
