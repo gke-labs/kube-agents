@@ -21,7 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"slices"
@@ -689,18 +689,18 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 					profileNamespaceName(agent), labelPartOf, partOfKubeAgents))
 			}
 			jobTemplates = nil
-			jobErr = errors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
 			break
 		}
 		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 			jobTemplates = nil
-			jobErr = errors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
 			break
 		}
 		for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
 			if err := r.applyManaged(ctx, agent, obj); err != nil {
 				jobTemplates = nil
-				jobErr = errors.Join(fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), r.revokeDispatcherJobsRole(ctx, agent))
+				jobErr = goerrors.Join(fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), r.revokeDispatcherJobsRole(ctx, agent))
 				break
 			}
 		}
@@ -774,37 +774,49 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// The warm pools the dispatcher hands interactive tasks to
+	// (agentprofile_pool.go). A failure there is the profile namespace's,
+	// like the quota's.
+	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved)
 	// Gated off: what an earlier pass rendered goes.
 	if !signal {
-		return r.deleteDispatcherJobResources(ctx, agent), nil
+		return goerrors.Join(poolErr, r.deleteDispatcherJobResources(ctx, agent)), nil
 	}
-	return jobErr, nil
+	return goerrors.Join(jobErr, poolErr), nil
 }
 
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the
 // owned objects only if this agent controls them, and the profile namespace's
 // Role and binding only if they carry this agent's labels.
 func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (profileErr error, err error) {
+	// The pools and their bundle go first, whatever the deletes after them
+	// do: their pods hold bus and broker tokens, and nothing dispatches to
+	// them once the dispatcher is off.
+	profileErr = r.deleteDispatcherPodsRBAC(ctx, agent)
 	name := a2aDispatcherName(agent)
+	var errs []error
 	for _, obj := range []client.Object{
 		&appsv1.Deployment{}, &rbacv1.RoleBinding{}, &rbacv1.Role{}, &corev1.ServiceAccount{},
 	} {
 		if err := r.deleteIfControlled(ctx, agent, obj, types.NamespacedName{Namespace: agent.Namespace, Name: name}); err != nil {
-			return nil, err
+			errs = append(errs, err)
 		}
 	}
 	if err := r.deleteIfControlled(ctx, agent, &corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}); err != nil {
-		return nil, err
+		errs = append(errs, err)
 	}
-	return r.deleteDispatcherPodsRBAC(ctx, agent), nil
+	return profileErr, goerrors.Join(errs...)
 }
 
-// deleteDispatcherPodsRBAC removes what the dispatcher has in the profile
-// namespace: its pod-read Role and binding, and Job mode's Jobs, Job
-// templates and Jobs Role (deleteDispatcherJobResources), each if it carries
-// this agent's labels. Both run whatever the other returns.
+// deleteDispatcherPodsRBAC removes what the dispatcher left in the profile
+// namespace: its pod-read Role and binding, this agent's warm pools, and Job
+// mode's Jobs, Job templates and Jobs Role (deleteDispatcherJobResources),
+// each if it carries this agent's labels.
 func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return errors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteDispatcherJobResources(ctx, agent))
+	// Each runs whatever the others return: the warm pools have no owner
+	// reference, so nothing else would reclaim pods holding bus and broker
+	// tokens.
+	return goerrors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteProfilePools(ctx, agent), r.deleteDispatcherJobResources(ctx, agent))
 }
 
 // deleteDispatcherPodReadRBAC removes the dispatcher's pod-read Role and
@@ -850,7 +862,13 @@ func (r *PlatformAgentReconciler) deleteIfControlled(ctx context.Context, agent 
 // agentLabelsMark reports whether obj carries this agent's a2a labels, the
 // ownership test for objects in the profile namespace.
 func agentLabelsMark(obj client.Object, agent *agentv1alpha1.PlatformAgent) bool {
-	want := a2aLabels(agent, "dispatcher")
+	return agentLabelsMarkComponent(obj, agent, "dispatcher")
+}
+
+// agentLabelsMarkComponent is agentLabelsMark for an object of another
+// component: it carries this agent's labels with that component.
+func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAgent, component string) bool {
+	want := a2aLabels(agent, component)
 	got := obj.GetLabels()
 	for k, v := range want {
 		if got[k] != v {

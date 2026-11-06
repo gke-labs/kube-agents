@@ -339,9 +339,10 @@ func Start(opts Options) *Server {
 // older than Go 1.27.1, where it was traced; this Transport can go once
 // net/http hands the signal to the reader of the response it belongs to.
 // A connection per request leaves nothing to reuse, at one dial per request,
-// which the paged soaks absorb. It fixes the fake's clients only: the
+// which the paged soaks absorb. It fixes the fake's clients only. The
 // watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
-// (clusterprofiles.Broker.ClientConfig) and is open to the same stall. A
+// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its watches
+// now open on a non-pooled twin (cmd/k8s-event-watcher/watchtransport.go). A
 // test that sets a CA, a client certificate, a certificate callback or
 // Insecure on this config fails at client construction, since client-go
 // refuses those next to a Transport.

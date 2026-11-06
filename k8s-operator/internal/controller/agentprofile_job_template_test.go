@@ -43,9 +43,18 @@ func jobTemplateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent,
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	policy, binding := shippedDispatcherJobPolicy(t)
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, chartProfileNamespace(agent), policy, binding}, objs...)...).
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)}, objs...)...).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	return &PlatformAgentReconciler{Client: c, Scheme: scheme}, c
+}
+
+// jobTestNATSCABundle is the agent's NATS CA bundle, which the warm pools
+// (reconcileProfilePools) copy into the profile namespace on every pass.
+func jobTestNATSCABundle(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aNATSCACertKey: "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----\n"},
+	}
 }
 
 // The index carries no template, so it goes to the API server without a
@@ -384,7 +393,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 	}
 	ssa := fakeServerSideApplyInterceptors()
 	policy, binding := shippedDispatcherJobPolicy(t)
-	c = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding).
+	c = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding, jobTestNATSCABundle(agent)).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 				err := ssa.Patch(ctx, cl, obj, patch, opts...)

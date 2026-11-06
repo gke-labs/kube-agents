@@ -713,9 +713,9 @@ litellm:
         ephemeral-storage: 2304Mi
 
 # The Hindsight memory store: the API the agents call for long-term memory,
-# the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
-# the database's deliberate lack of a password, and a PodMonitoring. Mirrors
-# k8s-operator/config/integrations/hindsight.
+# the Postgres/pgvector StatefulSet behind it, NetworkPolicies isolating the
+# API pod and standing in for the database's deliberate lack of a password,
+# and a PodMonitoring. Mirrors k8s-operator/config/integrations/hindsight.
 hindsight:
   # Tri-state. true/false is an answer; null (the default) follows
   # platformAgent.harness.memory.provider, so the providers that need the
@@ -790,6 +790,9 @@ hindsight:
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
+  # When litellm.enabled=false, hindsight-api's NetworkPolicy renders as
+  # Ingress-only (because its gateway egress rule selects app: litellm /
+  # app: standalone-replay pods in the release namespace).
   networkPolicy: true
   podMonitoring: true
   podDisruptionBudget:

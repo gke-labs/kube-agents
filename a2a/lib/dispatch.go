@@ -33,8 +33,17 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // submission, acked or not: it mirrors the operator's `--max-age=72h` on
 // PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
 // DeliverAll replays everything inside it, so the dispatcher keeps a
-// finished task's tombstone (LeaseRecord.FinishedAt) at least this long.
+// finished task's tombstone (LeaseRecord.FinishedAt) at least this long
+// when the dispatch config carries no SubmitRetentionSeconds, and never
+// less than this when it does. It is a compiled value, not the live
+// stream's: the operator never edits an existing stream, so don't lower it
+// below any max age an operator has created PROFILE_SUBMITS with (#4948).
 const ProfileSubmitRetention = 72 * time.Hour
+
+// MaxSubmitRetention is the longest SubmitRetentionSeconds a dispatch
+// config may carry. It keeps the retention, and a tombstone's keep-until
+// time, well inside a time.Duration.
+const MaxSubmitRetention = 365 * 24 * time.Hour
 
 // ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
 // writes for a submission it refused at admission, which no pod ever held.
@@ -259,7 +268,8 @@ type LeaseRecord struct {
 	// FinishedAt, set, makes the record a tombstone: the task ended (its
 	// final renewal came, or the dispatcher wrote its terminal: failed, or
 	// rejected at admission) at this time. A submission stream keeps acked
-	// submissions for ProfileSubmitRetention, so a durable re-created with
+	// submissions for its max age (DispatchConfig.SubmitRetentionSeconds,
+	// or ProfileSubmitRetention), so a durable re-created with
 	// DeliverAll replays finished tasks; the tombstone, kept under the same
 	// key at least that long, is how the dispatcher knows a replay is one
 	// and acks it without running or failing it again. A tombstone holds no
@@ -359,10 +369,9 @@ type DispatchConfig struct {
 	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
 	// submission (the operator renders it from the same value as the
 	// stream's max age). A durable re-created over the stream replays
-	// everything inside it, so the dispatcher is to keep a finished task's
-	// tombstone at least this long (it reads this from #4873 on; until then
-	// it keeps its own default). Zero is from an operator that predates the
-	// field; the dispatcher then uses its own default.
+	// everything inside it, so the dispatcher keeps a finished task's
+	// tombstone at least this long. Zero is from an operator that predates
+	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// JobLabels go on every Job the dispatcher creates: the operator's
 	// agent labels, by which a teardown deletes only this install's Jobs,
@@ -433,8 +442,8 @@ func (c DispatchConfig) Validate() error {
 	case max(c.LeaseSeconds, c.RenewSeconds, c.RestartGraceSeconds, c.AcceptTimeoutSeconds,
 		c.BreakerCooldownSeconds, c.JobStartSeconds, c.StopGraceSeconds) > MaxDispatchSeconds:
 		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
-	case c.SubmitRetentionSeconds < 0:
-		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
+	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
 	}
 	for k, v := range c.JobLabels {
 		if !validLabelKey(k) || !labelValue.MatchString(v) {
