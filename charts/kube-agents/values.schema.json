@@ -101,6 +101,15 @@
             }
           }
         },
+        "mcpServer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -445,7 +454,13 @@
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "presubmit", "replay-lane"]
+                  "enum": [
+                    "",
+                    "nightly",
+                    "nightly-untrusted",
+                    "presubmit",
+                    "replay-lane"
+                  ]
                 },
                 "project": {
                   "type": "string"
@@ -488,7 +503,12 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "presubmit", "replay-lane"]
+                    "enum": [
+                      "nightly",
+                      "nightly-untrusted",
+                      "presubmit",
+                      "replay-lane"
+                    ]
                   }
                 }
               }

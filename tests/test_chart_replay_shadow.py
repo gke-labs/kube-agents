@@ -44,6 +44,9 @@ _ON = (
     "litellm.replayShadow.job.pr=4700",
 )
 _PROXY = "inference-replay-shadow"
+# Every job kind the CI files under; tests/test_ci_replay_shadow.py holds the
+# other copies equal to this one.
+_JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit", "replay-lane")
 _PROXY_CONTAINER = "replay-shadow-proxy"
 _LITELLM_CONTAINER = "litellm-container"
 _HELM_TIMEOUT_SECONDS = 120
@@ -433,6 +436,18 @@ class SchemaTest(unittest.TestCase):
         res = _render(sets)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("/litellm/replayShadow/job/kind", res.stderr)
+
+    def test_every_kind_the_ci_files_under_renders_and_is_stamped(self):
+        for kind in _JOB_KINDS:
+            with self.subTest(kind=kind):
+                # The lane's kind renders only in replay mode, which takes both switches.
+                lane = ("litellm.replayShadow.mode=replay", "litellm.replayShadow.allowServe=true") \
+                    if kind == "replay-lane" else ()
+                res = _render([*_ON, f"litellm.replayShadow.job.kind={kind}", *lane],
+                              show_only="templates/litellm.yaml")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                container = _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
+                self.assertEqual({e["name"]: e.get("value") for e in container["env"]}["REPLAY_JOB_KIND"], kind)
 
     def test_on_with_an_unknown_job_kind_is_refused(self):
         res = _render([*_ON, "litellm.replayShadow.job.kind=weekly"])

@@ -1370,7 +1370,7 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges, the six proposal readings and the two people readings are produced by the operator, on the leader and off the reconcile path. Every five
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -1387,7 +1387,7 @@ operator cannot reach; the CR's events name the pod. It advances on any brokered
 those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
 default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is.
 
-The six proposal fields and the two people fields are readings, not totals. A reading's source is the credential broker or the A2A gateway. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
+The six proposal fields, the two people fields and the nine origin fields are readings, not totals. A reading's source is the credential broker, the A2A gateway or the chat plugin. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
 repository and the human events on them. The operator projects the latest poll's values as they
 stand, outside the ConfigMap.
 
@@ -1426,6 +1426,20 @@ and the second poll in a row that cannot read the broker clears it. It moves nei
 summary script and the chat gateway's `/feedback summary` print it as the
 `tools (top 5, since broker start)` block.
 
+The origins reading (`proposalsFromChat`, `proposalsFromConsole`, `proposalsFromApi`,
+`proposalsFromEvent`, `proposalsFromDrift`, `proposalsFromAudit`, `proposalsFromScheduled`,
+`proposalsFromIssue`, `proposalsFromOther`) comes from the chat plugin's proposals ledger: the pull
+requests the agent opened and the forge confirmed, counted by the origin of the work that started
+each. The operator reads it on the gateway pod's chat metrics listener, summed over the chat
+platform. The reading is present when all nine origins resolve; the plugin serves every origin,
+zero included, from its first ledger read. Until then, and while the served CRD predates them, the
+nine fields are absent.
+
+A poll that reads no body with all nine is a miss, and the second miss in a row clears them. A 0 is
+a reading, and none of the nine moves `lastActiveTime` or `lastHumanActiveTime`. A proposal the
+agent did not see itself open is not counted, so the nine usually sum to at most
+`remediationsProposedTotal`.
+
 The operator also serves every counter, cluster gauge, scalar reading and time of this block (the two lists, `activeInterfaces` and `topTools`, aside), and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
@@ -1461,7 +1475,7 @@ The counters and the two times land through the poller above, which consults the
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
-later (the two cluster gauges, the proposal readings, the people readings, `chatMessagesInboundTotal`,
+later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
 `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this

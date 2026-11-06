@@ -385,8 +385,9 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
-# GitLab CE lanes' only nightlies (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
-# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt); and the
+# GitLab CE lanes' weekly jobs (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
+# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt), with the next-mode
+# nightlies they replace listed until the weekly jobs run; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh); and the replay lane's periodic
 # (EVAL_REPLAY_LANE=true), which replays the nightlies' recordings and must
@@ -405,7 +406,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it

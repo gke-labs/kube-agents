@@ -2304,6 +2304,18 @@ class ApiSession:
                 return response
             report_retry(response.status_code, refusal_text(self._json_body(response)), attempts_made, delay)
             self._sleep(delay)
+            if (self._json_body(response) or {}).get(BUSY_BOUND_KEY) == ADMISSION_BOUND_DRAINING:
+                # A draining exec pod keeps answering this on the pooled
+                # keep-alive connection to its Envoy, so the retry would go back
+                # to it. A new connection reaches a ready replica, or fails over
+                # to the stateful broker.
+                self._drop_pooled_connections()
+
+    def _drop_pooled_connections(self) -> None:
+        close = getattr(self._http, "close", None)
+        if close is not None:
+            with self._lock:
+                close()
 
     @staticmethod
     def _json_body(response):

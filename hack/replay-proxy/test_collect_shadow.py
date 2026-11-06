@@ -8,6 +8,7 @@ The last class runs collect_shadow.py as a process with fake `kubectl` and
 `gcloud` executables on PATH, to cover the signal handling and the exit status.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -769,6 +770,22 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(events[0], "start")
         self.assertEqual(events[-1], "stop")
 
+    def test_a_nightly_untrusted_run_uploads_under_its_own_folder(self):
+        with open(os.path.join(self.pod, "logs", "p-1-000001.jsonl"), "wb") as handle:
+            handle.write(b"line\n")
+        proc = self.start("--kind", "nightly-untrusted", "--final-deadline", "20")
+        self.wait_for(lambda: any(f.endswith(".jsonl") for f in self.bucket_files()))
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(proc.returncode, 0, err)
+        files = self.bucket_files()
+        self.assertTrue(files)
+        for name in files:
+            self.assertTrue(name.startswith(f"{BUCKET}/replay-shadow/nightly-untrusted/"), name)
+        [manifest] = [f for f in files if "/job-" in f]
+        with open(os.path.join(self.bucket, manifest)) as handle:
+            self.assertEqual(json.load(handle)["kind"], "nightly-untrusted")
+
     def test_sigterm_cuts_a_hung_upload_at_the_final_deadline_and_exits_0(self):
         with open(os.path.join(self.pod, "logs", "p-1-000001.jsonl"), "wb") as handle:
             handle.write(b"line\n")
@@ -805,6 +822,16 @@ class ProcessTest(unittest.TestCase):
                                "--seed-dir", seed, "--seed-once"],
                               env=dict(self.env, FAKE_NO_PODS="1"), capture_output=True, timeout=PROCESS_WAIT_SECONDS)
         self.assertEqual(none.returncode, 1, none.stdout)
+
+    def test_a_build_or_bucket_that_could_make_a_dot_segment_is_refused(self):
+        base = ["--namespace", NAMESPACE, "--selector", SELECTOR, "--container", CONTAINER, "--kind", "presubmit"]
+        for bucket, build in ((BUCKET, ".."), (BUCKET, "."), (BUCKET, "../../nightly/2026-11-05/1"), (BUCKET, "a/b"),
+                              (BUCKET, ""), ("b/../x", "1"), ("gs://b", "1")):
+            with self.subTest(bucket=bucket, build=build):
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    C.parse_args([*base, "--bucket", bucket, "--build", build])
+        args = C.parse_args([*base, "--bucket", BUCKET, "--build", "1790000000000000000"])
+        self.assertNotRegex(C.job_prefix(args.bucket, args.kind, "2026-11-05", args.build), r"/\.\.?(/|$)")
 
     def test_bad_arguments_still_exit_0(self):
         proc = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--kind", "weekly"],

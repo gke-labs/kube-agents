@@ -234,17 +234,42 @@ readonly REPLAY_SHADOW_DEFAULT_BUCKET="kube-agents-replay-shadow"
 # The proxy's pods and container (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_SHADOW_POD_SELECTOR="app=litellm,kubeagents.x-k8s.io/inference-role=replay-shadow"
 readonly REPLAY_SHADOW_CONTAINER="replay-shadow-proxy"
-# The two job kinds the analysis reads (hack/replay-proxy/analyze_shadow.py):
-# a presubmit, or a scheduled or post-merge run of main. The replay lane is a
-# third, its own folder, which that analysis counts in no estimate.
+# The job kinds, each its own folder in the bucket with its own IAM grants
+# (docs/ci-pool-projects.md): a presubmit; a scheduled or post-merge run of
+# main uploading as the nightly runner; and one uploading as any other account.
+# Every presubmit runs pull-request code as prowjob-default-sa, so only
+# REPLAY_SHADOW_NIGHTLY_RECORDER may write nightly/, and a scheduled run as
+# prowjob-default-sa (the GitLab next lane) goes to nightly-untrusted/, which
+# hack/replay-proxy/analyze_shadow.py never takes an answer from. Both runners
+# may write nightly-untrusted/, so a nightly runner's night that fails the
+# check below still records, as untrusted.
 readonly REPLAY_SHADOW_KIND_PRESUBMIT="presubmit"
 readonly REPLAY_SHADOW_KIND_NIGHTLY="nightly"
+readonly REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED="nightly-untrusted"
+# The replay lane (EVAL_REPLAY_LANE=true) is a fourth, its own folder, which
+# the analysis counts in no estimate.
 readonly REPLAY_SHADOW_KIND_REPLAY_LANE="replay-lane"
+# The account a run must upload as to be filed under nightly/: the collector's
+# `gcloud storage cp` writes as gcloud's active account, so that is the one
+# read (_replay_shadow_upload_identity).
+readonly REPLAY_SHADOW_NIGHTLY_RECORDER="eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+# gcloud properties (or their CLOUDSDK_AUTH_* variables, which gcloud reads
+# into them) under which its calls run as someone other than the account
+# `gcloud auth list` shows. Any of them set, the run is not filed as nightly.
+readonly REPLAY_SHADOW_GCLOUD_IDENTITY_OVERRIDES=(auth/impersonate_service_account auth/access_token_file auth/credential_file_override)
+# The proxy Deployment and the variable the chart stamps the kind into
+# (charts/kube-agents/templates/litellm.yaml). The eval reads the kind back
+# from it, so the collector's folder is the kind on the deploy's lines.
+readonly REPLAY_SHADOW_DEPLOYMENT="inference-replay-shadow"
+readonly REPLAY_SHADOW_PROXY_KIND_VAR="REPLAY_JOB_KIND"
+readonly REPLAY_SHADOW_KUBECTL_TIMEOUT="30s"
 # ─── Inference replay: record and replay modes ───────────────────────────────
 # The proxy's three modes (hack/replay-proxy/README.md, "Modes"). A trusted
 # nightly records: it saves answers, and the collector uploads those from runs
 # that passed to the shared cache bucket (EVAL_REPLAY_RECORD=false keeps it in
-# shadow mode). The replay lane (EVAL_REPLAY_LANE=true, a periodic on main)
+# shadow mode); only a trusted nightly, filed nightly, records, never a
+# nightly-untrusted one. Only REPLAY_SHADOW_NIGHTLY_RECORDER may create objects
+# in the cache bucket (docs/ci-pool-projects.md). The replay lane (EVAL_REPLAY_LANE=true, a periodic on main)
 # replays them and gates nothing. A presubmit stays in shadow mode, always:
 # the cache must never take an answer from pull-request code
 # (examples/inference-replay/eval-design.md, "Who can write to the cache").
@@ -252,13 +277,6 @@ readonly REPLAY_MODE_SHADOW="shadow"
 readonly REPLAY_MODE_RECORD="record"
 readonly REPLAY_MODE_REPLAY="replay"
 readonly REPLAY_RECORD_DEFAULT="true"
-# The one account a nightly may record as: the collector uploads with gcloud's
-# active account, so that is the one read (_replay_shadow_upload_identity).
-# Only it may create objects in the cache bucket (docs/ci-pool-projects.md).
-readonly REPLAY_SHADOW_NIGHTLY_RECORDER="eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-# gcloud properties under which its calls run as someone other than the
-# account `gcloud auth list` shows; any of them set, the run does not record.
-readonly REPLAY_SHADOW_GCLOUD_IDENTITY_OVERRIDES=(auth/impersonate_service_account auth/access_token_file auth/credential_file_override)
 readonly REPLAY_CACHE_DEFAULT_BUCKET="kube-agents-replay-cache"
 # The cache directory in the proxy's data volume (litellm.replayShadow.cacheDir),
 # by its name there and its path in the pod.
@@ -276,12 +294,9 @@ readonly REPLAY_MODE_STOP_WAIT_SECONDS=255
 # beside its logs (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_LANE_CACHE_MAX_AGE_HOURS=30
 readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
-# The proxy Deployment, and the variable the chart stamps the mode into
-# (charts/kube-agents/templates/litellm.yaml). The deploy decides the mode once;
-# the eval reads it back so its collector runs in the mode the proxy runs in.
-readonly REPLAY_SHADOW_DEPLOYMENT="inference-replay-shadow"
+# The variable the chart stamps the mode into, read back the same way: the
+# deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
-readonly REPLAY_SHADOW_KUBECTL_TIMEOUT="30s"
 # A postsubmit records only on this branch; a periodic checks out main by its
 # job's extra_refs and carries no PULL_BASE_REF.
 readonly REPLAY_RECORD_BRANCH="main"
@@ -507,14 +522,22 @@ collect_credential_proxy_evidence() {
 # must not go ahead with; the deploy stops on it, the eval only warns.
 #
 # The job kind comes from Prow's JOB_TYPE: a presubmit is `presubmit` and
-# needs PULL_NUMBER; a periodic or postsubmit is `nightly`. A batch run (Tide
+# needs PULL_NUMBER; a periodic or postsubmit is `nightly` when gcloud's active
+# account, the one the collector uploads as, is REPLAY_SHADOW_NIGHTLY_RECORDER
+# and no impersonation or token override is set, and `nightly-untrusted`
+# otherwise, including when either can't be read. A wrong `nightly-untrusted`
+# costs that night's trusted data (it still records, as untrusted); a wrong
+# `nightly` would let pull-request code's account into nightly/, which IAM
+# refuses. The deploy decides; the eval's collector uploads under the kind the
+# deploy stamped on the proxy (start_replay_shadow_collector). A batch run (Tide
 # testing several pull requests merged together) belongs to no one pull
 # request and is no nightly, so it runs without the proxy, with a warning,
 # rather than failing a merge. A release-candidate run (RC_COMMIT_SHA) is
 # refused: that path builds no images, so there is no proxy image. Outside
 # Prow, where JOB_TYPE is unset, EVAL_REPLAY_SHADOW_JOB_KIND names the kind;
 # inside it, setting that too is refused, so a presubmit cannot be filed as a
-# nightly. BUILD_ID names the run, as it does every Prow job.
+# nightly. A `nightly` named there gets the same account check. BUILD_ID names
+# the run, as it does every Prow job.
 #
 # Each of those refusals holds only when EVAL_REPLAY_SHADOW=true was set: left
 # at its default, a run the proxy cannot serve (a release candidate, a run
@@ -546,10 +569,11 @@ _replay_shadow_unusable() {
 }
 
 # The account gcloud's uploads run as: its active account, which on a Prow pod
-# is the job's Kubernetes service account's Workload Identity binding. When
-# that can't be stated (no gcloud, a property that can't be read, an
-# impersonation or token override set, no active account, a failed `gcloud
-# auth list`), a reason in parentheses instead, which never equals an account.
+# is the job's Kubernetes service account's Workload Identity binding, read
+# from the metadata server. When that can't be stated (no gcloud, a property
+# that can't be read, an impersonation or token override set, no active
+# account, a failed `gcloud auth list`), a reason in parentheses instead, which
+# never equals an account.
 _replay_shadow_upload_identity() {
   if ! command -v gcloud >/dev/null 2>&1; then
     echo "(no gcloud on PATH)"
@@ -649,6 +673,12 @@ _replay_cache_bucket() {
   echo "${bucket}"
 }
 
+# The kind hack/ci-deploy.sh stamped on the proxy (REPLAY_SHADOW_PROXY_KIND_VAR on
+# REPLAY_SHADOW_DEPLOYMENT), or nothing when it can't be read.
+_replay_shadow_deployed_kind() {
+  _replay_shadow_deployed_env "$1" "${REPLAY_SHADOW_PROXY_KIND_VAR}" || true
+}
+
 resolve_replay_shadow() {
   REPLAY_SHADOW_ACTIVE="false"
   REPLAY_SHADOW_BUCKET=""
@@ -730,9 +760,9 @@ resolve_replay_shadow() {
   "")
     kind="${EVAL_REPLAY_SHADOW_JOB_KIND:-}"
     case "${kind}" in
-    "${REPLAY_SHADOW_KIND_PRESUBMIT}" | "${REPLAY_SHADOW_KIND_NIGHTLY}") ;;
+    "${REPLAY_SHADOW_KIND_PRESUBMIT}" | "${REPLAY_SHADOW_KIND_NIGHTLY}" | "${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}") ;;
     *)
-      _replay_shadow_unusable "outside Prow (JOB_TYPE unset) needs EVAL_REPLAY_SHADOW_JOB_KIND set to ${REPLAY_SHADOW_KIND_PRESUBMIT} or ${REPLAY_SHADOW_KIND_NIGHTLY}, not '${kind}'"
+      _replay_shadow_unusable "outside Prow (JOB_TYPE unset) needs EVAL_REPLAY_SHADOW_JOB_KIND set to ${REPLAY_SHADOW_KIND_PRESUBMIT}, ${REPLAY_SHADOW_KIND_NIGHTLY} or ${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}, not '${kind}'"
       return
       ;;
     esac
@@ -762,24 +792,34 @@ resolve_replay_shadow() {
     _replay_shadow_unusable "needs PROJECT_ID, the eval project every line is tagged with"
     return
   fi
-  local mode="${REPLAY_MODE_SHADOW}" cache_bucket="" identity
-  if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
+  if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ]; then
+    local identity
     identity="$(_replay_shadow_upload_identity)"
+    if [ "${identity}" != "${REPLAY_SHADOW_NIGHTLY_RECORDER}" ]; then
+      kind="${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}"
+      echo "Shadow replay proxy: this night's shadow data is filed as UNTRUSTED (${kind}/, never ${REPLAY_SHADOW_KIND_NIGHTLY}/), so no replay estimate takes an answer from it. Its uploads run as ${identity}; only ${REPLAY_SHADOW_NIGHTLY_RECORDER}, uploading as itself, files a trusted night." >&2
+    fi
+  fi
+  local mode="${REPLAY_MODE_SHADOW}" cache_bucket=""
+  # Record only on a trusted nightly: the account check above has already filed
+  # anything else as nightly-untrusted.
+  if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
     if [ "${JOB_TYPE:-}" = "${REPLAY_SHADOW_JOB_TYPE_POSTSUBMIT}" ] && [ "${PULL_BASE_REF:-}" != "${REPLAY_RECORD_BRANCH}" ]; then
       if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
         echo "ERROR: EVAL_REPLAY_RECORD=true on a postsubmit of '${PULL_BASE_REF:-}': only ${REPLAY_RECORD_BRANCH} records into the shared replay cache." >&2
         return 1
       fi
       echo "Replay proxy: shadow mode, not record: a postsubmit of '${PULL_BASE_REF:-}' is not ${REPLAY_RECORD_BRANCH}." >&2
-    elif [ "${identity}" = "${REPLAY_SHADOW_NIGHTLY_RECORDER}" ]; then
+    else
       cache_bucket="$(_replay_cache_bucket)" || return 1
       mode="${REPLAY_MODE_RECORD}"
-    elif [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
-      echo "ERROR: EVAL_REPLAY_RECORD=true, but this nightly's uploads run as ${identity}; only ${REPLAY_SHADOW_NIGHTLY_RECORDER}, uploading as itself, records into the shared replay cache." >&2
-      return 1
-    else
-      echo "Replay proxy: shadow mode, not record: this nightly's uploads run as ${identity}, and only ${REPLAY_SHADOW_NIGHTLY_RECORDER} records into the shared replay cache." >&2
     fi
+  elif [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
+    if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
+      echo "ERROR: EVAL_REPLAY_RECORD=true on an untrusted nightly: only ${REPLAY_SHADOW_NIGHTLY_RECORDER}, uploading as itself, records into the shared replay cache." >&2
+      return 1
+    fi
+    echo "Replay proxy: shadow mode, not record: an untrusted nightly never records into the shared replay cache." >&2
   elif [ "${kind}" != "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-}" = "true" ]; then
     echo "ERROR: EVAL_REPLAY_RECORD=true on a ${kind} run: only a trusted nightly records; a pull request's run never writes the shared replay cache." >&2
     return 1
@@ -842,6 +882,13 @@ replay_shadow_helm_args() {
 # caller: a setting resolve_replay_shadow refuses, or a missing python3 or
 # gcloud, is a warning and no collector.
 #
+# A scheduled run uploads under the kind hack/ci-deploy.sh stamped on the
+# proxy, read back from its Deployment, rather than this shell's own account
+# check: the deploy and the eval are two processes that each ask gcloud, and a
+# collector filing under another folder than the lines' tag would have them
+# dropped by the analysis. When the Deployment can't be read, this shell's own
+# answer stands. A presubmit stays a presubmit whatever the Deployment says.
+#
 # The collector runs in the mode the deploy installed the proxy in, read back
 # from its Deployment (_replay_shadow_deployed_mode): record when the proxy
 # records, so its cache is always emptied, and shadow when it doesn't, so a
@@ -869,8 +916,25 @@ start_replay_shadow_collector() {
       return 0
     fi
   done
-  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  # A scheduled run's kind is what the deploy stamped; a presubmit stays a
+  # presubmit and the replay lane the lane, whatever the Deployment says.
+  if [ "${REPLAY_SHADOW_KIND}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] || [ "${REPLAY_SHADOW_KIND}" = "${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}" ]; then
+    local deployed_kind
+    deployed_kind="$(_replay_shadow_deployed_kind "${namespace}")"
+    case "${deployed_kind}" in
+    "${REPLAY_SHADOW_KIND_NIGHTLY}" | "${REPLAY_SHADOW_KIND_NIGHTLY_UNTRUSTED}")
+      if [ "${deployed_kind}" != "${REPLAY_SHADOW_KIND}" ]; then
+        echo "Shadow replay proxy: uploading as ${deployed_kind}, the kind the deploy stamped on the proxy, not ${REPLAY_SHADOW_KIND} from this shell's own check." >&2
+      fi
+      REPLAY_SHADOW_KIND="${deployed_kind}"
+      ;;
+    *)
+      echo "WARNING: could not read the kind the deploy stamped on ${REPLAY_SHADOW_DEPLOYMENT} ('${deployed_kind}'); the collector uploads as ${REPLAY_SHADOW_KIND} from this shell's own check, and the analysis drops any line tagged otherwise." >&2
+      ;;
+    esac
+  fi
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
   mkdir -p "${artifact_dir}" 2>/dev/null || true
   local mode="${REPLAY_SHADOW_MODE}" final_deadline="${REPLAY_SHADOW_COLLECTOR_FINAL_DEADLINE_SECONDS}" deployed
   # The deploy decided the mode; the collector follows the proxy, so a proxy

@@ -8,6 +8,8 @@ host cluster and stopped from the EXIT trap, and never fails the eval. The
 functions run here as lifted from the shipped files, under bash.
 """
 
+import ast
+import json
 import os
 import pathlib
 import re
@@ -30,6 +32,10 @@ _CI_ENV = _ROOT / "hack" / "ci-env.sh"
 _CI_DEPLOY = _ROOT / "hack" / "ci-deploy.sh"
 _CI_EVAL = _ROOT / "hack" / "ci-eval-pr.sh"
 _CLOUDBUILD = _ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml"
+_COLLECTOR = _ROOT / "hack" / "replay-proxy" / "collect_shadow.py"
+_ANALYZER = _ROOT / "hack" / "replay-proxy" / "analyze_shadow.py"
+_SCHEMA = _ROOT / "charts" / "kube-agents" / "values.schema.json"
+_CHART_TEST = _ROOT / "tests" / "test_chart_replay_shadow.py"
 _BUCKET = "kube-agents-replay-shadow"
 _BUILD = "1790000000000000000"
 _PROJECT = "kube-agents-evals-07"
@@ -42,6 +48,61 @@ _WAIT_SECONDS = 20
 # caller that signals on the argv file instead of the "collector running" line
 # kills it in that gap, every time.
 _FAKE_HANDLER_DELAY_SECONDS = 0.5
+_RECORDER = "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+_PROW_DEFAULT = "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
+# A stand-in gcloud that answers only the calls the real one is asked:
+# `auth list` with FAKE_GCLOUD_ACCOUNT and status FAKE_GCLOUD_EXIT, and
+# `config get-value` of the three identity overrides with FAKE_GCLOUD_<NAME>
+# and status FAKE_GCLOUD_CONFIG_EXIT.
+_FAKE_GCLOUD = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    if [ "$1 $2" = "config get-value" ] && [ "$#" -eq 3 ]; then
+      case "$3" in
+      auth/impersonate_service_account) value="${FAKE_GCLOUD_IMPERSONATE_SERVICE_ACCOUNT:-}" ;;
+      auth/access_token_file) value="${FAKE_GCLOUD_ACCESS_TOKEN_FILE:-}" ;;
+      auth/credential_file_override) value="${FAKE_GCLOUD_CREDENTIAL_FILE_OVERRIDE:-}" ;;
+      *) exit 2 ;;
+      esac
+      [ -z "${value}" ] || echo "${value}"
+      exit "${FAKE_GCLOUD_CONFIG_EXIT:-0}"
+    fi
+    [ "$*" = "auth list --filter=status:ACTIVE --format=value(account) --limit=1" ] || exit 2
+    [ -z "${FAKE_GCLOUD_ACCOUNT:-}" ] || echo "${FAKE_GCLOUD_ACCOUNT}"
+    exit "${FAKE_GCLOUD_EXIT:-0}"
+""")
+# A stand-in kubectl: FAKE_DEPLOYED_KIND for the read of the proxy Deployment's
+# REPLAY_JOB_KIND (status FAKE_KUBECTL_EXIT), FAKE_DEPLOYED for its
+# REPLAY_MODE (unreadable with FAKE_KUBECTL_FAIL), each call's argv appended to
+# FAKE_KUBECTL_CALLS when set, and nothing for anything else.
+_FAKE_KUBECTL = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    [ -z "${FAKE_KUBECTL_CALLS:-}" ] || echo "$*" >> "${FAKE_KUBECTL_CALLS}"
+    case "$*" in
+    *"get deployment inference-replay-shadow -o jsonpath="*'@.name=="replay-shadow-proxy"'*'@.name=="REPLAY_JOB_KIND"'*)
+      printf '%s' "${FAKE_DEPLOYED_KIND:-}"
+      exit "${FAKE_KUBECTL_EXIT:-0}"
+      ;;
+    *"get deployment inference-replay-shadow -o jsonpath="*'@.name=="replay-shadow-proxy"'*'@.name=="REPLAY_MODE"'*)
+      [ -z "${FAKE_KUBECTL_FAIL:-}" ] || exit 1
+      printf '%s' "${FAKE_DEPLOYED:-}"
+      exit 0
+      ;;
+    esac
+    exit 0
+""")
+_FAKE_GCLOUD_DIR = None
+
+
+def setUpModule():
+    global _FAKE_GCLOUD_DIR
+    _FAKE_GCLOUD_DIR = tempfile.mkdtemp()
+    gcloud = pathlib.Path(_FAKE_GCLOUD_DIR, "gcloud")
+    gcloud.write_text(_FAKE_GCLOUD)
+    gcloud.chmod(0o755)
+
+
+def tearDownModule():
+    shutil.rmtree(_FAKE_GCLOUD_DIR, ignore_errors=True)
 
 
 def _constants(text, prefix):
@@ -61,26 +122,11 @@ def _lifted(*names, constants=True):
     return out + "".join(lift_function(n, text, _CI_ENV) for n in names)
 
 
-_RECORDER = "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-_PROW_RUNNER = "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
-# A gcloud that answers the account checks: FAKE_ACCOUNT is the active
-# account, FAKE_OVERRIDE the value of every identity-override property.
-_FAKE_GCLOUD = """#!/usr/bin/env bash
-case "$1 $2" in
-  "config get-value") printf '%s\\n' "${FAKE_OVERRIDE:-}" ;;
-  "auth list") printf '%s\\n' "${FAKE_ACCOUNT:-}" ;;
-esac
-exit 0
-"""
-_FAKE_BIN = tempfile.mkdtemp(prefix="replay-ci-fake-bin-")
-pathlib.Path(_FAKE_BIN, "gcloud").write_text(_FAKE_GCLOUD)
-pathlib.Path(_FAKE_BIN, "gcloud").chmod(0o755)
-
-
 def _env(**overrides):
-    env = {"PATH": _FAKE_BIN + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), "PROJECT_ID": _PROJECT,
+    # The stand-in gcloud first, as the nightly runner unless a test says otherwise.
+    env = {"PATH": f"{_FAKE_GCLOUD_DIR}:{os.environ.get('PATH', '/usr/bin:/bin')}", "PROJECT_ID": _PROJECT,
            "BUILD_ID": _BUILD, "EVAL_REPLAY_SHADOW": "true", "EVAL_REPLAY_SHADOW_BUCKET": _BUCKET,
-           "JOB_TYPE": "periodic", "FAKE_ACCOUNT": _PROW_RUNNER}
+           "JOB_TYPE": "periodic", "FAKE_GCLOUD_ACCOUNT": _RECORDER}
     for key, value in overrides.items():
         if value is None:
             env.pop(key, None)
@@ -102,9 +148,9 @@ _REPORT = textwrap.dedent("""\
 
 
 def _resolve(**overrides):
-    script = "set -euo pipefail\n" + _lifted(*_RESOLVE) + "rc=0\nresolve_replay_shadow || rc=$?\n" \
-        + 'echo "rc=${rc}"\n' + _REPORT
-    proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    script = "set -euo pipefail\n" + _lifted(*_RESOLVE) + "rc=0\nresolve_replay_shadow || rc=$?\n" + 'echo "rc=${rc}"\n' + _REPORT
+    proc = subprocess.run([shutil.which("bash"), "-c", script], env=_env(**overrides), capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL)
     assert proc.returncode == 0, proc.stderr
     values = dict(line.split("=", 1) for line in proc.stdout.splitlines())
     return values, proc.stderr
@@ -149,10 +195,52 @@ class ResolveTest(unittest.TestCase):
     def test_periodic_and_postsubmit_are_nightly(self):
         for job_type in ("periodic", "postsubmit"):
             with self.subTest(job_type=job_type):
-                values, _ = _resolve(JOB_TYPE=job_type, PULL_NUMBER=None)
+                values, _ = _resolve(JOB_TYPE=job_type, PULL_NUMBER=None, PULL_BASE_REF="main")
                 self.assertEqual(values, {"rc": "0", "active": "true", "bucket": _BUCKET, "kind": "nightly",
-                                          "project": _PROJECT, "build": _BUILD, "pr": "", "mode": "shadow",
-                                          "cache": ""})
+                                          "project": _PROJECT, "build": _BUILD, "pr": "", "mode": "record",
+                                          "cache": "kube-agents-replay-cache"})
+
+    def test_a_scheduled_run_as_any_other_account_is_nightly_untrusted(self):
+        # Only the nightly runner may write nightly/; every presubmit runs as prowjob-default-sa.
+        for job_type in ("periodic", "postsubmit"):
+            for account in (_PROW_DEFAULT, "eval-baseline-recorder@other-project.iam.gserviceaccount.com",
+                            f"x{_RECORDER}", f"{_RECORDER}x"):
+                with self.subTest(job_type=job_type, account=account):
+                    values, err = _resolve(JOB_TYPE=job_type, FAKE_GCLOUD_ACCOUNT=account)
+                    self.assertEqual((values["rc"], values["active"], values["kind"]), ("0", "true", "nightly-untrusted"))
+                    self.assertIn("this night's shadow data is filed as UNTRUSTED (nightly-untrusted/, never nightly/)", err)
+                    self.assertIn(f"Its uploads run as {account};", err)
+
+    def test_an_unreadable_account_is_nightly_untrusted(self):
+        empty = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        for name, overrides in (("gcloud fails", {"FAKE_GCLOUD_EXIT": "1"}),
+                                ("gcloud fails after printing the recorder", {"FAKE_GCLOUD_EXIT": "1", "FAKE_GCLOUD_ACCOUNT": _RECORDER}),
+                                ("no active account", {"FAKE_GCLOUD_ACCOUNT": None}),
+                                ("no gcloud", {"PATH": empty})):
+            with self.subTest(name):
+                values, err = _resolve(**overrides)
+                self.assertEqual((values["rc"], values["active"], values["kind"]), ("0", "true", "nightly-untrusted"))
+                self.assertIn("filed as UNTRUSTED", err)
+
+    def test_an_impersonation_or_token_override_is_nightly_untrusted(self):
+        # gcloud auth list still shows the base account, but uploads run as someone else.
+        for name in ("IMPERSONATE_SERVICE_ACCOUNT", "ACCESS_TOKEN_FILE", "CREDENTIAL_FILE_OVERRIDE"):
+            for value in (_RECORDER, "/var/run/token"):
+                with self.subTest(name=name, value=value):
+                    values, err = _resolve(**{f"FAKE_GCLOUD_{name}": value})
+                    self.assertEqual((values["rc"], values["kind"]), ("0", "nightly-untrusted"))
+                    self.assertIn(f"auth/{name.lower()} is set", err)
+        values, err = _resolve(FAKE_GCLOUD_CONFIG_EXIT="1")
+        self.assertEqual(values["kind"], "nightly-untrusted")
+        self.assertIn("gcloud could not read auth/impersonate_service_account", err)
+
+    def test_a_presubmit_ignores_the_account(self):
+        for account in (_RECORDER, _PROW_DEFAULT, None):
+            with self.subTest(account=account):
+                values, err = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=account)
+                self.assertEqual((values["rc"], values["kind"], values["pr"]), ("0", "presubmit", "4700"))
+                self.assertNotIn("nightly-untrusted", err)
 
     def test_presubmit_carries_its_pull_request(self):
         values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700")
@@ -182,6 +270,11 @@ class ResolveTest(unittest.TestCase):
     def test_outside_prow_the_override_names_the_kind(self):
         values, _ = _resolve(JOB_TYPE=None, EVAL_REPLAY_SHADOW_JOB_KIND="nightly")
         self.assertEqual((values["rc"], values["kind"]), ("0", "nightly"))
+        values, _ = _resolve(JOB_TYPE=None, EVAL_REPLAY_SHADOW_JOB_KIND="nightly-untrusted")
+        self.assertEqual((values["rc"], values["kind"]), ("0", "nightly-untrusted"))
+        # A nightly named there is held to the same account.
+        values, _ = _resolve(JOB_TYPE=None, EVAL_REPLAY_SHADOW_JOB_KIND="nightly", FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
+        self.assertEqual((values["rc"], values["kind"]), ("0", "nightly-untrusted"))
         values, _ = _resolve(JOB_TYPE=None, EVAL_REPLAY_SHADOW_JOB_KIND="presubmit", PULL_NUMBER="12")
         self.assertEqual((values["rc"], values["kind"], values["pr"]), ("0", "presubmit", "12"))
 
@@ -227,33 +320,33 @@ class RecordModeResolveTest(unittest.TestCase):
     def test_a_nightly_uploading_as_the_recorder_records_into_the_cache_bucket(self):
         for job_type in ("periodic", "postsubmit"):
             with self.subTest(job_type=job_type):
-                values, err = _resolve(JOB_TYPE=job_type, FAKE_ACCOUNT=_RECORDER, PULL_BASE_REF="main")
+                values, err = _resolve(JOB_TYPE=job_type, FAKE_GCLOUD_ACCOUNT=_RECORDER, PULL_BASE_REF="main")
                 self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]),
                                  ("0", "nightly", "record", "kube-agents-replay-cache"))
                 self.assertEqual(err, "")
 
     def test_a_nightly_uploading_as_anyone_else_stays_in_shadow_and_says_why(self):
-        for account in (_PROW_RUNNER, ""):
+        for account in (_PROW_DEFAULT, ""):
             with self.subTest(account=account):
-                values, err = _resolve(FAKE_ACCOUNT=account)
+                values, err = _resolve(FAKE_GCLOUD_ACCOUNT=account)
                 self.assertEqual((values["rc"], values["active"], values["mode"], values["cache"]),
                                  ("0", "true", "shadow", ""))
                 self.assertIn("shadow mode, not record", err)
 
     def test_an_impersonation_or_token_override_never_records(self):
-        values, err = _resolve(FAKE_ACCOUNT=_RECORDER, FAKE_OVERRIDE="someone@example.iam.gserviceaccount.com")
+        values, err = _resolve(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_GCLOUD_IMPERSONATE_SERVICE_ACCOUNT="someone@example.iam.gserviceaccount.com")
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("is set, so gcloud does not upload as its active account", err)
 
     def test_a_postsubmit_records_only_on_main(self):
-        values, _ = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="main", FAKE_ACCOUNT=_RECORDER)
+        values, _ = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="main", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual(values["mode"], "record")
         for ref in ("release-0.21", "", None):
             with self.subTest(ref=ref):
-                values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF=ref, FAKE_ACCOUNT=_RECORDER)
+                values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF=ref, FAKE_GCLOUD_ACCOUNT=_RECORDER)
                 self.assertEqual((values["rc"], values["mode"]), ("0", "shadow"))
                 self.assertIn("is not main", err)
-        values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="release-0.21", FAKE_ACCOUNT=_RECORDER,
+        values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="release-0.21", FAKE_GCLOUD_ACCOUNT=_RECORDER,
                                EVAL_REPLAY_RECORD="true")
         self.assertEqual(values["rc"], "1")
 
@@ -265,33 +358,42 @@ class RecordModeResolveTest(unittest.TestCase):
 
     def test_without_gcloud_it_never_records(self):
         path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if not os.path.exists(os.path.join(p, "gcloud")))
-        values, err = _resolve(FAKE_ACCOUNT=_RECORDER, PATH=path)
+        values, err = _resolve(FAKE_GCLOUD_ACCOUNT=_RECORDER, PATH=path)
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("no gcloud on PATH", err)
 
     def test_a_presubmit_never_records_whoever_it_runs_as(self):
-        values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_ACCOUNT=_RECORDER)
+        values, _ = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]), ("0", "presubmit", "shadow", ""))
 
     def test_asking_a_presubmit_to_record_is_refused(self):
-        values, err = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_ACCOUNT=_RECORDER,
+        values, err = _resolve(JOB_TYPE="presubmit", PULL_NUMBER="4700", FAKE_GCLOUD_ACCOUNT=_RECORDER,
                                EVAL_REPLAY_RECORD="true")
         self.assertEqual((values["rc"], values["active"]), ("1", "false"))
         self.assertIn("never writes the shared replay cache", err)
 
+    def test_an_untrusted_nightly_never_resolves_to_record(self):
+        for job_type in ("periodic", "postsubmit"):
+            with self.subTest(job_type=job_type):
+                values, err = _resolve(JOB_TYPE=job_type, PULL_BASE_REF="main", FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
+                self.assertEqual((values["kind"], values["mode"], values["cache"]), ("nightly-untrusted", "shadow", ""))
+                self.assertIn("an untrusted nightly never records", err)
+        _, args = HelmArgsTest()._args(FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
+        self.assertFalse(any("mode=" in a or "allowServe" in a for a in args))
+
     def test_asking_an_untrusted_nightly_to_record_is_refused(self):
-        values, err = _resolve(EVAL_REPLAY_RECORD="true")
+        values, err = _resolve(EVAL_REPLAY_RECORD="true", FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
         self.assertEqual((values["rc"], values["active"]), ("1", "false"))
         self.assertIn(_RECORDER, err)
 
     def test_false_keeps_a_trusted_nightly_in_shadow(self):
-        values, err = _resolve(FAKE_ACCOUNT=_RECORDER, EVAL_REPLAY_RECORD="false")
+        values, err = _resolve(FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_REPLAY_RECORD="false")
         self.assertEqual((values["rc"], values["mode"]), ("0", "shadow"))
         self.assertEqual(err, "")
 
     def test_a_switch_or_cache_bucket_out_of_shape_is_refused(self):
         for overrides in ({"EVAL_REPLAY_RECORD": "yes"}, {"EVAL_REPLAY_LANE": "1"},
-                          {"FAKE_ACCOUNT": _RECORDER, "EVAL_REPLAY_CACHE_BUCKET": "gs://nope"}):
+                          {"FAKE_GCLOUD_ACCOUNT": _RECORDER, "EVAL_REPLAY_CACHE_BUCKET": "gs://nope"}):
             with self.subTest(**overrides):
                 self.assertEqual(_resolve(**overrides)[0]["rc"], "1")
 
@@ -300,7 +402,7 @@ class ReplayLaneResolveTest(unittest.TestCase):
     """Replay mode: the lane only, on a periodic of main, every refusal an error."""
 
     def test_a_periodic_lane_replays_and_is_filed_as_the_lane(self):
-        values, err = _resolve(EVAL_REPLAY_LANE="true", EVAL_REPLAY_SHADOW=None, FAKE_ACCOUNT=_RECORDER)
+        values, err = _resolve(EVAL_REPLAY_LANE="true", EVAL_REPLAY_SHADOW=None, FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual(values, {"rc": "0", "active": "true", "bucket": _BUCKET, "kind": "replay-lane",
                                   "project": _PROJECT, "build": _BUILD, "pr": "", "mode": "replay",
                                   "cache": "kube-agents-replay-cache"})
@@ -345,7 +447,8 @@ class HelmArgsTest(unittest.TestCase):
                   + "resolve_replay_shadow\nreplay_shadow_helm_args repo/replay-proxy-shadow t1\n"
                   + 'echo "count=${#REPLAY_SHADOW_HELM_ARGS[@]}"\n'
                   + 'for a in ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
-        proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        proc = subprocess.run([shutil.which("bash"), "-c", script], env=_env(**overrides), capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = proc.stdout.splitlines()
         return int(lines[0].split("=", 1)[1]), [l.split("=", 1)[1] for l in lines[1:]]
@@ -370,7 +473,7 @@ class HelmArgsTest(unittest.TestCase):
         ])
 
     def test_record_adds_the_mode_and_cache_dir_and_never_allow_serve(self):
-        count, args = self._args(FAKE_ACCOUNT=_RECORDER)
+        count, args = self._args(FAKE_GCLOUD_ACCOUNT=_RECORDER)
         self.assertEqual(count, 18)
         self.assertEqual(args[14:], ["--set-string", "litellm.replayShadow.mode=record",
                                      "--set-string", "litellm.replayShadow.cacheDir=/data/replay-cache"])
@@ -385,9 +488,13 @@ class HelmArgsTest(unittest.TestCase):
                                      "--set", "litellm.replayShadow.allowServe=true"])
 
     def test_a_shadow_nightly_sets_exactly_what_it_did_before_the_modes(self):
-        count, args = self._args()
+        count, args = self._args(EVAL_REPLAY_RECORD="false")
         self.assertEqual(count, 14)
         self.assertFalse(any("mode=" in a or "cacheDir" in a or "allowServe" in a for a in args))
+
+    def test_the_chart_gets_the_same_kind_as_the_collector(self):
+        _, args = self._args(FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
+        self.assertIn("litellm.replayShadow.job.kind=nightly-untrusted", args)
 
 
 class DeployWiringTest(unittest.TestCase):
@@ -462,10 +569,7 @@ class _LifecycleBase(unittest.TestCase):
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
         (self.bin / "gcloud").write_text(_FAKE_GCLOUD)
-        # The proxy's installed mode, as _replay_shadow_deployed_env reads it.
-        # FAKE_KUBECTL_FAIL makes the Deployment unreadable.
-        (self.bin / "kubectl").write_text(
-            '#!/usr/bin/env bash\n[ -z "${FAKE_KUBECTL_FAIL:-}" ] || exit 1\nprintf "%s" "${FAKE_DEPLOYED:-}"\n')
+        (self.bin / "kubectl").write_text(_FAKE_KUBECTL)
         for tool in ("gcloud", "kubectl"):
             (self.bin / tool).chmod(0o755)
         self.artifacts = self.tmp / "artifacts"
@@ -490,8 +594,8 @@ class _LifecycleBase(unittest.TestCase):
                                    _constants(text, "REPLAY_"), flags=re.MULTILINE)
         assert count == 1, f"expected one REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS in {_CI_ENV}, replaced {count}"
         functions = "".join(lift_function(n, text, _CI_ENV) for n in (
-            *_RESOLVE, "_replay_shadow_deployed_env", "_replay_shadow_deployed_mode", "start_replay_shadow_collector",
-            "signal_replay_shadow_collector", "wait_replay_shadow_collector"))
+            *_RESOLVE, "_replay_shadow_deployed_env", "_replay_shadow_deployed_mode", "_replay_shadow_deployed_kind",
+            "start_replay_shadow_collector", "signal_replay_shadow_collector", "wait_replay_shadow_collector"))
         return ("set -euo pipefail\n" + constants + f"REPLAY_SHADOW_COLLECTOR_SCRIPT={str(self.fake)!r}\n"
                 + 'REPLAY_SHADOW_COLLECTOR_PID=""\n' + functions + body)
 
@@ -542,6 +646,66 @@ class CollectorLifecycleTest(_LifecycleBase):
         self.assertEqual(pairs["--namespace"], "kubeagents-system")
         self.assertTrue(pairs["--parent-pid"].isdigit())
         self.assertIn("collector running", (self.artifacts / "replay-shadow-collector.log").read_text())
+
+    def test_a_scheduled_run_uploads_under_the_kind_its_account_may_write(self):
+        body = textwrap.dedent("""\
+            start_replay_shadow_collector
+            for _ in $(seq 1 200); do grep -q "collector running" "$COLLECTOR_LOG" 2>/dev/null && break; sleep 0.05; done
+            signal_replay_shadow_collector
+            wait_replay_shadow_collector
+        """)
+        log = self.artifacts / "replay-shadow-collector.log"
+        # The Deployment unreadable: the eval's own check decides.
+        for account, kind in ((_RECORDER, "nightly"), (_PROW_DEFAULT, "nightly-untrusted"), (None, "nightly-untrusted")):
+            with self.subTest(account=account):
+                # The wait reads the log, so each run starts from none.
+                self.argv.unlink(missing_ok=True)
+                log.unlink(missing_ok=True)
+                self._fake_collector()
+                proc = self._run(body, COLLECTOR_LOG=str(log), JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=account,
+                                 FAKE_KUBECTL_EXIT="1")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                argv = self.argv.read_text().split("\n")
+                self.assertEqual(dict(zip(argv[::2], argv[1::2]))["--kind"], kind)
+
+    def test_a_scheduled_run_uploads_under_the_kind_the_deploy_stamped(self):
+        body = textwrap.dedent("""\
+            start_replay_shadow_collector
+            for _ in $(seq 1 200); do grep -q "collector running" "$COLLECTOR_LOG" 2>/dev/null && break; sleep 0.05; done
+            signal_replay_shadow_collector
+            wait_replay_shadow_collector
+        """)
+        log = self.artifacts / "replay-shadow-collector.log"
+        calls = self.tmp / "kubectl-calls"
+        cases = (
+            # (job type, this shell's account, the deployed kind, the folder, a note expected)
+            ("periodic", _RECORDER, "nightly-untrusted", "nightly-untrusted", "uploading as nightly-untrusted, the kind the deploy stamped"),
+            ("periodic", _PROW_DEFAULT, "nightly", "nightly", "uploading as nightly, the kind the deploy stamped"),
+            ("periodic", _RECORDER, "nightly", "nightly", None),
+            # Nothing a nightly could be filed as: this shell's own answer stands.
+            ("periodic", _PROW_DEFAULT, "presubmit", "nightly-untrusted", "could not read the kind the deploy stamped"),
+            ("periodic", _RECORDER, "", "nightly", "could not read the kind the deploy stamped"),
+            # A presubmit never asks.
+            ("presubmit", _RECORDER, "nightly", "presubmit", None),
+        )
+        for job_type, account, deployed, kind, note in cases:
+            with self.subTest(job_type=job_type, account=account, deployed=deployed):
+                for path in (self.argv, log, calls):
+                    path.unlink(missing_ok=True)
+                self._fake_collector()
+                proc = self._run(body, COLLECTOR_LOG=str(log), JOB_TYPE=job_type, PULL_NUMBER="4700",
+                                 FAKE_GCLOUD_ACCOUNT=account, FAKE_DEPLOYED_KIND=deployed, FAKE_KUBECTL_CALLS=str(calls))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                argv = self.argv.read_text().split("\n")
+                self.assertEqual(dict(zip(argv[::2], argv[1::2]))["--kind"], kind)
+                if note:
+                    self.assertIn(note, proc.stderr)
+                # The kind read; the mode is read on every run (ModeCollectorTest).
+                read = calls.exists() and "REPLAY_JOB_KIND" in calls.read_text()
+                self.assertEqual(read, job_type != "presubmit")
+                if read:
+                    self.assertIn("--context gke_p_us-central1_platform-agent-host", calls.read_text())
+                    self.assertIn("-n kubeagents-system", calls.read_text())
 
     def test_a_collector_that_ignores_term_is_killed_after_the_bounded_wait(self):
         self._fake_collector(ignore_term=True)
@@ -607,7 +771,7 @@ class ModeCollectorTest(_LifecycleBase):
         return proc
 
     def test_a_trusted_nightly_installed_in_record_mode_collects_and_publishes(self):
-        proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record")
+        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record")
         argv, pairs = self._argv_pairs()
         self.assertEqual(pairs["--mode"], "record")
         self.assertEqual(pairs["--publish-bucket"], "kube-agents-replay-cache")
@@ -619,12 +783,27 @@ class ModeCollectorTest(_LifecycleBase):
         self.assertIn("wait=255", proc.stdout)
 
     def test_a_recording_proxy_is_always_collected_in_record_mode(self):
-        # The deploy decided record; this shell's own account check now fails
-        # (gcloud auth list flaked). The collector still empties the cache.
-        proc = self._start(FAKE_ACCOUNT="", FAKE_DEPLOYED="record")
+        # The deploy filed a trusted night and decided record; this shell's own
+        # account check now fails (gcloud auth list flaked). The collector takes
+        # the deployed kind and mode, and still empties the cache.
+        proc = self._start(FAKE_GCLOUD_ACCOUNT="", FAKE_DEPLOYED_KIND="nightly", FAKE_DEPLOYED="record")
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--publish-bucket"]), ("record", "kube-agents-replay-cache"))
         self.assertIn("the mode the deploy installed", proc.stderr)
+
+    def test_an_untrusted_nightly_never_records_or_publishes(self):
+        # Filed nightly-untrusted, by the deploy or by this shell's own check:
+        # whatever the Deployment's mode, the collector never gets the cache bucket.
+        for deployed_kind, account in (("nightly-untrusted", _RECORDER), ("nightly-untrusted", _PROW_DEFAULT),
+                                       ("", _PROW_DEFAULT)):
+            with self.subTest(deployed_kind=deployed_kind, account=account):
+                self.argv.unlink(missing_ok=True)
+                proc = self._start(FAKE_GCLOUD_ACCOUNT=account, FAKE_DEPLOYED_KIND=deployed_kind, FAKE_DEPLOYED="record")
+                argv, pairs = self._argv_pairs()
+                self.assertEqual(pairs["--kind"], "nightly-untrusted")
+                self.assertNotIn("--publish-bucket", argv)
+                self.assertNotIn("--mode", argv)
+                self.assertIn("publishes nothing", proc.stderr)
 
     def test_a_run_that_is_not_a_nightly_never_publishes_whatever_was_installed(self):
         # A presubmit or the replay lane facing a recording proxy collects in
@@ -633,7 +812,7 @@ class ModeCollectorTest(_LifecycleBase):
         for overrides in ({"JOB_TYPE": "presubmit", "PULL_NUMBER": "4700"}, {"EVAL_REPLAY_LANE": "true"}):
             with self.subTest(**overrides):
                 self.argv.unlink(missing_ok=True)
-                proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", **overrides)
+                proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", **overrides)
                 argv, _ = self._argv_pairs()
                 self.assertNotIn("--publish-bucket", argv)
                 self.assertNotIn("record", argv)
@@ -645,16 +824,16 @@ class ModeCollectorTest(_LifecycleBase):
         for deployed in ("", "shadow", "garbled"):
             with self.subTest(deployed=deployed):
                 self.argv.unlink(missing_ok=True)
-                self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED=deployed)
+                self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED=deployed)
                 argv, _ = self._argv_pairs()
                 self.assertNotIn("--mode", argv)
                 self.assertNotIn("--publish-bucket", argv)
 
     def test_an_unreadable_proxy_falls_back_to_this_shells_check(self):
-        for account, mode in ((_RECORDER, "record"), (_PROW_RUNNER, None)):
+        for account, mode in ((_RECORDER, "record"), (_PROW_DEFAULT, None)):
             with self.subTest(account=account):
                 self.argv.unlink(missing_ok=True)
-                proc = self._start(FAKE_ACCOUNT=account, FAKE_KUBECTL_FAIL="1", FAKE_DEPLOYED="record")
+                proc = self._start(FAKE_GCLOUD_ACCOUNT=account, FAKE_KUBECTL_FAIL="1", FAKE_DEPLOYED="record")
                 _, pairs = self._argv_pairs()
                 self.assertEqual(pairs.get("--mode"), mode)
                 self.assertIn("could not read the installed mode", proc.stderr)
@@ -784,6 +963,43 @@ class LitellmLogLeavesTheProxyOutTest(unittest.TestCase):
                       text)
         self.assertIn('readonly REPLAY_SHADOW_POD_SELECTOR="app=litellm,kubeagents.x-k8s.io/inference-role=replay-shadow"',
                       text)
+
+
+def _module_tuple(path, name):
+    """A module-level tuple of strings, read without importing: literals, or names bound to them."""
+    tree = ast.parse(path.read_text())
+    strings, found = {}, None
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            target, value = node.targets[0].id, node.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                strings[target] = value.value
+            elif target == name and isinstance(value, ast.Tuple):
+                found = [e.value if isinstance(e, ast.Constant) else strings[e.id] for e in value.elts]
+    assert found is not None, f"no {name} tuple in {path}"
+    return found
+
+
+class JobKindsAgreeTest(unittest.TestCase):
+    """The kind list has a copy in each of five places; a kind missing from one is a refused upload or a dropped line."""
+
+    def test_every_copy_holds_the_same_kinds(self):
+        ci_env = set(re.findall(r'^readonly REPLAY_SHADOW_KIND_[A-Z_]+="([^"]*)"$', _CI_ENV.read_text(), re.MULTILINE))
+        replay_shadow = json.loads(_SCHEMA.read_text())["properties"]["litellm"]["properties"]["replayShadow"]
+        schema_any = set(replay_shadow["properties"]["job"]["properties"]["kind"]["enum"]) - {""}
+        schema_on = set(replay_shadow["then"]["properties"]["job"]["properties"]["kind"]["enum"])
+        copies = {
+            "hack/ci-env.sh REPLAY_SHADOW_KIND_*": ci_env,
+            "collect_shadow.py JOB_KINDS": set(_module_tuple(_COLLECTOR, "JOB_KINDS")),
+            "analyze_shadow.py JOB_KINDS": set(_module_tuple(_ANALYZER, "JOB_KINDS")),
+            "values.schema.json job.kind": schema_any,
+            "values.schema.json job.kind when enabled": schema_on,
+            "test_chart_replay_shadow.py _JOB_KINDS": set(_module_tuple(_CHART_TEST, "_JOB_KINDS")),
+        }
+        expected = {"nightly", "nightly-untrusted", "presubmit", "replay-lane"}
+        for where, kinds in copies.items():
+            with self.subTest(where=where):
+                self.assertEqual(kinds, expected)
 
 
 if __name__ == "__main__":

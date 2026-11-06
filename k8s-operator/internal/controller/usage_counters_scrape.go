@@ -127,6 +127,24 @@ const (
 	a2aPeopleWindowLabel = "window"
 	a2aPeopleWindowShort = "7d"
 	a2aPeopleWindowLong  = "30d"
+	// proposalsOpenedSeries is the chat plugin's count of the pull requests
+	// the agent opened, by the origin of the work and, for chat, its platform:
+	// a gauge it reads from the pod's proposals ledger at scrape time, served
+	// with a row for every origin once its first ledger read succeeds and as
+	// no family before. The origins reading (usageReadingOrigins) maps each
+	// origin, summed over the platform label, to status.usage.
+	proposalsOpenedSeries = "kubeagents_proposals_opened"
+	proposalsOriginLabel  = "origin"
+	// The nine origins the ledger counts, in the chat plugin's ORIGINS order.
+	proposalOriginChat      = "chat"
+	proposalOriginConsole   = "console"
+	proposalOriginAPI       = "api"
+	proposalOriginEvent     = "event"
+	proposalOriginDrift     = "drift"
+	proposalOriginAudit     = "audit"
+	proposalOriginScheduled = "scheduled"
+	proposalOriginIssue     = "issue"
+	proposalOriginOther     = "other"
 	// The broker's proposal readings (vcs_readings.py), gauges its readings
 	// sweep sets from what the forge reports now: the install's proposals by
 	// state; the closed ones by who closed them; the touches by anyone but
@@ -363,7 +381,8 @@ func usageSiblingsFor(counter string) []usageSibling {
 // the broker's top tools: its tool counter by tool and subcommand, which
 // every broker body carries (a broker that has run nothing carries an empty
 // one), read beside the counters the same series feeds and projected, not
-// folded, as status.usage.topTools.
+// folded, as status.usage.topTools. The fifth is the chat plugin's origins
+// reading, the pull requests the agent opened by the origin of the work.
 type usageReadingKind string
 
 const (
@@ -371,6 +390,7 @@ const (
 	usageReadingDetails  usageReadingKind = "details"
 	usageReadingPeople   usageReadingKind = "people"
 	usageReadingTopTools usageReadingKind = "topTools"
+	usageReadingOrigins  usageReadingKind = "origins"
 )
 
 // usageToolPair is one tool and subcommand the broker's tool counter labels.
@@ -408,10 +428,19 @@ var usageReadingSpecs = []usageReadingSpec{
 	{field: usageExportProposalsMergedUntouched, family: vcsTouchesPerProposalSeries, filter: usageLabelFilter{vcsReadingsOutcomeLabel: {vcsOutcomeMerged: true}, vcsReadingsLeLabel: {vcsLeUntouched: true}}, reading: usageReadingDetails},
 	{field: usageExportPeopleSeen7d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowShort: true}}, reading: usageReadingPeople},
 	{field: usageExportPeopleSeen30d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowLong: true}}, reading: usageReadingPeople},
+	{field: usageExportProposalsFromChat, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginChat: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromConsole, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginConsole: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromApi, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginAPI: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromEvent, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginEvent: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromDrift, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginDrift: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromAudit, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginAudit: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromScheduled, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginScheduled: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromIssue, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginIssue: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromOther, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginOther: true}}, reading: usageReadingOrigins, sum: true},
 }
 
 // usageReadingKinds is every reading, in a fixed order.
-var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople, usageReadingTopTools}
+var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople, usageReadingTopTools, usageReadingOrigins}
 
 // usageReadingKindsOf is the entries of specs whose reading is one of kinds,
 // in their order.
@@ -437,7 +466,10 @@ func usageReadingAged(kind usageReadingKind) bool {
 // since the broker serves only the label sets it has seen. The people
 // reading is present when both its windows resolved, with no age series:
 // the gateway serves both windows together or neither, so one alone is no
-// reading.
+// reading. The origins reading is present when all nine origins resolved,
+// each on at least one sample, sum fields though they are, again with no age
+// series: the chat plugin serves a row for every origin, zero included, from
+// its first ledger read on, and no family before it.
 func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
 	if kind == usageReadingTopTools {
 		// The tool counter is the broker's own, served from its first request

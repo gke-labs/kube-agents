@@ -155,6 +155,18 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The MCP server (<agent>-a2a-mcp), a Model Context Protocol endpoint that lets
+  # an external coding agent or IDE talk to a platformAgent.mode: next install
+  # over its message bus. true sets A2A_MCP_DOOR=true on the controller manager,
+  # which then renders the server's Deployment, Service, deny-all ingress
+  # NetworkPolicy and bearer-token Secret beside every next-mode PlatformAgent it
+  # manages; the quota preflight counts its pod. Under "today" the operator
+  # renders nothing for it. Setting this back to false removes all of it, the
+  # token included. An A2A_MCP_DOOR entry in extraEnv wins: the chart then
+  # renders only that entry. What it renders and how to connect: the site's
+  # "MCP server" reference page.
+  mcpServer:
+    enabled: false
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -699,9 +711,10 @@ litellm:
     mode: shadow
     cacheDir: /data/replay-cache
     allowServe: false
-    # Stamped on every log line (REPLAY_JOB_*). kind is nightly, presubmit or
-    # replay-lane, and is required when the proxy is on: an untagged line
-    # counts in no estimate.
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
+    # nightly-untrusted, presubmit or replay-lane (hack/ci-env.sh,
+    # resolve_replay_shadow), and is required when the proxy is on: an
+    # untagged line counts in no estimate.
     job:
       kind: ""
       project: ""
