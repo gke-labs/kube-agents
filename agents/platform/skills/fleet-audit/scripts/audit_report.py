@@ -2402,6 +2402,8 @@ EXPIRED_DECLARATION_LINE = (
 # declaration that carries a date, so a reader sees the renewal day before
 # it lapses rather than after.
 DECLARED_UNTIL_SUFFIX = " (until {expires})"
+# How a stderr line names the namespace slot of a cluster-scoped object.
+UNNAMESPACED_LOCATION_LABEL = "(cluster)"
 NOTE_SUFFIX = ".md"
 # Linear on purpose: `text` runs to the end of the line and the closing
 # sequence (blanks and `#`) is trimmed afterwards. Giving the tail up lazily
@@ -8933,7 +8935,9 @@ def cost_declared_title(check: str, obj: str, severity: str, excerpt: str) -> st
     return f"{obj} — {check}, {grade}: {measured}" if measured else f"{obj} — {check}, {grade}"
 
 
-def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
+def apply_declarations(
+    data: dict, declarations: list[dict], expired: list[dict] | None = None
+) -> list[dict]:
     """Move each finding a declaration covers into `declared[]`; return the moved.
 
     The lookup is on the fields the owner wrote, compared case-blind as the
@@ -8960,17 +8964,19 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
     the ledger block prints beside it, so the owner renews the date in the
     note or remediates; a standing note for the same posture wins outright,
     and the lapsed one is not reported against it.
+
+    `declarations` is `start`'s file as read, and the split is made here; a
+    caller that has already split it (`join_harness_declarations`, which
+    hands the standing half on to the manifest route and the shields) passes
+    the standing half as `declarations` and the lapsed half as `expired`, so
+    the file is split, and the calendar read, once per run.
     """
-    if not declarations:
+    if expired is None:
+        declarations, expired = split_expired_declarations(declarations)
+    if not declarations and not expired:
         return []
     declarable = audit_declarable_checks(str(data.get("audit") or ""))
-    standing, expired = split_expired_declarations(declarations)
-    scoped: dict[tuple, dict] = {}
-    fleet_wide: dict[tuple, dict] = {}
-    for entry in standing:
-        has_cluster = bool(entry.get(DECLARATION_CLUSTER_FIELD))
-        target = scoped if has_cluster else fleet_wide
-        target.setdefault(_declaration_key(entry, with_cluster=has_cluster), entry)
+    scoped, fleet_wide = _declaration_lookup(declarations)
     expired_scoped, expired_fleet_wide = _declaration_lookup(expired)
     declared = list(data.get("declared") or [])
     already = {derive_finding_id(entry) for entry in declared}
@@ -8991,7 +8997,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                 finding[EXPIRED_DECLARATION_FIELD] = _declaration_pointer_fields(lapsed)
                 log(
                     f"DECLARATION EXPIRED: {finding.get('id', '')} — {check} on "
-                    f"{finding.get('cluster', '')}/{finding.get('namespace') or '(cluster)'}/"
+                    f"{finding.get('cluster', '')}/{finding.get('namespace') or UNNAMESPACED_LOCATION_LABEL}/"
                     f"{finding.get('object', '')} was declared at {lapsed.get('repo', '')}:"
                     f"{lapsed.get('path', '')} until {lapsed.get(DECLARATION_EXPIRES_FIELD, '')}; "
                     "the declaration has expired and the finding publishes."
@@ -18149,11 +18155,10 @@ def join_harness_declarations(
     derived ones.
     """
     fold_searched_record(data, record)
-    declarations = read_declarations(audit_id, repo=repo)
-    moved = apply_declarations(data, declarations)
-    # The join reports a lapsed entry against the finding it covered; the
-    # manifest route and the shields read only the entries still standing.
-    standing, _expired = split_expired_declarations(declarations)
+    # Split once: the join reports a lapsed entry against the finding it
+    # covered; the manifest route and the shields read only the standing ones.
+    standing, expired = split_expired_declarations(read_declarations(audit_id, repo=repo))
+    moved = apply_declarations(data, standing, expired=expired)
     from_manifest = declare_collector_candidates(data, standing, manifest)
     shielded = shield_declared_account_siblings(data, standing, manifest)
     return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(standing)

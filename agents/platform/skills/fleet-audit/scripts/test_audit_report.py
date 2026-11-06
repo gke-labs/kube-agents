@@ -6865,6 +6865,18 @@ class TestDeclaredIntent(BaseTestCase):
         self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
         self.assertIn("`payments/Deployment/api`", comment)
 
+    def test_the_clean_comment_and_the_table_say_what_day_a_dated_declaration_stands_until(self):
+        until = (datetime.now(timezone.utc).date() + timedelta(days=90)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        doc = declaring_doc(findings=[])
+        entry = make_declared()
+        entry["declaration"]["expires"] = until
+        doc["declared"] = [entry]
+        validated = self.validate(doc)
+        comment = audit_report.render_clean_comment(DECLARING_AUDIT, validated, NOW)
+        self.assertIn(f"declared at `acme/terraform-live:clusters/prod-us-east/payments.tf` (until {until})", comment)
+        body = render_body(validated, generated_at=NOW)
+        self.assertIn(f"`min_replicas = 3 max_replicas = 3` (until {until}) |", body)
+
     def test_the_clean_comment_is_row_capped_and_says_so(self):
         doc = declaring_doc(findings=[])
         doc["declared"] = [
@@ -7325,6 +7337,45 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         # the validator holds `declared[]` to `scope.clusters`, and so does this.
         elsewhere = {"clusters": [{"name": "rogue-cluster", "candidates": [dict(posture, cluster="rogue-cluster")]}]}
         self.assertEqual(audit_report.declare_collector_candidates(doc, declarations, elsewhere), [])
+
+    def test_the_join_hands_only_standing_entries_to_the_manifest_route_and_the_shields(self):
+        # Through `join_harness_declarations`, the one caller that reads
+        # `start`'s file: an expired 2.6 note declares no collector candidate
+        # the worker left out, and an expired 2.7 note shields no sibling and
+        # files no namespace for the stale close; the standing ones still do,
+        # and the manifest route copies the standing note's date.
+        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (datetime.now(timezone.utc).date() + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        lapsed_ns = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/payments", "severity": "major", "excerpt": "no policy"}
+        standing_ns = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "billing", "object": "Namespace/billing", "severity": "major", "excerpt": "no policy"}
+        manifest = {"clusters": [{"name": "prod-us-east", "candidates": [lapsed_ns, standing_ns]}]}
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(
+            AUDIT,
+            "acme/fleet",
+            [
+                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/payments", "repo": "acme/fleet", "path": "knowledge/payments.md", "excerpt": "x", "expires": yesterday},
+                {"check": "netpol-missing", "namespace": "billing", "object": "Namespace/billing", "repo": "acme/fleet", "path": "knowledge/billing.md", "excerpt": "x", "expires": next_year},
+                {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x", "expires": yesterday},
+            ],
+        )
+        worker = self._sa_finding("worker", "Deployment/worker")
+        doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            declared_ids, shielded, filed = audit_report.join_harness_declarations(doc, None, AUDIT, "acme/fleet", manifest)
+        self.assertEqual(declared_ids, [audit_report._shorten_id(audit_report.derive_finding_id(standing_ns))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["Namespace/billing"])
+        self.assertEqual(doc["declared"][0]["declaration"]["expires"], next_year)
+        self.assertEqual(shielded, [])
+        self.assertEqual(filed, set())
+        (left,) = doc["findings"]
+        self.assertEqual(left["remediation"]["kind"], "manifest")
+        self.assertNotIn("declared at", left["remediation"]["note"])
+        # The lapsed 2.6 note is not reported either: the worker reported no
+        # finding for it, so there is nothing to carry the line.
+        self.assertNotIn("DECLARATION EXPIRED", err.getvalue())
+        self.assertNotIn("Namespace/payments", err.getvalue())
 
     def test_a_declaration_naming_no_workload_shields_nothing(self):
         # 2.7 is declared per workload. An item that copies the 2.6 shape, or
@@ -9607,6 +9658,27 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         )
         self.assertEqual([e["check"] for e in live], ["no-hpa", "single-replica"])
         self.assertEqual([e["check"] for e in expired], ["no-pdb"])
+
+    def test_an_expired_declaration_is_not_reported_against_a_fault_it_never_covered(self):
+        # The expired path applies the standing path's shape rules: the
+        # fixture's `hpa-cannot-scale` is the `minor` dangling-target fault,
+        # which no declaration covers, so a lapsed note for the HPA earns it
+        # no "expired" line.
+        self.record()
+        self.file({**self.entry(check="hpa-cannot-scale", namespace="web", obj="HorizontalPodAutoscaler/web"), audit_report.DECLARATION_EXPIRES_FIELD: self.day(-1)})
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertNotIn("DECLARATION EXPIRED", self.err)
+        self.assertNotIn("Declared intent expired", self.ledger_body())
+
+    def test_a_workers_copy_of_the_expired_field_is_dropped_by_the_validator(self):
+        # Only `finish` writes the field, from `start`'s file; a worker's copy
+        # would name a note nobody read, and the renderer would print it.
+        findings = posture_and_fault_findings()
+        findings[0][audit_report.EXPIRED_DECLARATION_FIELD] = {"repo": "acme/fleet", "path": "knowledge/made-up.md", "expires": self.day(-1)}
+        validated = audit_report.validate_findings(self.doc(findings), DECLARING_AUDIT)
+        self.assertTrue(all(audit_report.EXPIRED_DECLARATION_FIELD not in f for f in validated["findings"]))
+        self.assertNotIn("Declared intent expired", "\n".join(audit_report.render_finding(validated["findings"][0])))
 
     def test_a_non_matching_entry_leaves_the_finding_alone(self):
         self.record()
