@@ -33,6 +33,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _ROOT / "charts" / "kube-agents"
 _VALUES = _CHART / "values.yaml"
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
+_FLAGGED_PODS = _CHART / "files" / "flagged-pods.yaml"
 _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
@@ -164,6 +165,12 @@ _AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
 _AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
 _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
+_SIZING_VALUE = "platformAgent.deployment.sizingProfile"
+# The shell container's override, and its default memory request (shellSandboxMemoryRequest in
+# shell_sandbox_manifests.go, restated in footprint.yaml); its default limit is 2Gi and the
+# fleet row raises the limit to 4Gi.
+_SHELL_VALUE = "platformAgent.harness.experimental.shellSandbox.resources"
+_SHELL_MEMORY_REQUEST_BYTES = 512 * 1024**2
 # The operator's own resources block, which the preflight sums and holds to its memory floor.
 _OPERATOR_VALUE = "operator.resources"
 # What releases up to 0.16.0 shipped for the manager's memory limit, under the 512Mi floor.
@@ -421,6 +428,112 @@ class PreflightDecisionTest(unittest.TestCase):
         base = self._requirements()
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
+
+    def test_sizing_profile_rows_are_counted(self) -> None:
+        """platformAgent.deployment.sizingProfile medium and fleet are counted at their
+        rows, the difference from the small footprint across the three sized containers:
+        fleet raises the proxy to 4 CPU / 8Gi requests and 8 CPU / 8Gi limits, the
+        sidecar's memory limit to 8Gi and the shell's to 4Gi; medium raises the proxy to
+        1 CPU / 4Gi requests and a 4Gi memory limit and the sidecar's limit to 4Gi.
+        Ephemeral-storage and the pod count do not move. auto is the small row the
+        operator starts it at."""
+        base = self._requirements()
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(fleet["requestsCpu"] - base["requestsCpu"], 4000 - 500)
+        self.assertEqual(fleet["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        self.assertEqual(fleet["limitsCpu"] - base["limitsCpu"], 8000 - 2000)
+        self.assertEqual(fleet["limitsMemory"] - base["limitsMemory"], (6 + 6 + 2) * 1024**3)
+        medium = self._requirements([f"{_SIZING_VALUE}=medium"])
+        self.assertEqual(medium["requestsCpu"] - base["requestsCpu"], 1000 - 500)
+        self.assertEqual(medium["requestsMemory"] - base["requestsMemory"], 3 * 1024**3)
+        self.assertEqual(medium["limitsCpu"], base["limitsCpu"])
+        self.assertEqual(medium["limitsMemory"] - base["limitsMemory"], (2 + 2) * 1024**3)
+        for got in (fleet, medium):
+            for key in ("pods", "requestsEphemeral", "limitsEphemeral", "persistentVolumeClaims", "requestsStorage"):
+                self.assertEqual(got[key], base[key], key)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto"]), base)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=small"]), base)
+
+    def test_sizing_profile_override_merges_over_the_row(self) -> None:
+        """An override key replaces the row's figure and the rest of the row stands: under
+        fleet, a 3 CPU proxy request (valid on the fleet row, refused on small) counts 3
+        CPU, and a sidecar memory request alone above the small limit but under the
+        fleet one is counted rather than treated as refused."""
+        base = self._requirements()
+        proxy = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.cpu=3"])
+        self.assertEqual(proxy["requestsCpu"] - base["requestsCpu"], 3000 - 500)
+        self.assertEqual(proxy["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        sidecar = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_AA_VALUE}.requests.memory=3Gi"])
+        self.assertEqual(sidecar["requestsMemory"] - base["requestsMemory"], 7 * 1024**3 + 3 * 1024**3 - _AA_MEMORY_REQUEST_BYTES)
+        # A sidecar override the fleet row still refuses (a request above its 8Gi limit)
+        # is counted at the row, not at the small defaults.
+        refused = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_AA_VALUE}.requests.memory=9Gi"])
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(refused, fleet)
+
+    def test_sizing_profile_shell_override_is_refused_against_the_row(self) -> None:
+        """The shell's refusal rule reads the row the profile picks, not the small
+        defaults: a 3Gi memory request is refused on small (its 2Gi limit) and counted at
+        the defaults, admitted on fleet (its 4Gi limit) and counted as written, and a 5Gi
+        request on fleet is refused and counted at the row. Pins the footprint loop's order,
+        the row first and the refusal rule after it; reversed, the 3Gi case under fleet
+        would count the row alone and pass a quota the pod then cannot fit."""
+        base = self._requirements()
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        self.assertEqual(self._requirements([f"{_SHELL_VALUE}.requests.memory=3Gi"]), base)
+        admitted = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_SHELL_VALUE}.requests.memory=3Gi"])
+        self.assertEqual(admitted["requestsMemory"] - base["requestsMemory"],
+                         7 * 1024**3 + 3 * 1024**3 - _SHELL_MEMORY_REQUEST_BYTES)
+        self.assertEqual(admitted["limitsMemory"], fleet["limitsMemory"])
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=fleet", f"{_SHELL_VALUE}.requests.memory=5Gi"]), fleet)
+
+    def test_sizing_profile_auto_counts_a_proxy_request_alone_above_the_small_limit_at_the_row(self) -> None:
+        """Under auto the CR template admits a proxy request set alone up to the fleet
+        row's limit, while the preflight counts auto at the small row, where the operator
+        refuses that request and renders the row: a 6Gi memory request alone (above
+        small's 2Gi limit, under fleet's 8Gi) is counted at the small row rather than as a
+        6Gi request against a 2Gi limit, a pod the operator never writes. The same request
+        under fleet is admitted and counted as written, as is one set together with a
+        limit that admits it under auto, and a limit set alone below the row's request
+        lowers the request rather than reading as crossed."""
+        base = self._requirements()
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.memory=6Gi"]), base)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.cpu=3"]), base)
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        admitted = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.memory=6Gi"])
+        self.assertEqual(admitted["requestsMemory"] - fleet["requestsMemory"], (6 - 8) * 1024**3)
+        self.assertEqual(admitted["limitsMemory"], fleet["limitsMemory"])
+        paired = self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.memory=6Gi", f"{_PROXY_VALUE}.limits.memory=8Gi"])
+        self.assertEqual(paired["requestsMemory"] - base["requestsMemory"], 5 * 1024**3)
+        self.assertEqual(paired["limitsMemory"] - base["limitsMemory"], 6 * 1024**3)
+        lowered = self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.limits.memory=768Mi"])
+        self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], 768 * 1024**2 - 1024**3)
+        self.assertEqual(lowered["limitsMemory"] - base["limitsMemory"], 768 * 1024**2 - 2 * 1024**3)
+
+    def test_sizing_profile_on_autopilot_counts_the_rows_autopilot_requests(self) -> None:
+        """On GKE Autopilot the proxy's requests are the row's Autopilot pair, not the
+        small one: medium requests 2 CPU and 4Gi (the Standard medium row requests 1 CPU),
+        fleet 4 CPU and 8Gi. The limits are the row's, as on Standard."""
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        base = self._requirements()
+        small_on = self._requirements(extra_args=autopilot)
+        medium = self._requirements([f"{_SIZING_VALUE}=medium"])
+        medium_on = self._requirements([f"{_SIZING_VALUE}=medium"], extra_args=autopilot)
+        self.assertEqual(medium_on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
+        self.assertEqual(medium_on["requestsCpu"] - medium["requestsCpu"], 2000 - 1000)
+        self.assertEqual(medium_on["requestsMemory"] - base["requestsMemory"], 3 * 1024**3)
+        self.assertEqual(medium_on["requestsMemory"] - small_on["requestsMemory"], 2 * 1024**3)
+        self.assertEqual(medium_on["limitsCpu"], medium["limitsCpu"])
+        self.assertEqual(medium_on["limitsMemory"], medium["limitsMemory"])
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        fleet_on = self._requirements([f"{_SIZING_VALUE}=fleet"], extra_args=autopilot)
+        self.assertEqual(fleet_on["requestsCpu"] - base["requestsCpu"], 4000 - 500)
+        self.assertEqual(fleet_on["requestsMemory"] - base["requestsMemory"], 7 * 1024**3)
+        self.assertEqual(fleet_on["limitsCpu"], fleet["limitsCpu"])
+        self.assertEqual(fleet_on["limitsMemory"], fleet["limitsMemory"])
+        for got in (medium_on, fleet_on):
+            for key in ("pods", "requestsEphemeral", "limitsEphemeral"):
+                self.assertEqual(got[key], base[key], key)
 
     def test_agent_api_auth_memory_limit_override_moves_only_that_total(self) -> None:
         """The field's use case (#2648): raising the sidecar's memory limit is counted,
@@ -851,38 +964,47 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self._bridge_delta(env), cli)
 
-    def test_mode_next_counts_the_mcp_server_at_the_consoles_size_when_its_flag_is_on(self) -> None:
-        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), one
-        Recreate pod sized as the console, so no golden carries it and the chart adds it."""
-        console = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aConsole"]
-        self.assertEqual(console["pods"], 1)
-        self.assertGreater(console["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+    def _flagged(self) -> dict:
+        """files/flagged-pods.yaml by name; TestTheChartCountsEveryFlaggedPod holds it to the operator."""
+        # The tests index entries by name, so a missing one fails there; the names
+        # themselves are held to the operator by TestTheChartCountsEveryFlaggedPod.
+        return {p["name"]: p for p in yaml.safe_load(_FLAGGED_PODS.read_text())["pods"]}
+
+    def _flagged_delta(self, env: list) -> dict:
         base = self._requirements(["platformAgent.mode=next"])
-        on = (
+        req = self._requirements(["platformAgent.mode=next"], values={"operator": {"extraEnv": env}})
+        return {key: req[key] - base[key] for key in base}
+
+    def _assert_counts(self, delta: dict, *pods: dict) -> None:
+        for out, key in (
+            ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+            ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+            ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+            ("limitsEphemeral", "ephemeralStorageBytesLimit"),
+        ):
+            self.assertEqual(delta[out], sum(p["replicas"] * p[key] for p in pods), out)
+        self.assertEqual(delta["pods"], sum(p["replicas"] for p in pods))
+        self.assertEqual(delta["surgeRequestsCpu"], 0, "each rolls Recreate")
+
+    def test_mode_next_counts_the_mcp_server_when_its_flag_is_on(self) -> None:
+        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), so no
+        golden carries it and the chart adds it from files/flagged-pods.yaml."""
+        mcp = self._flagged()["mcp"]
+        self.assertGreater(mcp["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        for name, env in (
             ("true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
             ("by valueFrom", [{"name": "A2A_MCP_DOOR",
                                "valueFrom": {"configMapKeyRef": {"name": "x", "key": "door"}}}]),
             ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
             ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
                              {"name": "A2A_MCP_DOOR", "value": "true"}]),
-        )
-        for name, env in on:
+            ("a $(VAR) reference the kubelet expands", [{"name": "DOOR", "value": "true"},
+                                                        {"name": "A2A_MCP_DOOR", "value": "$(DOOR)"}]),
+        ):
             with self.subTest(name):
-                req = self._requirements(
-                    ["platformAgent.mode=next"], values={"operator": {"extraEnv": env}}
-                )
-                for out, key in (
-                    ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
-                    ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
-                    ("requestsEphemeral", "ephemeralStorageBytesRequest"),
-                    ("limitsEphemeral", "ephemeralStorageBytesLimit"),
-                ):
-                    self.assertEqual(req[out] - base[out], console[key], out)
-                self.assertEqual(req["pods"] - base["pods"], 1)
-                self.assertEqual(req["surgeRequestsCpu"], base["surgeRequestsCpu"], "it rolls Recreate")
+                self._assert_counts(self._flagged_delta(env), mcp)
 
     def test_the_mcp_server_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
-        base = self._requirements(["platformAgent.mode=next"])
         for name, env in (
             ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
             ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
@@ -892,14 +1014,47 @@ class PreflightDecisionTest(unittest.TestCase):
                              {"name": "A2A_MCP_DOOR", "value": "false"}]),
         ):
             with self.subTest(name):
-                self.assertEqual(
-                    self._requirements(["platformAgent.mode=next"],
-                                       values={"operator": {"extraEnv": env}}),
-                    base,
-                )
+                self.assertEqual(set(self._flagged_delta(env).values()), {0})
         # And never under today, where the operator renders no MCP server.
         door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
         self.assertEqual(self._requirements(values=door), self._requirements())
+
+    def test_mode_next_counts_the_profile_dispatcher_when_its_image_is_set(self) -> None:
+        """The operator renders the dispatcher, in the release namespace, while
+        A2A_DISPATCHER_IMAGE is non-blank (#4808)."""
+        dispatcher = self._flagged()["dispatcher"]
+        self.assertGreater(dispatcher["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        for name, env in (
+            ("an image", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/dispatcher:1"}]),
+            ("padded", [{"name": "A2A_DISPATCHER_IMAGE", "value": " example.com/d:1 "}]),
+            ("by valueFrom", [{"name": "A2A_DISPATCHER_IMAGE",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "image"}}}]),
+            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""},
+                             {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]),
+        ):
+            with self.subTest(name):
+                self._assert_counts(self._flagged_delta(env), dispatcher)
+
+    def test_the_profile_dispatcher_is_not_counted_without_an_image(self) -> None:
+        for name, env in (
+            ("empty", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
+            ("blank, which the operator trims", [{"name": "A2A_DISPATCHER_IMAGE", "value": "   "}]),
+            ("tab and newline", [{"name": "A2A_DISPATCHER_IMAGE", "value": "\t\n"}]),
+            ("no value", [{"name": "A2A_DISPATCHER_IMAGE"}]),
+            ("a null value", [{"name": "A2A_DISPATCHER_IMAGE", "value": None}]),
+            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"},
+                             {"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(set(self._flagged_delta(env).values()), {0})
+        image = {"operator": {"extraEnv": [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]}}
+        self.assertEqual(self._requirements(values=image), self._requirements())
+
+    def test_mode_next_counts_both_flagged_pods_together(self) -> None:
+        pods = self._flagged()
+        env = [{"name": "A2A_MCP_DOOR", "value": "true"},
+               {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
+        self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
 
     def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
@@ -1750,6 +1905,37 @@ class QuotaPreflightTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "missing footprint must fail render")
         self.assertIn("footprint.yaml is missing or unreadable", res.stderr)
+
+    @unittest.skipUnless(_HELM, "helm is not installed")
+    def test_a_missing_or_unreadable_flagged_pods_file_fails_a_next_render(self) -> None:
+        """Like footprint.yaml: without flagged-pods.yaml the flagged pods would count as none."""
+        for name, damage in (
+            ("missing", lambda f: f.unlink()),
+            ("unreadable", lambda f: f.write_text("pods: [unclosed\n")),
+            ("no pods list", lambda f: f.write_text("pod: []\n")),
+            ("an entry cut short", lambda f: f.write_text(
+                f.read_text().rsplit("    memoryBytesLimit", 1)[0])),
+        ):
+            with self.subTest(name):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                chart = pathlib.Path(tmp.name) / "kube-agents"
+                shutil.copytree(_CHART, chart)
+                (chart / "values.schema.json").unlink(missing_ok=True)
+                (chart / "templates" / "zz-probe.yaml").write_text(_PROBE_TEMPLATE)
+                damage(chart / "files" / "flagged-pods.yaml")
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+                    yaml.safe_dump({"probe": {"emitRequirements": True}}, fh)
+                    values_path = fh.name
+                self.addCleanup(lambda p=values_path: pathlib.Path(p).unlink(missing_ok=True))
+                res = subprocess.run(
+                    [_HELM, "template", "test-release", str(chart), "-f", values_path,
+                     "--set", "platformAgent.mode=next"] + _REQUIRED_HARNESS,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(res.returncode, 0, "a damaged flagged-pods.yaml must fail the render")
+                self.assertIn("flagged-pods.yaml is missing or unreadable", res.stderr)
 
     def test_the_bypass_flag_gates_the_whole_check(self) -> None:
         """`quotaPreflight.enabled=false` is the only remedy offered to a deployer without

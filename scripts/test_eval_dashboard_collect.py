@@ -2384,6 +2384,46 @@ class TestRepParsing(unittest.TestCase):
         self.assertEqual(parsed["tasks"], [])
         self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
 
+    def test_a_shape_line_sets_its_reps_shape(self):
+        """`bench-gate case` prints `rep N shape:` under the tokens line, from
+        the harness's shape.json; flags arrive as 1 or 0."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 1 of 2 repetitions\n"
+            "  rep 1: pass\n"
+            "  rep 1 tokens: input=18 output=1867 total=275153\n"
+            "  rep 1 shape: opens_on_verdict=1 apology=0 bot_messages=2 words_before_answer=0 answer_words=48\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 shape: opens_on_verdict=0 apology=1 bot_messages=3 words_before_answer=7 answer_words=312\n"
+            "  rep 2 report: Let me check the pods.\n"
+            "  rep 3 shape: opens_on_verdict=1\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2], "a shape line never fabricates a rep")
+        self.assertEqual(task["reps"][0]["shape"], {"opens_on_verdict": True, "apology": False, "bot_messages": 2,
+                                                    "words_before_answer": 0, "answer_words": 48})
+        self.assertEqual(task["reps"][1]["shape"], {"opens_on_verdict": False, "apology": True, "bot_messages": 3,
+                                                    "words_before_answer": 7, "answer_words": 312})
+        self.assertEqual(task["reps"][1]["excerpt"], "Let me check the pods.", "the report still attaches")
+
+    def test_a_shape_line_keeps_only_values_that_parse(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 shape: opens_on_verdict=2 apology=0 bot_messages=-1 answer_words=40 foo=1\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 shape: opens_on_verdict=yes answer_words=1.5 bot_messages=\u00b2\n"
+            "  rep 3: fail -- x\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["shape"], {"apology": False, "answer_words": 40})
+        self.assertNotIn("shape", task["reps"][1], "nothing parsed: no key")
+        self.assertNotIn("shape", task["reps"][2], "no shape line: the key is absent")
+
+    def test_a_shape_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 shape: answer_words=5 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+
     def test_the_real_fixtures_predate_the_tokens_line(self):
         for build in (BUILD_1057_PARALLEL, BUILD_1075_SERIAL, BUILD_1089_MIXED):
             for task in self.tasks(build).values():

@@ -34,7 +34,10 @@ import (
 type clusterRun struct {
 	cluster targetCluster
 	cache   *dedupCache
-	cancel  context.CancelFunc
+	// excluded is the dispatcher's alert-exclude recorder, flushed when the
+	// cluster stops; nil in a dry run.
+	excluded *excludedRecorder
+	cancel   context.CancelFunc
 	// done is closed once the cluster's watcher goroutine has returned.
 	done chan struct{}
 }
@@ -104,7 +107,7 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	disp.cluster = tc
 	disp.owners = newOwnerResolver(tc.Client)
 	cctx, cancel := context.WithCancel(ctx)
-	run := &clusterRun{cluster: tc, cache: cache, cancel: cancel, done: make(chan struct{})}
+	run := &clusterRun{cluster: tc, cache: cache, excluded: disp.excluded, cancel: cancel, done: make(chan struct{})}
 	// done closes once the watcher and both loops have returned, so a stop
 	// that waits on it deletes the cluster's gauge series after the last
 	// goroutine that could write one. Local to this start, so the group is
@@ -235,6 +238,7 @@ func (s *clusterSet) stop(profile string) {
 	if err := run.cache.Snapshot(); err != nil {
 		log.Printf("k8s-event-watcher: [%s] dedup snapshot on removal: %v", run.cluster.Name, err)
 	}
+	run.flushExcluded()
 	s.m.deleteClusterGauges(run.cluster.Name, run.cluster.ProjectID, run.cluster.Location)
 }
 
@@ -273,7 +277,20 @@ func (s *clusterSet) snapshotAll() {
 		if err := run.cache.Snapshot(); err != nil {
 			log.Printf("dedup snapshot on shutdown: %v", err)
 		}
+		run.flushExcluded()
 	}
+}
+
+// flushExcluded sends the cluster's pending alert-exclude sightings, with a
+// fresh context bounded by excludedFinalFlushTimeout: the cluster's own has
+// ended by now, and the memo goes with it.
+func (run *clusterRun) flushExcluded() {
+	if run.excluded == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), excludedFinalFlushTimeout)
+	defer cancel()
+	run.excluded.Flush(ctx)
 }
 
 // count is how many clusters are running.

@@ -5,7 +5,7 @@ description: Read-only detection of controllers that stopped making progress wit
 
 # GKE Stall Detection
 
-Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`gke-workload-troubleshooting`, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
+Use this skill when a controller has gone quiet rather than red: a Gateway that never programs, a rollout that never finishes, a custom resource whose status stopped following its spec, an HTTPRoute nobody accepted. The symptom-driven skills (`workload-triage-scan`, the `pod-*` skills, `gke-reliability`) start from a failing pod or a bad event; this one starts from the absence of progress, which those states never show. It is read-only: it lists objects, reads their status and events, resolves referenced names, and proposes nothing beyond naming what is missing.
 
 ## When to run it
 
@@ -68,7 +68,7 @@ The same four heuristics apply without Gateway-specific code: a Deployment whose
 You are a Cluster Agent under a strict read-only boundary: no patches applied, no Pull Requests opened, nothing passed back through the chat reply. Complete the kanban task you were spawned on.
 
 - A card that gives a report format wins: format `result` exactly as the card says. A stall alert raised through the Session KV server's `controller-stall` inject arrives as such a card, with the `What's wrong` / `Why` / `What to do` template and, when there is a fix, a `To authorize:` line; that shape is what gets the report saved so a reply of "apply" can act on it. Quote the scan's `stalled resources: <count>` line in `Why`.
-- Otherwise, follow the shape in `gke-workload-troubleshooting`:
+- Otherwise, follow the shape in `workload-triage-scan/references/reporting.md`:
 
 ```
 kanban_complete(

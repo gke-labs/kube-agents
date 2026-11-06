@@ -408,21 +408,21 @@ const (
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
-	// proxy Deployment is rendered at the operator's default resources.
+	// proxy Deployment is rendered at the sizing profile's row.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
-	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidAgentAPIAuthResources: the CR's
 	// spec.deployment.agentAPIAuth.resources fails ValidateAgentAPIAuthResources,
 	// so the override is ignored and the agent-api-auth sidecar is rendered at
-	// the operator's default resources.
+	// the sizing profile's row.
 	conditionReasonInvalidAgentAPIAuthResources = "InvalidAgentAPIAuthResources"
-	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidShellSandboxResources: the CR's
 	// spec.harness.experimental.shellSandbox.resources fails
 	// ValidateShellSandboxResources, so the override is ignored and the shell
-	// StatefulSet is rendered at the operator's default resources.
+	// StatefulSet is rendered at the sizing profile's row.
 	conditionReasonInvalidShellSandboxResources = "InvalidShellSandboxResources"
-	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -496,6 +496,23 @@ type PlatformAgentReconciler struct {
 	// clears it when an echo carries the pair. Under prunedNewerFieldsMu.
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
+	// prunedSizingTier records, per CR, the last write of
+	// status.effectiveSizingTier whose echo came back without the field: a
+	// served CRD that predates it. resolveSizingTier's write gate treats ""
+	// as settled while the record is fresh (usageStatusReprobeInterval), so an
+	// operator rolled ahead of its CRD writes and logs the tier once per
+	// interval rather than on every pass. Keyed by ObjectKey, value time.Time;
+	// cleared by an echo that carries the field, and when the CR is deleted.
+	prunedSizingTier sync.Map
+
+	// steppedBackAt records, per CR, when resolveSizingTier last stepped the
+	// sizing latch back from a pod admission refused on a quota
+	// (sizingRefusedStep); the gate measures no step up for
+	// sizingStepBackHoldInterval after it (sizingStepBackHeld). Keyed by
+	// ObjectKey, value time.Time; cleared when the CR is deleted. In memory
+	// by design: a restart forgets the hold and measures on the next settled
+	// pass.
+	steppedBackAt sync.Map
 
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
@@ -1020,6 +1037,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	// 10a. Resolve the sizing tier the three sized containers render at, and
+	// write it to status with the SizingCappedByQuota condition, before the
+	// sandbox, the broker and the gateway below read renderedSizingTier. Above
+	// the renders rather than in the Ready writer so the status says what the
+	// pods run even when a later step of this pass fails, and so a pass that
+	// parks Degraded below still leaves the latch where this pass moved it.
+	if err := r.resolveSizingTier(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
 	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
 	// CA Secret and proxy Service exist before the shell mounts and dials them.
@@ -1303,6 +1330,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// A sizing step back's hold ends at a time (sizingStepBackHoldInterval),
+	// and the settled lower row sends no event for it, so the pass that
+	// measures the step again is scheduled for the hold's end.
+	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.
@@ -2589,7 +2620,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		r.agentAPIAuthWarningsLogged.Store(apiAuthKey, agent.Generation)
 	}
 	if apiAuthRefusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", apiAuthRefusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, apiAuthRefusal)
 		gatewayAgent = agent.DeepCopy()
@@ -2798,7 +2829,7 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 	}
 	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidShellSandboxResources, refusal)
 		rendered = agent.DeepCopy()
@@ -3208,7 +3239,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	}
 	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
 		rendered = agent.DeepCopy()
@@ -4906,10 +4937,12 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 	}
 }
 
-// forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
-// map does not keep an entry per deleted name for the life of the process.
+// forgetUsageStatus drops the CR's pruning records when the CR goes away, so the
+// maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
+	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
