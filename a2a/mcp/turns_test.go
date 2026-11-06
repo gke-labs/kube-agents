@@ -15,6 +15,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 const (
@@ -1763,6 +1764,96 @@ func TestWaitForTurnStepReusesTaskWatchAcrossPollsWithReapDelay(t *testing.T) {
 	}
 	if n := created.Load(); n != 1 {
 		t.Errorf("created %d JetStream consumers across 13 polls, want 1", n)
+	}
+}
+
+// publishParts puts one artifact with the given parts on a task's events.
+func publishParts(t *testing.T, js jetstream.JetStream, addressee, taskID, name string, parts ...lib.Part) {
+	t.Helper()
+	p := mustJSON(t, lib.ArtifactUpdate{TaskID: taskID, ContextID: "ctx-" + taskID,
+		Artifact: lib.Artifact{Name: name, Parts: parts}, LastChunk: true})
+	env, err := lib.NewArtifactUpdateEnvelope(executor(addressee), taskID, "ctx-"+taskID, "corr-"+taskID, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub(t, js, lib.TaskEventsSubject(addressee, taskID), env)
+}
+
+// The api executor publishes a plan step with its call ids when a call
+// starts and the call's activity only when it ends. A call that outlasts
+// stepActivityWaitMax has its step reported bare; the step is reported
+// again with its Tool Activity once the activity lands.
+func TestWaitForTurnStepReportsALateActivityOfAStepAlreadyShown(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	rootID := "task-late-activity-root"
+	stepPart := mustStepPart(t, stepmsg.Step{Kind: stepmsg.KindPlan, Title: "Checking cluster nodes", CallIDs: []string{"c1"}})
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+		publishParts(t, js, fakeAddressee, rootID, stepmsg.ArtifactName, stepPart)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	first, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 3*time.Second)
+	if err != nil {
+		t.Fatalf("first WaitForTurnStep: %v", err)
+	}
+	if !first.StillRunning || len(first.NewStepDetails) != 1 || len(first.NewStepDetails[0].Activities) != 0 {
+		t.Fatalf("first poll = running %v, new steps %+v; want the bare plan step", first.StillRunning, first.NewStepDetails)
+	}
+
+	publishParts(t, js, fakeAddressee, rootID, lib.ArtifactActivity,
+		mustDataPart(t, map[string]any{"tool": "kubectl", "callId": "c1", "title": "kubectl get nodes", "status": "completed"}))
+
+	second, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 3*time.Second)
+	if err != nil {
+		t.Fatalf("second WaitForTurnStep: %v", err)
+	}
+	if len(second.NewStepDetails) != 1 || len(second.NewStepDetails[0].Activities) != 1 {
+		t.Fatalf("second poll new steps = %+v, want the step again with its activity", second.NewStepDetails)
+	}
+	if second.LastReportedSteps != 1 {
+		t.Errorf("second poll LastReportedSteps = %d, want 1 (the step is not counted twice)", second.LastReportedSteps)
+	}
+	if _, md, _ := FormatTurnCustomToolEnvelope(second); !strings.Contains(md, "**Tool Activity**") {
+		t.Errorf("second poll markdown has no Tool Activity line:\n%s", md)
+	}
+
+	third, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 300*time.Millisecond)
+	if err != nil {
+		t.Fatalf("third WaitForTurnStep: %v", err)
+	}
+	if len(third.NewStepDetails) != 0 {
+		t.Errorf("third poll new steps = %+v, want none (the step is reported whole)", third.NewStepDetails)
 	}
 }
 

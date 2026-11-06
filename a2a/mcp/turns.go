@@ -619,12 +619,17 @@ type taskStepState struct {
 	settledDelegationsAt time.Time
 	settledFollowedCount int
 	followedRefs         []TaskRef
-	seenStepKeys         map[string]bool
-	watch                *turnWatch
-	watchTimer           *time.Timer
-	taskWatches          map[TaskRef]*taskWatch
-	finalTasks           map[TaskRef]*lib.Task
-	failedTasks          map[TaskRef]error
+	// seenStepKeys holds the steps already reported: true once a step was
+	// reported whole, false while it was reported as a plan step before
+	// any of its activities arrived (the api executor publishes the plan
+	// step when a call starts and its activity only when it ends), so the
+	// step is reported again once they do.
+	seenStepKeys map[string]bool
+	watch        *turnWatch
+	watchTimer   *time.Timer
+	taskWatches  map[TaskRef]*taskWatch
+	finalTasks   map[TaskRef]*lib.Task
+	failedTasks  map[TaskRef]error
 	// idleTimer releases the task watches a streamed poll kept once no
 	// poll has followed within stepWatchIdleRelease; idleGen is bumped by
 	// every arm and disarm, and a firing that finds another generation is
@@ -1927,13 +1932,18 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	if st.seenStepKeys == nil {
 		st.seenStepKeys = map[string]bool{}
 	}
+	nextSteps := prevSteps
 	for _, d := range newDetails {
-		if d.StepKey != "" {
-			st.seenStepKeys[d.StepKey] = true
+		if d.StepKey == "" {
+			nextSteps++
+			continue
 		}
+		if _, reported := st.seenStepKeys[d.StepKey]; !reported {
+			nextSteps++
+		}
+		st.seenStepKeys[d.StepKey] = len(d.Activities) > 0 || !isPlanStep(d)
 	}
 
-	nextSteps := prevSteps + len(newDetails)
 	if chainSettled && len(details) > nextSteps {
 		nextSteps = len(details)
 	}
@@ -2009,10 +2019,12 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	}, nil
 }
 
+// unseenStepDetails returns the steps not yet reported, and a plan step
+// reported before its activities (seen false) once they have arrived.
 func unseenStepDetails(details []StepDetail, seen map[string]bool) []StepDetail {
 	var out []StepDetail
 	for _, d := range details {
-		if d.StepKey != "" && seen[d.StepKey] {
+		if whole, reported := seen[d.StepKey]; d.StepKey != "" && reported && (whole || len(d.Activities) == 0) {
 			continue
 		}
 		out = append(out, d)
@@ -2021,10 +2033,11 @@ func unseenStepDetails(details []StepDetail, seen map[string]bool) []StepDetail 
 }
 
 func stepReadyForDisplay(d StepDetail) bool {
-	if len(d.Activities) > 0 {
-		return true
-	}
-	return d.Step.Kind != "" && d.Step.Kind != stepmsg.KindPlan
+	return len(d.Activities) > 0 || !isPlanStep(d)
+}
+
+func isPlanStep(d StepDetail) bool {
+	return d.Step.Kind == "" || d.Step.Kind == stepmsg.KindPlan
 }
 
 func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Conversations, st *taskStepState) (TurnOutcome, bool, bool, error) {
