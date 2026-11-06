@@ -44,6 +44,9 @@ _ON = (
     "litellm.replayShadow.job.pr=4700",
 )
 _PROXY = "inference-replay-shadow"
+# Every job kind the CI files under; tests/test_ci_replay_shadow.py holds the
+# other copies equal to this one.
+_JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit")
 _PROXY_CONTAINER = "replay-shadow-proxy"
 _LITELLM_CONTAINER = "litellm-container"
 _HELM_TIMEOUT_SECONDS = 120
@@ -273,8 +276,7 @@ class SchemaTest(unittest.TestCase):
         self.assertIn("/litellm/replayShadow/job/kind", res.stderr)
 
     def test_every_kind_the_ci_files_under_renders_and_is_stamped(self):
-        # hack/ci-env.sh's REPLAY_SHADOW_KIND_* values; collect_shadow.py's JOB_KINDS.
-        for kind in ("nightly", "nightly-untrusted", "presubmit"):
+        for kind in _JOB_KINDS:
             with self.subTest(kind=kind):
                 res = _render([*_ON, f"litellm.replayShadow.job.kind={kind}"], show_only="templates/litellm.yaml")
                 self.assertEqual(res.returncode, 0, res.stderr)
