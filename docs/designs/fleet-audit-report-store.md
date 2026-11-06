@@ -205,6 +205,13 @@ operator restoring ownership clears it.
 
 ## 4. `finish`'s own memory
 
+A scheduled `finish` with a collector manifest also leaves a second, smaller memory outside the
+store: `/opt/data/scratch/last_scheduled_digest_<audit-id>.json`, the digest of its manifest with
+the `finished_at` of the envelope it stored, which the next scheduled run's `precheck` reads
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). It is checked only
+by its `audit` and that `finished_at` against the store's newest envelope; losing it costs one
+full run (`first-run`), and nothing rebuilds it from the store.
+
 The previous run's memory is the `latest.json` in this run's repository directory, trusted when its
 `issue_number` is the open ledger `find_existing_issue` just returned and its `repo` is this run's.
 The path already selects the repository; the envelope's own `repo` is checked as well, so a file

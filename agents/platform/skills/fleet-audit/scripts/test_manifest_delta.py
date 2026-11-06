@@ -103,9 +103,23 @@ class DigestTest(unittest.TestCase):
     def test_a_removed_candidate_changes_the_digest(self):
         self.assert_changes(lambda m: m["clusters"][0]["candidates"].clear(), "removed candidate")
 
-    def test_a_candidates_severity_or_excerpt_changes_the_digest(self):
+    def test_a_candidates_severity_changes_the_digest(self):
         self.assert_changes(lambda m: m["clusters"][0]["candidates"][0].update(severity="critical"), "severity")
-        self.assert_changes(lambda m: m["clusters"][0]["candidates"][0].update(excerpt="two policies"), "excerpt")
+        self.assert_changes(lambda m: m["clusters"][0]["candidates"][0].update(object="Namespace/other"), "object")
+
+    def test_a_candidates_excerpt_and_impact_do_not_count(self):
+        """The cost collector writes ages into excerpts (`AGE=12d`), the stockout
+        collector log-window stamps; a static fleet would otherwise digest
+        differently every day. `finish` adopts the fresh excerpt on a close."""
+        before = manifest_delta.manifest_digest(manifest())
+        aged = manifest()
+        aged["clusters"][0]["candidates"][0].update(excerpt="phase=Available, unclaimed, AGE=13d", impact="idle for 13 days")
+        self.assertEqual(manifest_delta.manifest_digest(aged), before)
+        shuffled = manifest()
+        shuffled["clusters"][0]["candidates"].append({"check": "x", "namespace": "", "object": "Namespace/x", "severity": "minor"})
+        reordered = manifest()
+        reordered["clusters"][0]["candidates"].insert(0, {"check": "x", "namespace": "", "object": "Namespace/x", "severity": "minor"})
+        self.assertEqual(manifest_delta.manifest_digest(shuffled), manifest_delta.manifest_digest(reordered))
 
     def test_a_check_that_stopped_running_changes_the_digest(self):
         self.assert_changes(lambda m: m["clusters"][0]["commands"].pop(), "dropped command")
@@ -222,6 +236,16 @@ class GateTest(unittest.TestCase):
         self.record(manifest(), now=NOW, full_run=False)
         record = manifest_delta.read_record(AUDIT, self.scratch)
         self.assertEqual(record[manifest_delta.RECORD_LAST_FULL_RUN_AT_KEY], manifest_delta._iso(NOW))
+
+    def test_the_record_names_the_envelope_when_given_one(self):
+        path = manifest_delta.record_scheduled_digest(
+            AUDIT, manifest(), NOW, full_run=True, scratch_dir=self.scratch, envelope_finished_at="2026-11-05T06:30:00+00:00"
+        )
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record[manifest_delta.RECORD_ENVELOPE_KEY], "2026-11-05T06:30:00+00:00")
+        self.assertEqual(manifest_delta.read_record(AUDIT, self.scratch)[manifest_delta.RECORD_ENVELOPE_KEY], "2026-11-05T06:30:00+00:00")
+        path = self.record(manifest())
+        self.assertNotIn(manifest_delta.RECORD_ENVELOPE_KEY, json.loads(path.read_text(encoding="utf-8")))
 
     def test_the_record_names_the_stream_and_the_checks_revision(self):
         path = self.record(manifest())

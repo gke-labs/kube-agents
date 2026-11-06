@@ -6,8 +6,8 @@
 # `audit_report.py precheck` digests the collector manifest and compares it with
 # the digest the last scheduled `finish` recorded; on `unchanged`, with the
 # scheduled flag, it runs `finish --scheduled` itself on the stored document
-# (docs/designs/fleet-audit-collector-manifest.md, section 3.7). Nine
-# governance SOPs run it after their collector.
+# (docs/designs/fleet-audit-collector-manifest.md, section 3.7). Every
+# collector stream's SOP but upgrade-retrospective's runs it after the collector.
 #
 # How the case makes the previous run and the scheduled run. The bench format
 # runs one prompt, and a chat-dispatched audit is an on-demand run, which never

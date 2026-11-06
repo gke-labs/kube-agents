@@ -1011,8 +1011,10 @@ same numbers to go stale, and the test above checks the roster against the SOPs
 ## The `--scheduled` sentence in audit prompts
 
 Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`,
-and the nine governance audits whose SOP runs `audit_report.py precheck` after
-the collector tell it to pass the flag to `precheck` too. Only a run with that
+and every stream whose SOP runs `audit_report.py precheck` after its collector
+(every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run: `PRECHECK_STREAMS` in the test file below) tells it to pass the
+flag to `precheck` too. Only a run with that
 flag can get `silent_ok: true`, so the sentence is what lets a quiet scheduled
 run answer `[SILENT]`; and only a run with it is closed by `precheck` from the
 last scheduled run's stored document when the collector manifest digests the
@@ -1025,7 +1027,7 @@ run of its stream go silent, or be closed from a stored document.
 prompt has the phrase `pass --scheduled to precheck and finish` (`pass
 --scheduled to finish` on a stream without the step) and that no SOP passes
 the flag; `test_every_collector_sop_runs_precheck_after_its_collector` beside
-it holds the step to those nine SOPs. A prompt without the sentence
+it holds the step to exactly those SOPs. A prompt without the sentence
 only makes its job noisier. The rule is in
 [ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 

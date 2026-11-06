@@ -461,7 +461,9 @@ practice groups are almost always singletons.
 
 ## 6. Script surface
 
-`agents/platform/skills/fleet-audit/scripts/audit_report.py` — three subcommands.
+`agents/platform/skills/fleet-audit/scripts/audit_report.py` — the subcommands below, plus
+`draft`, the content-mode reads and `precheck`; `precheck` and the `precheck` key it adds to the
+`finish` line are in [`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7.
 
 ### `start --audit <id>`
 
@@ -1491,7 +1493,10 @@ section says so. The one limit: an on-demand run that goes through `hermes cron 
 the cron prompt, so it counts as a scheduled run and can be silent.
 
 The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
-`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`, and, on a
+stream whose SOP runs `precheck` after its collector, to `precheck` too; a run `precheck` closes
+from the stored document is decided by this rule unchanged, since the close is `finish --scheduled`
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). The SOPs do
 not, because a scheduled run and an on-demand run read the same SOP, and an SOP that passed the
 flag would make every on-demand run of its stream able to go silent. A scheduled worker that
 forgets the flag reports a run that could have been silent. That is noise in the channel, and it

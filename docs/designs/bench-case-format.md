@@ -387,7 +387,9 @@ Session KV server in the agent pod and passes when every row in `finding_ids`, u
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
-the run started, with `status` when it gives one, with each key of `required_envelope` equal to the
+the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
+JSON file in the agent container, for a scheduled run the stack fired and waited out before the
+turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
 value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
 `required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the

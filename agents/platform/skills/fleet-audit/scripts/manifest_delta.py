@@ -66,6 +66,9 @@ RECORD_DIGEST_KEY = "digest"
 RECORD_CHECKS_REVISION_KEY = "checks_revision"
 RECORD_RECORDED_AT_KEY = "recorded_at"
 RECORD_LAST_FULL_RUN_AT_KEY = "last_full_run_at"
+# The `finished_at` of the envelope the recording `finish` stored, so the next
+# run's `precheck` republishes the document of the run whose digest it read.
+RECORD_ENVELOPE_KEY = "envelope_finished_at"
 
 # Manifest keys that say when the collector ran, not what it found.
 VOLATILE_MANIFEST_KEYS = frozenset({"started_at", "finished_at"})
@@ -73,6 +76,14 @@ VOLATILE_MANIFEST_KEYS = frozenset({"started_at", "finished_at"})
 # and the literal command, whose kubeconfig and workspace paths are per run.
 # The `check` and `rc` of each command are what `finish` reads, and they stay.
 VOLATILE_COMMAND_KEYS = frozenset({"command", "duration_s", "output_sha256"})
+# Per-candidate keys that are prose about a finding rather than the finding:
+# the collectors put ages ("AGE=12d"), log-window stamps and counts in them,
+# so a static fleet would digest differently every day. A candidate counts by
+# everything else it carries (check, cluster, namespace, object, severity, the
+# route and triage fields), and `finish` adopts the fresh manifest's excerpt
+# and authoritative impact on a close, so the ledger shows today's text.
+VOLATILE_CANDIDATE_KEYS = frozenset({"excerpt", "impact"})
+CANDIDATES_KEY = "candidates"
 COMMANDS_KEY = "commands"
 CLUSTERS_KEY = "clusters"
 CHECKS_UNEVALUATED_KEY = "checks_unevaluated"
@@ -105,12 +116,38 @@ def _normalized_commands(commands: object) -> list:
     return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
 
 
+def _normalized_candidates(candidates: object) -> list:
+    """Each candidate without its prose keys, sorted so order does not count."""
+    if not isinstance(candidates, list):
+        return [candidates]
+    rows = []
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            rows.append({k: v for k, v in candidate.items() if k not in VOLATILE_CANDIDATE_KEYS})
+        else:
+            rows.append(candidate)
+    return sorted(rows, key=lambda row: json.dumps(row, sort_keys=True, default=str))
+
+
+def _normalized_entry(entry: dict) -> dict:
+    out = {}
+    for key, value in entry.items():
+        if key == COMMANDS_KEY:
+            out[key] = _normalized_commands(value)
+        elif key == CANDIDATES_KEY:
+            out[key] = _normalized_candidates(value)
+        else:
+            out[key] = value
+    return out
+
+
 def normalized_manifest(manifest: dict) -> dict:
     """`manifest` without the keys that change on every run of the same fleet.
 
     Top-level timestamps go; each cluster entry keeps every key but reshapes
-    `commands` to its non-volatile fields. Cluster entries are sorted by their
-    JSON form so the collector's enumeration order does not count either.
+    `commands` and `candidates` to their non-volatile fields. Cluster entries
+    are sorted by their JSON form so the collector's enumeration order does
+    not count either.
     """
     out: dict = {}
     for key, value in manifest.items():
@@ -120,7 +157,7 @@ def normalized_manifest(manifest: dict) -> dict:
             entries = []
             for entry in value:
                 if isinstance(entry, dict):
-                    entries.append({k: (_normalized_commands(v) if k == COMMANDS_KEY else v) for k, v in entry.items()})
+                    entries.append(_normalized_entry(entry))
                 else:
                     entries.append(entry)
             out[key] = sorted(entries, key=lambda e: json.dumps(e, sort_keys=True, default=str))
@@ -133,9 +170,10 @@ def manifest_digest(manifest: dict) -> str:
     """A hex digest of what the manifest says about the fleet.
 
     Two manifests of an unchanged fleet digest the same whatever their
-    timestamps, command durations, output hashes, command strings, and cluster
-    or command order; a candidate added or removed, an outcome, a limitation,
-    a `checks_not_applicable` or `checks_unevaluated` entry, or a new
+    timestamps, command durations, output hashes, command strings, candidate
+    excerpts and impacts, and cluster, command or candidate order; a candidate
+    added or removed, a severity, an outcome, a limitation, a
+    `checks_not_applicable` or `checks_unevaluated` entry, or a new
     `checks_revision` digests differently.
     """
     canonical = json.dumps(normalized_manifest(manifest), sort_keys=True, separators=(",", ":"), default=str)
@@ -238,13 +276,16 @@ def record_scheduled_digest(
     *,
     full_run: bool,
     scratch_dir: str | os.PathLike | None = None,
+    envelope_finished_at: str | None = None,
 ) -> Path:
     """Write the record a scheduled `finish` leaves for the next run's gate.
 
     `full_run` says the model drafted this run's document, so
     `last_full_run_at` moves to `now`; a `finish` that `precheck` ran from the
     stored document keeps the previous value (or sets it to `now` when there
-    was none, which only a record written by hand can produce). The write is
+    was none, which only a record written by hand can produce).
+    `envelope_finished_at` names the stored envelope of the recording run,
+    which `precheck` holds the document it republishes to. The write is
     atomic, and the file is the only state the gate reads.
     """
     previous = read_record(audit_id, scratch_dir)
@@ -260,6 +301,7 @@ def record_scheduled_digest(
         RECORD_CHECKS_REVISION_KEY: manifest.get(CHECKS_REVISION_KEY),
         RECORD_RECORDED_AT_KEY: _iso(now),
         RECORD_LAST_FULL_RUN_AT_KEY: _iso(last_full),
+        **({RECORD_ENVELOPE_KEY: envelope_finished_at} if envelope_finished_at else {}),
     }
     path = digest_path_for(audit_id, scratch_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
