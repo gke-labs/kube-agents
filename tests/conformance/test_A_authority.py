@@ -1344,6 +1344,12 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         dispatcher = self._dispatcher_writes()
         for spelling in self.STOP_SPELLINGS:
             self.assertNotIn(spelling, dispatcher, "the dispatcher holds a publish grant on the stop record")
+        # The reads left out above are only reads while their list stays on
+        # the subscribe side: the stop subjects can't be spliced into the
+        # publish list.
+        body = self._dispatcher_identity()
+        publish = body[body.index("publish:") : body.index("subscribe:")]
+        self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
 
     CONSOLE_CONFIRM_PROBE = "chat.console.tab-1.confirm"
     CONSOLE_IN_PROBE = "chat.console.tab-1.in"
