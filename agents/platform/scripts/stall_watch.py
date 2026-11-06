@@ -727,7 +727,7 @@ def kinds_argument() -> str | None:
     if raw.lower() == ALL_KINDS:
         return None
     configured = env_list(KINDS_ENV, KINDS_SEPARATOR)
-    refused = [k for k in configured if k.lower().split("/", 1)[0].split(".", 1)[0] in REFUSED_KINDS]
+    refused = [k for k in configured if refused_kind(k)]
     if refused:
         sys.stderr.write(f"stall_watch: {KINDS_ENV} names kinds the watch never reads, ignored: {', '.join(refused)}\n")
     kept = [k for k in configured if k not in refused]
@@ -909,11 +909,24 @@ def kinds_for(served: set[str] | None) -> tuple[str | None, set[str]]:
     return KINDS_SEPARATOR.join(kept), dropped
 
 
+def refused_kind(kind: str) -> bool:
+    """Whether the kind list never carries this resource, by the part before
+    its group, as `kinds_argument` and the CRD's own rule read it."""
+    return kind.lower().split("/", 1)[0].split(".", 1)[0] in REFUSED_KINDS
+
+
 def wildcard_candidates(served: set[str] | None, wildcards: list[str]) -> list[str]:
-    """The served resources the wildcards stand for, by name."""
+    """The served resources the wildcards stand for, by name, less the kinds
+    the watch never reads: a wildcard passes the refusal in `kinds_argument`
+    and in the CRD, so its expansion is where `leases.coordination.k8s.io`
+    under `*.k8s.io` is refused."""
     if served is None:
         return []
-    return sorted(r for r in served if any(matches_wildcard(r, w) for w in wildcards))
+    return sorted(r for r in served if any(matches_wildcard(r, w) for w in wildcards) and not refused_kind(r))
+
+
+def resource_group(resource: str) -> str:
+    return resource.split(".", 1)[1] if "." in resource else ""
 
 
 def discovery_due(record: dict | None, now: str, refreshed: int) -> bool:
@@ -945,12 +958,15 @@ def resource_for(kind: str, api_version: str, batch: list[str]) -> str:
 def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
     """Which of `candidates` have objects on the cluster, and in which
     namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
-    that printed an object is known wherever it printed one; a kind that
-    printed none is known empty only when its batch exited 0 and was not cut,
-    and unknown otherwise, since kubectl lists the rest of a batch past a kind
-    it cannot read and the output does not say which one failed. A batch that
-    timed out or could not run leaves every kind in it unknown; the sandbox
-    being gone raises, as every other hop does."""
+    that printed an object is read wherever it printed one. Every kind in a
+    batch that exited 0 and was not cut is known: empty where it printed
+    nothing. Every kind in any other batch is unknown as well, the ones that
+    printed included: kubectl lists the rest of a batch past a kind it cannot
+    read without saying which failed, and a cut listing stops mid-kind, so
+    what did not print may still exist. An unknown kind's rows are held rather
+    than cleared (`wildcard_kinds_for`). A batch that timed out or could not
+    run leaves every kind in it unknown; the sandbox being gone raises, as
+    every other hop does."""
     batches = [candidates[i : i + DISCOVERY_BATCH_KINDS] for i in range(0, len(candidates), DISCOVERY_BATCH_KINDS)]
 
     def run(batch: list[str]):
@@ -982,10 +998,8 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
         for resource, namespaces in seen.items():
             kinds[resource] = sorted(namespaces)
         for resource in batch:
-            if resource in seen:
-                continue
             if complete:
-                kinds[resource] = []
+                kinds.setdefault(resource, [])
             else:
                 unknown.append(resource)
     return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
@@ -993,16 +1007,22 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
 
 def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: list[str], label: str) -> tuple[dict[str, list[str]], set[str], dict[str, set[str]]]:
     """From a cluster's discovery record: the wildcard kinds to read in each
-    namespace (at most WILDCARD_KINDS_CAP, by name), the kinds held as unread
-    in every namespace (unknown to the record, or served since it was made),
-    and the kinds held in one namespace because the cap cut them there."""
+    namespace (at most WILDCARD_KINDS_CAP, by name); the kinds whose rows are
+    held as unread wherever they are not read this tick (unknown to the
+    record, served since it was made, or in a group the api-resources listing
+    no longer shows, which is a listing gap until a discovery says otherwise);
+    and the kinds held in one namespace because the cap cut them there. A
+    kind the record names is read where the record saw it even when it is
+    held: held stops a row clearing, not a read."""
     known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
     if not isinstance(known, dict):
         return {}, set(candidates), {}
-    held = set(candidates) - set(known) | set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or [])
+    served_groups = {resource_group(c) for c in candidates}
+    stale = {r for r in known if resource_group(r) not in served_groups}
+    held = (set(candidates) - set(known)) | set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) | stale
     by_namespace: dict[str, list[str]] = {}
     for resource, namespaces in sorted(known.items()):
-        if resource in held or not any(matches_wildcard(resource, w) for w in wildcards):
+        if resource in stale or not any(matches_wildcard(resource, w) for w in wildcards):
             continue
         for namespace in namespaces or []:
             by_namespace.setdefault(str(namespace), []).append(resource)
@@ -1534,13 +1554,13 @@ def sweep_fleet(
             # the kinds it could not read; it never makes the cluster unreadable.
             extra_kinds, held, cut = {}, set(), {}
             candidates = wildcard_candidates(served, wildcards)
-            if candidates:
-                record = discoveries.get(cid)
-                if discovery_due(record, now, refreshed):
-                    if record is not None:
-                        refreshed += 1
-                    record = discover_kinds(kubeconfig, candidates, now)
-                    discoveries[cid] = record
+            record = discoveries.get(cid)
+            if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed):
+                if record is not None:
+                    refreshed += 1
+                record = discover_kinds(kubeconfig, candidates, now)
+                discoveries[cid] = record
+            if wildcards and (candidates or record is not None):
                 extra_kinds, held, cut = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))
         except sandbox_exec.SandboxUnavailable:
             raise
@@ -1595,7 +1615,7 @@ def sweep_fleet(
             # A kind the cluster does not serve holds its rows without making
             # the namespace unreadable: most clusters lack some optional CRD.
             # So does a wildcard kind discovery could not read or the cap cut.
-            not_asked = unread | dropped | held | cut.get(namespace, set())
+            not_asked = unread | dropped | (held - set(extra_kinds.get(namespace, []))) | cut.get(namespace, set())
             if not_asked:
                 sweep.partial_scopes[scope_key(cid, namespace)] = not_asked
             if unread:

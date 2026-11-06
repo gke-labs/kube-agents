@@ -30,9 +30,10 @@ import (
 // because a managed resource that cannot apply is otherwise silent: the
 // controller does not crash, logs only on the object, and the resource's
 // Ready=False stands until an audit reads it. Updating, UpToDate, Deleting and
-// Deleted are the controller's normal states and stay off the list. The
-// controller re-records each of these on every reconcile while the failure
-// lasts, so they are in the settle family (settleApplies).
+// Deleted are the controller's normal states and stay off the list. Two of
+// them, configConnectorSettleReasons, are transient by the guide's own
+// account and sit in the settle family; the rest are verdicts and fire on
+// their first sighting (settleApplies).
 var configConnectorReasons = []string{
 	"UpdateFailed",
 	"DeleteFailed",
@@ -45,8 +46,21 @@ var configConnectorReasons = []string{
 	"PostActuationTransformFailed",
 }
 
-// configConnectorReasonSet is configConnectorReasons for lookup.
-var configConnectorReasonSet = stringSet(configConnectorReasons)
+// configConnectorSettleReasons are the two Config Connector reasons that are
+// the normal state of an ordered apply for a while: DependencyNotReady while
+// a referenced resource is still being created, and Unmanaged, which the guide
+// says can appear transiently when a resource and its namespace's
+// ConfigConnectorContext are created together. Held for the settle period, so
+// one that clears on the next reconcile is not forwarded. The other seven are
+// verdicts (an API refused the change, a reference is missing or malformed,
+// another resource owns the Google Cloud resource) and fire at once: a settle
+// period measured on one Event object's stamps would otherwise hold a failure
+// whose message changes between reconciles forever, since each sighting is
+// then a new object with no span.
+var configConnectorSettleReasons = stringSet([]string{
+	"DependencyNotReady",
+	"Unmanaged",
+})
 
 // defaultReasons lists the standard Event.Reason values that trigger investigations.
 // These cover typical Kubernetes workload and node failures and Config
@@ -865,11 +879,12 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 // image-pull family, whose transient half has its own gate and whose
 // terminal half (a bad tag) should fire at once; FailedScheduling, which the
 // autoscaler gate reads with a better signal than time; and FailedToDrainNode.
-// Config Connector's reconcile failures (configConnectorReasons) are in it: the
-// controller re-records them on every reconcile while the failure lasts, and a
-// DependencyNotReady during an ordinary apply of several resources clears
-// inside the period. The family is read on the canonical reason so kubelet's
-// Reason=BackOff crash loop is in it and its image-pull BackOff is not.
+// Of Config Connector's reconcile failures only configConnectorSettleReasons
+// are in it: a DependencyNotReady during an ordinary apply of several
+// resources clears inside the period, while UpdateFailed and the other
+// verdicts fire at once. The family is read on the canonical reason so
+// kubelet's Reason=BackOff crash loop is in it and its image-pull BackOff is
+// not.
 //
 // A plain Failed joins it only when the message is one of kubelet's config
 // errors (retriedConfigError). A start error stays out because a container
@@ -884,7 +899,7 @@ func settleApplies(canonicalReason, message string) bool {
 	case reasonFailed:
 		return retriedConfigError(message)
 	}
-	_, configConnector := configConnectorReasonSet[canonicalReason]
+	_, configConnector := configConnectorSettleReasons[canonicalReason]
 	return configConnector
 }
 

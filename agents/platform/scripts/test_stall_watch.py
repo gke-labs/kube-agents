@@ -82,6 +82,8 @@ REFUSED = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: connect: connection refu
 #: a cluster whose control plane does not answer: no reason that names the
 #: kubeconfig.
 DARK = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: i/o timeout"\nUnable to connect to the server: dial tcp 34.118.224.1:443: i/o timeout'
+#: A discovery whose listing the proxy cut: exit 0 and the marker on stderr.
+PROXY_CUT = "cut"
 #: What the shim prints when the proxy refused the command at its admission bound.
 PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
@@ -222,6 +224,8 @@ class FakeFleet:
                 raise self.discovery
             batch = argv[len(stall_watch.DISCOVERY_ARGV)].split(",")
             lines = [f"{ns}   {kind}   {api}\n" for ns, kind, api in self.objects if stall_watch.resource_for(kind, api, batch) in batch]
+            if self.discovery == PROXY_CUT:
+                return completed(argv, "".join(lines), stderr=stall_watch.PROXY_TRUNCATED_TEXT)
             stderr = "Error from server (Forbidden): one kind is forbidden" if self.discovery else ""
             return completed(argv, "".join(lines), returncode=self.discovery, stderr=stderr)
         if argv[:2] == ["kubectl", "api-resources"]:
@@ -1980,12 +1984,46 @@ class ConfigConnector(Base):
         self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
         self.assertEqual(len(self.cleared(lines)), 1)
 
-    def test_a_batch_that_exits_non_zero_keeps_what_it_listed_and_holds_the_rest(self):
+    def test_a_batch_that_exits_non_zero_reads_what_it_listed_and_holds_every_kind_in_it(self):
         _, fake = self.run_tick({"c": {"payments": [], "config-control": []}}, served=KCC_SERVED, objects=KCC_OBJECTS, discovery=1)
-        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL], "a kind that printed an object is known where it printed one")
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL], "a kind that printed an object is read where it printed one")
         record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")]
-        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [KCC_BUCKETS], "a kind that printed nothing from a failed batch may have been the failure")
+        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [KCC_TOPICS, KCC_SQL, KCC_BUCKETS], "the listing does not say which kind failed, so every kind in the batch is unknown")
         self.assertEqual(self.ledger()["unreadable"], {}, "a held kind does not make the namespace unreadable")
+
+    def test_a_cut_batch_holds_a_kinds_rows_in_the_namespaces_past_the_cut(self):
+        billing = finding("billing", "SQLInstance/ledger-db", "stale-condition", "Ready=False UpdateFailed")
+        two = KCC_OBJECTS + [("billing", "SQLInstance", "sql.cnrm.cloud.google.com/v1beta1")]
+        self.run_tick({"c": {"payments": [KCC_ROW], "billing": [billing]}}, served=KCC_SERVED, objects=two, now="2026-11-06T00:00:00+00:00")
+        self.assertEqual(len(self.last_alerts), 2)
+        # Seven hours on, the listing is cut after the payments line.
+        lines, fake = self.run_tick({"c": {"payments": [KCC_ROW], "billing": []}}, served=KCC_SERVED, objects=KCC_OBJECTS[:1], discovery=PROXY_CUT, now="2026-11-06T07:00:00+00:00")
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL], "read where the cut listing still saw it")
+        self.assertNotIn(KCC_SQL, fake.kinds_asked("billing"))
+        self.assertEqual(lines, [], "the billing row is unread past the cut, not cleared")
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["SQLInstance/ledger-db", "SQLInstance/orders-db"])
+
+    def test_a_listing_without_the_group_holds_the_rows_the_record_knows(self):
+        self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(len(self.last_alerts), 1)
+        for served in (SERVED_DEFAULT, []):
+            with self.subTest(served=served):
+                lines, fake = self.run_tick({"c": {"payments": []}}, served=served, objects=KCC_OBJECTS)
+                self.assertEqual(fake.discoveries(), [])
+                self.assertNotIn(KCC_SQL, fake.kinds_asked("payments"))
+                self.assertEqual(lines, [], "a listing that lost the group is a gap, as it is for a plain kind")
+                self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
+        self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
+
+    def test_a_wildcard_never_expands_to_a_refused_kind(self):
+        served = SERVED_DEFAULT + ["leases.coordination.k8s.io", "endpointslices.discovery.k8s.io", "ingresses.networking.k8s.io"]
+        objects = [("payments", "Lease", "coordination.k8s.io/v1"), ("payments", "EndpointSlice", "discovery.k8s.io/v1"), ("payments", "Ingress", "networking.k8s.io/v1")]
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments,*.k8s.io"}):
+            _, fake = self.run_tick({"c": {"payments": []}}, served=served, objects=objects)
+        listed = sum(fake.discoveries(), [])
+        self.assertIn("ingresses.networking.k8s.io", listed)
+        self.assertEqual([k for k in listed if k.split(".", 1)[0] in stall_watch.REFUSED_KINDS], [])
+        self.assertEqual(fake.kinds_asked("payments"), ["deployments", "ingresses.networking.k8s.io"])
 
     def test_a_kind_served_since_the_record_is_held_until_the_refresh(self):
         self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T00:00:00+00:00")
