@@ -6374,7 +6374,7 @@ func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Conte
 		if c.Name != credentialProxyContainerName {
 			continue
 		}
-		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true).Requests
+		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true, renderedSizingTier(rendered)).Requests
 		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 			have, ok := c.Resources.Requests[name]
 			wantQ := want[name]
