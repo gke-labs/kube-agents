@@ -336,17 +336,18 @@ func Start(opts Options) *Server {
 // reused connection signals the channel once more, the parked reader takes
 // it, and the reader of the new response parks in its place until the
 // connection closes, by the idle timeout at the latest; a reflector's
-// re-stream after an expiry delivers nothing for that long. The code is
-// older than Go 1.27.1, where it was traced; this Transport can go once
-// net/http hands the signal to the reader of the response it belongs to.
-// A connection per request leaves nothing to reuse, at one dial per request,
-// which the paged soaks absorb. It fixes the fake's clients only. The
-// watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
-// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its watches
-// now open on a non-pooled twin (cmd/k8s-event-watcher/watchtransport.go). A
-// test that sets a CA, a client certificate, a certificate callback or
-// Insecure on this config fails at client construction, since client-go
-// refuses those next to a Transport.
+// re-stream after an expiry delivers nothing for that long. This is
+// golang/go#81404, in Go 1.27.0 and 1.27.1 and fixed in Go 1.27.2. go.mod's
+// toolchain line selects a Go with the fix, but GOTOOLCHAIN=local ignores
+// that line, so the Transport stays for a test binary built that way by
+// Go 1.27.0 or 1.27.1. A connection per request leaves nothing to reuse, at
+// one dial per request, which the paged soaks absorb. It fixes the fake's
+// clients only. The watcher's broker route reaches profile clusters over
+// pooled plain HTTP/1.1 (clusterprofiles.Broker.ClientConfig) and had the
+// same exposure; its watches now open on a non-pooled twin
+// (cmd/k8s-event-watcher/watchtransport.go). A test that sets a CA, a client
+// certificate, a certificate callback or Insecure on this config fails at
+// client construction, since client-go refuses those next to a Transport.
 func (s *Server) Config() *rest.Config {
 	return &rest.Config{Host: s.URL, Transport: &http.Transport{DisableKeepAlives: true}}
 }
