@@ -1380,6 +1380,14 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 #     parent's process with the parent's HERMES_KANBAN_TASK still set and own no
 #     card, which is why upstream's `_reject_delegated_child_mutation` refuses
 #     every board mutation from one.
+#   * The same finalize_turn insert opens with the budget hand-off
+#     (gke-labs/kube-agents#4902). Upstream's budget fallback asks the model
+#     for a closing summary and charges the card `timed_out`, then drops the
+#     summary: the run closed with none, no comment, and the retry started
+#     cold. The insert saves it as the run's `summary` (what `hermes kanban
+#     show` prints as "Latest summary" and the retry worker's prompt lists
+#     under "Prior attempts") and as a card comment, only onto the worker's
+#     own run when that charge closed it.
 #
 # The anchors prove only that the text landed. verify_kanban_guardrail_exit.py
 # additionally parses the patched loop to prove the nudge is reachable, ahead of
@@ -1593,6 +1601,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q "kube_permission_refusal_halt_after" /opt/hermes/agent/tool_guardrails.py && \
     grep -q 'decision.code == "permission_refusal_halt"' /opt/hermes/run_agent.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
+    grep -q "_kanban_persist_budget_handoff(" /opt/hermes/agent/turn_finalizer.py && \
     grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/turn_api_error.py && \
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
     grep -q "_kube_block_rate_limited_chat(turn.result)" /opt/hermes/hermes_cli/cli_chat_turn_mixin.py && \
