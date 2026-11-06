@@ -1487,16 +1487,16 @@ or more calls; `reason` says which.
 project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
 the one read outside the project, the warm-cache repository's policy in the Prow
-project, is the verifier's `warm_cache` check, which the scan does not run). The bot's own
-project, `kube-agents-prow`, also needs the API Keys API (`apikeys.googleapis.com`) enabled:
-gcloud bills the `gemini_api_key` check's key listing to the caller's project, and with the API
-off there the refusal names the bot's project, so the check reads every pool project as
-unverified rather than as missing its key (seen on the first scan of 2026-11-06). `bench/tf/fleet`
+project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
 grants them (`pool_state_readers`), so a project gets them from its fleet apply and
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default, or before a role joined the list, are one
+project. The bot's own project, `kube-agents-prow`, also needs the API Keys API
+(`apikeys.googleapis.com`) enabled: gcloud bills the `gemini_api_key` check's key listing to the
+caller's project, and with the API off there the refusal names the bot's project, so the check
+reads every pool project as unverified rather than as missing its key (seen on the first scan of
+2026-11-06). Projects applied before that default, or before a role joined the list, are one
 loop, run once by a project owner:
 
 ```bash
