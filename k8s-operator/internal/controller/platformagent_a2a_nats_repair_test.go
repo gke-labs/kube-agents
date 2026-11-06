@@ -46,12 +46,13 @@ var stuckPodNow = time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 const (
 	stuckPodCurrentRevision = "test-agent-a2a-nats-new"
 	stuckPodOldRevision     = "test-agent-a2a-nats-old"
+	stuckPodStatefulSetUID  = types.UID("sts-uid-1")
 )
 
 func stuckPodStatefulSet(generation, observed int64) *appsv1.StatefulSet {
 	agent := a2aTestAgent()
 	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Generation: generation},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Generation: generation, UID: stuckPodStatefulSetUID},
 		Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(1))},
 		Status:     appsv1.StatefulSetStatus{ObservedGeneration: observed, UpdateRevision: stuckPodCurrentRevision},
 	}
@@ -71,6 +72,10 @@ func stuckPod(revision string, ready bool, notReadyFor time.Duration) *corev1.Po
 			UID:               types.UID("pod-uid-1"),
 			Labels:            map[string]string{appsv1.ControllerRevisionHashLabelKey: revision},
 			CreationTimestamp: metav1.NewTime(stuckPodNow.Add(-time.Hour)),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "StatefulSet", Name: a2aNATSName(agent),
+				UID: stuckPodStatefulSetUID, Controller: ptr.To(true),
+			}},
 		},
 		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
 			Type:               corev1.PodReady,
@@ -185,6 +190,10 @@ func TestTheBusPodIsLeftAloneOtherwise(t *testing.T) {
 	noCondition.CreationTimestamp = metav1.NewTime(stuckPodNow.Add(-30 * time.Second))
 	allUpdated := stuckPodStatefulSet(3, 3)
 	allUpdated.Status.UpdatedReplicas = 1
+	squatter := stuckPod("", false, long)
+	squatter.OwnerReferences = nil
+	otherOwner := stuckPod(stuckPodOldRevision, false, long)
+	otherOwner.OwnerReferences[0].UID = "someone-else"
 	for _, tc := range []struct {
 		name string
 		sts  *appsv1.StatefulSet
@@ -196,6 +205,8 @@ func TestTheBusPodIsLeftAloneOtherwise(t *testing.T) {
 		{"already terminating", stuckPodStatefulSet(3, 3), terminating},
 		{"no Ready condition, created inside the grace", stuckPodStatefulSet(3, 3), noCondition},
 		{"every replica already updated", allUpdated, stuckPod(stuckPodOldRevision, false, long)},
+		{"a pod of that name with no controller", stuckPodStatefulSet(3, 3), squatter},
+		{"a pod of that name another object controls", stuckPodStatefulSet(3, 3), otherOwner},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rig := newStuckPodRig(t, tc.sts, tc.pod)
@@ -250,11 +261,13 @@ func TestADeleteThatLosesTheRaceIsNotAnError(t *testing.T) {
 }
 
 // Through Reconcile: the bus apply calls the repair with the StatefulSet the
-// apply returned, and a pod inside the grace sets the steady-state requeue.
-// The fake client does not run the StatefulSet controller, so the apply's
-// return is given the status a server would report: generation observed, one
-// replica, none of it on the update revision.
-func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
+// apply returned, and a pod inside the grace sets the requeue. The fake client
+// does not run the StatefulSet controller, so the apply's return is given the
+// status a server would report: generation observed, one replica, none of it
+// on the update revision. checker, when given, makes the pass RBAC-degraded,
+// whose requeue is rbacReprobeInterval unless something is due sooner.
+func busApplyReplacesAStuckPod(t *testing.T, checker *RBACChecker) {
+	t.Helper()
 	agent := a2aTestAgent()
 	stsName := a2aNATSName(agent)
 	base := assigningUIDsOnCreate(fakeServerSideApplyInterceptors())
@@ -276,6 +289,9 @@ func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
 		WithInterceptorFuncs(withStatus).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	if checker != nil {
+		r.RBAC = checker
+	}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
@@ -285,10 +301,15 @@ func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
 	completeTheProvisionJob(t, ctx, cl, agent)
 	busGatePass(t, ctx, r, req, "settled")
 
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatalf("get the bus StatefulSet: %v", err)
+	}
 	// A pod not Ready for 30 s on an old revision: kept, and the pass asks
 	// to come back when its grace runs out.
 	pod := stuckPod(stuckPodOldRevision, false, 0)
 	pod.Name, pod.Namespace = stsName+"-0", agent.Namespace
+	pod.OwnerReferences[0].UID = sts.UID
 	pod.Status.Conditions[0].LastTransitionTime = metav1.NewTime(time.Now().Add(-30 * time.Second))
 	if err := cl.Create(ctx, pod); err != nil {
 		t.Fatalf("create the stuck pod: %v", err)
@@ -314,4 +335,18 @@ func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); !errors.IsNotFound(err) {
 		t.Errorf("the stuck pod was not replaced by the bus apply (get: %v)", err)
 	}
+}
+
+func TestTheBusApplyReplacesAStuckPodAndRequeuesForTheGrace(t *testing.T) {
+	busApplyReplacesAStuckPod(t, nil)
+}
+
+// An out-of-date ClusterRole requeues at rbacReprobeInterval; a bus pod due
+// sooner brings the pass forward.
+func TestARBACDegradedPassStillRequeuesForTheStuckPod(t *testing.T) {
+	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews())
+	if _, err := checker.Probe(context.Background()); err != nil {
+		t.Fatalf("boot probe: %v", err)
+	}
+	busApplyReplacesAStuckPod(t, checker)
 }

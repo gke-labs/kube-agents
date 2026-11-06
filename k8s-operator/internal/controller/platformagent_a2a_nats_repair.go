@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,7 +68,8 @@ const (
 // else from its creation. The delete names the pod's UID, so it cannot remove
 // a pod the StatefulSet created since the read. A healthy bus, every replica
 // updated, costs no read; otherwise the pod is read live (podReader), as pods
-// are outside the manager's cache.
+// are outside the manager's cache. Only a pod the StatefulSet controls is
+// ever deleted.
 func (r *PlatformAgentReconciler) replaceStuckA2ANATSPod(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, now time.Time) (time.Duration, error) {
 	updateRevision := sts.Status.UpdateRevision
 	if sts.Status.ObservedGeneration < sts.Generation || updateRevision == "" {
@@ -79,6 +81,11 @@ func (r *PlatformAgentReconciler) replaceStuckA2ANATSPod(ctx context.Context, ag
 	pod := &corev1.Pod{}
 	if err := r.podReader().Get(ctx, types.NamespacedName{Name: sts.Name + a2aNATSPodOrdinalSuffix, Namespace: sts.Namespace}, pod); err != nil {
 		return 0, client.IgnoreNotFound(err)
+	}
+	// A pod of that name the StatefulSet did not create is not the bus's to
+	// replace, whatever its labels say.
+	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
+		return 0, nil
 	}
 	if pod.DeletionTimestamp != nil || pod.Labels[appsv1.ControllerRevisionHashLabelKey] == updateRevision {
 		return 0, nil
