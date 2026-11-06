@@ -128,9 +128,9 @@ def one_per_date(nights: list[dict]) -> list[dict]:
     its own, and counted as two it would make a case's typical span one date
     fewer, a sustained streak reach two from one date, and the night typical
     count the date twice. Unlike ``graded_nights``, which keeps the newest
-    run that graded each case, this keeps the newest whole night: a re-run
-    cut short, or one that timed fewer cases, stands for its date. A night
-    with no start time is kept."""
+    run that graded each case, this keeps the newest night as it stands: a
+    re-run cut short, or one that timed fewer cases, stands for its date. A
+    night with no start time is kept."""
     seen: set = set()
     out = []
     for night in nights:
