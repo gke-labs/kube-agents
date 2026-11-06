@@ -1,0 +1,13 @@
+# Legacy ledger settings. Nothing in the payments chart reads this ConfigMap:
+# the Deployment's PAYMENTS_LEGACY_LEDGER_URL comes from the Secret the chart
+# renders out of the encrypted values. It is the file a text search for the
+# variable's name finds first, and an edit to it changes nothing on the
+# cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-legacy-env
+  namespace: demo-shop
+data:
+  PAYMENTS_LEGACY_LEDGER_URL: http://ledger-legacy.demo-shop.svc.cluster.local:8080
+  PAYMENTS_LEGACY_LEDGER_TIMEOUT_SECONDS: "5"

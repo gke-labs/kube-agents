@@ -26,6 +26,8 @@ that holds all three.
    repository, with `CLUSTER` renamed to the agent host's cluster name and the three
    `CONTEXT_REPOSITORY_*` words in `source.yaml` replaced by the context repository's owner, name
    and ref. `values.enc.yaml` is SOPS-shaped filler: no key decrypts it, which is the point.
+   `legacy-env.yaml` is the decoy: a ConfigMap that carries the variable's name and that nothing
+   consumes, so a text search in the writable repository finds a file whose edit changes nothing.
 
 3. **The live workload** (`live/payments-api.yaml`). `kubectl apply -f` it to the agent host
    once, so the Deployment the request names exists with the variable. Delete the `demo-shop`

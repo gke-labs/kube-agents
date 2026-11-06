@@ -24,6 +24,17 @@ type: Opaque
 stringData:
   legacy_ledger_url: http://ledger-legacy.demo-shop.svc.cluster.local:8080
 ---
+# The decoy from the GitOps repository, as its reconciler would apply it.
+# Nothing mounts or references it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-legacy-env
+  namespace: demo-shop
+data:
+  PAYMENTS_LEGACY_LEDGER_URL: http://ledger-legacy.demo-shop.svc.cluster.local:8080
+  PAYMENTS_LEGACY_LEDGER_TIMEOUT_SECONDS: "5"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
