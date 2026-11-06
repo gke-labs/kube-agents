@@ -570,6 +570,10 @@ func writeTask(sb *strings.Builder, ref TaskRef, t *lib.Task) {
 func writeOutcome(sb *strings.Builder, out TurnOutcome) {
 	if len(out.Followed) == 0 || out.AnswerFrom == nil || *out.AnswerFrom == out.Root {
 		writeTask(sb, out.Root, out.Task)
+		if out.Unfollowed {
+			sb.WriteString("\nThis is a re-read of a finished turn: its delegated tasks were not followed live, so their answers " +
+				"are not shown here; read them with task_control get on each child task.\n")
+		}
 		writeFollowed(sb, out.Followed)
 		return
 	}

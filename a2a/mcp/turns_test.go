@@ -1163,6 +1163,44 @@ func TestWaitingOnAnUnknownTaskWithStreamStepsEndsAtOnce(t *testing.T) {
 	}
 }
 
+// A streamed get of a finished delegated root with no turn watch is a re-read:
+// it settles at once without discovering children, and says so, so the root's
+// delegate artifact is not taken for the turn's whole answer.
+func TestAStreamedReReadOfADelegatedTurnSaysItsChildrenWereNotFollowed(t *testing.T) {
+	url, js := testBus(t)
+	conv := "console:tok-reread"
+	publishSubmission(t, js, fakeAddressee, "task-reread-deleg", conv, "delegate", "")
+	publishRun(t, js, fakeAddressee, "task-reread-deleg", "", false)
+	publishArtifact(t, js, fakeAddressee, "task-reread-deleg", lib.ArtifactDelegate, "cluster-a: check")
+	publishStatus(t, js, fakeAddressee, "task-reread-deleg", lib.StateCompleted, true)
+	publishSubmission(t, js, "cluster-a", "task-reread-child", conv, "check", "task-reread-deleg")
+	publishRun(t, js, "cluster-a", "task-reread-child", "child finished answer", true)
+	publishSubmission(t, js, fakeAddressee, "task-reread-plain", conv, "plain", "")
+	publishRun(t, js, fakeAddressee, "task-reread-plain", answerText, true)
+
+	b := dial(t, url)
+	s := mustServer(t, TaskControlTool(b, NewConversations()))
+	const note = "This is a re-read of a finished turn: its delegated tasks were not followed live"
+	for task, delegating := range map[string]bool{"platform/task-reread-deleg": true, "platform/task-reread-plain": false} {
+		res := callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task_id": task, "wait_seconds": 5, "stream_steps": true})
+		if res.IsError {
+			t.Fatalf("task_control get %s: %s", task, res.Content[0].Text)
+		}
+		var env CustomToolResultEnvelope
+		if err := json.Unmarshal([]byte(res.Content[0].Text), &env); err != nil {
+			t.Fatalf("unmarshal envelope for %s: %v", task, err)
+		}
+		if strings.HasPrefix(env.Result, StreamingStepContinuePrefix) {
+			t.Fatalf("re-read of finished %s did not settle:\n%s", task, env.Result)
+		}
+		if delegating {
+			mustContain(t, env.Result, note, "task_control get on each child task")
+		} else {
+			mustNotContain(t, env.Result, note)
+		}
+	}
+}
+
 // When a streamed turn finishes on the bus before the caller polls its
 // terminal step with task_control get, the next send_message on the same
 // conversation clears the active step state cleanly without busy-polling or

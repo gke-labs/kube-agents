@@ -1746,6 +1746,10 @@ type TurnOutcome struct {
 	// Cards is what the gateway's result for the root said about cards,
 	// as last read while gathering.
 	Cards cardsSignal
+	// Unfollowed: the root delegated, but this read of the finished turn
+	// had no watch to find its delegated tasks, so none was followed and
+	// the root's own artifact is not the turn's whole answer.
+	Unfollowed bool
 }
 
 // cardsSignal is what the gateway's result frame for a turn's root said
@@ -2066,6 +2070,7 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	followedRefs := st.syncFollowedTasksLocked()
 	if len(followedRefs) == 0 {
 		if st.watch == nil {
+			out.Unfollowed = true
 			return out, true, waitedAny, nil
 		}
 		if st.followEmptySince.IsZero() {
