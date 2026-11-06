@@ -37,12 +37,17 @@ It also removes rotated Hermes log backups (``<name>.log.<n>``) older than the
 period. The live log files keep Hermes' own size cap. ``audit.jsonl`` and its
 rotations are never touched: the audit ledger has its own retention.
 
+``--pins-only`` does the pinning alone. The entrypoint runs it before the gateway
+starts, because Hermes prunes at gateway start and, on the first start after an
+upgrade, that prune would otherwise run before this job had pinned anything.
+
 Prints nothing on a clean run. A store it could not maintain prints one line, so
 the failure reaches chat.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -236,8 +241,33 @@ def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
     return lines
 
 
-def main() -> int:
-    lines = tick(Path(gitops_workspace.agent_home()))
+def pin_parents(agent_home: Path) -> list[str]:
+    """``keep_parents`` for every home, nothing else; one line per home it could not do."""
+    lines = []
+    for home in homes(agent_home):
+        try:
+            keep_parents(home)
+        except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
+            lines.append(f"pinning session parents in {label(home, agent_home)} failed: {type(exc).__name__}")
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--pins-only",
+        action="store_true",
+        help="only pin session parents, for the entrypoint to run before the gateway's first prune",
+    )
+    parser.add_argument("--agent-home", type=Path, help="defaults to the agent home this pod runs with")
+    args = parser.parse_args(argv)
+    agent_home = args.agent_home or Path(gitops_workspace.agent_home())
+    if args.pins_only:
+        failures = pin_parents(agent_home)
+        for line in failures:
+            print(line, file=sys.stderr)
+        return 1 if failures else 0
+    lines = tick(agent_home)
     if lines:
         print("\n".join(lines))
     return 0

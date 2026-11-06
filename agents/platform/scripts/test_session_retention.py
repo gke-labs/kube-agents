@@ -217,6 +217,30 @@ class ParentsOfLiveSessionsAreKept(RetentionTest):
         self.assertIn("profile `broken`", lines[0])
 
 
+class PinsOnlyForTheEntrypoint(RetentionTest):
+    def test_pins_only_pins_every_home_and_prunes_nothing(self):
+        machine = self.store()
+        profile = self.store("profiles", "cluster-a")
+        self.sessions(machine, ("root", None, 0), ("tip", "root", 0))
+        self.sessions(profile, ("p-root", None, 0), ("p-tip", "p-root", 0))
+        self.assertEqual(0, session_retention.main(["--pins-only", "--agent-home", str(self.home)]))
+        self.assertEqual({"root"}, self.pinned(machine))
+        self.assertEqual({"p-root"}, self.pinned(profile))
+        self.assertEqual([], FakeSessionDB.calls)
+
+    def test_pins_only_reports_a_store_it_cannot_pin_and_still_pins_the_rest(self):
+        broken = self.store("profiles", "broken")
+        (broken / session_retention.STATE_DB).write_text("not a database")
+        profile = self.store("profiles", "cluster-a")
+        self.sessions(profile, ("root", None, 0), ("tip", "root", 0))
+        with patch("sys.stderr") as stderr:
+            code = session_retention.main(["--pins-only", "--agent-home", str(self.home)])
+        self.assertEqual(1, code)
+        self.assertEqual({"root"}, self.pinned(profile))
+        written = "".join(c.args[0] for c in stderr.write.call_args_list)
+        self.assertIn("profile `broken`", written)
+
+
 class FailuresAreSaidAndContained(RetentionTest):
     def test_one_store_failing_does_not_stop_the_rest(self):
         self.store()
