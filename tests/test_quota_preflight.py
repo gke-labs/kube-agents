@@ -1161,13 +1161,15 @@ class PreflightDecisionTest(unittest.TestCase):
             if doc["kind"] == "Deployment" and replicas > 0:
                 if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
                     surges += 1
-        # The ConfigMap is rendered on every release (#4883), and with a PlatformAgent it
-        # carries the same count as the annotation.
-        self.assertIsNotNone(config_map, "no a2a-quota-chart-pods ConfigMap rendered")
-        if chart_pods is None:
-            self.assertIn("platformAgent.enabled=false", sets, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        # The count reaches the operator one way per release (#4883): the annotation on the
+        # PlatformAgent the chart renders, or, with platformAgent.enabled=false, the ConfigMap.
+        if "platformAgent.enabled=false" in sets:
+            self.assertIsNone(chart_pods, "a PlatformAgent rendered with platformAgent.enabled=false")
+            self.assertIsNotNone(config_map, "no a2a-quota-chart-pods ConfigMap without a PlatformAgent")
             chart_pods = config_map
-        self.assertEqual(config_map, chart_pods, "the ConfigMap and the annotation disagree")
+        else:
+            self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+            self.assertIsNone(config_map, "the ConfigMap rendered beside a PlatformAgent, whose annotation wins")
         return chart_pods, pods + surges, names
 
     def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
@@ -1200,6 +1202,17 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
+
+    def test_an_operator_only_release_refuses_a_count_past_the_cap(self) -> None:
+        """The ConfigMap carries the annotation's 64-pod cap check (#4883): an operator-only
+        next-mode release past it fails the render rather than stamp a count the operator
+        discards."""
+        sets = ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=61"]
+        res = self._render({"probe": {}}, sets)
+        self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", res.stderr)
+        ok = self._render({"probe": {}}, ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=60"])
+        self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the

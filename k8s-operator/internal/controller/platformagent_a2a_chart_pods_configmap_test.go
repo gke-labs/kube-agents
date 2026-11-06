@@ -133,3 +133,16 @@ func TestA2AChartConfigMapDiscardRewarnsOnAChangedValue(t *testing.T) {
 		t.Fatalf("a changed discarded value warned %d times, want once more", got)
 	}
 }
+
+// The Warning quotes at most 64 characters of a discarded value, so a large
+// value can't swell the event or the dedupe record.
+func TestA2AChartPodsWarningTruncatesTheValue(t *testing.T) {
+	long := strings.Repeat("9", 300)
+	_, why := a2aParseChartPods(long, true, "annotation "+a2aChartPodsAnnotation)
+	if why == "" {
+		t.Fatal("a 300-digit value was used")
+	}
+	if strings.Contains(why, long) || !strings.Contains(why, strings.Repeat("9", 64)) {
+		t.Errorf("the Warning quotes %d characters of the value, want 64: %q", strings.Count(why, "9"), why)
+	}
+}

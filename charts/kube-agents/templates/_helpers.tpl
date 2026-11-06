@@ -2108,7 +2108,8 @@ rolls surge-first and runs at least one replica (every one but Hindsight's Postg
 StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
 here too. A chart bump rolls several of them in one upgrade, since the chart's version label
 is in their pod templates, and each surge pod counts against the quota while it starts.
-platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
+platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods
+(and a2a-quota-chart-pods.yaml renders it in a ConfigMap when the chart renders no PlatformAgent),
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
 it to the Deployments and StatefulSets a render actually puts in the release namespace.

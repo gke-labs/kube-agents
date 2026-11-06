@@ -4048,7 +4048,7 @@ func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
 }
 
 // a2aChartPodsWarning is what a2aChartPodsWarned last reported for a CR: the
-// spec generation and the discarded annotation value.
+// spec generation and the Warning itself.
 type a2aChartPodsWarning struct {
 	generation int64
 	value      string // the Warning's message: its source and the value, truncated
