@@ -20941,6 +20941,32 @@ class SessionToolBudgetTest(unittest.TestCase):
         self.assertEqual(2, budget.streak_of("run-a"))
         self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
 
+    def test_a_busy_answer_gives_the_ceiling_its_unit_back_and_abandoned_keeps_it(self):
+        # The shim re-sends a busy request as the same invocation, up to its
+        # retry cap: five arrivals that all came back busy spend nothing.
+        budget = credential_proxy.SessionToolBudget(max_calls=3, max_identical_failures=0)
+        for _ in range(5):
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertEqual(0, budget._sessions["run-a"].total)
+        for _ in range(3):
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_SUCCESS)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-a", self.LIST, ceiling=True).code)
+        # Abandoned is charged: the shim never re-sends after a dropped connection.
+        budget = credential_proxy.SessionToolBudget(max_calls=2, max_identical_failures=0)
+        for _ in range(2):
+            self.assertIsNone(budget.admit("run-b", self.LIST, ceiling=True))
+            budget.record("run-b", self.LIST, credential_proxy.TOOL_STATUS_ABANDONED)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-b", self.LIST, ceiling=True).code)
+        # A refund for a session the LRU has dropped creates no entry and no
+        # negative count.
+        budget.record("run-gone", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertNotIn("run-gone", budget._sessions)
+        budget._sessions["run-b"].total = 0
+        budget.record("run-b", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertEqual(0, budget._sessions["run-b"].total)
+
     def test_zero_disables_each(self):
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=0)
         for _ in range(20):
@@ -21021,12 +21047,18 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         def __init__(self):
             self.calls = []
             self.exit_codes = {}
+            # An exception the next execute raises instead of running: the
+            # queue's 503 or the watermark gate's 429, as the real executor
+            # raises them from inside the call.
+            self.busy = None
 
         def git_lease_violation(self, argv, cwd):
             return None
 
         def execute(self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False, caller=None):
             self.calls.append(list(argv))
+            if self.busy is not None:
+                raise self.busy
             return credential_proxy.ExecutionResult(
                 exit_code=self.exit_codes.get(tuple(argv), 0), stdout="", stderr="",
                 duration_ms=0, truncated=False, timed_out=False,
@@ -21175,6 +21207,30 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self._post(self.LIST, session_id="chat-1", role=credential_proxy.CALLER_ROLE_SESSION)
         self.assertEqual((403, "BROKER_LOOP_BREAKER"), (status, body["code"]))
+
+    def test_a_busy_answer_is_not_charged_to_the_ceiling(self):
+        # A loaded broker answers 503 (the queue) or 429 (the watermark gate)
+        # and the shim re-sends the same body up to four more times; none of
+        # those arrivals is an invocation the ceiling counts.
+        self._budget(max_calls=2, max_identical_failures=0)
+        self.executor.busy = credential_proxy.CommandSlotUnavailable(
+            "no slot", bound=credential_proxy.ADMISSION_BOUND_SLOT, klass=credential_proxy.CLASS_BACKGROUND,
+        )
+        for _ in range(3):
+            status, body = self._post(self.LIST)
+            self.assertEqual((503, "busy"), (status, body["status"]), body)
+        self.executor.busy = credential_proxy.ResourcePressure("memory at 93%", 7, credential_proxy.CLASS_BACKGROUND)
+        for _ in range(3):
+            status, body = self._post(self.LIST)
+            self.assertEqual((429, "busy"), (status, body["status"]), body)
+        self.executor.busy = None
+        # Six busy arrivals later the run still has its two invocations.
+        self.assertEqual(200, self._post(self.LIST)[0])
+        self.assertEqual(200, self._post(self.DESCRIBE)[0])
+        status, body = self._post(self.LIST)
+        self.assertEqual((403, "BROKER_SESSION_BUDGET_EXCEEDED"), (status, body["code"]), body)
+        self.assertEqual(8, len(self.executor.calls), "six busy arrivals and two runs reached the executor")
+        self.assertEqual(1, self._blocked_count(self.LIST), "only the ceiling's refusal is `blocked`")
 
     def test_a_request_without_a_session_id_is_never_counted(self):
         self._budget(max_calls=1, max_identical_failures=1)

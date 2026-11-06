@@ -413,7 +413,8 @@ including:
   where the terminal runs in its own pod, the profile and session pods. The broker counts
   per key: a shell or profile session past `BROKER_SESSION_MAX_TOOL_CALLS`
   commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED` (the scope publisher is
-  a script whose Job sets no key, so its calls are uncounted), and any keyed session
+  a script whose Job sets no key, so its calls are uncounted; a busy reply the wrapper
+  re-sends is not charged, since the retries are one invocation), and any keyed session
   is refused the same command, on the same cluster, after it failed or was blocked
   `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times running, with `403 BROKER_LOOP_BREAKER`;
   the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)

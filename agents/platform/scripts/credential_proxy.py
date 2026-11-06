@@ -4076,6 +4076,12 @@ class SessionToolBudget:
     ``error`` extend the streak of the signature they are for (a different
     signature starts a new streak of one), ``success`` clears it, and ``busy``
     and ``abandoned``, which say nothing about the command, leave it alone.
+    ``busy`` also gives the ceiling back the unit ``admit`` charged: the broker
+    never started a busy request and the shim re-sends the same body on its
+    retry schedule, so without the refund a loaded broker would spend several
+    units of the ceiling per command and refuse a run that invoked far fewer.
+    ``abandoned`` keeps its unit: the shim never re-sends after a dropped
+    connection, so whatever follows is a new invocation.
 
     Sessions are kept in an LRU of ``max_sessions`` keys under one lock: the
     key is the shim's short text and the signature a fixed-size digest, so an
@@ -4135,6 +4141,15 @@ class SessionToolBudget:
         return None
 
     def record(self, session_id: str, signature: str, status: str) -> None:
+        if status == TOOL_STATUS_BUSY:
+            # Never started, and re-sent by the shim as the same invocation:
+            # the unit goes back. A session the LRU has since dropped gets no
+            # entry back, and the count never goes below zero.
+            with self._lock:
+                counts = self._sessions.get(session_id)
+                if counts is not None and counts.total > 0:
+                    counts.total -= 1
+            return
         if status not in (TOOL_STATUS_BLOCKED, TOOL_STATUS_ERROR, TOOL_STATUS_SUCCESS):
             return
         with self._lock:
