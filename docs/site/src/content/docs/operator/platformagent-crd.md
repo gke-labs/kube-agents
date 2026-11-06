@@ -366,12 +366,13 @@ Leases, which the scan reports nothing from. Up to 20 items. A kind a cluster do
 left out on that cluster.
 
 The Config Connector wildcard is in the default list because a managed resource that Config
-Connector cannot apply is silent in every other path. The controller does not crash and logs only
-on the object. The `ConfigConnector` object's status reports the controller's health, not the
-health of the resources it manages. The signal is the object's own `Ready` condition.
-`stall_report.py` reads it as a stale condition once it has been false for longer than the stall
-threshold, so a `SQLInstance` stuck on `UpdateFailed` is a stall like a Deployment past its
-progress deadline.
+Connector cannot apply shows it in two places only. The controller does not crash and logs only on
+the object. It records at most a Warning event there, which the event watcher forwards
+([a day in the life](/kube-agents/overview/day-in-the-life/) lists the reasons), and it sets the
+object's own `Ready` condition. The `ConfigConnector` object's status reports the controller's
+health, not the health of the resources it manages. `stall_report.py` reads the `Ready` condition
+as a stale condition once it has been false for longer than the stall threshold, so a `SQLInstance`
+stuck on `UpdateFailed` is a stall like a Deployment past its progress deadline, event or no event.
 
 The add-on serves about three hundred kinds, so the watch does not read each one in each
 namespace. On each cluster that serves them, it discovers once which kinds have objects and in
