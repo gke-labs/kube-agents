@@ -205,8 +205,9 @@ class PlantTest(unittest.TestCase):
         kept.write_text(json.dumps({"document": {"findings": []}}), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
-        self.assertFalse((self.store() / "latest.json").exists())
         self.assertEqual(sorted(runs.glob("*.json")), [kept])
+        # `latest.json` is the newest run left, as `finish` keeps it: the store reads nothing else.
+        self.assertEqual((self.store() / "latest.json").read_bytes(), kept.read_bytes())
         self.assertFalse(self.plant.digest_record_path(self.audit_report).exists())
         self.assertFalse(self.plant.planted_manifest_path(self.audit_report).exists())
 
@@ -217,8 +218,9 @@ class PlantTest(unittest.TestCase):
             path.write_text(path.read_text(encoding="utf-8").replace(_MARK, "carried"), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
-        self.assertFalse((self.store() / "latest.json").exists())
-        self.assertEqual(list((self.store() / "runs").glob("*.json")), [])
+        # No run left: the directory goes too, as before the plant, so the store
+        # reads as never written rather than as a lost memory.
+        self.assertFalse(self.store().exists())
         self.assertFalse(self.plant.plant_state_path(self.audit_report).exists())
 
     def test_the_teardown_removes_the_run_the_fire_closed_from_the_planted_one(self):
@@ -233,10 +235,22 @@ class PlantTest(unittest.TestCase):
         fired = {**planted, "finished_at": "2999-01-01T00:00:00+00:00", "precheck": "unchanged"}
         (runs / "29990101T000000Z.json").write_text(json.dumps(fired).replace(_MARK, "carried"), encoding="utf-8")
         (self.store() / "latest.json").write_text(json.dumps(fired).replace(_MARK, "carried"), encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
+        self.assertEqual(sorted(runs.glob("*.json")), [older])
+        self.assertEqual((self.store() / "latest.json").read_bytes(), older.read_bytes())
+        self.assertIn("store local: restored", out.getvalue())
+
+    def test_the_teardown_leaves_a_store_it_did_not_touch_alone(self):
+        self.assertEqual(self.run_plant(_MANIFEST), 0, self.err)
+        other = self.store().parent.parent / "acme" / "other"
+        (other / "runs").mkdir(parents=True)
+        (other / "latest.json").write_text(json.dumps({"document": {"findings": []}}), encoding="utf-8")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
-        self.assertFalse((self.store() / "latest.json").exists())
-        self.assertEqual(sorted(runs.glob("*.json")), [older])
+        self.assertTrue((other / "latest.json").exists())
+        self.assertFalse(self.store().exists())
 
     def test_an_older_newest_envelope_fails_the_plant(self):
         with mock.patch.object(self.plant, "stored_envelope", return_value=({"scheduled": True, "finished_at": "2020-01-01T00:00:00+00:00"}, "r")):
