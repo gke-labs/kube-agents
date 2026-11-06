@@ -3794,7 +3794,9 @@ class BootstrapFanoutVerifier(BaseVerifier):
       sweep audited it itself" gap line), not a row from a card of its own and
       not the gap line for a fleet cluster no audit reported on, and the audit
       reached the report: the row lists at least one workload, or the findings
-      block carries at least one line for the cluster. The cap's risk is a
+      block carries at least one line for the cluster on a row scanned in full
+      (a cluster whose kubectl reads failed still carries describe-level
+      findings). The cap's risk is a
       cluster nobody audits, which reads as clean; this is the half that
       catches it, and the second leg catches an audit the worker relayed empty
       (a row saying 0 workloads under the sweep's card, #4115). It reads a
@@ -3985,12 +3987,14 @@ class BootstrapFanoutVerifier(BaseVerifier):
         sweep_id = str((payload.get("sweep") or {}).get("id") or "")
         audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
         unreported = {tuple(p) for p in read.get("unreported") or []}
-        finding_counts = {(c, p): n for c, p, n in read.get("finding_counts") or []}
+        finding_counts = {tuple(entry[:-1]): entry[-1] for entry in read.get("finding_counts") or []}
         problems = []
         for r in rest:
-            ident = (r.get("cluster"), r.get("project"))
-            label = f"{r['profile']} ({ident[0]} in {ident[1]})"
-            rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            # The triple is the identity: a cluster of one name in another
+            # location of the same project has its own rows and finding lines.
+            ident = onboarding.cluster_identity(r)
+            label = f"{r['profile']} ({ident[2]} in {ident[0]})"
+            rows = [row for row in read["rows"] if onboarding.cluster_identity(row) == ident]
             sweep_rows = [row for row in rows if row.get("card") == sweep_id]
             if ident in unreported:
                 problems.append(f"{label} is listed in the fleet but no audit reported on it")

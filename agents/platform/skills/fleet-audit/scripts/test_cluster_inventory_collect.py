@@ -265,8 +265,8 @@ class Gaps(unittest.TestCase):
         self.assertEqual(len(meta["namespace_governance"]), 2)
 
     def test_the_read_budget_bounds_the_run(self):
-        # A clock that is already past the budget: the credential and describe
-        # reads run with the one-second floor, the two dumps are gaps, nothing hangs.
+        # A clock that is already past the budget: no read runs, every read is
+        # the budget's gap, nothing hangs.
         fake = FakeRun()
         ticks = iter([0.0] + [1000.0] * 50)
         budget = cic._Budget(seconds=cic.READ_BUDGET_SECONDS, clock=lambda: next(ticks))
@@ -274,12 +274,12 @@ class Gaps(unittest.TestCase):
             meta = cic.collect_cluster_inventory(PROJECT, LOCATION, CLUSTER, run=fake, budget=budget)
         self.assertEqual(meta["workloads"], [])
         self.assertEqual([g for g in meta["gaps"] if "read budget" in g].__len__(), 2)
-        self.assertFalse(any(argv[0] == "kubectl" for argv, _ in fake.calls))
+        self.assertEqual(fake.calls, [])
         self.assertEqual(cic.READ_BUDGET_SECONDS < cic.TERMINAL_TIMEOUT_SECONDS, True)
 
     def test_each_read_gets_the_time_the_budget_has_left(self):
         # A clock at 0, then 450 s into a 480 s budget: the first reads get the
-        # 60 s cap, the later ones the 30 s left, and after the deadline 1 s.
+        # 60 s cap, the later ones the 30 s left, and after the deadline none runs.
         fake = FakeRun()
         ticks = iter([0.0, 0.0, 0.0, 450.0, 450.0, 450.0] + [1000.0] * 50)
         budget = cic._Budget(seconds=480, clock=lambda: next(ticks))
@@ -287,7 +287,20 @@ class Gaps(unittest.TestCase):
             cic.collect_cluster_inventory(PROJECT, LOCATION, CLUSTER, run=fake, budget=budget)
         self.assertEqual(fake.timeouts[:2], [60, 60])
         self.assertIn(30, fake.timeouts)
-        self.assertEqual(fake.timeouts[-1], 1)
+        self.assertNotIn(1, fake.timeouts)
+
+    def test_a_page_asked_for_after_the_budget_is_spent_is_the_budgets_gap(self):
+        # The budget runs out inside the workload dump: the next page is not
+        # asked for, and its gap names the budget, not a one-second timeout.
+        fake = FakeRun()
+        ticks = iter([0.0, 0.0, 0.0, 450.0, 450.0, 450.0] + [1000.0] * 50)
+        budget = cic._Budget(seconds=480, clock=lambda: next(ticks))
+        with TemporaryDirectory() as tmp, patch.object(collect, "KUBECONFIG_DIR", Path(tmp)), redirect_stderr(io.StringIO()):
+            meta = cic.collect_cluster_inventory(PROJECT, LOCATION, CLUSTER, run=fake, budget=budget)
+        budget_gaps = [g for g in meta["gaps"] if "read budget" in g]
+        self.assertTrue(budget_gaps, meta["gaps"])
+        self.assertTrue(any(f"rc={cic.TIMEOUT_RC}" in g and "did not run" in g for g in budget_gaps), budget_gaps)
+        self.assertEqual(len([argv for argv, _ in fake.calls if argv[0] == "kubectl"]), 1)
 
     def test_a_failed_page_gap_carries_no_continue_token(self):
         gap = cic._gap("Step 3", ["kubectl", "get", "--raw", "/apis/apps/v1/deployments?limit=500&continue=eyJ2IjoibWV0YSJ9"],
@@ -399,8 +412,9 @@ class SweepFile(unittest.TestCase):
     def test_an_identity_that_is_not_a_bare_name_is_refused_before_any_read(self):
         fake = FakeRun()
         with patch.object(cic, "default_run", fake), redirect_stderr(io.StringIO()):
-            for argv in (["--project", "p/q", "--location", LOCATION, "--cluster", CLUSTER],
-                         ["--project", PROJECT, "--location", LOCATION, "--cluster", "../x"]):
+            # --sweep-id is given, so the only refusal left is the bare-name guard's.
+            for argv in (["--project", "p/q", "--location", LOCATION, "--cluster", CLUSTER, "--sweep-id", "t_sweep1"],
+                         ["--project", PROJECT, "--location", LOCATION, "--cluster", "../x", "--sweep-id", "t_sweep1"]):
                 with self.subTest(argv=argv), self.assertRaises(SystemExit):
                     cic.main(argv)
         self.assertEqual(fake.calls, [])

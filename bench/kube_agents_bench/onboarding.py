@@ -177,16 +177,28 @@ COVERAGE_WORKLOADS_HEADER = "Workloads audited"
 COVERAGE_IN_FULL_HEADER = "Scanned in full"
 COVERAGE_COLUMNS = ("Cluster", "Project", "Location", "Card", COVERAGE_WORKLOADS_HEADER, COVERAGE_IN_FULL_HEADER)
 # The machine-readable block at the end of the raw file (bootstrap_handoff.compose):
-# one JSON object per finding line, each naming its cluster and project. The
-# capped check counts them per cluster, so a Coverage row with no workload and
-# no finding line reads as a cluster nothing was read from.
+# one JSON object per finding line, each naming its project, location and
+# cluster. The capped check counts them per cluster, so a Coverage row with no
+# workload and no finding line on a row scanned in full reads as a cluster
+# nothing was read from.
 FINDINGS_FENCE_OPEN = "```findings"
 FINDINGS_FENCE_CLOSE = "```"
 FINDINGS_BLOCK_ABSENT = "absent"
 FINDINGS_BLOCK_PRESENT = "present"
 FINDINGS_BLOCK_CUT = "cut"
-SWEEP_AUDITED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^()]+?)\): no Cluster Agent card, so the sweep audited it itself$"
-UNREPORTED_RE = r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), [^()]*\): listed in the fleet but no audit reported on it$"
+# The cluster identity the hand-off keys on (bootstrap_handoff.IDENTITY_FIELDS,
+# pinned equal by bench/tests): two clusters of one name in two locations of
+# one project are two clusters, in the Coverage rows, the Gaps lines and the
+# findings block alike.
+IDENTITY_FIELDS = ("project", "location", "cluster")
+SWEEP_AUDITED_RE = (
+    r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?)(?:, (?P<location>[^()]*))?\): "
+    r"no Cluster Agent card, so the sweep audited it itself$"
+)
+UNREPORTED_RE = (
+    r"^- (?P<cluster>[^()]+?) \((?P<project>[^(),]+?), (?P<location>[^()]*)\): "
+    r"listed in the fleet but no audit reported on it$"
+)
 
 # The worker's scores (inventory_findings.py: DEFAULT_SCORES_PATH) and the report
 # it wrote, read together so a check can tell which of the batch's findings the
@@ -576,13 +588,19 @@ def _section(lines: list[str], heading: str) -> list[str] | None:
     return None
 
 
+def cluster_identity(obj: dict[str, Any]) -> tuple[str, str, str]:
+    """The (project, location, cluster) triple of a Coverage row, a roster entry,
+    a Gaps-line match or a finding line; a missing field is the empty string."""
+    return tuple(str(obj.get(f) or "").strip() for f in IDENTITY_FIELDS)  # type: ignore[return-value]
+
+
 def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
     """The Coverage rows and the per-cluster gap lines of a raw report.
 
     ``"rows"`` is each Coverage row's cluster, project, location and card, or
     ``None`` with ``"error"`` when the table is missing, malformed, or (for a
     ``truncated`` read) does not end inside the text. ``"sweep_audited"`` and
-    ``"unreported"`` are the ``[cluster, project]`` pairs the Gaps list names
+    ``"unreported"`` are the ``[project, location, cluster]`` triples the Gaps list names
     as audited by the sweep itself and as never reported on.
     """
     lines = text.splitlines()
@@ -614,8 +632,8 @@ def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
         for field, pattern in (("sweep_audited", SWEEP_AUDITED_RE), ("unreported", UNREPORTED_RE)):
             m = re.match(pattern, line.strip())
             if m:
-                out[field].append([m.group("cluster"), m.group("project")])
-    counts: dict[tuple[str, str], int] = {}
+                out[field].append(list(cluster_identity(m.groupdict())))
+    counts: dict[tuple[str, str, str], int] = {}
     opened = next((i for i, line in enumerate(lines) if line.strip() == FINDINGS_FENCE_OPEN), None)
     if opened is None and truncated:
         # The block sits at the end of the file; a read that stopped before its
@@ -633,9 +651,9 @@ def parse_raw_coverage(text: str, truncated: bool = False) -> dict[str, Any]:
             except ValueError:
                 continue
             if isinstance(item, dict):
-                key = (str(item.get("cluster", "")), str(item.get("project", "")))
+                key = cluster_identity(item)
                 counts[key] = counts.get(key, 0) + 1
-    out["finding_counts"] = [[c, p, n] for (c, p), n in sorted(counts.items())]
+    out["finding_counts"] = [[*key, n] for key, n in sorted(counts.items())]
     return out
 
 

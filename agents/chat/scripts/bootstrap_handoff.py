@@ -461,7 +461,7 @@ def finding_lines(meta: dict) -> list[dict]:
     it names no single namespace either, rather than dropped: the user can still
     act on it.
     """
-    project, cluster = _text(meta.get("project")), _text(meta.get("cluster"))
+    project, location, cluster = cluster_identity(meta)
     if not project or not cluster:
         return []
     lines = []
@@ -484,6 +484,7 @@ def finding_lines(meta: dict) -> list[dict]:
         line = {
             "check": _text(finding.get("check")) or _slug(f"{_text(finding.get('area'))} {title}"),
             "project": project,
+            "location": location,
             "cluster": cluster,
             "object": obj,
             "title": title,
@@ -516,9 +517,29 @@ def _workload_rows(meta: dict) -> list[dict]:
     return [w for w in _list(meta.get("workloads")) if isinstance(w, dict)]
 
 
+def cluster_identity(obj: dict) -> tuple[str, str, str]:
+    """The (project, location, cluster) triple that names one cluster everywhere
+    this module keys on one: the collector's file, the merge, the fleet check,
+    the Coverage rows and the finding lines. Two clusters of one name in two
+    locations of one project are two clusters."""
+    return tuple(_text(obj.get(f)) for f in IDENTITY_FIELDS)  # type: ignore[return-value]
+
+
 def _named(meta) -> bool:
     """An audit the report can list: it names its project and cluster."""
     return isinstance(meta, dict) and bool(_text(meta.get("cluster")) and _text(meta.get("project")))
+
+
+def _audited_by_hand(entry: dict) -> bool:
+    """A card entry carrying the SOP's object: the by-hand walk the card
+    prescribes where the collector cannot run. A names-only entry has no
+    topology; the relayed-boolean shape has no workload list."""
+    workloads = entry.get("workloads")
+    return (
+        isinstance(entry.get("topology"), dict)
+        and isinstance(workloads, list)
+        and all(isinstance(w, dict) for w in workloads)
+    )
 
 
 def _sweep_audits(sweep: dict) -> list:
@@ -598,8 +619,8 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         if _named(meta):
             audits.append((meta, sweep["id"]))
             gaps.append(
-                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}): no Cluster Agent card, so the "
-                "sweep audited it itself"
+                f"{_cell(meta.get('cluster'))} ({_cell(meta.get('project'))}, {_cell(meta.get('location'))}): "
+                "no Cluster Agent card, so the sweep audited it itself"
             )
         elif isinstance(meta, dict):
             gaps.append(f"sweep {sweep['id']}: an audit it reported has no `project` and `cluster`, so it is not listed")
@@ -634,13 +655,13 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
             f"sweep {sweep['id']} was still {_cell(sweep['status'])}: discovery did not finish, so clusters "
             "it would have listed or audited may be missing"
         )
-    reported = {(_text(m.get("project")), _text(m.get("cluster"))) for m, _ in audits}
+    reported = {cluster_identity(m) for m, _ in audits}
     fleet = [f for f in _list(sweep["metadata"].get("fleet")) if isinstance(f, dict)]
     for entry in fleet:
         status = _text(entry.get("status"))
         if status and status.upper() not in HEALTHY_CLUSTER_STATUSES:
             gaps.append(f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}): cluster status {_cell(status)}")
-        if (_text(entry.get("project")), _text(entry.get("cluster"))) not in reported:
+        if cluster_identity(entry) not in reported:
             gaps.append(
                 f"{_cell(entry.get('cluster'))} ({_cell(entry.get('project'))}, {_cell(entry.get('location'))}): "
                 "listed in the fleet but no audit reported on it"
@@ -1099,9 +1120,11 @@ def merge_collected_audits(state: dict, data_dir: Path, sweep_id: str, filed_at:
     for agent in past_cap:
         identity = agent.get("identity") if isinstance(agent, dict) else None
         if isinstance(identity, dict):
-            ident = tuple(_text(identity.get(f)) for f in IDENTITY_FIELDS)
+            ident = cluster_identity(identity)
             if all(ident):
                 roster.setdefault(ident, None)
+    # The one key without a location, on purpose: it resolves a named entry
+    # that carries none to the roster's location when exactly one matches.
     locations_by_name: dict[tuple[str, str], list[str]] = {}
     for project, location, cluster in roster:
         locations_by_name.setdefault((project, cluster), []).append(location)
@@ -1111,7 +1134,7 @@ def merge_collected_audits(state: dict, data_dir: Path, sweep_id: str, filed_at:
     unresolved: list[dict] = []  # entries kept as they are, each with a gap already appended
     unnamed: list[dict] = []
     for entry in entries:
-        project, location, cluster = (_text(entry.get(f)) for f in IDENTITY_FIELDS)
+        project, location, cluster = cluster_identity(entry)
         if not (project and cluster):
             unnamed.append(entry)  # compose reports an audit with no project or cluster as such
             continue
@@ -1163,6 +1186,9 @@ def merge_collected_audits(state: dict, data_dir: Path, sweep_id: str, filed_at:
                 _log(f"cannot read {path}: {e}")
                 return False
             else:
+                if raw is None and _audited_by_hand(card_entry):
+                    merged.append(card_entry)
+                    continue
                 if raw is None:
                     why = f"the collector's file {path} is missing"
                 else:

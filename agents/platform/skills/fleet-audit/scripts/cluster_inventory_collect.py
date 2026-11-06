@@ -165,6 +165,7 @@ Run = collector_run.Run
 RunFn = collect.RunFn
 default_run = functools.partial(collector_run.default_run, timeout=collect.DEFAULT_TIMEOUT_S)
 failed_page_text = collector_run.failed_page_text
+TIMEOUT_RC = collector_run.TIMEOUT_RC
 
 
 def _describe_argv(project: str, location: str, cluster: str) -> list[str]:
@@ -484,7 +485,12 @@ def _run_within(budget: "_Budget", run: RunFn) -> RunFn:
     """``run`` with each call's timeout cut to what the budget has left."""
 
     def within(argv: list[str], **kwargs) -> Run:
-        return run(argv, **{**kwargs, "timeout": max(1, budget.left())})
+        left = budget.left()
+        if left <= 0:
+            # A page asked for after the budget is spent is the budget's gap,
+            # not a one-second timeout the reader would retry.
+            return Run(argv, TIMEOUT_RC, "", BUDGET_EXHAUSTED.format(budget=budget.seconds), 0.0)
+        return run(argv, **{**kwargs, "timeout": left})
 
     return within
 

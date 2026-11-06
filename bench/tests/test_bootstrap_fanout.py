@@ -696,6 +696,61 @@ def test_a_finding_line_counts_only_on_a_row_scanned_in_full(capped) -> None:
     assert f"{PAST[0]} (c2 in proj) is in the report as the sweep's with 0 workloads audited and no finding line on a row scanned in full" in result.reason
 
 
+TWIN = "cluster-proj-c2-europe-west1"  # c2 again, in another location of the same project
+TWIN_IDENT = {"project": "proj", "cluster": "c2", "location": "europe-west1"}
+
+
+def _with_twin(capped, monkeypatch: pytest.MonkeyPatch, workloads: int, findings: int) -> None:
+    monkeypatch.setitem(CAPPED_ROSTER, TWIN, TWIN_IDENT)
+    first = _audit(PAST[0], workloads=46, findings=1)
+    twin_audit = _audit(TWIN, workloads=workloads, findings=findings)
+    capped(FIRST, _compose(FIRST, [*PAST, TWIN], swept_audits={PAST[0]: first, TWIN: twin_audit}), roster=dict(CAPPED_ROSTER))
+
+
+def test_a_same_named_clusters_workloads_do_not_vouch_for_its_twin(capped, monkeypatch) -> None:
+    # Round 2 of #4115: c2 in us-east4 audited in full with 46 workloads, c2 in
+    # europe-west1 relayed empty. The twin's row and finding lines are its own.
+    _with_twin(capped, monkeypatch, workloads=0, findings=0)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{TWIN} (c2 in proj) is in the report as the sweep's with 0 workloads audited" in result.reason
+    assert PAST[0] not in result.reason
+
+
+def test_a_same_named_clusters_finding_line_counts_for_the_twin_it_names(capped, monkeypatch) -> None:
+    # The finding line carries the location, so a twin with no workload and one
+    # finding on a row scanned in full passes on its own line, not its twin's.
+    _with_twin(capped, monkeypatch, workloads=0, findings=1)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "pass", result.reason
+    assert "all 4 cluster(s) past the cap of 2" in result.reason
+
+
+def test_the_identity_triple_is_the_hand_offs() -> None:
+    sys.path.insert(0, str(HANDOFF_DIR))
+    try:
+        import bootstrap_handoff
+    finally:
+        sys.path.remove(str(HANDOFF_DIR))
+    assert onboarding.IDENTITY_FIELDS == bootstrap_handoff.IDENTITY_FIELDS == ("project", "location", "cluster")
+    assert onboarding.cluster_identity(TWIN_IDENT) == bootstrap_handoff.cluster_identity(TWIN_IDENT)
+
+
+def test_the_raw_read_keeps_two_same_named_clusters_apart(monkeypatch) -> None:
+    # The parse behind the leg: rows, Gaps lines and finding lines of c2 in two
+    # locations come back as two triples each, never summed into one pair.
+    monkeypatch.setitem(CAPPED_ROSTER, TWIN, TWIN_IDENT)
+    monkeypatch.setitem(CAPPED_ROSTER, "cluster-proj-c2-asia-east1", {"project": "proj", "cluster": "c2", "location": "asia-east1"})
+    raw = _compose(FIRST, [*PAST, TWIN], swept_audits={PAST[0]: _audit(PAST[0], findings=2), TWIN: _audit(TWIN, findings=1)})
+    read = onboarding.parse_raw_coverage(raw)
+    rows = {onboarding.cluster_identity(r) for r in read["rows"] if r["cluster"] == "c2"}
+    assert rows == {("proj", "us-east4", "c2"), ("proj", "europe-west1", "c2")}
+    assert ["proj", "us-east4", "c2"] in read["sweep_audited"] and ["proj", "europe-west1", "c2"] in read["sweep_audited"]
+    assert read["unreported"] == [["proj", "asia-east1", "c2"]]
+    counts = {tuple(e[:-1]): e[-1] for e in read["finding_counts"]}
+    assert counts[("proj", "us-east4", "c2")] == 2 and counts[("proj", "europe-west1", "c2")] == 1
+
+
 def test_a_coverage_table_without_the_workloads_column_fails(capped) -> None:
     raw = _compose(FIRST, PAST).replace("| Workloads audited ", "| Pods ")
     capped(FIRST, raw)

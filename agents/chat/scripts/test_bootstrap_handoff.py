@@ -268,7 +268,7 @@ class ComposeTest(unittest.TestCase):
     def test_a_cluster_the_sweep_audited_is_named_as_having_no_agent_card(self):
         own = dict(_metadata()["t_ccbfda55"], cluster="no-agent-cluster")
         text = h.compose(self._state([], {"clusters": [own], "fleet": []}), timed_out=False, now=NOW)
-        self.assertIn("no-agent-cluster (example-project): no Cluster Agent card, so the sweep audited it itself", text)
+        self.assertIn("no-agent-cluster (example-project, us-central1-a): no Cluster Agent card, so the sweep audited it itself", text)
 
     def test_a_sweep_that_never_finished_says_so(self):
         text = h.compose(self._state(_all_done(), sweep_status="running"), timed_out=True, now=NOW)
@@ -409,6 +409,37 @@ class CollectedAuditsTest(unittest.TestCase):
         self.assertIn("is missing", entry["gaps"][0])
         self.assertIn(h.sweep_file_path(**self.IDENT), entry["gaps"][0])
         self.assertIn("no — see Gaps", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_by_hand_audit_without_a_file_keeps_its_entry_without_a_gap(self):
+        # The card's fallback where the collector cannot run: the SOP's full
+        # object in the entry. No file is not a gap for it.
+        by_hand = {k: v for k, v in self._file().items() if k not in (h.SWEEP_FILE_STAMP_AT, h.SWEEP_FILE_STAMP_SWEEP)}
+        state = self._state([by_hand])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertEqual(entry, by_hand)
+        self.assertIn("| seeded-c | p | us-central1-a | t_sweep | 1 | yes |", h.compose(state, timed_out=False, now=NOW))
+
+    def test_a_relayed_boolean_object_is_not_a_by_hand_audit(self):
+        state = self._state([{**self.IDENT, "topology": False, "workloads": False, "findings": False, "gaps": []}])
+        self.assertTrue(self._merge(state))
+        [entry] = state["sweep"]["metadata"]["clusters"]
+        self.assertIn("is missing", entry["gaps"][0])
+
+    def test_the_fleet_check_and_the_sweep_line_carry_the_location(self):
+        # Two clusters of one name in two locations: the audited one is listed
+        # as the sweep's, the other is unreported; a pair key would hide it.
+        twin = {**self.IDENT, "location": "europe-west1-b"}
+        audit = {k: v for k, v in self._file().items() if k not in (h.SWEEP_FILE_STAMP_AT, h.SWEEP_FILE_STAMP_SWEEP)}
+        state = self._state([audit])
+        state["sweep"]["metadata"]["fleet"] = [dict(self.IDENT, status="RUNNING"), dict(twin, status="RUNNING")]
+        text = h.compose(state, timed_out=False, now=NOW)
+        self.assertIn("seeded-c (p, us-central1-a): no Cluster Agent card, so the sweep audited it itself", text)
+        self.assertIn("seeded-c (p, europe-west1-b): listed in the fleet but no audit reported on it", text)
+        self.assertNotIn("seeded-c (p, us-central1-a): listed in the fleet", text)
+        [line] = h.finding_lines(audit)
+        self.assertEqual((line["project"], line["location"], line["cluster"]), ("p", "us-central1-a", "seeded-c"))
+        self.assertEqual(h.cluster_identity(audit), ("p", "us-central1-a", "seeded-c"))
 
     def test_a_past_cap_cluster_the_worker_did_not_name_takes_its_file(self):
         self._write(self._file())

@@ -351,7 +351,7 @@ card for anything else), or, with `cap`, one of the first-run cap's two (#3702):
 `carded=` set when it has one, else the first `cap` profiles by name) and
 `past_cap_clusters_sweep_audited` (every roster cluster outside that set shown in the sandbox's
 `INVENTORY.raw.md` as audited by the sweep itself, with at least one workload listed or one finding
-line, so an audit relayed empty does not pass).
+line on a row scanned in full, so an audit relayed empty does not pass).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses
