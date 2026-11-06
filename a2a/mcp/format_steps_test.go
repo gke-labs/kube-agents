@@ -379,6 +379,23 @@ func TestTruncateInlineTextPreservesValidUTF8(t *testing.T) {
 	}
 }
 
+func TestDescribeActivityForMarkdownRendersErrorType(t *testing.T) {
+	cases := []struct {
+		act  ActivityItem
+		want string
+	}{
+		{ActivityItem{Tool: "kubectl", Status: "error", ErrorType: "blocked"}, "`kubectl` **(error: blocked)**"},
+		{ActivityItem{Tool: "kubectl", IsError: true, ErrorType: "tool_error"}, "`kubectl` **(error: tool_error)**"},
+		{ActivityItem{Tool: "kubectl", Status: "error"}, "`kubectl` **(error)**"},
+		{ActivityItem{Tool: "kubectl", Status: "completed", ErrorType: "timeout"}, "`kubectl`"},
+	}
+	for _, c := range cases {
+		if got := describeActivityForMarkdown(c.act); got != c.want {
+			t.Errorf("describeActivityForMarkdown(%+v) = %q, want %q", c.act, got, c.want)
+		}
+	}
+}
+
 func TestFormatTurnCustomToolEnvelopeTerminalStates(t *testing.T) {
 	ref := TaskRef{Addressee: "platform", TaskID: "t-term"}
 	details := []StepDetail{

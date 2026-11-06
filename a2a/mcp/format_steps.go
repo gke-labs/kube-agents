@@ -36,6 +36,7 @@ const (
 	maxActivityCmdLen     = 180
 	maxActivityDetailLen  = 200
 	maxActivityErrLen     = 140
+	maxActivityErrTypeLen = 32
 	maxAnswerPreviewLen   = 400
 	maxWaitProgressLen    = 88
 	maxTableCardTitleLen  = 60
@@ -734,7 +735,14 @@ func describeActivityForMarkdown(act ActivityItem) string {
 	}
 	isErr := act.IsError || act.Status == "error"
 	if isErr {
-		parts = append(parts, "**(error)**")
+		// errorType is the producer's verdict word (blocked, cancelled,
+		// timeout, tool_error); it keeps a guardrail refusal apart from a
+		// tool failure when no error text is published.
+		if errType := strings.ReplaceAll(collapseInlineWhitespace(act.ErrorType), "*", ""); errType != "" {
+			parts = append(parts, fmt.Sprintf("**(error: %s)**", truncateInlineText(errType, maxActivityErrTypeLen)))
+		} else {
+			parts = append(parts, "**(error)**")
+		}
 	}
 	errOut := collapseInlineWhitespace(act.ErrorMessage)
 	if errOut == "" {
