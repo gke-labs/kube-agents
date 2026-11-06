@@ -1137,8 +1137,8 @@ such step. Skipping it here leaves agent RBAC without its admission backstop, an
 pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceAccount in the
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
 an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
-without it the operator runs no dispatcher Job mode, and unattended profile tasks run on the
-worker pool; set it on the operator only once the third policy is applied. Read each file's header for what the
+without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
+and wait until their queue timeout; set it on the operator only once the third policy is applied. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 

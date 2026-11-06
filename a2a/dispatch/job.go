@@ -36,7 +36,9 @@ type JobRunner interface {
 }
 
 // UseJobs sets the JobRunner unattended tasks run on. Set it before Run.
-// Without one, unattended tasks go to the warm pool as interactive ones do.
+// Without one, unattended tasks go to their tier's pool as interactive ones
+// do, and the operator builds pools for the read tier only, so they find no
+// worker and wait until their queue timeout.
 func (d *Dispatcher) UseJobs(j JobRunner) { d.jobs = j }
 
 func jobStart(cfg lib.DispatchConfig) time.Duration {

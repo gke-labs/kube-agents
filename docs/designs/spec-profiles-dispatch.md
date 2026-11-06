@@ -435,7 +435,8 @@ leave open:
   is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
-  Without a Job runner, unattended tasks go to the warm pool.
+  Without a Job runner or a Job template, an unattended task has no worker (the operator builds
+  warm pools for the read tier only) and waits until its queue timeout.
 
 ### Execution
 

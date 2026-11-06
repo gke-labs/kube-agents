@@ -125,7 +125,7 @@ func TestTheProfileQuotaCoversTerminatingJobPods(t *testing.T) {
 	}
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
 	if got, want := pods(readOnly, unattended), int64(1*1+1+5); got != want {
-		t.Errorf("no Job policy signal: pods = %d, want %d (unattended tasks run on the pool)", got, want)
+		t.Errorf("no Job policy signal: pods = %d, want %d (unattended tasks have no worker)", got, want)
 	}
 }
 

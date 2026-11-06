@@ -213,7 +213,8 @@ func autopilotRatioProblem(p *agentv1alpha1.AgentProfile) string {
 // set from the same helper as the policy. Job mode runs only where it is set:
 // without the policy the dispatcher's Job create would be as wide as its Role,
 // so the operator renders no Job templates and no Jobs Role, and unattended
-// tasks run on the pool. It says the policy was rendered, not that it still
+// tasks have no worker (the warm pools serve the read tier only) and wait
+// until their queue timeout. It says the policy was rendered, not that it still
 // holds.
 const a2aDispatcherJobPolicyEnvVar = "A2A_DISPATCHER_JOB_POLICY"
 
@@ -380,7 +381,7 @@ func a2aDispatcherJobsRoleName(agent *agentv1alpha1.PlatformAgent) string {
 type errForeignDispatchJobParam struct{ name string }
 
 func (e errForeignDispatchJobParam) Error() string {
-	return fmt.Sprintf("DispatchJobTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and Job mode is off for every profile (unattended tasks run on the worker pool) until it is removed", e.name)
+	return fmt.Sprintf("DispatchJobTemplate %s in the profile namespace is not this agent's (it lacks the agent's labels), so it is left alone and Job mode is off for every profile (unattended tasks have no worker, and wait until their queue timeout) until it is removed", e.name)
 }
 
 // reconcileDispatchJobParams brings the policy's params in line with

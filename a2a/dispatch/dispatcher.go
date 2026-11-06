@@ -725,7 +725,9 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	h.cluster = cluster
 
 	// Job mode needs the profile's Job template; without it (the chart
-	// didn't install the Job admission policy) the pool takes the task.
+	// didn't install the Job admission policy) the task goes to the (profile,
+	// tier)'s pool, and the operator builds pools for the read tier only, so
+	// an unattended task finds no worker and waits until its queue timeout.
 	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
 		h.onJob = true
 		var ended bool

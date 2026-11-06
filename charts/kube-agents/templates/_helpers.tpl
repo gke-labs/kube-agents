@@ -180,7 +180,7 @@ on an upgrade, its param kind's CRD (DispatchJobTemplate) already installed.
 `helm upgrade` never applies crds/, and a policy naming a kind the API server
 doesn't serve refuses every Job in the profile namespace; left out, the
 operator's A2A_DISPATCHER_JOB_POLICY (set from this helper) is too, and
-unattended tasks run on the pool until crds/ is applied (upgrade.sh does) and
+unattended tasks have no worker (they wait until their queue timeout) until crds/ is applied (upgrade.sh does) and
 the release upgraded again. `lookup` is empty under `helm template`, which is
 no upgrade, so the template renders there as on a fresh install.
 */}}

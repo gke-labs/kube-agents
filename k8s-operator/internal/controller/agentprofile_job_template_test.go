@@ -279,7 +279,7 @@ func TestNoDispatcherRoleCanWriteThePolicysParams(t *testing.T) {
 
 // Job mode needs the chart's signal that it rendered the Job admission
 // policy. Without it there are no Job templates, params or Jobs Role, so the
-// dispatcher's unattended tasks run on the pool; and the signal going away
+// dispatcher's unattended tasks have no worker; and the signal going away
 // removes what a pass with it rendered.
 func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 	agent := a2aTestAgent()
@@ -923,9 +923,9 @@ func TestAProfileNamespaceThePolicyDoesNotSelectGetsNoJobMode(t *testing.T) {
 
 // A params pass that fails (here a foreign index under the index's name,
 // after a good pass) revokes the dispatcher's Jobs Role and renders the
-// dispatch config without Job templates, so the dispatcher takes the pool
-// for unattended tasks instead of queueing them to a Job it can't create.
-func TestAFailedParamsPassRevokesJobModeAndKeepsThePool(t *testing.T) {
+// dispatch config without Job templates, so the dispatcher doesn't hand
+// unattended tasks to a Job it can't create.
+func TestAFailedParamsPassRevokesJobMode(t *testing.T) {
 	agent := a2aTestAgent()
 	r, c := jobTemplateTestReconciler(t, agent)
 	ctx := context.Background()

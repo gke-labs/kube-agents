@@ -661,7 +661,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		if !ok {
 			jobMode = false
 			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
-				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks run on the worker pool", why))
+				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks have no worker and wait until their queue timeout", why))
 		}
 	}
 	// Wanted, the params and the Jobs Role come before the dispatch config
@@ -670,7 +670,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// ready or not selected by the policy's binding (the binding selects
 	// profile namespaces by labels it may lack), or a policy not in place,
 	// revokes the Jobs Role alone and leaves the templates out, so unattended
-	// tasks take the pool; Jobs already running stay, since the policy holds
+	// tasks have no worker (the warm pools serve the read tier only) and wait
+	// until their queue timeout; Jobs already running stay, since the policy holds
 	// only creates and each was held to its template when made. Only the
 	// signal off (a deliberate gate-off) tears Job mode down, below.
 	var jobErr error
@@ -686,7 +687,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		if err != nil || !selected {
 			if err == nil {
 				r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
-					"the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, so unattended profile tasks run on the worker pool",
+					"the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, so unattended profile tasks have no worker and wait until their queue timeout",
 					profileNamespaceName(agent), labelPartOf, partOfKubeAgents))
 			}
 			jobTemplates = nil

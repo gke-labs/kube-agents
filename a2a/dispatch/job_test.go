@@ -255,8 +255,8 @@ func TestJobsCountAgainstTheCaps(t *testing.T) {
 	waitFor(t, 15*time.Second, "task-2 ran after task-1", func() bool { return len(b.terminalsOf("task-2")) > 0 })
 }
 
-// With no JobRunner, an unattended task goes to the warm pool, as before
-// Job mode: an install without Jobs loses nothing.
+// With no JobRunner, an unattended task goes to its tier's pool, when there
+// is one (the operator builds pools for the read tier only).
 func TestAnUnattendedTaskWithoutJobsUsesThePool(t *testing.T) {
 	b := newBus(t, "inv-0")
 	b.ensure("inv", 1, 0, "unattended")
@@ -271,8 +271,8 @@ func TestAnUnattendedTaskWithoutJobsUsesThePool(t *testing.T) {
 }
 
 // A profile with no Job template (the chart didn't install the Job
-// admission policy, so the operator rendered none) keeps the pool even with
-// a JobRunner set.
+// admission policy, so the operator rendered none) goes to its tier's pool,
+// when there is one, even with a JobRunner set.
 func TestAProfileWithoutAJobTemplateUsesThePool(t *testing.T) {
 	b := newBus(t, "inv-0")
 	b.ensure("inv", 1, 0, "unattended")
