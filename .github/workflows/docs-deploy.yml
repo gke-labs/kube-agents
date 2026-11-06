@@ -177,7 +177,7 @@ jobs:
     #   - two got a 5xx at create, and one `Deployment failed, try again later.`
     #
     # A hand re-run 43 seconds after one of the timeouts passed in 17 seconds.
-    # A failure that outlasts the pause fails both attempts, and the next run
+    # A failure that outlasts the pause fails both attempts, and a later run
     # redeploys. The concurrency group above already keeps two runs from
     # deploying at once.
     #
