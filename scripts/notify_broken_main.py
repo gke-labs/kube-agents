@@ -351,13 +351,13 @@ def _commit_subject(run):
 def _author(run):
     """Who wrote the change, which is not who pushed it.
 
-    Nothing merges to main by hand here -- the merge queue does, so `actor`
-    and `triggering_actor` are both `github-merge-queue[bot]` on every push and
+    Nothing merges to main by hand here -- the merge queue does, so `actor` and
+    `triggering_actor` are both `github-merge-queue[bot]` on every push and
     naming either tells a reader nothing. The squash commit keeps the pull
     request author (`Fuxiao G` on f0ad3a3, #4802, with GitHub itself as
-    committer), so that is the field to read. It is a display name and not a login, so it
-    renders as plain text; the pull request link beside it is the one worth
-    following.
+    committer), so that is the field to read. It is a display name and not a
+    login, so it renders as plain text; the pull request link beside it is the
+    one worth following.
     """
     name = ((run.get("head_commit") or {}).get("author") or {}).get("name")
     if name:

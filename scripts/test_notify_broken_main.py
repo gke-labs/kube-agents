@@ -283,7 +283,7 @@ class RenderTest(unittest.TestCase):
         42277127360 (Operator Tests) for #4802. Both actors are the queue's bot;
         the squash commit keeps the pull request's author, with GitHub as the
         committer."""
-        queue_merge = run(10, "failure", sha="f0ad3a3ec4a5b3c7a0e1d2c3b4a5968778695a4b",
+        queue_merge = run(10, "failure", sha="f0ad3a3ec572b469a92c85180b27a809e0e26450",
                           subject="feat(incident-triage): fold the pods of one Job, StatefulSet or DaemonSet into one incident (#4802)")
         queue_merge["head_commit"]["author"] = {"name": "Fuxiao G", "email": "116308835+Fuxiao-Gao@users.noreply.github.com"}
         queue_merge["head_commit"]["committer"] = {"name": "GitHub", "email": "noreply@github.com"}
