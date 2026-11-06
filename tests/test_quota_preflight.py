@@ -1198,6 +1198,10 @@ class PreflightDecisionTest(unittest.TestCase):
             ["operator.replicaCount=4", "operator.rollingUpdate.maxSurge=50%"],
             ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
             ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
+            # The Hindsight API runs one replica, so only maxSurge 0 tells its list entry apart
+            # from one pinned to 1 or reading the wrong key.
+            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=0",
+             "hindsight.api.rollingUpdate.maxUnavailable=1"],
             ["litellm.rollingUpdate.maxSurge=0"],
             # Past the replicas: a rollout still adds at most the replicas.
             ["operator.rollingUpdate.maxSurge=100"],
@@ -1221,6 +1225,17 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(three["chartSurgePods"], base["chartSurgePods"] + 2)
         for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
             self.assertEqual(three[key], base[key], key)
+
+    def test_a_max_surge_past_int64_counts_as_the_replicas(self) -> None:
+        """A whole number or percentage of 20 digits or more is past int64. Converting it
+        with a plain int64 wraps negative on amd64 (or reads 0), which would stamp a
+        negative or short count; it is clamped, and the cap at the replicas applies."""
+        base = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"])
+        for huge in ("1000000000000000000000%", "99999999999999999999"):
+            with self.subTest(huge=huge):
+                req = self._requirements(["platformAgent.mode=next", "operator.replicaCount=3"],
+                                         extra_args=["--set-string", f"operator.rollingUpdate.maxSurge={huge}"])
+                self.assertEqual(req["chartSurgePods"], base["chartSurgePods"] + 2)
 
     def test_a_max_surge_that_is_not_a_whole_number_or_percentage_counts_as_the_replicas(self) -> None:
         """The schema admits any string, and validate.yml requires such a value to render

@@ -2087,12 +2087,15 @@ render rather than be refused, so the count bounds it from above. Takes a dict w
   {{- $raw = trim (toString $v) -}}
 {{- end -}}
 {{- $n := 0 -}}
+{{- /* Every conversion to an integer goes through clampInt64: a percentage or integer
+       of 20 digits or more is past int64, and a plain `int64` of it wraps negative on
+       amd64 or reads as 0, either of which would under-count. */ -}}
 {{- if not (regexMatch "^[0-9]+%?$" $raw) -}}
   {{- $n = $replicas -}}
 {{- else if hasSuffix "%" $raw -}}
-  {{- $n = ceil (divf (mulf (trimSuffix "%" $raw | float64) (float64 $replicas)) 100.0) | int64 -}}
+  {{- $n = include "kube-agents.clampInt64" (ceil (divf (mulf (trimSuffix "%" $raw | float64) (float64 $replicas)) 100.0)) | int64 -}}
 {{- else -}}
-  {{- $n = $raw | int64 -}}
+  {{- $n = include "kube-agents.clampInt64" ($raw | float64) | int64 -}}
 {{- end -}}
 {{- if le $replicas (int64 0) -}}0{{- else -}}{{- min $n $replicas -}}{{- end -}}
 {{- end }}
