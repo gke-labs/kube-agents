@@ -594,7 +594,12 @@ document goes to `finish` with each remediation's note as the worker wrote it
 (`_strip_route_notes`, as after a carry): the route notes and the Config Connector paragraph are
 `finish`'s to write again from this run's manifest, and the note before a cut (`uncut_note`),
 which `validate_findings` drops, would otherwise pass for the worker's own on a finding whose
-excerpt moved and leave the store for good. The stored
+excerpt moved and leave the store for good. It also goes without the previous run's
+`declared_intent_searched`, and with each `declared[]` entry's `repo`, `path` and `excerpt` taken
+from the declarations file this run's `start` filed (joined as `apply_declarations` joins):
+`fold_searched_record` unions by slug, so the previous run's `owner/name@sha` would otherwise
+stand in the ledger's search line beside `Declared at` links at this run's sha, and a note the
+owner edited or moved would render as the previous run read it. The stored
 document is the one `finish` left, after the passes that write on it, and the close runs those
 passes again on a workspace `start` has reset, so `stored_document_replay_problem` refuses what
 they could not reproduce, by the rule the carry already applies (`_remediation_may_carry`): a
@@ -627,7 +632,13 @@ What a close waives, by design: the SOP steps after the collector. On the stocko
 streams some sub-conditions are checked by hand rather than by the collector, and a closed run
 republishes the previous document, whose `checks_run` attests them as that run ran them; a change
 only such a step would catch is seen on the weekly full run (`periodic-refresh`), and those two SOPs
-say so in their precheck step. The weekly refresh is the bound on everything the digest does not
+say so in their precheck step. Two shapes the digest does not see either, because the arm or the
+content lives in a candidate's `excerpt` alone: `public-control-plane` when the DNS endpoint opens
+or closes beside an open IP endpoint (the impact is the IP arm's either way), and
+`fleet-consistency-drift` when a split cluster's set of diverging facets, or a facet's cohort
+baseline, moves at the same severity. Both change how a cluster that already fails the check
+fails, not whether; a key the collector declares as a candidate's non-prose identity would close
+them and is not made here. The weekly refresh is the bound on everything the digest does not
 see.
 
 ## 4. The waiver — `--no-collector-manifest <reason>`
