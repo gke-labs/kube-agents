@@ -431,6 +431,57 @@ class GeneratedAnswerTest(unittest.TestCase):
                 self.assertNotIn("b", hit_ids(source + asked + [request], "replayed_high"))
 
 
+def with_diag(entry, diag):
+    entry["diag_message_hashes"] = list(diag)
+    return entry
+
+
+class DriftedEvidenceTest(unittest.TestCase):
+    """Evidence of a generated answer compares diagnosis hashes, which don't drift within a conversation."""
+
+    def drifted(self, drifted_prefix):
+        # Each build asks for the first answer, then a later request's earlier
+        # message hashes have drifted to `drifted_prefix`; its diagnosis hashes have not.
+        lines = []
+        for build, ts, answer in (("b1", 0, "ans"), ("b2", 10, "ANS")):
+            lines.append(with_diag(presubmit(f"{build}-ask", ts, "10", build, f"{build}Q", ["sys", "task"],
+                                             roles=ANSWER_ROLES[:2]), ["d-sys", "d-task"]))
+            lines.append(with_diag(presubmit(f"{build}-later", ts + 1, "10", build, f"{build}L",
+                                             drifted_prefix + [answer, "out"], roles=ANSWER_ROLES),
+                                   ["d-sys", "d-task", f"d-{answer}", "d-out"]))
+        return hit_ids(lines, "replayed_high")
+
+    def test_a_cidr_first_seen_in_a_later_tool_result_keeps_the_evidence(self):
+        # The CIDR in "out" keeps every earlier IP literal, so sys and task hash differently.
+        self.assertEqual(self.drifted(["sys-ips-literal", "task-ips-literal"]), ["b2-ask", "b2-later"])
+
+    def test_a_timestamp_crossing_a_bucket_keeps_the_evidence(self):
+        # The task's timestamp is now an hour old rather than minutes.
+        self.assertEqual(self.drifted(["sys", "task-older-bucket"]), ["b2-ask", "b2-later"])
+
+    def test_message_hashes_decide_when_a_record_lacks_diagnosis_hashes(self):
+        lines = [
+            presubmit("a-ask", 0, "10", "b1", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            with_diag(presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=ANSWER_ROLES),
+                      ["d-sys", "d-task", "d-ans", "d-out"]),
+            presubmit("b-ask", 10, "10", "b2", "AQ", ["sys", "task"], roles=ANSWER_ROLES[:2]),
+            with_diag(presubmit("b", 11, "10", "b2", "B", ["sys", "task", "ANS", "out"], roles=ANSWER_ROLES),
+                      ["d-sys", "d-task", "d-ANS", "d-out"]),
+        ]
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b-ask", "b"])
+
+    def test_diagnosis_hashes_decide_when_both_records_carry_them(self):
+        # Equal message hashes, but the diagnosis hashes show another conversation asked.
+        lines = []
+        for build, ts, answer in (("b1", 0, "ans"), ("b2", 10, "ANS")):
+            lines.append(with_diag(presubmit(f"{build}-ask", ts, "10", build, f"{build}Q", ["sys", "task"],
+                                             roles=ANSWER_ROLES[:2]), ["d-sys", "d-other-task"]))
+            lines.append(with_diag(presubmit(f"{build}-later", ts + 1, "10", build, f"{build}L",
+                                             ["sys", "task", answer, "out"], roles=ANSWER_ROLES),
+                                   ["d-sys", "d-task", f"d-{answer}", "d-out"]))
+        self.assertEqual(hit_ids(lines, "replayed_high"), ["b2-ask"])
+
+
 class EarliestSourceTest(unittest.TestCase):
     """Two sources in one earlier build under the same key: the earlier one is used."""
 

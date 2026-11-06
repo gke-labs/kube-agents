@@ -23,7 +23,12 @@ answer" and Rollout step 1):
 
   A generated answer is an assistant message the logs show the model gave in
   this conversation: an earlier request of the same build whose messages were
-  exactly the ones before it got an answer that reached the client. Only those
+  exactly the ones before it got an answer that reached the client. The
+  messages are compared by their `diag_message_hashes` when both requests
+  carry them, since those stay the same across one conversation's requests (a
+  CIDR first seen in a later message, or time moving a timestamp into another
+  bucket, changes earlier `message_hashes`), and by `message_hashes` otherwise,
+  where that drift can lose the evidence. Only generated answers
   would have come from the recording under replay. Any other assistant message
   (a few-shot example, a prefill, a resumed transcript, an empty reply's
   continuation) is prompt and keeps its hash. The logged `answer_hash` can't
@@ -31,7 +36,10 @@ answer" and Rollout step 1):
   calls in its own request's mapping, while a message hash covers the whole
   normalized message in the later request's mapping, so the two never compare.
   A client that swaps the model's answer for its own text before sending it
-  back is still taken as having sent the answer.
+  back is still taken as having sent the answer. Evidence is missing, and the
+  message keeps its hash, when the asking request isn't in the logs, ran in
+  another build, got no answer or lost its client, or (for lines without
+  diagnosis hashes) its message hashes drifted.
 
   It is an estimate both ways. Where the live model took a different action,
   shadow mode sees a different tool result and counts a miss, while replay
@@ -132,6 +140,8 @@ ASSISTANT_ROLE = "assistant"
 # Unstorable reasons meaning the client never got the model's answer, so the
 # request is no evidence that the next assistant message was generated.
 ANSWER_NOT_DELIVERED = (F.UNSTORABLE_NO_ANSWER, F.UNSTORABLE_CLIENT_DISCONNECTED)
+# Which hashes an entry of the generated-answer evidence index is filed by.
+BY_DIAG, BY_MESSAGE = "diag", "message"
 # Stands in for an assistant message's content in the replayed key: its place
 # in the conversation counts, its words do not.
 ANSWER_PLACEHOLDER = "assistant-message"
@@ -613,30 +623,49 @@ def mark_generated_answers(records: List[Record]) -> None:
     """Set each record's `generated_answers`, from records in time order.
 
     Position i holds a generated answer when it is an assistant message and an
-    earlier request of the same build, whose message hashes are exactly this
+    earlier request of the same build, whose messages are exactly this
     request's first i, got an answer that reached the client before this
-    request was made.
+    request was made. Messages compare by diagnosis hashes when both requests
+    carry them (they don't drift within a conversation), by message hashes
+    when either lacks them.
     """
     # Requests whose answer reached the client, by build, message count and
-    # last message hash; a candidate still has to match every earlier hash.
-    answered: Dict[Tuple[Tuple[str, str, str], int, str], List[Record]] = {}
+    # last hash: with diagnosis hashes under BY_DIAG, every request under
+    # BY_MESSAGE. A candidate still has to match every earlier hash.
+    answered: Dict[Tuple[str, Tuple[str, str, str], int, str], List[Record]] = {}
     for record in records:
         hashes = record.message_hashes
         if hashes is None:
             continue
+        diag = evidence_diag_hashes(record)
         generated = []
         for index, role in enumerate(record.roles[:len(hashes)]):
             if role != ASSISTANT_ROLE:
                 continue
-            last = hashes[index - 1] if index else ""
-            for asked in answered.get((record.build_key, index, last), ()):
-                if asked.available_at <= record.ts and asked.message_hashes == hashes[:index]:
-                    generated.append(index)
-                    break
+            if diag is not None and any(
+                asked.available_at <= record.ts and evidence_diag_hashes(asked) == diag[:index]
+                for asked in answered.get((BY_DIAG, record.build_key, index, diag[index - 1] if index else ""), ())
+            ):
+                generated.append(index)
+                continue
+            if any(
+                asked.available_at <= record.ts and asked.message_hashes == hashes[:index]
+                # With both diagnosis hashes, only they decide.
+                and (diag is None or evidence_diag_hashes(asked) is None)
+                for asked in answered.get((BY_MESSAGE, record.build_key, index, hashes[index - 1] if index else ""), ())
+            ):
+                generated.append(index)
         record.generated_answers = frozenset(generated)
         if record.answer_delivered:
-            key = (record.build_key, len(hashes), hashes[-1] if hashes else "")
-            answered.setdefault(key, []).append(record)
+            answered.setdefault((BY_MESSAGE, record.build_key, len(hashes), hashes[-1] if hashes else ""), []).append(record)
+            if diag is not None:
+                answered.setdefault((BY_DIAG, record.build_key, len(diag), diag[-1] if diag else ""), []).append(record)
+
+
+def evidence_diag_hashes(record: Record) -> Optional[List[str]]:
+    """A record's diagnosis hashes when it has one per message, for the generated-answer evidence."""
+    diag = record.diag_message_hashes
+    return diag if diag is not None and record.message_hashes is not None and len(diag) == len(record.message_hashes) else None
 
 
 def iter_hits(
