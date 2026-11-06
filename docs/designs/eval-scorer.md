@@ -115,7 +115,8 @@ One conjunction never reaches rung 3: an empty `trajectory` together with `token
 exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
-429s, #1137's unestablishable tunnels), and the launcher writes it too, on a record with no scores
+429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
+guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
 map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
 attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
@@ -392,8 +393,9 @@ carries a `mean` and its `n` per metric and not the repetitions' own values. So:
 
 **Only the nightly's lines feed the trend.** The store holds what ran on `main` — only the nightly
 appends to it, a pull request's run is graded against it and never writes — so a trend read from
-the store is nightly-only by construction. The presubmit's judged scores stay on the run page: they
-are per pull request, mix in broken branches, and are not evidence about `main`.
+the store is nightly-only by construction. The presubmit's judged scores (`OutcomeValidity` and
+`OutcomeScore`; a pull request's run skips `ToolInvocation` and `ChecklistScore`) stay on the run
+page: they are per pull request, mix in broken branches, and are not evidence about `main`.
 
 **Retention covers a quarter, and more.** Nothing in the bucket is ever deleted (no lifecycle rule,
 no `storage.objects.delete` on either identity); what is bounded is the read. The reader takes the

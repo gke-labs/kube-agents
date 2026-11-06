@@ -62,6 +62,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
@@ -100,6 +101,20 @@ MISSING = "MISSING"
 #: harness's KUBE_AGENTS_TIMING_FILE into the run directory, and its one key.
 _TIMING_FILE = "timing.json"
 _TIMING_TURN1_KEY = "turn1_s"
+#: The delivered reply's shape, which hack/ci-eval-pr.sh copies from the
+#: harness's KUBE_AGENTS_SHAPE_FILE into the run directory (chat_shape.KEYS).
+_SHAPE_FILE = "shape.json"
+
+#: The record's prompt-split buckets (devops_bench TOKEN_BUCKETS): ``cached``
+#: is cache reads, ``cache_write`` cache writes, and ``input`` the prompt
+#: that is neither; ``reasoning`` rides inside ``output``. The harness fills
+#: them from hermes' session rows; ``front_door`` is the router's own row
+#: once workers are folded in (harness._fold_worker_tokens).
+_TOKENS_CACHED_KEY = "cached"
+_TOKENS_CACHE_WRITE_KEY = "cache_write"
+_TOKENS_REASONING_KEY = "reasoning"
+_TOKENS_FRONT_DOOR_KEY = "front_door"
+_TOKENS_WORKERS_KEY = "workers"
 
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
@@ -194,8 +209,9 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: The marker :mod:`kube_agents_bench.harness` writes onto ``errors[0]`` when
 #: the harness recorded a condition under which no answer can be graded:
 #: transport exhausted, the server reporting a provider rate limit or billing
-#: stop on the opening turn, or delegated workers encountering quota exhaustion
-#: before acting. Such a record IS scored -- the judge grades the empty output and
+#: stop on the opening turn, or a delegated worker's card blocked by its
+#: rate-limit guardrail with no completion or block call of the worker's own
+#: and no artifact, whether or not the worker acted first (#4998). Such a record IS scored -- the judge grades the empty output and
 #: returns 0.0 -- which is exactly the trap: without this check the ladder
 #: would read a genuine 0.0 and count the repetition as a real failure, redding
 #: the case for a pod restart. There is no answer in the record to grade, so
@@ -445,8 +461,8 @@ class RunRecord:
     ``results.json`` is the scoring contract: it is the only artifact carrying
     ``VerificationCoverage`` and the per-check ``verification_report``.
     ``manifest.json`` and ``rows.json`` are read for the version key and for
-    latency/token reporting, and ``timing.json`` (copied in by
-    hack/ci-eval-pr.sh) for the opening turn's seconds.
+    latency/token reporting, and ``timing.json`` and ``shape.json`` (copied in
+    by hack/ci-eval-pr.sh) for the opening turn's seconds and the reply's shape.
     """
 
     run_dir: Path
@@ -481,6 +497,9 @@ class RunRecord:
     #: ``tool_calls_optional``, where a reply on a record with no error
     #: stands in for the trajectory.
     output: str = ""
+    #: The delivered reply's shape, from ``shape.json`` (:func:`chat_shape.parse`).
+    #: Reported, never scored; None when the file is absent or holds nothing valid.
+    shape: dict[str, bool | int] | None = None
 
     @property
     def catastrophic(self) -> float | None:
@@ -563,6 +582,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
 
     manifest = _read_json(path / "manifest.json") or {}
     turn1_s = _positive_seconds(_read_json(path / _TIMING_FILE), _TIMING_TURN1_KEY)
+    shape = chat_shape.parse(_read_json(path / _SHAPE_FILE))
     rows = _read_json(path / "rows.json") or []
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
 
@@ -587,6 +607,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
             scoring_version=_as_str(row.get("scoringVersion")),
             agent_model=_as_str(manifest.get("model")),
             output=str(rec.get("output") or ""),
+            shape=shape,
         )
 
     # The documented empty-list record: the file exists, zero tasks were
@@ -645,6 +666,33 @@ def _tokens_partial(tokens: dict[str, Any]) -> bool:
     return tokens.get("usage_partial") is True or bool(unbilled)
 
 
+def _tokens_split(tokens: dict[str, Any]) -> bool:
+    """Whether the record's top-level ``input`` excludes cache reads, so
+    ``cached`` beside it gives a hit rate: the front door's session row was
+    read (``cached`` a count, and ``front_door.cached`` one too when workers
+    were folded in). The inject transport leaves ``cached`` null, its
+    ``input`` counting cache reads; an api run whose row lookup failed keeps
+    the envelope's prompt total as ``input``, and its folded-in workers'
+    ``cached`` alone would read as a hit rate it does not have."""
+    if token_count(tokens.get(_TOKENS_CACHED_KEY)) is None:
+        return False
+    front_door = tokens.get(_TOKENS_FRONT_DOOR_KEY)
+    if isinstance(front_door, dict):
+        return token_count(front_door.get(_TOKENS_CACHED_KEY)) is not None
+    # Workers folded in with no front-door split to vouch for the rest: a
+    # card-wake merge (card_wake.merge) adds the wake turn's workers to an
+    # answer turn whose row lookup failed, so ``cached`` is the workers' alone
+    # while ``input`` still counts the answer's cache reads.
+    return not isinstance(tokens.get(_TOKENS_WORKERS_KEY), dict)
+
+
+def _split_count(tokens: dict[str, Any] | None, key: str) -> int | None:
+    """``key`` of the record's prompt split, or None when there is no split."""
+    if not tokens or not _tokens_split(tokens):
+        return None
+    return token_count(tokens.get(key))
+
+
 @dataclass(frozen=True)
 class RepResult:
     """One repetition's verdict.
@@ -675,9 +723,18 @@ class RepResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     tokens_partial: bool = False
+    #: The record's ``cached``, ``cache_write`` and ``reasoning`` buckets,
+    #: only when its ``input`` excludes cache reads (:func:`_tokens_split`),
+    #: for the same line. None otherwise.
+    cached_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
+    #: The delivered reply's shape, for the build log's shape line. Not in
+    #: the hand-off: the dashboard reads it from the log.
+    shape: dict[str, bool | int] | None = None
     #: Named checks the inject lane set aside as not applicable on this
     #: record's transport (``tool_called``, ``worker_commands``,
     #: ``worker_agents``, ``worker_budget``). Empty on
@@ -1216,7 +1273,11 @@ def classify_rep(
             input_tokens=token_count(record.tokens.get("input")) if record else None,
             output_tokens=token_count(record.tokens.get("output")) if record else None,
             tokens_partial=_tokens_partial(record.tokens) if record else False,
+            cached_tokens=_split_count(record.tokens, _TOKENS_CACHED_KEY) if record else None,
+            cache_write_tokens=_split_count(record.tokens, _TOKENS_CACHE_WRITE_KEY) if record else None,
+            reasoning_tokens=_split_count(record.tokens, _TOKENS_REASONING_KEY) if record else None,
             report=record.output if record else "",
+            shape=record.shape if record else None,
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )
 

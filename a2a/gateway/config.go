@@ -71,10 +71,14 @@ const (
 	envPodName      = "POD_NAME"
 )
 
-// envSlackAnswerFeedback turns answer feedback off when "false"
-// (feedback.go); the operator renders it only from
-// slack.answerFeedback=false.
-const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+// envSlackAnswerFeedback and envGchatAnswerFeedback turn answer feedback
+// off when "false" (feedback.go); the operator renders each only from its
+// backend's answerFeedback=false. The gateway holds one chat backend, so
+// either name turns off the one switch.
+const (
+	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+)
 
 // envPeopleSeen turns the people bucket's records off when "false"
 // (people.go); the operator renders it only from
@@ -222,9 +226,9 @@ type Config struct {
 	// PodName is its identity there. Empty runs the gateway unelected.
 	GatewayLease string
 	PodName      string
-	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
-	// rating controls are drawn and nothing is kept, whatever the feedback
-	// bucket holds.
+	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
+	// googleChat.answerFeedback=false: no rating controls are drawn and
+	// nothing is kept, whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.
@@ -337,7 +341,7 @@ type Config struct {
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
-	// MetricsPath and nothing else. It may not be either door's port: a door
+	// MetricsPath and ReadyzPath and nothing else. It may not be either door's port: a door
 	// that lost its port to this listener would fail to bind, and a door
 	// that won it would be what the collector's NetworkPolicy rule admits.
 	MetricsPort int
@@ -718,7 +722,8 @@ func FromEnv() (*Config, error) {
 		// would campaign as the same holder.
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
-	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}

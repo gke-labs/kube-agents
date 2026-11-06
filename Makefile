@@ -32,7 +32,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check cluster-reads-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -117,8 +117,8 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # Every tracked shell script through shellcheck. The `validate` job in
 # .github/workflows/validate.yml runs this target on every pull request with
 # the shellcheck release it pins there, so a warning in a tracked script fails
-# the merge; run it with that release locally, since the apt package is older
-# and reports a different set. No `-s`: each shebang decides the dialect, so
+# the merge; run it with that release locally, since a different release
+# reports a different set. No `-s`: each shebang decides the dialect, so
 # deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
 # SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
 # sources a runtime path that `-x` cannot follow; every other finding is fixed
@@ -437,7 +437,7 @@ endef
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
+PYTHON_TEST_IMPORTS := croniter fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
@@ -893,6 +893,9 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 
 cluster-reads-check: ## Fail when a file under agents/ adds a whole-cluster kubectl read, several kinds or one unpaged kind across every namespace as full objects (pinned backlog: scripts/cluster_reads_allowlist.txt; CI runs this via scripts/test_check_cluster_reads.py).
 	@python3 scripts/check_cluster_reads.py
+
+concurrency-check: ## Fail when a request handler in the broker, the KV server or the auth callout can start an unbounded thread or goroutine (CI runs this via scripts/test_check_bounded_concurrency.py).
+	@python3 scripts/check_bounded_concurrency.py
 
 # The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
 # in front of the real binary (#1309 shipped against a stub that answered `null`

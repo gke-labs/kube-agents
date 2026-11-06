@@ -437,6 +437,31 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_finding_scope_without_its_check_is_rejected(self):
+        """The verifier's model refuses the pair after the cluster lease; this
+        rule refuses it here."""
+        for node, phrase in (
+            ({"scope": "finding", "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [" "], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": 123, "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [123], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"finding_check": "no-pdb", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"finding_check": "", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"scope": "finding_ids", "finding_check": [], "any_of_phrases": ["x"]}, "read only under scope 'finding'"),
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn(phrase, problems[0])
+        for node in (
+            {"scope": "finding", "finding_check": "no-pdb", "required_phrases": ["x"]},
+            {"scope": "finding", "finding_check": ["a", "b"], "required_phrases": ["x"]},
+            {"scope": "finding_ids", "any_of_phrases": ["x"]},
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+
     def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
         """The verifier compares `value` raw and the API holds a bool, so a
         quoted boolean never compares equal and the check asserts nothing; the

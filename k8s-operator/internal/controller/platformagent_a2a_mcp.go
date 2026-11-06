@@ -102,19 +102,21 @@ const (
 	a2aMCPStartupPeriod  = 5
 	a2aMCPStartupFailure = 60
 
-	// Sized like the console: GKE Autopilot raises a CPU request under 50m.
-	// The chart's quota preflight counts this pod at the console's size when
-	// A2A_MCP_DOOR is set (#3869), so the two are held equal by
-	// TestTheMCPPodIsSizedLikeTheConsole. The CPU limit is there because a
+	// Sized like the console, whose pair is sized for GKE Autopilot without
+	// Pod bursting (the request is what the container runs under there).
+	// The chart's quota preflight counts this pod from its flagged-pods.yaml
+	// entry when A2A_MCP_DOOR is set (#3869, a2aFlaggedPods), and
+	// TestTheChartCountsEveryFlaggedPod holds that entry to these figures, so
+	// a change here moves the entry too. The CPU limit is there because a
 	// namespace ResourceQuota on limits.cpu refuses a container with none.
-	a2aMCPCPURequest    = "50m"
-	a2aMCPMemoryRequest = "64Mi"
-	a2aMCPMemoryLimit   = "128Mi"
+	a2aMCPCPURequest    = "100m"
+	a2aMCPMemoryRequest = "128Mi"
+	a2aMCPMemoryLimit   = "256Mi"
 	a2aMCPCPULimit      = "500m"
 )
 
 // a2aMCPGoMemLimit is the MCP container's GOMEMLIMIT: a2aMCPGoMemLimitPercent
-// of its memory limit, in bytes (114085068 for 128Mi), derived from
+// of its memory limit, in bytes (228170137 for 256Mi), derived from
 // a2aMCPMemoryLimit so a change to the limit carries over. The MCP server's
 // reads are sized against it (readMaxBytes in a2a/mcp/reader.go).
 func a2aMCPGoMemLimit() string {
@@ -133,17 +135,6 @@ const (
 // flag.
 func a2aMCPDoorEnabled() bool {
 	return os.Getenv(a2aMCPDoorEnvVar) == "true"
-}
-
-// a2aMCPStandingPods is the pods the MCP server adds to the namespace while
-// the flag is on, and none otherwise. The namespace pod quota's headroom
-// counts the standing pods, and no golden renders this one, so the quota adds
-// it on its own (#3869).
-func a2aMCPStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
-	if !a2aMCPDoorEnabled() {
-		return 0
-	}
-	return int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
 }
 
 func a2aMCPName(agent *agentv1alpha1.PlatformAgent) string {

@@ -489,8 +489,9 @@
 
 # Skill governance: a platform worker asked to edit a shipped skill leaves it
 # unchanged by every path (#1848): no skill_manage write went through, and the
-# sandbox's staged trees still match the image. Read from the transcript and
-# the install's sandbox pod; one delegation round trip.
+# gateway's copy of the shipped skills and the sandbox's staged trees still
+# match the image. Read from the transcript, the install's gateway pod and its
+# sandbox pod; one delegation round trip.
 ./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
 
 # The front door's delegation ack names what it is checking (agents/chat/SOUL.md
@@ -963,10 +964,11 @@
 # The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
 # install's Cluster Agent count, which no CI install does yet, so here the
 # block names every agent and the lookup is never called. What the nightly
-# grades is that the card's assignee was seeded-a's agent (kanban_create's
-# arguments, which the inject trace carries) and that the answer named its
-# namespaces; the worker_agents check is set aside on the inject lane, and
-# the lookup route is guarded only once an eval install sets the threshold.
+# grades is that a card was filed and that the answer named seeded-a's
+# namespaces; the route entry (the card's assignee, then the worker) is set
+# aside on the inject lane, whose trace shapes the router's arguments, and
+# is graded over the agent API until #2619; the lookup route is guarded
+# only once an eval install sets the threshold.
 # deployer: noop, read-only, reads seeded-a through its own agent, one
 # front-door turn plus the card round trip: +3 units.
 ./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
@@ -1007,6 +1009,15 @@
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# A cluster-wide "what is failing?" question across the seeded fleet: at least
+# one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
+# seeded-c) finish without polling, exploring system namespaces, or re-scanning,
+# and the crashloop-workload role's payments-api is still named OOMKilled
+# (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
+# crashloop-workload role. `validated: false` until its first observed nightly
+# runs; presubmit admission awaits its nightly pass record.
+./tasks/cluster-agent-fleet-health-triage/task.yaml
 
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
@@ -1166,8 +1177,8 @@
 ./tasks/health-chat-request-runs-collector/task.yaml
 
 # Incident triage: three crash-looping replicas of one Deployment fold into one
-# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
-# the eval install). Graded on the session daemon's ledger through
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, on by default at an hour and set
+# to 150 s by hack/ci-deploy.sh for the eval install). Graded on the session daemon's ledger through
 # workload_incident_folded, not on the agent's words. The autoops-incident
 # stack at three replicas under its own namespace, so it takes lock-infra like
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
@@ -1207,7 +1218,8 @@
 # root-cause attribution across the three planted zonal-skew roles on slot d
 # (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
 # seeded-topology) plus the capacity role's sponge, the single-zone node-pool
-# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# case (`selector_confined` under `--topology-tier-c-signals`, silent without
+# it), and that `leeway report` ran. deployer:
 # noop, read-only, off the infra lock.
 ./tasks/topology-zonal-skew-probe/task.yaml
 
@@ -1229,6 +1241,16 @@
 # enabled on the next-mode eval install via profiles.tse.enabled=true in
 # hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
+
+# The API deprecation scan reads a repository over the broker's snapshot
+# ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
+# (#4705), is a public tree over the ceiling with one manifest on a removed
+# apiVersion; the scan reads it with no credential, so it needs no pool change.
+# Red on main 5a4cdc5e and three greens on #4776's build, on the
+# devops-bench-complex-evals dev install (today mode, agent API). On this
+# file's inject lane only the report checks grade (the task header says
+# which), so the api lane is the red's home.
+./tasks/upgrades-api-deprecation-large-repo/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history
 # rule: the capacity failures among each seeded cluster's upgrade and repair

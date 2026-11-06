@@ -82,6 +82,12 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
     `closed` is when it closed or merged, `""` while it is open: a caller
     weighing a person's later instruction against a close needs a time on both
     sides.
+
+    `mergeCommit` is the merge or squash commit, `None` unless the state is
+    `merged`. After a rebase merge it is the target's new tip, which may not
+    hold the whole change -- a revert must check. GitHub fills
+    `merge_commit_sha` on an open pull request too, with a throwaway test
+    merge, so the field is read only once merged.
     """
     if node.get("merged_at"):
         state = "merged"
@@ -107,6 +113,9 @@ def proposal(node: dict[str, Any]) -> dict[str, Any]:
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
         "closed": node.get("closed_at") or "",
+        "mergeCommit": (node.get("merge_commit_sha") or None)
+        if state == "merged"
+        else None,
         "body": node.get("body") or "",
     }
 

@@ -103,6 +103,41 @@ func TestADispatchMessageIsCheckedBothWays(t *testing.T) {
 	}
 }
 
+// The task credentials (#3889) ride on a confirm only: a confirm carrying
+// them survives the wire, and an offer or an abandon carrying either is
+// refused.
+func TestTaskCredentialsRideOnAConfirmOnly(t *testing.T) {
+	confirm := DispatchMessage{Type: DispatchConfirm, TaskID: "t1", TaskCredential: "nats-token", ProxyToken: "proxy-token"}
+	raw, err := json.Marshal(confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"taskCredential":"nats-token"`) || !strings.Contains(string(raw), `"proxyToken":"proxy-token"`) {
+		t.Errorf("the confirm's wire form %s does not name the fields taskCredential and proxyToken", raw)
+	}
+	var back DispatchMessage
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if err := back.Validate(); err != nil || back.TaskCredential != "nats-token" || back.ProxyToken != "proxy-token" {
+		t.Errorf("a confirm with credentials: Validate = %v, back %+v", err, back)
+	}
+	if bare, _ := json.Marshal(DispatchMessage{Type: DispatchConfirm, TaskID: "t1"}); strings.Contains(string(bare), "taskCredential") || strings.Contains(string(bare), "proxyToken") {
+		t.Errorf("a confirm without credentials carries the fields: %s", bare)
+	}
+	abandon := DispatchMessage{Type: DispatchAbandon, TaskID: "t1", Reason: "stopped"}
+	for name, m := range map[string]DispatchMessage{
+		"offer with a task credential":   func() DispatchMessage { m := validOffer(); m.TaskCredential = "x"; return m }(),
+		"offer with a proxy token":       func() DispatchMessage { m := validOffer(); m.ProxyToken = "x"; return m }(),
+		"abandon with a task credential": func() DispatchMessage { m := abandon; m.TaskCredential = "x"; return m }(),
+		"abandon with a proxy token":     func() DispatchMessage { m := abandon; m.ProxyToken = "x"; return m }(),
+	} {
+		if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "confirm only") {
+			t.Errorf("%s: Validate = %v, want it refused", name, err)
+		}
+	}
+}
+
 // A decline says why; an accept and a renewal need only the task.
 func TestAnAcceptAndARenewalAreChecked(t *testing.T) {
 	if err := (DispatchAccept{TaskID: "t1", Accepted: true}).Validate(); err != nil {
@@ -262,6 +297,9 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
 		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
 		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"overflowing stop grace":    {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing cooldown":      {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
+		"overflowing deadline":      {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"duplicate profile":         {func(c *DispatchConfig) { c.Profiles = append(c.Profiles, c.Profiles[0]) }, "twice"},
 		"no concurrency":            {func(c *DispatchConfig) { c.Profiles[0].Concurrency = 0 }, "concurrency"},
 		"misnamed durable":          {func(c *DispatchConfig) { c.Profiles[0].Durables[0].Name = "other" }, "durable"},
@@ -366,9 +404,10 @@ func TestTheOperatorsHeldDurableIsOneSubscribeHeldBinds(t *testing.T) {
 	}
 }
 
-// A negative submission retention is refused; zero is an operator that
-// predates the field.
-func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
+// A negative submission retention is refused, and so is one past
+// MaxSubmitRetention, whose seconds would overflow a time.Duration well
+// before they mean anything; zero is an operator that predates the field.
+func TestDispatchConfigRefusesARetentionOutOfRange(t *testing.T) {
 	base := DispatchConfig{Namespace: "ns", ProfileNamespace: "ns-profiles", Ceiling: 6, LeaseSeconds: 90, RenewSeconds: 20, RestartGraceSeconds: 60, AcceptTimeoutSeconds: 10}
 	if err := base.Validate(); err != nil {
 		t.Fatalf("the base config: %v", err)
@@ -377,5 +416,17 @@ func TestDispatchConfigRefusesANegativeRetention(t *testing.T) {
 	neg.SubmitRetentionSeconds = -1
 	if err := neg.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
 		t.Errorf("a negative retention = %v, want refused", err)
+	}
+	longest := base
+	longest.SubmitRetentionSeconds = int(MaxSubmitRetention / time.Second)
+	if err := longest.Validate(); err != nil {
+		t.Errorf("the longest retention: %v", err)
+	}
+	for _, seconds := range []int{int(MaxSubmitRetention/time.Second) + 1, 27670112510} {
+		long := base
+		long.SubmitRetentionSeconds = seconds
+		if err := long.Validate(); err == nil || !strings.Contains(err.Error(), "submitRetentionSeconds") {
+			t.Errorf("a retention of %ds = %v, want refused", seconds, err)
+		}
 	}
 }

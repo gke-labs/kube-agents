@@ -3,26 +3,34 @@
 
 Customers in restricted networks cannot send telemetry. What they can do is paste
 a short block of text into an email or a chat message after reading it. This
-module assembles that block from three sources and nothing else:
+module assembles that block from four sources and nothing else:
 
 * the ``PlatformAgent`` resource, read with ``kubectl get`` (required): mode,
   image tag, readiness, install age and ``status.usage``;
 * the gateway pod, through one ``kubectl exec`` for each (optional): the session-kv
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
-* ``kubectl version`` for the Kubernetes version (optional); the model name is
-  the resource's ``status.inference``, and the gateway's ConfigMap whenever the
-  status has no ``inference`` key (optional): under an operator older than the
-  field, before this operator's first Ready write (so for a CR Degraded since it
-  was created), and under a served CRD that prunes the field.
+* the credential broker pod's Prometheus text on loopback port 8766 (through
+  ``kubectl exec``; optional), rolled up to the top five ``tool/subcommand`` pairs;
+  when that cannot be read (``--no-exec`` included) the resource's
+  ``status.usage.topTools``, the operator's reading of the same five pairs,
+  stands in, rendered the same way the chat gateway's ``/feedback summary``
+  renders it;
+* ``kubectl version`` and cluster object counts for the Kubernetes version and the
+  cluster scale line (optional); the model name is the resource's ``status.inference``,
+  and the gateway's ConfigMap whenever the status has no ``inference`` key (optional):
+  under an operator older than the field, before this operator's first Ready write
+  (so for a CR Degraded since it was created), and under a served CRD that prunes
+  the field.
 
 The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
 reaches it: the task roll-up reads status and timestamps only, and ``main`` refuses
 to print a block in which any identifier read from the resource appears outside
-the ``model:`` line, which is printed by design. Every
-optional source that fails prints as ``unavailable``; the block never exceeds
-SUMMARY_MAX_LINES so a reader can check all of it before pasting.
+the ``model:`` line and the ``proposals by origin:`` line, which are printed by
+design. Every optional source that fails prints as ``unavailable`` (the cluster
+``scale`` line is omitted when unread); the block never exceeds SUMMARY_MAX_LINES
+so a reader can check all of it before pasting.
 
 Run from a workstation::
 
@@ -46,14 +54,19 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 43
+SUMMARY_MAX_LINES = 57
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
+TOP_TOOLS_SHOWN = 5
 TASK_FEED_LIMIT = 200
 DEFAULT_NAMESPACE = "kubeagents-system"
 DEFAULT_AGENT_NAME = "platform-agent"
 GATEWAY_POD_INFIX = "-gateway-"
+BROKER_POD_INFIX = "-credential-proxy-"
+BROKER_CONTAINER = "envoy-credential-proxy"
+BROKER_METRICS_PORT = 8766
+BROKER_METRICS_URL = f"http://127.0.0.1:{BROKER_METRICS_PORT}/metrics"
 POD_PHASE_RUNNING = "Running"
 AGENT_CONTAINER = "platform-agent"
 SESSION_KV_URL = "http://127.0.0.1:8699/v1/tasks"
@@ -73,6 +86,7 @@ CURL_FLAGS = "-sSf"
 CURL_FLAGS_FOLLOW = "-sSfL"
 #: Why an optional source is missing, for the one stderr line.
 REASON_NO_POD = "no running gateway pod"
+REASON_NO_BROKER_POD = "no running credential-proxy pod"
 REASON_EXEC = "the exec or the request failed"
 REASON_SHAPE = "the answer had no tasks list"
 REASON_SKIPPED = "skipped by --no-exec"
@@ -88,6 +102,14 @@ READY_CONDITION = "Ready"
 OTHER_BUCKET = "other"
 SPEND_CURRENCY = "USD"
 TRUNCATED_SUFFIX = "+"
+KCC_CRD_SUFFIX = ".cnrm.cloud.google.com"
+SCALE_RESOURCES: Tuple[Tuple[str, str], ...] = (
+    ("namespaces", "namespaces"),
+    ("deployments", "deployments.apps"),
+    ("pods", "pods"),
+    ("nodes", "nodes"),
+    ("crds", "customresourcedefinitions.apiextensions.k8s.io"),
+)
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -116,7 +138,12 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "sessionsTotal",
     "chatSessionsTotal",
     "toolExecutionsTotal",
+    "toolExecutionsBlockedTotal",
+    "brokerFailuresTotal",
     "eventsIngestedTotal",
+    "chatTurnsErroredTotal",
+    "backgroundTasksGaveUpTotal",
+    "negativeFeedbackTotal",
     "remediationsProposedTotal",
     "remediationsMergedTotal",
     "proposalsAuthored",
@@ -130,6 +157,7 @@ USAGE_COUNTERS: Tuple[str, ...] = (
 USAGE_NO_READING = "no reading"
 USAGE_FORGE_READING_SUFFIX = " (as the forge reports)"
 USAGE_GATEWAY_READING_SUFFIX = " (as the gateway reports)"
+USAGE_AGENT_READING_SUFFIX = " (as the agent reports)"
 #: The fields read off a source rather than counted, each to the suffix naming
 #: that source: absent means no reading yet, which is not 0. The broker reads
 #: the six off the forge; the operator reads the two people readings off the
@@ -144,6 +172,79 @@ USAGE_READINGS: Mapping[str, str] = {
     "peopleSeen7d": USAGE_GATEWAY_READING_SUFFIX,
     "peopleSeen30d": USAGE_GATEWAY_READING_SUFFIX,
 }
+#: Credential broker tool-invocation family and closed outcome order; the
+#: order is also the status row's field names, and the gateway's
+#: usageSummaryToolStatusOrder verbatim.
+TOOL_INVOCATIONS_FAMILY = "kubeagents_tool_invocations_total"
+TOOL_STATUS_ORDER: Tuple[str, ...] = ("success", "error", "blocked", "busy", "abandoned")
+#: ``status.usage.topTools``: the operator's reading of the top five pairs, the
+#: fallback for an unread broker, and its row fields; the gateway's
+#: usageTopTools* names verbatim.
+TOP_TOOLS_STATUS_KEY = "topTools"
+TOP_TOOLS_TOOL_FIELD = "tool"
+TOP_TOOLS_SUBCOMMAND_FIELD = "subcommand"
+TOP_TOOLS_TOTAL_FIELD = "total"
+TOOL_PAIR_SEPARATOR = "/"
+TOP_TOOLS_LABEL = f"tools (top {TOP_TOOLS_SHOWN}, since broker start)"
+#: Closed per-tool subcommand vocabularies, held equal to
+#: ``credential_proxy._subcommand_vocabulary(tool)`` by ``GatewayCopyTest``.
+BROKER_SUBCOMMANDS: Mapping[str, frozenset] = {
+    "kubectl": frozenset({
+        "annotate", "api-resources", "api-versions", "apply", "attach", "auth",
+        "autoscale", "cluster-info", "config", "cordon", "cp", "create", "debug",
+        "delete", "describe", "diff", "drain", "edit", "events", "exec", "explain",
+        "expose", "get", "label", "logs", "patch", "port-forward", "proxy", "replace",
+        "rollout", "run", "scale", "set", "taint", "top", "uncordon", "version", "wait",
+    }),
+    "gcloud": frozenset({
+        "artifacts", "asset", "auth", "billing", "components", "compute", "config",
+        "container", "iam", "info", "init", "logging", "monitoring", "projects",
+        "resource-manager", "services", "version",
+    }),
+    "git": frozenset({
+        "add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+        "checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
+        "init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
+        "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
+        "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
+        "tag", "update-ref", "version", "worktree",
+    }),
+    "gh": frozenset({
+        "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+        "repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+        "workflow",
+    }),
+    "feedback": frozenset({"submit"}),
+}
+BROKER_TOOLS = frozenset(BROKER_SUBCOMMANDS) | {OTHER_BUCKET}
+#: Every word the tools or scale lines may print from closed vocabularies, so an
+#: install whose spec happens to use a generic word is not refused for the
+#: template's own vocabulary.
+TEMPLATE_EXTRA_TOKENS = (
+    BROKER_TOOLS
+    | frozenset(sub for subs in BROKER_SUBCOMMANDS.values() for sub in subs)
+    | frozenset(TOOL_STATUS_ORDER)
+    | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
+)
+#: The nine ``status.usage`` proposal-origin readings, in the origin table's
+#: order (docs/designs/proposal-origin.md); the block prints them as one line.
+#: The gateway's usageSummaryOriginFields verbatim.
+USAGE_ORIGIN_FIELDS: Tuple[str, ...] = (
+    "proposalsFromChat",
+    "proposalsFromConsole",
+    "proposalsFromApi",
+    "proposalsFromEvent",
+    "proposalsFromDrift",
+    "proposalsFromAudit",
+    "proposalsFromScheduled",
+    "proposalsFromIssue",
+    "proposalsFromOther",
+)
+#: What precedes the origin's name in its field.
+ORIGIN_FIELD_PREFIX = "proposalsFrom"
+#: The origin line's start; the audit runs over the block without this line,
+#: which carries only fixed words and digits.
+ORIGIN_LINE_PREFIX = "  proposals by origin: "
 #: Kanban statuses folded into the roll-up's buckets; anything else is "other".
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
@@ -181,8 +282,10 @@ ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "
 INFERENCE_STATUS_KEY = "inference"
 INFERENCE_PROVIDER_FIELD = "provider"
 INFERENCE_MODEL_FIELD = "model"
-#: The model line's start; the audit runs over the block without this one line.
+#: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
+#: The lines printed by design, each removed (its first occurrence) before the audit.
+FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, ORIGIN_LINE_PREFIX)
 #: The model_list entry whose model is the install's default (the operator's agentModelName).
 LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
 #: The ``model_name: model-default`` line, quoted or bare, at any indent.
@@ -283,6 +386,8 @@ class Snapshot:
     tasks_truncated: bool = False
     #: Why a source in ``sources`` is False, by source name.
     source_reasons: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    broker_metrics: Optional[str] = None
+    scale: Optional[Mapping[str, int]] = None
 
     @property
     def identifiers(self) -> List[str]:
@@ -543,12 +648,88 @@ def _nearest_rank(ordered: Sequence[float], quantile: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))]
 
 
+def _tool_pair(tool: str, sub: str) -> str:
+    """The pair as the block prints it: the tool alone for a bare tool, else ``tool/sub``."""
+    return tool if sub == NONE else f"{tool}{TOOL_PAIR_SEPARATOR}{sub}"
+
+
+def summarise_broker_tools(samples: Iterable[Sample]) -> List[Tuple[str, int, Mapping[str, int]]]:
+    """Top ``TOP_TOOLS_SHOWN`` tool/subcommand pairs by invocation count, with closed labels only.
+
+    Sorted by total descending, then tool and subcommand ascending, the order
+    the operator writes ``status.usage.topTools`` in, so the block reads the
+    same from either source.
+    """
+    by_pair: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for sample in samples:
+        if sample.name != TOOL_INVOCATIONS_FAMILY:
+            continue
+        count = int(round(sample.value))
+        if count <= 0:
+            continue
+        raw_tool = (sample.labels.get(TOP_TOOLS_TOOL_FIELD) or OTHER_BUCKET).lower()
+        raw_sub = (sample.labels.get(TOP_TOOLS_SUBCOMMAND_FIELD) or NONE).lower()
+        raw_status = (sample.labels.get("status") or OTHER_BUCKET).lower()
+        tool = raw_tool if raw_tool in BROKER_TOOLS else OTHER_BUCKET
+        allowed_subs = BROKER_SUBCOMMANDS.get(tool, frozenset())
+        if raw_sub == NONE:
+            sub = NONE
+        elif raw_sub in allowed_subs:
+            sub = raw_sub
+        else:
+            sub = OTHER_BUCKET
+        status = raw_status if raw_status in TOOL_STATUS_ORDER else OTHER_BUCKET
+        bucket = by_pair.setdefault((tool, sub), {})
+        bucket[status] = bucket.get(status, 0) + count
+    rows = [(tool, sub, sum(counts.values()), counts) for (tool, sub), counts in by_pair.items()]
+    rows.sort(key=lambda r: (-r[2], r[0], r[1]))
+    return [(_tool_pair(tool, sub), total, counts) for tool, sub, total, counts in rows[:TOP_TOOLS_SHOWN]]
+
+
+def summarise_status_tools(rows: Sequence[Any]) -> List[Tuple[str, int, Mapping[str, int]]]:
+    """``status.usage.topTools`` in the shape ``summarise_broker_tools`` returns.
+
+    The operator sorted and capped the list, so the rows are taken in their
+    order, at most ``TOP_TOOLS_SHOWN`` of them; a row that is not an object is
+    skipped. The gateway's ``renderTopTools`` reads the list the same way.
+    """
+    out: List[Tuple[str, int, Mapping[str, int]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or len(out) >= TOP_TOOLS_SHOWN:
+            continue
+        tool = str(row.get(TOP_TOOLS_TOOL_FIELD) or "")
+        sub = str(row.get(TOP_TOOLS_SUBCOMMAND_FIELD) or "")
+        counts = {status: _count(row.get(status)) for status in TOOL_STATUS_ORDER if _count(row.get(status)) > 0}
+        out.append((_tool_pair(tool, sub), _count(row.get(TOP_TOOLS_TOTAL_FIELD)), counts))
+    return out
+
+
+def _count(value: Any) -> int:
+    """A status row's count as an integer; anything that is not one reads 0, as the gateway's asInt reads it."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tools_lines(top_tools: Sequence[Tuple[str, int, Mapping[str, int]]]) -> List[str]:
+    """The tools block: the label and ``none`` for no pairs, else the label and one row per pair."""
+    if not top_tools:
+        return [f"{TOP_TOOLS_LABEL}: {NONE}"]
+    lines = [f"{TOP_TOOLS_LABEL}:"]
+    status_order = TOOL_STATUS_ORDER + (OTHER_BUCKET,)
+    for pair, total, by_status in top_tools:
+        breakdown = ", ".join(f"{s} {by_status[s]}" for s in status_order if by_status.get(s))
+        lines.append(f"  {pair}: {total}" + (f" ({breakdown})" if breakdown else ""))
+    return lines
+
+
 @functools.lru_cache(maxsize=1)
 def template_tokens() -> frozenset:
     """Every token the block prints with no source at all: the template's own vocabulary."""
     empty = Snapshot(generated_at=TEMPLATE_EPOCH, cr={}, server_version=None, litellm_config=None,
                      tasks=None, litellm_metrics=None, sources={})
-    return frozenset(TOKEN_PATTERN.findall(render(empty)))
+    return frozenset(TOKEN_PATTERN.findall(render(empty))) | TEMPLATE_EXTRA_TOKENS
 
 
 def audit(text: str, identifiers: Iterable[str]) -> List[str]:
@@ -570,19 +751,37 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
     return leaked
 
 
-def _without_model_line(text: str) -> str:
-    """The block less its first ``model:`` line, the one line printed by design.
+def _without_fixed_lines(text: str) -> str:
+    """The block less its first ``model:`` line and its first origin line, the lines printed by design.
 
     A deployment name can carry a spec identifier as a segment
-    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``); the line is
-    never the reason a block is refused, and every other line stays audited.
+    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``), and the
+    origin line prints origin words a cluster may be named (``chat``,
+    ``drift``); neither line is the reason a block is refused, and every
+    other line stays audited.
     """
     lines = text.split("\n")
-    for index, line in enumerate(lines):
-        if line.startswith(MODEL_LINE_PREFIX):
-            del lines[index]
-            break
+    for prefix in FIXED_LINE_PREFIXES:
+        for index, line in enumerate(lines):
+            if line.startswith(prefix):
+                del lines[index]
+                break
     return "\n".join(lines)
+
+
+def _origin_line(usage: Mapping[str, Any]) -> str:
+    """The origins whose reading is above zero, in order; ``none`` when all read zero; ``no reading`` when absent.
+
+    The operator writes all nine or none; a status carrying only some of them,
+    which no operator writes, lists the present non-zero ones and ignores the rest.
+    """
+    readings = [(field, usage.get(field)) for field in USAGE_ORIGIN_FIELDS]
+    present = [(field, int(value)) for field, value in readings if value is not None]
+    if not present:
+        shown = USAGE_NO_READING
+    else:
+        shown = ", ".join(f"{field[len(ORIGIN_FIELD_PREFIX):].lower()} {value}" for field, value in present if value) or NONE
+    return f"{ORIGIN_LINE_PREFIX}{shown}{USAGE_AGENT_READING_SUFFIX}"
 
 
 # --- rendering ------------------------------------------------------------------
@@ -645,6 +844,15 @@ def render(snapshot: Snapshot) -> str:
         "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,
     }
     lines.extend(f"  {key}: {environment[key]}" for key in ENVIRONMENT_KEYS)
+    if snapshot.scale:
+        scale = snapshot.scale
+        lines.append(
+            f"  scale: namespaces {scale.get('namespaces', 0)}, "
+            f"deployments {scale.get('deployments', 0)}, "
+            f"pods {scale.get('pods', 0)}, "
+            f"nodes {scale.get('nodes', 0)}, "
+            f"crds {scale.get('crds', 0)} (kcc {scale.get('kcc', 0)})"
+        )
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         value = usage.get(counter)
@@ -654,7 +862,18 @@ def render(snapshot: Snapshot) -> str:
             lines.append(f"  {counter}: {shown}{suffix}")
         else:
             lines.append(f"  {counter}: {int(value or 0)}")
+    lines.append(_origin_line(usage))
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
+    lines.append(f"  lastHumanActive: {usage.get('lastHumanActiveTime') or NEVER}")
+    # The broker's own text first; the operator's reading of it in the status
+    # when the broker could not be read; unavailable when neither is there.
+    status_tools = usage.get(TOP_TOOLS_STATUS_KEY)
+    if snapshot.broker_metrics is not None:
+        lines.extend(_tools_lines(summarise_broker_tools(parse_prometheus(snapshot.broker_metrics))))
+    elif isinstance(status_tools, list):
+        lines.extend(_tools_lines(summarise_status_tools(status_tools)))
+    else:
+        lines.append(f"{TOP_TOOLS_LABEL}: {UNAVAILABLE}")
     lines.append("performance:")
     if snapshot.litellm_metrics is not None:
         samples = parse_prometheus(snapshot.litellm_metrics)
@@ -706,21 +925,56 @@ def _optional(options: Options, *args: str, timeout: int = KUBECTL_TIMEOUT_SECON
         return None
 
 
-def _gateway_pod(options: Options) -> Optional[str]:
+def _running_pods(options: Options) -> Tuple[Optional[str], Optional[str]]:
+    """The running gateway and credential-proxy pod names from one pod list."""
     raw = _optional(options, "get", "pods", "-n", options.namespace, "-o", "json")
     if raw is None:
-        return None
+        return None, None
     try:
         items = json.loads(raw).get("items") or []
     except ValueError:
-        return None
+        return None, None
+    gateway: Optional[str] = None
+    broker: Optional[str] = None
     for item in items:
         metadata = item.get("metadata") or {}
         name = metadata.get("name") or ""
         running = (item.get("status") or {}).get("phase") == POD_PHASE_RUNNING
-        if name.startswith(options.name + GATEWAY_POD_INFIX) and running and not metadata.get("deletionTimestamp"):
-            return name
-    return None
+        if not running or metadata.get("deletionTimestamp"):
+            continue
+        if gateway is None and name.startswith(options.name + GATEWAY_POD_INFIX):
+            gateway = name
+        elif broker is None and name.startswith(options.name + BROKER_POD_INFIX):
+            broker = name
+    return gateway, broker
+
+
+def _broker_metrics(options: Options, broker_pod: Optional[str]) -> Optional[str]:
+    if not broker_pod:
+        return None
+    raw = _optional(
+        options, "exec", "-n", options.namespace, broker_pod, "-c", BROKER_CONTAINER, "--",
+        "sh", "-c", f"curl {CURL_FLAGS} -m {CURL_TIMEOUT_SECONDS} {BROKER_METRICS_URL}",
+        timeout=KUBECTL_TIMEOUT_SECONDS + CURL_TIMEOUT_SECONDS,
+    )
+    return raw if raw and raw.strip() else None
+
+
+def _cluster_scale(options: Options) -> Optional[Dict[str, int]]:
+    """Cluster-wide object counts from ``-o name`` lines (integer totals only, never names)."""
+    counts: Dict[str, int] = {}
+    for label, resource in SCALE_RESOURCES:
+        args = ["get", resource, "-o", "name"]
+        if label in ("deployments", "pods"):
+            args.insert(2, "--all-namespaces")
+        raw = _optional(options, *args)
+        if raw is None:
+            return None
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        counts[label] = len(lines)
+        if label == "crds":
+            counts["kcc"] = sum(1 for line in lines if line.endswith(KCC_CRD_SUFFIX))
+    return counts
 
 
 def _in_pod_curl(options: Options, pod: str, shell: str) -> Optional[str]:
@@ -813,13 +1067,27 @@ def collect(options: Options) -> Snapshot:
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
     truncated = False
     metrics: Optional[str] = None
+    broker_metrics: Optional[str] = None
+    scale: Optional[Mapping[str, int]] = None
     reasons: Dict[str, str] = {}
     if not options.in_pod:
-        reasons = {"session-kv": REASON_SKIPPED, "litellm-metrics": REASON_SKIPPED}
+        reasons = {
+            "session-kv": REASON_SKIPPED,
+            "litellm-metrics": REASON_SKIPPED,
+            "broker-metrics": REASON_SKIPPED,
+            "scale": REASON_SKIPPED,
+        }
     else:
-        pod = _gateway_pod(options)
+        pod, broker_pod = _running_pods(options)
+        broker_metrics = _broker_metrics(options, broker_pod)
+        if broker_metrics is None:
+            reasons["broker-metrics"] = REASON_NO_BROKER_POD if not broker_pod else REASON_EXEC
+        scale = _cluster_scale(options)
+        if scale is None:
+            reasons["scale"] = REASON_EXEC
         if not pod:
-            reasons = {"session-kv": REASON_NO_POD, "litellm-metrics": REASON_NO_POD}
+            reasons["session-kv"] = REASON_NO_POD
+            reasons["litellm-metrics"] = REASON_NO_POD
         else:
             since = int(now.timestamp()) - TASK_WINDOW_DAYS * SECONDS_PER_DAY
             feed = _in_pod_curl(
@@ -840,8 +1108,13 @@ def collect(options: Options) -> Snapshot:
     return Snapshot(
         generated_at=now, cr=cr, server_version=server_version, litellm_config=litellm_config,
         tasks=tasks, litellm_metrics=metrics, tasks_truncated=truncated,
-        sources={"session-kv": tasks is not None, "litellm-metrics": metrics is not None},
-        source_reasons=reasons,
+        sources={
+            "session-kv": tasks is not None,
+            "litellm-metrics": metrics is not None,
+            "broker-metrics": broker_metrics is not None,
+            "scale": scale is not None,
+        },
+        source_reasons=reasons, broker_metrics=broker_metrics, scale=scale,
     )
 
 
@@ -851,7 +1124,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     parser.add_argument("--name", default=DEFAULT_AGENT_NAME, help="the PlatformAgent resource")
     parser.add_argument("--context")
     parser.add_argument("--kubeconfig")
-    parser.add_argument("--no-exec", action="store_true", help="read the resource only; skip the in-pod sources")
+    parser.add_argument("--no-exec", action="store_true", help="read the resource only; skip the pod and cluster-scale sources")
     args = parser.parse_args(argv)
     options = Options(namespace=args.namespace, name=args.name, context=args.context, kubeconfig=args.kubeconfig, in_pod=not args.no_exec)
     try:
@@ -864,7 +1137,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
         print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(_without_model_line(text), snapshot.identifiers)
+    leaked = audit(_without_fixed_lines(text), snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK

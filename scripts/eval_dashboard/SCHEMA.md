@@ -92,7 +92,7 @@ layout and are collected from the moment they start running.
   in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
-  red comment's "runs from other PRs" count (`gate_comment.py`), the
+  red comment's gate-versus-this-PR call (`gate_comment.py`), the
   Brief's runs list, the Grid's columns, the Cases page's strips and
   presubmit rates — reads presubmit runs only. A nightly run appears where
   the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
@@ -162,8 +162,9 @@ layout and are collected from the moment they start running.
     task's verdict line, in log order:
     `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
     plus `"excerpt": <string>` when the log carried one, `"agent_s"` /
-    `"turn1_s"` when the log carried them, and `"tokens"` when the log
-    carried a count (below).
+    `"turn1_s"` when the log carried them, `"tokens"` when the log
+    carried a count, and `"shape"` when the log carried the reply's shape
+    (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -196,8 +197,8 @@ layout and are collected from the moment they start running.
       when nothing remains.
     - `excerpt` — **optional, additive**: the agent's own words — the text
       of the `rep N report: <text>` line `bench-gate case` prints under the
-      grading line of a repetition that did not pass, after its timing and
-      tokens lines (since
+      grading line of a repetition that did not pass, after its timing,
+      tokens and shape lines (since
       2026-09-15): the first 300 characters of the agent's final report
       (`results.json`'s `output`, the "Actual Output" the judge grades),
       whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
@@ -220,8 +221,8 @@ layout and are collected from the moment they start running.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
-      right under the grading line (before any `rep N tokens:` or
-      `rep N report:` line), one
+      right under the grading line (before any `rep N tokens:`,
+      `rep N shape:` or `rep N report:` line), one
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
@@ -239,9 +240,11 @@ layout and are collected from the moment they start running.
       build graded before it existed), or when the line follows no grading
       line of that repetition: absence means unknown.
     - `tokens` — **optional, additive**: what the repetition billed, from the
-      `rep N tokens: input=<n> output=<n> total=<n> [partial=1]` line
-      `bench-gate case` prints right under the timing line, as
-      `{"input": <int|null>, "output": <int|null>, "total": <int|null>, "partial": <bool>}`.
+      `rep N tokens: input=<n> output=<n> total=<n> [cached=<n> cache_write=<n> reasoning=<n>] [partial=1]`
+      line `bench-gate case` prints right under the timing line, as
+      `{"input": <int|null>, "output": <int|null>, "total": <int|null>, "partial": <bool>}`
+      plus `"cached"`, `"cache_write"` and `"reasoning"` (each an int) when
+      the line carried them.
       The counts are `results.json`'s top-level `tokens.input`,
       `tokens.output` and `tokens.total`. `total` is everything the run
       billed on both transports: on the api transport the front door's
@@ -257,13 +260,44 @@ layout and are collected from the moment they start running.
       (`tokens.usage_partial`), a worker session reported no counts
       (`tokens.workers.unbilled`), or the run delegated work whose workers
       could not be billed at all (`tokens.workers` null), so `total` is the
-      front door's alone. A count the line did not carry, or one
+      front door's alone. `cached` (cache reads), `cache_write` (cache
+      writes) and `reasoning` (counted inside `output`, not beside it) are
+      `results.json`'s buckets of the same names, printed only when `input`
+      excludes cache reads: on the api transport with the front door's
+      session row read (and, when workers were folded in,
+      `tokens.front_door.cached` a count). They are absent on the inject transport, on an api run whose
+      session row could not be read, and on every line printed before
+      they existed; one that is not a whole number at or above zero is
+      absent too. The prompt is then `input + cached + cache_write`, and
+      the cache hit rate `cached` over it. A count among `input`,
+      `output` and `total` the line did not carry, or one
       that is not a whole number at or above zero, is `null`; zero is a
       count. The collector consumes the line whole, like the timing line.
       The key is **absent** when the line carried no count, when the log has
       no such line (every build graded before it existed, and any record
       with no token accounting), or when the line follows no grading line
       of that repetition: absence means unknown.
+    - `shape` — **optional, additive**: how the reply the repetition
+      delivered reads, from the
+      `rep N shape: opens_on_verdict=<0|1> apology=<0|1> bot_messages=<n> words_before_answer=<n> answer_words=<n>`
+      line `bench-gate case` prints under the tokens line, measured by
+      `bench/kube_agents_bench/chat_shape.py` on every case whatever its
+      own checks, as `{"opens_on_verdict": <bool>, "apology": <bool>,
+"bot_messages": <int>, "words_before_answer": <int>,
+"answer_words": <int>}`. The answer is the last delivered card result
+      of a delegated ask and the whole reply otherwise; `opens_on_verdict`
+      is false when its first line is a heading, ends on a colon, or opens
+      on a lead-in phrase ("Let me", "Sure", "Here's"), `apology` reads the
+      whole reply, the ack included, `bot_messages` counts the thread's
+      messages for the ask, and the two word counts are the words ahead of
+      the answer and the answer's own. Reported, never graded. The collector
+      consumes the line whole, like the timing line, and keeps a flag given
+      as `0` or `1` and a count that is a whole number at or above zero;
+      each key is **absent** when the line did not carry it, and `shape`
+      when the line carried nothing that parses, when the log has no such
+      line (a run that delivered no reply, and every build graded before
+      it existed), or when the line follows no grading line of that
+      repetition: absence means unknown.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -1007,7 +1041,7 @@ each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
 previous_build, parts[], missing_parts[], running_parts[],
-verdict_withheld_by, turn1_p50_s, turn1_p95_s, cases[]}`. A
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, cases[]}`. A
 night is one nightly run, or the main, main-b and writers parts' runs of
 one date:
 a run's date is the UTC date of its start plus 15 minutes
@@ -1056,7 +1090,7 @@ verdict for the night, though `newly_failing` still lists what the parts on
 record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
-infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`
+infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape}` with `state` in `pass|partial|fail|infra`
 by the strip's rule over the task's reps (no `reps` key: the task's result
 is one rep), `reason` the first failing rep's grader text (`null` on a
 pass), and `turn1_p50_s` / `agent_p50_s` the median of the task's reps'
@@ -1068,7 +1102,13 @@ every rep of the night's `cases[]` that is not `infra` (`null` when none
 carries it). They are advisory: the page and the digest show the p95 beside
 the chat-turn target, p95 under 10 s (`TURN1_P95_TARGET_S`, from
 `docs/architecture/05-system-architecture.md`), and nothing judges the
-night on it. `expected` counts the cases `nightly_active` on this checkout,
+night on it. A case's `shape` is `nightly.shape_rollup` over its reps'
+`shape` that are not `infra`, `{n, opens_on_verdict, apology,
+bot_messages_p50, words_before_answer_p50, answer_words_p50}`: `n` the reps
+that carried one with both flags, each flag the number of them it was true on, and each
+count's nearest-rank median (`null` when no rep carried it); `null` when no
+rep carried a shape. The night's `shape` is the same over every such rep of
+the night's `cases[]`. Reported, never a verdict. `expected` counts the cases `nightly_active` on this checkout,
 less any case a part of the night dropped on the inject lane
 (`runs[].lane_excluded`); `missing[]` names the expected cases the night did
 not record.
@@ -1431,7 +1471,7 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the reconciles), and the poster treats a told job as recovered only
+failure for the reconciles and for the certification slice), and the poster treats a told job as recovered only
 on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
 a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)

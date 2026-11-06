@@ -119,10 +119,11 @@ that failure is why this step has previously been skipped rather than run.
 **Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
 same target on every pull request, and it is a required check, so a warning-severity finding in
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
-shellcheck step in `.github/workflows/validate.yml`) from
-<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
-one the job pins and asserts, and a different release reports a different set of findings than CI.
+shellcheck step in `.github/workflows/validate.yml`): a different release reports a different set
+of findings than CI. A distribution package is whatever release that distribution ships, so check
+`shellcheck --version` against the pin and install from
+<https://github.com/koalaman/shellcheck/releases> when it differs; the job does the same with the
+runner image's package.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
@@ -180,8 +181,9 @@ check runs once, because its failure is a test verdict. A new `docker/setup-buil
 shape.
 
 `tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
-the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
-nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+the `go install` retry behind setup-envtest, controller-gen and kustomize, `a2a-test.yml`'s
+nats CLI install step and `python-tests.yml`'s operator module download steps against stubs, and
+reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
@@ -336,8 +338,8 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
   further round: fix it only if you would have unasked, saying so in the thread, or answer it there
-  for the reviewer the green summons ([green is settled](#green-is-settled)) — the thread still has
-  to be resolved before the merge, per the section below, but the check is not waiting on it.
+  and resolve it, per the section below ([green is settled](#green-is-settled)); the check is not
+  waiting on it.
 - **Back on the first review's bar:** a diff that has more than doubled in lines since the commit
   the bot last reviewed — the softer bar is earned by a review of roughly this change, not by a
   commit count — and, silently, a pull request whose earlier round the bot could not read back (a
@@ -435,8 +437,8 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   its **Kind** line says `behaviour`, it is on code this pull request added, and the fix is one
   mechanical edit per site that adds no file, helper, branch, flag, dependency or regex
   alternative; a class is fixed whole or deferred whole. Otherwise reply
-  `declined: <reason about this change>` or `deferred to #N`, record it in **Self-Review**, leave
-  the thread open for the approving human, and request no re-read; a round that pushed nothing —
+  `declined: <reason about this change>` or `deferred to #N`, record it in **Self-Review**, resolve
+  the thread ([resolving conversations](#resolving-conversations)), and request no re-read; a round that pushed nothing —
   every finding declined, deferred or refuted — goes to the human instead: `/request-review` if
   no human is on it yet. A finding that correctly applies a rule with no exemption is still a fix
   on a first review and, when it is a 🔴 High, on any round; a High you can show wrong is a
@@ -455,25 +457,28 @@ posting every Medium as a thread and sets no round budget of its own — the sto
 - **A merge of `main` or a rebase that changes nothing of yours earns no `/review`.** The bot
   re-reads the whole pull request at full price and samples a large diff differently each time;
   eleven of the eighteen rounds on #2360 were on merges of `main`.
-- **Resolving.** An unattended agent replies and leaves a declined bot thread open until a human
-  rules on it, and then resolves the thread citing the ruling (**who counts**, next). With a user in
-  the loop you may resolve a declined `kube-agents-bot` finding earlier, once the reply and
-  **Self-Review** give the reason, but a resolved thread collapses and the summoned reviewer may
-  never see it, so prefer leaving it open with the reply
-  ([resolving conversations](#resolving-conversations)).
-- **Who counts, and what a ruling is.** A human is _on_ a pull request when a reviewer is requested,
+- **Resolving.** Reply to a declined or deferred bot finding with the reason, and the follow-up
+  issue when there is one, record it in **Self-Review**, and then resolve the thread, with a user in
+  the loop or without. An open thread makes the pull request the author's on the reviewers'
+  dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
+  reviewer would never see a pull request that kept one open. The reply stays on the resolved
+  thread. A reviewer who disagrees replies in it (one with write access may also unresolve it); a
+  reply does not reopen it, so on one that asks for the fix, unresolve it, and it is your move again
+  (**who counts**, next;
+  [resolving conversations](#resolving-conversations)).
+- **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
   `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
   the author's own approval already covers), or a requested or `OWNERS`-listed reviewer has replied
   in one of its threads. The author's own replies, a bystander's comment, an approval from outside
   `OWNERS`, `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never
   count. A
-  **ruling** on a declined bot thread is read for its content, not for the event GitHub files: a
-  human's approval of the pull request, or their reply in the thread that accepts the decline, is
-  the ruling, and you then resolve the thread citing it; a `CHANGES_REQUESTED` review, or a reply or
+  human's answer to a resolved bot thread is read for its content, not for the event GitHub files: a
+  reply that accepts the decline needs nothing more; a `CHANGES_REQUESTED` review, or a reply or
   comment that asks for the fix, is a disagreement and owes the fix (or the design-question reply of
-  the mechanism rule) with the thread left open for them. A `COMMENTED` review on its own is a reply,
-  not a ruling — GitHub files one for every thread reply. When the human on it has replied without a
+  the mechanism rule): unresolve the thread if the reply left it resolved, and keep it open until
+  the fix lands. A `COMMENTED` review on its own is
+  a reply, not a request for the fix — GitHub files one for every thread reply. When the human on it has replied without a
   verdict, their review request is cleared: answer them and re-request the same reviewer
   (`gh pr edit <n> --add-reviewer <login>`, the hand-back under
   [who owns an open pull request](#who-owns-an-open-pull-request)), not `/request-review`, which
@@ -491,36 +496,46 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-`kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve
-what a commit fixed or you showed wrong, except the description thread, which waits for the body
-edit described below or for a ruling on a disputed ask. A declined bot finding is better left open with its reply until a human
-rules on it — an approval, or a reply in the thread that accepts the decline — which hands the
-thread back to you to resolve, citing it; a reply that asks for the fix is a disagreement and owes
-the fix with the thread left open ([green is settled](#green-is-settled), _who counts_); with a user
-in the loop you may resolve it earlier once the reply and **Self-Review** give the reason. A pull request carrying
+`kube-agents-bot` finding you decline or defer, the reason and the follow-up issue, if any, which
+**Self-Review** gives too. Then resolve what a commit fixed, what you showed wrong, and the bot
+findings you declined or deferred; the description thread waits for the body edit described below,
+or for your reply declining an ask the bot repeated. An open thread makes the pull request its
+author's on the reviewers' dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)),
+so a declined bot thread left open hides the pull request from the reviewer who has to rule on it.
+A reviewer who disagrees replies in the thread; only the author or a user with write access can
+unresolve it. A reply does not reopen a resolved thread, so on a reply that asks for the fix,
+unresolve it (`unresolveReviewThread`, below): it owes the fix and stays open until the fix lands
+([green is settled](#green-is-settled), _who counts_). Nothing mechanical holds a pull request on a
+resolved declined thread: `scripts/hold_unresolved_threads.py` counts unresolved threads only, and
+`AI Review` is not a required check, so the reviewer's approval is their ruling on the declines. A
+disagreement with a human reviewer stays open until they are satisfied: resolving it does not end a
+disagreement with a person. A pull request carrying
 both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that the enqueue sweep keeps it out of the merge queue until then;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
-# Every unresolved thread, with both ids you need: resolveReviewThread takes the
-# thread's node id, while the reply endpoint above takes the first comment's
-# databaseId. REST returns only the latter, which is why this one is GraphQL.
+# Every unresolved thread, and every resolved one whose last comment is not
+# yours (a reviewer's reply does not reopen a resolved thread), with both ids you
+# need: resolveReviewThread and unresolveReviewThread take the thread's node id,
+# while the reply endpoint above takes the first comment's databaseId. REST
+# returns only the latter, which is why this one is GraphQL.
 gh api graphql -f query='
 query($pr: Int!) {
   repository(owner: "gke-labs", name: "kube-agents") {
     pullRequest(number: $pr) {
       reviewThreads(first: 100) {
         nodes {
-          id isResolved isOutdated viewerCanResolve path line
+          id isResolved isOutdated viewerCanResolve viewerCanUnresolve path line
           comments(first: 20) { nodes { databaseId author { login } body } }
+          last: comments(last: 1) { nodes { author { login } } }
         }
       }
     }
   }
 }' -F pr=<number> --jq '.data.repository.pullRequest.reviewThreads.nodes[]
-  | select(.isResolved | not)
-  | "\(.path):\(.line // "outdated") thread \(.id) canResolve=\(.viewerCanResolve)
+  | select((.isResolved | not) or (.last.nodes[0].author.login != "<your-login>"))
+  | "\(.path):\(.line // "outdated") thread \(.id) resolved=\(.isResolved) canResolve=\(.viewerCanResolve) canUnresolve=\(.viewerCanUnresolve)
   reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
   replies so far: \(.comments.nodes | length - 1)"'
 
@@ -543,21 +558,21 @@ Five ways that goes wrong quietly:
   because a mutation that fails after the reply is posted leaves a half-answered thread that looks
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
-  something you resolved.
+  something you resolved, or a reviewer replies in a resolved thread to ask for the fix.
 - No unresolved threads does not mean the bot is answered. Its finding about the pull request
   description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
   and only editing the body answers it. After that, every review that still finds the body owing an
   answer — a section missing, empty, contradicted by the tree, or judged not to answer — repeats the
   finding in its summary body, under **The pull request description is still unanswered.**, and
   opens a new thread only for a section no earlier thread named. A pull request with every thread
-  resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
-  the body is edited, or on a ruling. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  resolved can therefore still hold the `AI Review` check. Resolve the description thread once
+  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
   is a re-cut that checks only for missing and empty sections, so comment `/review fresh` — one of
   the two re-reads of your own — and read the body of a review newer than your edit, with the first
   poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
   that newer review repeats after your reply is a dispute for the human reviewer, not another edit:
-  reply `declined: <reason>`, and once both re-reads are spent leave the thread open for them; a
-  ruling returns it to you to resolve like any other declined thread
+  reply `declined: <reason>`, record it in **Self-Review**, and resolve the thread like any other
+  declined bot thread; a reviewer who disagrees replies, and you unresolve it
   ([green is settled](#green-is-settled), _who counts_).
 
 ## How a change merges
@@ -842,12 +857,11 @@ Every open pull request has exactly one party whose move it is, and the commones
 a fortnight is that both sides believe it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled required check,
-a pull request the sweep left out of the merge queue, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
-comment is the author's `declined:` or `deferred to #N` reply, which waits for the reviewer's
-ruling; an approval, or a reply in the thread that accepts the decline, is that ruling, and the
-thread is the author's again, to resolve citing it; a reply that asks for the fix is theirs to
-answer, thread open — [green is settled](#green-is-settled), _who counts_), changes requested, or
-no human reviewer requested yet.
+a pull request the sweep left out of the merge queue, merge conflicts, unresolved review threads,
+changes requested, or no human reviewer requested yet. An open thread is always the author's move,
+the reviewers' dashboard counts it that way, and a declined or deferred `kube-agents-bot` finding is
+resolved with its reply rather than left open for the reviewer
+([resolving conversations](#resolving-conversations)).
 **Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
 is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
 

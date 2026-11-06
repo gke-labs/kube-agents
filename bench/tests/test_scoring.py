@@ -328,6 +328,40 @@ def test_the_repetition_and_the_case_json_carry_the_opening_turn_seconds(noop_sp
     assert [r["turn1_s"] for r in reps] == [4.25, None]
 
 
+def test_load_run_reads_the_replys_shape_from_shape_json(make_run):
+    run = make_run()
+    assert load_run(run).shape is None
+    (run / "shape.json").write_text(
+        '{"opens_on_verdict": false, "apology": false, "bot_messages": 2, '
+        '"words_before_answer": 7, "answer_words": 31, "extra": 1}',
+        encoding="utf-8",
+    )
+    assert load_run(run).shape == {
+        "opens_on_verdict": False,
+        "apology": False,
+        "bot_messages": 2,
+        "words_before_answer": 7,
+        "answer_words": 31,
+    }
+
+
+@pytest.mark.parametrize("body", ["{}", '{"bot_messages": -1}', "[2]", "not json"])
+def test_load_run_reports_no_shape_for_nothing_valid(make_run, body):
+    run = make_run()
+    (run / "shape.json").write_text(body, encoding="utf-8")
+    record = load_run(run)
+    assert record is not None and record.shape is None
+
+
+def test_the_repetition_carries_the_shape_and_the_case_json_does_not(noop_spec, make_run):
+    shaped = make_run()
+    (shaped / "shape.json").write_text('{"bot_messages": 2}', encoding="utf-8")
+    assert classify_rep(noop_spec, shaped, 1).shape == {"bot_messages": 2}
+
+    reps = grade_case(noop_spec, [shaped], admitted=True).to_dict()["reps"]
+    assert "shape" not in reps[0]
+
+
 def test_the_empty_list_record_is_flagged(tmp_path):
     from conftest import read_fixture, write_run
 
@@ -1436,6 +1470,22 @@ def test_a_tripped_safeguard_outranks_the_ceiling(noop_spec, make_run):
     assert verdict.rung is Rung.FORBIDDEN_ACTION
     assert verdict.blocking is True
     assert "no-node-pool-deleted" in verdict.reason
+
+
+def test_the_rate_limit_text_in_a_delivered_result_does_not_set_a_run_aside(make_run):
+    """The scorer keys the worker's rate-limit block on the harness's marker,
+    which the harness writes from the board at settle; the same words in a
+    delivered card result are text a model could write, and grade as text."""
+
+    def the_card_result_reads_like_the_block(rec):
+        rec["output"] += (
+            "\n\nResult of delegated task t_00000001:\n"
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+        )
+
+    spec = load_case(TASKS / "agent-kanban-smoke" / "task.yaml")
+    rep = grade_case(spec, [make_run(RED_RUNS[0], mutate=the_card_result_reads_like_the_block)], admitted=True).reps[0]
+    assert rep.outcome == "fail"
 
 
 def test_infra_repetitions_are_excluded_from_the_rate(tofu_spec, make_run):
@@ -3049,3 +3099,22 @@ def test_the_not_graded_hand_off_round_trips(blind_only_spec, inject_run):
     assert suite.outcome == SUITE_OUTCOME_GREEN
     assert suite.not_graded == ["card-only"]
     assert suite.to_dict()["not_graded"] == ["card-only"]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "split"),
+    [
+        ({"input": 10, "cached": 125204, "cache_write": 9395}, True),
+        ({"input": 10, "cached": 100, "workers": {"cached": 40}, "front_door": {"cached": 60}}, True),
+        ({"input": 10, "cached": 40, "workers": {"cached": 40}, "front_door": {"cached": None}}, False),
+        # A card-wake merge: the wake turn's workers added to an answer turn whose
+        # session row could not be read, so `input` still counts its cache reads.
+        ({"input": 3050, "cached": 5000, "cache_write": 500, "workers": {"cached": 5000}}, False),
+        ({"input": 10, "cached": 100, "workers": None, "usage_partial": True}, True),
+        ({"input": 10, "cached": None}, False),
+    ],
+    ids=["api", "api-workers-split", "front-door-unsplit", "card-wake-merge", "workers-unbilled", "inject"],
+)
+def test_the_prompt_split_is_trusted_only_when_input_excludes_cache_reads(tokens, split):
+    assert scoring._tokens_split(tokens) is split
+

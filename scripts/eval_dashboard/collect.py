@@ -375,7 +375,7 @@ NOT_GRADED_KEY = "not_graded"
 # an id the pages link is one the collector keeps -- and the list is cut at
 # the size a suite could name; the rest is dropped as malformed detail, the
 # way a non-string entry already is. Same idea as the log parser's `\S+`
-# task names and the excerpt scrub in gate_comment.py. Matched with
+# task names. Matched with
 # `fullmatch`: a `$` anchor under `match` admits one trailing newline.
 _CASE_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 NOT_EVALUATED_MAX_CASES = 64
@@ -502,11 +502,29 @@ _REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # plus `partial=1` when the record says the counts are short (the inject
 # transport's `tokens.usage_partial`, a worker in `tokens.workers.unbilled`,
 # or `tokens.workers` null: the run delegated and no worker was billed).
+# After `total` come `cached`, `cache_write` and `reasoning` when the
+# record's `input` excludes cache reads (the api transport with the front
+# door's session row read; never the inject transport), absent otherwise and
+# on every line printed before they existed.
 # Its own shape, `rep N tokens:`, so `_REP_LINE` never matches it.
 #   rep 2 tokens: input=60468 output=79 total=60547 partial=1
+#   rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0
 _REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")
 _REP_TOKENS_KEYS = ("input", "output", "total")
+_REP_TOKENS_SPLIT_KEYS = ("cached", "cache_write", "reasoning")
 _REP_TOKENS_PARTIAL = "partial=1"
+# The shape of the reply the run delivered: one optional line under the
+# tokens line, printed by `bench-gate case` from the harness's shape.json
+# (bench/kube_agents_bench/chat_shape.py): `opens_on_verdict` and `apology`
+# as 1 or 0, then three counts. Reported, never graded. Its own shape,
+# `rep N shape:`, so `_REP_LINE` never matches it.
+#   rep 2 shape: opens_on_verdict=1 apology=0 bot_messages=2 words_before_answer=0 answer_words=48
+_REP_SHAPE_LINE = re.compile(r"^\s+rep (?P<n>\d+) shape: (?P<fields>.*)$")
+_REP_SHAPE_FLAGS = ("opens_on_verdict", "apology")
+_REP_SHAPE_COUNTS = ("bot_messages", "words_before_answer", "answer_words")
+# Longer than any real count, and far inside int()'s digit limit, which a
+# forged line would otherwise trip.
+_REP_SHAPE_MAX_DIGITS = 9
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -653,27 +671,55 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
 
     ``{"input", "output", "total"}`` each an int, or None when the line did
     not carry it or its value is not a whole number at or above zero, and
-    ``partial`` true when the line says the counts are short. A line with no
-    count that parses adds no key -- absence means unknown -- and a line for
-    a repetition the log never graded is dropped.
+    ``partial`` true when the line says the counts are short. Each of
+    ``_REP_TOKENS_SPLIT_KEYS`` is added only when the line carried it as such
+    a count. A line with no count that parses adds no key -- absence means
+    unknown -- and a line for a repetition the log never graded is dropped.
     """
     words = fields.split()
     counts: dict = {key: None for key in _REP_TOKENS_KEYS}
+    split: dict = {}
     for pair in words:
         key, _, raw = pair.partition("=")
-        if key in counts and raw.isascii() and raw.isdigit():
+        target = counts if key in counts else split if key in _REP_TOKENS_SPLIT_KEYS else None
+        if target is not None and raw.isascii() and raw.isdigit():
             # int() refuses a digit run past the interpreter's limit; a
             # count that size is not one, and must not drop the build.
             try:
-                counts[key] = int(raw)
+                target[key] = int(raw)
             except ValueError:
                 pass
-    if all(value is None for value in counts.values()):
+    if all(value is None for value in counts.values()) and not split:
         return
+    counts.update(split)
     counts["partial"] = _REP_TOKENS_PARTIAL in words
     for rep in reversed(task.get("reps") or []):
         if rep["n"] == n:
             rep["tokens"] = counts
+            return
+
+
+def _attach_shape(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N shape:` line as ``shape`` on the rep it follows.
+
+    A flag is kept as a bool when its value is ``1`` or ``0``, a count as an
+    int when it is a whole number at or above zero; anything else, and an
+    unknown key, is skipped, never raised on. A line with nothing that parses
+    adds no key -- absence means unknown -- and a line for a repetition the
+    log never graded is dropped.
+    """
+    shape: dict = {}
+    for pair in fields.split():
+        key, _, raw = pair.partition("=")
+        if key in _REP_SHAPE_FLAGS and raw in ("0", "1"):
+            shape[key] = raw == "1"
+        elif key in _REP_SHAPE_COUNTS and raw.isascii() and raw.isdigit() and len(raw) <= _REP_SHAPE_MAX_DIGITS:
+            shape[key] = int(raw)
+    if not shape:
+        return
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep["shape"] = shape
             return
 
 
@@ -708,8 +754,8 @@ def parse_build_log(text: str) -> dict:
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
     grading line becomes that rep's `excerpt`, the agent's own words, a
-    `rep N timing:` line its `agent_s` and `turn1_s`, and a `rep N tokens:`
-    line its `tokens`.
+    `rep N timing:` line its `agent_s` and `turn1_s`, a `rep N tokens:`
+    line its `tokens`, and a `rep N shape:` line its `shape`.
     """
     project = None
     tasks = []
@@ -723,7 +769,7 @@ def parse_build_log(text: str) -> dict:
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
         # it. A report line that follows no grading block is dropped, and so
-        # is a timing or tokens line.
+        # is a timing, tokens or shape line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
@@ -738,6 +784,11 @@ def parse_build_log(text: str) -> dict:
         if m:
             if current is not None:
                 _attach_tokens(current, int(m.group("n")), m.group("fields"))
+            continue
+        m = _REP_SHAPE_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_shape(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:

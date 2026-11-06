@@ -54,6 +54,12 @@ const DefaultHeldAckWait = 2 * time.Minute
 // delivery back at once, for another worker to take.
 const abandonedNakDelay = time.Second
 
+// heldDrainTimeout bounds how long Stop holds off cancelling the handlers
+// while the consume context drains. A connection already gone never finishes
+// the drain; the handlers are cancelled either way, and a delivery that
+// couldn't be given back waits out AckWait.
+const heldDrainTimeout = 2 * time.Second
+
 // heartbeatsPerAckWait is how many in-progress acks a holder sends per
 // AckWait, so two can be lost before the server redelivers.
 const heartbeatsPerAckWait = 3
@@ -196,7 +202,8 @@ type Delivery interface {
 // itself shutting down.
 type HeldSubscription interface {
 	// Stop stops taking deliveries and cancels every running handler's
-	// context. It does not wait; call Wait for that.
+	// context once what was already on its way has been given back (at
+	// most heldDrainTimeout later). It does not wait; call Wait for that.
 	Stop()
 	// StopIntake stops taking deliveries and lets running handlers finish:
 	// what a worker does to drain before it exits. Deliveries already on
@@ -295,7 +302,7 @@ type heldSubscription struct {
 }
 
 func (hs *heldSubscription) Stop()                          { hs.s.Stop() }
-func (hs *heldSubscription) StopIntake()                    { hs.s.stopIntake() } // still registered, so Close can cancel a straggler
+func (hs *heldSubscription) StopIntake()                    { hs.s.drainIntake() } // still registered, so Close can cancel a straggler
 func (hs *heldSubscription) Wait(ctx context.Context) error { return hs.h.wait(ctx) }
 
 // heldState is a durableSub's held-mode half. nil on an auto-ack sub.

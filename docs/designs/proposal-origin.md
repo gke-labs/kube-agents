@@ -1,9 +1,11 @@
 # Proposal origin: which feature opened each pull request
 
-**Status:** proposed, 2026-11-03. Workstream 3 of the telemetry epic that asked who starts the
-agent's pull requests. Lands after the second pull request of `human-interaction-readings.md`
-(the readings slot with a target per reading kind) and after `install-model-reading.md` (the
-summary audit that removes a fixed line); it builds on both. Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
+**Status:** implemented, 2026-11-04: the first pull request landed the origin record, the
+claim token, the ledger and its series (2.1, 2.2); the second the operator's origins reading, the
+nine fields, their gauges and the summary line (2.3, 2.4). Proposed 2026-11-03. Workstream 3 of the
+telemetry epic that asked who starts the agent's pull requests. It follows the second pull request
+of `human-interaction-readings.md` (the readings slot with a target per reading kind) and
+`install-model-reading.md` (the summary audit that removes a fixed line). Builds on [`usage-counters-producer.md`](usage-counters-producer.md) (the
 status block, its fold rules, its gauges and its zero-PII contract),
 [`proposal-outcome-readings.md`](proposal-outcome-readings.md) (the broker's exact
 `proposal-create` count, which this design leaves alone) and
@@ -143,7 +145,7 @@ names, and a record with neither takes no claim. The verb does the forge check i
 with the credential it holds and accepts each token once, so the hook no longer makes its own
 forge reads. The claim is one broker call through the sandbox hop per record line, made in line
 before the command returns, so the hook keeps today's cap of five record lines per output: the
-first five are claimed, or burned, before the model reads them, and the hook strips the token
+first five are claimed, or burned, before the model reads them, none starts after the hook's 20 s claim budget, and each claim's hop is bounded so the hook answers inside Hermes' 30 s callback timeout. The hook strips the token
 from every record line in the output it did not claim, those past the cap and those whose claim
 failed, in every process, so no live token reaches what the model reads. A proposal whose line
 went unclaimed counts as missed. A line without a valid token is left as text
@@ -172,7 +174,7 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
 instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
 succeeds and a ledger write that then fails loses that proposal's count, since the token is
 spent. A broker restart between the mint and the claim loses the claims in flight, since the
@@ -192,17 +194,22 @@ what that needs: it treats a process it has not seen as counting from zero and a
 sample, so a durable count served as a counter would be re-added in full on every gateway
 restart or pod roll. So the nine are **readings**, not counters, through the readings slot
 ([`proposal-outcome-readings.md`](proposal-outcome-readings.md) §6) as
-[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target, present when all nine origins
-resolved from the body (the listener serves every origin's series, zero included, so the kind
-needs no age series, like the `people` kind), one miss per poll without them, cleared after
-two, the largest reading across pods, and its own pruning record ("the nine origin readings"),
-so a served CRD that predates them keeps the rest of the block landing.
+[`human-interaction-readings.md`](human-interaction-readings.md) §2.2 generalises it in its second pull request, a target per reading with the miss rule following the target, which this design depends on: a new reading kind, `origins`, on the chat plugin's target (its metrics listener, read on the pod
+that runs the gateway), present when all nine origins resolved from the body, each on at least
+one sample and summed over `platform` (the listener serves every origin's series, zero included,
+from its first ledger read, so the kind needs no age series, like the `people` kind), one miss
+per poll without them, cleared after two, the largest reading across the bodies read, and its own
+pruning record ("the nine origin readings"), so a served CRD that predates them keeps the rest of
+the block landing.
 
 The fields, named like the block's other readings: `proposalsFromChat`,
 `proposalsFromConsole`, `proposalsFromApi`, `proposalsFromEvent`, `proposalsFromDrift`,
 `proposalsFromAudit`, `proposalsFromScheduled`, `proposalsFromIssue`, `proposalsFromOther`. Each
-is a pointer field: a 0 is a reading; absent until the first reading and while the served CRD
-predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+is a pointer field: a 0 is a reading; absent until the first reading, after two polls in a row
+without one, and while the served CRD predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+A ledger read that fails after the plugin's first success keeps serving the last counts, so the
+fields hold a stale count until the plugin restarts; a staleness signal beside the series is a
+plugin follow-up, not part of this design.
 Each gets a row in the per-field gauge `kubeagents_platformagent_usage{field=...}`, so a shared
 Prometheus reads the split with one `sum by (field)`.
 
@@ -210,19 +217,21 @@ Prometheus reads the split with one `sum by (field)`.
 
 ### 2.4 The summary
 
-Both summary copies print one line after the proposal readings:
+Both summary copies print one line after the readings, before `lastActive`:
 `  proposals by origin: chat 3, event 1, audit 2 (as the agent reports)`, listing the origins
 whose reading is above zero in the table's order, `none` when every reading is zero, and
-`no reading` when they are absent. One line rather than nine reads as the answer to one
-question. The script's full block is at its forty-line cap today, and the people readings' pull request
-adds its own rows first, so both copies' caps rise by one from wherever that pull request leaves
-them, said in the commit body. The nine field names are a list pinned between the copies by the
-existing copy test, beside the counters and the readings. The privacy audit removes this line
-before it checks the block, the removal
+`no reading` when none is present. One line rather than nine reads as the answer to one
+question. Each copy's line cap rises by one: the script's `SUMMARY_MAX_LINES` from 43 to 44, the
+gateway's `usageSummaryMaxLines` from 41 to 42. The nine field names are a list pinned between the
+copies by the existing copy test, beside the counters and the readings. The privacy audit removes
+this line before it checks the block, the removal
 [`install-model-reading.md`](install-model-reading.md) §2.2 adds for the model line and this
-design depends on: the line carries only fixed text (its label, the nine origin words, `none`, `no reading`, the
-suffix) and digits, so nothing on it can leak, and a cluster or project named `chat` or `drift`
-is still refused anywhere else in the block.
+design depends on: the line carries only fixed text (its label, the nine origin words, `none`,
+`no reading`, the suffix) and digits, so nothing on it can leak. Its label and suffix join each
+copy's own vocabulary, which the audit never refuses. An identifier spelled like an origin word is
+still refused on every other line, except where that word is already the copy's own: the gateway's
+block prints `chat turns`, so the gateway never refuses `chat` on any line, while the script
+refuses it everywhere but the two removed lines.
 
 ### 2.5 Trust and privacy
 

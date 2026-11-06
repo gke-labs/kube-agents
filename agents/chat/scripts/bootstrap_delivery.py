@@ -1532,7 +1532,7 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
             if not chat_notify.route_unavailable(res.returncode):
                 break
             if delay is None:
-                return NOT_POSTED, f"the gateway's notify route was not there: {(res.stderr or '').strip()}"
+                return NOT_POSTED, f"the gateway posted nothing for now (its route absent, or the record unreadable): {(res.stderr or '').strip()}"
             time.sleep(delay)
     except OSError as e:
         return NOT_POSTED, f"could not write the report card: {e}"

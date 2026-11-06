@@ -17,8 +17,10 @@ repetition's final report under its grading line (`rep N report:`), the
 collector keeps it as `reps[].excerpt`, and the Brief and the run page show
 it beside the grader's reason (builds graded before 2026-09-15 carry none).
 In the same way, a `rep N timing:` line under each grading line carries the
-repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
+repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show,
+and a `rep N shape:` line the shape of the reply it delivered, from which the Nightly
+page shows how many repetitions opened on the answer, the apologies and the answer's
+median length ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 which also carries the slow-gate and close-to-the-deadline notes
@@ -519,12 +521,16 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
+not a pool job but the certification lane's weekly slice, watched here because
+its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
-`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
-identities cannot write the Prow archive),
+`gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
+identities cannot write the Prow archive), or from the nightlies' bucket
+`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
 `fleet-reconcile.json`, the sweep's `pull-sweep.json`, and beside it the
@@ -556,7 +562,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -1001,8 +1007,22 @@ Nightly report's.
   with timing and a typical are slow, and more than 5, one "broad slowdown" line replaces the
   list: a shift that wide has one cause. A night cut off at the deadline,
   or with a part missing or still running, carries the block too, labelled as
-  covering only the cases or parts on record. It is advisory and moves no
+  covering only the cases or parts on record. Nights here are dates: a
+  same-date re-run of the main job counts once, by its newest run. It is
+  advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
+- **🗣 Reply shape:** how last night's answers read, over every repetition that
+  delivered one and was not lost to infra: the share opening on the answer rather than a lead-in or a heading,
+  the answer's median length, the median messages posted for the ask, and the share
+  that apologized, each against its typical, worked out as the latency line's are. A
+  number gets a ⚠ mark when the share opening on the answer drops 5 points or more,
+  the share apologizing rises as much, or the answer or the message count reaches
+  1.5× its typical. A second line gives the two shares for the chat-and-routing
+  cases alone, whose replies are what they grade, marked at 10 points: a drop
+  confined to them barely moves the whole suite's share. A night cut off at the deadline, or with a part missing or still
+  running, carries the line too, labelled as the latency block is. It is advisory and
+  moves no state, verdict or gate. `scripts/eval_dashboard/nightly_tone.py`
+  holds the rules, and `bench/kube_agents_bench/chat_shape.py` measures each reply.
 - A footer asking owners to reply in the thread.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
@@ -1010,9 +1030,9 @@ report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
 counts), no recovery, no infra item and no part cut off, missing or still running is
 one summary line instead: the date, the pass count and how many were not graded, "no
-new reds, nothing recovered", and how many are still red, followed by the latency block. A night whose main part was cut
+new reds, nothing recovered", and how many are still red, followed by the latency block and the reply-shape line. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list and the latency block follow; a writers part cut off, missing or still running is named in
+counted, and only the infra list, the latency block and the reply-shape line follow; a writers part cut off, missing or still running is named in
 the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
@@ -1170,7 +1190,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when repetitions carry the prompt
+split), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1183,8 +1204,12 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
-left out when no repetition the week compared carries a count.
+weighs the same and its partial counts do not move it. When full counts carry the prompt
+split, the tile and the Chat line add the cache hit rate: their cache reads over their
+whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
+a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
+tokens tile and the Chat line are left out when no repetition the week compared carries a
+count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy
@@ -1411,15 +1436,15 @@ first shows up as a 403 in an agent transcript on whichever pull request leased
 the project (#1927: a role missing on all 30 projects for two weeks). The
 `fixture-state-scan` job runs the verifier on a clock instead. After the fleet
 scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
-`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,token_minter_kms --report`
+`verify_ci_pool_project.py --checks project_and_apis,iam,artifact_registry,gke_and_state,forge_pieces,gitops_default_branch,gemini_api_key,token_minter_kms --report`
 against every pool project, eight at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project and export `MODEL_PROVIDER=gemini` (the five eval nightlies, `post-kube-agents-eval-rc` and the two Argon smoke presubmits; `pull-kube-agents-smoke-test-claude`, `pull-kube-agents-smoke-test-flash` and the forge smoke variants stay on Vertex AI and do not read the key). `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
-(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout), the Gemini Developer API key (`gemini_api_key`; lease-silent, and kept out until the registered projects carry the key, because until then it reports drift on every one).
+(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,

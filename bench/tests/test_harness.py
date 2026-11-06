@@ -1690,6 +1690,83 @@ def test_a_timing_file_that_will_not_write_leaves_the_run_alone(
     assert not target.is_file()
 
 
+# --- the delivered reply's shape file -----------------------------------------
+#
+# hack/ci-eval-pr.sh sets KUBE_AGENTS_SHAPE_FILE per repetition and copies the
+# file beside results.json, where load_run reads it for the dashboard.
+
+
+def test_a_run_writes_its_replys_shape(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "opens_on_verdict": True,
+        "apology": False,
+        "bot_messages": 1,
+        "words_before_answer": 0,
+        "answer_words": len(_FINAL_TEXT.split()),
+    }
+    assert [p.name for p in tmp_path.iterdir()] == ["shape.json"]
+
+
+def test_no_shape_file_without_the_variable(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_shape_file_for_a_silence_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway posts nothing for the marker, so there is no reply to measure."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+
+    harness._write_chat_shape(AgentResult(output="[SILENT]", trajectory=[], metadata={"final_message": "[SILENT]"}))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_for_an_answer_adopted_from_the_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The relay posted nothing; the thread shows only the placeholder."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    metadata = {"final_message": "**Two pods are OOMKilled.**", "outcome": harness.inject.OUTCOME_STREAM_TERMINAL, "window_posts": 1}
+
+    harness._write_chat_shape(AgentResult(output="", trajectory=[], metadata=metadata))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_when_nothing_was_delivered(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert not target.exists()
+
+
 # --- the ci-eval-pr.sh contract ----------------------------------------------
 
 
@@ -2104,7 +2181,8 @@ def test_a_running_card_is_watched_on_the_board_without_a_model_turn(
     # result once the board shows the card done. The three reads that saw it
     # still moving cost no turn at all.
     assert len(stub_agent.requests) == 2
-    assert len(reads) == 4
+    # The four polls, then settle's read of the cards' end state (#4998).
+    assert len(reads) == 5
     assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
 
 
@@ -4574,13 +4652,14 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
         for s in no_cluster_exec
     ]
     # The pod clock at the run's start, the board read of the one poll
-    # (unanswered here, so the status turn follows), then three reads: the
-    # artifact listing, the card's worker log (for the worker_commands check),
-    # then the workers' session stores (for the worker trajectory); the purge
-    # comes after all of them. The stub pod prints nothing, so the purge is owed.
-    assert kinds == ["clock", "board", "read", "read", "read", "purge", "owe"]
-    assert harness._LOGS_DIR in no_cluster_exec[3]
-    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[4]
+    # (unanswered here, so the status turn follows), then the artifact
+    # listing, settle's read of the cards' end state (#4998), the card's
+    # worker log (for the worker_commands check), then the workers' session
+    # stores (for the worker trajectory); the purge comes after all of them.
+    # The stub pod prints nothing, so the purge is owed.
+    assert kinds == ["clock", "board", "read", "board", "read", "read", "purge", "owe"]
+    assert harness._LOGS_DIR in no_cluster_exec[4]
+    assert worker_trajectory.CAPTURE_PRESENT in no_cluster_exec[5]
 
 
 def test_a_run_that_delegates_nothing_reads_nothing_and_purges_nothing(
@@ -5175,6 +5254,238 @@ def test_rate_limit_reason_prefix_matches_guardrail_constant():
     assert harness._RATE_LIMIT_REASON_PREFIX == mod.RATE_LIMIT_REASON_PREFIX
     reason_line = mod.rate_limit_block_reason("rate_limit", "429")
     assert harness._extract_infra_failure_reason(reason_line) == "rate_limit"
+
+
+def test_guardrail_block_kind_matches_the_patch_constant():
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "deploy/docker/patches/kanban_guardrail_exit.py"
+    spec = importlib.util.spec_from_file_location("kanban_guardrail_exit", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert harness._GUARDRAIL_BLOCK_KIND == mod.RATE_LIMIT_BLOCK_KIND
+
+
+_GUARDRAIL_SUMMARY = (
+    "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429: "
+    "TPM quota exhausted"
+)
+
+
+def _worker_entry(name: str, task: str = "t_1", **args: object) -> dict[str, object]:
+    return {"name": name, "args": dict(args), "result": None, "failed": None, "agent": "platform", "task": task}
+
+
+def _settle_after_guardrail_block(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entries: list[dict[str, object]] | None,
+    cards: dict[str, harness.board.BoardCard] | None,
+    artifact_paths: list[str] = (),
+    front_trajectory: list[dict[str, object]] | None = None,
+    awaited: list[str] = ("t_1",),
+    summary: dict[str, object] | None = None,
+) -> harness.AgentResult:
+    """Settle the awaited cards (``t_1`` by default) with the board, the capture
+    and the artifacts faked; ``entries=None`` is a capture that could not run."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": harness._WorkerLog("log", "100", "100")})
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: None
+        if entries is None
+        else harness.worker_trajectory.WorkerCapture(
+            entries=list(entries), tokens={}, unbilled=[], summary=dict(summary or {})
+        ),
+    )
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, awaited, to: cards)
+    monkeypatch.setattr(harness, "_artifact_paths", lambda task_ids, to: list(artifact_paths))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "report body")
+    res = harness.AgentResult(
+        output="router ack", trajectory=list(front_trajectory or [{"name": "kanban_create"}])
+    )
+    harness.KubeAgentsHarness._settle(res, [], list(awaited))
+    return res
+
+
+_ACTED = [_worker_entry("read_file", path="x"), _worker_entry("terminal", command="kubectl get pods")]
+_GUARDRAIL_CARD = {"t_1": harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, "transient")}
+
+
+def test_settle_marks_infra_when_the_guardrail_blocked_a_worker_that_acted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4998: the worker ran commands, then spent its retries on 429s and the
+    guardrail blocked its card. The run holds no answer; it is infrastructure,
+    and rung 1 grades what the worker did before that above the mark."""
+    res = _settle_after_guardrail_block(monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD)
+    assert res.errors and res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate-limit guardrail blocked t_1" in res.errors[0]
+    assert res.output == "router ack"
+
+
+def test_settle_keeps_a_card_the_worker_blocked_itself_graded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same board state written by the model's own kanban_block call is
+    the worker's word, not the guardrail's: graded."""
+    entries = [*_ACTED, _worker_entry("kanban_block", reason=_GUARDRAIL_SUMMARY, kind="transient")]
+    res = _settle_after_guardrail_block(monkeypatch, entries=entries, cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_the_worker_completed_under_the_tool_call_wrapper_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wrapped = _worker_entry(
+        harness.worker_trajectory.TOOL_CALL_WRAPPER,
+        calls=[{"name": "kanban_complete", "args": {"summary": _GUARDRAIL_SUMMARY}}],
+    )
+    assert "kanban_complete" in harness.worker_trajectory.wrapped_tool_names(wrapped)
+    res = _settle_after_guardrail_block(monkeypatch, entries=[*_ACTED, wrapped], cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, raw='{"name": "kanban_bl'),
+        {**_worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER), "args": "kanban_block(...)"},
+        _worker_entry(harness.worker_trajectory.TOOL_CALL_WRAPPER, calls=[{"arguments": {}}]),
+    ],
+    ids=["clipped-raw", "string-args", "no-names"],
+)
+def test_settle_keeps_a_card_graded_when_a_wrapper_call_could_hide_the_workers_close(
+    wrapper: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreadable ``tool_call`` wrapper may hold the worker's own kanban_block:
+    #3988 counts it as acted, and here it fails closed to graded."""
+    assert not harness.worker_trajectory.wrapped_tool_names(wrapper)
+    res = _settle_after_guardrail_block(monkeypatch, entries=[*_ACTED, wrapper], cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_graded_when_the_front_door_acted_after_it_died(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A front door that ran a command of its own, or made up an answer, after
+    the card died produced something the judge must see."""
+    res = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards=_GUARDRAIL_CARD,
+        front_trajectory=[{"name": "kanban_create"}, {"name": "terminal", "args": {"command": "kubectl delete deploy web"}}],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_graded_when_the_capture_was_clipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capture that hit a cap may have dropped the worker's own kanban_block,
+    so the guardrail's block and the worker's cannot be told apart: graded."""
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD, summary={"clipped": ["calls"]}
+    )
+    assert harness.worker_trajectory.gaps(res.metadata["worker_trajectory"])
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        [_worker_entry("kanban_block", task="t_other", task_id="t_1", reason="x", kind="transient")],
+        [{"name": "kanban_block", "args": {"task_id": "t_1", "reason": "x", "kind": "transient"}}],
+    ],
+    ids=["another-cards-worker", "front-door"],
+)
+def test_settle_keeps_a_card_graded_when_someone_else_blocked_it(
+    closer: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = closer if closer[0].get("agent") else []
+    front = [{"name": "kanban_create"}, *([] if closer[0].get("agent") else closer)]
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=[*_ACTED, *worker], cards=_GUARDRAIL_CARD, front_trajectory=front
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_fan_out_graded_when_one_card_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every awaited card has to be the guardrail's block: one that completed is
+    a delivery the run is graded on."""
+    cards = {**_GUARDRAIL_CARD, "t_2": harness.board.BoardCard("done", "The pods are healthy.", None, None)}
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=cards, awaited=["t_1", "t_2"]
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    both = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards={**_GUARDRAIL_CARD, "t_2": _GUARDRAIL_CARD["t_1"]},
+        awaited=["t_1", "t_2"],
+    )
+    assert both.errors and "blocked t_1, t_2" in both.errors[0]
+
+
+def test_settle_keeps_a_guardrail_blocked_card_with_an_artifact_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file the worker wrote before it died is a delivery the checks read."""
+    res = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards=_GUARDRAIL_CARD,
+        artifact_paths=[f"{harness._ATTACHMENTS_DIR}/t_1/report.md"],
+    )
+    assert "Artifact report.md produced by delegated task t_1" in res.output
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_guardrail_blocked_card_graded_when_the_capture_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No capture, no way to tell the guardrail's block from the model's: fail closed."""
+    res = _settle_after_guardrail_block(monkeypatch, entries=None, cards=_GUARDRAIL_CARD)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, "needs_input"),
+        harness.board.BoardCard("blocked", "Two clusters run it. Which one?", None, "transient"),
+        harness.board.BoardCard("done", _GUARDRAIL_SUMMARY, None, "transient"),
+        harness.board.BoardCard("blocked", _GUARDRAIL_SUMMARY, None, None),
+        harness.board.BoardCard(
+            "blocked", "HTTP 429 (failure_reason=rate_limit): TPM quota exhausted", None, "transient"
+        ),
+        harness.board.BoardCard(
+            "blocked",
+            "provider rate limit: API retries exhausted (failure_reason=billing): credit wall",
+            None,
+            "transient",
+        ),
+    ],
+    ids=["question-kind", "other-reason", "done", "no-kind", "reason-without-the-guardrail-prefix", "billing"],
+)
+def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
+    card: harness.board.BoardCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    res = _settle_after_guardrail_block(monkeypatch, entries=_ACTED, cards={"t_1": card})
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_marks_the_guardrail_block_on_the_inject_lane_whether_or_not_the_worker_acted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The presubmit grades the inject lane, where the scorer sets the
+    worker-blind safeguards aside on every record; the mark reads the same
+    there as on the api transport (#4871's build 2118527973618356224: two
+    workers that ran terminal commands, then died on 429s)."""
+    inject_front = [{"name": harness.inject.EVENT_ENTRY_TASK}, {"name": "kanban_create"}]
+    for entries in (_ACTED, [_worker_entry("read_file", path="x")]):
+        res = _settle_after_guardrail_block(
+            monkeypatch, entries=entries, cards=_GUARDRAIL_CARD, front_trajectory=inject_front
+        )
+        assert res.errors and res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
 
 
 def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
@@ -6325,3 +6636,46 @@ def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
     mine = harness._purge_sorted_marker(["t_1"])
     assert len(others) == 2 and mine not in others
     assert all(m.endswith("-t_1") for m in {*others, mine})
+
+
+def _report_only_judge_context() -> Any:
+    """A record both report-only evaluators apply to: MCP on, a bulleted checklist."""
+    from devops_bench.metrics.pipeline import _build_context
+
+    record = {"input": "prompt", "output": "answer", "expected_output": "Critical requirements:\n- names the node pool"}
+    return _build_context(record, judge_model=None, use_mcp=True)
+
+
+@pytest.fixture
+def report_only_judges(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
+    """The two evaluator classes, with ``applies`` restored after the test, as the switch patches the class."""
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        monkeypatch.setattr(evaluator, "applies", evaluator.applies)
+    return ToolInvocationMetric, ChecklistMetric
+
+
+def test_report_only_judges_run_when_the_switch_is_unset(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+) -> None:
+    monkeypatch.delenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, raising=False)
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert all(evaluator().applies(ctx) for evaluator in report_only_judges)
+
+
+def test_a_pull_request_run_skips_the_report_only_judges(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """hack/ci-eval-pr.sh sets the switch on a pull request; OutcomeValidity, which rung 6 reads, still runs."""
+    from devops_bench.metrics.base import METRICS
+
+    monkeypatch.setenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, "1")
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
+    assert METRICS["outcome_validity"]().applies(ctx)
+    assert {"tool_invocation", "checklist"} <= set(METRICS)
+    assert "judge scores are off for this run" in capsys.readouterr().err
