@@ -597,6 +597,17 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # Cause and advice text. Plain language: the reader is whoever is deciding
 # whether to type /retest.
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
+# The same cause as the public tracking issue states it (gate_issue.py):
+# the failing cases stay on the incident brief, since the repository is
+# public.
+CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
+# The fixed text of the evidence lines that grade a case (shared_break's
+# per-case collapse line, its coverage line, and the PR-caused lines).
+# gate_issue.public_evidence drops a line carrying one of these from every
+# public issue body, so the lines below are built on them.
+EVIDENCE_CASE_COLLAPSE = " failed all graded reps on "
+EVIDENCE_CASES_EXPLAIN = "these cases explain "
+EVIDENCE_PR_CAUSED = "PR-caused: "
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -718,6 +729,14 @@ UTC = timezone.utc
 # --------------------------------------------------------------------------- #
 # Reading data.json
 # --------------------------------------------------------------------------- #
+
+
+def public_cause(health_doc: dict) -> str:
+    """``health["cause"]`` as a public text may carry it: a shared break
+    names no case (CAUSE_SHARED_BREAK_PUBLIC); every other cause as is."""
+    if health_doc.get("condition") == SHARED_BREAK:
+        return CAUSE_SHARED_BREAK_PUBLIC
+    return health_doc.get("cause") or CAUSE_SHARED_BREAK_PUBLIC
 
 
 def parse_iso(value) -> datetime | None:
@@ -1079,11 +1098,11 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         path, others, solid = pr_caused_path(case, runs, window)
         if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
             )
         elif path == PR_CAUSED_REPEATED:
             pr_caused.append(
-                f"PR-caused: {case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
         if path is not None:
             pr_caused_latest.append(max(run.finished for run in solid))
@@ -1103,12 +1122,12 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         runs = collapses[case]
         prs = _prs(runs)
         evidence.append(
-            f"{case} failed all graded reps on {len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
+            f"{case}{EVIDENCE_CASE_COLLAPSE}{len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
         )
     if cases and reds:
         hours = int(SHARED_BREAK_WINDOW.total_seconds() // 3600)
         evidence.append(
-            f"these cases explain {len(covered)} of {len(reds)} red runs"
+            f"{EVIDENCE_CASES_EXPLAIN}{len(covered)} of {len(reds)} red runs"
             f" ({len(reds)} of {len(concluded)} concluded runs red) in the last {hours}h"
         )
     return {
