@@ -1293,7 +1293,15 @@ It also counts the standing pods the operator renders only behind an operator fl
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
 is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
 and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
-as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
+as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
+election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
+`A2A_GATEWAY_ELECTION` to `false`. It also counts the
+scope publisher's Job pod, sized in `files/transient-pods.yaml`, which the operator starts every
+15 minutes, one at a time, where the gateway pod admission policy is on (rendered by the chart,
+or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.scope` names a
+folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
+hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
+provisioning Job, so it overstates both. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
@@ -1354,7 +1362,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, or under `platformAgent.mode: next` a damaged `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
@@ -1570,6 +1578,9 @@ helm uninstall kube-agents -n kubeagents-system
   operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
+- `files/transient-pods.yaml` is hand-kept too: the scope publisher's Job pod, which runs on a
+  schedule and which no golden declares a scope for. `TestTheChartCountsTheScopePublishersJobPod`
+  holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`,
