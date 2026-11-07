@@ -103,8 +103,11 @@ const (
 	// maxStepTaskWatches bounds the task watches one streamed state holds
 	// between polls, each a reader slot (maxTaskReaders): the root's, and
 	// followed tasks' up to the bound. A followed task past it is not read
-	// until a held one finishes and frees its place, so one delegated turn
-	// leaves half the slots to the server's other readers.
+	// until a held one finishes and frees its place. The cap is per turn,
+	// not a reservation: two streamed turns at their cap still hold all
+	// maxTaskReaders slots, and a closed watch keeps its slot for
+	// reapDelay, so a poll that reopens watches inside that window can
+	// briefly take more (#5166).
 	maxStepTaskWatches = maxTaskReaders / 2
 )
 
