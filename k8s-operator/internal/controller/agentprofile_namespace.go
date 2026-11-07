@@ -252,13 +252,21 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 				},
 				{
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
-					},
+					To:    profileBrokerPeers(agent),
 				},
 			},
 		},
 	}
+}
+
+// profileBrokerPeers is the broker in the agent's namespace, and the exec
+// tier while it renders: /v1/exec admits the profile role on both.
+func profileBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+	}
+	return peers
 }
 
 // profileNamespacePeer admits every pod in the profile namespace, for the

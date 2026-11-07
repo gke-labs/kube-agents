@@ -573,6 +573,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
 			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
 		)
+		if s.cfg.CredentialProxyExecURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,

@@ -2868,13 +2868,20 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to one pod on one port, and the pod on
+		// widening of this fence, to the broker's pods on one port (the
+		// stateful broker, and the exec tier while it renders), and the pod on
 		// the other end authenticates the token and confers the session
 		// role. The API server stays unreachable from here; kubectl runs
 		// in the broker. Header comment: this IS the design change.
+		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+		// And the exec tier while it renders, on the same port, for the
+		// commands the session pod's shim sends there.
+		if credentialProxyExecTierEnabled(agent) {
+			to = append(to, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+		}
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
+			To:    to,
 		})
 	}
 
@@ -5250,6 +5257,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		clusterViewEnv = []corev1.EnvVar{
 			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
 			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+		}
+		// The exec tier's address, while it renders, for the session pods'
+		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
+		if credentialProxyExecTierEnabled(agent) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 		}
 	}
 
