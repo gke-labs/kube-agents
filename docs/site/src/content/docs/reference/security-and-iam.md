@@ -186,6 +186,7 @@ Under `spec.mode: next`, the A2A gateway creates session pods (one per delegated
 - It mounts no Secret and no host path, uses no host namespace, host port or fixed node, and runs no init container.
 - It meets Pod Security "restricted": non-root, seccomp `RuntimeDefault`, no added capabilities, no privilege escalation, and no `Unconfined` AppArmor.
 - It carries exactly the session labels, so the session network policies select it and no other workload's policies or Services do.
+- It leaves scheduling alone: no runtime class, node selector, affinity or positive priority, and no scheduler or toleration beyond those the API server and GKE add to every pod. A default PriorityClass with a positive value, or a mutating webhook that adds a scheduling field, refuses every session pod.
 
 The source is [`k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/a2a-gateway-pod-policy.yaml). The chart installs it on the same terms as the two policies above: `admissionPolicy.enabled` and Kubernetes 1.30 or later. Method 2 applies it by hand. Where the chart installs it, the chart also sets `A2A_GATEWAY_POD_POLICY` on the operator. It is a signal for operator features that must run only where this policy is installed, and it says the policy was rendered, not that it still holds.
 
