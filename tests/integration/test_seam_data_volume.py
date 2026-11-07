@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,10 +29,15 @@ from _seams import SCRIPTS_DIR, KVServer, fake_executable, wait_until
 # The fake volume's size; the percentages below are of this.
 FAKE_VOLUME_BLOCKS = 1000
 FAKE_VOLUME_BLOCK_BYTES = 10 * 1024 * 1024
-# How long a check may take to read the volume after the server answers, and
-# how long it then has to act on the reading before the server is stopped.
-CHECK_READ_TIMEOUT_SECONDS = 30.0
+# How long a check may take to read the volume and, for a check that posts, to
+# finish the post and record where the crossing stands. A check that must not
+# post gets a settle instead: a late post there can only hide a fault, never
+# fail the test.
+CHECK_TIMEOUT_SECONDS = 30.0
 CHECK_SETTLE_SECONDS = 2.0
+# The data_volume_warning states the server writes after a delivered post.
+STATE_WARNED = 1
+STATE_ARMED = 0
 REPORT_TIMEOUT_SECONDS = 120
 SLACK_ON = "platforms:\n  slack:\n    enabled: true\n"
 WARNING_PREFIX = "The agent's data volume is "
@@ -104,6 +110,9 @@ class TestDataVolumeSignals(unittest.TestCase):
             "SEAM_VOLUME_READS_FILE": str(self.reads_file),
             "PYTHONPATH": os.pathsep.join([str(site), str(SCRIPTS_DIR)]),
             "HERMES_MANAGED_DIR": str(managed),
+            # Slack is posted through `hermes send`; an exported A2A notify
+            # platform would route it through a real `a2a notify` instead.
+            "A2A_NOTIFY_PLATFORM": "",
         }
 
     def _lines(self, path: Path) -> list[str]:
@@ -112,28 +121,43 @@ class TestDataVolumeSignals(unittest.TestCase):
     def _posts(self) -> list[str]:
         return [" ".join(json.loads(line)) for line in self._lines(self.record)]
 
-    def _check_at(self, percent: int) -> list[str]:
-        """Start the server on a volume `percent` used, let its first check run,
-        and return every post so far."""
+    def _state(self, db_path: str) -> int | None:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
+        return row[0] if row else None
+
+    def _check_at(self, percent: int, posts: int, state: int | None = None) -> list[str]:
+        """Start the server on a volume `percent` used and let its first check
+        run. With `state`, the check posts: wait until the post count is `posts`
+        and the server has recorded `state`. Without it, wait for the reading
+        and a settle. Return every post so far."""
         self.percent_file.write_text(str(percent))
         reads = len(self._lines(self.reads_file))
         server = KVServer(self.tmp, env=self.env, path_prepend=str(self.tmp / "bin"))
         try:
-            wait_until(
-                lambda: len(self._lines(self.reads_file)) > reads,
-                timeout=CHECK_READ_TIMEOUT_SECONDS,
-                message=f"the data volume check at {percent}%",
-            )
-            # The reading is acted on at once; this covers a post's subprocess.
-            time.sleep(CHECK_SETTLE_SECONDS)
+            if state is None:
+                done = lambda: len(self._lines(self.reads_file)) > reads  # noqa: E731
+            else:
+                done = lambda: len(self._posts()) >= posts and self._state(server.db_path) == state  # noqa: E731
+            try:
+                wait_until(done, timeout=CHECK_TIMEOUT_SECONDS, message=f"the data volume check at {percent}%")
+            except AssertionError as error:
+                raise AssertionError(f"{error}; server log:\n{server._log_tail()}") from None
+            if state is None:
+                time.sleep(CHECK_SETTLE_SECONDS)
         finally:
             server.stop()
-        return self._posts()
+        found = self._posts()
+        self.assertEqual(len(found), posts, found)
+        return found
 
     def _board_report(self, percent: int) -> str:
         """Build a board with one finding and run the board health report on the
         same fake volume; return its output."""
         self.percent_file.write_text(str(percent))
+        # A `hermes` beside the interpreter would win over this guard
+        # (kanban_board_health.hermes_bin); it could only read the temporary
+        # board, which the report pins.
         guard = self.tmp / "report-bin"
         fake_executable(guard, "hermes", "import sys\nsys.exit(127)\n")
         env = dict(os.environ, **self.env)
@@ -160,25 +184,26 @@ class TestDataVolumeSignals(unittest.TestCase):
         return result.stdout
 
     def test_a_volume_that_fills_and_drains_says_so_once_each_way(self):
-        self.assertEqual(self._check_at(50), [], "a half-full volume posts nothing")
+        self._check_at(50, posts=0)
+        self._check_at(89, posts=0)
 
-        posts = self._check_at(95)
-        self.assertEqual(len(posts), 1, posts)
-        self.assertIn(WARNING_PREFIX + "95% full", posts[0])
+        posts = self._check_at(90, posts=1, state=STATE_WARNED)
+        self.assertIn(WARNING_PREFIX + "90% full", posts[0])
         warning = posts[0][posts[0].index(WARNING_PREFIX):]
 
         # A restart above the line does not post again: where the crossing
         # stands is on the session database, which the next start reads.
-        self.assertEqual(len(self._check_at(96)), 1)
+        self._check_at(96, posts=1)
 
         # The board health report on the same volume leads its finding with
         # the server's own line.
-        report = self._board_report(95)
+        report = self._board_report(90)
         self.assertIn(warning, report)
         self.assertLess(report.index(warning), report.index(GHOST_CLAIM_FINDING), report)
 
-        posts = self._check_at(80)
-        self.assertEqual(len(posts), 2, posts)
+        # Between the lines nothing is said; below the lower one, the all-clear.
+        self._check_at(86, posts=1)
+        posts = self._check_at(80, posts=2, state=STATE_ARMED)
         self.assertIn(ALL_CLEAR_PREFIX + "80% full", posts[1])
 
 
