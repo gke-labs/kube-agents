@@ -2,7 +2,7 @@
 
 **Scope:** The commands for getting a branch from "about to start" to "merged" in this repository —
 finding work already in flight, measuring drift from `main`, validating locally, working the
-automated review, the labels the merge queue reads, re-running a check that flaked, and whose move it is
+automated review, the labels the merge queue reads, re-running a check that flaked, quarantining a flaky test, and whose move it is
 at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
@@ -873,6 +873,53 @@ same-commit pass after a failure is evidence the code was innocent. Prow's `/ret
 test is a different system and is not watched; the `presubmit-gate` label is that job's channel, and
 a smoke green after a red at the same head may be step 0 reusing the older green rather than a pass
 (see "A green smoke run stays valid when `main` moves" above).
+
+## Quarantining a flaky test
+
+A Go or Python test that flakes on pull requests or `main` is skipped in its own source the first
+time, so pull requests stop paying for it with re-runs and merge-queue drops, and an issue tracks
+the real fix. Quarantine is not triage: a flake can be a product race, and skipping the test hides
+the bug. Quarantine a test only when all of these hold:
+
+- No fix is already in review or in the merge queue. If one is, wait for it.
+- The tracking issue says, each at the start of its own line,
+  `Suspected cause: <one line>` and `Product race ruled out: yes, <why>`. Put them in a comment: the
+  bot rebuilds a `ci:flaky` issue's body on every occurrence. Until a product race is ruled out, the
+  test stays live and the issue gets an owner instead.
+- The issue carries the `ci:quarantined` label and is assigned to the person who owns the fix: the
+  area's primary owner in [`ownership.md`](ownership.md) when one is known. Reuse the `ci:flaky`
+  issue when one exists.
+- The test is not a conformance test, an auth-callout account-boundary or grant test, or any other
+  security or isolation test. Those are fixed, not skipped, unless a security approver agrees: a
+  skip under `PROTECTED_PREFIXES` needs its `<path> <issue>` line in
+  [`hack/quarantine-approved.txt`](../hack/quarantine-approved.txt), which only the
+  `security-approvers` alias can approve ([`hack/OWNERS`](../hack/OWNERS)).
+
+The skip names the issue in a fixed form and checks `KA_RUN_QUARANTINED`, so whoever fixes it can
+run the test without editing it:
+
+```go
+if os.Getenv("KA_RUN_QUARANTINED") == "" {
+	t.Skip("quarantined: gke-labs/kube-agents#1234")
+}
+```
+
+```python
+@unittest.skipUnless(os.environ.get("KA_RUN_QUARANTINED"), "quarantined: gke-labs/kube-agents#1234")
+```
+
+Under pytest (`bench/tests/`) the same pair goes through
+`pytest.mark.skipif(not os.environ.get("KA_RUN_QUARANTINED"), reason="quarantined: ...")`. The fix
+pull request removes the skip and closes the issue.
+
+[`scripts/check_quarantine.py`](../scripts/check_quarantine.py) checks both halves. Its offline
+check runs with the Python unit tests and fails a quarantine string that is malformed, does not
+read `KA_RUN_QUARANTINED`, or skips a protected test the approvals file does not list. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
+it daily with `--github --notify`. That run fails when a cited issue is closed, unlabelled,
+unassigned, or missing either line above, and comments once on that
+issue naming its assignees. Its summary lists every quarantine with its age. A quarantine older
+than `STALE_DAYS` (14) gets one comment too. The summary also flags an open `ci:quarantined` issue
+that no test cites any more.
 
 ## Who owns an open pull request
 
