@@ -239,6 +239,29 @@ def test_a_relay_is_lifted_only_out_of_the_prose_ahead_of_the_sections():
     )
 
 
+def test_a_shorter_card_folded_first_does_not_cut_a_longer_cards_relay():
+    longer = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base(longer)
+    _append_final(base, [_SECTION_T1, f"Result of delegated task t2:\n{longer}"])
+    assert base.metadata["final_message"] == f"{_SECTION_T1}\n\nResult of delegated task t2:\n{longer}"
+
+
+def test_two_relays_one_inside_the_other_are_each_lifted_whole():
+    longer = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base(f"Both said the same.\n\n{_RELAYED_RESULT}\n\n{longer}")
+    _append_final(base, [_SECTION_T1, f"Result of delegated task t2:\n{longer}"])
+    assert base.metadata["final_message"] == (
+        f"Both said the same.\n\n{_SECTION_T1}\n\nResult of delegated task t2:\n{longer}"
+    )
+
+
+def test_a_relayed_result_keeps_its_indented_first_line():
+    body = "  tree:\n    leaf: 1"
+    base = _base(f"The specialist's tree:\n\n{body}")
+    _append_final(base, [f"Result of delegated task t1:\n{body}"])
+    assert base.metadata["final_message"] == f"The specialist's tree:\n\nResult of delegated task t1:\n{body}"
+
+
 def test_an_artifact_keeps_its_indented_first_line():
     section = "Artifact a.yaml produced by delegated task t1:\n  key: v\n  k2: v2"
     base = _base("Read the file.")

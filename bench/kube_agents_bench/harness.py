@@ -1220,27 +1220,38 @@ def _fold_sections(current: str, sections: list[str]) -> str:
     section, and the answer is attributed once and quoted once. Only the
     prose ahead of the first delivered section is searched, so a card whose
     answer repeats part of an earlier card's never cuts into that card's
-    section, and its own section is appended in full. The last occurrence
-    in the prose is the relay: a router that names a short result in its
-    own sentence first quotes it in full last. A body already under its own
-    header is left alone. An artifact already quoted anywhere is not
-    appended again.
+    section, and the longest body is lifted first, so a card whose answer
+    is part of another card's never cuts into that card's relay. The last
+    occurrence in the prose is the relay: a router that names a short
+    result in its own sentence first quotes it in full last. A body already
+    under its own header is left alone. An artifact already quoted anywhere
+    is not appended again.
     """
-    for section in sections:
-        header, _, body = section.partition("\n")
-        body = body.strip()
-        if not body or _attributed(current, header, body):
+    first = _DELIVERED_HEADER_LINE.search(current)
+    prose = current if first is None else current[: first.start()]
+    delivered = "" if first is None else current[first.start() :].strip()
+    parts = [(section, *section.partition("\n")[::2]) for section in sections]
+    pending = [(section, header, body.strip()) for section, header, body in parts if body.strip()]
+    lifted: set[str] = set()
+    for section, header, body in sorted(pending, key=lambda part: -len(part[2])):
+        if not header.startswith(_RELAYED_SECTION_PREFIXES) or _attributed(current, header, body):
             continue
-        first = _DELIVERED_HEADER_LINE.search(current)
-        prose = current if first is None else current[: first.start()]
-        delivered = "" if first is None else current[first.start() :].strip()
-        at = prose.rfind(body) if header.startswith(_RELAYED_SECTION_PREFIXES) else -1
+        at = prose.rfind(body)
         if at >= 0:
             prose = "\n\n".join(filter(None, [prose[:at].rstrip(), prose[at + len(body) :].strip()]))
-            current = "\n\n".join(filter(None, [prose, delivered, f"{header}\n{body}"]))
-        elif header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current:
-            current = "\n\n".join(filter(None, [current, section.rstrip()]))
-    return current
+            lifted.add(section)
+    appended = [
+        section.rstrip()
+        for section, header, body in pending
+        if section in lifted
+        or (
+            not _attributed(current, header, body)
+            and (header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current)
+        )
+    ]
+    if not lifted and not appended:
+        return current
+    return "\n\n".join(filter(None, [prose, delivered, *appended]))
 
 
 def _append_delivered(
