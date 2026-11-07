@@ -319,7 +319,7 @@ verification_spec:
       # The two identities are the Google accounts the two periodics that run
       # this case map to: eval-baseline-recorder for ci-kube-agents-eval-nightly,
       # the recorder, whose audit entry named it on 2026-10-22, and
-      # prowjob-default-sa for ci-kube-agents-eval-nightly-next-claude, by its
+      # prowjob-default-sa for the retired next-mode nightly, by its
       # serviceAccountName (not yet seen on this case's audit entries; the case
       # was registered the night before). oss-test-infra#2751 moves that job to
       # eval-baseline-recorder; when it merges, drop the second entry.
@@ -335,7 +335,7 @@ verification_spec:
         - "eval-operator@example.com"
         # The recorder nightly plants under this identity, so the audit log names it.
         - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-        # The Claude nightly twins plant under this identity.
+        # The next-mode nightly twins plant under this identity.
         - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-object-kind

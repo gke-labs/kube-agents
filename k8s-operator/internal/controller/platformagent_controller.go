@@ -4388,7 +4388,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
-		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
+		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
+		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
@@ -4400,7 +4401,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
-			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
+			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
+			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
 		return nil
 	}
@@ -4415,6 +4417,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4766,6 +4769,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
 	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
+	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
+	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4832,6 +4837,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
+		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4917,6 +4923,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	// Copied before the write: decoding the response may reuse the pointer's target.

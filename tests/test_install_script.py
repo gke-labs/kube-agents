@@ -10888,19 +10888,32 @@ class PtyChildTestMixin:
     def _watch_pty_child(self, pid, fd):
         drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
         drain.start()
-        self.addCleanup(self._cleanup_pty, pid, fd)
+        self.addCleanup(self._cleanup_pty, pid)
 
     @staticmethod
     def _drain(fd):
+        """Read the pty until the child's side closes, then close the descriptor.
+
+        Only this thread closes the descriptor. If the cleanup closes it, its
+        number is free while this thread can still be between two reads. On a
+        loaded runner the scheduler can hold this thread there until a later
+        test runs. This thread's next read then takes bytes from the file that
+        the later test opened with the same number. For install.sh it takes all
+        of them, and the later test's read_text() returns an empty string.
+        """
         while True:
             try:
                 if not os.read(fd, 4096):
-                    return
+                    break
             except OSError:
-                return
+                break
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     @staticmethod
-    def _cleanup_pty(pid, fd):
+    def _cleanup_pty(pid):
         for killer in (lambda: os.killpg(os.getpgid(pid), signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
             try:
                 killer()
@@ -10908,10 +10921,6 @@ class PtyChildTestMixin:
                 pass
         try:
             os.waitpid(pid, 0)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
         except OSError:
             pass
 
@@ -10922,6 +10931,55 @@ class PtyChildTestMixin:
                 return path.read_text().strip()
             time.sleep(self._POLL_INTERVAL_SECS)
         self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "the mixin under test forks a child under a pty")
+class PtyChildDrainClosesThePtyTest(PtyChildTestMixin, unittest.TestCase):
+    """The drain thread closes the pty descriptor, and the cleanup does not.
+
+    This test holds the drain thread between two reads, as a loaded runner can,
+    and runs the cleanup. The descriptor must still name the pty after the
+    cleanup, so that no file a later test opens can get its number.
+    """
+
+    def test_a_drain_held_between_reads_keeps_the_pty_open_through_the_cleanup(self):
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - runs in the forked child
+            try:
+                os.write(pty.STDOUT_FILENO, b"ready\n")
+                time.sleep(self._READY_TIMEOUT_SECS)
+            finally:
+                os._exit(0)
+        held, release = threading.Event(), threading.Event()
+        test_thread = threading.current_thread()
+        drain_reads = []
+        real_read = os.read
+
+        def read(read_fd, size):
+            # Holds the drain thread before its second read of the pty.
+            if read_fd == fd and threading.current_thread() is not test_thread:
+                drain_reads.append(threading.current_thread())
+                if len(drain_reads) == 2:
+                    held.set()
+                    release.wait(self._READY_TIMEOUT_SECS)
+            return real_read(read_fd, size)
+
+        with mock.patch.object(os, "read", read):
+            self._watch_pty_child(pid, fd)
+            try:
+                self.assertTrue(held.wait(self._READY_TIMEOUT_SECS), "the drain thread did not come back for a second read")
+                self.doCleanups()
+                try:
+                    still_the_pty = stat.S_ISCHR(os.fstat(fd).st_mode)
+                except OSError:
+                    still_the_pty = False
+            finally:
+                release.set()
+            drain_reads[0].join(self._READY_TIMEOUT_SECS)
+        self.assertTrue(still_the_pty, "the cleanup closed the pty while the drain thread could still read it")
+        self.assertFalse(drain_reads[0].is_alive(), "the drain thread did not stop after the child was gone")
+        with self.assertRaises(OSError, msg="the drain thread left the pty open"):
+            os.fstat(fd)
 
 
 @unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")

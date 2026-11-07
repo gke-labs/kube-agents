@@ -101,7 +101,7 @@ happens inside one `local-exec`. A module directory may hold those instead, run 
 relative path: `tf/modules/drift-inject/` is a bash library that the `gitops-drift-*`
 stacks handing their record straight to the daemon `source`, and two python files they execute;
 `tf/modules/namespaced-plant/` is a shell the stacks that plant namespaced objects on the host
-cluster call with their namespace, name, labels and manifest, leaving the namespace's creation,
+cluster call with their namespace, stack name, labels and manifest, leaving the namespace's creation,
 the leftover pre-clear and the teardown to it. Prefer a module to inlining the text with `file()`, which
 costs `shellcheck -x` its ability to follow the call and puts the whole helper into every rendered
 plan — and whose interpolation, placed at a smaller indent than the heredoc body, silently sets the
