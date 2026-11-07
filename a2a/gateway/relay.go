@@ -416,10 +416,13 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	// ack, or a connection outage outlasted AckWait while the ack was being
 	// retried. Its sequence is on the record then, and it is acked without
 	// rendering twice.
-	// In stream order: a stop gives deliveries back in order, but redelivery
-	// can still interleave with new events, and the stream sequence is the
-	// order they were written in. Items without one (not off the durable)
-	// keep the order they were queued in.
+	// In stream order: a stop's give-back keeps that order only for a relay
+	// already bound when it falls due, so a relay that binds later can get
+	// the oldest given-back event behind later ones, and redelivery can
+	// interleave with new events. The stream sequence is the order they were
+	// written in, and sorting by it restores that order only among the
+	// events in one batch. Items without one (not off the durable) keep the
+	// order they were queued in.
 	if !slices.ContainsFunc(batch, func(it relayItem) bool { return it.sequence() == 0 }) {
 		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
 	}
