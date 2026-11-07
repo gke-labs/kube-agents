@@ -65,8 +65,9 @@ expected_output: >-
   fleet_scope tool's collector arguments, rather than per-cluster checks,
   and answers in chat without publishing a ledger issue or a pull request.
   The answer names the checkout-gateway Deployment in the seeded-reliability
-  namespace: two replicas and no PodDisruptionBudget, so one node drain can
-  evict both replicas at once.
+  namespace: two replicas and no PodDisruptionBudget, so back-to-back drains
+  during a node upgrade or scale-down can evict both before a replacement is
+  Ready.
 infrastructure:
   deployer: noop
 validated: false

@@ -138,8 +138,9 @@ _injected_ as steering - a follow-up `message` on the same `taskId`, forwarded t
 harness stdin, absorbed at its next turn boundary. That matches what `kanban_comment`
 gives users today, the adapter owes the same stdin path to `input-required` anyway, and
 each steer carries its own `authority` block, so group-room attribution stays clean. A
-cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; wiring it
-to a chat gesture is adapter polish, later.
+cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; its chat
+gesture is Slack's native Stop on an Agent Session and the drawn Stop button on Google Chat's
+status line (the adapter sections; amended 11/5), and none on the console or Discord.
 
 **The deterministic interceptors (amended 8/31).** The gateway holds no model, so its
 affordances are literal: a small set of normalized phrases and prefixes, deterministic
@@ -151,7 +152,8 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   history, and the latest `progress` line, labeled as replay so nobody reads it as a
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
-  the cancel affordance above; a backend-native gesture stays adapter polish, later.
+  the cancel affordance above; the backend gestures above land on the same path as
+  `IntentCancel` (amended 11/5).
   A stopped task whose terminal event has not yet arrived DETACHES: it stops
   serializing the conversation - new turns start new tasks - while its events, if
   they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
@@ -244,7 +246,8 @@ during a `working` task is a steer, per the 8/24 decision above.
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
-edits; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
+edits, posted and edited with `OutMessage.Stop` while the task runs so that a backend that
+draws a Stop control draws it there, which Google Chat does, below; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
 Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
@@ -1710,8 +1713,8 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
-escaped text instead. The gateway answers clicks only on the choice buttons and rating controls
-it draws itself (the Slack adapter section, and "Chat messages on Google Chat"), so a button on such a card would be clicked into
+escaped text instead. The gateway answers clicks only on the choice buttons, rating controls
+and, on Google Chat, the Stop button it draws itself (the Slack adapter section, and "Chat messages on Google Chat"), so a button on such a card would be clicked into
 nothing, or, as a rating block, rate under a task id the sender chose: the gateway refuses any
 interactive block or element in raw blocks (an `actions` or `input` block, a button, a select, a
 date or time picker, a text input, a `context_actions` block and its `feedback_buttons` and
@@ -1776,8 +1779,7 @@ takes the defang alone, and a button label is widget text Chat parses nothing ou
 message whose text runs past the room Chat's 32,000-byte message cap leaves for its buttons,
 or one that lays nothing out, is refused before any call, and a `400` from the API is a refused
 layout too; both fall back to the text. The golden layouts of the shared cases are
-`a2a/gateway/testdata/gchat-chat/`, beside Slack's. An edit
-without a chat message replaces the layout, the widgets patched empty. A `mark` draws
+`a2a/gateway/testdata/gchat-chat/`, beside Slack's. An edit without a chat message replaces the layout, the widgets patched empty, unless it is a running task's line (The Stop button, below). A `mark` draws
 nothing: Chat's reaction API takes user credentials, and the relay holds the app's.
 
 A click on a choice button arrives on the same subscription as a message, as a
@@ -1812,6 +1814,8 @@ are held in the process: after a restart a question keeps its buttons until clic
 is still a turn, and the rewrite reads the message the event carries, its text, its link
 buttons and the clicked button's label. A click on a button the adapter did not draw is
 logged and acked. A click on a rating button or the note card is never a turn ([Answer feedback](#answer-feedback-added-1016)).
+
+**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and the adapter draws a `Stop` button under it: after the message's own buttons when the newest progress laid it out (a progress message's links), alone under the text otherwise. The terminal edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is drawn, and a text line Chat refuses with the button is posted or patched once more without it, so the line itself never fails for the button; a laid-out line's refusal is the layout's, and the relay falls back to its text, which then takes the same path. A click on it arrives as a `CARD_CLICKED` interaction like a choice click, with the button's function `kage.stop` and two parameters: the conversation key the line was posted under, since the click's event names the surface the line is on, which is not the key a DM's thread-less line was posted under; and the task the line is for. The adapter turns it into `IntentCancel` with no text, marked a click, naming that task (`InboundMessage.TaskID`), from the clicker, bound to that conversation, which must be in the space the click came from, and handed over like a typed message, so the allowlist decides, for anyone it admits (the Slack button's requester gate, `stopgate.go`, is Slack's). The gateway sends the cancel a typed `stop` sends, quietly, as for Slack's button (`TaskRef.QuietCancel`: no "cancel sent" post, no "canceled" notice from the relay), and answers on the line itself (a task with no line, its placeholder post having failed, takes the typed stop's posts instead): edited to "🛑 cancel sent — the task ends when the executor confirms" with the control gone, left so by later progress (`ActiveTask.LineClosed`), and made "🛑 canceled" by the terminal edit; a second press, or one on a task a typed `stop` already detached, changes nothing, and a press with the card stop armed takes the typed stop's path, cards and replies included. A redelivered click is a duplicate by its id, as a choice click is. Nothing is remembered for it: a line carries its conversation and its task in the button, and a press on a task that is not the running one (a line whose closing edit failed, since each closing edit is one unretried call; one from before a restart) is answered on that line, edited to "ℹ️ this task has ended" with the control gone, and cancels nothing, so a press is never a cancel of a task the presser did not see. A task the heal ends has its line closed by the heal, and a stopped task the next ask supersedes before its terminal has its line closed as canceled by that turn, since the relay's terminal edit would find neither, so no line outlives its task with the button on it.
 
 ## The Slack adapter (added 9/4)
 
@@ -2757,7 +2761,18 @@ lib's 45-second bind window) the relay waits for the stream rather than exiting
 not end it either: nats.go reconnects (or lib rebuilds the connection), and the wait goes on there.
 Each wait logs when it starts or changes, then every 30 seconds, and warns every 10 minutes. So a gateway waiting on provisioning reads
 not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
-Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. Its progress
+Recreate until a gateway on its image holds the election's Lease, so the probe opens no gap in
+that roll; it shows the one Recreate already has. An elected replica that holds the Lease answers
+as above, and an elected gateway's term waits for the `session-state` bucket the same way
+(`waiting for bucket session-state: ...`). Its term also waits for a bus that isn't answering
+(`waiting for the bus: ...`), but only for 60 seconds: past that it gives the Lease up, so a
+standby whose bus works can take it, and stands back for a lease's duration before campaigning
+again in the same process (it doesn't exit, so a bus outage puts no replica into
+CrashLoopBackOff). A standby answers 200 once it is connected and has read
+the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
+as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
+replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the
+leader's own `/readyz` still names the wait. Its progress
 deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
 read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
 while the gateway keeps waiting and the CR keeps reading `Provisioning`.

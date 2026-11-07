@@ -3331,6 +3331,38 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (mul $n ($sp.ephemeralStorageBytesLimit | default 0 | int64))) | int64 -}}
     {{- end -}}
   {{- end -}}
+  {{- /* The A2A gateway's standby: the operator runs it at two replicas under the
+         election (on unless operator.extraEnv sets A2A_GATEWAY_ELECTION to "false"),
+         rolling with a surge pod, once a gateway on its image holds the Lease. No golden
+         renders that (no pod holds the Lease there), so footprint.yaml counts one gateway
+         pod and no surge, and the second pod and the surge room are added here. The chart
+         sets no availability.a2aGateway.replicas, so this counts the default of two. */ -}}
+  {{- if $next -}}
+    {{- $election := true -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString (index ($e | default dict) "name")) "A2A_GATEWAY_ELECTION" -}}
+        {{- $v := index $e "value" -}}
+        {{- $election = not (and (hasKey $e "value") (kindIs "string" $v) (eq $v "false")) -}}
+      {{- end -}}
+    {{- end -}}
+    {{- $gw := $next.a2aGateway | default dict -}}
+    {{- $gwPods := $gw.pods | default 0 | int64 -}}
+    {{- if and $election (gt $gwPods (int64 0)) -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (int64 1)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (div ($gw.cpuMillisRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (div ($gw.cpuMillisLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (div ($gw.memoryBytesRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (div ($gw.memoryBytesLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (div ($gw.ephemeralStorageBytesRequest | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (div ($gw.ephemeralStorageBytesLimit | default 0 | int64) $gwPods)) | int64 -}}
+      {{- $surgeCpuReq = max $surgeCpuReq (div ($gw.cpuMillisRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeCpuLim = max $surgeCpuLim (div ($gw.cpuMillisLimit | default 0 | int64) $gwPods) -}}
+      {{- $surgeMemReq = max $surgeMemReq (div ($gw.memoryBytesRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeMemLim = max $surgeMemLim (div ($gw.memoryBytesLimit | default 0 | int64) $gwPods) -}}
+      {{- $surgeEphReq = max $surgeEphReq (div ($gw.ephemeralStorageBytesRequest | default 0 | int64) $gwPods) -}}
+      {{- $surgeEphLim = max $surgeEphLim (div ($gw.ephemeralStorageBytesLimit | default 0 | int64) $gwPods) -}}
+    {{- end -}}
+  {{- end -}}
   {{- with $next.storage -}}
     {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
     {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}

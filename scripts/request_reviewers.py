@@ -34,8 +34,9 @@ the `approved` label, or, when the author's own approval already covers every
 changed file (`author_approves`), anyone whose review Prow takes for `lgtm`
 (`applicable_reviewers`); an approval from anyone else used to suppress the
 auto-assign for good. The same test decides who is asked: a pull request the
-author does not self-approve draws an approver alone, so a non-approver in the
-pool is only ever asked for the one label still missing. And `/request-review`
+author does not self-approve draws approvers alone, enough to approve every
+changed file (`draw_covering`), so a non-approver in the pool is only ever asked
+for the one label still missing. And `/request-review`
 (`--react-to`) is a person saying "ask someone anyway", so it skips the verdict
 check, and when it still declines -- draft, closed, someone already requested --
 it says so with a 😕 reaction on the comment and a warning annotation on the run,
@@ -518,17 +519,66 @@ def default_reviewers(config, author):
     return _dedupe(_expand_groups(defaults, config), author)
 
 
-def select_reviewers(config, changed_files, author, rng=random, restrict_to=None):
+def uncovered_files(approvers_by_file, logins):
+    """The part of `approvers_by_file` none of `logins` (lower-cased) approves.
+
+    Files with no approvers at all are left out: nobody can be asked for them.
+    """
+    return {path: approvers for path, approvers in approvers_by_file.items() if approvers and not approvers & logins}
+
+
+def draw_covering(pool, approvers_by_file, author, rng=random, fallback=()):
+    """Approvers drawn from `pool` until every changed file has one asked.
+
+    Prow's `approved` is per file, so a reviewer drawn from the union of the
+    approvers can be one who clears none of the files only a narrower group
+    approves: a change to `hack/replay-proxy/` plus one doc drew a root
+    approver, and the eval-crew approval it still needed was asked of nobody.
+    So the first draw is from the file with the fewest approvers, and each
+    further draw only for a file the reviewers drawn so far cannot approve.
+    Files the author approves are already covered. A file nobody in the pool
+    approves is drawn for from `fallback`, the default reviewers: a change to
+    a roster file routes to eval-crew alone, and its root-owned half would
+    otherwise get a root approver only while some member happens to be one.
+    A file neither approves is a config shape, logged and left out.
+    """
+    uncovered = list(uncovered_files(approvers_by_file, {author.lower()}).values())
+    picked = []
+    while uncovered:
+        narrowest = min(uncovered, key=len)
+        candidates = [name for name in pool if name.lower() in narrowest]
+        if not candidates:
+            candidates = [name for name in fallback if name.lower() in narrowest]
+            if candidates:
+                log(f"Nobody in the pool approves a file only {', '.join(sorted(narrowest))} can; drawing from the default reviewers")
+        if not candidates:
+            log(f"Nobody in the pool or the defaults approves a file only {', '.join(sorted(narrowest))} can; not drawing for it")
+            uncovered = [logins for logins in uncovered if logins != narrowest]
+            continue
+        pick = rng.choice(candidates)
+        if picked:
+            log(f"Also drawing {pick}: {', '.join(picked)} cannot approve every changed file")
+        picked.append(pick)
+        uncovered = [logins for logins in uncovered if pick.lower() not in logins]
+    return picked
+
+
+def select_reviewers(config, changed_files, author, rng=random, approvers_by_file=None):
     """The full selection: globs, then defaults as fallback, then sampling.
 
-    `restrict_to`, a set of lower-cased logins, narrows the pool before the
-    draw: the OWNERS approvers for the change, when the author's own approval
-    does not cover it, so that a non-approver in the pool is never asked for
-    an `lgtm` that leaves `approved` outstanding with nobody asked. A pool the
-    restriction empties is a config shape rather than a pull-request one --
+    `approvers_by_file`, {changed file: lower-cased logins}, is the OWNERS
+    approvers per file, passed when the author's own approval does not cover
+    the change. It narrows the pool to those approvers, so that a
+    non-approver in the pool is never asked for an `lgtm` that leaves
+    `approved` outstanding with nobody asked, and `draw_covering` picks
+    enough of them to approve every file, even past `number_of_reviewers`.
+    When the narrowing empties the pool -- the files still owed after a
+    partial approval are ones the glob pool cannot approve, or the config
+    routes a file to non-approvers -- the default reviewers are tried for
+    them. Only when those cover nothing either is the pool kept whole, since
+    asking someone who can `lgtm` beats asking nobody, and the log says so.
     `main` declines before the draw when the approver set itself is empty, as
-    it is for a pull request with no changed files -- and asking someone who
-    can `lgtm` beats asking nobody, so it is kept whole and the log says so.
+    it is for a pull request with no changed files.
     """
     reviewers = reviewers_by_changed_files(config, changed_files, author)
 
@@ -537,19 +587,31 @@ def select_reviewers(config, changed_files, author, rng=random, restrict_to=None
         if reviewers:
             log("No glob matched; falling back to the default reviewers")
 
-    if restrict_to is not None and reviewers:
-        narrowed = [name for name in reviewers if name.lower() in restrict_to]
+    covering = []
+    if approvers_by_file is not None and reviewers:
+        approvers = set().union(*approvers_by_file.values())
+        narrowed = [name for name in reviewers if name.lower() in approvers]
+        fallback = [name for name in default_reviewers(config, author) if name.lower() in approvers]
         if narrowed:
             dropped = [name for name in reviewers if name not in narrowed]
             if dropped:
                 log(f"Not drawing {', '.join(dropped)}: not an OWNERS approver for the change")
             reviewers = narrowed
+            covering = draw_covering(reviewers, approvers_by_file, author, rng, fallback)
         else:
-            log(f"The pool is {', '.join(reviewers)} and none of them is an OWNERS approver for the change; drawing from it anyway")
+            # The glob pool approves none of the files still owed -- after a
+            # partial approval, say -- so the defaults are tried before it is
+            # drawn from whole.
+            covering = draw_covering([], approvers_by_file, author, rng, fallback)
+            if covering:
+                reviewers = covering
+            else:
+                log(f"The pool is {', '.join(reviewers)} and none of them is an OWNERS approver for the change; drawing from it anyway")
 
     number = (config.get("options") or {}).get("number_of_reviewers")
     if number is not None and reviewers:
-        reviewers = rng.sample(reviewers, min(int(number), len(reviewers)))
+        rest = [name for name in reviewers if name not in covering]
+        reviewers = covering + rng.sample(rest, max(min(int(number), len(reviewers)) - len(covering), 0))
 
     return reviewers
 
@@ -602,7 +664,31 @@ def skip_reason(pull_request, config):
     return None
 
 
-def already_reviewed_reason(pull_request, reviews, approvers, robots=frozenset()):
+def _latest_verdicts(pull_request, reviews, robots):
+    """{lower-cased login: their latest human verdict}, as `already_reviewed_reason` reads them."""
+    author = ((pull_request.get("user") or {}).get("login") or "").lower()
+    robots = {login.lower() for login in robots}
+    latest = {}
+    for review in sorted(reviews, key=lambda review: review.get("submitted_at") or ""):
+        user = review.get("user") or {}
+        login = (user.get("login") or "").lower()
+        if user.get("type") == "Bot" or login in robots or login == author or review.get("state") not in HUMAN_VERDICT_STATES:
+            continue
+        latest[login] = review
+    return latest
+
+
+def approved_logins(pull_request, reviews, approvers, robots=frozenset()):
+    """Lower-cased logins in `approvers` whose latest verdict is `APPROVED`."""
+    approvers = {login.lower() for login in approvers}
+    return {
+        login
+        for login, review in _latest_verdicts(pull_request, reviews, robots).items()
+        if review["state"] == APPROVED_STATE and login in approvers
+    }
+
+
+def already_reviewed_reason(pull_request, reviews, approvers, robots=frozenset(), approvers_by_file=None):
     """Why a verdict already on the pull request makes a request redundant, or None.
 
     Only a verdict from another person counts. Replying to a review thread
@@ -630,23 +716,23 @@ def already_reviewed_reason(pull_request, reviews, approvers, robots=frozenset()
     count either way, and neither do reviews from the logins in `robots`: the
     roster's `options.robot_accounts`, robots that review under a user
     account and so read as `User` to the API.
+
+    `approvers_by_file`, passed when the author's own approval does not
+    cover the change, makes the approvals count only once together they
+    approve every file, since Prow's `approved` is per file: a root
+    approver's approval on a change that also touches `hack/replay-proxy/`
+    leaves the eval-crew approval outstanding, and `main` draws for that.
     """
     author = ((pull_request.get("user") or {}).get("login") or "").lower()
     approvers = {login.lower() for login in approvers}
-    robots = {login.lower() for login in robots}
-
-    latest = {}
-    for review in sorted(reviews, key=lambda review: review.get("submitted_at") or ""):
-        user = review.get("user") or {}
-        login = (user.get("login") or "").lower()
-        if user.get("type") == "Bot" or login in robots or login == author or review.get("state") not in HUMAN_VERDICT_STATES:
-            continue
-        latest[login] = review
+    latest = _latest_verdicts(pull_request, reviews, robots)
+    approved = approved_logins(pull_request, reviews, approvers, robots)
+    covered = approvers_by_file is None or not uncovered_files(approvers_by_file, approved | {author})
 
     humans = [
         review["user"]["login"]
         for login, review in latest.items()
-        if review["state"] != APPROVED_STATE or login in approvers
+        if review["state"] != APPROVED_STATE or (login in approvers and covered)
     ]
     if humans:
         return f"{', '.join(humans)} already reviewed it"
@@ -982,13 +1068,13 @@ def main(argv=None):
     log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
     # Whether the pull request opened with `approved` already on it (#1075)
     # decides both what counts as reviewed and who is drawn: needing lgtm
-    # alone, anyone Prow takes an lgtm from will do; otherwise only an
-    # approver's review finishes it, so only an approver is asked.
+    # alone, anyone Prow takes an lgtm from will do; otherwise only
+    # approvers' reviews finish it, so only approvers are asked.
     self_approved = self_approval_covers(by_file, author)
     if self_approved:
         log(f"{author}'s own approval covers every changed file; lgtm is all it needs")
     else:
-        log(f"{author}'s own approval does not cover the change; only an approver is drawn")
+        log(f"{author}'s own approval does not cover the change; only approvers are drawn")
     # Nobody to narrow to -- a pull request with no changed files, where the
     # walk returns nothing and nothing is self-approved. Narrowing to an empty
     # set would fall back to the whole pool and could hand a non-approver an
@@ -1018,10 +1104,25 @@ def main(argv=None):
         # and this line is what shows which logins were in effect.
         log(f"Robot accounts, whose reviews never count: {', '.join(sorted(robots)) or 'none'}")
         reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
-        reason = already_reviewed_reason(pull_request, reviews, counting, robots)
+        reason = already_reviewed_reason(
+            pull_request, reviews, counting, robots, approvers_by_file=None if self_approved else by_file
+        )
         if reason:
             decline(api, args, reason)
             return 0
+
+    # Files an approval already on the pull request clears need nobody new, on
+    # the override path too: `/request-review` asks for whoever is still owed,
+    # not again for someone who approved. When nothing is still owed -- only
+    # the override gets here then -- the draw is left as it was.
+    if not self_approved:
+        if reviews is None:
+            reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
+        approved = approved_logins(pull_request, reviews, approvers, robot_accounts(config))
+        remaining = uncovered_files(by_file, approved | {author.lower()}) if approved else {}
+        if remaining:
+            by_file = remaining
+            log(f"Already approved by {', '.join(sorted(approved))}; drawing only for the files they cannot approve")
 
     deciding = None
     why = "a person asked for a reviewer with /request-review" if args.react_to else "a maintainer ran the request by hand"
@@ -1048,7 +1149,7 @@ def main(argv=None):
             return 0
 
     rng = random.Random(args.seed) if args.seed is not None else random
-    reviewers = select_reviewers(config, changed_files, author, rng=rng, restrict_to=None if self_approved else approvers)
+    reviewers = select_reviewers(config, changed_files, author, rng=rng, approvers_by_file=None if self_approved else by_file)
 
     if not reviewers:
         decline(api, args, "no reviewer matched")

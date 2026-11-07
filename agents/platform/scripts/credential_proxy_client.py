@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import http.client
 import json
 import math
@@ -224,13 +223,6 @@ KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
-# What a workspace `open` labels itself with, so the broker's log can say who
-# holds a slot when the store is full: the kanban card first, the session
-# otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
-# outside it is dropped rather than sent, because a label is a courtesy to the
-# log and must never be what fails an open.
-CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
-CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
 # A shell's context pin: which cluster the last context-less `get-credentials`
@@ -1785,7 +1777,7 @@ def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
 
 
 class WorkspaceUnavailable(RuntimeError):
-    """The broker does not have content workspaces armed."""
+    """The broker has no version control built (`VCS_UNAVAILABLE`)."""
 
 
 class BrokerDisconnected(RuntimeError):
@@ -1812,361 +1804,27 @@ class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
     def __init__(self, status: int, payload: dict) -> None:
-        # Two spellings of the same field, because the broker has two error
-        # shapes: a refusal from `ContentWorkspaceError` answers `{status,
-        # code, message}`, while a malformed body answers `{error}`. Reading
+        # Two spellings of the same field: the vcs routes answer `{error,
+        # code}`, and a broker policy refusal answers `{status, code,
+        # message}`. Reading
         # only one of them would render half the broker's refusals as the
         # generic fallback below, which is the sentence that tells a caller
         # nothing.
         super().__init__(
             payload.get("message")
             or payload.get("error")
-            or f"workspace request failed ({status})"
+            or f"broker request failed ({status})"
         )
         self.status = status
         self.payload = payload
 
 
-class Listing(list):
-    """The entries `list` returned, plus what it did not return.
-
-    A plain list, so every existing caller keeps working, carrying the two
-    fields that say whether it is the whole answer. A listing that stops at the
-    broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw. `symlinks` names the files
-    in the page's range that `read` refuses and so are never entries, and
-    `symlinked_directories` the links to directories the listing does not
-    enter, each a `{"path", "target"}` mapping.
-    """
-
-    def __init__(
-        self,
-        entries,
-        total: int = 0,
-        truncated: bool = False,
-        symlinks=(),
-        symlinked_directories=(),
-    ) -> None:
-        super().__init__(entries)
-        self.total = total or len(self)
-        self.truncated = truncated
-        # Symlinked files in this page's range, which `read` refuses and so
-        # are never entries; a broker older than the field reports none.
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
-
-
-def default_caller_label() -> str:
-    """The card or session id this process runs under, or "" when it has none.
-
-    Read at call time, like `session_lease` in the skill, because the agent
-    runs each command in a fresh process and the identity lives in its
-    environment. A value the broker's grammar would refuse is dropped here:
-    the label exists so the log can name who filled the store, and it must
-    never be the reason an open fails.
-    """
-    for name in CALLER_LABEL_ENV:
-        value = os.environ.get(name, "").strip()
-        if value and CALLER_LABEL_RE.match(value):
-            return value
-    return ""
-
-
-class Workspace:
-    """A git repository the broker owns and this process cannot see.
-
-    There is no path anywhere in this class, which is the point. A caller says
-    "write these bytes to `manifests/app.yaml` and commit them"; it never learns
-    where that file lands, so it cannot be talked into reading or writing
-    anything else there -- including `.git/config`, which is where a filter
-    driver or a hook path would have to be defined for the sixteen known
-    code-execution routes to work.
-
-    Typical use, replacing a clone/add/commit/push sequence:
-
-        with Workspace.open(endpoint, "acme/infra") as workspace:
-            current = workspace.read_text("manifests/app.yaml")
-            workspace.commit(
-                branch="fix/replicas",
-                message="raise replicas",
-                changes={"manifests/app.yaml": patched.encode()},
-            )
-            workspace.push()
-    """
-
-    def __init__(self, endpoint: str, opened: dict) -> None:
-        self.endpoint = endpoint
-        self.handle = opened["handle"]
-        self.repo = opened["repo"]
-        self.base = opened["base"]
-        self.base_sha = opened["baseSha"]
-        self.branch_sha = opened.get("branchSha", "")
-        self.started_from = opened.get("startedFrom", "")
-        self.shallow = bool(opened.get("shallow", False))
-        self.branch: str | None = None
-        self._closed = False
-
-    @classmethod
-    def open(
-        cls,
-        endpoint: str,
-        repo: str,
-        base: str | None = None,
-        branch: str | None = None,
-        depth: int | None = None,
-        caller: str | None = None,
-    ) -> "Workspace":
-        """`branch` names the branch this session will commit to, if known.
-
-        `caller` labels the workspace in the broker's log; left None, it is the
-        card or session id from the environment (`default_caller_label`).
-
-        Naming it decides what `read` and `list` answer with: when the branch
-        already exists on the remote -- a second round of review feedback -- the
-        broker checks that out rather than the base, so a file read here is the
-        file as the pull request has it.
-
-        `depth` opens a shallow single-branch clone for reading. The broker
-        refuses `commit` on one and refuses `depth` together with `branch`.
-        """
-        payload = {"repo": repo}
-        if base:
-            payload["base"] = base
-        if branch:
-            payload["branch"] = branch
-        if depth:
-            payload["depth"] = depth
-        label = default_caller_label() if caller is None else caller
-        if label:
-            payload["caller"] = label
-        return cls(endpoint, _workspace_call(endpoint, "open", payload))
-
-    def read(self, path: str) -> bytes:
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "path": path}
-        )
-        return base64.b64decode(result["contentBase64"])
-
-    def read_text(self, path: str, encoding: str = "utf-8") -> str:
-        return self.read(path).decode(encoding)
-
-    def read_many(self, paths: list[str]) -> tuple[dict[str, bytes], list[dict]]:
-        """Several files in one round trip.
-
-        Returns what came back and what did not, the second as the broker's own
-        `{path, reason}` records. A caller that ignores the second half will
-        materialise a partial tree and not know it -- `requestBudget` means ask
-        again for the rest, `tooLarge` means that file is never coming, and
-        `symlink` means the file is there but the broker will not follow a link
-        to it, so ask for the target's own name.
-        """
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}
-        )
-        files = {
-            entry["path"]: base64.b64decode(entry["contentBase64"])
-            for entry in result.get("files", [])
-        }
-        return files, result.get("skipped", [])
-
-    def list(self, prefix: str | None = None, after: str | None = None) -> Listing:
-        """One page of tracked names. `after` is the last path of the page before.
-
-        `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false. `symlinks` on the result
-        names the symlinked files the page's range holds, each once across the
-        pages; a caller rebuilding the tree needs them to know what it lacks,
-        and `symlinked_directories` the links to directories with their targets.
-        """
-        payload = {"handle": self.handle}
-        if prefix:
-            payload["prefix"] = prefix
-        if after:
-            payload["after"] = after
-        result = _workspace_call(self.endpoint, "list", payload)
-        return Listing(
-            result.get("entries", []),
-            total=result.get("total", 0),
-            truncated=bool(result.get("truncated")),
-            symlinks=result.get("symlinks") or [],
-            symlinked_directories=result.get("symlinkedDirectories") or [],
-        )
-
-    def grep(
-        self,
-        pattern: str,
-        prefix: str | None = None,
-        regex: bool = False,
-        ignore_case: bool = False,
-    ) -> dict:
-        """Search the checked-out tree. Fixed-string unless `regex` is set.
-
-        The whole answer, `{matches, total, truncated}`, rather than the matches
-        alone: a search that hit the broker's ceiling and looks complete sends a
-        reader off with a wrong conclusion about the repository.
-        """
-        payload = {"handle": self.handle, "pattern": pattern}
-        if prefix:
-            payload["prefix"] = prefix
-        if regex:
-            payload["regex"] = True
-        if ignore_case:
-            payload["ignoreCase"] = True
-        return _workspace_call(self.endpoint, "grep", payload)
-
-    def commit(
-        self,
-        branch: str,
-        message: str,
-        changes: dict[str, bytes | None],
-        expected_base_sha: str | None = None,
-        expected_branch_sha: str | None = None,
-    ) -> dict:
-        """`changes` maps a repository-relative path to bytes, or to None to delete.
-
-        Pass `expected_base_sha` (normally `self.base_sha`) to have the broker
-        refuse with 409 when the base branch has moved under a file this commit
-        also writes. Leaving it out means last-writer-wins against whatever
-        landed in the meantime.
-
-        The working branch is checked the same way and needs no argument: the
-        broker compares against the sha it last saw for that branch, which is
-        the only place the value exists. `expected_branch_sha` overrides it for
-        a caller that learned the sha somewhere else.
-        """
-        entries = []
-        for path, content in changes.items():
-            if content is None:
-                entries.append({"path": path, "delete": True})
-            else:
-                entries.append(
-                    {
-                        "path": path,
-                        "contentBase64": base64.b64encode(content).decode("ascii"),
-                    }
-                )
-        payload = {
-            "handle": self.handle,
-            "branch": branch,
-            "message": message,
-            "changes": entries,
-        }
-        if expected_base_sha:
-            payload["expectedBaseSha"] = expected_base_sha
-        if expected_branch_sha:
-            payload["expectedBranchSha"] = expected_branch_sha
-        result = _workspace_call(self.endpoint, "commit", payload)
-        self.branch = result["branch"]
-        # `committed: false` is an ordinary answer rather than an error -- a
-        # re-run whose fix is already on the branch has nothing to add -- and it
-        # carries neither a sha nor a commit. Callers read the flag; reading
-        # `result["commit"]` unconditionally is how that case turns into a
-        # KeyError several frames from the decision that produced it.
-        if result.get("baseSha"):
-            self.base_sha = result["baseSha"]
-        if result.get("branchSha") is not None:
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def push(self, branch: str | None = None) -> dict:
-        branch = branch or self.branch
-        if not branch:
-            raise ValueError("nothing has been committed on this workspace yet")
-        result = _workspace_call(
-            self.endpoint, "push", {"handle": self.handle, "branch": branch}
-        )
-        if result.get("branchSha"):
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        _workspace_call(self.endpoint, "close", {"handle": self.handle})
-
-    def __enter__(self) -> "Workspace":
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        # Best effort: a failure to clean up a broker-side tree must not mask
-        # the exception that is already propagating out of the with-block.
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-def workspaces_available(endpoint: str) -> bool:
-    """Whether this broker has content workspaces armed.
-
-    Both mechanisms run side by side while the skills migrate, so a caller that
-    can do either asks first rather than assuming.
-    """
-    try:
-        _workspace_call(endpoint, "open", {"repo": ""})
-    except WorkspaceUnavailable:
-        return False
-    except WorkspaceRequestError as exc:
-        # 401 is the one status that says nothing about the route: the broker
-        # rejects the caller before it looks at the path, so a client with no
-        # token would read "workspaces are armed" off a broker that never
-        # reached the question. Every other status is an answer about the
-        # payload, and an answer about the payload means the route exists.
-        #
-        # Reported live: a sandbox with no CREDENTIAL_PROXY_TOKEN_FILE saw this
-        # return True and then failed on the first real verb.
-        if exc.status == 401:
-            return False
-        return True
-    except TokenUnavailable:
-        # No token to present, so nothing here is reachable whatever the broker
-        # is serving.
-        return False
-    except urllib.error.URLError:
-        return False
-    return True
-
-
-def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    # The same credential and the same opener `execute` uses. These routes
-    # spend the broker's GitHub token exactly as /v1/exec does, so a
-    # cross-Pod call that omitted the header would earn a 401, and one that
-    # went through the stock opener would carry a total socket timeout onto a
-    # clone that legitimately runs for minutes.
-    headers.update(authorization_headers())
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/workspace/{verb}",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        try:
-            answer = json.load(exc)
-        except (ValueError, TypeError):
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
-        if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
-            raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
-        raise WorkspaceRequestError(exc.code, answer) from exc
-
-
 def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     """One `POST /v1/vcs/<verb>`.
 
-    Its own function rather than a parameter on `_workspace_call`, because the
-    two namespaces are different protocols that happen to share a transport:
-    every `/v1/vcs/*` call stands alone and holds nothing across a session.
-    Folding them together would put a `handle` argument on routes that have
-    none and invite a caller to hold one.
-
-    Public, unlike its neighbour, because the version-control skill is the
-    caller and it lives outside this module.
+    Every `/v1/vcs/*` call stands alone and holds nothing across a session.
+    Public, because the version-control skill is the caller and it lives
+    outside this module.
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}

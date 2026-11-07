@@ -70,8 +70,8 @@ _DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 9536 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 10048 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 25472 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
 # replicas, and the cleanup hook's 1088Mi.
@@ -865,12 +865,21 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             footprint_path.write_text(original_footprint)
 
-    def _next_mode_delta(self, agent_replicas: int = 1) -> dict:
-        """What footprint.yaml's nextMode adds, summed independently of the template."""
+    def _next_mode_delta(self, agent_replicas: int = 1, gateway_standby: bool = True) -> dict:
+        """What footprint.yaml's nextMode adds, summed independently of the template.
+
+        `gateway_standby` adds the A2A gateway's second pod, which the operator runs once a
+        gateway holds the election's Lease and no golden renders (the election on, its
+        default), at the footprint's per-pod figures.
+        """
         following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
         bridge = following["agentPod"]["hermesBridge"]
         workloads = [v for k, v in following.items() if k not in ("agentPod", "storage")]
         self.assertTrue(workloads, "footprint.yaml has no nextMode workloads")
+        if gateway_standby:
+            gateway = following["a2aGateway"]
+            workloads.append({k: (v // gateway["pods"] if isinstance(v, int) and k != "pods" else v)
+                              for k, v in gateway.items() if k not in ("requests", "limits", "surges")} | {"pods": 1})
         delta = {
             "pods": sum(w["pods"] for w in workloads),
             "persistentVolumeClaims": following["storage"]["persistentVolumeClaims"],
@@ -895,6 +904,18 @@ class PreflightDecisionTest(unittest.TestCase):
         # Not a vacuous zero: the stack is several pods and a JetStream claim.
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
         self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 1)
+
+    def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
+        """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
+        preflight counts the footprint's one gateway pod and nothing more."""
+        base = self._requirements()
+        following = self._requirements(
+            ["platformAgent.mode=next"],
+            values={"operator": {"extraEnv": [{"name": "A2A_GATEWAY_ELECTION", "value": "false"}]}},
+        )
+        for key, value in self._next_mode_delta(gateway_standby=False).items():
+            with self.subTest(key=key):
+                self.assertEqual(following[key] - base[key], value)
 
     def test_mode_today_counts_what_an_unset_mode_does(self) -> None:
         self.assertEqual(self._requirements(["platformAgent.mode=today"]), self._requirements())
@@ -1949,7 +1970,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"27520Mi"', res.stderr)
+        self.assertIn('"limits.memory":"28544Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1980,8 +2001,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        # The release's 9536Mi plus one LiteLLM surge Pod's 2Gi.
-        self.assertIn('"memory":"11584Mi"', res.stderr)
+        # The release's 10048Mi plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"12096Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -2065,7 +2086,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
-        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 1024 * 1024**2)
+        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 2 * 1024**3)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.
@@ -2482,6 +2503,9 @@ class DocumentedFootprintTest(unittest.TestCase):
         callout_cpu, callout_mem, callout_replicas = per_pod("a2aCallout")
         verifier_cpu, verifier_mem, verifier_replicas = per_pod("a2aVerifier")
         gateway_cpu, gateway_mem, gateway_replicas = per_pod("a2aGateway")
+        # The gateway's standby, which no golden renders (it runs once a gateway holds
+        # the election's Lease), is one more gateway pod by default.
+        gateway_replicas += 1
         console_cpu, console_mem, console_replicas = per_pod("a2aConsole")
         provision_cpu, provision_mem, _ = per_pod("a2aProvision")
         bridge = following["agentPod"]["hermesBridge"]
@@ -2544,6 +2568,9 @@ class DocumentedFootprintTest(unittest.TestCase):
                 if k not in ("agentPod", "storage", "a2aProvision")
             )
         )
+        # The gateway's standby and a rollout's surge pod (a2aGatewayStandbyPods), which the
+        # footprint can't show: no golden renders the scale-out.
+        operator_standing += 2
         headroom = operator_standing + chart_default + margin
 
         page = " ".join(self._PREREQUISITES.read_text().split())
@@ -2587,7 +2614,7 @@ class DocumentedFootprintTest(unittest.TestCase):
             f"two capability verifier replicas ({verifier_cpu} CPU, {verifier_mem} memory each)",
             page,
         )
-        self.assertIn(f"the A2A gateway ({gateway_cpu} CPU, {gateway_mem} memory)", page)
+        self.assertIn(f"two A2A gateway replicas ({gateway_cpu} CPU, {gateway_mem} memory each", page)
         self.assertIn(f"the console ({console_cpu} CPU, {console_mem} memory)", page)
         self.assertIn(
             f"`hermes-bridge` container in the agent pod ({bridge_cpu} CPU, {bridge_mem} memory under the default `api` executor",

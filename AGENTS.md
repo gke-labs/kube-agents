@@ -208,9 +208,9 @@ user" clauses here. Agents with a user in the loop follow this file.
 - **Expect an automated review after opening a PR** from `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
 - **Leave no conversation unanswered.** Open threads block merge and keep the PR counted as
-  [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request), a
-  declined bot thread excepted (below). Reply first, then resolve every addressed thread per
-  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
+  [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request).
+  Reply first, then resolve every addressed thread
+  ([how](docs/pull-request-workflow.md#resolving-conversations)).
 - **You do not merge it; the merge queue does** once a reviewer's `lgtm` and an `OWNERS` approver's
   `approved` are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
@@ -286,14 +286,15 @@ fix, before any `/review`; a skipped live run is written `Not live-tested: <what
 why no install reaches it>`; a description ask repeated after your reply is a dispute for the human
 reviewer, not another edit.
 
-**Resolve a thread** only when **fully confident the issue is addressed**: the fix is on the PR head
+**Resolve a thread** when **fully confident the issue is addressed**: the fix is on the PR head
 with its commit named, or the finding is factually wrong against `main` (not a stale checkout) and
-you have said why. A judgment call, a declined ask, or an unanswered rebuttal stays open with a
-reply; resolving does not end a disagreement. A declined `kube-agents-bot` finding stays open until
-a human rules on it (an approval, or a reply accepting the decline; one asking for the fix owes it),
-then you resolve it citing the ruling; with a user in the loop you may resolve it once your reply
-and **Self-Review** give the reason, bar the description thread, but prefer not to. Reply first: a
-resolved thread collapses, and the reply is the only record a reviewer may see.
+you have said why. Resolve a `kube-agents-bot` finding you decline or defer once your reply gives
+the reason (and any follow-up issue) and **Self-Review** names it, and the description thread once
+the body is edited: an open thread hides the PR from its reviewer
+([why](docs/pull-request-workflow.md#who-owns-an-open-pull-request)). Unresolve it if a reviewer
+asks for the fix. A person's thread is different: a judgment call, a declined ask, or an unanswered
+rebuttal stays open with a reply; resolving does not end a disagreement. Reply first:
+a resolved thread collapses, and the reply is the only record a reviewer may see.
 
 ## Before Reviewing Someone Else's Pull Request
 
