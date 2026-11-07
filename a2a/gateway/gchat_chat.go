@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -11,7 +12,8 @@ import (
 // The Google Chat renderer for kube-agents.chat/v1 (spec-a2a-payloads.md,
 // "Chat messages"): one validated chat message laid out as a Chat text
 // message, in the spec's fixed order -- headline and note, detail, rows,
-// after, fold, then the buttons, choices before links -- with the buttons as
+// after, fold, then the buttons, choices before links, then the Retry and
+// Drop of any row that carries them (gchat_board.go) -- with the buttons as
 // accessory widgets under the message; in a progress message the plan
 // follows the headline in the rows' place. It is text rather than a card
 // because Chat's card text has no monospace and no code, which a table, a
@@ -22,8 +24,10 @@ import (
 // a mention or a <url|text> in it is defanged as in any post. It lays out
 // and never composes: every word comes from the message, and the only things
 // it adds are its backend's own -- the glyph on a plan item, the step
-// markers, the bullet on a row, and the Stop button the gateway asks for
-// under a running task's line (gchat_stop.go).
+// markers, the bullet on a row, the Stop button the gateway asks for under
+// a running task's line (gchat_stop.go), and, where a row carries Retry and
+// Drop, the row's number in the bullet's place and the "Retry n" and "Drop
+// n" labels on its buttons (gchat_board.go).
 const (
 	// gchatChatTextMax bounds the laid-out text: the adapter's one bound on
 	// a posted text (gchatTextMax). A message past it posts as its
@@ -88,6 +92,12 @@ var errGchatChatEmpty = errors.New("the chat message lays nothing out")
 type gchatChatLayout struct {
 	Text    string
 	Widgets []map[string]any
+	// RowsStart and RowsCount place the rows in Text, by line, when the
+	// message's rows carry Retry and Drop (gchat_board.go): a tap edits its
+	// row by them, so a numbered list in the detail or the fold is never
+	// taken for the rows. RowsCount is 0 when no row acts, or for a layout
+	// read back from a click's copy of the message.
+	RowsStart, RowsCount int
 }
 
 // renderGchatChat lays m out as a Chat text message with accessory buttons.
@@ -104,18 +114,35 @@ func renderGchatChat(m *chatmsg.Message) (gchatChatLayout, error) {
 	if strings.TrimSpace(m.Detail) != "" {
 		add(toGchatText(m.Detail))
 	}
+	// The rows' buttons are drawn only where the rows are: a progress
+	// message's plan takes their place, and a button for a row not shown
+	// would name nothing.
+	var rowButtons []map[string]any
+	var rowsStart, rowsCount int
 	if m.Plan != nil && len(m.Plan.Items) > 0 {
 		add(gchatChatPlan(m.Plan))
 	} else {
-		add(gchatChatRows(m.Rows))
+		rows := strings.TrimRight(gchatChatRows(m.Rows), "\n")
+		rowButtons = gchatBoardButtons(m.Rows)
+		if len(rowButtons) > 0 && strings.TrimSpace(rows) != "" {
+			// The rows begin after the sections so far (their last line is
+			// the count of breaks in them) and the gap's blank line.
+			if before := strings.Join(sections, gchatChatSectionGap); before != "" {
+				rowsStart = strings.Count(before, "\n") + strings.Count(gchatChatSectionGap, "\n")
+			}
+			rowsCount = strings.Count(rows, "\n") + 1
+		}
+		add(rows)
 	}
 	add(gchatChatAfter(m.After))
 	if m.Fold != nil {
 		add(gchatChatFold(m.Fold))
 	}
 	layout := gchatChatLayout{
-		Text:    strings.Join(sections, gchatChatSectionGap),
-		Widgets: gchatChatWidgets(m.Choices, m.Links),
+		Text:      strings.Join(sections, gchatChatSectionGap),
+		Widgets:   gchatButtonList(append(gchatChatButtons(m.Choices, m.Links), rowButtons...)),
+		RowsStart: rowsStart,
+		RowsCount: rowsCount,
 	}
 	if layout.Text == "" && len(layout.Widgets) == 0 {
 		return gchatChatLayout{}, errGchatChatEmpty
@@ -153,30 +180,50 @@ func gchatBoldLine(text string) string {
 }
 
 // gchatChatRows is the rows as a bulleted list: the severity as inline code
-// ahead of the text, the detail after it on the same line.
+// ahead of the text, the detail after it on the same line. When a row
+// carries buttons, every row is numbered in the bullet's place, since the
+// buttons sit under the whole message and name their row by its number
+// (gchat_board.go).
 func gchatChatRows(rows []chatmsg.Row) string {
 	var lines []string
+	numbered := slackChatRowsAct(rows)
+	drawn := 0
 	for _, r := range rows {
+		// A row that was a rule is nothing after the pass, and draws no
+		// empty bullet and takes no number (gchatChatRowText).
+		text, ok := gchatChatRowText(r)
+		if !ok {
+			continue
+		}
+		drawn++
 		line := gchatChatRowBullet
+		if numbered {
+			line = fmt.Sprintf(gchatBoardRowMarker, drawn)
+		}
 		if r.Severity != "" {
 			line += gchatChatCode + r.Severity + gchatChatCode + " "
 		}
-		// A row the model wrote as a list item keeps its marker through
-		// the line pass (Chat's bullet is the renderer's), so the marker is
-		// shed before the renderer's goes on; a row that was a rule is
-		// nothing after the pass, and draws no empty bullet.
-		text := strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
 		line += text
 		// Measured after the pass, as the text is: a detail that was a rule
 		// is nothing, and draws no separator.
 		if detail := strings.TrimSpace(toGchatText(r.Detail)); detail != "" {
 			line += gchatChatRowDetailSep + detail
 		}
-		if text != "" || r.Severity != "" {
-			lines = append(lines, line)
-		}
+		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// gchatChatRowText is a row's text as drawn, and whether the row is drawn
+// at all: a row the model wrote as a list item keeps its marker through
+// the line pass (Chat's bullet is the renderer's), so the marker is shed
+// before the renderer's goes on; a row that was a rule is nothing after the
+// pass and, with no severity, is not drawn. The row buttons count drawn
+// rows the same way (gchatBoardButtons), so a number names the same row in
+// the text and on its buttons.
+func gchatChatRowText(r chatmsg.Row) (text string, drawn bool) {
+	text = strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
+	return text, text != "" || r.Severity != ""
 }
 
 // gchatChatAfter is the lines after the rows, one each.
@@ -252,11 +299,25 @@ func gchatChatPlan(p *chatmsg.Plan) string {
 }
 
 // gchatChatWidgets is the buttons as one accessory button list, choices
-// before links. A choice's click sends gchatChatFunction with the choice's
-// reply (its text when it has none) and index, which the adapter turns into
-// the clicker's message; a link button opens its url. The one primary entry
-// is drawn filled.
+// before links (gchatChatButtons).
 func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
+	return gchatButtonList(gchatChatButtons(choices, links))
+}
+
+// gchatButtonList is buttons as one accessory button list, nil for none.
+func gchatButtonList(buttons []map[string]any) []map[string]any {
+	if len(buttons) == 0 {
+		return nil
+	}
+	return []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
+}
+
+// gchatChatButtons is the choice and link buttons, choices before links. A
+// choice's click sends gchatChatFunction with the choice's reply (its text
+// when it has none) and index, which the adapter turns into the clicker's
+// message; a link button opens its url. The one primary entry is drawn
+// filled.
+func gchatChatButtons(choices []chatmsg.Choice, links []chatmsg.Link) []map[string]any {
 	var buttons []map[string]any
 	for i, c := range choices {
 		reply := c.Reply
@@ -278,10 +339,7 @@ func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[stri
 		b["onClick"] = map[string]any{"openLink": map[string]any{"url": l.URL}}
 		buttons = append(buttons, b)
 	}
-	if len(buttons) == 0 {
-		return nil
-	}
-	return []map[string]any{{"buttonList": map[string]any{"buttons": buttons}}}
+	return buttons
 }
 
 // gchatHomeButtons marks each choice button of a home post's layout with

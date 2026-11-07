@@ -593,7 +593,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -606,9 +606,11 @@ and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
-agent turn. Google Chat, and a run that also reports the board's other
-findings, get the text.
+today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
+allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
+where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
+is never an agent turn. Google Chat under today, and a run that also reports
+the board's other findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
