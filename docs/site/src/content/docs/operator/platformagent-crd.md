@@ -1431,9 +1431,10 @@ The origins reading (`proposalsFromChat`, `proposalsFromConsole`, `proposalsFrom
 `proposalsFromIssue`, `proposalsFromOther`) comes from the chat plugin's proposals ledger: the pull
 requests the agent opened and the forge confirmed, counted by the origin of the work that started
 each. The operator reads it on the gateway pod's chat metrics listener, summed over the chat
-platform. The reading is present when all nine origins resolve; the plugin serves every origin,
-zero included, from its first ledger read. Until then, and while the served CRD predates them, the
-nine fields are absent.
+platform. The reading is present when all nine origins resolve and the plugin's read age, when the body
+carries it, is not above two poll intervals; the plugin serves every origin, zero included, from its
+first ledger read. Until then, and while the served CRD predates them, the nine fields are absent. A
+ledger that stops answering therefore clears them about twenty minutes later.
 
 A poll that reads no body with all nine is a miss, and the second miss in a row clears them. A 0 is
 a reading, and none of the nine moves `lastActiveTime` or `lastHumanActiveTime`. A proposal the
