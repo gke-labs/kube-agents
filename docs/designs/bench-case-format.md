@@ -94,7 +94,7 @@ rather than for a merge decision.
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
 and costs what that stack takes to apply and destroy on every pull request, minutes for a
 cluster and seconds for a single alert policy. `task_stack` in `hack/ci-eval-pr.sh` reads
-`infrastructure.stack` out of the file text for the infra lock and the nightly halves, so
+`infrastructure.stack` out of the file text for the infra lock and the nightly's main shards, so
 keep it on one line; `bench-gate` reads `deployer` through a YAML parse
 (`bench/kube_agents_bench/cases.py`) to classify a crashed run.
 
