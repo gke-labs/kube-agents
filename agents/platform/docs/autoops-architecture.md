@@ -399,7 +399,7 @@ The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
   rules, a flapping guard and a settle period. The deployed watcher forwards seventeen reasons, which
-  `deploy/shared/start-services.sh` passes as `--reason` (`WATCHER_REASONS`) and no environment
+  `deploy/shared/start-services.sh` passes as `--reason` (`EVENT_WATCHER_REASONS`) and no environment
   variable overrides: `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`,
   `ImagePullBackOff`, `ErrImagePull`, `OOMKilled`, `FailedScheduling`, and the nine reasons Config
   Connector records on a managed resource it cannot apply (`UpdateFailed`, `DeleteFailed`,

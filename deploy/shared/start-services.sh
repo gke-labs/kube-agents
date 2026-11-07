@@ -546,7 +546,7 @@ normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 # these on the object and nothing else, so without them the event path
 # never hears of it. Its normal states (Updating, UpToDate, Deleting,
 # Deleted) are not on the list.
-readonly WATCHER_REASONS=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedScheduling,TriggeredScaleUp,NotTriggerScaleUp,\
+readonly EVENT_WATCHER_REASONS=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedScheduling,TriggeredScaleUp,NotTriggerScaleUp,\
 UpdateFailed,DeleteFailed,DependencyNotReady,DependencyNotFound,DependencyInvalid,ManagementConflict,Unmanaged,PreActuationTransformFailed,PostActuationTransformFailed
 
 # The settle period: how long a failure in the settle family (the crash-loop
@@ -963,7 +963,7 @@ start_event_watcher() {
         --gateway-url="${AGENT_GATEWAY_URL}" \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
-        --reason="${WATCHER_REASONS}" \
+        --reason="${EVENT_WATCHER_REASONS}" \
         --backoff-min-count="${WATCHER_BACKOFF_MIN_COUNT}" \
         --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
         --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \

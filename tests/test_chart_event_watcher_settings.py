@@ -222,8 +222,8 @@ _CONFIG_CONNECTOR_REASONS = (
     "PreActuationTransformFailed",
     "PostActuationTransformFailed",
 )
-_REASON_LIST = re.compile(r"^readonly WATCHER_REASONS=(\S+)$", re.MULTILINE)
-_REASON_FLAG = '--reason="${WATCHER_REASONS}"'
+_REASON_LIST = re.compile(r"^readonly EVENT_WATCHER_REASONS=(\S+)$", re.MULTILINE)
+_REASON_FLAG = '--reason="${EVENT_WATCHER_REASONS}"'
 
 
 class EntrypointReasonListTest(unittest.TestCase):
