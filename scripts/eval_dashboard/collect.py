@@ -375,7 +375,7 @@ NOT_GRADED_KEY = "not_graded"
 # an id the pages link is one the collector keeps -- and the list is cut at
 # the size a suite could name; the rest is dropped as malformed detail, the
 # way a non-string entry already is. Same idea as the log parser's `\S+`
-# task names and the excerpt scrub in gate_comment.py. Matched with
+# task names. Matched with
 # `fullmatch`: a `$` anchor under `match` admits one trailing newline.
 _CASE_ID_SHAPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 NOT_EVALUATED_MAX_CASES = 64

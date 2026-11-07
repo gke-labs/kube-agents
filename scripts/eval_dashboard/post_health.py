@@ -1607,7 +1607,7 @@ def nightly_latency_line(data: dict, now: datetime) -> str | None:
         night, _ = nightly.last_night(data, now)
         if night is None:
             return None
-        return nightly_latency.night_line(nightly.night_reports(data, running=nightly.running_nights(data, now)))
+        return nightly_latency.night_line(nightly.night_dates(data, running=nightly.running_nights(data, now)))
     except Exception:  # noqa: BLE001 -- the digest must still go out
         traceback.print_exc()
         log("warning: nightly latency line skipped")

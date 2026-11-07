@@ -34,7 +34,9 @@
 #      a2a/cmd/web-console models.go, patches.go and repositories.go) is unchanged.
 #   3. Labels, finalizers and owner references are unchanged.
 #   4. A forge that already existed (matched by name) keeps its host, port, scheme, provider,
-#      credentialsRef and caBundleRef, and its namespace when it has a credentialsRef.
+#      credentialsRef, caBundleRef and identity (the account a Bitbucket token acts as, which the
+#      broker uses to tell the install's own proposals from another person's), and its namespace
+#      when it has a credentialsRef.
 #   5. A forge the console adds carries no credentialsRef and no caBundleRef.
 #   6. The install's GitHub host (the first GitHub forge's host, github.com by default) is unchanged,
 #      and a GitHub forge the console adds sits at a host a GitHub forge already uses (github.com
@@ -161,9 +163,9 @@ spec:
     # A forge that already existed (matched by name) keeps where its credential goes: host (trimmed
     # and lowercased, and on a GitHub forge the github.com spellings read as github.com, as the
     # operator's canonicalHost reads it), port, scheme, provider (absent reads as github),
-    # credentialsRef and caBundleRef, and the namespace
-    # when it has a credentialsRef, since that namespace scopes the token's allowed paths. The
-    # console copies a same-name forge's fields, so its own writes pass.
+    # credentialsRef, caBundleRef and identity (whose account the credential acts as), and the
+    # namespace when it has a credentialsRef, since that namespace scopes the token's allowed paths.
+    # The console copies a same-name forge's fields, so its own writes pass.
     - expression: >-
         variables.newForges.all(f, variables.oldForges.all(o, o.name != f.name || (
           ((has(o.provider) && o.provider.trim() != '' ? o.provider.trim().lowerAscii() : 'github') == 'github' &&
@@ -180,8 +182,9 @@ spec:
           (!has(o.credentialsRef) || o.credentialsRef == f.credentialsRef) &&
           has(o.caBundleRef) == has(f.caBundleRef) &&
           (!has(o.caBundleRef) || o.caBundleRef == f.caBundleRef) &&
+          (has(o.identity) ? o.identity : '') == (has(f.identity) ? f.identity : '') &&
           (!has(o.credentialsRef) || (has(o.namespace) ? o.namespace : '') == (has(f.namespace) ? f.namespace : '')))))
-      message: "the web console may not change where an existing forge's credential goes: its host, port, scheme, provider, credentialsRef or caBundleRef, or the namespace of a forge with a credentialsRef"
+      message: "the web console may not change where an existing forge's credential goes or whose account it acts as: its host, port, scheme, provider, credentialsRef, caBundleRef or identity, or the namespace of a forge with a credentialsRef"
       reason: Forbidden
     # A forge the console adds carries no credential: an administrator adds credentials.
     - expression: >-

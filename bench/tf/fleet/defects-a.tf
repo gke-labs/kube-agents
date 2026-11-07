@@ -69,7 +69,10 @@ resource "kubernetes_namespace_v1" "seeded_stall" {
 # `spec.replicas >= 2` with no matching PDB and explicitly does NOT flag
 # single-replica workloads -- at replicas = 1 the audit produces no finding
 # and the scenario could never pass. Nothing constrains the eviction API,
-# so one drain can still take both replicas at once; that is the finding.
+# so back-to-back drains during an upgrade or scale-down can take both
+# replicas before a replacement is Ready; that is the finding. One drain
+# takes both only if they share a node, which the soft spread below makes
+# unlikely (#4966).
 # Asserted by obtainability-planted-pdb and by
 # cluster-agent-healthy-workload-no-finding, which uses this workload for the
 # opposite property: its runtime state is clean, so it is one of the

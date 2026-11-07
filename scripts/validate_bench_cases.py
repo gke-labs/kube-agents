@@ -353,11 +353,6 @@ FIXTURE_NOT_READY = {
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
     ),
-    "networking-world-open-ingress": (
-        "#2682: bench/tf/fleet's world_open firewall rule and VM are applied; the "
-        "un-park cites a fixture-state scan that reads the world-open-ingress role "
-        "healthy on every pool project"
-    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
@@ -441,22 +436,6 @@ FIXTURE_NOT_READY = {
         "install's context_repos, as the case's header gives; no pool install "
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
-    ),
-    "gce-startup-script-failure": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied; the un-park cites a "
-        "fixture-state scan that reads the startup-fail-vm role healthy on every "
-        "pool project"
-    ),
-    "gce-chat-request-runs-collector": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied, as for "
-        "gce-startup-script-failure; the un-park cites a fixture-state scan that "
-        "reads the startup-fail-vm role healthy on every pool project"
-    ),
-    "obtainability-pdb-kustomize-overlay": (
-        "#2686: bench/tf/prebuilt/kustomize-overlay-declaration plants the "
-        "Kustomize root for each run with the write token hack/ci-eval-pr.sh "
-        "mints for a stack that declares bench_gitops_write_token_file; the "
-        "un-park cites one pool run that shows the plant and the teardown work"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "

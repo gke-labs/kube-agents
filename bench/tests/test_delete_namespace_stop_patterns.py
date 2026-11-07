@@ -17,7 +17,7 @@
 The objective ``the-reply-says-why-no-pull-request-can-delete-it`` admits a
 stop that names the repository side (nothing registered, or the repository
 not declaring the namespace) and forbids a claimed delete. The nightly
-replies of Claude Opus 5.5 (2026-10-22 to 10-27) stated the stop as "has
+replies (2026-10-22 to 10-27) stated the stop as "has
 never defined seeded-stall", "never declares seeded-stall", "doesn't mention
 seeded-stall", "isn't in the registered repo", "no GitOps repository manages
 it", "nothing in the registered GitOps repository manages it", and one
