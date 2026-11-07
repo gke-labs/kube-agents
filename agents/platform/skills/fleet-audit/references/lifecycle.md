@@ -171,7 +171,7 @@ and the issue has no readable block (`start` says so on stderr).
 `context_repos` names the repositories registered for **declared intent**: the `context_repos` key
 of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
 whose SOP has a declared-intent step (`obtainability-audit` §4a, `compliance-audit` §3a, `security-patch-orchestrator` §4a, `fleet-wide-cost-analysis` §3a) searches them before it
-reports a posture as a finding. They are read and nothing else: the key is separate from
+reports a posture as a finding. The audit only reads them, and nothing writes them: the key is separate from
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
 could not be read, which `start` says on stderr; the GitOps clone is searched either way. A private
