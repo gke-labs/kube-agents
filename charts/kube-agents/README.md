@@ -1299,11 +1299,17 @@ on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted 
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
-`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
-and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
-so a next-mode one written by hand in the release namespace must carry that annotation
-itself, with the figure `helm template` stamps for the same values; without it the quota
-counts 5 for the chart's pods however many the release runs.
+`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
+and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`, and instead renders
+the same count in a ConfigMap, `a2a-quota-chart-pods`, in the release namespace, which the
+operator reads for a next-mode one written by hand there. The operator reads it from its own namespace only. For a
+hand-written CR in any other namespace, such as beside a release with `operator.enabled=false`, it counts the chart's
+Deployments and StatefulSets there (those labelled `app.kubernetes.io/managed-by: Helm` and
+`app.kubernetes.io/part-of: kube-agents`) at their replicas and rollout surge pods, as the chart does. An annotation on
+the CR still wins. A count past the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
+`A2AQuotaChartPodsDiscarded` Warning naming it, as does a failed read of the workloads. The operator reads the
+ConfigMap and the workloads on each reconcile but doesn't watch them, so a changed count reaches the quota on the next
+reconcile, which can be the operator's periodic one.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
