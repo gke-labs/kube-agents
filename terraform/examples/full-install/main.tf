@@ -1092,33 +1092,38 @@ resource "helm_release" "kube_agents" {
           alertDailyLimits = local.alert_daily_limits
         } : {}
       )
-      security = {
-        # With annotations set, the OPERATOR creates and manages the KSA (see
-        # the chart README's ServiceAccount-ownership section); this one wires
-        # Workload Identity to the GSA the kube-agents-iam module created.
-        # The KSA module.kube_agents_iam bound above -- one variable, so the
-        # binding cannot name a KSA the pod does not run as.
-        serviceAccountName = var.agent_ksa_name
-        serviceAccountAnnotations = {
-          "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
+      security = merge(
+        {
+          # With annotations set, the OPERATOR creates and manages the KSA (see
+          # the chart README's ServiceAccount-ownership section); this one wires
+          # Workload Identity to the GSA the kube-agents-iam module created.
+          # The KSA module.kube_agents_iam bound above -- one variable, so the
+          # binding cannot name a KSA the pod does not run as.
+          serviceAccountName = var.agent_ksa_name
+          serviceAccountAnnotations = {
+            "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
+          }
+          # The mapping the credential broker selects from, one row per project
+          # the module provisioned a member for. It has to reach the cluster as
+          # data rather than being recomputed there: the broker refuses a
+          # project it has no entry for, so a second implementation of the
+          # naming rule would turn a mismatch into a refusal at request time
+          # instead of a diff at plan time. `enabled` is the arming switch the
+          # operator reads; the list is empty while it is false.
+          scopedServiceAccountPool = {
+            enabled = var.scoped_pool_enabled
+            serviceAccounts = [
+              for project_id in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
+                projectId           = project_id
+                serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[project_id]
+              }
+            ]
+          }
+        },
+        var.disallow_secrets_read == null ? {} : {
+          disallowSecretsRead = var.disallow_secrets_read
         }
-        # The mapping the credential broker selects from, one row per project
-        # the module provisioned a member for. It has to reach the cluster as
-        # data rather than being recomputed there: the broker refuses a
-        # project it has no entry for, so a second implementation of the
-        # naming rule would turn a mismatch into a refusal at request time
-        # instead of a diff at plan time. `enabled` is the arming switch the
-        # operator reads; the list is empty while it is false.
-        scopedServiceAccountPool = {
-          enabled = var.scoped_pool_enabled
-          serviceAccounts = [
-            for project_id in sort(keys(module.kube_agents_iam.scoped_service_accounts)) : {
-              projectId           = project_id
-              serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[project_id]
-            }
-          ]
-        }
-      }
+      )
       # The same object the IAM module bound above, so the CR declares no
       # project the module did not also bind. Always rendered, empty lists
       # included: the reconcile reads a present block with an empty projects

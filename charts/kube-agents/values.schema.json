@@ -1424,6 +1424,9 @@
                   "type": "string"
                 }
               }
+            },
+            "disallowSecretsRead": {
+              "type": ["boolean", "null"]
             }
           }
         },

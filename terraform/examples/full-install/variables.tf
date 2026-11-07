@@ -1012,3 +1012,9 @@ variable "extra_helm_values" {
   type        = any
   default     = {}
 }
+
+variable "disallow_secrets_read" {
+  description = "Omit core secrets (get, list, watch) from the reader ClusterRole (spec.security.disallowSecretsRead on the PlatformAgent CR). Null leaves the field unset on the CR so new installs grant secrets read access and existing installs keep their current ClusterRole permissions."
+  type        = bool
+  default     = null
+}
