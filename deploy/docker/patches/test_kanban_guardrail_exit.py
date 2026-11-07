@@ -1414,6 +1414,22 @@ class BudgetHandoffCommentTest(unittest.TestCase):
         self.assertNotIn("protocol violation", body)
         self.assertIn("Run ?", body)
 
+    def test_it_says_what_the_charge_did_to_the_card(self):
+        """A counted failure retries; the one that tripped the limit blocked
+        the card, and the comment must not promise a retry there."""
+        counted = kge.budget_handoff_comment(run_id=28, api_call_count=3, max_iterations=3, text="t")
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.OUTCOME], counted)
+        self.assertNotIn("blocked", counted)
+        tripped = kge.budget_handoff_comment(
+            run_id=28, api_call_count=3, max_iterations=3, text="t", outcome=kge.TRIPPED_OUTCOME
+        )
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.TRIPPED_OUTCOME], tripped)
+        self.assertIn("blocked", tripped)
+        self.assertNotIn("retry limit", tripped)
+        for body in (counted, tripped):
+            self.assertNotIn("next attempt", body)
+            self.assertIn("next worker on this card", body)
+
     def test_it_says_where_the_text_came_from(self):
         for source, lead in kge.HANDOFF_ORIGINS.items():
             with self.subTest(source=source):
@@ -1498,9 +1514,15 @@ class PersistBudgetHandoffTest(unittest.TestCase):
         """gave_up is the outcome upstream books on the attempt that trips the
         breaker; the card is blocked and the hand-off is what the operator reads."""
         conn = closed_by_budget([("t_80ff98c9", "blocked", 28)], outcome="gave_up")
-        did, _, _ = self._persist(conn)
+        did, com, _ = self._persist(conn)
         self.assertTrue(did)
         self.assertEqual(self._summary(conn), SUMMARY)
+        body = com.calls[0][2]
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.TRIPPED_OUTCOME], body)
+        self.assertNotIn("retry limit", body)
+        # And the counted outcome keeps its own framing.
+        _, com, _ = self._persist(closed_by_budget([("t_80ff98c9", "ready", 28)]))
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.OUTCOME], com.calls[0][2])
 
     def test_a_run_closed_by_something_else_is_left_alone(self):
         """The worker blocked its card, carried on, and only then exhausted the

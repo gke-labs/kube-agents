@@ -6203,6 +6203,35 @@ def test_settle_delegated_worker_triage_rate_limit_with_worker_actions_stays_gra
     assert tool_entry in res.trajectory
 
 
+def test_delivered_results_skips_the_budget_handoff_a_capped_run_left_as_its_summary() -> None:
+    """The image saves a budget-exhausted worker's closing summary on its run
+    (timed_out, or gave_up on the attempt that tripped the limit) as a hand-off
+    for the next worker. It is not the card's answer: a blocked card with one
+    delivers nothing, a ready card between attempts delivers nothing, and a
+    completed run's summary is still delivered as before."""
+    handoff = "I completed steps 1-2; remaining: steps 3-5, then kanban_complete."
+    gave_up = {
+        "task": {"id": "t_1", "status": "blocked", "result": None},
+        "runs": [{"id": 7, "status": "gave_up", "outcome": "gave_up", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(gave_up)}], ["t_1"]) == {}
+    between_attempts = {
+        "task": {"id": "t_1", "status": "ready", "result": None},
+        "runs": [{"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(between_attempts)}], ["t_1"]) == {}
+    completed = {
+        "task": {"id": "t_1", "status": "done", "result": None},
+        "runs": [
+            {"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff},
+            {"id": 8, "status": "done", "outcome": "completed", "summary": "All five steps ran."},
+        ],
+    }
+    assert harness.delivered_results([{"result": json.dumps(completed)}], ["t_1"]) == {
+        "t_1": "All five steps ran."
+    }
+
+
 def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -> None:
     """delivered_results excludes rate-limited triage results and handles non-string result safely."""
     rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"

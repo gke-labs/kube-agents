@@ -507,21 +507,33 @@ HANDOFF_SOURCE_TRANSCRIPT = "transcript"
 HANDOFF_SOURCE_NONE = "none"
 
 #: The comment the hand-off leaves on the card. It describes and does not
-#: instruct: the retry worker reads it under the card's comments. ``{origin}``
-#: is one of ``HANDOFF_ORIGINS`` and ``{text}`` is the model's own text,
-#: verbatim, last so a reader who wants only the hand-off can stop at the
-#: framing.
+#: instruct: the retry worker reads it under the card's comments.
+#: ``{consequence}`` is ``HANDOFF_CONSEQUENCES[outcome]``: what the charge did
+#: to the card, which differs between a counted failure and the one that
+#: tripped the limit. ``{origin}`` is one of ``HANDOFF_ORIGINS`` and
+#: ``{text}`` is the model's own text, verbatim, last so a reader who wants
+#: only the hand-off can stop at the framing. "The next worker on this card"
+#: is true for both outcomes: a counted failure's retry, or the run an
+#: unblock starts.
 BUDGET_HANDOFF_COMMENT = (
-    "Run {run} ended on an exhausted iteration budget ({used}/{maximum}). The "
-    "run counts as a failure toward the card's retry limit. {origin}\n\n{text}"
+    "Run {run} ended on an exhausted iteration budget ({used}/{maximum}). "
+    "{consequence} {origin}\n\n{text}"
 )
+HANDOFF_CONSEQUENCES = {
+    OUTCOME: "The run counts as a failure toward the card's retry limit.",
+    TRIPPED_OUTCOME: (
+        "It was the card's last permitted failure: the card is blocked until "
+        "someone unblocks it."
+    ),
+}
 HANDOFF_ORIGINS = {
     HANDOFF_SOURCE_SUMMARY: (
-        "Hand-off from the worker's own closing summary, saved for the next attempt:"
+        "Hand-off from the worker's own closing summary, saved for the next "
+        "worker on this card:"
     ),
     HANDOFF_SOURCE_TRANSCRIPT: (
         "The closing summary call produced nothing, so this is the worker's last "
-        "written answer, saved for the next attempt:"
+        "written answer, saved for the next worker on this card:"
     ),
     HANDOFF_SOURCE_NONE: "Nothing was left to hand off:",
 }
@@ -1294,14 +1306,22 @@ def budget_handoff_text(final_response, messages=None, summary_request=None) -> 
 
 
 def budget_handoff_comment(
-    *, run_id, api_call_count, max_iterations, text, source=HANDOFF_SOURCE_SUMMARY
+    *,
+    run_id,
+    api_call_count,
+    max_iterations,
+    text,
+    source=HANDOFF_SOURCE_SUMMARY,
+    outcome=OUTCOME,
 ) -> str:
-    """The comment body: which run, how much of the budget it used, where the
-    hand-off came from, the hand-off."""
+    """The comment body: which run, how much of the budget it used, what the
+    charge did to the card (``outcome``: a counted ``timed_out`` or the
+    ``gave_up`` that blocked it), where the hand-off came from, the hand-off."""
     return BUDGET_HANDOFF_COMMENT.format(
         run=run_id if run_id is not None else UNKNOWN_RUN_ID,
         used=api_call_count,
         maximum=max_iterations,
+        consequence=HANDOFF_CONSEQUENCES.get(outcome, HANDOFF_CONSEQUENCES[OUTCOME]),
         origin=HANDOFF_ORIGINS.get(source, HANDOFF_ORIGINS[HANDOFF_SOURCE_SUMMARY]),
         text=text,
     )
@@ -1336,16 +1356,18 @@ def should_persist_budget_handoff(
     )
 
 
-def budget_charge_landed(conn, task_id: str, run_id) -> bool:
-    """Whether upstream's budget charge closed this worker's own run.
+def budget_charge_outcome(conn, task_id: str, run_id):
+    """The outcome upstream's budget charge closed this worker's own run with,
+    or ``None`` when it did not.
 
     ``_record_kanban_budget_exhausted`` calls ``_record_task_failure`` with no
     ``expected_run_id``, so it closes whatever run is current. If that was this
     worker's run, the row is closed with one of ``BUDGET_EXHAUSTED_OUTCOMES``
-    and the hand-off describes it truthfully. Any other outcome on the row
+    (``timed_out``, or ``gave_up`` on the attempt that tripped the limit) and
+    the hand-off describes it truthfully. Any other outcome on the row
     (``blocked``, ``completed``) means this run ended on its own terms earlier
     and the card moved on; an open row means the charge did not land (upstream
-    logs and continues). Both answer ``False``: write nothing.
+    logs and continues). Both answer ``None``: write nothing.
     """
     try:
         row = conn.execute(
@@ -1353,20 +1375,26 @@ def budget_charge_landed(conn, task_id: str, run_id) -> bool:
             (run_id, task_id),
         ).fetchone()
     except Exception:
-        # A read that fails answers False, as everywhere in this module, but
+        # A read that fails answers None, as everywhere in this module, but
         # loudly: the hand-off is lost and the retry starts cold.
         logger.warning(
             "budget hand-off for task %s run %s: could not read the run row", task_id, run_id,
             exc_info=True,
         )
-        return False
+        return None
     if row is None:
-        return False
+        return None
     try:
         outcome = row["outcome"]
     except (TypeError, IndexError, KeyError):
         outcome = row[0]
-    return str(outcome or "") in BUDGET_EXHAUSTED_OUTCOMES
+    outcome = str(outcome or "")
+    return outcome if outcome in BUDGET_EXHAUSTED_OUTCOMES else None
+
+
+def budget_charge_landed(conn, task_id: str, run_id) -> bool:
+    """Whether upstream's budget charge closed this worker's own run."""
+    return budget_charge_outcome(conn, task_id, run_id) is not None
 
 
 def persist_budget_handoff(
@@ -1447,7 +1475,8 @@ def persist_budget_handoff(
         text = redact(text)
     conn = connect()
     try:
-        if not budget_charge_landed(conn, task_id, run_id):
+        outcome = budget_charge_outcome(conn, task_id, run_id)
+        if outcome is None:
             return False
         placeholders = ",".join("?" for _ in BUDGET_EXHAUSTED_OUTCOMES)
         cursor = conn.execute(
@@ -1477,6 +1506,7 @@ def persist_budget_handoff(
                         max_iterations=max_iterations,
                         text=text,
                         source=source,
+                        outcome=outcome,
                     ),
                 )
         except Exception:
