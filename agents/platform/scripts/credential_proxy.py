@@ -14651,6 +14651,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
         answered = False
+        # The API server's status line arrived: the cached host and CA reached
+        # it, so a failure after this point is not theirs to be forgotten for.
+        upstream_answered = False
         try:
             connection = self._watcher_k8s_connection(host, ca_pem)
             connection.connect()
@@ -14662,6 +14665,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 connection.putheader("Accept", accept)
             connection.endheaders()
             response = connection.getresponse()
+            upstream_answered = True
             if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
                 LOGGER.warning("watcher k8s redirect refused request_id=%s status=%d", request_id, response.status)
                 self._json(
@@ -14754,22 +14758,27 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 sent += len(chunk)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
         except (OSError, http.client.HTTPException) as exc:
-            # Before the status line, an answer, and the cached address is
-            # forgotten in case it is what failed; after it, nothing more is
-            # written and the stream is cut, which the client answers by
-            # re-listing or re-watching, as it would on any dropped watch.
+            # Before our status line, an answer, and the cached address is
+            # forgotten in case it is what failed: only when the API server's
+            # own status line never arrived, since one that did proves the
+            # address (a buffered Pod read that fails mid-body). After our
+            # status line, nothing more is written and the stream is cut,
+            # which the client answers by re-listing or re-watching, as it
+            # would on any dropped watch.
             LOGGER.warning(
-                "watcher k8s upstream failed request_id=%s type=%s answered=%s",
+                "watcher k8s upstream failed request_id=%s type=%s answered=%s upstream_answered=%s",
                 request_id,
                 type(exc).__name__,
                 answered,
+                upstream_answered,
             )
             if answered:
                 self.close_connection = True
             else:
-                key = (target["project"], target["location"], target["cluster"])
-                with self.watcher_endpoints_lock:
-                    self.watcher_endpoints.pop(key, None)
+                if not upstream_answered:
+                    key = (target["project"], target["location"], target["cluster"])
+                    with self.watcher_endpoints_lock:
+                        self.watcher_endpoints.pop(key, None)
                 with contextlib.suppress(OSError):
                     self._json(
                         HTTPStatus.BAD_GATEWAY,

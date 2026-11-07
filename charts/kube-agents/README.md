@@ -1213,7 +1213,7 @@ web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
-another host, add a forge with a credential, add a GitHub forge at a new host, or
+another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
 change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
@@ -1286,7 +1286,9 @@ It also counts the standing pods the operator renders only behind an operator fl
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
 is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
 and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
-as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
+as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
+election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
+`A2A_GATEWAY_ELECTION` to `false`. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
