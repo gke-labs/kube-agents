@@ -5630,6 +5630,10 @@ type a2aProvisionState struct {
 	// such a rollout, and the status writers carry it as
 	// a2aCalloutStalledConditionType so the wedged rollout is visible.
 	calloutStalled string
+	// calloutMap is what the callout pods' /status said about the identity
+	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
+	// that did not get as far as rendering one.
+	calloutMap *calloutMapState
 	// busHeld reports that a running bus was left on its current config
 	// this pass because a callout replica is not yet on the current spec
 	// (a2aBusWaitsForCallout). It shares the reconcile's requeue with
@@ -5660,6 +5664,14 @@ type a2aProvisionState struct {
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
+}
+
+// wantsRequeue reports whether a pass should come back at a2aPendingRequeue
+// rather than wait for an event: the stack is still converging, the gateway
+// or the bus is held, or the callouts haven't settled on the map (a map
+// taken changes nothing the operator watches).
+func (s a2aProvisionState) wantsRequeue() bool {
+	return !s.done || s.gatewayHeld || s.gatewayWaking || s.busHeld || s.calloutMap.unsettled()
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5877,6 +5889,15 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to prune stale A2A identity map shards: %w", err)
 	}
 	state.AuthMapVersion = authMapVersion
+	// Whether the callouts took that map, or refused it and serve the one
+	// they had. An unreadable answer hides a refusal, so turning unreadable
+	// is a Warning, once per transition.
+	mapState := r.readCalloutMapState(ctx, agent, authMapVersion)
+	if prev := meta.FindStatusCondition(agent.Status.Conditions, a2aIdentityMapAppliedConditionType); mapState.reason == a2aIdentityMapStatusUnreadable &&
+		(prev == nil || prev.Reason != a2aIdentityMapStatusUnreadable) {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aIdentityMapStatusUnreadable, mapState.message)
+	}
+	state.calloutMap = &mapState
 
 	// The auth callout, before the bus's config and before anything that
 	// dials the bus. nats.conf names it as the authority for every
