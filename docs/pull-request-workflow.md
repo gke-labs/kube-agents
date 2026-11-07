@@ -2,7 +2,7 @@
 
 **Scope:** The commands for getting a branch from "about to start" to "merged" in this repository —
 finding work already in flight, measuring drift from `main`, validating locally, working the
-automated review, the labels the merge queue reads, re-running a check that flaked, and whose move it is
+automated review, the labels the merge queue reads, re-running a check that flaked, quarantining a flaky test, and whose move it is
 at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
@@ -139,6 +139,29 @@ with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Ma
 quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
 line, and the check skips the spans on that line. CI runs the same check through
 `scripts/test_check_cluster_reads.py`.
+
+**SQL in the session KV server.** If you add or change a SQL statement in
+`agents/platform/scripts/session_kv_server.py`, `findings_queue.py`, `session_retention.py`,
+`session_manager.py`, `chat_notify.py` or `eod_report_generator.py`, run `make sqlite-plan-check` (it imports the server, so it needs
+`make test-python-deps`). It prepares every fixed statement under `EXPLAIN QUERY PLAN` against the
+schema the server builds and fails a plan that reads a whole table this repository defines (a
+`SCAN <table>`, through an index or not, since a scan through an index walks the whole index; or a
+`SEARCH` through an automatic index, which is built by reading the table), because such a read
+grows with the fleet; a scan through a partial index passes as bounded only when the script's
+`BOUNDED_INDEXES` vouches for that index's `WHERE` as a bound (the pending drift backlog today).
+A statement handed to a helper that executes its parameter (`_ids_where_in`) is read at the call
+site, an `IN` list's `",".join("?" * n)` marks as one parameter (a `VALUES` row built that way is
+dynamic, since its count is the statement's shape). Statements on the Hermes tables the script's
+`FOREIGN_TABLES` lists are skipped; a statement on any other table the schema does not build fails
+the check until the table is built in the schema or listed there with its owner; a statement on a
+table any target creates itself fails until that table is built in the schema (a `FOREIGN_TABLES`
+entry for a created table is itself a problem); and a statement that names an owned table beside a
+Hermes one fails rather than skipping, since the owned read cannot be planned here. The scans
+already in the tree, and the statements the check
+cannot read statically (one `(dynamic)` entry per function), are pinned with a reason in
+`scripts/sqlite_query_plan_baseline.txt`: a rise against an entry fails, so a new scan or a new
+dynamic statement needs a baseline hunk the reviewer sees. CI runs the same check through
+`scripts/test_check_sqlite_query_plans.py`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
@@ -468,8 +491,9 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
-  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
-  the author's own approval already covers), or a requested or `OWNERS`-listed reviewer has replied
+  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, once the approvals with the author's
+  own together cover every changed file, or an `OWNERS` reviewer's on a change the author's own approval already
+  covers), or a requested or `OWNERS`-listed reviewer has replied
   in one of its threads. The author's own replies, a bystander's comment, an approval from outside
   `OWNERS`, `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never
   count. A
@@ -637,9 +661,9 @@ The two labels are the two people:
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
   [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
-  and the inject lane's exclusions and safeguards under `hack/eval/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/replay-proxy/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
-  to what the presubmit runs or what blocks; the nightly file and the case directories under
+  to what the presubmit runs, what blocks, or what replay serves ([`eval-gate-roster.md`](eval-gate-roster.md)); the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
@@ -653,12 +677,17 @@ for. Its pool for an ordinary change is the `repository-owners` group, root appr
 `repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
 between them by what the author's own approval already covers (#1075): an approver's own change opens with `approved` on it and needs
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
-approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
+approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files, and
+`approved` is per file, so it takes as many of them as it needs to cover every file: first one for
+the file with the fewest approvers, then one more for whatever that person cannot approve, from
+the default reviewers when nobody the glob matched can approve it. A change
+to `hack/replay-proxy/` plus a doc therefore gets an `eval-crew` member, and a root approver too
+unless that member is one. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
-settles a self-approved change and nothing else. The entries for the two presubmit roster files and the inject lane's two files under `hack/eval/` send a change there to its own `eval-crew` group, so the
-reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
-member is a root approver, so a change that also touches root-owned paths still waits on a root
-approver's `/approve` after that review. The bot never requests the author, so a member's own case
+settles a self-approved change and nothing else, and on any other change the approvals count only
+once together they cover every file; an approval that covers some of them leaves the draw to the
+rest. The entries for the two presubmit roster files and the inject lane's two files under `hack/eval/` send a change there to its own `eval-crew` group, so for a change confined to those files the
+reviewer the workflow summons can clear both labels in one action. The bot never requests the author, so a member's own case
 or roster change goes to the rest of the group, with the author's `approved` already on it. That
 is a property of the lists agreeing today — the alias in `OWNERS_ALIASES`, the `reviewers` list in
 `OWNERS` and the groups in the bot's config — which `scripts/test_request_reviewers.py` pins; none
@@ -851,6 +880,53 @@ test is a different system and is not watched; the `presubmit-gate` label is tha
 a smoke green after a red at the same head may be step 0 reusing the older green rather than a pass
 (see "A green smoke run stays valid when `main` moves" above).
 
+## Quarantining a flaky test
+
+A Go or Python test that flakes on pull requests or `main` is skipped in its own source the first
+time, so pull requests stop paying for it with re-runs and merge-queue drops, and an issue tracks
+the real fix. Quarantine is not triage: a flake can be a product race, and skipping the test hides
+the bug. Quarantine a test only when all of these hold:
+
+- No fix is already in review or in the merge queue. If one is, wait for it.
+- The tracking issue says, each at the start of its own line,
+  `Suspected cause: <one line>` and `Product race ruled out: yes, <why>`. Put them in a comment: the
+  bot rebuilds a `ci:flaky` issue's body on every occurrence. Until a product race is ruled out, the
+  test stays live and the issue gets an owner instead.
+- The issue carries the `ci:quarantined` label and is assigned to the person who owns the fix: the
+  area's primary owner in [`ownership.md`](ownership.md) when one is known. Reuse the `ci:flaky`
+  issue when one exists.
+- The test is not a conformance test, an auth-callout account-boundary or grant test, or any other
+  security or isolation test. Those are fixed, not skipped, unless a security approver agrees: a
+  skip under `PROTECTED_PREFIXES` needs its `<path> <issue>` line in
+  [`hack/quarantine-approved.txt`](../hack/quarantine-approved.txt), which only the
+  `security-approvers` alias can approve ([`hack/OWNERS`](../hack/OWNERS)).
+
+The skip names the issue in a fixed form and checks `KA_RUN_QUARANTINED`, so whoever fixes it can
+run the test without editing it:
+
+```go
+if os.Getenv("KA_RUN_QUARANTINED") == "" {
+	t.Skip("quarantined: gke-labs/kube-agents#1234")
+}
+```
+
+```python
+@unittest.skipUnless(os.environ.get("KA_RUN_QUARANTINED"), "quarantined: gke-labs/kube-agents#1234")
+```
+
+Under pytest (`bench/tests/`) the same pair goes through
+`pytest.mark.skipif(not os.environ.get("KA_RUN_QUARANTINED"), reason="quarantined: ...")`. The fix
+pull request removes the skip and closes the issue.
+
+[`scripts/check_quarantine.py`](../scripts/check_quarantine.py) checks both halves. Its offline
+check runs with the Python unit tests and fails a quarantine string that is malformed, does not
+read `KA_RUN_QUARANTINED`, or skips a protected test the approvals file does not list. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
+it daily with `--github --notify`. That run fails when a cited issue is closed, unlabelled,
+unassigned, or missing either line above, and comments once on that
+issue naming its assignees. Its summary lists every quarantine with its age. A quarantine older
+than `STALE_DAYS` (14) gets one comment too. The summary also flags an open `ci:quarantined` issue
+that no test cites any more.
+
 ## Who owns an open pull request
 
 Every open pull request has exactly one party whose move it is, and the commonest way one sits for
@@ -894,9 +970,10 @@ Four states that look like somebody else's problem and are not:
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when no `OWNERS` approver covers
 the change and the author's own approval does not either (a pull request with no changed files),
-when an `OWNERS` approver for one of the changed files has submitted `APPROVED` (or, on a pull
-request the author's own approval already covers, anyone `OWNERS` lists under `reviewers` for
-them), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
+when `OWNERS` approvers, the author's implicit approval among them, have approved every changed
+file between them (an approval
+that covers only some leaves a draw for the rest; on a pull request the author's own approval
+already covers, one from anyone `OWNERS` lists under `reviewers` for them is enough), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
 latest verdict, as GitHub counts them. An account
 `.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
 robot that reviews under a user account re-reviews every push and files its follow-ups as

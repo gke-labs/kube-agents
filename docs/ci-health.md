@@ -1008,7 +1008,9 @@ Nightly report's.
   list: a shift that wide has one cause. A night cut off at the deadline,
   or with a part missing or still running, carries the block too, labelled as
   covering only the cases or parts on record. Nights here are dates: a
-  same-date re-run of the main job counts once, by its newest run. It is
+  same-date re-run of the main job counts once, by its newest run, and the
+  block reads back over the last 14 dates, so a re-run never pushes an
+  earlier date out. It is
   advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - **🗣 Reply shape:** how last night's answers read, over every repetition that

@@ -168,8 +168,11 @@ SKIP_KIND_MISMATCH = "kind_mismatch"
 # Files, not lines: a log file found under a directory argument but not at the
 # collector's layout (FILED_DEPTH), so its kind is not the folder IAM governs.
 SKIP_OFF_LAYOUT = "off_layout_files"
+# A replay-mode line served from the cache: the model was not called, so it is
+# neither a sighting a later request could reuse nor an answer to judge.
+SKIP_SERVED = "served"
 SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT,
-                SKIP_KIND_MISMATCH, SKIP_OFF_LAYOUT)
+                SKIP_KIND_MISMATCH, SKIP_OFF_LAYOUT, SKIP_SERVED)
 # Labels in Miss.first_difference_role besides a message role.
 DIFF_UNHASHED = "unhashed"
 DIFF_SETTINGS = "settings"
@@ -641,6 +644,9 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
                     continue
                 if not entry.get(F.FINGERPRINT):
                     skipped[SKIP_NO_FINGERPRINT] += 1
+                    continue
+                if entry.get(F.SERVED):
+                    skipped[SKIP_SERVED] += 1
                     continue
                 tag = (entry.get(F.JOB) or {}).get(F.JOB_KIND)
                 if tag not in JOB_KINDS:

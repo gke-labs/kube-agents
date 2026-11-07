@@ -1,0 +1,1277 @@
+#!/usr/bin/env python3
+"""Tests for scripts/check_sqlite_query_plans.py."""
+
+from __future__ import annotations
+
+import io
+import sqlite3
+import sys
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import scripts.check_sqlite_query_plans as plan_check  # noqa: E402
+from scripts.check_sqlite_query_plans import (  # noqa: E402
+    BASELINE,
+    EXIT_FAIL,
+    EXIT_OK,
+    KIND_BOUNDED,
+    KIND_DYNAMIC,
+    KIND_FINDING,
+    KIND_OK,
+    KIND_SCHEMA,
+    KIND_SKIPPED,
+    REPO_ROOT,
+    TARGETS,
+    SchemaSource,
+    check,
+    explain,
+    leading_keyword,
+    main,
+    cte_names,
+    derived_names,
+    partial_indexes,
+    planned_text,
+    scan,
+    scan_index,
+    scanned_table,
+    sql_text,
+    statement_tables,
+    table_aliases,
+)
+
+# A module shaped like the server: a database-path hook, an `init_db` that
+# builds the schema, an extra DDL constant, and one statement of every shape
+# the check distinguishes, each in a function named for what it shows.
+FIXTURE_SERVER = textwrap.dedent(
+    '''
+    import os
+    import sqlite3
+
+    import fixture_helper
+
+    DB_PATH = os.environ.get("DB_PATH", "")
+    DRIFT_REASON = "drift"
+    PENDING = 1
+    ALERT_LIMIT = 5
+    SIDE_SCHEMA = "CREATE TABLE IF NOT EXISTS side (id TEXT PRIMARY KEY, note TEXT)"
+    RECENT_SQL = "SELECT id FROM events WHERE created_at > ?"
+    COLUMNS = ("id", "cluster", "reason")
+    SELECT_COLUMNS = f"SELECT {', '.join(COLUMNS)} FROM events"
+    shadowed = "SELECT id FROM events WHERE id = ?"
+    FALLBACK_SQL = "SELECT id FROM events WHERE id = ?"
+    try:
+        import fixture_absent_module  # noqa: F401
+    except ImportError:
+        FALLBACK_SQL = "SELECT id FROM events WHERE cluster = ?"
+    GLOBAL_SQL = "SELECT id FROM events WHERE id = ?"
+    # The helper module has a HELPER_TABLE of its own; its constants resolve against that one, not this.
+    HELPER_TABLE = "notes"
+
+
+    def init_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster TEXT NOT NULL,
+                object_uid TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                backlog INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at)")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_events_drift ON events (object_uid) WHERE reason = '{DRIFT_REASON}'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_backlog_pending ON events (created_at) WHERE backlog = 1")
+        conn.execute("CREATE TABLE IF NOT EXISTS data_volume_warning (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, author TEXT, body TEXT)")
+        for column in ("extra",):
+            conn.execute(f"ALTER TABLE notes ADD COLUMN {column} TEXT")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.commit()
+        conn.close()
+
+
+    def unindexed(conn, cluster):
+        return conn.execute("SELECT id FROM events WHERE cluster = ?", (cluster,)).fetchall()
+
+
+    def indexed(conn):
+        return conn.execute(RECENT_SQL, ("2026-01-01",)).fetchall()
+
+
+    def covering(conn):
+        return conn.execute("SELECT COUNT(*) FROM events WHERE created_at >= ?", ("2026-01-01",)).fetchone()
+
+
+    def partial_literal(conn, uid):
+        return conn.execute(f"SELECT id FROM events WHERE reason = '{DRIFT_REASON}' AND object_uid = ?", (uid,)).fetchall()
+
+
+    def partial_bound(conn, uid):
+        return conn.execute("SELECT id FROM events WHERE reason = ? AND object_uid = ?", ("drift", uid)).fetchall()
+
+
+    def concatenated(conn):
+        return conn.execute("SELECT id FROM events " + "WHERE backlog = " + str(PENDING) + " AND created_at > ?", ("x",)).fetchall()
+
+
+    def local_once(conn):
+        columns = "id, cluster"
+        return conn.execute(f"SELECT {columns} FROM events WHERE created_at > ?", ("x",)).fetchall()
+
+
+    def local_twice(conn, flag):
+        where = "WHERE cluster = ?"
+        if flag:
+            where = "WHERE created_at > ?"
+        return conn.execute(f"SELECT id FROM events {where}", ("x",)).fetchall()
+
+
+    def sibling_constant(conn):
+        return conn.execute(fixture_helper.HELPER_SQL, ("x",)).fetchall()
+
+
+    def joined_columns(conn):
+        return conn.execute(f"{SELECT_COLUMNS} WHERE created_at > ?", ("x",)).fetchall()
+
+
+    def joined_comprehension(conn):
+        return conn.execute(f"SELECT {', '.join(c for c in COLUMNS)} FROM events WHERE id = ?", (1,)).fetchall()
+
+
+    def joined_list(conn):
+        assignments = []
+        assignments.append("cluster = ?")
+        return conn.execute(f"UPDATE events SET {', '.join(assignments)} WHERE id = ?", ("x", 1)).rowcount
+
+
+    def unpacked_shadow(conn):
+        shadowed, params = "SELECT id FROM events WHERE cluster = ?", ("x",)
+        return conn.execute(shadowed, params).fetchall()
+
+
+    def except_shadow(conn):
+        try:
+            return conn.execute(shadowed, (1,)).fetchall()
+        except ValueError as shadowed:
+            raise RuntimeError(str(shadowed))
+
+
+    def closure(conn):
+        shadowed = "SELECT id FROM events WHERE cluster = ?"
+
+        def inner():
+            return conn.execute(shadowed, ("x",)).fetchall()
+
+        return inner()
+
+
+    def closure_inner_wins(conn):
+        columns = "cluster"
+
+        def inner():
+            columns = "id"
+            return conn.execute(f"SELECT {columns} FROM events WHERE created_at > ?", ("x",)).fetchall()
+
+        return inner()
+
+
+    def closure_own_name(conn):
+        columns = "id"
+        sql = f"SELECT {columns} FROM events WHERE created_at > ?"
+
+        def inner():
+            columns = "cluster"
+            return conn.execute(sql, ("x",)).fetchall()
+
+        return inner()
+
+
+    def closure_nonlocal(conn):
+        columns = "id"
+        sql = f"SELECT {columns} FROM events WHERE created_at > ?"
+
+        def inner():
+            nonlocal columns
+            columns = "cluster"
+            return conn.execute(sql, ("x",)).fetchall()
+
+        return inner()
+
+
+    def nested_helper_name(conn):
+        sql = "SELECT id FROM events WHERE cluster = ?"
+
+        def fmt(sql):
+            return sql.strip()
+
+        return conn.execute(sql, (fmt("x"),)).fetchall()
+
+
+    def module_rebound_in_block(conn):
+        return conn.execute(FALLBACK_SQL, (1,)).fetchall()
+
+
+    def rebind_global():
+        global GLOBAL_SQL
+        GLOBAL_SQL = "SELECT id FROM events WHERE cluster = ?"
+
+
+    def global_rebound(conn):
+        return conn.execute(GLOBAL_SQL, (1,)).fetchall()
+
+
+    def sibling_built_constant(conn):
+        return conn.execute(fixture_helper.HELPER_SCAN_SQL, ("x",)).fetchall()
+
+
+    def index_walk(conn):
+        return conn.execute("SELECT COUNT(*) FROM events").fetchone()
+
+
+    def partial_index_walk(conn):
+        return conn.execute("SELECT id FROM events WHERE reason = 'drift'").fetchall()
+
+
+    def bounded_index_walk(conn):
+        return conn.execute("SELECT id FROM events WHERE backlog = 1").fetchall()
+
+
+    def lambda_param(conn, flag):
+        sql = "SELECT id FROM events WHERE id = ?"
+        run = lambda sql: conn.execute(sql).fetchall()
+        return run("SELECT id FROM events WHERE cluster = ?" if flag else sql)
+
+
+    def lambda_closure(conn):
+        sql = "SELECT id FROM events WHERE cluster = ?"
+        run = lambda: conn.execute(sql).fetchall()
+        return run()
+
+
+    def aliased_subquery(conn):
+        return conn.execute(
+            "SELECT g.cluster FROM (SELECT cluster, COUNT(*) AS c FROM events WHERE created_at > ? GROUP BY cluster) AS g "
+            "WHERE g.c > ?",
+            ("x", 1),
+        ).fetchall()
+
+
+    def aliased_cte(conn):
+        return conn.execute(
+            "WITH recent AS (SELECT cluster, COUNT(*) AS c FROM events WHERE created_at > ? GROUP BY cluster) "
+            "SELECT r.cluster FROM recent r WHERE r.c > ?",
+            ("x", 1),
+        ).fetchall()
+
+
+    def materialized_subquery(conn):
+        return conn.execute(
+            "SELECT e.id FROM events e JOIN (SELECT author FROM notes GROUP BY author) a ON a.author = e.cluster "
+            "WHERE e.created_at > ?",
+            ("x",),
+        ).fetchall()
+
+
+    def automatic_index(conn):
+        return conn.execute(
+            "SELECT n.body FROM events e JOIN notes n ON n.author = e.cluster WHERE e.created_at > ?", ("x",)
+        ).fetchall()
+
+
+    def create_as_select(conn, cluster):
+        conn.execute("CREATE TEMP TABLE recent AS SELECT id FROM events WHERE cluster = ?", (cluster,))
+
+
+    def create_view(conn):
+        conn.execute("CREATE VIEW IF NOT EXISTS recent_events AS SELECT id FROM events WHERE created_at > '2026'")
+
+
+    def comma_list(conn, cluster):
+        return conn.execute(
+            "SELECT e.id FROM notes n, events e WHERE e.cluster = ? AND n.id = e.id", (cluster,)
+        ).fetchall()
+
+
+    def quoted_alias(conn, cluster):
+        return conn.execute('SELECT "e".id FROM events AS "e" WHERE "e".cluster = ?', (cluster,)).fetchall()
+
+
+    def cte(conn, cluster):
+        return conn.execute(
+            "WITH RECURSIVE chain(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM chain WHERE n < 3) "
+            "SELECT n FROM chain",
+        ).fetchall()
+
+
+    def named_parameters(conn):
+        return conn.execute("SELECT id FROM events WHERE created_at > :since", {"since": "x"}).fetchall()
+
+
+    def hermes(conn, session_id):
+        return conn.execute("SELECT id FROM sessions WHERE parent_session_id = ?", (session_id,)).fetchall()
+
+
+    def dynamic(conn, ids):
+        marks = ",".join("?" * len(ids))
+        return conn.execute("SELECT id FROM events WHERE id IN ({})".format(marks), ids).fetchall()
+
+
+    def run_sql(conn, query, params=()):
+        return conn.execute(query, params).fetchall()
+
+
+    def run_in(conn, query, ids):
+        marks = ",".join("?" * len(ids))
+        return conn.execute(query.format(marks=marks, table="events"), ids).fetchall()
+
+
+    def run_rebound(conn, query):
+        query = query.strip()
+        return conn.execute(query).fetchall()
+
+
+    def through_helper(conn, cluster):
+        return run_sql(conn, "SELECT id FROM events WHERE cluster = ?", (cluster,))
+
+
+    def through_helper_keyword(conn):
+        return run_sql(conn, params=("x",), query=RECENT_SQL)
+
+
+    def through_helper_dynamic(conn, sql):
+        return run_sql(conn, sql)
+
+
+    def through_format_helper(conn, ids):
+        return run_in(conn, "SELECT id FROM {table} WHERE cluster IN ({marks})", ids)
+
+
+    def through_format_helper_indexed(conn, ids):
+        return run_in(conn, "SELECT id FROM events WHERE id IN ({marks})", ids)
+
+
+    def through_format_helper_unfilled(conn, ids):
+        return run_in(conn, "SELECT id FROM events WHERE {column} IN ({marks})", ids)
+
+
+    def through_rebound_helper(conn):
+        return run_rebound(conn, " SELECT id FROM events WHERE cluster = 'x' ")
+
+
+    def through_nested_helper(conn, cluster):
+        def newest(query, ceiling):
+            return conn.execute(query, (cluster, ceiling))
+
+        return newest("SELECT id FROM events WHERE cluster = ? LIMIT ?", 5)
+
+
+    def in_marks(conn, ids):
+        marks = ",".join("?" * len(ids))
+        return conn.execute(f"SELECT id FROM events WHERE cluster IN ({marks})", ids).fetchall()
+
+
+    def in_marks_list(conn, ids):
+        return conn.execute(f"SELECT id FROM events WHERE id IN ({', '.join(['?'] * len(ids))})", ids).fetchall()
+
+
+    def count_events(conn, query="SELECT COUNT(*) FROM events"):
+        return conn.execute(query).fetchone()
+
+
+    def through_default(conn):
+        return count_events(conn)
+
+
+    def through_default_passed(conn):
+        return count_events(conn, RECENT_SQL)
+
+
+    def shadowed_helper(conn):
+        def run_sql(conn, query, params=()):
+            return (query, params)
+
+        return run_sql(conn, "SELECT id FROM events WHERE cluster = ?", ("x",))
+
+
+    def bounded(conn):
+        return conn.execute("SELECT body FROM data_volume_warning").fetchall()
+
+
+    def catalog(conn):
+        return conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+
+
+    def constant_row(conn):
+        return conn.execute("SELECT 1").fetchone()
+
+
+    def side_table(conn, note_id):
+        return conn.execute("SELECT note FROM side WHERE id = ?", (note_id,)).fetchone()
+
+
+    def aliased(conn, author):
+        return conn.execute(
+            "SELECT a.id FROM notes AS a JOIN events e ON e.id = a.id WHERE a.author = ?", (author,)
+        ).fetchall()
+
+
+    def twice(conn, cluster):
+        return conn.execute(
+            "SELECT id FROM events WHERE cluster = ? OR id IN (SELECT id FROM events WHERE cluster = ?)",
+            (cluster, cluster),
+        ).fetchall()
+
+
+    def many(conn, rows):
+        conn.executemany("UPDATE notes SET body = ? WHERE author = ?", rows)
+
+
+    class Store:
+        def method(self, conn):
+            return conn.execute("DELETE FROM notes WHERE author = ?", ("x",)).rowcount
+
+        def outer(self, conn):
+            def inner():
+                return conn.execute("SELECT body FROM notes WHERE author = ?", ("x",)).fetchone()
+
+            return inner()
+
+
+    class Body:
+        shadowed = "SELECT id FROM events WHERE cluster = ?"
+        if False:  # the shape alone, never run: a statement in the class body reads the class body's names
+            rows = CONN.execute(shadowed).fetchall()
+
+        def method(self, conn):
+            return conn.execute(shadowed, (1,)).fetchall()
+
+        def nested(self, conn):
+            # The default is evaluated in the method, which never sees the class attribute: the module's `shadowed`.
+            def run(query=shadowed):
+                return conn.execute(query).fetchall()
+
+            return run()
+
+
+    def values_marks(conn, row):
+        return conn.execute(f"INSERT INTO notes (author, body) VALUES ({', '.join('?' * len(row))})", row)
+
+
+    def values_marks_counted(conn, author, body):
+        return conn.execute(f"INSERT INTO notes (author, body) VALUES ({', '.join('?' * 2)})", (author, body))
+
+
+    def through_format_helper_values(conn, row):
+        return run_in(conn, "INSERT INTO notes (author, body) VALUES ({marks})", row)
+
+
+    def prose():
+        """Hermes runs CREATE TABLE sessions at its own start; this module never does."""
+
+
+    QUALIFIED_SCHEMA = "CREATE TABLE IF NOT EXISTS main.qualified (id TEXT PRIMARY KEY) -- not CREATE TABLE commented"
+    TEMP_SCHEMA = "CREATE TABLE temp.scratch_rows (id TEXT)"
+    '''
+)
+
+FIXTURE_HELPER = textwrap.dedent(
+    '''
+    HELPER_SQL = "SELECT id FROM events WHERE created_at > ?"
+    HELPER_TABLE = "events"
+    HELPER_SCAN_SQL = f"SELECT id FROM {HELPER_TABLE} WHERE cluster = ?"
+
+
+    def helper(conn):
+        return conn.execute(HELPER_SQL, ("x",)).fetchall()
+    '''
+)
+
+FIXTURE_SCHEMA = SchemaSource(
+    module="fixture_server.py", db_path_attr="DB_PATH", init_function="init_db", extra_ddl_attrs=("SIDE_SCHEMA",)
+)
+FIXTURE_TARGETS = ("fixture_server.py", "fixture_helper.py")
+# The fixture's one partial index whose WHERE is a bound by design; `idx_events_drift` is partial too and is not here.
+FIXTURE_BOUNDED_INDEXES = frozenset({"idx_events_backlog_pending"})
+# The one table the fixture reads that its schema never builds.
+FIXTURE_FOREIGN_TABLES = frozenset({"sessions"})
+# What the fixture's findings pin to, exactly: the scans, then the statements the check cannot read.
+FIXTURE_SCAN_BASELINE = textwrap.dedent(
+    """
+    # the shapes the fixture leaves unindexed on purpose
+    fixture_server.py unindexed events 1
+    fixture_server.py partial_bound events 1
+    fixture_server.py aliased notes 1
+    fixture_server.py twice events 2
+    fixture_server.py unpacked_shadow events 1
+    fixture_server.py closure.inner events 1
+    fixture_server.py nested_helper_name events 1
+    fixture_server.py sibling_built_constant events 1
+    fixture_server.py index_walk events 1
+    fixture_server.py partial_index_walk events 1
+    fixture_server.py lambda_closure.<lambda> events 1
+    fixture_server.py Body events 1
+    fixture_server.py materialized_subquery notes 1
+    fixture_server.py automatic_index notes 1
+    fixture_server.py create_as_select events 1
+    fixture_server.py comma_list events 1
+    fixture_server.py quoted_alias events 1
+    fixture_server.py Store.method notes 1
+    fixture_server.py Store.outer.inner notes 1
+    fixture_server.py many notes 1
+    fixture_server.py through_helper events 1
+    fixture_server.py through_format_helper events 1
+    fixture_server.py through_nested_helper events 1
+    fixture_server.py in_marks events 1
+    fixture_server.py through_default events 1
+    """
+)
+FIXTURE_DYNAMIC_BASELINE = textwrap.dedent(
+    """
+    # the statements the fixture builds at run time on purpose
+    fixture_server.py init_db (dynamic) 1
+    fixture_server.py local_twice (dynamic) 1
+    fixture_server.py joined_comprehension (dynamic) 1
+    fixture_server.py joined_list (dynamic) 1
+    fixture_server.py except_shadow (dynamic) 1
+    fixture_server.py closure_nonlocal.inner (dynamic) 1
+    fixture_server.py module_rebound_in_block (dynamic) 1
+    fixture_server.py global_rebound (dynamic) 1
+    fixture_server.py lambda_param.<lambda> (dynamic) 1
+    fixture_server.py dynamic (dynamic) 1
+    fixture_server.py run_sql (dynamic) 1
+    fixture_server.py run_in (dynamic) 1
+    fixture_server.py through_helper_dynamic (dynamic) 1
+    fixture_server.py through_format_helper_unfilled (dynamic) 1
+    fixture_server.py run_rebound (dynamic) 1
+    fixture_server.py through_nested_helper.newest (dynamic) 1
+    fixture_server.py count_events (dynamic) 1
+    fixture_server.py Body.nested.run (dynamic) 1
+    fixture_server.py values_marks (dynamic) 1
+    fixture_server.py through_format_helper_values (dynamic) 1
+    """
+)
+FIXTURE_BASELINE = FIXTURE_SCAN_BASELINE + FIXTURE_DYNAMIC_BASELINE
+
+
+def _write_fixture(root: Path, baseline: str | None = FIXTURE_BASELINE) -> Path:
+    (root / "fixture_server.py").write_text(FIXTURE_SERVER, encoding="utf-8")
+    (root / "fixture_helper.py").write_text(FIXTURE_HELPER, encoding="utf-8")
+    baseline_path = root / "baseline.txt"
+    if baseline is not None:
+        baseline_path.write_text(baseline, encoding="utf-8")
+    return baseline_path
+
+
+def _run(
+    root: Path,
+    baseline: Path,
+    list_statements: bool = False,
+    bounded_indexes: frozenset[str] = FIXTURE_BOUNDED_INDEXES,
+    foreign_tables: frozenset[str] = FIXTURE_FOREIGN_TABLES,
+    **overrides,
+) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    kwargs = dict(targets=FIXTURE_TARGETS, schema=FIXTURE_SCHEMA, baseline=baseline, list_statements=list_statements)
+    kwargs.update(overrides)
+    with (
+        mock.patch.object(plan_check, "BOUNDED_INDEXES", bounded_indexes),
+        mock.patch.object(plan_check, "FOREIGN_TABLES", foreign_tables),
+    ):
+        code = check(root, out=out, err=err, **kwargs)
+    return code, out.getvalue(), err.getvalue()
+
+
+def _kinds(listing: str) -> dict[str, list[str]]:
+    """function -> the kinds of every verdict listed for it, in order."""
+    kinds: dict[str, list[str]] = {}
+    for line in listing.splitlines():
+        location, rest = line.split(": ", 1)
+        function, kind = rest.split(" ", 2)[:2]
+        kinds.setdefault(f"{location.split(':')[0]}:{function}", []).append(kind)
+    return kinds
+
+
+class FixtureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_unindexed_query_fails_with_the_plan_line(self) -> None:
+        baseline = _write_fixture(self.root, baseline=None)
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("fixture_server.py:", err)
+        self.assertIn("unindexed scans events: `SCAN events` for `SELECT id FROM events WHERE cluster = ?`", err)
+        self.assertIn("index it or pin it in", err)
+        # No baseline file pins nothing, and says so rather than passing a tree with no scans.
+        self.assertIn("baseline.txt: the baseline file is missing; restore it", err)
+
+    def test_classification_of_every_shape(self) -> None:
+        baseline = _write_fixture(self.root)
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_OK, err)
+        kinds = _kinds(out)
+        server = "fixture_server.py:"
+        # The schema builder's DDL and PRAGMA are listed, never prepared; the
+        # ALTER TABLE in a loop does not resolve.
+        self.assertEqual(kinds[server + "init_db"], [KIND_SCHEMA] * 6 + [KIND_DYNAMIC, KIND_SCHEMA])
+        self.assertEqual(kinds[server + "unindexed"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "indexed"], [KIND_OK])
+        self.assertEqual(kinds[server + "covering"], [KIND_OK])
+        self.assertEqual(kinds[server + "partial_literal"], [KIND_OK])
+        # A bound parameter never matches a partial index's WHERE.
+        self.assertEqual(kinds[server + "partial_bound"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "concatenated"], [KIND_OK])
+        self.assertEqual(kinds[server + "local_once"], [KIND_OK])
+        self.assertEqual(kinds[server + "local_twice"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "sibling_constant"], [KIND_OK])
+        # `", ".join(COLUMNS)` over a tuple constant resolves; over a comprehension it does not.
+        self.assertEqual(kinds[server + "joined_columns"], [KIND_OK])
+        self.assertEqual(kinds[server + "joined_comprehension"], [KIND_DYNAMIC])
+        # A list literal can be appended to after it is bound, so a join over it does not resolve.
+        self.assertEqual(kinds[server + "joined_list"], [KIND_DYNAMIC])
+        # A local bound by unpacking is the statement judged, not the module constant it shadows.
+        self.assertEqual(kinds[server + "unpacked_shadow"], [KIND_FINDING])
+        # A name also bound by `except ... as` resolves to nothing, not to the module constant.
+        self.assertEqual(kinds[server + "except_shadow"], [KIND_DYNAMIC])
+        # A nested function reads the enclosing function's local, not the module constant it shadows.
+        self.assertEqual(kinds[server + "closure.inner"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "closure_inner_wins.inner"], [KIND_OK])
+        # A name the nested function binds is its own variable: the outer statement keeps the outer value.
+        self.assertEqual(kinds[server + "closure_own_name.inner"], [KIND_OK])
+        # A `nonlocal` rebinding in the nested function is a second binding of the outer name, so nothing resolves.
+        self.assertEqual(kinds[server + "closure_nonlocal.inner"], [KIND_DYNAMIC])
+        # A nested helper's parameter of the same name does not count against the enclosing function's local.
+        self.assertEqual(kinds[server + "nested_helper_name"], [KIND_FINDING])
+        # A module constant rebound inside a top-level `try`, or through `global` in a function, is bound twice.
+        self.assertEqual(kinds[server + "module_rebound_in_block"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "global_rebound"], [KIND_DYNAMIC])
+        # A sibling's constant resolves against the sibling's names: its table, not this module's HELPER_TABLE.
+        self.assertEqual(kinds[server + "sibling_built_constant"], [KIND_FINDING])
+        self.assertIn("sibling_built_constant finding table=events plan=SCAN events", out)
+        # A SCAN through an index still reads every row, and through a partial index it reads what that index
+        # admits, which is a bound only for an index BOUNDED_INDEXES vouches for: `idx_events_drift` is partial
+        # and not listed, so the walk through it is a finding like any other.
+        self.assertEqual(kinds[server + "index_walk"], [KIND_FINDING])
+        self.assertIn("index_walk finding table=events plan=SCAN events USING COVERING INDEX idx_events_created_at", out)
+        self.assertEqual(kinds[server + "partial_index_walk"], [KIND_FINDING])
+        self.assertIn("partial_index_walk finding table=events plan=SCAN events USING ", out)
+        self.assertIn("INDEX idx_events_drift", out)
+        self.assertEqual(kinds[server + "bounded_index_walk"], [KIND_BOUNDED])
+        self.assertIn("bounded_index_walk bounded table=events plan=SCAN events USING ", out)
+        self.assertIn("INDEX idx_events_backlog_pending", out)
+        # A lambda is a scope of its own: its parameter, not the enclosing local of the same name, is what runs,
+        # and a closure variable it reads resolves as it does in a nested def.
+        self.assertEqual(kinds[server + "lambda_param.<lambda>"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "lambda_closure.<lambda>"], [KIND_FINDING])
+        # A statement in a class body reads the class body's names; a method does not see them.
+        self.assertEqual(kinds[server + "Body"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "Body.method"], [KIND_OK])
+        # A helper nested in a method has its default evaluated in the method, which never sees the class body:
+        # the module's `shadowed` (the lookup), not the class attribute (the scan).
+        self.assertEqual(kinds[server + "Body.nested"], [KIND_OK])
+        self.assertEqual(kinds[server + "Body.nested.run"], [KIND_DYNAMIC])
+        # `"?" * n` stands for one `?` inside `IN (` only: a VALUES row built that way is dynamic, bare or through the
+        # formatting helper, and a literal count expands to that many marks.
+        self.assertEqual(kinds[server + "values_marks"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "values_marks_counted"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_format_helper_values"], [KIND_DYNAMIC])
+        # A derived table the plan declares (CO-ROUTINE or MATERIALIZE) is no table under its alias either.
+        self.assertEqual(kinds[server + "aliased_subquery"], [KIND_OK])
+        self.assertEqual(kinds[server + "aliased_cte"], [KIND_OK])
+        self.assertEqual(kinds[server + "materialized_subquery"], [KIND_FINDING])
+        self.assertIn("materialized_subquery finding table=notes plan=SCAN notes", out)
+        # The planner builds an automatic index by reading the whole inner table; its line says SEARCH.
+        self.assertEqual(kinds[server + "automatic_index"], [KIND_FINDING])
+        self.assertIn("automatic_index finding table=notes plan=SEARCH n USING AUTOMATIC COVERING INDEX (author=?)", out)
+        # The query under a CREATE ... AS SELECT is planned; a view's indexed query passes.
+        self.assertEqual(kinds[server + "create_as_select"], [KIND_FINDING])
+        self.assertIn("create_as_select finding table=events plan=SCAN events", out)
+        self.assertEqual(kinds[server + "create_view"], [KIND_OK])
+        # The second table of a comma list, and a double-quoted alias, map back to their tables.
+        self.assertEqual(kinds[server + "comma_list"], [KIND_FINDING])
+        self.assertIn("comma_list finding table=events plan=SCAN e ", out)
+        self.assertEqual(kinds[server + "quoted_alias"], [KIND_FINDING])
+        # A recursive CTE scans its own rows, which is no table.
+        self.assertEqual(kinds[server + "cte"], [KIND_OK])
+        self.assertEqual(kinds[server + "named_parameters"], [KIND_OK])
+        self.assertEqual(kinds[server + "hermes"], [KIND_SKIPPED])
+        self.assertEqual(kinds[server + "dynamic"], [KIND_DYNAMIC])
+        # A helper that executes its parameter keeps its own execute call dynamic; the literal a caller hands it is
+        # the caller's statement, by position or by keyword, and a name with no static value is dynamic there too.
+        self.assertEqual(kinds[server + "run_sql"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "run_in"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "through_helper"], [KIND_FINDING])
+        self.assertIn("through_helper finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster = ?", out)
+        self.assertEqual(kinds[server + "through_helper_keyword"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_helper_dynamic"], [KIND_DYNAMIC])
+        # A helper that formats its parameter fills each field: a static keyword with its value, a run-time one
+        # (the `IN` list) with one `?`; a field the helper never fills leaves the statement dynamic.
+        self.assertEqual(kinds[server + "through_format_helper"], [KIND_FINDING])
+        self.assertIn("through_format_helper finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster IN (?)", out)
+        self.assertEqual(kinds[server + "through_format_helper_indexed"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_format_helper_unfilled"], [KIND_DYNAMIC])
+        # A function that rebinds the parameter before executing it is no helper: nothing is read at its call site.
+        self.assertEqual(kinds[server + "run_rebound"], [KIND_DYNAMIC])
+        self.assertNotIn(server + "through_rebound_helper", kinds)
+        # A nested helper is read by the calls in the function that defines it.
+        self.assertEqual(kinds[server + "through_nested_helper"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "through_nested_helper.newest"], [KIND_DYNAMIC])
+        # An `IN` list's marks, `",".join("?" * n)` or over `["?"] * n`, resolve to one `?`, so the statement plans.
+        self.assertEqual(kinds[server + "in_marks"], [KIND_FINDING])
+        self.assertIn("in_marks finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster IN (?)", out)
+        self.assertEqual(kinds[server + "in_marks_list"], [KIND_OK])
+        # A call that passes nothing in the executed parameter's place executes the parameter's default, which is
+        # judged as that call's statement; the helper's own execute stays dynamic.
+        self.assertEqual(kinds[server + "through_default"], [KIND_FINDING])
+        self.assertIn("through_default finding table=events plan=SCAN events USING COVERING INDEX", out)
+        self.assertEqual(kinds[server + "through_default_passed"], [KIND_OK])
+        self.assertEqual(kinds[server + "count_events"], [KIND_DYNAMIC])
+        # A local `def` of the helper's name that executes nothing shadows the module helper: nothing is read.
+        self.assertNotIn(server + "shadowed_helper", kinds)
+        self.assertNotIn(server + "shadowed_helper.run_sql", kinds)
+        self.assertEqual(kinds[server + "bounded"], [KIND_BOUNDED])
+        self.assertEqual(kinds[server + "catalog"], [KIND_OK])
+        self.assertEqual(kinds[server + "constant_row"], [KIND_OK])
+        # The extra DDL constant built the side table, so its primary-key read plans.
+        self.assertEqual(kinds[server + "side_table"], [KIND_OK])
+        # The planner names the aliased table `a`; the alias maps back to `notes`.
+        self.assertEqual(kinds[server + "aliased"], [KIND_FINDING])
+        self.assertIn("aliased finding table=notes plan=SCAN a ", out)
+        # One statement, two scans of the same table.
+        self.assertEqual(kinds[server + "twice"], [KIND_FINDING, KIND_FINDING])
+        self.assertEqual(kinds[server + "many"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "Store.method"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "Store.outer.inner"], [KIND_FINDING])
+        self.assertEqual(kinds["fixture_helper.py:helper"], [KIND_OK])
+        self.assertIn("hermes skipped table=sessions", out)
+        self.assertIn("statement(s) read across 2 file(s)", out)
+
+    def test_concatenated_statement_keeps_the_constant_value(self) -> None:
+        _write_fixture(self.root)
+        statements, _, _, created = scan(self.root, FIXTURE_TARGETS)
+        # Every `CREATE TABLE` in a target's DDL strings names a table of this repository's, with the DDL's site; a
+        # schema qualifier is not the name, a `temp.` table, a docstring that mentions one and a `--` comment are not read.
+        self.assertEqual(set(created), {"events", "data_volume_warning", "notes", "side", "qualified"})
+        self.assertEqual(created["side"], "fixture_server.py:11")
+        by_function = {s.function: s.sql for s in statements}
+        self.assertEqual(by_function["in_marks"], "SELECT id FROM events WHERE cluster IN (?)")
+        self.assertEqual(by_function["in_marks_list"], "SELECT id FROM events WHERE id IN (?)")
+        self.assertIsNone(by_function["values_marks"])
+        self.assertEqual(by_function["values_marks_counted"], "INSERT INTO notes (author, body) VALUES (?, ?)")
+        self.assertIsNone(by_function["through_format_helper_values"])
+        self.assertEqual(by_function["Body.nested"], "SELECT id FROM events WHERE id = ?")
+        self.assertEqual(by_function["through_default"], "SELECT COUNT(*) FROM events")
+        self.assertEqual(by_function["concatenated"], "SELECT id FROM events WHERE backlog = 1 AND created_at > ?")
+        self.assertEqual(by_function["partial_literal"], "SELECT id FROM events WHERE reason = 'drift' AND object_uid = ?")
+        self.assertEqual(by_function["local_once"], "SELECT id, cluster FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["sibling_constant"], "SELECT id FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["joined_columns"], "SELECT id, cluster, reason FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["unpacked_shadow"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertEqual(by_function["closure.inner"], "SELECT id FROM events WHERE cluster = ?")
+        # The inner binding wins; a name the nested function binds is its own, and a `nonlocal` rebind is the outer's.
+        self.assertEqual(by_function["closure_inner_wins.inner"], "SELECT id FROM events WHERE created_at > ?")
+        self.assertEqual(by_function["closure_own_name.inner"], "SELECT id FROM events WHERE created_at > ?")
+        self.assertIsNone(by_function["closure_nonlocal.inner"])
+        self.assertEqual(by_function["nested_helper_name"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertIsNone(by_function["module_rebound_in_block"])
+        self.assertIsNone(by_function["global_rebound"])
+        self.assertEqual(by_function["sibling_built_constant"], "SELECT id FROM events WHERE cluster = ?")
+        # The lambda's own parameter shadows the enclosing local; a lambda with no such parameter reads the local.
+        self.assertIsNone(by_function["lambda_param.<lambda>"])
+        self.assertEqual(by_function["lambda_closure.<lambda>"], "SELECT id FROM events WHERE cluster = ?")
+        # The class body's `shadowed` is read in the body and not in the method, which reads the module's.
+        self.assertEqual(by_function["Body"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertEqual(by_function["Body.method"], "SELECT id FROM events WHERE id = ?")
+        self.assertIsNone(by_function["except_shadow"])
+        self.assertIsNone(by_function["joined_comprehension"])
+        self.assertIsNone(by_function["local_twice"])
+        self.assertIsNone(by_function["dynamic"])
+
+    def test_prepare_error_fails(self) -> None:
+        baseline = _write_fixture(self.root)
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def broken(conn):
+                return conn.execute("SELECT missing_column FROM events WHERE id = ?", (1,)).fetchone()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("broken: `SELECT missing_column FROM events WHERE id = ?` does not prepare: no such column", err)
+
+    def test_unmapped_scan_name_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def odd_alias(conn, cluster):
+                return conn.execute("SELECT x.id FROM main.events x WHERE x.cluster = ?", (cluster,)).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("odd_alias: `SCAN x` names 'x', which is neither a table the schema defines nor an alias", err)
+        self.assertIn("odd_alias error table=- plan=SCAN x", out)
+        self.assertNotIn("odd_alias ok", out)
+
+    def test_rebound_alias_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def rebound_alias(conn, author):
+                return conn.execute(
+                    "SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM notes e WHERE e.author = ?)", (author,)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        # Newer SQLite prints `SCAN e EXISTS` for this shape, so the plan text is not pinned.
+        self.assertIn("rebound_alias: `SCAN e", err)
+        self.assertIn("names 'e', an alias the statement binds to more than one table; give each reference its own alias", err)
+        self.assertNotIn("rebound_alias ok", out)
+        self.assertNotIn("rebound_alias finding", out)
+
+    def test_cte_or_subquery_named_like_a_table_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A FROM-subquery alias, or a CTE, named after the table it reads makes the plan print `SCAN events` for
+        # the table and for the derived rows alike; neither line is placed, and the statement is reported.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def shadow_alias(conn):
+                return conn.execute(
+                    "SELECT id FROM (SELECT id FROM events ORDER BY created_at LIMIT ?) AS events LIMIT ?", (5, 1)
+                ).fetchall()
+
+
+            def shadow_cte(conn):
+                return conn.execute(
+                    "WITH events AS (SELECT id FROM main.events WHERE created_at > ?) SELECT id FROM events", ("x",)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("shadow_alias: `SELECT id FROM (SELECT id FROM events ORDER BY created_at LIMIT ?) AS events LIMIT ?`", err)
+        self.assertIn("names a CTE or subquery 'events' after the table it reads, so a `SCAN events` line cannot be placed", err)
+        self.assertIn("shadow_cte: `WITH events AS (SELECT id FROM main.events WHERE created_at > ?) SELECT id FROM events`", err)
+        self.assertIn("shadow_alias error table=events", out)
+        self.assertIn("shadow_cte error table=events", out)
+        self.assertNotIn("shadow_alias ok", out)
+        self.assertNotIn("shadow_cte ok", out)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+
+    def test_table_a_target_creates_is_never_skipped(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A foreign entry for a table a target creates is a problem naming the DDL's site (and, since the fixture
+        # builds `side`, the built-table problem too).
+        code, _, err = _run(self.root, baseline, foreign_tables=frozenset({"sessions", "side"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("FOREIGN_TABLES names 'side', which fixture_server.py:11 creates, so it is this repository's; drop the entry", err)
+        self.assertIn("FOREIGN_TABLES names 'side', which the schema builds; drop the entry", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+        # A table a function creates itself and the schema never builds is a problem naming the site, whether or
+        # not FOREIGN_TABLES names it: never `skipped`.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def scratch(conn, key):
+                conn.execute("CREATE TABLE IF NOT EXISTS scratch (id TEXT PRIMARY KEY, body TEXT)")
+                return conn.execute("SELECT body FROM scratch WHERE id = ?", (key,)).fetchone()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        create_line = source.count("\n", 0, source.index("CREATE TABLE IF NOT EXISTS scratch")) + 1
+        for foreign in (FIXTURE_FOREIGN_TABLES, FIXTURE_FOREIGN_TABLES | {"scratch"}):
+            code, out, err = _run(self.root, baseline, list_statements=True, foreign_tables=foreign)
+            self.assertEqual(code, EXIT_FAIL)
+            self.assertIn(
+                f"scratch: `SELECT body FROM scratch WHERE id = ?` names 'scratch', which fixture_server.py:{create_line} "
+                "creates and the schema does not build; add its DDL to SCHEMA_SOURCE.extra_ddl_attrs",
+                err,
+            )
+            self.assertIn("scratch error table=scratch plan=no such table: scratch", out)
+            self.assertNotIn("scratch skipped", out)
+        self.assertIn(f"FOREIGN_TABLES names 'scratch', which fixture_server.py:{create_line} creates", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+
+    def test_dynamic_statements_are_pinned_per_function(self) -> None:
+        # The statements the check cannot read follow the scans' rules under `(dynamic)`: one with no entry is
+        # reported with where to pin it, and a rise, a drop and a stale entry each fail.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def two_dynamic(conn, column):
+                conn.execute("SELECT {} FROM events WHERE id = ?".format(column), (1,))
+                return conn.execute("SELECT id FROM events WHERE {} = ?".format(column), ("x",)).fetchall()
+            '''
+        )
+        dynamic = (
+            FIXTURE_DYNAMIC_BASELINE.replace("fixture_server.py run_sql (dynamic) 1\n", "")
+            .replace("fixture_server.py local_twice (dynamic) 1", "fixture_server.py local_twice (dynamic) 2")
+            + "fixture_server.py indexed (dynamic) 1\nfixture_server.py two_dynamic (dynamic) 1\n"
+        )
+        baseline = _write_fixture(self.root, baseline=FIXTURE_SCAN_BASELINE + dynamic)
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "run_sql executes a statement the check cannot read: `-`; write it as a literal or a constant, or pin it in "
+            "baseline.txt as `fixture_server.py run_sql (dynamic) <count>`",
+            err,
+        )
+        self.assertIn("two_dynamic executes 2 statement(s) the check cannot read, the entry at baseline.txt:", err)
+        self.assertIn("allows 1; write the new one as a literal or a constant", err)
+        self.assertIn("local_twice executes 1 statement(s) the check cannot read, the entry at baseline.txt:", err)
+        self.assertIn("allows 2; lower the entry to 1", err)
+        self.assertIn("fixture_server.py indexed executes no statement the check cannot read; remove the entry", err)
+        self.assertIn("1 finding(s) not pinned and 3 problem(s)", err)
+        # With the entries right, the same tree passes, and the summary counts the pinned statements.
+        baseline = _write_fixture(self.root, baseline=FIXTURE_BASELINE + "fixture_server.py two_dynamic (dynamic) 2\n")
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("22 not readable, no full scan or unreadable statement beyond the 46 baseline entr(y/ies)", out)
+
+    def test_old_sqlite_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        with mock.patch.object(sqlite3, "sqlite_version_info", (3, 34, 1)), mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
+            code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("sqlite3 library 3.34.1 is older than 3.36.0", err)
+        self.assertEqual(out, "")
+
+    def test_explain_binds_null_to_named_and_positional_parameters(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        self.assertEqual(explain(conn, "SELECT a FROM t WHERE id = :id AND a = :a"), ["SEARCH t USING INTEGER PRIMARY KEY (rowid=?)"])
+        self.assertEqual(explain(conn, "SELECT a FROM t WHERE id = ? AND a = ?"), ["SEARCH t USING INTEGER PRIMARY KEY (rowid=?)"])
+        self.assertEqual(explain(conn, "SELECT a FROM t"), ["SCAN t"])
+        with self.assertRaises(sqlite3.ProgrammingError):
+            explain(conn, "SELECT 1; SELECT 2")
+
+    def test_baseline_rise_drop_stale_unscanned_malformed_duplicate(self) -> None:
+        baseline = _write_fixture(
+            self.root,
+            baseline=textwrap.dedent(
+                """
+                fixture_server.py unindexed events 1
+                fixture_server.py partial_bound events 1
+                fixture_server.py aliased notes 1
+                fixture_server.py twice events 1
+                fixture_server.py Store.method notes 2
+                fixture_server.py Store.outer.inner notes 1
+                fixture_server.py indexed events 1
+                other.py unindexed events 1
+                fixture_server.py unindexed events
+                fixture_server.py unindexed events 0
+                fixture_server.py unindexed events 1
+                """
+            )
+            + FIXTURE_DYNAMIC_BASELINE,
+        )
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("twice scans events 2 time(s), the entry at baseline.txt:5 allows 1; index the new one", err)
+        self.assertIn("Store.method scans notes 1 time(s), the entry at baseline.txt:6 allows 2; lower the entry to 1", err)
+        self.assertIn("baseline.txt:8: fixture_server.py indexed scans events no more; remove the entry", err)
+        self.assertIn("baseline.txt:9: other.py is not a file this check reads; remove the entry", err)
+        self.assertIn("baseline.txt:10: expected `<file> <function> <table> <count>`", err)
+        self.assertIn("baseline.txt:11: expected `<file> <function> <table> <count>`", err)
+        self.assertIn("baseline.txt:12: fixture_server.py unindexed events already has an entry at line 2", err)
+        # `many`, `comma_list`, `quoted_alias`, `unpacked_shadow`, `closure.inner`, `nested_helper_name`,
+        # `sibling_built_constant`, `index_walk`, `partial_index_walk`, `lambda_closure.<lambda>`, `Body`,
+        # `materialized_subquery`, `automatic_index`, `create_as_select`, the three helper routes, `in_marks` and
+        # `through_default` have no entry and are reported beside the problems.
+        self.assertIn("many scans notes: `SCAN notes`", err)
+        self.assertIn("automatic_index scans notes: `SEARCH n USING AUTOMATIC COVERING INDEX (author=?)`", err)
+        self.assertIn("index_walk scans events: `SCAN events USING COVERING INDEX idx_events_created_at`", err)
+        self.assertIn("lambda_closure.<lambda> scans events: `SCAN events`", err)
+        self.assertIn("through_format_helper scans events: `SCAN events` for `SELECT id FROM events WHERE cluster IN (?)`", err)
+        self.assertIn("19 finding(s) not pinned and 7 problem(s)", err)
+
+    def test_bounded_index_the_schema_does_not_build_is_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A list naming an index the schema never builds fails, and the fixture's bounded walk, no longer vouched
+        # for, is the finding it would otherwise be.
+        code, _, err = _run(self.root, baseline, bounded_indexes=frozenset({"idx_events_gone"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("BOUNDED_INDEXES names 'idx_events_gone', which the schema does not build as a partial index", err)
+        # 3.53 prints COVERING where 3.40 does not, so the index is asserted and the words before it are not.
+        self.assertIn("bounded_index_walk scans events: `SCAN events USING ", err)
+        self.assertIn("INDEX idx_events_backlog_pending` for `SELECT id FROM events WHERE backlog = 1`", err)
+        self.assertIn("1 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_table_outside_foreign_tables_is_a_problem_not_a_skip(self) -> None:
+        baseline = _write_fixture(self.root)
+        # With `sessions` off the list, the Hermes read is a table the schema does not build and nothing vouches
+        # for: a problem naming the table, where a lazily created side table or a misspelt owned name would land.
+        code, out, err = _run(self.root, baseline, list_statements=True, foreign_tables=frozenset())
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("fixture_server.py:", err)
+        self.assertIn(
+            "hermes: `SELECT id FROM sessions WHERE parent_session_id = ?` names 'sessions', a table the schema does not "
+            "build and FOREIGN_TABLES does not list; build it in the schema, fix the name, or add it to FOREIGN_TABLES",
+            err,
+        )
+        self.assertIn("hermes error table=sessions plan=no such table: sessions", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_foreign_table_the_schema_builds_is_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        code, _, err = _run(self.root, baseline, foreign_tables=frozenset({"sessions", "events"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("FOREIGN_TABLES names 'events', which the schema builds; drop the entry", err)
+        # The schema builder's own `CREATE TABLE` is a target's too, so the created-table rule names it as well.
+        self.assertIn("FOREIGN_TABLES names 'events', which fixture_server.py:29 creates, so it is this repository's", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+
+    def test_missing_target_fails(self) -> None:
+        baseline = _write_fixture(self.root)
+        code, _, err = _run(self.root, baseline, targets=FIXTURE_TARGETS + ("gone.py",))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("gone.py: a configured target this check reads is missing", err)
+
+    def test_schema_module_that_does_not_import_fails(self) -> None:
+        baseline = _write_fixture(self.root)
+        (self.root / "fixture_server.py").write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("fixture_server.py: the schema module does not import: RuntimeError: boom", err)
+        # A bare interpreter fails here on the server's third-party imports; the message names the remedy.
+        self.assertIn("(a bare interpreter needs the test imports: make test-python-deps)", err)
+
+    def test_schema_module_missing_an_attribute_fails(self) -> None:
+        baseline = _write_fixture(self.root)
+        schema = SchemaSource(module="fixture_server.py", db_path_attr="DB_PATH", init_function="no_such_init")
+        code, _, err = _run(self.root, baseline, schema=schema)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("fixture_server.py: the schema module has no attribute no_such_init", err)
+
+    def test_alias_named_like_a_table_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        # The planner prints the alias, and the schema's names are tried first, so `SCAN data_volume_warning` would
+        # be placed as the bounded table while the statement walks `events`: the binding is refused instead.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def shadow_table_alias(conn):
+                return conn.execute("SELECT id FROM events AS data_volume_warning WHERE created_at > ?", ("x",)).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "shadow_table_alias: `SELECT id FROM events AS data_volume_warning WHERE created_at > ?` binds the alias "
+            "'data_volume_warning', the name of a table the schema defines, so a `SCAN data_volume_warning` line cannot "
+            "be placed; give it another alias",
+            err,
+        )
+        self.assertIn("shadow_table_alias error table=events", out)
+        self.assertNotIn("shadow_table_alias bounded", out)
+        self.assertNotIn("shadow_table_alias ok", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_owned_table_beside_a_foreign_one_is_a_problem_not_a_skip(self) -> None:
+        baseline = _write_fixture(self.root)
+        # The prepare stops at the foreign name, so the owned table's scan is never planned: a problem, not a skip.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def mixed(conn, cluster):
+                return conn.execute(
+                    "SELECT s.id FROM events e JOIN sessions s ON s.id = e.id WHERE e.cluster = ?", (cluster,)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "mixed: `SELECT s.id FROM events e JOIN sessions s ON s.id = e.id WHERE e.cluster = ?` names 'events', a "
+            "table the schema builds, beside 'sessions', a table another process owns, so the read of 'events' cannot "
+            "be planned here; split the statement, or build 'sessions' in the schema on purpose",
+            err,
+        )
+        self.assertIn("mixed error table=sessions plan=no such table: sessions", out)
+        self.assertNotIn("mixed skipped", out)
+        # The plain Hermes read beside it is still skipped.
+        self.assertIn("hermes skipped table=sessions", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_targets_sharing_a_file_name_are_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        (self.root / "other").mkdir()
+        (self.root / "other" / "fixture_helper.py").write_text(FIXTURE_HELPER, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, targets=FIXTURE_TARGETS + ("other/fixture_helper.py",))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "other/fixture_helper.py: a target with the same file name as fixture_helper.py is not read, since a sibling "
+            "constant names a module by its bare name; rename one or drop it from the targets",
+            err,
+        )
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_narrowed_run_leaves_entries_for_unread_targets_alone(self) -> None:
+        # A `--target` run reads one file; the baseline's entries for the configured targets it left out are out of
+        # scope, not stale, and only an entry for a file in neither set is reported.
+        baseline = _write_fixture(self.root, baseline=FIXTURE_BASELINE + "other.py unindexed events 1\n")
+        code, out, err = _run(self.root, baseline, targets=("fixture_helper.py",), configured=FIXTURE_TARGETS)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertNotIn("fixture_server.py is not a file this check reads", err)
+        self.assertIn("other.py is not a file this check reads; remove the entry", err)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+        baseline = _write_fixture(self.root)
+        code, out, err = _run(self.root, baseline, targets=("fixture_helper.py",), configured=FIXTURE_TARGETS)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("statement(s) read across 1 file(s)", out)
+
+
+class PlanLineTests(unittest.TestCase):
+    def test_scan_lines(self) -> None:
+        self.assertEqual(scanned_table("SCAN events"), "events")
+        self.assertEqual(scanned_table("SCAN events AS e"), "events")
+        # An automatic index is a full read of the table under a SEARCH verb.
+        self.assertEqual(scanned_table("SEARCH notes USING AUTOMATIC COVERING INDEX (author=?)"), "notes")
+        self.assertEqual(scanned_table("SEARCH notes USING AUTOMATIC PARTIAL COVERING INDEX (author=?)"), "notes")
+        self.assertEqual(scanned_table("SEARCH notes AS n USING AUTOMATIC INDEX (author=?)"), "notes")
+        # A SCAN through an index walks the whole index: every row, the LIMIT (if any) not in the line.
+        self.assertEqual(scanned_table("SCAN events USING INDEX idx_events_created_at"), "events")
+        self.assertEqual(scanned_table("SCAN events USING COVERING INDEX idx_events_created_at"), "events")
+        self.assertEqual(scan_index("SCAN events USING INDEX idx_events_created_at"), "idx_events_created_at")
+        self.assertEqual(scan_index("SCAN events USING COVERING INDEX sqlite_autoindex_events_1"), "sqlite_autoindex_events_1")
+        self.assertIsNone(scan_index("SCAN events"))
+        self.assertIsNone(scan_index("SEARCH events USING INDEX idx_events_created_at (created_at>?)"))
+        self.assertIsNone(scan_index("SEARCH notes USING AUTOMATIC COVERING INDEX (author=?)"))
+        self.assertIsNone(scanned_table("SEARCH events USING INTEGER PRIMARY KEY (rowid=?)"))
+        self.assertIsNone(scanned_table("SEARCH events USING INDEX idx_events_created_at (created_at>?)"))
+        self.assertIsNone(scanned_table("LIST SUBQUERY 1"))
+        # A constant row and a subquery are names the schema does not hold, which judge() drops.
+        self.assertEqual(scanned_table("SCAN CONSTANT ROW"), "CONSTANT")
+        self.assertEqual(scanned_table("SCAN (subquery-1)"), "(subquery-1)")
+
+    def test_aliases_and_ctes(self) -> None:
+        tables = frozenset({"events", "notes"})
+        self.assertEqual(table_aliases("SELECT e.id FROM events e JOIN notes AS n ON n.id = e.id", tables), {"e": "events", "n": "notes"})
+        self.assertEqual(table_aliases("SELECT * FROM notes n, events e WHERE e.id = n.id", tables), {"n": "notes", "e": "events"})
+        self.assertEqual(table_aliases('UPDATE OR REPLACE events AS "e" SET cluster = ? WHERE "e".id = ?', tables), {"e": "events"})
+        self.assertEqual(table_aliases("SELECT id FROM events WHERE id = ? ORDER BY id DESC LIMIT ?", tables), {})
+        self.assertEqual(table_aliases("INSERT INTO events (id, cluster) VALUES (?, ?)", tables), {})
+        self.assertEqual(table_aliases("SELECT id FROM other o", tables), {})
+        # One alias bound to the same table twice maps; bound to two tables, it maps to nothing.
+        self.assertEqual(table_aliases("SELECT id FROM events r WHERE id IN (SELECT id FROM events r)", tables), {"r": "events"})
+        self.assertEqual(table_aliases("SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM notes e)", tables), {"e": None})
+        self.assertEqual(cte_names("WITH RECURSIVE c(n) AS (SELECT 1), d AS (SELECT 2) SELECT * FROM c, d"), frozenset({"c", "d"}))
+        self.assertEqual(cte_names("SELECT id FROM events WHERE id = ?"), frozenset())
+        # An alias of a CTE or a derived table maps to that name once it is among the names offered.
+        self.assertEqual(table_aliases("WITH recent AS (SELECT 1) SELECT r.x FROM recent r", tables | {"recent"}), {"r": "recent"})
+        self.assertEqual(
+            derived_names(["CO-ROUTINE g", "SCAN events", "USE TEMP B-TREE FOR GROUP BY", "SCAN g", "MATERIALIZE a", "SCAN a"]),
+            frozenset({"g", "a"}),
+        )
+        self.assertEqual(derived_names(["SEARCH events USING INDEX idx (created_at>?)"]), frozenset())
+
+    def test_comments_and_literals_are_not_read(self) -> None:
+        tables = frozenset({"events", "notes"})
+        # Blanking keeps the length, so offsets into the blanked text index the original.
+        sql = "SELECT id FROM events e -- from notes e\n WHERE body = 'from notes n' /* join notes x */ AND id = ?"
+        self.assertEqual(len(sql_text(sql)), len(sql))
+        self.assertEqual(sql_text("a = 'it''s' -- c\nb"), "a = " + " " * len("'it''s'") + " " + " " * len("-- c") + "\nb")
+        self.assertEqual(table_aliases(sql, tables), {"e": "events"})
+        self.assertEqual(statement_tables(sql, tables), frozenset({"events"}))
+        self.assertEqual(statement_tables("SELECT s.id FROM events e JOIN sessions s ON s.id = e.id", tables), frozenset({"events"}))
+        self.assertEqual(cte_names("SELECT 'x AS (' FROM events -- y AS (\n"), frozenset())
+        self.assertEqual(cte_names("WITH c AS (SELECT 1) SELECT * FROM c"), frozenset({"c"}))
+        # An `AS SELECT` in a column default or a comment is no query; one after the DDL is, sliced from the original.
+        self.assertIsNone(planned_text("CREATE TABLE t (a TEXT DEFAULT 'as select') -- as select\n"))
+        self.assertEqual(planned_text("CREATE TABLE t -- as with\n AS SELECT 'as with' FROM events"), "SELECT 'as with' FROM events")
+
+    def test_partial_indexes(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)")
+        conn.execute("CREATE INDEX idx_t_a ON t (a)")
+        conn.execute("CREATE INDEX idx_t_pending ON t (a) WHERE b = 1")
+        conn.execute("CREATE TABLE u (k TEXT PRIMARY KEY, v TEXT)")
+        self.assertEqual(partial_indexes(conn, frozenset({"t", "u"})), frozenset({"idx_t_pending"}))
+        # The partial index serves the scan (3.53 prints COVERING where 3.40 does not, so the line is read, not
+        # pinned); a primary key's automatic index is not partial, and a projection of it walks the whole index.
+        (plan,) = explain(conn, "SELECT a FROM t WHERE b = 1")
+        self.assertEqual((scanned_table(plan), scan_index(plan)), ("t", "idx_t_pending"))
+        self.assertEqual(explain(conn, "SELECT k FROM u"), ["SCAN u USING COVERING INDEX sqlite_autoindex_u_1"])
+
+    def test_planned_text(self) -> None:
+        self.assertEqual(planned_text("SELECT id FROM events WHERE id = ?"), "SELECT id FROM events WHERE id = ?")
+        self.assertEqual(planned_text("CREATE TEMP TABLE r AS SELECT id FROM events"), "SELECT id FROM events")
+        self.assertEqual(planned_text("CREATE VIEW v AS\n  WITH c AS (SELECT 1) SELECT * FROM c"), "WITH c AS (SELECT 1) SELECT * FROM c")
+        self.assertEqual(planned_text("create table if not exists r as select id from events"), "select id from events")
+        self.assertIsNone(planned_text("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, created_at TEXT)"))
+        self.assertIsNone(planned_text("CREATE INDEX IF NOT EXISTS idx ON events (created_at)"))
+        self.assertIsNone(planned_text("PRAGMA journal_mode=WAL"))
+        self.assertIsNone(planned_text("BEGIN IMMEDIATE"))
+
+    def test_leading_keyword(self) -> None:
+        self.assertEqual(leading_keyword("\n  -- a note\n  select 1"), "SELECT")
+        self.assertEqual(leading_keyword("PRAGMA journal_mode=WAL"), "PRAGMA")
+        self.assertEqual(leading_keyword("BEGIN IMMEDIATE"), "BEGIN")
+        self.assertEqual(leading_keyword("WITH c AS (SELECT 1) SELECT * FROM c"), "WITH")
+        self.assertEqual(leading_keyword(""), "")
+
+
+class CheckoutTests(unittest.TestCase):
+    def test_checkout_passes_with_its_baseline_under_thirty_seconds(self) -> None:
+        for target in TARGETS:
+            self.assertTrue((REPO_ROOT / target).is_file(), target)
+        self.assertTrue(BASELINE.is_file())
+        out, err = io.StringIO(), io.StringIO()
+        started = time.monotonic()
+        code = check(out=out, err=err)
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, EXIT_OK, err.getvalue())
+        self.assertLess(elapsed, 30.0)
+        self.assertIn("check_sqlite_query_plans:", out.getvalue())
+        self.assertIn("skipped on tables the repository does not define", out.getvalue())
+        self.assertIn("not readable, no full scan or unreadable statement beyond the", out.getvalue())
+
+    def test_main_lists_the_checkout(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        self.assertEqual(main(["--list"], out=out, err=err), EXIT_OK, err.getvalue())
+        listing = out.getvalue()
+        self.assertIn("agents/platform/scripts/session_kv_server.py:", listing)
+        self.assertIn(" skipped table=sessions ", listing)
+        # The two scripts that open the database themselves are read too.
+        self.assertIn("agents/platform/scripts/chat_notify.py:", listing)
+        self.assertIn(" conversation_route ok table=- plan=- statement=SELECT metadata FROM session_metadata WHERE session_id = ?", listing)
+        self.assertIn("agents/platform/scripts/eod_report_generator.py:", listing)
+        # The server's `_ids_where_in` executes its parameter: the literal a caller hands it is read at the call
+        # site, its `{marks}` list as one parameter.
+        self.assertIn(
+            " _collect_card_tree skipped table=task_links plan=- "
+            "statement=SELECT parent_id, child_id FROM task_links WHERE parent_id IN (?)",
+            listing,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
