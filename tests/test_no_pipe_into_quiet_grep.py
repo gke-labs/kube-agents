@@ -97,9 +97,12 @@ PIPE_INTO_GREP_QUIET = re.compile(
     r"[ \t]+(?:-[a-pr-zA-Z]*q[a-zA-Z]*|--quiet|--silent)(?=[\s;)]|$)"
 )
 
-#: A `set` that turns pipefail on: `set -o pipefail`, `set -euo pipefail`,
-#: `set -e -o pipefail`; not `set +o pipefail`.
-_SETS_PIPEFAIL = re.compile(r"^[ \t]*set[ \t]+(?:-[A-Za-z]+[ \t]+)*-[A-Za-z]*o[ \t]+pipefail\b", re.M)
+#: What ends one shell command and starts the next on a line, so that
+#: `set -eu; set -o pipefail` is read as two `set` commands.
+_COMMAND_SEPARATOR = re.compile(r"&&|\|\||;")
+
+#: Words that can open a command before its name: `then set -o pipefail`.
+_COMMAND_PREFIX_WORDS = frozenset({"then", "do", "else", "{"})
 
 #: A Terraform heredoc: `<<EOT` or `<<-EOT` to the line holding the marker
 #: alone. A shell heredoc nested in it names another marker, so the first
@@ -206,13 +209,34 @@ def pipes_into_grep_quiet(shell: str) -> "list[tuple[int, str]]":
     return found
 
 
+def sets_pipefail(text: str) -> bool:
+    """Whether a `set` command in text turns pipefail on.
+
+    Reads each command's words rather than a grammar of `set`'s options, so
+    `set -o pipefail`, `set -euo pipefail`, `set -o errexit -o pipefail` and a
+    `set -o pipefail` after `;` or `&&` all count, and `set +o pipefail` and a
+    commented-out `set` do not.
+    """
+    for line in text.splitlines():
+        for command in _COMMAND_SEPARATOR.split(line):
+            words = command.split()
+            while words and words[0] in _COMMAND_PREFIX_WORDS:
+                words = words[1:]
+            if not words or words[0] != "set":
+                continue
+            if any(value == "pipefail" and flag.startswith("-") and flag.endswith("o")
+                   for flag, value in zip(words[1:], words[2:])):
+                return True
+    return False
+
+
 def pipefail_heredocs(terraform: str) -> "list[tuple[int, str]]":
     """(1-based line of the body's first line, body) for each heredoc in
     `terraform` whose body turns pipefail on."""
     return [
         (terraform.count("\n", 0, match.start(2)) + 1, match.group(2))
         for match in _TERRAFORM_HEREDOC.finditer(terraform)
-        if _SETS_PIPEFAIL.search(match.group(2))
+        if sets_pipefail(match.group(2))
     ]
 
 
@@ -239,7 +263,7 @@ def pipefail_run_blocks(workflow: dict) -> "list[tuple[str, str]]":
                 (s for s in (step.get("shell"), default_shell(job), default_shell(workflow)) if s is not None),
                 None,
             )
-            if _runs_with_pipefail(shell) or _SETS_PIPEFAIL.search(run):
+            if _runs_with_pipefail(shell) or sets_pipefail(run):
                 blocks.append((f"{job_id}/{step.get('name') or index}", run))
     return blocks
 
@@ -398,6 +422,20 @@ class GrammarTest(unittest.TestCase):
             pipes_into_grep_quiet("set -euo pipefail\nkubectl logs pod \\\n  | grep -q fire\n"),
             [(3, "| grep -q fire")],
         )
+
+    def test_every_spelling_that_turns_pipefail_on_counts(self):
+        for text in (
+            "set -o pipefail",
+            "set -euo pipefail",
+            "set -e -o pipefail",
+            "set -o errexit -o nounset -o pipefail",
+            "set -eu; set -o pipefail",
+            "set -e && set -o pipefail",
+            "  if true; then set -o pipefail; fi",
+        ):
+            self.assertTrue(sets_pipefail(text), text)
+        for text in ("set -eu", "set +o pipefail", "# set -o pipefail", "echo set -o pipefail", "set -o errexit"):
+            self.assertFalse(sets_pipefail(text), text)
 
     def test_only_heredocs_that_turn_pipefail_on_are_read(self):
         terraform = (
