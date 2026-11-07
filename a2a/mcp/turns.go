@@ -100,6 +100,12 @@ const (
 	delegationFollowGrace = 10 * time.Minute
 	reportGatherBudget    = 5 * time.Second
 	stepWatchIdleRelease  = 2 * time.Second
+	// maxStepTaskWatches bounds the task watches one streamed state holds
+	// between polls, each a reader slot (maxTaskReaders): the root's, and
+	// followed tasks' up to the bound. A followed task past it is not read
+	// until a held one finishes and frees its place, so one delegated turn
+	// leaves half the slots to the server's other readers.
+	maxStepTaskWatches = maxTaskReaders / 2
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
@@ -2181,6 +2187,11 @@ func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, r
 	unsubmittedRoot := st.isUnsubmittedRootLocked(ref)
 	tw, ok := st.taskWatches[ref]
 	if !ok || tw == nil {
+		if ref != st.ref && len(st.taskWatches) >= maxStepTaskWatches {
+			// Not read yet: it waits, as a task with no events does,
+			// for a held watch to free its place.
+			return nil, false, nil
+		}
 		var err error
 		tw, err = b.watchTask(ctx, ref)
 		if err != nil {

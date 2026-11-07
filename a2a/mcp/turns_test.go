@@ -2542,3 +2542,52 @@ func TestTheClosingPollAfterAStopDoesNotRepeatSteps(t *testing.T) {
 		t.Errorf("len(convs.steps) after the closing poll = %d, want 0", remaining)
 	}
 }
+
+// A streamed delegated turn following more live tasks than
+// maxStepTaskWatches holds no more watches than that between polls, so the
+// server's other readers still find a reader slot. The mutant this kills: a
+// state that holds a watch on every followed task, pinning every slot.
+func TestAStreamedTurnLeavesAReaderSlotForOthers(t *testing.T) {
+	url, js := testBus(t)
+	b := dial(t, url)
+	b.reapDelay = 0
+	convs := NewConversations().WithEvents(b.Events())
+
+	root := TaskRef{Addressee: fakeAddressee, TaskID: "task-slots-root"}
+	publishSubmission(t, js, fakeAddressee, root.TaskID, "console:slots", "fan out", "")
+	publishRun(t, js, fakeAddressee, root.TaskID, "", false)
+	publishArtifact(t, js, fakeAddressee, root.TaskID, lib.ArtifactDelegate, "cluster-a: inspect")
+	publishStatus(t, js, fakeAddressee, root.TaskID, lib.StateCompleted, true)
+	var children []TaskRef
+	for i := range maxFollowedTasks {
+		child := TaskRef{Addressee: "cluster-a", TaskID: fmt.Sprintf("task-slots-child%d", i)}
+		publishSubmission(t, js, child.Addressee, child.TaskID, "console:slots", "inspect", root.TaskID)
+		publishRun(t, js, child.Addressee, child.TaskID, "", false)
+		children = append(children, child)
+	}
+	if len(children) <= maxStepTaskWatches {
+		t.Fatalf("the test needs more followed tasks (%d) than maxStepTaskWatches (%d)", len(children), maxStepTaskWatches)
+	}
+	tw := &turnWatch{stop: make(chan struct{}), followed: children}
+	st := convs.getOrCreateTaskStepState(root, tw)
+	t.Cleanup(st.closeAll)
+
+	// A window long enough to reach every followed task: each live one's
+	// read waits stepPollWait.
+	out, err := b.WaitForTurnStep(t.Context(), convs, nil, root, time.Duration(maxFollowedTasks+2)*stepPollWait)
+	if err != nil {
+		t.Fatalf("WaitForTurnStep: %v", err)
+	}
+	if !out.StillRunning {
+		t.Fatal("the turn settled with its followed tasks still running")
+	}
+	st.mu.Lock()
+	held := len(st.taskWatches)
+	st.mu.Unlock()
+	if held > maxStepTaskWatches {
+		t.Errorf("the streamed state holds %d task watches, want at most %d", held, maxStepTaskWatches)
+	}
+	if _, err := b.ReadTask(t.Context(), root); err != nil {
+		t.Errorf("a concurrent ReadTask = %v, want a free reader slot", err)
+	}
+}
