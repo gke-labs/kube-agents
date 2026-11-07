@@ -63,6 +63,12 @@ from slack_relay_patch import read_upload
 # padded for a loaded CI runner, and it is only ever waited out once.
 _RESET_SETTLE_SECONDS = 0.5
 
+# How often a test waiting for a server thread's work, such as the line a
+# handler writes as it returns, checks again. The wait ends at a deadline rather
+# than after a settle, since a loaded runner can stall that thread past any
+# fixed sleep.
+_POLL_SECONDS = 0.01
+
 # A request body that cannot sit entirely in the kernel's socket buffers, and so
 # is still being written when a handler that does not read it closes. Below that
 # threshold the write completes, the close is orderly, and the response arrives
@@ -15434,12 +15440,34 @@ class _CredentialedUnixServer(unittest.TestCase):
         )
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
+        self.addCleanup(self._join_handlers)
         self.addCleanup(self.server.shutdown)
         self.opened = []
         self.addCleanup(lambda: [sock.close() for sock in self.opened])
 
     def max_threads(self):
         return None
+
+    def _join_handlers(self):
+        """Wait for the server's handler threads; fail naming any still running.
+
+        server_close does not join daemon handlers, and one stalled past the
+        test would write its "thread cap released" line during a later test,
+        under the interval that test patched and into its capture. Runs after
+        the connections are closed and the accept loop has stopped. A running
+        handler's Thread still holds its target; Thread.run drops it on return.
+        """
+        handlers = [
+            thread for thread in threading.enumerate()
+            if getattr(thread, "_target", None) == self.server.process_request_thread
+        ]
+        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+        for thread in handlers:
+            thread.join(max(0, deadline - time.monotonic()))
+        self.assertEqual(
+            [], [thread.name for thread in handlers if thread.is_alive()],
+            f"handler threads still running {_CLOSE_WAIT_SECONDS}s after their connections closed",
+        )
 
     @staticmethod
     def _restore(attribute, was_set, original):
@@ -15884,6 +15912,11 @@ class ThreadCapTest(_CredentialedUnixServer):
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
         return status, headers, body
 
+    def _wait_for_a_free_slot(self, slots):
+        """Block until a closed connection's thread has given one of ``slots`` back; fail at _CLOSE_WAIT_SECONDS."""
+        self.assertTrue(slots.acquire(timeout=_CLOSE_WAIT_SECONDS), f"no slot was given back within {_CLOSE_WAIT_SECONDS}s")
+        slots.release()
+
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
@@ -15912,12 +15945,18 @@ class ThreadCapTest(_CredentialedUnixServer):
             self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
 
         # A slot comes back when a holder goes; the episode is reported
-        # over only once an interval has passed with no refusal.
+        # over only once an interval has passed with no refusal. The closed
+        # holder's handler writes that line as it returns, so the test waits
+        # for the line, inside the shortened interval, rather than sleeping.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
-                time.sleep(_RESET_SETTLE_SECONDS)
+                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                while not any("thread cap released" in line for line in logs.output):
+                    if time.monotonic() > deadline:
+                        self.fail(f"the closed holder's handler did not report the release: {logs.output}")
+                    time.sleep(_POLL_SECONDS)
             released = [line for line in logs.output if "thread cap released" in line]
             self.assertEqual(1, len(released), logs.output)
             self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
@@ -15940,12 +15979,12 @@ class ThreadCapTest(_CredentialedUnixServer):
             # connection is served, inside the close wait, with every drain
             # still parked.
             holders[0].close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._cap_slots)
             served = self.connect()
             self.send(served, "GET", "/healthz")
             self.assertEqual(200, self.response(served)[0])
             served.close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._cap_slots)
             holders[0] = self.connect()  # the slot is held again
             time.sleep(_RESET_SETTLE_SECONDS)
             # Past THREAD_CAP_REFUSAL_THREADS parked drains, a refused
@@ -15958,7 +15997,7 @@ class ThreadCapTest(_CredentialedUnixServer):
             # A parked peer closing frees its refusal thread; the next refusal
             # is answered again.
             parked[0].close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._refusal_slots)
             self.assertEqual(503, self._refused()[0])
 
     def test_the_line_counts_the_refusals_closed_unanswered(self):
