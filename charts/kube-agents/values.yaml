@@ -1115,8 +1115,9 @@ platformAgent:
       # excludeNamespaces: ["load-test", "payments-canary"]
       # Hold a new alert until a stall has lasted this many minutes (0-1440).
       # minStallAgeMinutes: 30
-      # Replaces the default kind list; ["all"] scans every namespaced kind.
-      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
+      # Replaces the default kind list, Config Connector's group wildcard
+      # included; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io", "*.cnrm.cloud.google.com"]
     # How long the agent keeps its working data: ended sessions in every
     # profile's state.db (with their transcript files) and rotated log backups.
     # Hermes prunes on its own schedule and the session-retention cron job runs
