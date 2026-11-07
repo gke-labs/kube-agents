@@ -10554,6 +10554,22 @@ def group_branch_for(audit_id: str, group: list[dict]) -> str:
     return f"platform-agent/fix-{audit_id}-{suffix}"
 
 
+def scoped_group_branch_for(audit_id: str, group: list[dict]) -> str | None:
+    """The group's branch name with this install's scope digest, or None unscoped.
+
+    The name a scoped install falls back to when another install's open pull
+    request sits on `group_branch_for`'s name: two installs that stage the
+    same path in one repository then each keep a branch of their own. The
+    primary name stays in use everywhere else, so an install with no such
+    neighbour, and every pull request open today, is untouched. The digest
+    is the scope label's, so the name is stable across runs.
+    """
+    scope = ledger_scope()
+    if scope is None:
+        return None
+    return f"{group_branch_for(audit_id, group)}-{scope.label.rsplit('-', 1)[-1]}"
+
+
 def group_paths(group: list[dict]) -> list[str]:
     """Every path the group stages, sorted and de-duplicated."""
     paths: set[str] = set()
@@ -14162,11 +14178,16 @@ def render_held_comment(
     return _clip_comment("\n".join(out))
 
 
-def _select_pr_by_head(prs: list[dict], branch: str) -> dict | None:
-    """The most recent pull request on `branch`, or None.
+def _select_pr_by_head(prs: list[dict], branch: str, alternate: str | None = None) -> dict | None:
+    """The most recent pull request on `branch`, else on `alternate`, or None.
 
     Highest number wins, so a branch that was merged and then re-opened
     reports its current pull request rather than the historical one.
+
+    `alternate` is the scoped branch name (`scoped_group_branch_for`) a
+    scoped install fell back to when another install's pull request held
+    the primary name; `prs` is already this install's own, so a pull request
+    on either name is its own.
 
     The comparison assumes the branch lives in the same repository, which is
     what `open_remediation_pr` does. `headRefName` is a bare branch name for a
@@ -14174,16 +14195,19 @@ def _select_pr_by_head(prs: list[dict], branch: str) -> dict | None:
     arrives qualified, so the suffix form is accepted too rather than having
     every lookup silently miss.
     """
-    matches = [
-        pr
-        for pr in prs or []
-        if str(pr.get("headRefName", "")) == branch
-        or str(pr.get("headRefName", "")).endswith(f":{branch}")
-    ]
-    if not matches:
-        return None
-    matches.sort(key=lambda p: int(p.get("number", 0)))
-    return matches[-1]
+    for name in (branch, alternate):
+        if not name:
+            continue
+        matches = [
+            pr
+            for pr in prs or []
+            if str(pr.get("headRefName", "")) == name
+            or str(pr.get("headRefName", "")).endswith(f":{name}")
+        ]
+        if matches:
+            matches.sort(key=lambda p: int(p.get("number", 0)))
+            return matches[-1]
+    return None
 
 
 def remediation_pr_title(audit_id: str, group: list[dict]) -> str:
@@ -16253,7 +16277,9 @@ def reconcile_remediation_prs(
     pr_by_finding: dict[str, dict | None] = {}
     url_by_finding: dict[str, str] = {}
     for group in remediation_groups(findings):
-        pr = _select_pr_by_head(prs, group_branch_for(audit_id, group))
+        pr = _select_pr_by_head(
+            prs, group_branch_for(audit_id, group), scoped_group_branch_for(audit_id, group)
+        )
         for finding in group:
             fid = str(finding.get("id", ""))
             pr_by_finding[fid] = pr
@@ -16910,7 +16936,24 @@ def open_remediation_pr(
     """
     import gitops_workspace
 
-    branch = assert_pushable(group_branch_for(audit_id, group))
+    branch = group_branch_for(audit_id, group)
+    scoped_branch = scoped_group_branch_for(audit_id, group)
+    own_head = str((existing or {}).get("headRefName") or "").rsplit(":", 1)[-1]
+    if scoped_branch and own_head == scoped_branch:
+        # This install's pull request already sits on its scoped name: keep
+        # refreshing it there.
+        branch = scoped_branch
+    elif scoped_branch and existing is None and foreign_proposal_on(repo, branch):
+        # Another install's pull request holds the primary name. Its branch
+        # and pull request are not this install's to rewrite, so the fix goes
+        # on a name of this install's own; the primary name stays for every
+        # install and every pull request that has no such neighbour.
+        log(
+            f"{branch} carries another install's open pull request; this install's "
+            f"fix goes on {scoped_branch} instead."
+        )
+        branch = scoped_branch
+    branch = assert_pushable(branch)
     paths = group_paths(group)
     if content_mode():
         # The broker's copy reports its base, and an open pull request keeps
@@ -17036,21 +17079,40 @@ def open_proposal_on(repo: str, branch: str) -> dict | None:
     repository share a branch name, and the second must not rewrite the
     first's pull request as its own.
     """
+    own, _foreign = _proposals_on(repo, branch)
+    return own[0] if own else None
+
+
+def foreign_proposal_on(repo: str, branch: str) -> bool:
+    """Whether another install's open pull request, under this credential, sits on `branch`.
+
+    What sends a scoped install to `scoped_group_branch_for`'s name: the
+    primary name is taken by a neighbour that stages the same path, and
+    opening on it would contend for one branch.
+    """
+    _own, foreign = _proposals_on(repo, branch)
+    return bool(foreign)
+
+
+def _proposals_on(repo: str, branch: str) -> tuple[list[dict], list[dict]]:
+    """This credential's open pull requests on `branch`: (this install's, another install's).
+
+    Both empty when the forge cannot say who this install is.
+    """
     viewer = viewer_login(repo)
     if not viewer:
-        return None
+        return [], []
     answer = try_forge(
         "proposal-list", repo, {"source": branch, "state": "open", "limit": 1}
     )
     scope = ledger_scope()
-    found = [
-        pr_record(p)
-        for p in (answer or {}).get("proposals") or []
-        if isinstance(p, dict)
-        and _login_key(str(p.get("author") or "")) == _login_key(viewer)
-        and belongs_to_scope(p.get("labels"), scope)
-    ]
-    return found[0] if found else None
+    own: list[dict] = []
+    foreign: list[dict] = []
+    for p in (answer or {}).get("proposals") or []:
+        if not isinstance(p, dict) or _login_key(str(p.get("author") or "")) != _login_key(viewer):
+            continue
+        (own if belongs_to_scope(p.get("labels"), scope) else foreign).append(pr_record(p))
+    return own, foreign
 
 
 def close_stale_remediation_prs(
@@ -18888,7 +18950,11 @@ def _promised_fix_carried(
     that the promised `path` names, as the sweep joins a fix to its branch.
     With `open_only`, only an open pull request counts."""
     as_written = {"id": fid, "remediation": {"kind": "manifest", "path": path}}
-    pr = _select_pr_by_head(prs, group_branch_for(audit_id, [as_written]))
+    pr = _select_pr_by_head(
+        prs,
+        group_branch_for(audit_id, [as_written]),
+        scoped_group_branch_for(audit_id, [as_written]),
+    )
     if pr is None:
         return False
     return _pr_is_open(pr) if open_only else not pr_closed_by_harness(pr)
@@ -23605,8 +23671,14 @@ def _finish_store_ledger(
             now,
             noun=noun,
             sweep_off=not sweep_on,
+            # The branch a finding's fix is on: its own pull request's when
+            # it has one (the scoped name after a collision), else the
+            # primary name.
             branch_by_finding={
-                str(finding.get("id", "")): group_branch_for(audit_id, group)
+                str(finding.get("id", "")): (
+                    str((pr_by_finding.get(str(finding.get("id", ""))) or {}).get("headRefName") or "")
+                    or group_branch_for(audit_id, group)
+                )
                 for group in remediation_groups(findings)
                 for finding in group
             },
@@ -25501,8 +25573,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             noun=noun,
             sweep_off=not sweep_on,
+            # As on the store path: the branch a finding's own pull request
+            # is on, else the primary name.
             branch_by_finding={
-                str(finding.get("id", "")): group_branch_for(audit_id, group)
+                str(finding.get("id", "")): (
+                    str((pr_by_finding.get(str(finding.get("id", ""))) or {}).get("headRefName") or "")
+                    or group_branch_for(audit_id, group)
+                )
                 for group in remediation_groups(findings)
                 for finding in group
             },

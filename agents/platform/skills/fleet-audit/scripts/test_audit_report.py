@@ -35925,6 +35925,83 @@ class TestScopedRemediationPrs(ScopedHarnessTestCase):
             listed = audit_report.list_remediation_prs("acme/fleet", AUDIT)
         self.assertEqual([p["number"] for p in listed], [7, 8])
 
+    NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def promoting(self):
+        """A critical manifest finding whose fix is written, as `TestAutoPromotionInFinish` does."""
+        self.touch(self.NETPOL)
+        self.harness.replies.update(
+            {
+                "identity": {"login": "kube-agents-bot"},
+                "issue-list": {"issues": []},
+                "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+                "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+                "rev-parse --abbrev-ref": "feature-branch\n",
+            }
+        )
+        return make_doc()
+
+    def test_a_branch_another_install_holds_sends_the_fix_to_the_scoped_name(self):
+        # Install A's open pull request sits on the primary branch name. This
+        # install (B) neither adopts nor overwrites it: its fix lands on the
+        # scoped name, and the primary name is left to A.
+        doc = self.promoting()
+        primary = audit_report.group_branch_for(AUDIT, doc["findings"])
+        scoped = audit_report.scoped_group_branch_for(AUDIT, doc["findings"])
+        self.assertEqual(scoped, f"{primary}-{self.scope.label.rsplit('-', 1)[-1]}")
+        self.harness.replies["proposal-list"] = proposals_view(
+            [self.labelled_on(5, primary, ["audit:remediation", self.other_label])]
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        created_prs = self.harness.forge_calls("proposal-create")
+        self.assertEqual(len(created_prs), 1)
+        self.assertEqual(created_prs[0]["source"], scoped)
+        self.assertIn("carries another install's open pull request", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+
+    def test_this_installs_pull_request_on_the_scoped_name_is_found_again(self):
+        # The run after the fallback: the mapping finds the install's own
+        # pull request on the scoped name and reports it rather than opening
+        # a second one on either name.
+        doc = self.promoting()
+        primary = audit_report.group_branch_for(AUDIT, doc["findings"])
+        scoped = audit_report.scoped_group_branch_for(AUDIT, doc["findings"])
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                self.labelled_on(5, primary, ["audit:remediation", self.other_label]),
+                self.labelled_on(9, scoped, ["audit:remediation", self.scope.label]),
+            ]
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        out = self.stdout_json()
+        self.assertEqual(out["prs_opened"], [])
+        self.assertEqual(out["prs_still_open"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_with_no_neighbour_the_primary_branch_name_stays(self):
+        doc = self.promoting()
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        created_prs = self.harness.forge_calls("proposal-create")
+        self.assertEqual(len(created_prs), 1)
+        self.assertEqual(created_prs[0]["source"], audit_report.group_branch_for(AUDIT, doc["findings"]))
+        self.assertNotIn("carries another install's open pull request", self.err)
+
+    def test_the_head_lookup_falls_back_to_the_alternate_name(self):
+        own = pr(9, "platform-agent/fix-x-abcdef12")
+        self.assertIsNone(audit_report._select_pr_by_head([own], "platform-agent/fix-x"))
+        self.assertEqual(
+            audit_report._select_pr_by_head([own], "platform-agent/fix-x", "platform-agent/fix-x-abcdef12"),
+            own,
+        )
+        primary = pr(5, "platform-agent/fix-x")
+        self.assertEqual(
+            audit_report._select_pr_by_head([own, primary], "platform-agent/fix-x", "platform-agent/fix-x-abcdef12"),
+            primary,
+        )
+
+    def labelled_on(self, number, branch, names):
+        return {**pr(number, branch), "labels": [{"name": n} for n in names]}
+
     def test_another_installs_pull_request_on_the_same_branch_is_not_adopted(self):
         # Two installs that stage the same path share a branch name. The
         # open-proposal lookup must not hand the second install the first's

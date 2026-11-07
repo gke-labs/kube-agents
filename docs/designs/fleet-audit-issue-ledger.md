@@ -192,11 +192,12 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   `<!-- audit-id-scheme -->` stamp.
 - Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`, and on a
   scoped install `audit-scope:<slug>` (§8); the listing drops another install's pull requests, and
-  the open-proposal lookup on a branch adopts none of theirs, so two installs that stage the same
-  path share a branch name without the second rewriting the first's pull request as its own: the
-  second's group is refused as "already exists with other content and no open pull request of
-  this install" when the branch carries different content, and its create is refused by the forge
-  when the content is the same.
+  the open-proposal lookup on a branch adopts none of theirs. Two installs that stage the same
+  path would share a branch name, so when another install's open pull request holds the primary
+  name (`foreign_proposal_on`), a scoped install lands its fix on the primary name plus its scope
+  digest (`scoped_group_branch_for`), and the mapping from a group to its pull request reads the
+  primary name first and the scoped name second. The primary name stays for every install with no
+  such neighbour and for every pull request open today, so nothing is renamed on upgrade.
 
 ## 3. Decisions
 
