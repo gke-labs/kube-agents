@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 	batchv1 "k8s.io/api/batch/v1"
@@ -1228,6 +1229,20 @@ func topicsStateInfoJSON(subjects ...string) string {
 // real CLI does, so a test can shape one stream's answer without the other's.
 func stubNatsWithTopicsState(t *testing.T, dir, liveJSON, topicsStateJSON string) string {
 	t.Helper()
+	return stubNatsAnswering(t, dir, liveJSON, topicsStateJSON, profileSubmitsInfoJSON(a2aProfileSubmitMaxAge))
+}
+
+// profileSubmitsInfoJSON is a `stream info PROFILE_SUBMITS --json` answer
+// with the given max age, in the shape natscli prints (nanoseconds, under
+// config). Zero is no age limit.
+func profileSubmitsInfoJSON(maxAge time.Duration) string {
+	return fmt.Sprintf(`{"config":{"name":"PROFILE_SUBMITS","subjects":["a2a.submit.>"],"max_age":%d},"state":{"messages":0}}`, maxAge.Nanoseconds())
+}
+
+// stubNatsAnswering is stubNats with the TOPICS-STATE and PROFILE_SUBMITS
+// answers chosen by the caller; every other stream gets liveJSON.
+func stubNatsAnswering(t *testing.T, dir, liveJSON, topicsStateJSON, submitsJSON string) string {
+	t.Helper()
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
@@ -1240,11 +1255,15 @@ stream=""
 for a in "$@"; do
   case "$a" in
     --json) json=1 ;;
-    TASKS|TOPICS-STATE|DIRECTORY|TOPICS-JOURNAL) stream="$a" ;;
+    TASKS|TOPICS-STATE|DIRECTORY|TOPICS-JOURNAL|PROFILE_SUBMITS) stream="$a" ;;
   esac
 done
 if [ "$json" = "1" ]; then
   if [ "$stream" = "TOPICS-STATE" ]; then
+    cat <<'JSON'
+%s
+JSON
+  elif [ "$stream" = "PROFILE_SUBMITS" ]; then
     cat <<'JSON'
 %s
 JSON
@@ -1256,7 +1275,7 @@ JSON
   exit 0
 fi
 exit 0
-`, log, topicsStateJSON, liveJSON)
+`, log, topicsStateJSON, submitsJSON, liveJSON)
 	if err := os.WriteFile(filepath.Join(bin, "nats"), []byte(stub), 0o700); err != nil {
 		t.Fatal(err)
 	}

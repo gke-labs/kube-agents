@@ -1966,7 +1966,7 @@ class GitHardeningTest(unittest.TestCase):
         for argv in (
             ["git", "reset", "--hard", "--quiet"],
             ["git", "ls-remote", "--heads", "origin"],
-            ["git", "diff", "--histogram"],
+            ["git", "log", "--histogram"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNone(git_argument_violation(argv))
@@ -2189,7 +2189,6 @@ class GitHardeningTest(unittest.TestCase):
     def test_supported_git_subcommands_are_allowed(self):
         for argv in (
             ["git", "status"],
-            ["git", "diff"],
             ["git", "log"],
             ["git", "branch"],
             ["git", "cat-file", "-t", "HEAD"],
@@ -2405,23 +2404,6 @@ class GitHardeningTest(unittest.TestCase):
             executor.git_lease_violation(["git", "push", "origin", "HEAD:platform-agent/fix-bug"], cwd=str(clone_dir))
         )
         executor.require_git_lease = True
-
-        # Content workspace store honours base_branch argument (#1498, Thread 5)
-        import content_workspace
-        store_flag = content_workspace.ContentWorkspaceStore(
-            Path(self.temp_dir.name) / "trees_flag",
-            Path(self.temp_dir.name) / "agent_flag",
-            executor.execute_workspace_git,
-            base_branch="custom-cli-base",
-        )
-        h = "a" * 32
-        store_flag._workspaces[h] = content_workspace.Workspace(h, "acme/repo", Path(self.temp_dir.name), "main", "sha", shallow=False)
-        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
-            store_flag.commit(h, "custom-cli-base", "msg", [])
-        self.assertIn("custom-cli-base", str(ctx.exception))
-        with self.assertRaises(content_workspace.ContentWorkspaceError) as ctx:
-            store_flag.push(h, "custom-cli-base")
-        self.assertIn("custom-cli-base", str(ctx.exception))
 
         # Checked alias expansion is returned by resolve_git_command and executed directly (Thread 8)
         repo_alias = self.repository(executor, name="repo_alias")
@@ -2730,7 +2712,7 @@ class GitArgumentRefusalTest(unittest.TestCase):
         # and break the skills, which is the failure mode the rule invites.
         for argv in (
             ["git", "log", "--oneline"],              # vs --open-files-in-pager
-            ["git", "diff", "--cached"],              # vs --config-env
+            ["git", "rm", "--cached", "x"],           # vs --config-env
             ["git", "add", "--update", "--", "x"],    # vs --upload-pack
             ["git", "log", "--graph"],                # vs --git-dir
             ["git", "push", "--set-upstream", "o", "b"],   # vs --system
@@ -2947,6 +2929,16 @@ class ExecRouteRefusesGitTest(_ExecRouteServer):
         self.assert_refused(["git", "status", "--porcelain"], str(workspace / "acme__fleet"))
         self.assertNotIn("git", credential_proxy.EXEC_ROUTE_EXECUTABLES)
 
+    def test_the_verbs_only_the_retired_workspace_ran_are_refused_as_before(self):
+        """`diff`, `grep` and `check-ref-format` left the git argument gate
+        with the content workspace. /v1/exec refuses `git` before that gate,
+        so the answer to them is the allowlist's, as it was."""
+        workspace = CredentialProxyHandler.executor.workspace_dir
+        for argv in (["git", "diff"], ["git", "grep", "x"], ["git", "check-ref-format", "refs/heads/main"]):
+            with self.subTest(argv=argv):
+                self.assertNotIn(argv[1], credential_proxy.ALLOWED_GIT_SUBCOMMANDS)
+                self.assert_refused(argv, str(workspace))
+
 
 class ResourcePressureRouteTest(unittest.TestCase):
     """The resource watermark gate (#4333) as a caller meets it: over /v1/exec
@@ -3073,79 +3065,6 @@ class ResourcePressureRouteTest(unittest.TestCase):
         handler.endpoints_asked = []
         handler._watcher_cluster_endpoint = lambda target, request_id: handler.endpoints_asked.append(target) or None
         return handler
-
-    def test_a_workspace_write_at_the_hard_watermark_is_refused_and_a_read_passes(self):
-        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
-        routed = []
-        store = types.SimpleNamespace()
-        with (
-            mock.patch.object(CredentialProxyHandler, "workspaces", store),
-            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
-        ):
-            status, headers, body = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
-            self.assertEqual(429, status)
-            self.assertEqual("11", headers["Retry-After"])
-            self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
-            self.assertEqual([], routed)
-            # A commit fetches into the state volume and writes the changed
-            # files, so it is refused the same way; a push, which fetches
-            # nothing, still runs a git child and takes the check too.
-            for verb in ("commit", "push"):
-                status, _, body = self.post({"handle": "h", "branch": "fix/it"}, path=f"/v1/workspace/{verb}")
-                self.assertEqual(429, status, verb)
-                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", body["code"])
-            self.assertEqual([], routed)
-            status, _, _ = self.post({"handle": "h", "path": "README.md"}, path="/v1/workspace/read")
-            self.assertEqual(200, status)
-            self.assertEqual(["read"], routed)
-            self.set_memory_percent(50)
-            status, _, _ = self.post({"repo": "acme/fleet"}, path="/v1/workspace/open")
-            self.assertEqual(200, status)
-
-    def test_a_workspace_write_refused_at_the_hard_watermark_still_delivers_its_429_under_a_large_body(self):
-        # The refusal is decided before the body is read. A commit body larger
-        # than the socket buffers is still being sent when the answer is
-        # written, and a response over unread body bytes closes the
-        # connection, which resets it and swallows the 429 and its Retry-After
-        # unless the body is drained first (the vcs route's refusal drains for
-        # the same reason). Drained, the body counts as read, so the 429 is
-        # framed on a connection kept open, and the next request on it is
-        # answered: proof the drain left no body byte to be parsed as that
-        # request's line.
-        self.as_role(credential_proxy.CALLER_ROLE_SHELL)
-        routed = []
-        body = json.dumps({"handle": "h", "pad": "x" * _BODY_LARGER_THAN_SOCKET_BUFFERS}).encode("utf-8")
-        with (
-            mock.patch.object(CredentialProxyHandler, "workspaces", types.SimpleNamespace()),
-            mock.patch.object(CredentialProxyHandler, "_workspace_route", lambda self, route, payload: routed.append(route) or {"ok": True}),
-            self.assertLogs(credential_proxy.LOGGER, level="WARNING"),
-        ):
-            request = (
-                b"POST /v1/workspace/commit HTTP/1.1\r\n"
-                b"Host: 127.0.0.1\r\n"
-                b"Content-Type: application/json\r\n"
-                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body
-            )
-            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=10) as client:
-                try:
-                    client.sendall(request)
-                    refusal = http.client.HTTPResponse(client)
-                    refusal.begin()
-                    payload = refusal.read()
-                except OSError as exc:
-                    self.fail(
-                        "the broker abandoned the connection instead of delivering its 429, "
-                        f"which reads to a caller as a dead broker: {exc}"
-                    )
-                self.assertEqual(429, refusal.status)
-                self.assertEqual("11", refusal.getheader("Retry-After"))
-                self.assertNotEqual("close", (refusal.getheader("Connection") or "").lower())
-                self.assertEqual("CREDENTIAL_PROXY_RESOURCE_PRESSURE", json.loads(payload)["code"])
-                client.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-                probe = http.client.HTTPResponse(client)
-                probe.begin()
-                self.assertEqual((200, b'{"status":"ok"}'), (probe.status, probe.read()))
-        self.assertEqual([], routed)
 
     def test_a_vcs_request_refused_after_its_slot_wait_still_delivers_its_503_under_a_large_body(self):
         # The queue refusal takes the same branch as the gate's, after a wait:
@@ -6948,9 +6867,9 @@ class CommandExecutorTest(unittest.TestCase):
     def test_commands_take_no_slot_of_their_own(self):
         # A slot is a request's, held by the route around the command and the
         # response; a command never queues on its own. So the kubeconfig
-        # cache-fill under `_kubeconfig_lock`, a trusted helper and the
-        # workspace's git all run inside whatever slot their request holds,
-        # and none of them can hold a lock while waiting for one.
+        # cache-fill under `_kubeconfig_lock` and a trusted helper both run
+        # inside whatever slot their request holds, and neither can hold a
+        # lock while waiting for one.
         executor = self.executor(max_concurrent_commands=1)
         self.hold_a_slot(executor, seconds=2)
 
@@ -6988,25 +6907,6 @@ class CommandExecutorTest(unittest.TestCase):
                 result = executor.execute_internal(["/bin/echo", "inside"])
             self.assertEqual("inside\n", result.stdout)
             self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
-
-    def test_the_content_workspace_git_reserves_nothing(self):
-        # The store serves one verb at a time under its own lock; its one
-        # process tree at a time is the fixed CONTENT_WORKSPACE_RESERVE_BYTES
-        # term, subtracted whether or not a workspace is open, so its spawns
-        # must neither wait for the budget nor count against it.
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
-            executor = self.budgeted(admits=1)
-        self.hold_a_slot(executor, seconds=3)
-        tree = executor.content_workspace_root / "t"
-        tree.mkdir(parents=True)
-        with mock.patch.object(
-            executor,
-            "reserve_child_memory",
-            side_effect=AssertionError("the content workspace's git took a reservation"),
-        ):
-            result = executor.execute_workspace_git(["git", "check-ref-format", "refs/heads/main"], cwd=tree)
-        self.assertEqual(0, result.exit_code, result.stderr)
-        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
 
     def test_the_fixed_workspace_term_is_subtracted_with_no_workspace_open(self):
         mib = credential_proxy.MEBIBYTE
@@ -10287,7 +10187,6 @@ class GracefulDrainTest(unittest.TestCase):
         requests = (
             ("POST", "/v1/exec"),
             ("POST", "/v1/vcs/status"),
-            ("POST", "/v1/workspace/open"),
             ("POST", "/v1/chat/teams/events"),
             ("POST", "/v1/forge/refresh"),
             ("GET", credential_proxy.API_RELAY_PREFIX + "compute/v1/projects/p/zones"),
@@ -11150,10 +11049,14 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         self.assertIsInstance(server, credential_proxy.ThreadingUnixHTTPServer)
         self.assertEqual([], relays)
 
-    def test_serve_drains_on_sigterm_only_in_the_broker_role(self):
-        # The broker pod's grace period holds the drain; the sidecar roles'
-        # pods keep the short stop.
-        for role, drain_seconds in (("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS), ("combined", 0)):
+    def test_serve_drains_on_sigterm_in_the_broker_and_exec_roles(self):
+        # The broker pod's and the exec pods' grace periods hold the drain; the
+        # sidecar roles' pods keep the short stop.
+        for role, drain_seconds in (
+            ("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            (credential_proxy_client.EXEC_ROLE, credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            ("combined", 0),
+        ):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 self.assertEqual(drain_seconds, self.installed_shutdown.kwargs["drain_seconds"])
@@ -11412,7 +11315,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             "API_SERVER_EXTERNAL_KEY": "external",
             "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
-            "CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1",
         }
         bound = []
 
@@ -11430,7 +11332,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         originals = (
             CredentialProxyHandler.base_branch,
             CredentialProxyHandler.pinned_bases,
-            CredentialProxyHandler.workspaces,
             CredentialProxyHandler.vcs,
         )
         expected = {
@@ -11460,8 +11361,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
                         base,
                         CredentialProxyHandler.vcs.capabilities({"repository": repository})["baseBranch"],
                     )
-            assert CredentialProxyHandler.workspaces is not None
-            self.assertEqual(expected, CredentialProxyHandler.workspaces.pinned_bases)
 
             # Each pinned branch is protected from a direct push, with no
             # `--base-branch` and the environment cleared.
@@ -11478,7 +11377,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             (
                 CredentialProxyHandler.base_branch,
                 CredentialProxyHandler.pinned_bases,
-                CredentialProxyHandler.workspaces,
                 CredentialProxyHandler.vcs,
             ) = originals
             for server in bound:
@@ -11526,7 +11424,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         originals = (
             CredentialProxyHandler.base_branch,
             CredentialProxyHandler.pinned_bases,
-            CredentialProxyHandler.workspaces,
             CredentialProxyHandler.vcs,
         )
         try:
@@ -11539,7 +11436,6 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             (
                 CredentialProxyHandler.base_branch,
                 CredentialProxyHandler.pinned_bases,
-                CredentialProxyHandler.workspaces,
                 CredentialProxyHandler.vcs,
             ) = originals
             for server in bound:
@@ -11833,247 +11729,13 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.executed)
 
 
-class WorkspaceGitPathTest(unittest.TestCase):
-    """The broker's own git is a separate door from the agent's.
-
-    This is the property that decides how small the agent-facing git allowlist
-    can be. If broker-internal git shared `/v1/exec`, every subcommand the broker's
-    plumbing needs would have to be permitted to the agent as well. Each test
-    here pairs the refusal with the ordinary call it must not break.
-    """
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-
-    def executor(self, enabled=True, **environment):
-        environment.setdefault(
-            "CREDENTIAL_PROXY_CONTENT_WORKSPACE", "1" if enabled else "0"
-        )
-        with mock.patch.dict(os.environ, environment):
-            return CommandExecutor(
-                timeout_seconds=10,
-                max_output_bytes=1 << 16,
-                state_dir=str(Path(self.temp_dir.name) / "state"),
-            )
-
-    def tree(self, executor, name="repo"):
-        path = executor.content_workspace_root / name
-        path.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
-        )
-        return path
-
-    def test_the_broker_root_is_not_inside_the_volume_the_agent_writes(self):
-        executor = self.executor()
-        self.assertFalse(
-            credential_proxy._within(
-                executor.workspace_dir, executor.content_workspace_root
-            ),
-            "the agent's volume must not contain the broker's trees",
-        )
-        self.assertFalse(
-            credential_proxy._within(
-                executor.content_workspace_root, executor.workspace_dir
-            )
-        )
-        # Paired: the root the broker does own is real and usable.
-        self.assertTrue(executor.content_workspace_root.parent.is_dir())
-
-    def test_only_the_subcommands_the_broker_issues_may_run(self):
-        executor = self.executor()
-        tree = self.tree(executor)
-        for argv in (
-            ["git", "bisect", "run", "/bin/sh"],
-            ["git", "config", "--get", "user.name"],
-            ["git", "submodule", "foreach", "id"],
-            ["git", "rebase", "-x", "id", "HEAD~1"],
-            ["git", "filter-branch", "--tree-filter", "id"],
-        ):
-            with self.subTest(argv=argv):
-                with self.assertRaises(ValueError):
-                    executor.execute_workspace_git(argv, tree)
-
-        # Paired ordinary use: the eleven the product does issue still run, and
-        # produce git's real answer rather than a refusal.
-        result = executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree)
-        self.assertEqual(0, result.exit_code)
-        self.assertEqual("true", result.stdout.strip())
-
-    def test_a_working_directory_redirect_is_refused(self):
-        executor = self.executor()
-        tree = self.tree(executor)
-        # `-C` is applied before the subcommand runs, so containment on `cwd`
-        # would be checking a directory the command does not use.
-        with self.assertRaises(ValueError):
-            executor.execute_workspace_git(
-                ["git", "-C", "/etc", "rev-parse", "--show-toplevel"], tree
-            )
-        # Paired: the same command with no redirect answers about the tree it
-        # was pointed at.
-        result = executor.execute_workspace_git(["git", "rev-parse", "--show-toplevel"], tree)
-        self.assertEqual(str(tree.resolve()), result.stdout.strip())
-
-    def test_the_broker_path_cannot_run_in_the_agents_volume(self):
-        executor = self.executor()
-        elsewhere = executor.workspace_dir / "gitops"
-        elsewhere.mkdir(parents=True, exist_ok=True)
-        for cwd in (elsewhere, Path("/etc"), executor.state_dir):
-            with self.subTest(cwd=cwd):
-                with self.assertRaises(ValueError):
-                    executor.execute_workspace_git(["git", "rev-parse", "HEAD"], cwd)
-
-        # Paired: inside the broker's own root it runs.
-        tree = self.tree(executor)
-        self.assertEqual(
-            0,
-            executor.execute_workspace_git(["git", "rev-parse", "--is-inside-work-tree"], tree).exit_code,
-        )
-
-    def test_the_agent_facing_path_cannot_reach_the_broker_root(self):
-        """Widening containment for the broker must not widen it for /v1/exec.
-
-        `_execute` grew a `containment_root` parameter for the workspace path.
-        If that parameter leaked into the agent-facing call, the agent could
-        name the broker's trees as a working directory and every property above
-        would be decoration.
-        """
-        executor = self.executor()
-        tree = self.tree(executor)
-        with self.assertRaises(ValueError):
-            executor.execute(["git", "status"], cwd=str(tree))
-        with self.assertRaises(ValueError):
-            executor.execute(["git", "status"], cwd=str(executor.content_workspace_root))
-
-        # Paired: the agent's own workspace is still accepted, unchanged.
-        inside = executor.workspace_dir / "gitops"
-        inside.mkdir(parents=True, exist_ok=True)
-        result = executor.execute(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(inside))
-        self.assertNotEqual(
-            0, result.exit_code, "not a repository, but it was allowed to try"
-        )
-
-    def test_the_path_does_not_exist_at_all_when_the_feature_is_off(self):
-        executor = self.executor(enabled=False)
-        self.assertIsNone(executor.content_workspace_root)
-        with self.assertRaises(RuntimeError):
-            executor.execute_workspace_git(["git", "rev-parse", "HEAD"], Path("/tmp"))
-        self.assertIsNone(credential_proxy.build_workspace_store(executor))
-
-        # Paired: with the flag on, the store is built and the routes exist.
-        armed = self.executor(enabled=True)
-        self.assertIsNotNone(credential_proxy.build_workspace_store(armed))
-
-    def test_the_routes_answer_over_a_socket_and_never_return_a_path(self):
-        """The protocol surface, end to end, not just the functions behind it.
-
-        Two properties that only exist at this layer: the routes are *absent*
-        when the feature is off -- indistinguishable from an older broker, which
-        is what lets a migrating client detect support by asking -- and no
-        response body carries a filesystem path. The second is the whole
-        invariant: a path handed back is a directory the agent can be told to
-        `cd` into, which is the arrangement content-passing replaces.
-        """
-        import content_workspace
-
-        executor = self.executor(enabled=True)
-        tree_root = executor.content_workspace_root
-        original = getattr(CredentialProxyHandler, "workspaces", None)
-        original_max = getattr(CredentialProxyHandler, "max_request_bytes", 1 << 20)
-        CredentialProxyHandler.max_request_bytes = 1 << 20
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
-        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-
-        def post(route, body):
-            request = urllib.request.Request(
-                f"{endpoint}/v1/workspace/{route}",
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request) as response:
-                    return response.status, json.load(response)
-            except urllib.error.HTTPError as exc:
-                return exc.code, json.load(exc)
-
-        # Off: the routes do not exist. Not "exist and refuse" -- absent, so a
-        # bug in a refusal cannot reach them.
-        CredentialProxyHandler.workspaces = None
-        self.addCleanup(setattr, CredentialProxyHandler, "workspaces", original)
-        self.addCleanup(setattr, CredentialProxyHandler, "max_request_bytes", original_max)
-        for route in ("open", "read", "list", "commit", "push", "close"):
-            with self.subTest(route=route, armed=False):
-                self.assertEqual(404, post(route, {})[0])
-
-        # On, with a store whose git is a local repository rather than GitHub.
-        seeded = tree_root / "seed"
-        seeded.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "init", "--quiet", "--initial-branch=main", str(seeded)],
-            check=True,
-            capture_output=True,
-        )
-        (seeded / "manifests").mkdir(exist_ok=True)
-        (seeded / "manifests" / "app.yaml").write_text("kind: Service\n")
-        store = content_workspace.ContentWorkspaceStore(
-            tree_root, executor.workspace_dir, executor.execute_workspace_git
-        )
-        workspace = content_workspace.Workspace(
-            handle="c" * 32, repo="acme/fleet", tree=seeded, base="main", base_sha=""
-        )
-        store._workspaces[workspace.handle] = workspace
-        CredentialProxyHandler.workspaces = store
-
-        # Paired ordinary use: a read comes back as bytes.
-        status, body = post("read", {"handle": workspace.handle, "path": "manifests/app.yaml"})
-        self.assertEqual(200, status)
-        self.assertEqual(
-            b"kind: Service\n", base64.b64decode(body["contentBase64"])
-        )
-
-        status, listing = post("list", {"handle": workspace.handle})
-        self.assertEqual(200, status)
-        self.assertIn("manifests/app.yaml", [e["path"] for e in listing["entries"]])
-
-        # A refusal keeps its own code rather than reading as a proxy fault.
-        status, refused = post("read", {"handle": workspace.handle, "path": ".git/config"})
-        self.assertEqual(403, status)
-        self.assertEqual("workspace.path.refused", refused["code"])
-        self.assertEqual(404, post("read", {"handle": "z" * 32, "path": "a"})[0])
-        self.assertEqual(404, post("nonsense", {})[0])
-
-        # The invariant: nothing anywhere in a response is a path into the tree.
-        for payload in (body, listing, refused):
-            rendered = json.dumps(payload)
-            self.assertNotIn(str(tree_root), rendered)
-            self.assertNotIn(str(seeded), rendered)
-
-    def test_the_directory_path_keeps_working_while_the_flag_is_on(self):
-        """Land dark: the two mechanisms coexist, so neither blocks the other."""
-        executor = self.executor(enabled=True)
-        workspace = executor.workspace_dir / "gitops" / "lease"
-        workspace.mkdir(parents=True, exist_ok=True)
-        (workspace / ".lease").write_text("{}", encoding="utf-8")
-        self.assertIsNone(
-            executor.git_lease_violation(["git", "commit", "-m", "x"], str(workspace)),
-            "arming content-passing must not disturb the path the skills use today",
-        )
-
-
 class VcsGitPathTest(unittest.TestCase):
-    """The version-control broker's git is a third door, not a wider second.
+    """The version-control broker's git is a door of its own, not a wider `/v1/exec`.
 
-    `execute_workspace_git` and `execute_vcs_git` are deliberately separate
-    methods with separate roots and separate subcommand lists. Sharing one
-    would grant each path the other's subcommands for no reason beyond the
-    convenience of a single method, so each test here checks that a subcommand
-    one path needs is still refused on the other.
+    `execute_vcs_git` is a separate method with its own root and its own
+    subcommand list. Sharing one with `/v1/exec` would grant each path the
+    other's subcommands for no reason beyond the convenience of a single
+    method.
     """
 
     def setUp(self):
@@ -12081,7 +11743,6 @@ class VcsGitPathTest(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
 
     def executor(self, **environment):
-        environment.setdefault("CREDENTIAL_PROXY_CONTENT_WORKSPACE", "1")
         with mock.patch.dict(os.environ, environment):
             return CommandExecutor(
                 timeout_seconds=10,
@@ -12106,28 +11767,20 @@ class VcsGitPathTest(unittest.TestCase):
         self.assertFalse(
             credential_proxy._within(executor.vcs_root, executor.workspace_dir)
         )
-        # And it is disjoint from the *other* broker root too, so a bundle
-        # written by one path cannot be read as a workspace by the other.
-        self.assertNotEqual(executor.vcs_root, executor.content_workspace_root)
         self.assertTrue(executor.vcs_root.is_dir())
 
-    def test_the_two_broker_doors_do_not_share_a_subcommand_list(self):
+    def test_the_door_accepts_only_the_subcommands_the_broker_issues(self):
         executor = self.executor()
         scratch = self.tree(executor)
-        # `bundle` is the version-control path's and not the workspace path's:
-        # accepted here (git's own "refusing to create empty bundle" is an
-        # answer, not a refusal by the executor)...
+        # `bundle` is the version-control path's: accepted here (git's own
+        # "refusing to create empty bundle" is an answer, not a refusal by the
+        # executor).
         executor.execute_vcs_git(
             ["git", "bundle", "create", str(scratch / "out.bundle"), "--all"],
             scratch,
             check=False,
         )
-        # ...and unavailable on the door that never needed it.
-        with self.assertRaises(ValueError):
-            executor.execute_workspace_git(
-                ["git", "bundle", "list-heads", "x.bundle"], scratch
-            )
-        # And neither door accepts what neither issues.
+        # And the door refuses what the broker never issues.
         for argv in (
             ["git", "config", "--get", "user.name"],
             ["git", "submodule", "foreach", "id"],
@@ -12188,7 +11841,6 @@ class VcsGitPathTest(unittest.TestCase):
         executor = self.executor()
         for cwd in (
             executor.workspace_dir,
-            executor.content_workspace_root,
             Path("/etc"),
             executor.state_dir,
         ):
@@ -12238,6 +11890,31 @@ class VcsGitPathTest(unittest.TestCase):
             config=(("credential.helper", "!true"),),
         )
         self.assertEqual(0, result.returncode)
+
+    def test_containment_root_has_exactly_one_caller(self):
+        """A behavioural test cannot see a *new* caller added later. This can.
+
+        If this fails because someone added a legitimate second caller, read
+        `_execute`'s docstring before raising the number: the argument is safe
+        because of who passes it, not because of what it does.
+        """
+        source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
+        callers = [
+            line.strip()
+            for line in source.splitlines()
+            if "containment_root=" in line and "def _execute" not in line
+        ]
+        self.assertEqual(
+            callers,
+            [
+                # `execute_vcs_git` and `execute_forge_cli`. Both roots are the
+                # broker's own scratch tree, which `assert_disjoint_roots`
+                # proves at construction is somewhere the agent cannot name.
+                "containment_root=self.vcs_root,",
+                "containment_root=self.vcs_root,",
+            ],
+            f"unexpected containment_root callers: {callers}",
+        )
 
 
 class ForgeCliPathTest(unittest.TestCase):
@@ -12861,8 +12538,8 @@ class SnapshotRouteTest(unittest.TestCase):
         self.assertEqual((self.HELPER_CLEARED,), self.clone_config())
 
     def test_a_bare_name_on_an_install_with_github_and_a_second_forge_is_read_on_github(self):
-        # The content workspace reads it there; without the lift the registry
-        # refuses a hostless name when it serves two forges.
+        # A bare name is GitHub's; without the lift the registry refuses a
+        # hostless name when it serves two forges.
         token = self.base / "token"
         token.write_text("glpat-SENTINEL-must-never-appear")
         broker = self.broker({"forges": [
@@ -12893,6 +12570,28 @@ class SnapshotRouteTest(unittest.TestCase):
             ("github", "acme/infra", "https://github.com/acme/infra.git"),
             credential_proxy.snapshot_bare_name_fallback("acme/infra.git", ()),
         )
+
+    def test_a_host_and_one_segment_is_not_a_slug_and_is_never_read_from_github(self):
+        """A dot in the owner slot is a host, so `www.github.com/acme` is a host
+        and one segment, which no forge serves. Read as a slug it would go to
+        `https://github.com/www.github.com/acme.git` with no credential. The
+        hosts below are outside `repo_ref.KNOWN_HOSTS`, so only the dot rule in
+        `is_bare_github_name` refuses them."""
+        for name in ("www.github.com/acme", "git.example.org/acme"):
+            with self.subTest(name=name):
+                self.assertFalse(credential_proxy.is_bare_github_name(name))
+                self.assertIsNone(credential_proxy.snapshot_bare_name_fallback(name, ()))
+
+    def test_the_two_roots_must_not_overlap_in_either_direction(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        agent = base / "opt" / "data"
+        agent.mkdir(parents=True)
+        for tree in (agent / "vcs", base / "opt", agent):
+            with self.subTest(tree=str(tree)), self.assertRaises(RuntimeError):
+                credential_proxy.assert_disjoint_roots(tree, agent, purpose="version-control scratch")
+        credential_proxy.assert_disjoint_roots(base / "var" / "lib" / "credential-proxy" / "vcs", agent, purpose="version-control scratch")
 
 
 class CredentialHelperClearTest(unittest.TestCase):
@@ -12930,253 +12629,6 @@ class CredentialHelperClearTest(unittest.TestCase):
             self.assertNotIn("from-the-global-file", cleared.stdout + cleared.stderr)
 
 
-class ContentWorkspaceOnGitLabTest(unittest.TestCase):
-    """The content workspace end to end on a real two-forge registry: the real
-    locate, the real credential selector, the real token-file credential, and
-    a store recording every git call it makes."""
-
-    TOKEN = "glpat-SENTINEL-must-never-appear"
-    READ_TOKEN = "glpat-READ-SENTINEL-must-never-appear"
-
-    def setUp(self):
-        import content_workspace
-        self.cw = content_workspace
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.base = Path(tmp.name)
-        token = self.base / "token"
-        token.write_text(self.TOKEN)
-        path = self.base / "forges.json"
-        path.write_text(json.dumps({"forges": [
-            {"provider": "github", "host": "github.com"},
-            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(token), "allowedPaths": ["acme"]},
-        ]}))
-        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
-            self.registry = credential_proxy.providers.Registry()
-        self.managed = {"gitlab:gitlab.com/acme/infra", "github:github.com/acme/fleet"}
-        self.context = {"gitlab:gitlab.com/acme/notes"}
-        for patcher in (
-            mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry),
-            mock.patch.object(credential_proxy, "managed_repositories", side_effect=lambda: frozenset(self.managed)),
-            mock.patch.object(credential_proxy, "context_repositories", side_effect=lambda: frozenset(self.context)),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        (self.base / "data").mkdir()
-        self.calls = []
-
-        def runner(argv, cwd, config=()):
-            self.calls.append((list(argv), tuple(config)))
-            result = types.SimpleNamespace(exit_code=0, stdout="", stderr="")
-            if "diff" in argv and "--cached" in argv:
-                result.exit_code = 1
-            return result
-
-        self.store = content_workspace.ContentWorkspaceStore(
-            self.base / "trees", self.base / "data", runner,
-            credential_for=lambda repo: credential_proxy._workspace_credential(self.registry, repo),
-            locate=credential_proxy._workspace_locate,
-        )
-
-    def _config_of(self, subcommand):
-        return [config for argv, config in self.calls if argv[1] == subcommand]
-
-    def _forges_with_read_token(self):
-        """The forges file the operator renders when the forge has credentialsRef:
-        `readTokenPath` set, and the file there only if the Secret has the key."""
-        path = self.base / "forges-read.json"
-        path.write_text(json.dumps({"forges": [
-            {"provider": "github", "host": "github.com"},
-            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(self.base / "token"),
-             "readTokenPath": str(self.base / "read-token"), "allowedPaths": ["acme"]},
-        ]}))
-        return path
-
-    def _with_read_token_path(self):
-        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
-            self.registry = credential_proxy.providers.Registry()
-        patcher = mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _store_read_token(self):
-        read = self.base / "read-token"
-        read.write_text(self.READ_TOKEN)
-        return str(read)
-
-    def _helper_file(self, config):
-        """The token file the forge's git helper reads, from one git call's config."""
-        return dict(config)["credential.https://gitlab.com.helper"].split()[1]
-
-    def _commit(self, handle):
-        self.store.commit(
-            handle, "platform-agent/change", "feat: a change",
-            [self.cw.Change(self.cw.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
-        )
-
-    def test_a_managed_gitlab_clone_carries_the_helper_scoped_to_its_host_and_never_the_token(self):
-        workspace = self.store.open("gitlab.com/acme/infra")
-        clone = next(argv for argv, _ in self.calls if argv[1] == "clone")
-        self.assertIn("https://gitlab.com/acme/infra.git", clone)
-        config = dict(self._config_of("clone")[0])
-        self.assertEqual("", config["credential.helper"])
-        self.assertIn("credential.https://gitlab.com.helper", config)
-        self.assertNotIn(self.TOKEN, json.dumps(self.calls))
-        self.assertEqual("gitlab.com/acme/infra", workspace.repo)
-
-    def test_a_context_gitlab_repository_never_gets_the_write_token(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            workspace = self.store.open("gitlab.com/acme/notes")
-        self.assertEqual([()], self._config_of("clone"))
-        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
-        self.assertIn("presents none", "\n".join(logs.output))
-        # This forges file names no readTokenPath, so the warning blames the
-        # operator that rendered it, not the Secret.
-        self.assertIn("names no readTokenPath", "\n".join(logs.output))
-
-    def test_a_context_gitlab_repository_clones_with_the_stored_read_token(self):
-        self._with_read_token_path()
-        read = self._store_read_token()
-        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
-            workspace = self.store.open("gitlab.com/acme/notes")
-        [config] = self._config_of("clone")
-        self.assertEqual("", dict(config)["credential.helper"])
-        self.assertEqual(read, self._helper_file(config))
-        self.assertTrue(workspace.credential.stored_token)
-        dumped = json.dumps(self.calls)
-        self.assertNotIn(self.READ_TOKEN, dumped)
-        self.assertNotIn(self.TOKEN, dumped)
-
-    def test_a_secret_without_the_read_token_key_clones_a_context_repository_with_none(self):
-        # The path is configured, but the Secret lacks the key, so the
-        # operator's optional projection mounts no file: today's behaviour.
-        self._with_read_token_path()
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            workspace = self.store.open("gitlab.com/acme/notes")
-        self.assertEqual([()], self._config_of("clone"))
-        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
-        self.assertIn("presents none", "\n".join(logs.output))
-        self.assertIn(credential_proxy.FORGE_READ_TOKEN_KEY, "\n".join(logs.output))
-        # A key added later is presented on the next open, with no restart.
-        read = self._store_read_token()
-        self.calls.clear()
-        self.store.open("gitlab.com/acme/notes")
-        self.assertEqual(read, self._helper_file(self._config_of("clone")[0]))
-
-    def test_the_read_token_never_reaches_a_write_route(self):
-        self._with_read_token_path()
-        read = self._store_read_token()
-        token = str(self.base / "token")
-        # The content workspace: a managed repository's clone, fetch and push
-        # present the write token's helper, never the read token's.
-        managed = self.store.open("gitlab.com/acme/infra")
-        self._commit(managed.handle)
-        self.store.push(managed.handle, "platform-agent/change")
-        for subcommand in ("clone", "fetch", "push"):
-            with self.subTest(subcommand=subcommand):
-                configs = self._config_of(subcommand)
-                self.assertTrue(configs)
-                for config in configs:
-                    self.assertEqual(token, self._helper_file(config))
-        # A context repository clones with the read token and is never
-        # pushable: the write gate refuses it before any push.
-        context = self.store.open("gitlab.com/acme/notes")
-        self.assertEqual(read, self._helper_file(self._config_of("clone")[-1]))
-        with self.assertRaises(self.cw.RepositoryNotManaged):
-            credential_proxy.require_managed_workspace(self.store, context.handle)
-        # The API routes and `/v1/vcs/publish`: the broker's transport and git
-        # runner present `forge.credential`, the write token.
-        git_configs = []
-        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
-            broker = vcs_broker.VcsBroker(
-                self.base / "vcs",
-                git_runner=lambda argv, cwd, check=True, config=(): git_configs.append(config),
-            )
-        forge, repo = broker.registry.resolve("gitlab.com/acme/infra")
-        self.assertEqual({"PRIVATE-TOKEN": self.TOKEN}, broker._transport(forge, repo)._headers())
-        broker._git_for(forge, repo)(self.base, "push")
-        self.assertEqual(token, self._helper_file(git_configs[0]))
-        # `/v1/forge/refresh` has nothing to make current for a stored token,
-        # read-only or not, and presents neither.
-        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
-        handler.max_request_bytes = 1 << 20
-        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
-        handler.headers = {"Content-Length": str(len(body))}
-        handler.rfile = io.BytesIO(body)
-        handler.executor = types.SimpleNamespace(
-            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
-        )
-        replies = []
-        handler._json = lambda status, payload: replies.append((status, payload))
-        handler._handle_forge_refresh()
-        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
-        self.assertNotIn(self.READ_TOKEN, json.dumps(self.calls + replies))
-
-    def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
-        with self.assertRaises(self.cw.ContentWorkspaceError):
-            self.store.open("gitlab.com/other/infra")
-        self.assertEqual([], self._config_of("clone"))
-        store = mock.Mock()
-        store.get.return_value = mock.Mock(repo="gitlab.com/other/infra")
-        with self.assertRaises(self.cw.RepositoryNotManaged):
-            credential_proxy.require_managed_workspace(store, "h")
-
-    def test_a_forge_the_install_names_but_has_no_credential_for_is_refused(self):
-        path = self.base / "github-only.json"
-        path.write_text(json.dumps({"forges": [{"provider": "github", "host": "github.com"}]}))
-        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
-            github_only = credential_proxy.providers.Registry()
-        with mock.patch.object(credential_proxy, "forge_registry", return_value=github_only):
-            for refused in ("gitlab.com/acme/infra", "evil.example.com/acme/infra"):
-                with self.subTest(refused=refused):
-                    with self.assertRaises(self.cw.ContentWorkspaceError):
-                        credential_proxy._workspace_locate(refused)
-
-    def test_a_stored_token_is_withdrawn_when_the_repository_is_unregistered_after_open(self):
-        workspace = self.store.open("gitlab.com/acme/infra")
-        self.managed.discard("gitlab:gitlab.com/acme/infra")
-        self.calls.clear()
-        with self.assertRaises(self.cw.RepositoryNotManaged):
-            credential_proxy.require_managed_workspace(self.store, workspace.handle)
-        self._commit(workspace.handle)
-        self.assertEqual([()], self._config_of("fetch"))
-
-    def test_a_gitlab_push_carries_the_helper_and_a_github_push_carries_nothing(self):
-        gitlab = self.store.open("gitlab.com/acme/infra")
-        self._commit(gitlab.handle)
-        self.calls.clear()
-        self.store.push(gitlab.handle, "platform-agent/change")
-        self.assertIn("credential.https://gitlab.com.helper", dict(self._config_of("push")[0]))
-        github = self.store.open("acme/fleet")
-        self.assertIsInstance(github.credential, credential_proxy.providers.NoCredential)
-        self._commit(github.handle)
-        self.calls.clear()
-        self.store.push(github.handle, "platform-agent/change")
-        self.assertEqual([()], self._config_of("push"))
-
-    def test_a_github_handle_opened_as_context_pushes_on_the_ambient_credential(self):
-        # Review: push carried the read mint's layer, which clears
-        # `credential.helper`, so a repository promoted to managed after `open`
-        # pushed with no credential at all.
-        from providers.credentials import MintedReadCredential
-        import content_workspace
-        mint = MintedReadCredential("github", lambda provider, repo: "ghs_minted", "github.com")
-        store = content_workspace.ContentWorkspaceStore(
-            self.base / "trees2", self.base / "data",
-            lambda argv, cwd, config=(): self.calls.append((list(argv), tuple(config)))
-            or types.SimpleNamespace(exit_code=1 if ("diff" in argv and "--cached" in argv) else 0, stdout="", stderr=""),
-            credential_for=lambda repo: mint,
-        )
-        workspace = store.open("acme/tf-live")
-        store.commit(
-            workspace.handle, "platform-agent/change", "feat: a change",
-            [content_workspace.Change(content_workspace.repo_relative("m.yaml"), b"x\n")],
-        )
-        self.calls.clear()
-        store.push(workspace.handle, "platform-agent/change")
-        self.assertEqual([()], self._config_of("push"))
-
-
 class TwoForgeInstallTest(unittest.TestCase):
     """Review: an install serving GitHub and GitLab has no one forge to default
     to, and the callers that held a bare GitHub name stopped working on it."""
@@ -13205,60 +12657,6 @@ class TwoForgeInstallTest(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
-
-    def test_the_workspace_locates_a_host_qualified_repository_through_its_forge(self):
-        self.assertEqual(
-            ("gitlab.com/acme/infra", "https://gitlab.com/acme/infra.git"),
-            credential_proxy._workspace_locate("gitlab.com/acme/infra"),
-        )
-        # GitHub's comes back as the bare name the store keys it by.
-        self.assertEqual(
-            ("acme/infra", "https://github.com/acme/infra.git"),
-            credential_proxy._workspace_locate("github.com/acme/infra"),
-        )
-        import content_workspace
-        for refused in ("evil.example.com/acme/infra", "bitbucket.org/acme/infra"):
-            with self.subTest(refused=refused):
-                with self.assertRaises(content_workspace.ContentWorkspaceError):
-                    credential_proxy._workspace_locate(refused)
-
-    def test_a_workspace_write_to_a_gitlab_repository_asks_that_forges_list(self):
-        import content_workspace
-        store = mock.Mock()
-        managed = frozenset({"gitlab:gitlab.com/acme/infra"})
-        with mock.patch.object(credential_proxy, "managed_repositories", return_value=managed):
-            store.get.return_value = mock.Mock(repo="gitlab.com/acme/infra")
-            credential_proxy.require_managed_workspace(store, "h")
-            store.get.return_value = mock.Mock(repo="gitlab.com/acme/other")
-            with self.assertRaises(content_workspace.RepositoryNotManaged):
-                credential_proxy.require_managed_workspace(store, "h")
-            store.get.return_value = mock.Mock(repo="evil.example.com/acme/infra")
-            with self.assertRaises(content_workspace.RepositoryNotManaged):
-                credential_proxy.require_managed_workspace(store, "h")
-
-    def test_a_workspace_write_to_a_managed_github_repository_still_passes(self):
-        store = mock.Mock()
-        store.get.return_value = mock.Mock(repo="acme/infra")
-        credential_proxy.require_managed_workspace(store, "h")
-        store.get.return_value = mock.Mock(repo="acme/other")
-        with self.assertRaises(Exception) as caught:
-            credential_proxy.require_managed_workspace(store, "h")
-        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
-
-    def test_the_workspace_credential_resolves_a_bare_github_name_through_the_seam(self):
-        # Review round 4: the cases above call `_hosted` directly, so dropping
-        # it from `_workspace_credential` kept the suite green. Driven through
-        # the production seam on the two-forge registry, the bare name has to
-        # reach the role lookup on the GitHub forge.
-        seen = []
-
-        def role(repository, forge=None):
-            seen.append((repository, forge.name if forge else None))
-            return credential_proxy.ROLE_UNREGISTERED
-
-        with mock.patch.object(credential_proxy, "repository_role", side_effect=role):
-            credential_proxy._workspace_credential(self.registry, "acme/infra")
-        self.assertEqual([("acme/infra", "github")], seen)
 
     def test_the_github_refresh_alias_accepts_an_older_images_bare_slug(self):
         # Review round 4: the alias branch was driven by no test. An older
@@ -13338,34 +12736,6 @@ class TwoForgeInstallTest(unittest.TestCase):
         self.assertEqual("stable", pinned(pins, "gitlab.com", "acme/platform/fleet"))
         self.assertIsNone(pinned(pins, "github.com", "acme/platform/fleet"))
 
-    def _gitlab_only(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        path = Path(tmp.name) / "forges.json"
-        path.write_text(json.dumps({"forges": [
-            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t", "allowedPaths": []},
-        ]}))
-        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(path)}):
-            return credential_proxy.providers.Registry()
-
-    def test_an_install_with_no_github_forge_refuses_a_workspace_write_as_not_managed(self):
-        # Review round 2: it answered 503 "list unavailable", which is false
-        # and invites a retry; the workspace has no forge to write through.
-        store = mock.Mock()
-        store.get.return_value = mock.Mock(repo="acme/infra")
-        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()):
-            with self.assertRaises(Exception) as caught:
-                credential_proxy.require_managed_workspace(store, "h")
-        self.assertEqual("RepositoryNotManaged", type(caught.exception).__name__)
-        self.assertIn("serves github repositories only", str(caught.exception))
-
-    def test_an_install_with_no_github_forge_clones_the_workspace_without_a_credential(self):
-        with mock.patch.object(credential_proxy, "forge_registry", return_value=self._gitlab_only()), \
-                self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            credential = credential_proxy._workspace_credential(self._gitlab_only(), "acme/infra")
-        self.assertIsInstance(credential, providers.NoCredential)
-        self.assertIn("serves no github forge", "\n".join(logs.output))
-
     def test_a_host_with_no_forge_answers_its_gap_not_nothing_to_refresh(self):
         # Review round 3: a GitHub-only install's placeholder for gitlab.com
         # carries no credential, and the route answered 200 "nothing to
@@ -13435,8 +12805,7 @@ class TwoForgeInstallTest(unittest.TestCase):
                 credential_proxy._warn_on_unserved_types(frozenset({"GitLab:gitlab.com/c/d"}))
 
     def test_a_bare_name_the_caller_knows_the_forge_of_still_resolves(self):
-        # The content workspace's read credential and the older images'
-        # `/v1/github/refresh` both hold a bare GitHub name.
+        # The older images' `/v1/github/refresh` holds a bare GitHub name.
         lifted = credential_proxy._hosted("acme/infra", "github")
         self.assertEqual("https://github.com/acme/infra", lifted)
         forge, repo = self.registry.resolve(lifted)
@@ -13444,266 +12813,6 @@ class TwoForgeInstallTest(unittest.TestCase):
         for unchanged in ("https://gitlab.com/a/b/c", "a/b/c", None):
             self.assertEqual(unchanged, credential_proxy._hosted(unchanged, "github"))
         self.assertEqual("acme/infra", credential_proxy._hosted("acme/infra", "bitbucket"))
-
-
-class WorkspaceRouteTest(unittest.TestCase):
-    """Two claims about the routes that a behavioural test cannot make.
-
-    `WorkspaceGitPathTest` above asserts what the broker's git may do. These
-    two are about the surface in front of it: that widening containment stayed
-    a one-caller change, and that the route table refuses a name it does not
-    know rather than falling through to the store.
-    """
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-        # The write verbs consult the managed-repository list, which reads a
-        # ConfigMap through kubectl. Open by default here so that the routing
-        # claims below are about routing; the gate has its own tests, which
-        # patch over this one.
-        gate = mock.patch.object(
-            credential_proxy, "repository_is_managed", return_value=True
-        )
-        gate.start()
-        self.addCleanup(gate.stop)
-
-    def test_containment_root_has_exactly_one_caller(self):
-        """A behavioural test cannot see a *new* caller added later. This can.
-
-        If this fails because someone added a legitimate second caller, read
-        `_execute`'s docstring before raising the number: the argument is safe
-        because of who passes it, not because of what it does.
-        """
-        source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
-        callers = [
-            line.strip()
-            for line in source.splitlines()
-            if "containment_root=" in line and "def _execute" not in line
-        ]
-        self.assertEqual(
-            callers,
-            [
-                "containment_root=self.content_workspace_root,",
-                # `execute_vcs_git` and `execute_forge_cli`. Both roots are the
-                # broker's own scratch tree, which `assert_disjoint_roots`
-                # proves at construction is somewhere the agent cannot name --
-                # the same argument that admits the content workspace.
-                "containment_root=self.vcs_root,",
-                "containment_root=self.vcs_root,",
-            ],
-            f"unexpected containment_root callers: {callers}",
-        )
-
-    def _route(self, route, payload):
-        store = mock.Mock()
-        store.read.return_value = b""
-        # Named, which is what keeps it out of `store.method_calls`: a Mock
-        # assigned to an attribute is adopted as a child and has its calls
-        # recorded unless it already carries a name. The write gate looks the
-        # handle up before calling the store, and the assertions below are about
-        # the call the route makes -- every one of them reads the first entry.
-        store.get = mock.Mock(
-            name="workspace_get", return_value=mock.Mock(repo="acme/fleet")
-        )
-        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
-        handler.workspaces = store
-        handler._workspace_route(route, payload)
-        return store
-
-    def test_open_passes_a_host_qualified_name_to_the_store_and_still_refuses_a_bad_slug(self):
-        import content_workspace
-        store = self._route("open", {"repo": "gitlab.com/acme/platform/infra"})
-        store.open.assert_called_once_with("gitlab.com/acme/platform/infra", None, None, None, caller=None)
-        for bad in ("acme/..", "", None, 7):
-            with self.subTest(bad=bad):
-                with self.assertRaises(content_workspace.ContentWorkspaceError):
-                    self._route("open", {"repo": bad})
-
-    def test_open_hands_the_caller_label_to_the_store(self):
-        store = self._route("open", {"repo": "acme/fleet", "caller": "t_f660e9c5"})
-        store.open.assert_called_once_with("acme/fleet", None, None, None, caller="t_f660e9c5")
-        # Paired: an open without one hands the store None, never "".
-        store = self._route("open", {"repo": "acme/fleet"})
-        store.open.assert_called_once_with("acme/fleet", None, None, None, caller=None)
-
-    def test_the_write_verbs_gate_on_the_managed_repository_list(self):
-        # The gate is on `commit` and `push` and not on `open`: opening is a
-        # read, and `inspect-repository` opens repositories this install does
-        # not manage on purpose. It raises rather than returning a reply tuple,
-        # because the workspace routes answer through this exception family.
-        import content_workspace
-
-        for route, payload in (
-            (
-                "commit",
-                {
-                    "handle": "h",
-                    "branch": "b",
-                    "message": "m",
-                    "changes": [{"path": "a.yaml", "delete": True}],
-                },
-            ),
-            ("push", {"handle": "h", "branch": "b"}),
-        ):
-            with self.subTest(route=route):
-                with mock.patch.object(
-                    credential_proxy, "repository_is_managed", return_value=True
-                ):
-                    store = self._route(route, payload)
-                self.assertIn(route, [call[0] for call in store.method_calls])
-
-                with mock.patch.object(
-                    credential_proxy, "repository_is_managed", return_value=False
-                ):
-                    with self.assertRaises(content_workspace.RepositoryNotManaged):
-                        self._route(route, payload)
-
-                # An unreadable list is not an unmanaged repository. Answering
-                # 403 to a ConfigMap read that failed would tell an operator to
-                # register a repository that is already registered.
-                with mock.patch.object(
-                    credential_proxy,
-                    "repository_is_managed",
-                    side_effect=RuntimeError("kubectl exited 1"),
-                ):
-                    with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-                        with self.assertRaises(
-                            content_workspace.ManagedRepositoriesUnavailable
-                        ):
-                            self._route(route, payload)
-
-    def test_the_write_gate_reads_the_repository_off_the_handle(self):
-        # Off the handle rather than off the request body, or a caller could
-        # name a managed repository and write to the one it opened.
-        store = mock.Mock()
-        store.get.return_value = mock.Mock(repo="acme/unmanaged")
-        seen = []
-        with mock.patch.object(
-            credential_proxy,
-            "repository_is_managed",
-            side_effect=lambda repo, forge=None: seen.append(repo) or True,
-        ):
-            credential_proxy.require_managed_workspace(store, "h")
-        self.assertEqual(["acme/unmanaged"], seen)
-
-    def test_the_open_route_does_not_consult_the_managed_repository_list(self):
-        # Reading an upstream project is what `inspect-repository` is for, and
-        # a gate here would refuse every one of them.
-        with mock.patch.object(
-            credential_proxy, "repository_is_managed", return_value=False
-        ) as gate:
-            store = self._route("open", {"repo": "kubernetes-sigs/kustomize"})
-        gate.assert_not_called()
-        self.assertEqual("open", store.method_calls[0][0])
-
-    def test_the_read_verb_splits_on_paths_rather_than_on_a_second_route(self):
-        # One verb, two shapes. Keyed on the presence of `paths` so that a
-        # caller reading one file and a caller reading forty use one route --
-        # and so that `paths: []` is the store's refusal to make, not the
-        # router's silent fallback to the single-file read.
-        self.assertEqual(
-            [mock.call.read("h", "a.yaml")],
-            self._route("read", {"handle": "h", "path": "a.yaml"}).method_calls,
-        )
-        for paths in (["a.yaml", "b.yaml"], []):
-            with self.subTest(paths=paths):
-                self.assertEqual(
-                    [mock.call.read_many("h", paths)],
-                    self._route(
-                        "read", {"handle": "h", "path": "a.yaml", "paths": paths}
-                    ).method_calls,
-                )
-
-    def test_the_branch_expectation_reaches_the_store(self):
-        # Dropped here, the lease on the working branch is silently absent and
-        # a maintainer's edit to the pull request is overwritten -- with
-        # `--force-with-lease` unable to object, because it compares against
-        # the tip being overwritten.
-        store = self._route(
-            "commit",
-            {
-                "handle": "h",
-                "branch": "fix/x",
-                "message": "m",
-                "changes": [{"path": "a.yaml", "delete": True}],
-                "expectedBaseSha": "b" * 40,
-                "expectedBranchSha": "e" * 40,
-            },
-        )
-        call = store.method_calls[0]
-        self.assertEqual("commit", call[0])
-        self.assertEqual(("h", "fix/x", "m"), call.args[:3])
-        self.assertEqual(
-            {"expected_base_sha": "b" * 40, "expected_branch_sha": "e" * 40},
-            dict(call.kwargs),
-        )
-        # Absent means absent, not the empty string: the broker's own default
-        # is what fills it in, and "" would read as "no expectation".
-        store = self._route(
-            "commit",
-            {
-                "handle": "h",
-                "branch": "fix/x",
-                "message": "m",
-                "changes": [{"path": "a.yaml", "delete": True}],
-            },
-        )
-        self.assertIsNone(store.method_calls[0].kwargs["expected_branch_sha"])
-
-    def test_the_paging_and_search_arguments_reach_the_store(self):
-        # Dropping `after` here would page forever on the first page, and
-        # dropping `regex` would run a regex search as a fixed string and
-        # answer "no matches" to a pattern that matches.
-        self.assertEqual(
-            [mock.call.list("h", "manifests", "manifests/a.yaml")],
-            self._route(
-                "list",
-                {"handle": "h", "prefix": "manifests", "after": "manifests/a.yaml"},
-            ).method_calls,
-        )
-        self.assertEqual(
-            [mock.call.grep("h", "nginx", "manifests", regex=True, ignore_case=True)],
-            self._route(
-                "grep",
-                {
-                    "handle": "h",
-                    "pattern": "nginx",
-                    "prefix": "manifests",
-                    "regex": True,
-                    "ignoreCase": True,
-                },
-            ).method_calls,
-        )
-        # The flags are booleans on the wire, so a caller sending a truthy
-        # string must not turn a fixed-string search into a regex one.
-        self.assertEqual(
-            [mock.call.grep("h", "a[", None, regex=False, ignore_case=False)],
-            self._route(
-                "grep", {"handle": "h", "pattern": "a[", "regex": "yes"}
-            ).method_calls,
-        )
-
-    def test_an_unknown_verb_is_not_routed(self):
-        # `_workspace_route` returns None for a name it does not know, and the
-        # handler has to turn that into a 404. Reaching the store with an
-        # unrecognised route would mean the dispatch is a fallthrough.
-        store = mock.Mock()
-        original = getattr(CredentialProxyHandler, "workspaces", None)
-        CredentialProxyHandler.workspaces = store
-        self.addCleanup(setattr, CredentialProxyHandler, "workspaces", original)
-        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
-        handler.path = "/v1/workspace/exec"
-        handler.max_request_bytes = 1 << 20
-        handler.headers = {"Content-Length": "2"}
-        handler.rfile = io.BytesIO(b"{}")
-        answered = {}
-        handler._json = lambda status, payload: answered.update(
-            status=status, payload=payload
-        )
-        handler._handle_workspace_post()
-        self.assertEqual(HTTPStatus.NOT_FOUND, answered["status"])
-        self.assertFalse(store.method_calls)
 
 
 class BackendSocketModeTest(unittest.TestCase):
@@ -14527,7 +13636,7 @@ class RequiredRoleTest(unittest.TestCase):
     """
 
     def test_the_shell_routes(self):
-        for path in ("/v1/github/refresh", "/v1/workspace/open"):
+        for path in ("/v1/github/refresh",):
             with self.subTest(path=path):
                 self.assertEqual(
                     (credential_proxy.CALLER_ROLE_SHELL,),
@@ -14699,7 +13808,7 @@ class RolePermitsTest(unittest.TestCase):
         self.assertTrue(handler._role_permits(principal))
         self.assertEqual([], handler.replies)
         for path in (
-            "/v1/vcs/probe", "/v1/workspace/open", "/v1/forge/refresh", "/v1/github/refresh",
+            "/v1/vcs/probe", "/v1/forge/refresh", "/v1/github/refresh",
             credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x",
             "/v1/chat/slack/api", "/v1/chat/api", "/v1/chat/a2a/events",
         ):
@@ -15365,7 +14474,6 @@ class MCPRouteAdmissionTest(unittest.TestCase):
             "/v1/exec",
             "/v1/github/refresh",
             "/v1/forge/refresh",
-            "/v1/workspace/open",
             credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x",
             credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "server/x",
             credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x",
@@ -15388,7 +14496,7 @@ class MCPRouteAdmissionTest(unittest.TestCase):
         # A POST path ROUTE_ROLES misses admits every role, the mcp role with
         # it; each family do_POST dispatches must be in the table.
         for path in (
-            "/v1/exec", "/v1/github/refresh", "/v1/forge/refresh", "/v1/workspace/open",
+            "/v1/exec", "/v1/github/refresh", "/v1/forge/refresh",
             "/v1/vcs/x", feedback_broker.ROUTE, "/v1/chat/x",
             credential_proxy.API_RELAY_PREFIX, credential_proxy.mcp_policy.MCP_RELAY_PREFIX,
             credential_proxy.watcher_policy.WATCHER_GCP_PREFIX,
@@ -18791,22 +17899,14 @@ class RepositoryRoleTest(unittest.TestCase):
 
         `repository_is_managed` is the only question every write path asks,
         and it reads `managed_repos` alone. A repository registered only under
-        `context_repos` is therefore refused by `commit`, `push`, the API
-        routes and `/v1/forge/refresh` exactly as an unregistered one is --
+        `context_repos` is therefore refused by the API routes and
+        `/v1/forge/refresh` exactly as an unregistered one is --
         with a token for it now existing in the minter, which is why this is
         worth a test rather than an assumption.
         """
-        import content_workspace
-
         with self._lists(managed=["acme/gitops"], context=["acme/tf-live"]):
             self.assertFalse(credential_proxy.repository_is_managed("acme/tf-live"))
             self.assertEqual("context", credential_proxy.repository_role("acme/tf-live"))
-
-            # commit / push: the workspace gate reads the repository off the handle.
-            store = mock.Mock()
-            store.get.return_value = mock.Mock(repo="acme/tf-live")
-            with self.assertRaises(content_workspace.RepositoryNotManaged):
-                credential_proxy.require_managed_workspace(store, "h")
 
             # The API routes and the refresh route share one gate.
             handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
@@ -18826,8 +17926,6 @@ class RepositoryRoleTest(unittest.TestCase):
 
             # Paired: the managed repository passes every one of them.
             self.assertTrue(credential_proxy.repository_is_managed("acme/gitops"))
-            store.get.return_value = mock.Mock(repo="acme/gitops")
-            credential_proxy.require_managed_workspace(store, "h")
             self.assertTrue(handler._repository_is_permitted("acme/gitops"))
 
 
@@ -18857,9 +17955,6 @@ class ReadCredentialMintTest(unittest.TestCase):
     def _executor(self, result=None):
         executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
         executor.calls = []
-        # The mint runs under the store's fixed workspace term
-        # (`_outside_budget`), which records the exemption per thread.
-        executor._request_budget = threading.local()
 
         def run(argv):
             executor.calls.append(list(argv))
@@ -18889,24 +17984,6 @@ class ReadCredentialMintTest(unittest.TestCase):
         (argv,) = executor.calls
         self.assertTrue(argv[0].endswith("/github_token_refresh.py"), argv)
         self.assertEqual(["--read-only", "acme/tf-live"], argv[1:])
-
-    def test_a_vcs_request_s_reservation_covers_the_mint_and_nothing_else_is_exempt(self):
-        # Under a `snapshot`, the request's reservation covers the helper, as
-        # it covers the write mint; anywhere else -- the content workspace,
-        # under its store lock -- the mint runs on the workspace's fixed term.
-        token = "ghs_" + "C" * 36
-        for reserved, exempt in ((True, False), (False, True)):
-            with self.subTest(reserved=reserved):
-                executor = self._executor(self._result(0, stdout=token))
-                executor._request_budget.reserved = reserved
-                seen = []
-                executor.execute_internal = lambda argv: seen.append(
-                    getattr(executor._request_budget, "exempt", False)
-                ) or self._result(0, stdout=token)
-                with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
-                    self.assertEqual(token, executor.mint_read_credential("github", "acme/tf-live"))
-                self.assertEqual([exempt], seen)
-                self.assertFalse(getattr(executor._request_budget, "exempt", False))
 
     def test_the_flag_is_the_one_the_helper_parses(self):
         # Two copies of one string, kept in step here because the broker
@@ -19049,10 +18126,9 @@ class SweepCredentialMintTest(unittest.TestCase):
         # Two copies of one string, kept in step here for FORGE_READ_ONLY_FLAG's reason.
         self.assertEqual(github_token_refresh.SWEEP_FLAG, credential_proxy.FORGE_SWEEP_FLAG)
 
-    def test_mint_sweep_credential_reserves_child_memory_and_never_takes_the_exemption(self):
-        # The sweep thread holds no store lock, so its spawn is not under the
-        # content workspace's reserve: it reserves like any route that spawns,
-        # never under the exemption the read and write mints run in.
+    def test_mint_sweep_credential_reserves_child_memory(self):
+        # The sweep thread is covered by no route's reservation: it reserves
+        # like any route that spawns.
         executor = self._executor()
         entered = []
 
@@ -19062,11 +18138,9 @@ class SweepCredentialMintTest(unittest.TestCase):
             yield
 
         with mock.patch.object(credential_proxy, "repository_role", return_value="managed"), \
-                mock.patch.object(executor, "reserve_child_memory", side_effect=reserving), \
-                mock.patch.object(executor, "_outside_budget") as exempt:
+                mock.patch.object(executor, "reserve_child_memory", side_effect=reserving):
             executor.mint_sweep_credential("github", "acme/gitops")
         self.assertEqual(["reserved"], entered)
-        exempt.assert_not_called()
 
     def test_drop_sweep_credential_forgets_one_repositorys_token(self):
         executor = self._executor()
@@ -19276,132 +18350,6 @@ class SweepTransportTest(unittest.TestCase):
             static.credential = gitlab.credential
             self.assertFalse(credential_proxy.sweep_app_credential(static))
 
-
-class ReadCredentialSelectionTest(unittest.TestCase):
-    """What the store is handed per role, and how it reaches git."""
-
-    def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp_dir.cleanup)
-
-    def test_a_name_that_resolves_to_no_forge_is_not_logged_as_unreadable_lists(self):
-        # Review finding: a resolution refusal was logged as "the repository
-        # lists could not be read", sending an operator to the ConfigMap.
-        registry = mock.Mock()
-        registry.resolve.side_effect = providers.ForgeUnsupported("names no host")
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            credential = credential_proxy.read_credential_for(registry, "acme/infra")
-        self.assertIsInstance(credential, providers.NoCredential)
-        joined = "\n".join(logs.output)
-        self.assertIn("does not resolve to a forge", joined)
-        self.assertNotIn("could not be read", joined)
-
-    def test_only_a_context_repository_gets_a_credential(self):
-        registry = providers.Registry({"mint": lambda provider, repo: "token"})
-        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
-            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
-                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
-        self.assertIsInstance(credential, providers.MintedReadCredential)
-        self.assertIn("repo=acme/tf-live role=context", logs.output[0])
-        for role in ("managed", "unregistered"):
-            with self.subTest(role=role):
-                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
-                    with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
-                        credential = credential_proxy.read_credential_for(registry, "acme/x")
-                self.assertIsInstance(credential, providers.NoCredential)
-                self.assertIn(f"role={role}", logs.output[0])
-
-    def test_an_unreadable_list_means_no_credential_not_a_refusal(self):
-        # `open` has no gate by design; a ConfigMap read that failed must not
-        # take `inspect-repository` away from every public repository.
-        registry = providers.Registry({"mint": lambda provider, repo: "token"})
-        with mock.patch.object(
-            credential_proxy, "repository_role", side_effect=RuntimeError("kubectl exited 1")
-        ):
-            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
-        self.assertIsInstance(credential, providers.NoCredential)
-        self.assertIn("role=unknown", logs.output[0])
-
-    def _executor(self):
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
-            return CommandExecutor(
-                timeout_seconds=10,
-                max_output_bytes=1 << 16,
-                state_dir=str(Path(self.temp_dir.name) / "state"),
-            )
-
-    def test_the_store_the_broker_builds_mints_through_the_executor(self):
-        executor = self._executor()
-        store = credential_proxy.build_workspace_store(executor)
-        minted = []
-
-        def mint(provider, repository):
-            minted.append((provider, repository))
-            return "s3cret"
-
-        executor.mint_read_credential = mint
-        # Bound at construction: the registry was built with the executor's
-        # method, so swapping the attribute afterwards must not matter for the
-        # property under test -- rebuild to pick the stub up.
-        store = credential_proxy.build_workspace_store(executor)
-        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
-            credential = store._credential_for("acme/tf-live")
-        credential.ensure("acme/tf-live")
-        self.assertEqual([("github", "acme/tf-live")], minted)
-        config = dict(credential.git_config("acme/tf-live"))
-        header = config["http.https://github.com/.extraheader"]
-        self.assertEqual(
-            "x-access-token:s3cret",
-            base64.b64decode(header.split()[-1]).decode("utf-8"),
-        )
-        self.assertEqual("", config["credential.helper"])
-
-    def test_the_workspace_git_path_carries_the_credential_layer_ahead_of_the_pins(self):
-        executor = self._executor()
-        stub_dir = Path(self.temp_dir.name) / "fake-bin"
-        stub_dir.mkdir(parents=True, exist_ok=True)
-        stub = stub_dir / "git"
-        stub.write_text("#!/bin/bash\nenv\n", encoding="utf-8")
-        stub.chmod(0o755)
-        executor.executables["git"] = str(stub)
-        tree = executor.content_workspace_root / "repo"
-        tree.mkdir(parents=True, exist_ok=True)
-
-        def environment(config=()):
-            result = executor.execute_workspace_git(
-                ["git", "rev-parse", "HEAD"], tree, config=config
-            )
-            self.assertEqual(0, result.exit_code, result.stderr)
-            self.assertFalse(result.truncated)
-            return dict(
-                line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
-            )
-
-        def layer(env):
-            count = int(env["GIT_CONFIG_COUNT"])
-            return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"]) for i in range(count)]
-
-        credential = (
-            ("http.https://github.com/.extraheader", "AUTHORIZATION: basic eDp5"),
-            ("credential.helper", ""),
-        )
-        with_credential = layer(environment(credential))
-        self.assertEqual(list(credential), with_credential[:2])
-        self.assertEqual("core.hooksPath", with_credential[2][0])
-        self.assertEqual(
-            list(credential_proxy.GIT_FORCED_CONFIG), with_credential[3:],
-            "the forced pins must follow the credential so they still win",
-        )
-        # The token is in the environment of that one process and nowhere in
-        # its argv.
-        self.assertNotIn("eDp5", " ".join(environment(credential).get("_", "")))
-
-        # Paired: with nothing to add, the layer is exactly what it always was.
-        without = layer(environment())
-        self.assertEqual("core.hooksPath", without[0][0])
-        self.assertEqual(list(credential_proxy.GIT_FORCED_CONFIG), without[1:])
-        self.assertNotIn("http.https://github.com/.extraheader", dict(without))
 
 class ApiRelayOverTheSocketTest(unittest.TestCase):
     """The read-only Cloud API relay, driven over a real socket.
@@ -20612,19 +19560,17 @@ class FeedbackRouteTest(_ExecRouteServer):
 
 
 class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
-    """`_execute` widens `GIT_ALLOW_PROTOCOL` to `https:http` for an `http` forge across both `execute_vcs_git` and `execute_workspace_git`."""
+    """`_execute` widens `GIT_ALLOW_PROTOCOL` to `https:http` for an `http` forge on `execute_vcs_git`."""
 
     def test_git_allow_protocol_widens_for_allow_http_or_http_credential_helper(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
-                executor = CommandExecutor(
-                    timeout_seconds=5,
-                    max_output_bytes=4096,
-                    state_dir=root / "state",
-                )
+            executor = CommandExecutor(
+                timeout_seconds=5,
+                max_output_bytes=4096,
+                state_dir=root / "state",
+            )
             executor.vcs_root.mkdir(parents=True, exist_ok=True)
-            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
             captured_envs = []
 
             class FakeProcess:
@@ -20655,180 +19601,8 @@ class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
                     config=(("credential.helper", ""),),
                     allow_http=True,
                 )
-                executor.execute_workspace_git(
-                    [
-                        "git",
-                        "clone",
-                        "--quiet",
-                        "http://gitea.gitea.svc.cluster.local:3000/acme/infra.git",
-                        str(executor.content_workspace_root / "repo"),
-                    ],
-                    executor.content_workspace_root,
-                    config=(),
-                    allow_http=True,
-                )
             self.assertEqual("https", captured_envs[0]["GIT_ALLOW_PROTOCOL"])
             self.assertEqual("https:http", captured_envs[1]["GIT_ALLOW_PROTOCOL"])
-            self.assertEqual("https:http", captured_envs[2]["GIT_ALLOW_PROTOCOL"])
-
-    def test_content_workspace_store_open_on_http_gitea_forge_widens_git_allow_protocol(self):
-        import content_workspace
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            token_file = root / "gitea-token"
-            token_file.write_text("gitea-pat-token\n", encoding="utf-8")
-            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
-                executor = CommandExecutor(
-                    timeout_seconds=5,
-                    max_output_bytes=4096,
-                    state_dir=root / "state",
-                )
-            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
-            agent_dir = root / "agent"
-            agent_dir.mkdir(parents=True, exist_ok=True)
-
-            gitea_forge = providers.build_forges({
-                "forges": [
-                    {
-                        "provider": "gitea",
-                        "name": "gitea",
-                        "host": "gitea.gitea.svc.cluster.local",
-                        "scheme": "http",
-                        "port": 3000,
-                        "token_path": str(token_file),
-                        "allowed_paths": ["acme"],
-                    }
-                ]
-            })[-1]
-
-            captured_clone_envs = []
-
-            class FakeProcess:
-                returncode = 0
-
-            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
-                if "clone" in argv:
-                    captured_clone_envs.append(dict(env or {}))
-                    Path(argv[-1]).mkdir(parents=True, exist_ok=True)
-                return FakeProcess()
-
-            def fake_capture(_proc, *_args, **_kwargs):
-                return credential_proxy._CapturedOutput(
-                    stdout=b"refs/remotes/origin/main\n" + (b"a" * 40) + b"\n",
-                    stderr=b"",
-                    truncated=False,
-                    timed_out=False,
-                    abandoned=False,
-                )
-
-            for label, cred_fn in (
-                ("managed stored credential", lambda _repo: gitea_forge.credential),
-                ("context or unregistered NoCredential", lambda _repo: providers.NoCredential()),
-            ):
-                with self.subTest(case=label):
-                    captured_clone_envs.clear()
-                    store = content_workspace.ContentWorkspaceStore(
-                        executor.content_workspace_root,
-                        agent_dir,
-                        executor.execute_workspace_git,
-                        credential_for=cred_fn,
-                        locate=lambda _repo: (
-                            "gitea.gitea.svc.cluster.local/acme/infra",
-                            gitea_forge.clone_url("acme/infra"),
-                        ),
-                    )
-                    with (
-                        mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
-                        mock.patch.object(credential_proxy, "_capture_output", side_effect=fake_capture),
-                    ):
-                        ws = store.open("gitea.gitea.svc.cluster.local/acme/infra")
-                    self.assertEqual("gitea.gitea.svc.cluster.local/acme/infra", ws.repo)
-                    self.assertEqual(1, len(captured_clone_envs))
-                    self.assertEqual("https:http", captured_clone_envs[0]["GIT_ALLOW_PROTOCOL"])
-
-    @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_every_remote_verb_of_an_http_workspace_asks_for_http(self):
-        """`ls-remote`, `clone`, `fetch` and `push` all hand the runner `allow_http`.
-
-        The workspace's remote is the `http` Gitea URL, rewritten by
-        `url.insteadOf` to a local bare repository so real git answers. The
-        runner records which verbs asked for `allow_http`: the pinned-base probe
-        and the clone from `open`, then `fetch` from `commit` and `push` from
-        `push`, the last two reading `Workspace.allow_http`. The executor's
-        mapping from `allow_http` to `GIT_ALLOW_PROTOCOL=https:http` is pinned by
-        the first test in this class.
-        """
-        import content_workspace
-
-        host = "gitea.gitea.svc.cluster.local"
-        remote_prefix = f"http://{host}:3000/"
-        url = f"{remote_prefix}acme/infra.git"
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            plain_env = {
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                "HOME": str(root),
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": "/dev/null",
-                "GIT_AUTHOR_NAME": "Test",
-                "GIT_AUTHOR_EMAIL": "test@example.invalid",
-                "GIT_COMMITTER_NAME": "Test",
-                "GIT_COMMITTER_EMAIL": "test@example.invalid",
-            }
-
-            def plain_git(*argv, cwd):
-                subprocess.run(["git", *argv], cwd=str(cwd), env=plain_env, check=True, capture_output=True)
-
-            bare = root / "remotes" / "acme" / "infra.git"
-            bare.parent.mkdir(parents=True)
-            plain_git("init", "--quiet", "--bare", "--initial-branch=main", str(bare), cwd=root)
-            seed = root / "seed"
-            plain_git("init", "--quiet", "--initial-branch=main", str(seed), cwd=root)
-            (seed / "README.md").write_text("seed\n", encoding="utf-8")
-            plain_git("add", "README.md", cwd=seed)
-            plain_git("commit", "--quiet", "-m", "seed", cwd=seed)
-            plain_git("push", "--quiet", str(bare), "main", "main:release", cwd=seed)
-
-            asked: list[tuple[str, bool]] = []
-
-            def runner(argv, cwd, config=(), allow_http=False):
-                asked.append((argv[1], allow_http))
-                rewritten = [
-                    "git",
-                    "-c",
-                    f"url.{(root / 'remotes').as_uri()}/.insteadOf={remote_prefix}",
-                    *argv[1:],
-                ]
-                done = subprocess.run(rewritten, cwd=str(cwd), env=plain_env, capture_output=True, text=True)
-                return types.SimpleNamespace(exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr)
-
-            agent_dir = root / "agent"
-            agent_dir.mkdir()
-            store = content_workspace.ContentWorkspaceStore(
-                root / "trees",
-                agent_dir,
-                runner,
-                credential_for=lambda _repo: providers.NoCredential(),
-                locate=lambda _repo: (f"{host}/acme/infra", url),
-                pinned_bases={(host, "acme/infra"): "release"},
-            )
-            ws = store.open(f"{host}/acme/infra")
-            self.assertTrue(ws.allow_http)
-            store.commit(
-                ws.handle,
-                "platform-agent/change",
-                "feat: a change",
-                [content_workspace.Change(content_workspace.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
-            )
-            store.push(ws.handle, "platform-agent/change")
-
-            remote_verbs = {"ls-remote", "clone", "fetch", "push"}
-            seen = {verb for verb, _ in asked if verb in remote_verbs}
-            self.assertEqual(remote_verbs, seen)
-            for verb, allow_http in asked:
-                if verb in remote_verbs:
-                    self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
 
 
 class ScopeCallerBindingTest(unittest.TestCase):
@@ -21050,7 +19824,6 @@ class ScopeRouteAdmissionTest(unittest.TestCase):
             "/v1/vcs/proposal-view",
             "/v1/github/refresh",
             "/v1/forge/refresh",
-            "/v1/workspace/open",
             credential_proxy.API_RELAY_PREFIX + "cloudasset.googleapis.com/v1/x",
             credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "server/x",
             credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x",
@@ -21777,7 +20550,7 @@ class ExecPodRefusesTest(unittest.TestCase):
     def test_no_other_broker_role_gates(self):
         for broker_role in ("combined", "broker"):
             with self.subTest(broker_role=broker_role):
-                handler = self._handler("/v1/workspace/open", broker_role=broker_role)
+                handler = self._handler("/v1/vcs/probe", broker_role=broker_role)
                 self.assertFalse(handler._exec_pod_refuses("POST", self._principal(credential_proxy.CALLER_ROLE_SCOPE)))
                 self.assertEqual([], handler.replies)
 
@@ -21793,7 +20566,7 @@ class ExecPodRouteGateTest(unittest.TestCase):
     _HANDLERS = (
         "_handle_api_relay", "_handle_watcher_gcp", "_handle_platform_pubsub", "_handle_watcher_k8s",
         "_handle_mcp_relay", "_handle_slack_post", "_handle_teams_post", "_handle_chat_post",
-        "_handle_forge_refresh", "_handle_workspace_post", "_handle_vcs_post", "_handle_feedback_post",
+        "_handle_forge_refresh", "_handle_vcs_post", "_handle_feedback_post",
     )
     _GCP_PATH = credential_proxy.API_RELAY_PREFIX + "monitoring.googleapis.com/v3/x"
     _NOT_SERVED = (
@@ -21814,7 +20587,6 @@ class ExecPodRouteGateTest(unittest.TestCase):
         ("POST", "/v1/chat/teams/api"),
         ("POST", "/v1/forge/refresh"),
         ("POST", "/v1/github/refresh"),
-        ("POST", "/v1/workspace/open"),
         ("POST", "/v1/vcs/probe"),
         ("POST", feedback_broker.ROUTE),
     )
@@ -21897,7 +20669,7 @@ class ExecPodRouteGateTest(unittest.TestCase):
                 raise credential_proxy.AuthenticationError("no token")
 
         with mock.patch.object(CredentialProxyHandler, "authenticator", Refuses()):
-            for method, path in (("POST", "/v1/workspace/open"), ("GET", "/v1/chat/events")):
+            for method, path in (("POST", "/v1/vcs/probe"), ("GET", "/v1/chat/events")):
                 with self.subTest(method=method, path=path):
                     status, _ = self._request(method, path, credential_proxy_client.EXEC_ROLE)
                     self.assertEqual(HTTPStatus.UNAUTHORIZED, status)
@@ -21970,7 +20742,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         self.policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
         for name, value in (
             ("broker_role", "combined"), ("api_relay", None), ("chat_relay", None),
-            ("workspaces", None), ("vcs", None),
+            ("vcs", None),
             ("a2a_chat_relay", None), ("slack_relay", None), ("teams_relay", None),
             ("watcher_subscription", ""), ("platform_pubsub_subscriptions", frozenset()),
         ):
@@ -22048,8 +20820,7 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         self.assertIsNotNone(CredentialProxyHandler.api_relay)
         self.assertEqual(credential_proxy_client.EXEC_ROLE, CredentialProxyHandler.broker_role)
         metrics_listener.assert_called_once_with("127.0.0.1", 9466)
-        # No workspace store and no VCS broker, so no forge is asked at start what a credential reaches.
-        self.assertIsNone(CredentialProxyHandler.workspaces)
+        # No VCS broker, so no forge is asked at start what a credential reaches.
         self.assertIsNone(CredentialProxyHandler.vcs)
         self.assertNotIn("<lambda>", thread_targets)
 

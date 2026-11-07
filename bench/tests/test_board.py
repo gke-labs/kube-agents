@@ -441,6 +441,54 @@ def test_read_board_state_extracts_statuses_summaries_and_errors(tmp_path: Path)
     assert just_statuses == {"t_failed": "blocked"}
 
 
+def test_read_board_cards_carries_the_block_kind_from_the_tasks_table(tmp_path: Path) -> None:
+    """The guardrail's block kind is a ``tasks`` column; the card read carries it
+    beside the status and the newest summary, and leaves it ``None`` on a store
+    whose schema has no such column."""
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, block_kind TEXT)")
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT)")
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", ("t_limited", "blocked", "transient"))
+        conn.execute("INSERT INTO tasks VALUES (?, ?, ?)", ("t_done", "done", None))
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary) VALUES (?, ?)",
+            ("t_limited", "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"),
+        )
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_limited", "t_done", "t_gone"])
+
+    cards = board.read_board_cards(shell, ["t_limited", "t_done", "t_gone"], 5.0)
+    assert cards is not None
+    assert set(cards) == {"t_limited", "t_done"}
+    assert cards["t_limited"] == board.BoardCard(
+        "blocked",
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429",
+        None,
+        "transient",
+    )
+    assert cards["t_done"] == board.BoardCard("done", None, None, None)
+    # The 3-tuple read is unchanged beside it.
+    assert board.read_board_state(shell, ["t_limited"], 5.0) == (
+        {"t_limited": "blocked"},
+        {"t_limited": "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"},
+        {},
+    )
+
+
+def test_read_board_cards_without_the_block_kind_column(tmp_path: Path) -> None:
+    board_path = tmp_path / board.BOARD_FILE
+    with sqlite3.connect(board_path) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+        conn.execute("INSERT INTO tasks VALUES (?, ?)", ("t_old", "blocked"))
+
+    def shell(script: str, timeout: float) -> str:
+        return _run_script(tmp_path, ["t_old"])
+
+    assert board.read_board_cards(shell, ["t_old"], 5.0) == {"t_old": board.BoardCard("blocked")}
+
+
 def test_read_board_state_newest_run_empty_summary_does_not_fall_back_to_older_run(
     tmp_path: Path,
 ) -> None:

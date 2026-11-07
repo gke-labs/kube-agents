@@ -30,3 +30,7 @@
 # Ignore on an inert group). A declared gap, expected_fail: no compliance check
 # reads a CA bundle's notAfter; the gap is #4960.
 ./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit names a
+# Deployment whose containers set no memory limit (the planted
+# memory-unbounded-worker in seeded-workloads). A baseline: no gap declared.
+./tasks/workload-missing-memory-limits-oom-baseline/task.yaml

@@ -16,8 +16,10 @@ server is what stops serving a removed version — node pools do not enter into 
 Read-only against every repository. It reads one revision of each through the credential
 broker's `/v1/vcs/snapshot` into a temporary directory of its own, with no history, and
 deletes it after the read. The broker chooses the credential by the repository's role, so
-a managed, a context and a public repository are all read. The broker refuses a whole
-tree over its snapshot ceiling, and that repository is listed under errors. When
+a managed, a context and a public repository are all read. A tree over the broker's
+snapshot ceiling is read in parts: the refusal names the entries below it, and the scan
+takes those that hold manifests, in at most NARROW_SNAPSHOT_CAP snapshots after the refused
+one; a part it could not read is listed as not read and sets exit code 1. When
 CREDENTIAL_PROXY_URL is not set (a run outside the pod), it reads GitHub repositories
 through a leased checkout on the shared volume, under a lease of its own, so the reset
 that positions that checkout on the base branch never touches the session's working tree,
@@ -58,6 +60,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import gitops_workspace  # noqa: E402
 import vcs_client  # noqa: E402
+import workspace_paths  # noqa: E402
 
 # The lease owner name written beside a directory-mode checkout, so a stale
 # lease names the skill that took it, and the prefix that makes the scan's lease
@@ -95,12 +98,47 @@ SECONDS_PER_HOUR = 3600.0
 
 # Bounds on what the scan reads from one repository, so a repository nobody sized
 # cannot fill its context. Both are reported when they bite; a capped scan is a
-# partial scan and the section says so. Through the broker, its snapshot ceiling
-# applies first, to the whole tree: a repository over it is not scanned at all.
+# partial scan and the section says so.
 DEFAULT_MAX_FILES = 5000
 DEFAULT_MAX_BYTES = 64 << 20
 STOPPED_MAX_FILES = "maxFiles"
 STOPPED_MAX_BYTES = "maxBytes"
+
+# A tree over the broker's snapshot ceiling is read in parts. The refusal names
+# the entries one level down, each with what a snapshot of it measures and its
+# count of manifest files; the scan asks for the entries that hold manifests,
+# as many to a snapshot as fit under the ceiling, and asks for an entry over
+# the ceiling alone, so its own refusal names the entries below it. Each
+# snapshot is a broker clone of a large revision, so one repository takes at
+# most NARROW_SNAPSHOT_CAP of them after the refused whole-tree one; what is
+# left is listed as not read and the exit code is 1. The two path bounds are
+# the broker's MAX_SNAPSHOT_PATHS and MAX_SNAPSHOT_PATHS_BYTES (each path and
+# its separator), and CEILING_ENV and MANIFEST_SUFFIXES are its names too;
+# test_api_deprecation_scan holds them equal.
+NARROW_SNAPSHOT_CAP = 16
+NARROW_PATHS_PER_SNAPSHOT = 256
+NARROW_PATH_BYTES_PER_SNAPSHOT = 64 << 10
+# A name the broker refuses in `paths` (its `validate_path`, or longer than
+# its MAX_SNAPSHOT_PATH_BYTES) refuses the whole request, so such an entry is
+# listed as not read on its own and never put in a batch.
+NARROW_PATH_BYTES = 4096
+UNREAD_NAME_TOO_LONG = "its name is longer than the {limit} bytes the broker takes in `paths`"
+ENTRY_TREE = "tree"
+NARROW_PART_NAME = "part-{index}"
+CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
+# A part is sized to the lower of the broker's ceiling and vcs_client's own
+# unpack bound (SNAPSHOT_MAX_UNPACKED_BYTES): with the ceiling raised past it,
+# a part the broker serves would be refused by the client, with no entries.
+UNREAD_OVER_CEILING = (
+    "a file over the {limit}-byte snapshot bound on its own "
+    "(the lower of the broker's {env} and the client's unpack bound)"
+)
+UNREAD_PAST_CAP = "past the cap of {cap} snapshots for one repository"
+UNREAD_NO_LISTING = "refused as too large, and the refusal named no entries below it: {refusal}"
+# The broker decodes its listing with replacement, so a name that is not UTF-8
+# comes back with U+FFFD and names nothing when it is asked for.
+REPLACEMENT_CHARACTER = "\ufffd"
+UNREAD_NOT_UTF8 = "its name is not UTF-8, so the broker's listing could not name it to ask for"
 
 # `[v]MAJOR.MINOR[.PATCH][-gke.BUILD]`: the GKE form Phase 1 prints, and the bare
 # minor the removal table and a human's `--target-version 1.27` use. Only the
@@ -311,6 +349,14 @@ class Snapshot:
     files: dict[str, bytes] = field(default_factory=dict)
     skipped: list[dict] = field(default_factory=list)
     stopped: str | None = None
+    # A tree read in parts: that it was, the commit the whole tree was refused
+    # at, how many snapshots, the revisions the parts were read from (more than
+    # one when the branch moved between them), and the parts not read.
+    in_parts: bool = False
+    refused_revision: str | None = None
+    parts: int = 0
+    revisions: list[str] = field(default_factory=list)
+    unread: list[dict] = field(default_factory=list)
 
 
 def is_manifest_path(path: str) -> bool:
@@ -359,13 +405,145 @@ def read_repo_content(
     remove_stale_scan_copies()
     with tempfile.TemporaryDirectory(prefix=CLONE_DIR_PREFIX, dir=vcs_client.ROOT) as scratch:
         tree = Path(scratch) / SNAPSHOT_TREE_NAME
-        answer = snapshot(repo, into=tree)
+        try:
+            answer = snapshot(repo, into=tree)
+        except vcs_client.VcsError as refused:
+            if refused.code != vcs_client.SNAPSHOT_TOO_LARGE or refused.entries is None or refused.ceiling is None:
+                raise
+            return read_repo_in_parts(
+                repo, refused.entries, refused.ceiling, Path(scratch), snapshot, max_files, max_bytes,
+                revision=refused.revision,
+            )
         sha = answer.get("revision") or None
         # A tree that is gone would read as a clean section with nothing in it.
         if not tree.is_dir():
             raise FileNotFoundError(f"the snapshot of {repo} is not at {tree}")
         read = read_tree(tree, SOURCE_REPO.format(sha=sha or SHA_UNKNOWN), sha, max_files, max_bytes, skip_links=True)
     read.skipped = list(answer.get("skipped") or []) + read.skipped
+    return read
+
+
+def _holds_manifests(entry: dict) -> bool:
+    """An entry the broker counted no manifest files under is left out; one it did not count is not."""
+    return entry.get("manifests") != 0
+
+
+def _name_refusal(path: str) -> str | None:
+    """Why the broker would refuse ``path`` in `paths`, or None when it takes it."""
+    if len(path.encode()) > NARROW_PATH_BYTES:
+        return UNREAD_NAME_TOO_LONG.format(limit=NARROW_PATH_BYTES)
+    if REPLACEMENT_CHARACTER in path:
+        return UNREAD_NOT_UTF8
+    try:
+        workspace_paths.validate_path(path)
+    except workspace_paths.WorkspaceError as refused:
+        return str(refused)
+    return None
+
+
+def _batches(entries: list[dict], ceiling: int) -> list[list[dict]]:
+    """Entries that fit under ``ceiling``, in path order, as few snapshots as their measures allow.
+
+    Each entry's measure counts the tar's start and end, so the sum is never
+    under the measure of the snapshot that asks for them together.
+    """
+    batches: list[list[dict]] = []
+    total = names = 0
+    for entry in sorted(entries, key=lambda e: e["path"]):
+        name = len(entry["path"].encode()) + 1
+        if (
+            not batches
+            or total + entry["bytes"] > ceiling
+            or len(batches[-1]) >= NARROW_PATHS_PER_SNAPSHOT
+            or names + name > NARROW_PATH_BYTES_PER_SNAPSHOT
+        ):
+            batches.append([])
+            total = names = 0
+        batches[-1].append(entry)
+        total += entry["bytes"]
+        names += name
+    return batches
+
+
+def read_repo_in_parts(
+    repo: str,
+    entries: list[dict],
+    ceiling: int,
+    scratch: Path,
+    snapshot: Callable,
+    max_files: int = DEFAULT_MAX_FILES,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    revision: str | None = None,
+) -> Snapshot:
+    """Broker mode, for a tree over the snapshot ceiling: the parts that hold manifests.
+
+    ``entries``, ``ceiling`` and ``revision`` are the refusal's. Every part the
+    scan could not read is listed under ``unread`` with its reason: never a
+    section that reads as whole when it is not.
+    """
+    read = Snapshot(source="", sha=None, in_parts=True, refused_revision=revision or None)
+    limit = min(ceiling, vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES)
+    pending = [entry for entry in entries if _holds_manifests(entry)]
+    total_bytes = 0
+    while pending and not read.stopped:
+        for entry in list(pending):
+            reason = _name_refusal(entry["path"])
+            if reason is not None:
+                pending.remove(entry)
+                read.unread.append({"path": entry["path"], "reason": reason})
+        alone = [entry for entry in pending if entry["bytes"] > limit]
+        requests = _batches([entry for entry in pending if entry["bytes"] <= limit], limit)
+        pending = []
+        for entry in alone:
+            if entry.get("type") == ENTRY_TREE:
+                requests.append([entry])
+            else:
+                read.unread.append(
+                    {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(limit=limit, env=CEILING_ENV)}
+                )
+        for batch in requests:
+            # Checked before the next clone, not only inside `read_tree` after it.
+            if len(read.files) >= max_files:
+                read.stopped = STOPPED_MAX_FILES
+            elif total_bytes >= max_bytes:
+                read.stopped = STOPPED_MAX_BYTES
+            if read.stopped:
+                break
+            if read.parts >= NARROW_SNAPSHOT_CAP:
+                read.unread.extend(
+                    {"path": entry["path"], "reason": UNREAD_PAST_CAP.format(cap=NARROW_SNAPSHOT_CAP)} for entry in batch
+                )
+                continue
+            read.parts += 1
+            part = scratch / NARROW_PART_NAME.format(index=read.parts)
+            try:
+                answer = snapshot(repo, paths=[entry["path"] for entry in batch], into=part)
+            except vcs_client.VcsError as refused:
+                if refused.code == vcs_client.SNAPSHOT_TOO_LARGE and refused.entries is not None:
+                    # The entries below every asked path, whatever the batch's size
+                    # (a part can grow past the ceiling when the branch moves).
+                    pending.extend(entry for entry in refused.entries if _holds_manifests(entry))
+                elif refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
+                    read.unread.append(
+                        {"path": batch[0]["path"], "reason": UNREAD_NO_LISTING.format(refusal=refused)}
+                    )
+                else:
+                    read.unread.extend({"path": entry["path"], "reason": str(refused)} for entry in batch)
+                continue
+            if answer.get("revision") and answer["revision"] not in read.revisions:
+                read.revisions.append(answer["revision"])
+            got = read_tree(
+                part, "", None, max_files - len(read.files), max_bytes - total_bytes, skip_links=True
+            )
+            shutil.rmtree(part, ignore_errors=True)
+            read.files.update(got.files)
+            total_bytes += sum(len(data) for data in got.files.values())
+            read.skipped.extend(list(answer.get("skipped") or []) + got.skipped)
+            read.stopped = got.stopped
+    # The section names a commit its files came from; the refused one only
+    # when no part was read.
+    read.sha = read.revisions[0] if read.revisions else read.refused_revision
+    read.source = SOURCE_REPO.format(sha=read.sha or SHA_UNKNOWN)
     return read
 
 
@@ -548,6 +726,11 @@ def scan_snapshot(snapshot: Snapshot, in_range: list[Removal], members: list[Mem
         "hits": hits,
         "skipped": skipped,
         "stopped": snapshot.stopped,
+        "in_parts": snapshot.in_parts,
+        "refused_revision": snapshot.refused_revision,
+        "parts": snapshot.parts,
+        "revisions": list(snapshot.revisions),
+        "unread": list(snapshot.unread),
         "error": None,
     }
 
@@ -562,6 +745,11 @@ def error_section(message: str) -> dict:
         "hits": [],
         "skipped": [],
         "stopped": None,
+        "in_parts": False,
+        "refused_revision": None,
+        "parts": 0,
+        "revisions": [],
+        "unread": [],
         "error": message,
     }
 
@@ -607,6 +795,22 @@ def render_section(name: str, section: dict, floor: Version, target: Version) ->
             f"up to {format_version(target)}; {section['files_read']} file(s), "
             f"{section['documents']} document(s) read."
         )
+    if section["in_parts"]:
+        lines.append(
+            f"- read in parts ({section['parts']} snapshot(s)): the whole tree is over the broker's "
+            "snapshot ceiling, so the scan took the parts that hold manifests"
+            + ("" if section["parts"] or section["unread"] else "; no part of it holds one")
+        )
+    refused = section["refused_revision"]
+    if len(section["revisions"]) > 1 or (refused and section["revisions"] and section["revisions"] != [refused]):
+        lines.append(
+            "- the branch moved during the read: "
+            + (f"the whole tree was measured at {refused} and refused; " if refused else "")
+            + "the parts were read from "
+            + MEMBER_SEPARATOR.join(section["revisions"])
+        )
+    for unread in section["unread"]:
+        lines.append(f"- partial: {unread['path']} was not read: {unread['reason']}")
     if section["stopped"]:
         lines.append(
             f"- partial: the scan stopped at the {section['stopped']} cap; "
@@ -719,6 +923,7 @@ def build_report(
             "hits": sum(len(s["hits"]) for s in sources.values()),
             "skipped": sum(len(s["skipped"]) for s in sources.values()),
             "errors": sum(1 for s in sources.values() if s["error"]),
+            "unread": sum(len(s["unread"]) for s in sources.values()),
         },
     }
 
@@ -849,7 +1054,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")
             return EXIT_PARTIAL
 
-    return EXIT_PARTIAL if report["summary"]["errors"] else EXIT_OK
+    return EXIT_PARTIAL if report["summary"]["errors"] or report["summary"]["unread"] else EXIT_OK
 
 
 if __name__ == "__main__":

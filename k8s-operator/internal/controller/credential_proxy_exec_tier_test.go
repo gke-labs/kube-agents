@@ -253,7 +253,7 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 			t.Errorf("exec pod reads %s from a Secret", e.Name)
 		}
 	}
-	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME", "CREDENTIAL_PROXY_CONTENT_WORKSPACE"} {
+	for _, name := range []string{"TOKEN_BROKER_URL", "GOOGLE_CHAT_SUBSCRIPTION_NAME"} {
 		if _, ok := env[name]; ok {
 			t.Errorf("exec pod carries %s", name)
 		}

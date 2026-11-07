@@ -106,6 +106,11 @@ type NotifyReply struct {
 	MessageID string `json:"message_id,omitempty"`
 	ThreadID  string `json:"thread_id,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Retry marks a refusal that says nothing about the request: the gateway
+	// is stopping, or couldn't read the conversation's record in time.
+	// Nothing was posted, and the same request may land later, so a sender
+	// waits rather than counting it against the destination.
+	Retry bool `json:"retry,omitempty"`
 	// Kept says the refusal in Error is a home post the gateway kept for the
 	// digest it posts once a home channel is set: nothing was posted now, and
 	// a sender that would retry or re-send should treat the post as handled.
