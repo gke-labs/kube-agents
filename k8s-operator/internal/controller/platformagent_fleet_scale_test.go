@@ -362,7 +362,7 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
-	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("rendering the identity map for %d profiles: %v", fleetScaleProfiles, err)
 	}
@@ -389,7 +389,7 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
-	cm, err := buildA2ADispatchConfigMap(agent, profiles)
+	cm, err := buildA2ADispatchConfigMap(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("rendering the dispatch config for %d profiles: %v", fleetScaleProfiles, err)
 	}

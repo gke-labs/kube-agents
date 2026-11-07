@@ -175,8 +175,9 @@ func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
 }
 
 // dropUnstartedJob deletes the Job of a task that ends at admission (stopped,
-// or refused) without ever being confirmed: one launched before a dispatcher
-// restart, whose pod would otherwise wait for an offer until its deadline,
+// or refused), or whose profile drains or leaves the config, without ever
+// being confirmed: one launched before a dispatcher restart or a failed
+// hand-off, whose pod would otherwise wait for an offer until its deadline,
 // outside every cap. Not held to the profile's current Job template: the
 // operator drops it (a revoke, a tier removed) while a Job an earlier pass
 // launched may still be there, and the Job's name follows from the task. A
@@ -186,7 +187,25 @@ func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, hk 
 		return
 	}
 	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
-		log.Warn("delete the Job of a task that ended at admission", "err", err)
+		log.Warn("delete the Job of a task never started", "err", err)
+	}
+}
+
+// dropUnconfirmedJob is dropUnstartedJob for a task whose profile the config
+// doesn't list, so its lease hasn't been read yet: only a task with no lease
+// record (never confirmed to a worker) has its Job deleted. A lease that
+// can't be read deletes nothing: unknown is not "never started".
+func (d *Dispatcher) dropUnconfirmedJob(ctx context.Context, log *slog.Logger, hk holdKey) {
+	if d.jobs == nil || !d.cfg.unattended(hk.tier) {
+		return
+	}
+	_, _, found, err := d.findLease(ctx, hk.profile, hk.tier, hk.taskID)
+	if err != nil {
+		log.Warn("could not read the task's lease; its Job, if any, stays", "err", err)
+		return
+	}
+	if !found {
+		d.dropUnstartedJob(ctx, log, hk)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -317,7 +318,7 @@ func TestNoJobModeWithoutTheAdmissionPolicy(t *testing.T) {
 			t.Errorf("%T %s survived the signal going away: %v", o.obj, o.name, err)
 		}
 	}
-	cfg, err := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false))
+	cfg, err := desiredDispatchConfigWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,11 +342,49 @@ func TestRenderedDispatchJobFixture(t *testing.T) {
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
-	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false))
+	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, false), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkFixture(t, dispatchJobConfigFixturePath, cm.Data[a2aDispatchConfigKey])
+}
+
+// An unattended profile that leaves the install drains with no Job
+// template, even with a template still rendered under its name: nothing new
+// is dispatched for a draining profile, so it has nothing to stamp a Job
+// from, and the applied config's template is not carried forward.
+func TestADrainingProfileHasNoJobTemplate(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	templates := dispatchJobTemplates(agent, profiles, false)
+	applied, err := desiredDispatchConfigWith(agent, profiles, templates, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied.Profiles) != 1 || applied.Profiles[0].JobTemplate == nil {
+		t.Fatalf("precondition: the live profile renders %+v, want one with a Job template", applied.Profiles)
+	}
+	body, err := json.Marshal(applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded a2aDispatchConfig
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	draining := drainingDispatchProfiles(&decoded, map[string]bool{}, time.Now())
+	if len(draining) != 1 || draining[0].JobTemplate != nil {
+		t.Fatalf("the profile that left drains as %+v, want one entry with no Job template", draining)
+	}
+	cfg, err := desiredDispatchConfigWith(agent, nil, templates, draining)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Profiles) != 1 || cfg.Profiles[0].DrainingUntil.IsZero() || cfg.Profiles[0].JobTemplate != nil {
+		t.Errorf("the draining profile renders %+v, want draining with no Job template", cfg.Profiles)
+	}
 }
 
 // The policy admits a Job as an account the index lists and holds it to

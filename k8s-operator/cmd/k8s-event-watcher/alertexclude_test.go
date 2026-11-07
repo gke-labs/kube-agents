@@ -57,10 +57,10 @@ func TestParseAlertExcludeRefuses(t *testing.T) {
 		{"not JSON", `namespace=payments`, "not a JSON list"},
 		{"an object, not a list", `{"namespace": "payments"}`, "not a JSON list"},
 		{"an unknown key", `[{"namespaces": ["payments"]}]`, "not a JSON list"},
-		{"a rule with no part", `[{"namespace": "payments"}, {}]`, "rule 1 sets no part"},
+		{"a rule with no part", `[{"namespace": "payments"}, {}]`, "rule 2 sets no part"},
 		{"a cluster with no name", `[{"cluster": {"projectId": "p"}}]`, "cluster needs clusterName"},
 		{"a star inside a name", `[{"name": "api-*-x"}]`, `"*" only as its last character`},
-		{"a bare wildcard name", `[{"name": "*"}]`, "rule 0 sets no part"},
+		{"a bare wildcard name", `[{"name": "*"}]`, "rule 1 sets no part"},
 		{"text after the list", `[{"namespace": "a"}] [{"namespace": "b"}]`, "text follows the list"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,7 +264,91 @@ func TestRealMain_RunsWithNoRulesOnAMalformedAlertExclude(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
 		t.Fatalf("want realMain to go past --alert-exclude and stop on the kubeconfig, got err=%v", err)
 	}
-	if got := buf.String(); !strings.Contains(got, "ALERT --alert-exclude rule 0 sets no part") || !strings.Contains(got, "running with no alert-exclude rules") {
+	if got := buf.String(); !strings.Contains(got, "ALERT --alert-exclude rule 1 sets no part") || !strings.Contains(got, "running with no alert-exclude rules") {
 		t.Errorf("log does not carry the ALERT line:\n%s", got)
+	}
+}
+
+// loadAlertExclude names every rule in force in the log and sets the two
+// gauges: a valid list, an empty one and a refused one.
+func TestLoadAlertExclude(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		buf := captureLog(t)
+		m := newMetrics()
+		rules := loadAlertExclude(`[{"namespace": "payments"}, {"reason": "FailedScheduling", "cluster": {"clusterName": "seeded-capacity"}}]`, m)
+		if len(rules) != 2 {
+			t.Fatalf("got %d rules in force, want 2", len(rules))
+		}
+		log := buf.String()
+		for _, want := range []string{
+			`alert-exclude rule 1 of 2: namespace="payments"`,
+			`alert-exclude rule 2 of 2: cluster={clusterName="seeded-capacity"} reason="FailedScheduling"`,
+			"2 alert-exclude rules;",
+		} {
+			if !strings.Contains(log, want) {
+				t.Errorf("log does not carry %q:\n%s", want, log)
+			}
+		}
+		assertAlertExcludeGauges(t, m, 2, 0)
+	})
+	t.Run("empty", func(t *testing.T) {
+		for _, raw := range []string{"", "[]"} {
+			buf := captureLog(t)
+			m := newMetrics()
+			if rules := loadAlertExclude(raw, m); len(rules) != 0 {
+				t.Errorf("loadAlertExclude(%q) = %v; want no rules", raw, rules)
+			}
+			if log := buf.String(); strings.Contains(log, "alert-exclude") {
+				t.Errorf("loadAlertExclude(%q) logged a rule line:\n%s", raw, log)
+			}
+			assertAlertExcludeGauges(t, m, 0, 0)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		for _, raw := range []string{`namespace=payments`, `[{"namespace": "payments"}, {}]`} {
+			buf := captureLog(t)
+			m := newMetrics()
+			if rules := loadAlertExclude(raw, m); rules != nil {
+				t.Errorf("loadAlertExclude(%q) = %v; want no rules in force", raw, rules)
+			}
+			log := buf.String()
+			if !strings.Contains(log, "ALERT --alert-exclude") || !strings.Contains(log, "running with no alert-exclude rules") || strings.Contains(log, "alert-exclude rule 1 of") {
+				t.Errorf("loadAlertExclude(%q) log:\n%s", raw, log)
+			}
+			assertAlertExcludeGauges(t, m, 0, 1)
+		}
+	})
+}
+
+func assertAlertExcludeGauges(t *testing.T, m *metrics, rules, refused float64) {
+	t.Helper()
+	if got := testutil.ToFloat64(m.alertExcludeRules); got != rules {
+		t.Errorf("k8s_event_watcher_alert_exclude_rules = %v, want %v", got, rules)
+	}
+	if got := testutil.ToFloat64(m.alertExcludeRefused); got != refused {
+		t.Errorf("k8s_event_watcher_alert_exclude_refused = %v, want %v", got, refused)
+	}
+}
+
+// A rule's log form names each part it sets and each cluster key it sets,
+// quoted, so an unset key reads apart from one set to a literal "*".
+func TestAlertExcludeRuleString(t *testing.T) {
+	for _, tc := range []struct {
+		rule alertExcludeRule
+		want string
+	}{
+		{alertExcludeRule{Namespace: "payments"}, `namespace="payments"`},
+		{alertExcludeRule{Kind: "Pod", Name: "inventory-api-*"}, `kind="Pod" name="inventory-api-*"`},
+		{alertExcludeRule{Reason: "BackOff", Namespace: "shop"}, `namespace="shop" reason="BackOff"`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}}, `cluster={clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "seeded-a"}}, `cluster={projectId="p" location="us-central1" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{Location: "us-central1", ClusterName: "seeded-a"}}, `cluster={location="us-central1" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "*", ClusterName: "seeded-a"}}, `cluster={projectId="*" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}, Namespace: "shop"}, `cluster={clusterName="seeded-a"} namespace="shop"`},
+		{alertExcludeRule{Namespace: "a\nb"}, `namespace="a\nb"`},
+	} {
+		if got := tc.rule.String(); got != tc.want {
+			t.Errorf("%+v.String() = %s, want %s", tc.rule, got, tc.want)
+		}
 	}
 }

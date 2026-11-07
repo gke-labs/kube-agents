@@ -11,10 +11,10 @@ next drift fails here rather than in a nightly run that greps for strings
 nobody emits.
 
 `references/report-example.json` in each copy of the skill is a real document
-from leeway v0.1.3's own report collector (its `TestCollect_SeededD` fixture
-plus three more clusters), with the bench fixture names replaced. Regenerate
-it from leeway when the schema moves, and update VOCABULARY below from
-`pkg/leeway/{cause,intent,remediation,finding}.go` in the same change.
+from leeway v0.1.5's own report collector (its `TestCollect_CauseAttribution`
+fixture plus three more clusters), with the bench fixture names replaced.
+Regenerate it from leeway when the schema moves, and update VOCABULARY below
+from `pkg/leeway/{cause,intent,remediation,finding}.go` in the same change.
 """
 
 import json
@@ -33,9 +33,9 @@ SHARED_START = "<!-- shared:reading-start -->"
 SHARED_END = "<!-- shared:reading-end -->"
 FLEET_FIXTURES = REPO_ROOT / "docs/designs/fleet-fixtures.yaml"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
-LEEWAY_VERSION = "v0.1.3"
+LEEWAY_VERSION = "v0.1.5"
 
-# leeway v0.1.3 (go-steer/leeway@4366049), pkg/leeway: the strings a report
+# leeway v0.1.5 (go-steer/leeway@349045c), pkg/leeway: the strings a report
 # carries in these fields. The kind inventory is frozen by leeway's schema;
 # the rest changes only with a leeway release.
 VOCABULARY = {
@@ -53,6 +53,7 @@ VOCABULARY = {
         "domain_outage",
         "consolidation",
         "rollout_bias",
+        "selector_confined",
         "unknown",
     },
     "intent.source": {
@@ -153,8 +154,8 @@ class ExampleReportTest(unittest.TestCase):
                 self.assertIn(finding["remediation"]["kind"], VOCABULARY["remediation.kind"])
 
     def test_the_report_exercises_every_row_the_skill_can_point_at(self):
-        # Rows 1, 3, 4, 5 and 6 of the attribution table have a finding each;
-        # row 8 is the workload with no finding, which the prose names.
+        # Rows 1, 3, 4, 5, 6 and 8 of the attribution table have a finding each
+        # when `--topology-tier-c-signals` is set.
         seen = {(f["suspectedCause"], (f.get("remediation") or {}).get("kind")) for f in _findings(_example("cluster"))}
         for pair in (
             ("constraint_ignored", "manifest_patch"),
@@ -162,6 +163,7 @@ class ExampleReportTest(unittest.TestCase):
             ("volume_pinning", "storage_topology"),
             ("domain_capacity_shortfall", "cluster_capacity"),
             ("taint_exclusion", "cluster_nodes"),
+            ("selector_confined", "cluster_nodes"),
         ):
             self.assertIn(pair, seen)
 

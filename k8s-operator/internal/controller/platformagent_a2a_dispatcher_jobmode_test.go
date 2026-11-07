@@ -334,7 +334,7 @@ func TestEveryJobModeRevocationSaysWhy(t *testing.T) {
 	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
 	t.Run("namespace not ready", func(t *testing.T) {
 		r, _ := jobTemplateTestReconciler(t, agent)
-		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, false)
+		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -345,7 +345,7 @@ func TestEveryJobModeRevocationSaysWhy(t *testing.T) {
 			Name: dispatchJobTemplatePrefix + "tse", Namespace: profileNamespaceName(agent), Labels: map[string]string{"x": "y"},
 		}}
 		r, _ := jobTemplateTestReconciler(t, agent, foreign)
-		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true)
+		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,7 +377,7 @@ func TestEveryJobModeRevocationSaysWhy(t *testing.T) {
 					return cl.Get(ctx, key, obj, opts...)
 				},
 			})
-			got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true)
+			got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -394,7 +394,7 @@ func TestEveryJobModeRevocationSaysWhy(t *testing.T) {
 				return fakeServerSideApplyInterceptors().Patch(ctx, cl, obj, patch, opts...)
 			},
 		})
-		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true)
+		got, _, err := r.reconcileA2ADispatcherWithJobMode(context.Background(), agent, profiles, true, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -35,9 +35,9 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // DeliverAll replays everything inside it, so the dispatcher keeps a
 // finished task's tombstone (LeaseRecord.FinishedAt) at least this long
 // when the dispatch config carries no SubmitRetentionSeconds, and never
-// less than this when it does. It is a compiled value, not the live
-// stream's: the operator never edits an existing stream, so don't lower it
-// below any max age an operator has created PROFILE_SUBMITS with (#4948).
+// less than this when it does. The operator renders the live stream's max
+// age when it is longer than its own constant (#4948), so a stream an older
+// operator created longer is covered by the config, not by this floor.
 const ProfileSubmitRetention = 72 * time.Hour
 
 // MaxSubmitRetention is the longest SubmitRetentionSeconds a dispatch
@@ -378,7 +378,8 @@ type DispatchConfig struct {
 	// and DispatchJobLabel. Set when some profile has a JobTemplate.
 	JobLabels map[string]string `json:"jobLabels,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
-	// identity. A profile absent here has no durables to read.
+	// identity, and those draining after they left it (DrainingUntil). A
+	// profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
 }
 
@@ -392,7 +393,7 @@ type DispatchProfile struct {
 	ActiveDeadlineSeconds int                `json:"activeDeadlineSeconds"`
 	Parameters            []ProfileParameter `json:"parameters,omitempty"`
 	// Durables are the shared durables the operator created for it, one
-	// per (tier, kind).
+	// per (tier, kind). A draining profile has none.
 	Durables []DispatchDurable `json:"durables"`
 	// JobTemplate is the pod template (a core/v1 PodTemplateSpec) the
 	// profile's unattended tasks run on as Jobs, rendered by the operator
@@ -402,7 +403,15 @@ type DispatchProfile struct {
 	// pools for the read tier only) and the dispatcher refuses them
 	// no-worker at admission.
 	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
+	// DrainingUntil, set, makes the profile draining (#5074): it has left
+	// the install, so it has no durables and nothing new is dispatched for
+	// it, but it stays listed, and keeps its .supervisor grant, until then,
+	// so the terminals of the tasks it still holds reach their requesters.
+	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
 }
+
+// Draining reports whether the profile is draining (DrainingUntil).
+func (p DispatchProfile) Draining() bool { return !p.DrainingUntil.IsZero() }
 
 // DispatchJobLabel marks a Job the dispatcher created (the operator's
 // dispatchJobLabel).
@@ -464,8 +473,11 @@ func (c DispatchConfig) Validate() error {
 		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
 			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
 		}
-		if p.Concurrency < 1 || len(p.Tiers) == 0 || len(p.Durables) == 0 {
-			return fmt.Errorf("dispatch config: profile %s needs a concurrency, a tier and a durable", p.Name)
+		if p.Concurrency < 1 || len(p.Tiers) == 0 {
+			return fmt.Errorf("dispatch config: profile %s needs a concurrency and a tier", p.Name)
+		}
+		if p.Draining() != (len(p.Durables) == 0) {
+			return fmt.Errorf("dispatch config: profile %s has %d durables; a live profile needs one, a draining one has none", p.Name, len(p.Durables))
 		}
 		for _, d := range p.Durables {
 			if d.Name != ProfileDurableName(p.Name, d.Tier, d.Kind) {
