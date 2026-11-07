@@ -1188,13 +1188,15 @@ class PreflightDecisionTest(unittest.TestCase):
         allows; a StatefulSet sizes none."""
         res = self._render({"probe": {}}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
-        chart_pods, pods, surges, names = None, 0, 0, []
+        chart_pods, config_map, pods, surges, names = None, None, 0, 0, []
         for doc in yaml.safe_load_all(res.stdout):
             if not doc:
                 continue
             meta = doc.get("metadata", {})
             if doc.get("kind") == "PlatformAgent":
                 chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+            if doc.get("kind") == "ConfigMap" and meta.get("name") == "a2a-quota-chart-pods":
+                config_map = int(doc["data"]["pods"])
             if "helm.sh/hook" in (meta.get("annotations") or {}):
                 continue
             # A pod-running kind neither list models would pass both unseen, so it fails here.
@@ -1216,7 +1218,15 @@ class PreflightDecisionTest(unittest.TestCase):
                     n = math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
                     # The controller never scales the new ReplicaSet past the desired count.
                     surges += min(n, replicas)
-        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        # The count reaches the operator one way per release (#4883): the annotation on the
+        # PlatformAgent the chart renders, or, with platformAgent.enabled=false, the ConfigMap.
+        if "platformAgent.enabled=false" in sets:
+            self.assertIsNone(chart_pods, "a PlatformAgent rendered with platformAgent.enabled=false")
+            self.assertIsNotNone(config_map, "no a2a-quota-chart-pods ConfigMap without a PlatformAgent")
+            chart_pods = config_map
+        else:
+            self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+            self.assertIsNone(config_map, "the ConfigMap rendered beside a PlatformAgent, whose annotation wins")
         return chart_pods, pods + surges, names
 
     def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
@@ -1242,6 +1252,9 @@ class PreflightDecisionTest(unittest.TestCase):
              "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
              "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
+            # An operator-only release (#4883): no PlatformAgent, so the ConfigMap is the count.
+            ["platformAgent.enabled=false", "hindsight.enabled=true", "githubMinter.enabled=true",
+             "githubMinter.org=o", "githubMinter.repo=r"],
             # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
             # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
             ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
@@ -1265,6 +1278,17 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
+
+    def test_an_operator_only_release_refuses_a_count_past_the_cap(self) -> None:
+        """The ConfigMap carries the annotation's 64-pod cap check (#4883): an operator-only
+        next-mode release past it fails the render rather than stamp a count the operator
+        discards."""
+        sets = ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=61"]
+        res = self._render({"probe": {}}, sets)
+        self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", res.stderr)
+        ok = self._render({"probe": {}}, ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=60"])
+        self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_the_session_quota_counts_every_surge_pod_and_the_patch_room_stays_one(self) -> None:
         """chartSurgePods totals each rollout's surge pods (#4876), and the patch's surge room
