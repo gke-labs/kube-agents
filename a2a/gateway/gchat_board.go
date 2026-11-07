@@ -86,7 +86,11 @@ const (
 	gchatBoardUnwired    = "a board tap with no board route wired"
 	gchatBoardUnverified = "a board tap from a member the gateway would not answer"
 	gchatBoardBusy       = "a second tap on a board row being tapped"
+	gchatBoardStale      = "a board tap on a row the message no longer shows"
 	gchatBoardTaken      = "a board tap, acted on off the pull loop: "
+	// gchatBoardRowMoved is logged for a tap whose row was laid out again
+	// between the tap and its edit: the outcome is not drawn on the new row.
+	gchatBoardRowMoved = "gchat: the tapped board row was laid out again before its edit; the message is left as it is"
 )
 
 // gchatBoardNotes are the lines a tapped row may already show, as prefixes,
@@ -136,15 +140,21 @@ func (a *GoogleChatAdapter) SetBoardAdmits(admits BoardAdmits) {
 }
 
 // gchatBoardButtons is the buttons of every row that asks for them, in row
-// order, each labelled with the action and the row's number as drawn
-// (gchatChatRows); nil when no row does.
+// order, each labelled with the action and the row's number as drawn: its
+// place among the rows gchatChatRows draws, so a row that draws nothing
+// (gchatChatRowText) takes no number and gets no buttons. nil when no row
+// asks for any.
 func gchatBoardButtons(rows []chatmsg.Row) []map[string]any {
 	var buttons []map[string]any
-	for i, r := range rows {
+	n := 0
+	for _, r := range rows {
+		if _, drawn := gchatChatRowText(r); !drawn {
+			continue
+		}
+		n++
 		if len(r.Actions) == 0 || len(r.Tasks) == 0 {
 			continue
 		}
-		n := i + 1
 		tasks := strings.Join(r.Tasks, gchatBoardTaskSeparator)
 		for _, action := range r.Actions {
 			label, ok := slackBoardLabels[action]
@@ -237,6 +247,12 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 		a.mu.Unlock()
 		return gchatBoardBusy
 	}
+	// A message laid out again since the client drew its buttons: the row
+	// the tap names is not the row n the message shows now.
+	if layout, remembered := ux.board[message]; remembered && !gchatBoardRowHolds(layout, n, tasks) {
+		a.mu.Unlock()
+		return gchatBoardStale
+	}
 	ux.boardTaps[key] = true
 	remember(&ux.boardTapsOrder, key, func(k string) { delete(ux.boardTaps, k) })
 	a.mu.Unlock()
@@ -274,6 +290,15 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, key, verb string, n int,
 	base, remembered := a.boardLayoutOf(message)
 	if !remembered {
 		base = gchatEventLayout(ev.Message)
+	}
+	// The round trip took time, and the message may have been laid out
+	// again in it (trackBoard frees the claims and replaces the record): the
+	// outcome belongs to the row the tap named, not to whatever is row n
+	// now, so it is drawn only where that row, with those cards, still is.
+	if !gchatBoardRowHolds(base, n, tasks) {
+		a.releaseBoardTap(key)
+		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
+		return
 	}
 	layout, err := gchatBoardRowLayout(base, n, line, settled)
 	if err == nil {
@@ -358,6 +383,25 @@ func gchatBoardRowLayout(layout gchatChatLayout, n int, line string, settled boo
 		})
 	}
 	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}, nil
+}
+
+// gchatBoardRowHolds reports whether layout still draws row n's buttons for
+// tasks: a kage.board button whose row is n and whose cards are tasks, in
+// order. A settled row has none, and a message laid out again has other
+// rows or other cards.
+func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) bool {
+	row, joined := strconv.Itoa(n), strings.Join(tasks, gchatBoardTaskSeparator)
+	for _, w := range layout.Widgets {
+		list, _ := w[gchatButtonListKey].(map[string]any)
+		buttons, _ := list[gchatButtonsKey].([]map[string]any)
+		for _, b := range buttons {
+			if gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == row &&
+				gchatButtonParam(b, gchatBoardParamTasks) == joined {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // gchatBoardRowsBlock finds the rows in a laid-out text: the longest run of

@@ -169,30 +169,43 @@ func gchatBoldLine(text string) string {
 func gchatChatRows(rows []chatmsg.Row) string {
 	var lines []string
 	numbered := slackChatRowsAct(rows)
-	for i, r := range rows {
+	drawn := 0
+	for _, r := range rows {
+		// A row that was a rule is nothing after the pass, and draws no
+		// empty bullet and takes no number (gchatChatRowText).
+		text, ok := gchatChatRowText(r)
+		if !ok {
+			continue
+		}
+		drawn++
 		line := gchatChatRowBullet
 		if numbered {
-			line = fmt.Sprintf(gchatBoardRowMarker, i+1)
+			line = fmt.Sprintf(gchatBoardRowMarker, drawn)
 		}
 		if r.Severity != "" {
 			line += gchatChatCode + r.Severity + gchatChatCode + " "
 		}
-		// A row the model wrote as a list item keeps its marker through
-		// the line pass (Chat's bullet is the renderer's), so the marker is
-		// shed before the renderer's goes on; a row that was a rule is
-		// nothing after the pass, and draws no empty bullet.
-		text := strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
 		line += text
 		// Measured after the pass, as the text is: a detail that was a rule
 		// is nothing, and draws no separator.
 		if detail := strings.TrimSpace(toGchatText(r.Detail)); detail != "" {
 			line += gchatChatRowDetailSep + detail
 		}
-		if text != "" || r.Severity != "" {
-			lines = append(lines, line)
-		}
+		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// gchatChatRowText is a row's text as drawn, and whether the row is drawn
+// at all: a row the model wrote as a list item keeps its marker through
+// the line pass (Chat's bullet is the renderer's), so the marker is shed
+// before the renderer's goes on; a row that was a rule is nothing after the
+// pass and, with no severity, is not drawn. The row buttons count drawn
+// rows the same way (gchatBoardButtons), so a number names the same row in
+// the text and on its buttons.
+func gchatChatRowText(r chatmsg.Row) (text string, drawn bool) {
+	text = strings.TrimPrefix(strings.TrimSpace(toGchatText(r.Text)), gchatChatRowBullet)
+	return text, text != "" || r.Severity != ""
 }
 
 // gchatChatAfter is the lines after the rows, one each.

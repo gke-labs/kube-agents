@@ -82,6 +82,19 @@ func buttonTexts(t *testing.T, body map[string]any) []string {
 	return texts
 }
 
+// gchatShownWidgets is a layout's widgets as a click event carries them
+// back. Decoded into a fresh slice: a decode into the fixture's own buttons
+// would keep the fields the JSON does not set.
+func gchatShownWidgets(t *testing.T, layout gchatChatLayout) []gchatAccessoryWidget {
+	t.Helper()
+	raw, _ := json.Marshal(layout.Widgets)
+	var shown []gchatAccessoryWidget
+	if err := json.Unmarshal(raw, &shown); err != nil {
+		t.Fatal(err)
+	}
+	return shown
+}
+
 func postBoardCard(t *testing.T, a *GoogleChatAdapter) {
 	t.Helper()
 	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: gchatBoardCard()}); err != nil {
@@ -267,14 +280,7 @@ func TestGchatBoardTapAfterARestartEditsFromTheEventsCopy(t *testing.T) {
 	}
 	ev := gchatBoardTap(t, "retry", 2, "t_3")
 	ev.Message.Text = layout.Text
-	// Into a fresh slice: a decode into the fixture's own buttons would keep
-	// the fields the JSON does not set.
-	raw, _ := json.Marshal(layout.Widgets)
-	var shown []gchatAccessoryWidget
-	if err := json.Unmarshal(raw, &shown); err != nil {
-		t.Fatal(err)
-	}
-	ev.Message.AccessoryWidgets = shown
+	ev.Message.AccessoryWidgets = gchatShownWidgets(t, layout)
 	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
 		t.Fatalf("tap: %q", reason)
 	}
@@ -478,8 +484,15 @@ func TestGchatBoardAdmitsIsWiredThroughNewMuxAndSideDoor(t *testing.T) {
 	if _, reason := a.classify(other); reason != gchatBoardUnverified {
 		t.Errorf("unlisted presser: %q", reason)
 	}
+	// As after a restart: the event carries the message, text and buttons.
+	shown, err := renderGchatChat(&chatmsg.Message{Schema: chatmsg.Schema,
+		Rows: []chatmsg.Row{{Text: "x", Tasks: []string{"t_1"}, Actions: []string{"retry", "drop"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ev := gchatBoardTap(t, "retry", 1, "t_1")
-	ev.Message.Text = "1. x"
+	ev.Message.Text = shown.Text
+	ev.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
 	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatBoardTaken) {
 		t.Fatalf("listed presser: %q", reason)
 	}
@@ -503,5 +516,100 @@ func TestGchatBoardAdmitsIsWiredThroughNewMuxAndSideDoor(t *testing.T) {
 		if !set {
 			t.Errorf("the %s did not pass SetBoardAdmits through", name)
 		}
+	}
+}
+
+// A message laid out again while a tap's round trip is in flight has new
+// rows: the tap's outcome is not drawn on the new row n, the new row keeps
+// its buttons, and a tap on it acts. A tap whose client still shows the old
+// buttons is dropped before it acts.
+func TestGchatBoardReLayoutDuringTheRoundTripLeavesTheNewRow(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	again := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
+		Rows: []chatmsg.Row{{Text: "**Only z**", Tasks: []string{"t_9"}, Actions: []string{"retry", "drop"}}}}
+	var acted []lib.BoardAction
+	a.SetBoardActor(func(_ context.Context, act lib.BoardAction) (*lib.BoardActionResult, error) {
+		acted = append(acted, act)
+		if len(acted) == 1 {
+			// The re-layout lands while session-kv is still answering.
+			if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "again", Chat: again}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		res := &lib.BoardActionResult{Action: act.Action}
+		for _, id := range act.Tasks {
+			res.Results = append(res.Results, lib.BoardActionOutcome{ID: id, Outcome: lib.BoardOutcomeDone})
+		}
+		return res, nil
+	})
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	// Create, the re-layout's patch, and nothing from the tap.
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("%d relay calls, want the create and the re-layout's patch only", n)
+	}
+	if body := callBody(t, f.call(1)); body["text"] != "*1 task is stuck.*\n\n1. *Only z*" {
+		t.Errorf("the re-laid message = %q", body["text"])
+	}
+	// The old row's buttons, still on a client: dropped before acting.
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_1,t_2")); reason != gchatBoardStale {
+		t.Errorf("a tap on the old row: %q", reason)
+	}
+	// The new row 1 is free to act.
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_9")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap on the new row: %q", reason)
+	}
+	if len(acted) != 2 || strings.Join(acted[1].Tasks, ",") != "t_9" {
+		t.Fatalf("board actions = %+v", acted)
+	}
+	body := checkPatch(t, f, 2, gchatBoardMessage)
+	if want := "*1 task is stuck.*\n\n1. *Only z* — Dropped. Test Sender, 15:04 UTC"; body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+}
+
+// A row that draws nothing (a rule, no severity) takes no number and no
+// buttons, so the numbers in the text and on the buttons name the same
+// rows, and a tap on "Retry 1" edits the first drawn row.
+func TestGchatBoardSkippedRowTakesNoNumber(t *testing.T) {
+	a, f, actor := newBoardGchatAdapter(t)
+	card := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "2 tasks are stuck.",
+		Rows: []chatmsg.Row{
+			{Text: "---", Tasks: []string{"t_0"}, Actions: []string{"retry", "drop"}},
+			{Text: "**Triage x**", Tasks: []string{"t_1"}, Actions: []string{"retry", "drop"}},
+			{Text: "**Open GitOps PR for y**", Tasks: []string{"t_3"}, Actions: []string{"retry", "drop"}},
+		}}
+	layout, err := renderGchatChat(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "*2 tasks are stuck.*\n\n1. *Triage x*\n2. *Open GitOps PR for y*"; layout.Text != want {
+		t.Errorf("text =\n%s\nwant\n%s", layout.Text, want)
+	}
+	buttons := layout.Widgets[0]["buttonList"].(map[string]any)["buttons"].([]map[string]any)
+	var got []string
+	for _, b := range buttons {
+		got = append(got, b["text"].(string)+"="+gchatButtonParam(b, "tasks"))
+	}
+	if strings.Join(got, ",") != "Retry 1=t_1,Drop 1=t_1,Retry 2=t_3,Drop 2=t_3" {
+		t.Errorf("buttons = %v", got)
+	}
+	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	if calls := actor.taken(); len(calls) != 1 || strings.Join(calls[0].Tasks, ",") != "t_1" {
+		t.Fatalf("board actions = %+v", calls)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	if want := "*2 tasks are stuck.*\n\n1. *Triage x* — ✓ Retrying. Test Sender, 15:04 UTC\n2. *Open GitOps PR for y*"; body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 2,Drop 2" {
+		t.Errorf("buttons = %v", texts)
 	}
 }
