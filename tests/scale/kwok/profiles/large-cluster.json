@@ -1,0 +1,7 @@
+{
+  "nodes": 2000,
+  "pods": 60000,
+  "namespaces": 500,
+  "services": 4000,
+  "events": 150000
+}
