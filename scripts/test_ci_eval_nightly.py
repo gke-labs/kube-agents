@@ -600,6 +600,10 @@ class ArrayHygieneTest(unittest.TestCase):
             "consistency-drift-outlier",
             "fleet-cost-idle-pool",
             "upgrades-audit-reports-upgrade-blocked",
+            "gce-startup-script-failure",
+            "networking-world-open-ingress",
+            "obtainability-pdb-kustomize-overlay",
+            "gce-chat-request-runs-collector",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")

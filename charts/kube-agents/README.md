@@ -992,7 +992,19 @@ boolean. A duration that the watcher cannot read keeps its default, and the cont
 An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
-gives each setting's meaning and default.
+gives each setting's meaning and default. Alert excludes are under
+`platformAgent.harness.eventWatcher.alertExclude`.
+
+`platformAgent.harness.eventWatcher.alertExclude` is a list of rules for events that open no
+incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
+`spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
+holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
+API server would refuse fails the render. A change rolls the agent pod. On an existing install,
+apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
+instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
+removes an `enabled: false` set on the CR by hand. The
+[`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
+gives the rule parts, how they match, and an example.
 
 `platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
 later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
@@ -1201,7 +1213,7 @@ web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
-another host, add a forge with a credential, add a GitHub forge at a new host, or
+another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
 change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
@@ -1278,7 +1290,7 @@ as on. An operator test holds that file to the operator's own list and sizes. Th
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
-pods with a surge pod for each that rolls with one (which the chart stamps on the
+pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
 and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
 so a next-mode one written by hand in the release namespace must carry that annotation

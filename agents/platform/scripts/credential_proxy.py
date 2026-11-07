@@ -410,8 +410,8 @@ MEMORY_HIGH_WATER_LOG_STEP_BYTES = 64 * MEBIBYTE
 # below), and answers in three steps:
 #   * under the soft watermark, nothing changes;
 #   * from the soft watermark, admitted commands run one at a time
-#     (PRESSURE_CLAMPED_CONCURRENCY), and the first tick to see it reclaims idle
-#     content workspaces and orphaned vcs scratch, runs a collection and hands
+#     (PRESSURE_CLAMPED_CONCURRENCY), and the first tick to see it reclaims
+#     orphaned vcs scratch, runs a collection and hands
 #     the allocator's free pages back (malloc_trim);
 #   * from the hard watermark, a background caller is refused at once with 429
 #     and a Retry-After, before it queues, and INTERACTIVE_RESERVED_SLOTS stays
@@ -1275,10 +1275,9 @@ KUBECTL_WRITE_VERBS = frozenset(
 )
 GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manager", "services"})
 # The read-only git porcelain the sandbox runs that no gate lists: the lease
-# gate reads GIT_MUTATING_SUBCOMMANDS and the workspace runs
-# content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
-# union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
-# list is labelled by name without a second edit here.
+# gate reads GIT_MUTATING_SUBCOMMANDS, and the git vocabulary is the union of
+# that, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's list is
+# labelled by name without a second edit here.
 GIT_READ_SUBCOMMANDS = frozenset(
     {"blame", "cat-file", "describe", "log", "ls-files", "rev-list", "show", "status", "version"}
 )
@@ -2172,13 +2171,6 @@ ROLE_SLOT_ATTRIBUTES: dict[str, str] = {
 # is refused first under the hard watermark and told when to come back. Read
 # from the authenticated principal, never from a header the caller sets.
 INTERACTIVE_ROLES = frozenset({CALLER_ROLE_SESSION})
-# The content workspace routes that write the state volume, and so take the
-# resource watermark gate's hard check: `open` clones into it, `commit`
-# fetches into it and writes the changed files, and `push` runs a git child
-# against it (content_workspace.py; the push itself fetches nothing).
-WORKSPACE_WRITING_ROUTES = frozenset({"open", "commit", "push"})
-
-
 # The roles whose commands are background work (§12): the profile workers and
 # the scope publisher. Every other slot-taking role is interactive, the shell
 # included until a turn token can tell its chat turns from its sweeps.
@@ -2437,9 +2429,8 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
 # That is the right default for the two that are: /healthz, which the readiness
 # probe reaches before any token exists, and an unknown path, which must answer
 # 404 to the caller that may legitimately be probing for it —
-# credential_proxy_client.workspaces_available detects an older broker by
-# asking, and a 403 there would read as "not permitted" rather than "not
-# supported".
+# `vcs_client` reads a codeless 404 as an older broker, and a 403 there would
+# read as "not permitted" rather than "not supported".
 ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
@@ -2489,7 +2480,6 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The MCP pod reaches this family and no other; which verbs within it is
     # ROLE_VCS_VERBS's to say, checked in _dispatch_vcs_post.
     ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),
-    ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
 
 # The failure kind a 5xx on a route family counts under, keyed by the family
@@ -2677,8 +2667,8 @@ REFRESH_YIELDED_BUDGET_WAIT_TEXT = (
 
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
-# is neither. The content workspace's clone and the vcs `snapshot` verb read
-# the answer, and the values are the broker's, so the two cannot drift.
+# is neither. The vcs `snapshot` verb reads the answer, and the values are the
+# broker's, so the two cannot drift.
 ROLE_MANAGED = vcs_broker.ROLE_MANAGED
 ROLE_CONTEXT = vcs_broker.ROLE_CONTEXT
 ROLE_UNREGISTERED = vcs_broker.ROLE_UNREGISTERED
@@ -2766,8 +2756,7 @@ def _repository_key(repository: str, forge: providers.Forge | None) -> str:
     forge it was registered as and no other, so an entry typed for one provider
     that happens to name another provider's host admits nothing. A caller that
     resolved the repository passes the forge it resolved to. One that holds a
-    bare path -- the content workspace, which serves one forge -- gets the
-    install's only forge; with more than one there is no such thing, and asking
+    bare path gets the install's only forge; with more than one there is no such thing, and asking
     is a bug the caller has to fix, so it raises, which every gate below treats
     as an unreadable list and refuses.
     """
@@ -2813,8 +2802,8 @@ def repository_role(repository: str, forge: providers.Forge | None = None) -> st
 
     Managed wins. A repository in both lists is one the install writes to, and
     the write path must see it exactly as it would without the second entry.
-    Consulted by the content workspace and the vcs `snapshot` verb to decide
-    what credential a clone gets, and by nothing that gates a write:
+    Consulted by the vcs `snapshot` verb to decide what credential a clone
+    gets, and by nothing that gates a write:
     `repository_is_managed` stays the only question `commit`, `push`, the API
     routes and the refresh route ask, and `ROLE_CONTEXT` is not an answer any
     of them accepts.
@@ -2843,84 +2832,17 @@ def _provider_forge(provider: str) -> providers.Forge:
     raise PermissionError(f"{provider} is not a forge this install serves")
 
 
-def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The credential the broker's clone, fetch or push of ``repository`` presents.
-
-    Asked at `open`, and again before every fetch and push of a handle whose
-    credential is a stored token, so a repository unregistered meanwhile stops
-    getting it. By role:
-
-    - managed: on a forge whose credential is a token an administrator stored
-      (GitLab), that token, through the forge's helper; on GitHub, nothing --
-      the clone and push ride the ambient write credential the CLI installed,
-      as they always have;
-    - context: the forge's read-only credential, and never the write token
-      (on GitLab, the optional `read-token` key beside the write token); a
-      forge that offers none clones with no credential;
-    - unregistered: no credential at all, a public upstream read.
-
-    An unreadable list is logged and answered with no credential rather than
-    raised: this is not an authorization check -- `open` has none by design --
-    and refusing the clone would take `inspect-repository` away from every
-    public repository for the sake of a private one that would have failed
-    anyway.
-    """
-    try:
-        forge, repo = registry.resolve(repository)
-    except providers.WorkspaceError as exc:
-        # Not the lists: the name does not resolve to a forge this install
-        # serves (a bare name with more than one forge, or none built).
-        LOGGER.warning(
-            "content workspace open repo=%s role=unknown: the repository does not "
-            "resolve to a forge this install serves code=%s; cloning without a credential",
-            repository,
-            exc.fields.get("code"),
-        )
-        return providers.NoCredential()
-    try:
-        role = repository_role(repo, forge)
-    except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
-        LOGGER.warning(
-            "content workspace open repo=%s role=unknown: the repository lists "
-            "could not be read type=%s; cloning without a credential",
-            repository,
-            type(exc).__name__,
-        )
-        return providers.NoCredential()
-    LOGGER.info("content workspace credential repo=%s role=%s", repository, role)
-    if role == ROLE_MANAGED and _holds_stored_token(forge):
-        # A forge whose credential is a token an administrator stored has no
-        # ambient helper behind it, so a managed repository's clone, fetch and
-        # push present the token themselves, through the forge's helper.
-        return forge.credential
-    if role != ROLE_CONTEXT:
-        return providers.NoCredential()
-    # A context repository gets the forge's read-only credential, and never
-    # the write token: a forge that offers none -- GitLab without a
-    # `read-token` key in its credentials Secret -- clones it with no
-    # credential, which reads a public repository and refuses a private one
-    # at the clone.
-    credential = forge.read_credential(repo)
-    vcs_broker.warn_without_read_token(forge, credential, f"content workspace open repo={repository}")
-    return credential
-
-
-def _holds_stored_token(forge: providers.Forge) -> bool:
-    """Whether ``forge`` presents a stored token rather than a minted one."""
-    return vcs_broker.holds_stored_token(forge)
-
-
-#: The forge a bare `owner/name` means to the content workspace. A
-#: host-qualified name is cloned from the forge that serves its host.
-CONTENT_WORKSPACE_PROVIDER = "github"
+#: The forge a bare `owner/name` means. A host-qualified name is read from the
+#: forge that serves its host.
+BARE_NAME_PROVIDER = "github"
 
 
 def _hosted(repository: object, provider: str) -> object:
     """A bare `owner/name` put on ``provider``'s host; anything else unchanged.
 
-    For callers that know their forge but were handed a name without a host:
-    the content workspace, which is GitHub by construction, and the
-    `/v1/github/refresh` alias, which older agent images call with a bare slug.
+    For a caller that knows its forge but was handed a name without a host:
+    the `/v1/github/refresh` alias, which older agent images call with a bare
+    slug.
     With one forge the registry would have read the name the same way; with
     two it refuses a hostless name, rightly for a caller that does not know
     which forge it means. A provider this install did not build leaves the
@@ -2942,94 +2864,42 @@ def _hosted(repository: object, provider: str) -> object:
     return f"https://{forges[0].hosts[0]}/{'/'.join(ref.segments)}"
 
 
-def _workspace_credential(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The content workspace's clone credential: `read_credential_for` on its forge.
+def is_owner_name(value: str) -> bool:
+    """`owner/name`, with nothing in it that could be read as anything else."""
+    parts = value.split("/")
+    if len(parts) != 2:
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9._-]{1,100}", part) and part not in (".", "..") for part in parts)
 
-    ``repository`` is the store's canonical name: a bare `owner/name` is
-    GitHub's, and anything else names its host and resolves to the forge that
-    serves it. A bare name on an install that built no GitHub forge has none to
-    read with, and would otherwise resolve to whatever single forge the install
-    does serve -- a credential for another host, on a github.com clone. That
-    clone proceeds without one, as an unregistered repository's does, and the
-    log says why.
+
+def is_bare_github_name(value: str) -> bool:
+    """A bare GitHub `owner/name`: `is_owner_name`, with no dot in the owner.
+
+    A GitHub owner never carries a dot and a host always does, so this is what
+    tells `github.com/acme` -- a host and one segment, which no forge serves --
+    from a slug. Read as a slug it would be cloned from
+    `https://github.com/github.com/acme.git` on the ambient credential; read as
+    a host-qualified name it goes to the forge locator, which refuses it.
     """
-    if _is_bare_name(repository):
-        try:
-            _provider_forge(CONTENT_WORKSPACE_PROVIDER)
-        except PermissionError:
-            LOGGER.warning(
-                "content workspace open repo=%s: this install serves no %s forge and the "
-                "content workspace clones %s repositories only; cloning without a credential",
-                repository, CONTENT_WORKSPACE_PROVIDER, CONTENT_WORKSPACE_PROVIDER,
-            )
-            return providers.NoCredential()
-        repository = _hosted(repository, CONTENT_WORKSPACE_PROVIDER)
-    credential = read_credential_for(registry, repository)
-    if isinstance(credential, providers.NoCredential):
-        return credential
-    try:
-        _forge, path = registry.resolve(repository)
-    except providers.WorkspaceError:
-        return credential
-    return _ForgePathCredential(credential, path)
-
-
-class _ForgePathCredential:
-    """A credential that the store asks about by its own name, bound to the forge's path.
-
-    The store names a repository on another host `<host>/<path>`, and a
-    credential is asked about the forge's reading of it, `<path>`: a minted
-    credential's managed and context checks key on the forge and the path,
-    and a host left in the path would match no registration. So every call
-    the store makes with its name is answered for the path.
-    """
-
-    def __init__(self, credential: providers.Credential, path: str) -> None:
-        self._credential = credential
-        self._path = path
-        self.stored_token = bool(getattr(credential, "stored_token", False))
-
-    def ensure(self, repo: str) -> None:
-        self._credential.ensure(self._path)
-
-    def headers(self, repo: str) -> dict[str, str]:
-        return self._credential.headers(self._path)
-
-    def git_config(self, repo: str) -> tuple[tuple[str, str], ...]:
-        return self._credential.git_config(self._path)
-
-
-def _workspace_github_host() -> str:
-    """The install's one GitHub host for the content workspace, or github.com.
-
-    An install that built no GitHub forge answers github.com, so a bare name
-    clones from there with no credential, as it did before.
-    """
-    try:
-        forge = _provider_forge(CONTENT_WORKSPACE_PROVIDER)
-    except PermissionError:
-        return repo_ref.GITHUB_CANONICAL_HOST
-    return forge.hosts[0] if forge.hosts else repo_ref.GITHUB_CANONICAL_HOST
+    return is_owner_name(value) and "." not in value.split("/", 1)[0]
 
 
 def _is_bare_name(repository: object) -> bool:
-    """Whether ``repository`` is a bare `owner/name`: GitHub's, to the workspace."""
-    import content_workspace
-
-    return isinstance(repository, str) and content_workspace.is_bare_github_name(repository)
+    """Whether ``repository`` is a bare `owner/name`, which is GitHub's."""
+    return isinstance(repository, str) and is_bare_github_name(repository)
 
 
 def snapshot_bare_name_fallback(
     repository: object, forges: tuple[providers.Forge, ...]
 ) -> tuple[str, str, str] | str | None:
-    """Where the vcs `snapshot` reads a bare `owner/name`, as the content workspace reads it.
+    """Where the vcs `snapshot` reads a bare `owner/name`.
 
-    A bare name is GitHub's to the workspace (`is_bare_github_name`), and
-    `inspect-repository` relies on that. Against ``forges``, the broker's own:
+    A bare name is GitHub's (`is_bare_github_name`), and `inspect-repository`
+    relies on that. Against ``forges``, the broker's own:
 
     - the name has a host, or is not GitHub-shaped: None, for the registry;
     - the install has a GitHub forge: the name on that forge's host, for the
-      registry to resolve, as `_workspace_credential` lifts it (`_hosted`).
+      registry to resolve, composed on that forge's host.
       With a second forge the registry refuses a hostless name;
     - no GitHub forge, and a forge of the install lists the name as managed
       or context: the name on that forge's host, read on the install's forge,
@@ -3056,7 +2926,7 @@ def snapshot_bare_name_fallback(
     if ref is None or ref.host or len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
         return None
     path = "/".join(ref.segments)
-    github = [forge for forge in forges if forge.name == CONTENT_WORKSPACE_PROVIDER]
+    github = [forge for forge in forges if forge.name == BARE_NAME_PROVIDER]
     if github:
         return f"https://{github[0].hosts[0]}/{path}" if github[0].hosts else None
     for forge in forges:
@@ -3073,104 +2943,10 @@ def snapshot_bare_name_fallback(
         if role != ROLE_UNREGISTERED:
             return f"https://{forge.hosts[0]}/{path}" if forge.hosts else None
     return (
-        CONTENT_WORKSPACE_PROVIDER,
+        BARE_NAME_PROVIDER,
         path,
         f"https://{repo_ref.GITHUB_CANONICAL_HOST}/{path}.git",
     )
-
-
-def _workspace_locate(repository: str) -> tuple[str, str]:
-    """A host-qualified repository's canonical name and clone URL, for the store.
-
-    Resolved through the forges this install serves, so the forge parses the
-    name -- nesting, allowed paths -- and composes the URL; the caller names a
-    repository and never a host or a URL. GitHub's comes back as the bare
-    `owner/name` the store has always keyed it by, so `github.com/owner/name`
-    and `owner/name` are one repository there. A GitHub Enterprise Server
-    repository keeps its host, as another forge's does.
-    """
-    import content_workspace
-
-    try:
-        forge, path = forge_registry().resolve(repository)
-        if forge.name == CONTENT_WORKSPACE_PROVIDER and forge.hosts[0] == repo_ref.GITHUB_CANONICAL_HOST:
-            return path, forge.clone_url(path)
-        # Inside the same refusal: the placeholder for a forge this install
-        # names but has no credential for parses the name and refuses here.
-        return f"{forge.hosts[0]}/{path}", forge.clone_url(path)
-    except providers.WorkspaceError as exc:
-        raise content_workspace.ContentWorkspaceError(
-            f"{repository} is not a repository on a forge this install serves: {exc}"
-        ) from exc
-
-
-def require_managed_workspace(store, handle: object) -> None:
-    """Refuse a workspace write to a repository this install does not manage.
-
-    `validate_repo` and `get_managed_github_repos` moved into skill scripts that
-    now run in the sandbox, which makes them advice the agent gives itself
-    rather than a control. The broker holds the installation token, so the
-    question "is this a repository we write to" has to be answered here.
-    `CredentialProxyHandler._repository_is_permitted` is the same check on the
-    GitHub API routes; this one raises instead of writing a reply, because the
-    workspace routes answer through the `ContentWorkspaceError` family.
-
-    On `commit` and `push` rather than on `open`: opening is a read, and
-    `inspect-repository` opens repositories this install does not manage on
-    purpose. The repository comes off the handle rather than off the request, so
-    a caller cannot name one repository and write to another.
-
-    An unreadable list refuses rather than allows -- an authorization check that
-    fails open is not one -- and says which of the two it was in the log.
-    """
-    import content_workspace
-
-    repository = store.get(handle).repo
-    # A bare `owner/name` is GitHub's whatever else the install serves: the
-    # store cloned it from github.com. Asked of the GitHub forge by name, since
-    # with a second forge there is no install-wide default to fall back on. An
-    # install that built no GitHub forge has nothing to write it through, which
-    # is a refusal of this repository -- the list itself is readable, so not
-    # "unavailable". A host-qualified name was cloned from its own forge, and
-    # is asked of that forge.
-    if not _is_bare_name(repository):
-        try:
-            forge, path = forge_registry().resolve(repository)
-        except providers.WorkspaceError as exc:
-            raise content_workspace.RepositoryNotManaged(
-                f"{repository} is not on a forge this install serves"
-            ) from exc
-        _require_managed(content_workspace, path, forge, repository)
-        return
-    try:
-        forge = _provider_forge(CONTENT_WORKSPACE_PROVIDER)
-    except PermissionError as exc:
-        raise content_workspace.RepositoryNotManaged(
-            f"{repository} cannot be written through the content workspace: it serves "
-            f"{CONTENT_WORKSPACE_PROVIDER} repositories only, and this install serves "
-            f"no {CONTENT_WORKSPACE_PROVIDER} forge"
-        ) from exc
-    _require_managed(content_workspace, repository, forge, repository)
-
-
-def _require_managed(content_workspace, path: str, forge: providers.Forge, shown: str) -> None:
-    """Refuse unless ``path`` on ``forge`` is managed; an unreadable list refuses too."""
-    try:
-        permitted = repository_is_managed(path, forge)
-    except Exception as exc:
-        LOGGER.warning(
-            "refusing a workspace write: the managed-repository list could not "
-            "be read type=%s",
-            type(exc).__name__,
-        )
-        raise content_workspace.ManagedRepositoriesUnavailable(
-            "the managed repository list is unavailable"
-        ) from exc
-    if not permitted:
-        raise content_workspace.RepositoryNotManaged(
-            f"{shown} is not one of the repositories this agent manages; "
-            "register it in the gitops-state ConfigMap first"
-        )
 
 
 # Chat API methods the relay refuses to spend its credential on.
@@ -3957,8 +3733,8 @@ class ResourceWatermarkGate:
 
     def relieve(self) -> None:
         """The soft watermark's relief step: every reclaimer, then the
-        collection and trim. Outside the lock, because a reclaimer takes the
-        store's own lock and walks trees."""
+        collection and trim. Outside the lock, because a reclaimer walks
+        trees."""
         reclaimed = []
         with self._lock:
             reclaimers = self._reclaimers
@@ -4023,8 +3799,8 @@ class ResourceWatermarkGate:
         return ResourcePressure(f"{reason}; retry in {retry_after} s", retry_after, admission_class(role))
 
     def check(self, role: str | None) -> None:
-        """The hard check alone, for a route that takes no slot (a k8s list, a
-        content workspace write): raise ResourcePressure when a caller of
+        """The hard check alone, for a route that takes no slot (a k8s list):
+        raise ResourcePressure when a caller of
         `role` would be refused now."""
         memory = self.read_memory_ratio()
         with self._lock:
@@ -7207,13 +6983,8 @@ _GIT_REMOTE_NOT_A_NAME = frozenset({"", ".", ".."})
 # claim than "exists, empty, and not writable by the agent".
 GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 
-# Broker-owned git trees, under the state dir rather than the shared workspace.
-CONTENT_WORKSPACE_DIR = "content-workspaces"
-
-# Where the version-control routes build and delete their scratch trees. A
-# sibling of the content workspaces rather than a subdirectory: the two are
-# contained separately, and a shared parent would make one path's containment
-# check accept the other's directories.
+# Where the version-control routes build and delete their scratch trees, under
+# the state dir rather than the shared workspace.
 VCS_SCRATCH_DIR = "vcs"
 
 # The git subcommands the version-control broker issues on its own behalf. A
@@ -7265,21 +7036,18 @@ VCS_ONLY_GIT_SUBCOMMANDS = frozenset({"archive", "ls-tree"})
 
 
 def _allowed_git_subcommands() -> frozenset[str]:
-    from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
-
     return (
         GIT_MUTATING_SUBCOMMANDS
         | GIT_READ_SUBCOMMANDS
         | (VCS_GIT_SUBCOMMANDS - VCS_ONLY_GIT_SUBCOMMANDS)
-        | WORKSPACE_GIT_SUBCOMMANDS
         | frozenset({"config"})
     )
 
 
 # The closed set of subcommands the product and its skills issue: the union of
-# the four git verb sets this module already tracks (`GIT_MUTATING_SUBCOMMANDS`,
-# `GIT_READ_SUBCOMMANDS`, `VCS_GIT_SUBCOMMANDS` less `VCS_ONLY_GIT_SUBCOMMANDS`,
-# and `WORKSPACE_GIT_SUBCOMMANDS`) plus `config` (whose own
+# the three git verb sets this module already tracks (`GIT_MUTATING_SUBCOMMANDS`,
+# `GIT_READ_SUBCOMMANDS`, and `VCS_GIT_SUBCOMMANDS` less `VCS_ONLY_GIT_SUBCOMMANDS`)
+# plus `config` (whose own
 # `_git_config_violation` gate restricts writes to `ALLOWED_GIT_CONFIG_KEYS`). A verb outside this union is refused. On the
 # `/v1/exec` path the check runs after `resolve_git_command` has expanded a
 # repository-local alias, so an alias is judged by what it expands to rather
@@ -7373,7 +7141,7 @@ _PROVIDER_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
 # and `alias.<name>` reach the same place and cannot be pinned, because the key
 # contains an arbitrary name and there is nothing to enumerate. They are open,
 # they are recorded as open, and the fix for the class is to stop executing
-# subprocesses in a directory the agent controls at all (content-passing).
+# subprocesses in a directory the agent controls at all (the vcs routes).
 # What this buys is blast radius, not closure — do not read it as more.
 #
 # Only keys whose "off" value is a *working* value belong here. `diff.external`
@@ -8490,24 +8258,6 @@ def _within(root: Path, candidate: Path) -> bool:
     return candidate == root or root in candidate.parents
 
 
-def content_workspace_enabled() -> bool:
-    """Is broker-owned, content-passed git armed?
-
-    Off by default, and it stays off until the skills are migrated in a reviewed
-    change. Both halves run side by side in the meantime: `/v1/exec` keeps
-    accepting a directory from the agent exactly as it does today, so turning
-    this on adds a door rather than moving one. That is deliberate — the
-    mechanism lands, the migration is a separate diff, and neither has to be
-    reverted to fix the other.
-    """
-    return os.getenv("CREDENTIAL_PROXY_CONTENT_WORKSPACE", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 _forge_registry: providers.Registry | None = None
 _forge_registry_lock = threading.Lock()
 
@@ -9066,26 +8816,7 @@ class CommandExecutor:
         # because the agent never had a handle on the document at all.
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
         self.git_hooks_dir = self.state_dir / GIT_HOOKS_DISABLED_DIR
-        # Where broker-owned git trees live when content-passing is armed.
-        # Under the state dir, never under `workspace_dir`: the state dir is the
-        # broker's own emptyDir and the workspace is the volume the agent
-        # writes. `ContentWorkspaceStore` re-proves that separation at
-        # construction and refuses to start if a future mount layout collapses
-        # it — see `content_workspace.assert_disjoint_roots`. None when the
-        # feature is off, which is what makes `execute_workspace_git`
-        # unreachable rather than merely unused.
-        # Resolved, like `workspace_dir` and unlike the other state paths: it is
-        # compared against a resolved `cwd` in `_execute`, and on a filesystem
-        # with a symlinked prefix an unresolved root never matches — the
-        # containment check would refuse every legitimate call and the feature
-        # would look broken rather than closed.
-        self.content_workspace_root = (
-            (self.state_dir / CONTENT_WORKSPACE_DIR).resolve()
-            if content_workspace_enabled()
-            else None
-        )
-        # Always present, unlike the content-workspace root. Version control is
-        # not behind a switch -- there is no other way for the sandbox to reach
+        # Always present. Version control is not behind a switch -- there is no other way for the sandbox to reach
         # a repository -- so the directory its scratch trees live in exists on
         # every start, and `execute_vcs_git` is reachable whenever the process
         # is. Resolved for the same reason as the roots above: `_execute`
@@ -9116,11 +8847,6 @@ class CommandExecutor:
             self.kubeconfig_dir,
             self.git_hooks_dir,
             self.vcs_root,
-            *(
-                (self.content_workspace_root,)
-                if self.content_workspace_root is not None
-                else ()
-            ),
         ):
             path.mkdir(parents=True, exist_ok=True)
         # Re-applied on every start rather than only at creation: the state dir
@@ -9454,13 +9180,9 @@ class CommandExecutor:
         that reads slowly keep its body alive while the next command holds the
         slot, and the number of bodies in memory would be the number of
         callers rather than the cap. The other routes take no slot: the forge
-        refresh is a short call to the minter, the content workspace's git is
-        serialised by the store's own lock, and the Cloud API relay answers
+        refresh is a short call to the minter, and the Cloud API relay answers
         from a bounded read of its own. The forge refresh reserves child memory
-        without a slot when it will run its helper; the content workspace's git
-        takes neither a slot nor a reservation, because the store's lock
-        serialises it and the budget carries it as a fixed term
-        (`_outside_budget`). Admission also requires the request's child memory
+        without a slot when it will run its helper. Admission also requires the request's child memory
         reservation to fit the budget (`_fits_budget`), in the same queue and
         under the same wait.
 
@@ -9599,20 +9321,6 @@ class CommandExecutor:
             f"child memory budget ({self._budget_in_use_text()}) and this "
             f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
         )
-
-    @contextlib.contextmanager
-    def _outside_budget(self) -> Iterator[None]:
-        """Spawns inside this block are the content workspace's, covered by
-        the fixed CONTENT_WORKSPACE_RESERVE_BYTES term rather than a
-        reservation (§2.1): the store's lock is the bound and the reserve is
-        its size, and a wait for admission under that lock would stall every
-        verb behind it, reads included."""
-        previous = getattr(self._request_budget, "exempt", False)
-        self._request_budget.exempt = True
-        try:
-            yield
-        finally:
-            self._request_budget.exempt = previous
 
     def _only_slot_caps_hold_ahead_of(self, ticket: _AdmissionTicket) -> bool:
         """Whether every ticket ahead of `ticket` takes a slot and is held by a
@@ -10201,70 +9909,6 @@ class CommandExecutor:
         """
         return self._execute(argv, cwd=cwd)
 
-    def execute_workspace_git(
-        self,
-        argv: list[str],
-        cwd: Path,
-        config: tuple[tuple[str, str], ...] = (),
-        *,
-        allow_http: bool = False,
-    ) -> ExecutionResult:
-        """git the broker issues on its own behalf, in a tree the agent cannot name.
-
-        A separate door from `/v1/exec`, and separate on purpose. The point of
-        content-passing is that the agent no longer spells `git` at all; if the
-        broker's own plumbing went through the agent-facing path, every
-        subcommand that plumbing needs would have to be permitted to the agent
-        too, and the agent-facing git allowlist would land at eighteen entries
-        instead of none. Keeping the two apart is what makes the agent-facing
-        answer "git is not reachable" rather than "git is reachable, narrowly".
-
-        Three things are enforced here rather than assumed:
-
-        * the subcommand is one of `WORKSPACE_GIT_SUBCOMMANDS`, checked
-          against the argv as parsed rather than as composed, so a later edit
-          that threads a caller's string into one of these vectors is refused
-          instead of run;
-        * `-C` is refused outright — it is a working-directory redirect, and the
-          containment below is the only reason this path is safe;
-        * the working directory is inside the *content workspace* root, which
-          `assert_disjoint_roots` has already proven is not inside the volume
-          the agent writes to.
-
-        `config` is what the credential for this clone asked git to carry --
-        the read-only token's `extraheader`, for a context repository -- and it
-        travels the same way `execute_vcs_git`'s does: into the
-        `GIT_CONFIG_COUNT` layer ahead of the forced pins, so a credential can
-        add a header and cannot turn a pin off.
-        """
-        from content_workspace import WORKSPACE_GIT_SUBCOMMANDS
-
-        if self.content_workspace_root is None:
-            raise RuntimeError("content workspace support is not enabled")
-        if not argv or argv[0] != "git":
-            raise ValueError("only git runs on the workspace path")
-        executable_path = self.executables.get("git")
-        if not executable_path:
-            raise RuntimeError("supported executable is unavailable: git")
-        subcommand, redirects = _git_plan(argv)
-        if redirects:
-            raise ValueError("`-C` is not accepted on the workspace path")
-        if subcommand not in WORKSPACE_GIT_SUBCOMMANDS:
-            raise ValueError(
-                f"`git {subcommand}` is not one of the subcommands the broker "
-                "issues on its own behalf"
-            )
-        with self._outside_budget():
-            result = self._execute(
-                [executable_path, *argv[1:]],
-                cwd=str(cwd),
-                containment_root=self.content_workspace_root,
-                extra_config=tuple(config),
-                allow_http=allow_http,
-            )
-        self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
-        return result
-
     def tls_refusal(self, output: str):
         """The FORGE_TLS_UNTRUSTED refusal git's `output` stands for, or None.
 
@@ -10290,10 +9934,10 @@ class CommandExecutor:
     ) -> subprocess.CompletedProcess:
         """git the version-control broker issues, in its own scratch tree.
 
-        A third door rather than a widening of the second. The broker needs
-        `bundle`, `init` and `remote`, which content-passing does not, and
-        putting them on one list would grant each path the other's
-        subcommands for no reason beyond sharing a method.
+        A door of its own rather than a widening of `/v1/exec`. The broker needs
+        `bundle`, `init` and `remote`, which `/v1/exec` does not, and putting
+        them on one list would grant each path the other's subcommands for no
+        reason beyond sharing a method.
 
         `config` is what the forge's credential asked for on this invocation --
         a helper pin, an `insteadOf`, whatever presenting that forge's
@@ -10533,9 +10177,7 @@ class CommandExecutor:
         # getattr: an executor built without `__init__`, as the lock and caches
         # below allow for, has no budget and nothing reserved.
         request_budget = getattr(self, "_request_budget", None)
-        covered = getattr(request_budget, "reserved", False) or getattr(
-            request_budget, "exempt", False
-        )
+        covered = getattr(request_budget, "reserved", False)
         if covered:
             if self._refresh_is_current(cache_key, clean_repo):
                 return
@@ -10883,17 +10525,11 @@ class CommandExecutor:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
-        budget = getattr(self, "_request_budget", None)
-        covered_by_request = getattr(budget, "reserved", False) or getattr(budget, "exempt", False)
-        with contextlib.ExitStack() as admission:
-            # A vcs `snapshot`'s reservation covers the helper, as it covers
-            # the write mint; the content workspace's `open` and `commit`, under
-            # the store's lock, run on the workspace's fixed term.
-            if not covered_by_request and budget is not None:
-                admission.enter_context(self._outside_budget())
-            result = self._run_forge_helper(
-                provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
-            )
+        # A vcs `snapshot`'s reservation covers the helper, as it covers the
+        # write mint; an uncovered caller takes a transient one (`_execute`).
+        result = self._run_forge_helper(
+            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+        )
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
@@ -10935,11 +10571,10 @@ class CommandExecutor:
             token = cached()
             if token:
                 return token
-            # The sweep runs on its own thread with no store lock, so its spawn
-            # is not covered by the content workspace's reserve the way the
-            # read and write mints are: it takes a reservation of its own and
-            # waits for admission like any route that spawns, which a
-            # background thread can afford.
+            # The sweep runs on its own thread, covered by no route's
+            # reservation: it takes a reservation of its own and waits for
+            # admission like any route that spawns, which a background thread
+            # can afford.
             with self.reserve_child_memory():
                 result = self._run_forge_helper(
                     provider, helper, [FORGE_SWEEP_FLAG, repository], "sweep credential mint"
@@ -10993,20 +10628,14 @@ class CommandExecutor:
             token = cached()
             if token:
                 return token
-            budget = getattr(self, "_request_budget", None)
-            covered_by_request = getattr(budget, "reserved", False) or getattr(budget, "exempt", False)
             arguments = [FORGE_WRITE_MINT_FLAG, FORGE_HOST_FLAG, host, repository]
-            with contextlib.ExitStack() as admission:
-                # A vcs verb's reservation covers the helper, as it covers a
-                # refresh; anything else -- the content workspace, under its
-                # store lock -- runs on the workspace's fixed term.
-                if not covered_by_request and budget is not None:
-                    admission.enter_context(self._outside_budget())
-                try:
-                    result = self._run_forge_helper(provider, helper, arguments, "write credential mint")
-                except Exception:
-                    self._write_tokens.pop(key, None)
-                    raise
+            # A vcs verb's reservation covers the helper, as it covers a
+            # refresh; an uncovered caller takes a transient one (`_execute`).
+            try:
+                result = self._run_forge_helper(provider, helper, arguments, "write credential mint")
+            except Exception:
+                self._write_tokens.pop(key, None)
+                raise
             try:
                 answer = json.loads(result.stdout or "")
                 token = str(answer["token"]).strip()
@@ -11696,10 +11325,10 @@ class CommandExecutor:
         still caller-controlled.
 
         `containment_root` names which root the working directory must be inside
-        of. It defaults to the agent-shared workspace, which is every existing
-        caller. `execute_workspace_git` passes the broker-owned content
-        workspace root instead — the two roots are proven disjoint at startup,
-        so widening the check here cannot widen the other path.
+        of. It defaults to the agent-shared workspace. `execute_vcs_git` passes
+        the broker-owned version-control scratch root instead — the two roots
+        are proven disjoint at startup, so widening the check here cannot widen
+        the other path.
 
         `timeout_seconds` overrides the broker-wide deadline for this one
         command; `execute` passes the shorter kubectl bound through it.
@@ -11720,8 +11349,7 @@ class CommandExecutor:
         for admission. The one exception is the refresh route, which holds
         `_refresh_lock` across its budget wait and yields it to a vcs verb that
         needs a refresh (`refresh_forge_credential`). While the budget is on, a thread that holds no
-        reservation and is not the store's takes a transient one for the
-        child's lifetime.
+        reservation takes a transient one for the child's lifetime.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -11729,14 +11357,13 @@ class CommandExecutor:
             requested_cwd = Path(cwd).resolve()
             if not _within(root, requested_cwd):
                 # Name the root that was actually checked. With one message for
-                # all of them, a refusal on the content or version-control path
+                # all of them, a refusal on the version-control path
                 # reads as though the agent-shared containment fired, which
                 # sends whoever is debugging it to the wrong control. Derived
                 # from the root rather than from a branch per caller, so a
                 # fourth door cannot be added without naming itself here.
                 named = {
                     self.workspace_dir: "the shared workspace",
-                    self.content_workspace_root: "the content workspace",
                     self.vcs_root: "the version-control scratch tree",
                 }.get(root, str(root))
                 raise ValueError(f"working directory is outside {named}")
@@ -11788,8 +11415,7 @@ class CommandExecutor:
         # two deliberate exemptions (design §2.1): the bootstrap command, which
         # runs before the broker serves anything, and `_read_repo_alias`'s
         # `git config`, a few hundred KB over in milliseconds. A thread that holds
-        # a reservation (a route admitted it) or runs the store's git (exempt,
-        # covered by the fixed term) spawns under that; any other thread takes
+        # a reservation (a route admitted it) spawns under that; any other thread takes
         # a transient reservation for the child's lifetime, with the same wait
         # and the same refusal, so a route that forgets to reserve is throttled
         # rather than uncounted. A caller that reaches this point uncovered
@@ -11797,9 +11423,7 @@ class CommandExecutor:
         # which is why every route reserves before it takes one -- except the
         # refresh route, which reserves under the refresh lock and yields the
         # lock to a vcs verb that needs it (`refresh_forge_credential`).
-        covered = getattr(self._request_budget, "reserved", False) or getattr(
-            self._request_budget, "exempt", False
-        )
+        covered = getattr(self._request_budget, "reserved", False)
         admission = (
             contextlib.nullcontext()
             if covered or self.children_budget_bytes is None
@@ -11896,57 +11520,23 @@ class CommandExecutor:
         return value[: self.max_output_bytes], True
 
 
-def build_workspace_store(
-    executor: CommandExecutor,
-    base_branch: str = "",
-    pinned_bases: Mapping[tuple[str, str], str] | None = None,
-):
-    """The content-passing store, or None when the feature is off.
+def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path, purpose: str) -> None:
+    """Refuse to start if the agent can name a broker-owned tree.
 
-    Returning None rather than an inert object is deliberate: the handler tests
-    `workspaces is None` to decide whether the routes exist at all, so "off"
-    means the endpoints are absent, not present-and-refusing. An absent endpoint
-    cannot be reached by a bug in a refusal.
-
-    A failure to construct — which today means only `assert_disjoint_roots`
-    refusing overlapping roots — is fatal rather than a downgrade to off. An
-    operator who asked for content-passing and silently got the directory path
-    back would believe they had a property they do not have.
+    The broker operates where the agent has no path. If the two roots overlap,
+    that sentence is false. Executed at construction, so a mount rearrangement
+    that points both at the same volume is a broker that will not start, not a
+    broker that starts without the property. `purpose` names which root is
+    checked, so the message sends whoever is debugging it to the right control.
     """
-    if executor.content_workspace_root is None:
-        return None
-    from content_workspace import ContentWorkspaceStore
-
-    # Its own registry, carrying the read-only mint, and the write mint a forge
-    # with no ambient credential presents for a managed repository's clone and
-    # push. On github.com the write token stays the CLI's: the GitHub forge
-    # there never asks for the write mint, and the content workspace never
-    # hands its write credential out.
-    registry = providers.Registry(
-        {
-            "mint": executor.mint_read_credential,
-            "mint_write": executor.mint_write_credential,
-            "drop_write": executor.drop_write_credential,
-        }
-    )
-    store = ContentWorkspaceStore(
-        executor.content_workspace_root,
-        executor.workspace_dir,
-        executor.execute_workspace_git,
-        base_branch=base_branch,
-        # Lifted to the host the workspace clones from, for the reason
-        # `require_managed_workspace` gives: a bare name does not resolve once
-        # the install serves a second forge.
-        credential_for=lambda repository: _workspace_credential(registry, repository),
-        # A repository named with its host is cloned from the forge that serves
-        # it, which composes the URL; a bare `owner/name` stays GitHub's.
-        locate=_workspace_locate,
-        github_host=_workspace_github_host,
-        pinned_bases=pinned_bases,
-        tls_refusal=executor.tls_refusal,
-    )
-    LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
-    return store
+    tree = Path(tree_root).resolve()
+    agent = Path(agent_workspace_root).resolve()
+    if tree == agent or agent in tree.parents or tree in agent.parents:
+        raise RuntimeError(
+            f"the {purpose} root ({tree}) and the agent-shared workspace root "
+            f"({agent}) overlap. The broker operates where the agent has no "
+            "path; with these roots it would not. Refusing to start."
+        )
 
 
 def build_vcs_broker(
@@ -11956,18 +11546,14 @@ def build_vcs_broker(
 ):
     """The version-control broker. Always built; there is no switch.
 
-    Unlike the content workspace this has no off state. It is the forge-neutral
-    route, and a build that could return None here would be a build where the
+    It has no off state. It is the forge-neutral route, and a build that could return None here would be a build where the
     neutral route is absent and every caller silently falls back to the one
     thing it was meant to replace: a forge CLI, spelled `gh`.
 
-    The scratch tree is the broker's own -- same requirement as content
-    passing, same check, and it is a construction-time refusal for the same
-    reason: an overlap makes "the agent has no path to it" false while the
+    The scratch tree is the broker's own, and `assert_disjoint_roots` checks
+    that at construction: an overlap makes "the agent has no path to it" false while the
     code goes on claiming it.
     """
-    from content_workspace import assert_disjoint_roots
-
     assert_disjoint_roots(
         executor.vcs_root, executor.workspace_dir, purpose="version-control scratch"
     )
@@ -12501,9 +12087,7 @@ def _subcommand_vocabulary(tool: str) -> frozenset[str]:
         surfaces = (command_policy._gcloud_surface(list(command)) for command in command_policy.GCLOUD_READ_COMMANDS)
         return frozenset(surface for surface in surfaces if surface) | GCLOUD_EXTRA_SURFACES
     if tool == "git":
-        from content_workspace import WORKSPACE_GIT_SUBCOMMANDS  # local, as every import of it here is
-
-        return VCS_GIT_SUBCOMMANDS | GIT_MUTATING_SUBCOMMANDS | WORKSPACE_GIT_SUBCOMMANDS | GIT_READ_SUBCOMMANDS
+        return VCS_GIT_SUBCOMMANDS | GIT_MUTATING_SUBCOMMANDS | GIT_READ_SUBCOMMANDS
     return FORGE_CLI_VOCABULARIES.get(tool, frozenset())
 
 
@@ -13370,15 +12954,10 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     # target, from `parse_pinned_bases`. Each pinned branch is also protected
     # from a direct push, as `base_branch` is; see `providers.pinned_base`.
     pinned_bases: Mapping[tuple[str, str], str] = {}
-    # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
-    # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
-    # which is what lets a migrating client detect support by asking rather than
-    # by version-sniffing.
-    workspaces: object | None = None
     # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
     # not shadow the module inside a method, but it reads as though it does.
-    # Unlike `workspaces` it is not behind a switch, because it is the only way
-    # the sandbox reaches a repository at all. It is None on an exec pod, which
+    # It is not behind a switch, because it is the only way the sandbox
+    # reaches a repository at all. It is None on an exec pod, which
     # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
     # The claim tokens `proposal-create` answers carry and `proposal-claim`
@@ -13780,9 +13359,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             # which is also why the provider travels in the body rather than in
             # the path on the route that replaces it.
             self._handle_forge_refresh(provider="github")
-            return
-        if self.path.startswith("/v1/workspace/"):
-            self._handle_workspace_post()
             return
         if self.path.startswith("/v1/vcs/"):
             self._handle_vcs_post()
@@ -15075,6 +14651,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         connection: http.client.HTTPConnection | None = None
         started = time.monotonic()
         answered = False
+        # The API server's status line arrived: the cached host and CA reached
+        # it, so a failure after this point is not theirs to be forgotten for.
+        upstream_answered = False
         try:
             connection = self._watcher_k8s_connection(host, ca_pem)
             connection.connect()
@@ -15086,6 +14665,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 connection.putheader("Accept", accept)
             connection.endheaders()
             response = connection.getresponse()
+            upstream_answered = True
             if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
                 LOGGER.warning("watcher k8s redirect refused request_id=%s status=%d", request_id, response.status)
                 self._json(
@@ -15178,22 +14758,27 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 sent += len(chunk)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
         except (OSError, http.client.HTTPException) as exc:
-            # Before the status line, an answer, and the cached address is
-            # forgotten in case it is what failed; after it, nothing more is
-            # written and the stream is cut, which the client answers by
-            # re-listing or re-watching, as it would on any dropped watch.
+            # Before our status line, an answer, and the cached address is
+            # forgotten in case it is what failed: only when the API server's
+            # own status line never arrived, since one that did proves the
+            # address (a buffered Pod read that fails mid-body). After our
+            # status line, nothing more is written and the stream is cut,
+            # which the client answers by re-listing or re-watching, as it
+            # would on any dropped watch.
             LOGGER.warning(
-                "watcher k8s upstream failed request_id=%s type=%s answered=%s",
+                "watcher k8s upstream failed request_id=%s type=%s answered=%s upstream_answered=%s",
                 request_id,
                 type(exc).__name__,
                 answered,
+                upstream_answered,
             )
             if answered:
                 self.close_connection = True
             else:
-                key = (target["project"], target["location"], target["cluster"])
-                with self.watcher_endpoints_lock:
-                    self.watcher_endpoints.pop(key, None)
+                if not upstream_answered:
+                    key = (target["project"], target["location"], target["cluster"])
+                    with self.watcher_endpoints_lock:
+                        self.watcher_endpoints.pop(key, None)
                 with contextlib.suppress(OSError):
                     self._json(
                         HTTPStatus.BAD_GATEWAY,
@@ -15202,190 +14787,6 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         finally:
             if connection is not None:
                 connection.close()
-
-    def _handle_workspace_post(self) -> None:
-        """The content-passing routes: bytes in, bytes out, never a path.
-
-        Every response here is content or a name. Nothing returns a filesystem
-        path, because a path handed back is a directory the agent can be told to
-        `cd` into — which is precisely the arrangement this replaces. The
-        `handle` is a broker-minted opaque token, not a location. That holds for
-        the error responses too: `ContentWorkspaceStore._redact` takes every
-        absolute path, plus the handle, back out of git's stderr before it goes
-        on the wire. That is the only reason the sentence above is a property
-        rather than an intention, and it scrubs by shape rather than by a list
-        of known paths -- the leak nobody predicted is the failure mode here.
-
-        These routes deliberately do **not** go through `Policy.blocked_by`,
-        `git_argument_violation` or `git_lease_violation`. Those three inspect an
-        argv the caller composed; here the caller composes no argv at all. The
-        equivalent controls are structural: `content_workspace.repo_relative`
-        decides what a path may name, `CommandExecutor.execute_workspace_git`
-        decides which git may run, and neither reads a caller string into a
-        command position.
-        """
-        import content_workspace
-
-        if self.workspaces is None:
-            # A code as well as the status. A caller that can do either
-            # content-passing or a working-tree clone has to tell "the broker
-            # does not have this armed" from "that verb does not exist", and a
-            # bare 404 answers both. See
-            # `credential_proxy_client.workspaces_available`.
-            self._json(
-                HTTPStatus.NOT_FOUND,
-                {
-                    "status": "not_found",
-                    "code": "CONTENT_WORKSPACES_DISABLED",
-                    "message": "content workspaces are not enabled on this broker",
-                },
-            )
-            return
-        route = self.path[len("/v1/workspace/") :]
-        body_limit = max(self.max_request_bytes, content_workspace.max_total_bytes() * 2)
-        # The verbs that write the state volume take the gate's hard check,
-        # as the k8s list does: `open` clones into it, which is the fill the
-        # disk half exists to stop, and `commit` fetches into it. Reads take
-        # nothing, as before.
-        gate = getattr(self, "watermark_gate", None)
-        if route in WORKSPACE_WRITING_ROUTES and gate is not None:
-            try:
-                gate.check(self._caller_role())
-            except ResourcePressure as exc:
-                LOGGER.warning("workspace %s refused under resource pressure: %s", route, exc)
-                # Refused before the body is read, so the body is drained
-                # before the answer, as the vcs route's refusal is: the
-                # connection closes after the response, and a commit's body
-                # still arriving would turn the 429 into a reset.
-                drain_request_body(self, body_limit)
-                self._busy(exc)
-                return
-        try:
-            payload = self._read_json_body(max_bytes=body_limit)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-
-        try:
-            body = self._workspace_route(route, payload)
-        except content_workspace.ContentWorkspaceError as exc:
-            LOGGER.warning(
-                "workspace request refused route=%s code=%s", route, exc.code
-            )
-            self._json(
-                HTTPStatus(exc.status),
-                {"status": "blocked", "code": exc.code, "message": str(exc)},
-            )
-            return
-        except ValueError as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        except Exception as exc:
-            LOGGER.exception("workspace request failed route=%s type=%s", route, type(exc).__name__)
-            self._json(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                {"error": "credential proxy workspace operation failed"},
-            )
-            return
-        if body is None:
-            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
-            return
-        self._json(HTTPStatus.OK, body)
-
-    def _workspace_route(self, route: str, payload: dict) -> dict | None:
-        import content_workspace
-
-        store = self.workspaces
-        if route == "open":
-            requested = payload.get("repo")
-            # A bare `owner/name` is held to the GitHub slug rule it always was;
-            # a host-qualified name goes on to the store, which asks the forge
-            # that serves it and refuses anything no served forge owns.
-            # Two segments and no host is a GitHub slug; anything that names a
-            # host, or nests deeper, is for the forges this install serves.
-            ref = repo_ref.try_parse(requested) if isinstance(requested, str) else None
-            slug = ref is not None and not ref.host and len(ref.segments) == 2
-            if ref is None or (slug and not is_valid_repository(requested)):
-                # A ContentWorkspaceError rather than a ValueError, though both
-                # answer 400. `credential_proxy_client.workspaces_available`
-                # probes this route with an empty repo to find out whether the
-                # broker serves it at all, so a malformed slug is a reply this
-                # route owes an error *code* for, and the code is what tells a
-                # probe apart from a caller that got the name wrong. It also
-                # keeps the refusal on the same exception family as the write
-                # gate below, so a caller catching one catches both.
-                raise content_workspace.ContentWorkspaceError(
-                    "repo must be owner/name, or a repository on a forge this install serves"
-                )
-            # No managed-repository gate here. `inspect-repository` exists to
-            # read code this install does not manage -- a dependency, an
-            # upstream project, a repository named in an issue -- so gating the
-            # clone would take the skill away rather than take a capability
-            # away. The gate is on `commit` and `push` below, which are where
-            # the installation token stops reading and starts writing.
-            workspace = store.open(
-                requested,
-                payload.get("base") or None,
-                payload.get("branch") or None,
-                payload.get("depth"),
-                # Passed as sent: the store treats None and "" as no label
-                # and refuses anything else it cannot read, so a falsy
-                # non-string is a 400 rather than a silently blank label.
-                caller=payload.get("caller"),
-            )
-            return {
-                "handle": workspace.handle,
-                "repo": workspace.repo,
-                "base": workspace.base,
-                "baseSha": workspace.base_sha,
-                "branchSha": workspace.branch_sha,
-                "startedFrom": workspace.started_from,
-                "shallow": workspace.shallow,
-            }
-        if route == "read":
-            # `paths` is the batched form and answers a different shape. Keyed
-            # on its presence rather than on a separate route so that a caller
-            # reading one file and a caller reading forty use one verb.
-            if payload.get("paths") is not None:
-                return store.read_many(payload.get("handle"), payload.get("paths"))
-            content = store.read(payload.get("handle"), payload.get("path"))
-            return {
-                "path": payload.get("path"),
-                "contentBase64": base64.b64encode(content).decode("ascii"),
-                "size": len(content),
-            }
-        if route == "list":
-            return store.list(
-                payload.get("handle"),
-                payload.get("prefix") or None,
-                payload.get("after") or None,
-            )
-        if route == "grep":
-            return store.grep(
-                payload.get("handle"),
-                payload.get("pattern"),
-                payload.get("prefix") or None,
-                regex=payload.get("regex") is True,
-                ignore_case=payload.get("ignoreCase") is True,
-            )
-        if route == "commit":
-            require_managed_workspace(store, payload.get("handle"))
-            changes = content_workspace.parse_changes(payload.get("changes"))
-            return store.commit(
-                payload.get("handle"),
-                payload.get("branch"),
-                payload.get("message"),
-                changes,
-                expected_base_sha=payload.get("expectedBaseSha") or None,
-                expected_branch_sha=payload.get("expectedBranchSha") or None,
-            )
-        if route == "push":
-            require_managed_workspace(store, payload.get("handle"))
-            return store.push(payload.get("handle"), payload.get("branch"))
-        if route == "close":
-            store.close(payload.get("handle"))
-            return {"closed": True}
-        return None
 
     def _handle_forge_refresh(self, provider: str = "") -> None:
         """`POST /v1/forge/refresh` — make a credential current before it is spent.
@@ -15694,9 +15095,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "request body not received verb=%s type=%s", verb, type(exc).__name__
                     )
                     return TOOL_STATUS_ERROR
-                # The managed-repository control, on the same footing as
-                # `require_managed_workspace` on the content routes: the broker
-                # holds the forge credential, so "is this a repository we act
+                # The managed-repository control: the broker holds the forge credential, so "is this a repository we act
                 # on" can only be answered here. Nothing downstream answers it
                 # -- a forge is handed a repository and spends the token on it
                 # -- so this is the whole of the check for these routes, reads
@@ -16798,28 +16197,19 @@ def serve(args: argparse.Namespace) -> None:
     )
     for (host, path), branch in CredentialProxyHandler.pinned_bases.items():
         LOGGER.info("pinned base repository=https://%s/%s branch=%s", host, path, branch)
-    # An exec pod answers 404 on /v1/workspace/* and /v1/vcs/* (exec_pod_serves),
-    # so it builds neither: no workspace sweep, and no forge asked at each
-    # replica's start what a credential reaches.
+    # An exec pod answers 404 on /v1/vcs/* (exec_pod_serves), so it does not
+    # build the broker: no forge asked at each replica's start what a
+    # credential reaches.
     if role != EXEC_ROLE:
-        CredentialProxyHandler.workspaces = build_workspace_store(
-            executor,
-            base_branch=CredentialProxyHandler.base_branch,
-            pinned_bases=CredentialProxyHandler.pinned_bases,
-        )
         CredentialProxyHandler.vcs = build_vcs_broker(
             executor,
             base_branch=CredentialProxyHandler.base_branch,
             pinned_bases=CredentialProxyHandler.pinned_bases,
         )
-    # What the gate's soft watermark reclaims: idle content workspaces (the
-    # store's own idle rule, run now rather than on the next verb) and vcs
-    # scratch no request of this process holds (the vcs broker swept a dead
-    # process's at start). The store is None with content passing off, and an
-    # exec pod has neither.
+    # What the gate's soft watermark reclaims: vcs scratch no request of this
+    # process holds (the vcs broker swept a dead process's at start). An exec
+    # pod has none.
     reclaimers: list[Callable[[], int]] = []
-    if CredentialProxyHandler.workspaces is not None:
-        reclaimers.append(CredentialProxyHandler.workspaces.reclaim_idle)
     if CredentialProxyHandler.vcs is not None:
         reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
     gate.set_reclaimers(reclaimers)
