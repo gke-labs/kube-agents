@@ -292,6 +292,9 @@ F2), so recovery is a **corrective-PR loop**, never a direct fix:
 **Cap:** a few heartbeat cycles (or ~equivalent wall time), mirroring §5's intent. Every correction
 is a human-merged PR — never a direct cluster write, never an auto-merge.
 
+A related check, whether a merged fix was applied and made its finding go away, is designed in
+[`post-merge-verification.md`](../designs/post-merge-verification.md).
+
 ---
 
 ## 6. Failure isolation across tiers
