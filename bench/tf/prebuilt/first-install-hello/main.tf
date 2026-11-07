@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/first-install-hello-running and
-# first-install-hello-done.
+# The scenario driver for bench/tasks/first-install-hello-running,
+# first-install-hello-done and first-install-hello-filed.
 #
 # The first-install greeting fires once per deployment, on the first turn from
 # a chat platform with durable delivery (the bootstrap_onboarding plugin in
@@ -201,6 +201,13 @@ resource "null_resource" "planted_report" {
 resource "null_resource" "greet_request" {
   # The report first, so the request never answers before it is in place.
   depends_on = [null_resource.planted_report]
+
+  lifecycle {
+    precondition {
+      condition     = var.variant != "filed" || var.filed_url != ""
+      error_message = "variant filed needs filed_url: without it the plugin ignores the request and the case grades a missing greeting as the model's."
+    }
+  }
 
   triggers = {
     host_cluster  = var.host_cluster_name

@@ -80,10 +80,17 @@ REPORT_FILED_URL_KEY = "url"
 URL_SCHEME_PREFIX = "http"
 REPORT_FILED_AT_KEY = "filed_at"
 _FALLBACK_REPORT_FILED = (
-    "This is the first message anyone has sent this install. Its first-run inventory report was "
-    "ready before anyone wrote, so it is filed as an issue at {url}{dated} instead of being posted here. "
-    "Answer the ask first, as on any turn. Then, after the answer and never in front of a bare "
-    "acknowledgement, add one sentence with that link."
+    "This is the first time this person has talked to you since the install. Nobody wrote within a day of "
+    "the discovery sweep, so the first-run inventory report is filed as an issue at {url}{dated} instead of "
+    "being posted into a chat thread. One message of at most 60 words in plain sentences: open \"Hi there, "
+    "I'm kube-agents 👋\" unless the session gives their Slack profile name (a typed name is not one); say "
+    "the report was ready before anyone wrote and is filed at that address, given exactly once after the "
+    "opener and never as the first words; that you only read their clusters, so nothing changed; that a "
+    "change you think should happen comes as a pull request for their team to review; then ask one question, "
+    "\"Want me to start on one of those findings?\", and end on it. If their message is a real ask, answer "
+    "it first in your normal voice, then add those points in two sentences at the end and skip the question; "
+    "if your reply is only an acknowledgement before you work, send that alone. Do not restate the findings, "
+    "name internal agents, list what you can do, claim to have saved anything, apologise, or use hype."
 )
 REPORT_FILED_DATE_FORMAT = "%Y-%m-%d %H:%M"
 REPORT_FILED_DATED_FORMAT = " (filed {date} UTC)"
@@ -109,7 +116,8 @@ REPORT_FILED_INSTRUCTIONS = "report_filed.md"
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
 # "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION),
-# "report": str (required with from_report)}.
+# "report": str (required with from_report), "url": str (required with filed),
+# "filed_at": number (optional with filed)}.
 # The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
 # the opening turn's report check, run on the file the request's "report" names
 # rather than the real report, so a case never puts a file where onboarding
@@ -199,7 +207,7 @@ DEFAULT_DATA_DIR = "/opt/data"
 # touches no disk. A gateway restart empties it and leaves the file to age out.
 _greeting_turns: set = set()
 
-# The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
+# The greeting's word ceiling; the three first-install-hello bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
 
 # Added to the greeting instructions only when this turn made the chat the home

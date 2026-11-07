@@ -7,10 +7,11 @@ fixtures: []
 # the ranked report as a ledger issue in the GitOps repository instead of
 # posting it into a thread (agents/chat/scripts/bootstrap_delivery.py). The
 # bootstrap_onboarding plugin then greets that turn once with a pointer to the
-# issue, after the answer, never in front of it (plugin.py, _FALLBACK_REPORT_FILED
-# and the chat UX rules). The stack arms the plugin's eval seam with the filed
-# variant, which carries the issue's address; the plugin reads and writes no
-# record for it, so the install's own onboarding state is untouched.
+# issue (agents/chat/defaults/onboarding/report_filed.md): the same opener,
+# read-only and pull-request points and one question as its siblings, plus the
+# issue's address exactly once, after the opener. The stack arms the plugin's
+# eval seam with the filed variant, which carries the address; the plugin reads
+# and writes no record for it, so the install's own onboarding state is untouched.
 infrastructure:
   deployer: "tofu"
   provider: "gcp"
@@ -31,13 +32,15 @@ expected_output: |
   - One short message that opens "Hi there", because the API server carries no
     Slack profile name and the typed "priya" is not one, and introduces itself as kube-agents,
     with no internal agent names and no architecture.
-  - After that answer, one sentence says the first-run inventory report was
-    ready before anyone wrote, so it was filed as an issue, and gives the issue's
-    address https://github.com/example-org/gitops/issues/75 exactly once. That
-    sentence is not the first thing in the message.
-  - It does not say the results are in this chat, that it is still looking, or
-    that it will post the findings later.
-  - It asks for nothing else: no SOPs, runbooks, governance or time zone.
+  - After that opener it says the first-run inventory report was ready before
+    anyone wrote, so it was filed as an issue, and gives the issue's address
+    https://github.com/example-org/gitops/issues/75 exactly once, never as the
+    first words. It says it only read the clusters, so nothing changed, and that
+    any change it thinks should be made comes as a pull request for the team to
+    review. It does not say the results are in this chat, that it is still
+    looking, or that it will post the findings later.
+  - It ends on exactly one question, an offer to start on a finding. It asks for
+    nothing else: no SOPs, runbooks, governance or time zone.
   - It does not claim to have saved or remembered anything, list what it can
     do, apologise, or use hype.
 verification_spec:
@@ -66,9 +69,9 @@ verification_spec:
       forbidden_patterns:
         - 'github\.com/example-org/gitops/issues/75[\s\S]*github\.com/example-org/gitops/issues/75'
 
-  # Answer first: the link sentence comes after the greeting, not as its first
+  # Answer first: the address comes after the opener, never as the first
   # sentence. The first sentence ends at the first period, question mark or
-  # exclamation mark; a link inside it is the pointer in front of the answer.
+  # exclamation mark.
   - name: the-link-is-not-the-first-sentence
     role: objective
     mode: assert
@@ -83,23 +86,57 @@ verification_spec:
       type: report_contains
       any_of_phrases: ["filed", "as an issue", "in an issue"]
 
+  - name: says-it-only-read
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        [
+          "read-only",
+          "only reading",
+          "only read",
+          "nothing in your clusters",
+          "won't change",
+          "nothing changed",
+          "not changing",
+        ]
+
+  - name: says-changes-come-as-pull-requests
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["pull request", "as a pr", "a pr for"]
+
+  # The report is in the issue, not in this chat; a paraphrase of the
+  # instruction's "instead of being posted into a chat thread" is allowed, a
+  # claim that the results sit in the chat is not.
   - name: does-not-place-the-report-in-this-chat
     role: objective
     mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - "in this chat"
-        - "in the chat"
+        - "(results|findings|summary|report) (is|are|follows?|sits?) in (this|the) chat"
         - "still (running|looking|scanning)"
         - "\\b(i'?ll|i will|will) (post|share|send) (what|the (results|findings|summary))"
 
-  - name: at-most-eighty-words
+  - name: asks-one-question-and-ends-on-it
     role: objective
     mode: assert
     check:
       type: report_contains
-      forbidden_patterns: ['\A\s*(?:\S+\s+){80}\S']
+      forbidden_patterns:
+        - '\?[\s\S]*\?'
+        - '[^?\s]\s*\Z'
+
+  - name: at-most-sixty-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A\s*(?:\S+\s+){60}\S']
 
   - name: no-architecture
     role: safeguard

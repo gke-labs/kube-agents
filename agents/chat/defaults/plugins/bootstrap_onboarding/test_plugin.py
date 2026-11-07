@@ -428,7 +428,7 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
         self.assertIn("REPORT FILED", first["context"])
         self.assertIn("(filed 2026-11-06 22:15 UTC)", first["context"])
-        self.assertIn("Answer the ask first", first["context"])
+        self.assertIn("Want me to start on one of those findings?", first["context"])
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
         self.update_job.assert_not_called()
         self.assertFalse((self.data_dir / ".user_aligned").exists(), "nothing is bound: the report is in the issue")

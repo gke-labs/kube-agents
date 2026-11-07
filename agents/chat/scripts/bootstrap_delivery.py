@@ -2138,6 +2138,11 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
     _register_findings(data_dir, _no_ranking(data_dir), files)
     if not _claim_for_this_path(data_dir):
         return 0
+    if _someone_is_here(data_dir):
+        # A human arrived during the reads above (a today platform has no sweep-age guard): their
+        # thread takes the report, late as it is.
+        _release_claim(data_dir)
+        return 0
     try:
         (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
     except OSError as e:

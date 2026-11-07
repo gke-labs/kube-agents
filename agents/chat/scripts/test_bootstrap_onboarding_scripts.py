@@ -2085,6 +2085,18 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         (self.d / COMPLETED).touch()
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
 
+    def test_a_human_arriving_during_the_retire_reads_keeps_the_report(self):
+        self._filed(8 * self.DAY)
+        real = bootstrap_delivery._register_findings
+        def arrive(*a, **k):
+            (self.d / ALIGNED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=arrive):
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
     def test_the_retire_path_leaves_a_record_so_its_claim_settles(self):
         self._filed(8 * self.DAY)
         self.assertEqual(self._main(), 0)
