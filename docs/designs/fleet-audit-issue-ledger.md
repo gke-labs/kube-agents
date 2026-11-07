@@ -109,8 +109,11 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
   `scope.clusters` nor `scope.skipped` holds nothing: the run's fleet listing has no such cluster,
   which is a cluster deleted since the finding was filed, and a ledger held open for it would never
   close (`bench/tasks/fleet-audit-clean-close-reads-clean`). The close retires it, but the
-  all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out, the
-  JSON line lists it under `retired_unlisted`, and the run is never silent over one. After the
+  all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out (on
+  the JSON line, in the stored envelope, on the since-last-scheduled line and in the whole-run
+  count), the JSON line lists it under `retired_unlisted`, and the run is never silent over one.
+  The store ledger applies the same rule; the no-forge record keeps ids with no places, so a run
+  with no repository cannot tell such a finding apart and counts it resolved as before. After the
   close, the run changes the title to `0 findings` and puts a
   banner above the old body, so the closed issue does not show its findings as open. After and not
   before: if the close fails, an open ledger must not show an all-clear. The old
@@ -190,8 +193,10 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
 - Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`, and on a
   scoped install `audit-scope:<slug>` (§8); the listing drops another install's pull requests, and
   the open-proposal lookup on a branch adopts none of theirs, so two installs that stage the same
-  path share a branch name without the second rewriting the first's pull request as its own (the
-  forge refuses the second's create on that branch instead).
+  path share a branch name without the second rewriting the first's pull request as its own: the
+  second's group is refused as "already exists with other content and no open pull request of
+  this install" when the branch carries different content, and its create is refused by the forge
+  when the content is the same.
 
 ## 3. Decisions
 

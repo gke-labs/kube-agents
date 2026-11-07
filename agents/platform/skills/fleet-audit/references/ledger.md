@@ -12,8 +12,10 @@ A finding whose `evidence` and `severity` are the same as in the previous run pu
 previous run's `title` and `impact`, and usually its `recommendation` and `remediation` together. So
 new words for an unchanged finding do not reach the ledger. Your `manifest` remediation and its
 `recommendation` always stay, and so does a `gcloud` command where the previous run wrote `manual`.
-A relative age in a finding's text ("completed 166 days ago") is dated by `finish` to the run that
-published it ("166 days ago as of 2026-11-06"), once; prefer an absolute date in what you write.
+A relative age in a finding's text ("completed 166 days ago") is dated by `finish`, and by
+`remediate` on a pull request body, to the run that published it ("166 days ago as of
+2026-11-06"), once; text inside a code span is left as written. Prefer an absolute date in what
+you write.
 
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |

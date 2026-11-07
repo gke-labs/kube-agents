@@ -37528,6 +37528,31 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         self.assertNotIn(self.gone_id(), envelope["resolved_ids"])
         self.assertEqual(len(envelope["resolved_ids"]), 1)
 
+    def test_the_whole_run_chat_line_leaves_a_retired_finding_out_of_resolved(self):
+        # A later `finish` of the same run says the change since the last
+        # scheduled run for the whole run; a finding the close retired
+        # unread is not resolved on that line either.
+        kept = derived_id(fid="a")
+        baseline = audit_report.RunBaseline(
+            ids=[kept, self.gone_id()],
+            known=True,
+            stale_scheme=False,
+            filed=[],
+            from_entry=True,
+            scheduled={
+                audit_report.SCHEDULED_CONTEXT_IDS_KEY: [kept, self.gone_id()],
+                audit_report.SCHEDULED_CONTEXT_REPORTED_KEY: [],
+                audit_report.SCHEDULED_CONTEXT_KIND_KEY: False,
+                audit_report.SCHEDULED_CONTEXT_AGAINST_KEY: True,
+            },
+        )
+        chat = audit_report.whole_run_chat_payload(
+            {"status": "CLEAN"}, baseline, True, set(), [], [], {self.gone_id()}
+        )
+        since = chat.get(audit_report.SINCE_SCHEDULED_KEY) or {}
+        self.assertEqual(since.get("resolved"), [kept])
+        self.assertNotIn(self.gone_id(), since.get("resolved") or [])
+
     def test_a_standing_remediate_on_a_retired_finding_is_deferred_not_answered_as_gone(self):
         self.previous_ledger(self.gone())
         self.harness.replies["*-view comments"] = comments_view(
