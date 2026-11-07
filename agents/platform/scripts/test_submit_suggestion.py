@@ -60,6 +60,24 @@ def _load_subject():
 
 submit_suggestion = _load_subject()
 
+#: A valid evidence file's content; `run_subject` passes it to every submit that writes a body.
+EVIDENCE = {
+    "finding": "checkout-gateway runs 2 replicas and no PodDisruptionBudget selects it.",
+    "checks": [
+        {
+            "command": "kubectl get pdb -n seeded-reliability",
+            "output": "No resources found in seeded-reliability namespace.",
+        }
+    ],
+    "change": "Adds a PodDisruptionBudget with minAvailable: 1 selecting app=checkout-gateway.",
+    "verify": [
+        {
+            "command": "kubectl get pdb checkout-gateway -n seeded-reliability",
+            "expect": "ALLOWED DISRUPTIONS is 1",
+        }
+    ],
+}
+
 GIT_ENV = {
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -343,11 +361,28 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------
 
-    def run_subject(self, *argv) -> tuple[int, str]:
+    def run_subject(self, *argv, evidence: bool = True) -> tuple[int, str]:
+        """Dispatch argv. A call that writes a body gets a valid `--evidence-file`
+        unless it names one or `evidence=False`: the evidence gate has tests of
+        its own below, and every other test is about something else."""
+        argv = list(argv)
+        writes_body = any(flag in argv for flag in ("--body", "--body-file"))
+        if evidence and writes_body and "--evidence-file" not in argv:
+            argv += ["--evidence-file", self.evidence_file()]
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            code = submit_suggestion.dispatch(list(argv))
+            code = submit_suggestion.dispatch(argv)
         return code, buffer.getvalue().strip()
+
+    def evidence_file(self, evidence=None, name: str = "evidence.json") -> str:
+        path = self.scratch / name
+        path.write_text(evidence if isinstance(evidence, str) else json.dumps(evidence or EVIDENCE))
+        return str(path)
+
+    @staticmethod
+    def description(body: str) -> str:
+        """The caller's own text, without the evidence section appended to it."""
+        return body.split("\n\n" + submit_suggestion.EVIDENCE_HEADING, 1)[0]
 
     def prepare(self, branch="platform-agent/scale-web", **extra) -> dict:
         argv = ["prepare", "--branch", branch]
@@ -1127,7 +1162,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         created = self.broker.payloads("proposal-create")[0]
         self.assertEqual(created["source"], "platform-agent/scale-web")
         self.assertEqual(created["target"], "main")
-        self.assertEqual(created["body"], "why this change\n")
+        self.assertEqual(self.description(created["body"]), "why this change")
+        self.assertIn(submit_suggestion.EVIDENCE_HEADING, created["body"])
         # The commit is the change, not the whole tree of the container.
         published = self.broker.payloads("publish")[0]
         self.assertEqual(published["target"], "main")
@@ -1161,7 +1197,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
         self.assertEqual(len(self.broker.payloads("proposal-create")), 1)
         self.assertEqual(self.broker.proposals[0]["title"], "second")
-        self.assertEqual(self.broker.proposals[0]["body"], "two")
+        self.assertEqual(self.description(self.broker.proposals[0]["body"]), "two")
         # The branch was extended rather than replaced: both revisions are on it.
         log = git(self.origin, "log", "--format=%s", "refs/heads/platform-agent/scale-web")
         self.assertEqual(log.stdout.split("\n")[:2], ["second", "first"])
@@ -1188,7 +1224,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         )
         self.assertEqual(out, "https://forge.test/acme/infra/pull/101")
         self.assertEqual(self.broker.proposals[0]["title"], "first")
-        self.assertEqual(self.broker.proposals[0]["body"], "one")
+        self.assertEqual(self.description(self.broker.proposals[0]["body"]), "one")
         self.assertEqual(self.broker.payloads("proposal-update"), [])
         self.assertEqual(len(self.broker.payloads("publish")), 2)
         # Both halves of what the notice now claims: the title did not reach
@@ -1453,7 +1489,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         )
         self.assertEqual(url, self.broker.proposals[0]["url"])
         self.assertEqual(self.broker.proposals[0]["title"], "the title the reviewer asked for")
-        self.assertEqual(self.broker.proposals[0]["body"], "and the body")
+        self.assertEqual(self.description(self.broker.proposals[0]["body"]), "and the body")
         self.assertEqual(len(self.broker.payloads("publish")), 1)
         self.assertTrue(any("nothing" in line and "refreshing" in line for line in self.logged))
 
@@ -1791,6 +1827,197 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             self.run_subject("submit", "--branch", "b", "--title", "t", "--body-file", str(empty))
         self.assertIn("is empty", str(caught.exception))
 
+    # -- the evidence the body carries (#4966) -----------------------------
+
+    def submit_with(self, evidence_argv: list) -> tuple[int, str]:
+        return self.run_subject(
+            "submit", "--branch", "platform-agent/scale-web",
+            "--title", "fix(reliability): add a disruption budget",
+            "--body-file", self.body_file("Adds a PDB for checkout-gateway.\n"),
+            *evidence_argv, evidence=False,
+        )
+
+    def assert_refused_before_publishing(self, evidence_argv: list, says: str) -> None:
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.submit_with(evidence_argv)
+        self.assertIn(says, str(caught.exception))
+        # The refusal tells the agent what to write, and nothing went out.
+        self.assertIn("--evidence-file", str(caught.exception))
+        self.assertEqual(self.broker.payloads("publish"), [])
+        self.assertEqual(self.broker.payloads("proposal-create"), [])
+
+    def test_a_body_without_evidence_is_refused_before_publishing(self):
+        """The one-line body of #4966: accepted before, refused now."""
+        self.assert_refused_before_publishing([], "no --evidence-file was given")
+
+    def test_an_inline_body_without_evidence_is_refused_too(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--title", "t",
+                "--body", "Applies a PDB (minAvailable: 1) for the checkout deployment.",
+                evidence=False,
+            )
+        self.assertIn("no --evidence-file was given", str(caught.exception))
+
+    def test_evidence_missing_a_part_is_refused_naming_it(self):
+        for broken, says in (
+            ({k: v for k, v in EVIDENCE.items() if k != "finding"}, "`finding` is missing"),
+            ({**EVIDENCE, "checks": []}, "`checks` must be a non-empty list"),
+            ({**EVIDENCE, "checks": [{"command": "kubectl get pdb -A"}]}, "`checks[0].output`"),
+            ({**EVIDENCE, "change": "  "}, "`change` is missing or empty"),
+            ({k: v for k, v in EVIDENCE.items() if k != "verify"}, "`verify` must be a non-empty list"),
+            ({**EVIDENCE, "verify": ["kubectl get pdb"]}, "`verify[0]` is not an object"),
+            ({**EVIDENCE, "checks": EVIDENCE["checks"] * 6}, "has 6 entries"),
+        ):
+            with self.subTest(says=says):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.load_evidence(self.evidence_file(broken))
+                self.assertIn(says, str(caught.exception))
+
+    def test_evidence_that_is_not_json_is_refused(self):
+        self.assert_refused_before_publishing(
+            ["--evidence-file", self.evidence_file("finding: no PDB\n")], "is not JSON"
+        )
+
+    def test_an_evidence_file_outside_scratch_is_refused(self):
+        outside = Path(self.tmp.name) / "evidence.json"
+        outside.write_text(json.dumps(EVIDENCE))
+        with self.assertRaises(ValueError) as caught:
+            self.submit_with(["--evidence-file", str(outside)])
+        self.assertIn("--evidence-file", str(caught.exception))
+        self.assertIn("resolves outside", str(caught.exception))
+
+    def test_evidence_is_rendered_into_the_proposal_body(self):
+        prepared = self.prepare()
+        self.edit(prepared)
+        code, _ = self.submit_with(["--evidence-file", self.evidence_file()])
+        self.assertEqual(code, 0)
+        body = self.broker.payloads("proposal-create")[0]["body"]
+        self.assertEqual(self.description(body), "Adds a PDB for checkout-gateway.")
+        for part in (
+            "## Evidence",
+            "**Finding:** checkout-gateway runs 2 replicas",
+            "**Reproduce with** (read-only):",
+            "```bash\nkubectl get pdb -n seeded-reliability\n```",
+            "```text\nNo resources found in seeded-reliability namespace.\n```",
+            "**What this change does:** Adds a PodDisruptionBudget",
+            "**Verify after merge:**",
+            "```bash\nkubectl get pdb checkout-gateway -n seeded-reliability\n```",
+            "Expect: ALLOWED DISRUPTIONS is 1",
+        ):
+            self.assertIn(part, body)
+
+    def test_rendered_evidence_is_redacted_clipped_and_fenced_safely(self):
+        token = "ghp_" + "a" * 36
+        evidence = {
+            **EVIDENCE,
+            "checks": [{
+                "command": f"kubectl get deploy x -o yaml  # {token}",
+                "output": "```\nescaped?\n" + "\n".join(f"line {i}" for i in range(100)),
+            }],
+            "verify": [{"command": "kubectl get pdb -A"}],
+        }
+        section = submit_suggestion.render_evidence(
+            submit_suggestion.load_evidence(self.evidence_file(evidence))
+        )
+        self.assertNotIn(token, section)
+        self.assertIn("[REDACTED]", section)
+        self.assertIn("more lines)", section)
+        self.assertNotIn("line 99", section)
+        # The output's own fence cannot close the block it sits in.
+        self.assertIn("````text\n```\nescaped?", section)
+        self.assertNotIn("Expect:", section)
+
+    def test_output_keeps_its_first_line_indentation(self):
+        evidence = {**EVIDENCE, "checks": [{"command": "kubectl get deploy x -o yaml", "output": "\n  replicas: 2\n  selector: {}\n"}]}
+        section = submit_suggestion.render_evidence(
+            submit_suggestion.load_evidence(self.evidence_file(evidence))
+        )
+        self.assertIn("```text\n  replicas: 2\n  selector: {}\n```", section)
+
+    def test_secret_data_and_key_material_are_refused(self):
+        for output in (
+            "apiVersion: v1\ndata:\n  password: aHVudGVyMg==\nkind: Secret\n",
+            '{\n  "data": {"password": "aHVudGVyMg=="},\n  "kind": "Secret",\n}',
+            "users:\n- user:\n    client-key-data: LS0tLS1CRUdJTg==\n",
+        ):
+            with self.subTest(output=output[:20]):
+                evidence = {**EVIDENCE, "checks": [{"command": "kubectl get secret x -o yaml", "output": output}]}
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.load_evidence(self.evidence_file(evidence))
+                self.assertIn("Secret manifest, Secret data or key material", str(caught.exception))
+        # A Secret named in prose is not a manifest.
+        named = {**EVIDENCE, "checks": [{"command": "kubectl get secret -n app", "output": "NAME   TYPE\ndb     Opaque"}]}
+        submit_suggestion.load_evidence(self.evidence_file(named))
+
+    def test_secret_data_excerpts_and_reads_are_refused_in_every_field(self):
+        """The excerpt the skill asks for drops the `kind:` line; the guard
+        reads the `data:` block itself, the command beside it, CRLF output,
+        and every field the body renders, not only checks[].output."""
+        listing = {"command": "kubectl get pdb -A", "output": "No resources found."}
+        for broken, where in (
+            ({"checks": [{"command": "kubectl get pdb -A", "output": "data:\n  password: aHVudGVyMg==\n"}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": "  data:\r\n    password: aHVudGVyMg==\r\n"}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": 'apiVersion: v1\r\nkind: Secret\r\n'}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": '"data": {"password": "aHVudGVyMg=="},'}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get secret db -n app -o jsonpath='{.data}'", "output": "{}"}]}, "checks[0].command"),
+            ({"checks": [{"command": "kubectl get secret/db -o yaml | grep -A3 data:", "output": "x"}]}, "checks[0].command"),
+            ({"checks": [{"command": "kubectl -n app get secrets --output=json", "output": "x"}]}, "checks[0].command"),
+            ({"checks": [listing], "finding": "The Secret holds a stale password:\ndata:\n  password: aHVudGVyMg=="}, "finding"),
+            ({"checks": [listing], "verify": [{"command": "kubectl get pdb", "expect": "data:\n  token: c2VjcmV0dmFsdWU="}]}, "verify[0].expect"),
+        ):
+            with self.subTest(where=where, broken=str(broken)[:60]):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, **broken}))
+                self.assertIn(f"evidence `{where}`", str(caught.exception))
+        for fine in (
+            # A ConfigMap's data with values that are not base64-shaped.
+            {"command": "kubectl get cm app -o yaml", "output": "data:\n  LOG_LEVEL: debug\n  REPLICAS: \"2\"\nkind: ConfigMap"},
+            {"command": "kubectl describe secret db -n app", "output": "Data\n====\npassword:  8 bytes"},
+            {"command": "kubectl get secret -n app -o wide", "output": "NAME TYPE DATA AGE"},
+        ):
+            with self.subTest(fine=fine["command"]):
+                submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, "checks": [fine]}))
+
+    def test_a_blank_optional_expect_is_absent_not_missing(self):
+        evidence = {**EVIDENCE, "verify": [{"command": "kubectl get pdb -A", "expect": "  "}]}
+        loaded = submit_suggestion.load_evidence(self.evidence_file(evidence))
+        self.assertEqual(loaded["verify"], [{"command": "kubectl get pdb -A"}])
+        # A non-string is still refused by name.
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, "verify": [{"command": "x", "expect": 3}]}))
+        self.assertIn("`verify[0].expect`", str(caught.exception))
+
+    # The headings pdb-remediation-pr's `body_contains` grades. The case adds
+    # them only once main's grader accepts the field: the smoke job grades a
+    # pull request's cases with main's bench/, so one change cannot add the
+    # field and use it.
+    BENCH_EVIDENCE_HEADINGS = ("## Evidence", "**Verify after merge:**")
+
+    def test_the_bench_case_grades_the_headings_this_renders(self):
+        """render_evidence writes every heading the bench case grades; renaming
+        one here without the case reds a presubmit roster case."""
+        section = submit_suggestion.render_evidence(EVIDENCE)
+        for phrase in self.BENCH_EVIDENCE_HEADINGS:
+            self.assertIn(phrase, section)
+        task = HERE.parents[2] / "bench" / "tasks" / "pdb-remediation-pr" / "task.yaml"
+        lines = [line for line in task.read_text().splitlines() if line.strip().startswith("body_contains:")]
+        self.assertLessEqual(len(lines), 1)
+        if lines:
+            self.assertEqual(tuple(json.loads(lines[0].split(":", 1)[1])), self.BENCH_EVIDENCE_HEADINGS)
+
+    def test_evidence_with_keep_description_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            self.run_subject(
+                "submit", "--branch", "platform-agent/scale-web", "--keep-description",
+                "--evidence-file", self.evidence_file(),
+            )
+        self.assertIn("--keep-description", str(caught.exception))
+
     # -- the call shapes that outlive a roll -------------------------------
 
     def test_a_retired_flag_is_ignored_with_a_line_saying_so(self):
@@ -1973,10 +2200,11 @@ class LiftedNameReachesTheBrokerTest(unittest.TestCase):
         session = {"spec": "acme/fleet", "path": "/scratch/acme__fleet", "key": "platform-agent/x"}
         args = argparse.Namespace(
             repo="acme/fleet", branch="platform-agent/x", title="t", body="b",
-            body_file=None, keep_description=False,
+            body_file=None, keep_description=False, evidence_file="evidence.json",
         )
         with mock.patch.object(gitops_workspace, "get_managed_repos", lambda: mixed), \
                 mock.patch.dict(os.environ, {"GITOPS_ORG": "acme"}), \
+                mock.patch.object(submit_suggestion, "load_evidence", return_value=EVIDENCE), \
                 mock.patch.object(submit_suggestion.vcs_client, "resolve_session", return_value=session), \
                 mock.patch.object(submit_suggestion.vcs_client, "key_of", return_value="platform-agent/x"), \
                 mock.patch.object(submit_suggestion.vcs_client, "current_branch", return_value="platform-agent/x"), \

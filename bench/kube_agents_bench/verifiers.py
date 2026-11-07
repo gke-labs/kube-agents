@@ -5521,6 +5521,24 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # needs only `pull_requests: read`. A glob that names any other file is an
     # error (see _head_files).
     content: list[PullRequestContentCheck] = Field(default_factory=list)
+    # Substrings the pull request's description must contain, each verbatim
+    # and case-sensitive. For the evidence section submit_suggestion.py renders
+    # into every proposal body (#4966): a body that is one line of prose passes
+    # every other clause here. Read from the same `/issues/{n}` answer as the
+    # rest (GitLab: the merge request's `description`), so it costs no call.
+    body_contains: list[str] = Field(default_factory=list)
+
+    def _body_missing(self, body: object) -> str | None:
+        """Why the description fails :attr:`body_contains`, or None."""
+        text = body if isinstance(body, str) else ""
+        absent = [phrase for phrase in self.body_contains if phrase not in text]
+        if not absent:
+            return None
+        return (
+            f"its description lacks {', '.join(repr(p) for p in absent)} "
+            "(`body_contains`) -- the proposal does not carry the evidence "
+            "a reviewer needs to judge it"
+        )
 
     def _head_files(
         self, owner: str, repo: str, number: int, token: str, budget: float
@@ -6051,6 +6069,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
         changed = int(count) if count.isdigit() else None
         if changed == 0:
             return "reject", f"{slug}: changes no files, so it carries no proposed fix", None
+        missing = self._body_missing(mr.get("description"))
+        if missing:
+            return "reject", f"{slug}: {missing}", None
         head_sha = str(mr.get("sha") or "")
         pushed = None
         if head_sha:
@@ -6428,6 +6449,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 rejected.append(
                     f"{slug}: changes no files, so it carries no proposed fix"
                 )
+                continue
+            # The body as the endpoint that answered returned it: both
+            # `/issues/{n}` and `/pulls/{n}` carry `body`.
+            missing = self._body_missing(payload.get("body"))
+            if missing:
+                rejected.append(f"{slug}: {missing}")
                 continue
             if pushed and (since - pushed).total_seconds() > self.max_clock_skew_sec:
                 rejected.append(

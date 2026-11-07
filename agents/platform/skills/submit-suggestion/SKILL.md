@@ -432,13 +432,51 @@ the file and tells you to name the paths that belong in the change — so a
 description left in the working copy stops the submit instead of riding along
 in it.
 
+Write the evidence to a second file the same way. `submit` refuses a body
+without it, before anything is published, and appends it to the body as an
+`## Evidence` section:
+
+```bash
+EVIDENCE=$(mktemp -p /opt/data/scratch pr_evidence.XXXXXX.json)
+cat > "$EVIDENCE" <<'EOF'
+{
+  "finding": "<what is wrong, on which cluster and object>",
+  "checks": [
+    {"command": "<read-only command you ran>", "output": "<excerpt of what it printed>"}
+  ],
+  "change": "<what merging this changes>",
+  "verify": [
+    {"command": "<read-only command to run after merge>", "expect": "<what it should show>"}
+  ]
+}
+EOF
+```
+
+- `checks`: commands you ran this session, each with the output lines that show
+  the finding. Read-only commands only (`kubectl get`, `kubectl describe`,
+  `gcloud ... describe`). Long output is clipped.
+- `verify`: what a reviewer runs after merge to see the fix took. `expect` is
+  optional.
+- A requested change with no defect: `finding` is the request; `checks` is the
+  read that shows the current state.
+- No secret values in any field: name a Secret and its keys, never its
+  `data`. `submit` refuses any field holding a Secret manifest, a `data:` value,
+  key material or a `kubectl get secret -o …` read, and redacts known token
+  shapes; do not rely on either.
+- At most five entries per list. JSON escaping applies: `\n` for a newline,
+  `\"` for a quote.
+
 ```bash
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body-file "$BODY"
+  --body-file "$BODY" \
+  --evidence-file "$EVIDENCE"
 ```
+
+A refusal naming `--evidence-file` or an evidence field: fix the file and run
+the same `submit` again. Nothing was published.
 
 `--base <branch>` names what the change merges into, for the rare case where it
 is not the `base` Step 1 reported. It may not name the branch you are
@@ -515,8 +553,9 @@ no token to refresh.
    submit do not apply: stay on `<source>` in this copy. Stage only those specific files
    (**never `git add .` / `-A`**).
 
-   Pass `--title` and `--body-file` again so the description matches the
-   revisions now on the branch — or `--keep-description` and no body-file, when
+   Pass `--title`, `--body-file` and `--evidence-file` again so the description
+   matches the revisions now on the branch — or `--keep-description` and neither
+   file, when
    what you were asked for does not alter what the pull request is for. That
    flag keeps the title along with the body, so a `--title` passed beside it
    does **not** reach the pull request, and the run says so. It is not inert,
