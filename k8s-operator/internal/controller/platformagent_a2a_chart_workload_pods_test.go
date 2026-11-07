@@ -66,8 +66,9 @@ func chartWorkloadReconciler(objs ...client.Object) *PlatformAgentReconciler {
 
 // A PlatformAgent outside the operator's namespace with no annotation is
 // sized from the chart's workloads there (#5006): their replicas and each
-// Deployment's surge pods. The operator's own workloads, unlabelled ones and
-// a chart ConfigMap there are not counted.
+// Deployment's surge pods. The operator's own workloads, unlabelled ones,
+// another Helm chart's, a chart release's in another namespace and a chart
+// ConfigMap there are not counted.
 func TestA2AQuotaAgentCountsTheChartWorkloadsOutsideTheOperatorNamespace(t *testing.T) {
 	agent := a2aTestAgent()
 	ns := agent.Namespace
@@ -76,6 +77,9 @@ func TestA2AQuotaAgentCountsTheChartWorkloadsOutsideTheOperatorNamespace(t *test
 	own.Labels = commonLabels(agent)
 	plain := chartDeployment(ns, "unrelated", 4, nil)
 	plain.Labels = map[string]string{"app": "unrelated"}
+	otherHelm := chartDeployment(ns, "redis", 4, nil)
+	otherHelm.Labels = map[string]string{labelManagedBy: "Helm"}  // another chart's release
+	elsewhere := chartDeployment("another-ns", "litellm", 4, nil) // a chart release in another namespace
 	unset := chartDeployment(ns, "minter", 0, &one)
 	unset.Spec.Replicas = nil // the API server's default of 1
 	r := chartWorkloadReconciler(agent,
@@ -83,7 +87,7 @@ func TestA2AQuotaAgentCountsTheChartWorkloadsOutsideTheOperatorNamespace(t *test
 		chartDeployment(ns, "litellm", 2, &one), // 2 + 1
 		chartDeployment(ns, "hindsight-api", 1, nil), // 1 + 25% of 1, rounded up
 		chartStatefulSet(ns, "hindsight", 1),         // 1, no surge
-		own, plain,
+		own, plain, otherHelm, elsewhere,
 		chartPodsConfigMap(ns, map[string]string{a2aChartPodsConfigMapKey: "40"}),
 	)
 	sized, why, err := r.a2aQuotaAgent(context.Background(), agent)
