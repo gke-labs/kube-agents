@@ -28,7 +28,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | `deployment.extraVolumes` | `[]corev1.Volume` | no |  |  | ExtraVolumes specifies custom volumes to mount for the main container. The same reserved names and reserved sources as SidecarVolumes are refused at admission -- a ServiceAccount token projection for the "a2a-bus" audience, or a reference to &lt;agent&gt;-a2a-nats-creds, &lt;agent&gt;-a2a-nats-config, &lt;agent&gt;-a2a-callout-keys, &lt;agent&gt;-a2a-nats-tls, &lt;agent&gt;-a2a-nats-ca or &lt;agent&gt;-a2a-task-signing-key -- and dropped from the render on an install running the A2A surface. |
 | `deployment.extraVolumeMounts` | `[]corev1.VolumeMount` | no |  |  | ExtraVolumeMounts specifies custom volume mounts for the main container. Appended to platform-agent and platform-agent-dashboard both, so an entry naming a reserved volume is refused at admission, and dropped from the render on an install running the A2A surface. The render drops one more shape admission does not: an entry naming a user volume that was itself dropped for the credential its source carries. |
 | `deployment.podAnnotations` | `map[string]string` | no |  |  | PodAnnotations specifies custom annotations to apply to the generated Pod template. |
-| `deployment.scaleToZero` | `boolean` | no |  |  | ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods). |
+| `deployment.scaleToZero` | `boolean` | no |  |  | ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods). While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready condition False with reason ScaledToZero; clearing it restores the normal phases. |
 | `deployment.availability` | `object` | no |  |  | Availability configures high availability and scheduling settings for the agent pod. |
 | `deployment.availability.replicas` | `integer` | no |  | min `0` | Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1. The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and the ReplicasLimited status condition says so. A multi-replica gateway does not start yet, because its leader election has no in-cluster ServiceAccount token to use and the data volumes an install creates at one replica are ReadWriteOnce. |
 | `deployment.availability.nodeSelector` | `map[string]string` | no |  |  | NodeSelector is a selector which must match a node's labels for the pod to be scheduled |
@@ -218,7 +218,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 
 | Field | Type | Required | Default | Constraints | Description |
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
-| `phase` | `string` | no |  |  | Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed). |
+| `phase` | `string` | no |  |  | Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed). Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the Ready condition then reads False with reason ScaledToZero. |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
 | `address` | `string` | no |  |  | Address is the fully qualified domain name (FQDN) of the agent service. |
 | `lastReconcileTime` | `metav1.Time` | no |  |  | LastReconcileTime is the timestamp when the operator last updated this status. |
