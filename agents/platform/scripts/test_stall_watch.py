@@ -2126,14 +2126,44 @@ class ConfigConnector(Base):
         self.assertEqual(lines, [])
         self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["IAMPolicy/orders-db-access", "SQLInstance/orders-db"])
 
-    def test_more_kinds_in_a_namespace_than_the_cap_are_cut_by_name_and_held(self):
-        kinds = [f"kind{i:02d}s.k{i:02d}.cnrm.cloud.google.com" for i in range(stall_watch.WILDCARD_KINDS_CAP + 2)]
+    def test_more_kinds_in_a_namespace_than_the_cap_are_read_in_turns_and_the_ledger_says_so(self):
+        cap = stall_watch.WILDCARD_KINDS_CAP
+        kinds = [f"kind{i:02d}s.k{i:02d}.cnrm.cloud.google.com" for i in range(cap + 2)]
         objects = [("config-control", f"Kind{i:02d}", f"k{i:02d}.cnrm.cloud.google.com/v1beta1") for i in range(len(kinds))]
+        # A row of the kind that sorts last, as a SQLInstance's does behind
+        # twenty compute kinds: it must be read, and its card must close.
+        last_row = finding("config-control", f"Kind{cap + 1:02d}/db", "stale-condition", "Ready=False UpdateFailed")
         with patch.object(sys, "stderr", io.StringIO()) as err:
-            _, fake = self.run_tick({"c": {"config-control": []}}, served=SERVED_DEFAULT + kinds, objects=objects)
-        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[: stall_watch.WILDCARD_KINDS_CAP])
+            _, fake = self.run_tick({"c": {"config-control": [last_row]}}, served=SERVED_DEFAULT + kinds, objects=objects)
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[:cap])
         self.assertIn(f"has objects of {len(kinds)} kinds", err.getvalue())
-        self.assertEqual(self.ledger()["unreadable"], {})
+        scope = f"{cid('c')}/config-control"
+        self.assertIn("2 wildcard kinds wait their turn", self.ledger()["unreadable"][scope])
+        self.assertIn(kinds[-1], self.ledger()["unreadable"][scope])
+        # The planted row of the last kind is held, not cleared: that kind was not asked.
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], [f"Kind{cap + 1:02d}/db"])
+        # Next tick the window moves on: the two that waited, then the first eighteen again.
+        lines, fake = self.run_tick({"c": {"config-control": []}}, served=SERVED_DEFAULT + kinds, objects=objects)
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[cap:] + kinds[: cap - 2])
+        self.assertEqual(len(self.cleared(lines)), 1, "read on its turn, the last kind's row clears")
+        # And the third tick resumes where the second stopped.
+        _, fake = self.run_tick({"c": {"config-control": []}}, served=SERVED_DEFAULT + kinds, objects=objects)
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[cap - 2 : cap + 2] + kinds[: cap - 4])
+
+    def test_discovery_records_no_namespace_the_watch_does_not_read(self):
+        objects = KCC_OBJECTS + [("kube-system", "SQLInstance", "sql.cnrm.cloud.google.com/v1beta1"), ("load-test", "PubSubTopic", "pubsub.cnrm.cloud.google.com/v1beta1"), ("quiet", "StorageBucket", "storage.cnrm.cloud.google.com/v1beta1")]
+        fleet = {"c": {"payments": [], "config-control": [], "load-test": [], "quiet": []}}
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "load-test"}):
+            _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=objects, namespaces_extra=["kube-system"], annotations={"quiet": {stall_watch.EXEMPT_ANNOTATION: stall_watch.EXEMPT_VALUE}})
+        record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_KINDS_KEY]
+        self.assertEqual(record, {KCC_SQL: ["payments"], KCC_TOPICS: ["config-control"], KCC_BUCKETS: []}, "a system, an excluded and an exempt namespace reach no record")
+        self.assertEqual(sorted(fake.scanned()), ["config-control", "payments"])
+
+    def test_a_plain_kind_the_wildcard_also_finds_is_read_once(self):
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: KCC_SQL + "," + stall_watch.KCC_KINDS_WILDCARD}):
+            _, fake = self.run_tick({"c": {"payments": [], "web": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.kinds_asked("payments"), [KCC_SQL], "once, not once from the list and once from discovery")
+        self.assertEqual(fake.kinds_asked("web"), [KCC_SQL], "the plain kind is read everywhere, as before")
 
     def test_refreshes_are_spread_over_ticks_and_first_discoveries_are_not(self):
         fleet = {"a": {"payments": []}, "b": {"payments": []}, "c": {"payments": []}}

@@ -80,10 +80,11 @@ own condition or reference.
 
 Why a group wildcard. Config Connector serves some three hundred namespaced
 kinds under groups ending in ``.cnrm.cloud.google.com``, and a managed
-resource whose reconcile fails is silent in every other path: its controller
-does not crash, logs only on the object, and records at most a Warning event
-there. The object's own ``Ready`` condition is the signal, and
-``stall_report.py``'s stale-condition heuristic reads it; Config Connector's
+resource whose reconcile fails shows it in two places only: its controller
+does not crash and logs only on the object; it records at most a Warning
+event there, which the event watcher forwards, and it sets the object's own
+``Ready`` condition, which ``stall_report.py``'s stale-condition heuristic
+reads, event or no event. Config Connector's
 ``ConfigConnector`` status reports the controller's health, not the managed
 resources'. So the default list carries ``*.cnrm.cloud.google.com``, which
 stands for every served kind in such a group. Listing all of them in every
@@ -95,8 +96,15 @@ namespace), keeps that in the ledger, redoes it after
 namespace only the kinds found there, at most ``WILDCARD_KINDS_CAP``. A kind
 discovery could not read, or that appeared since, is held as unread, so its
 rows are never judged absent; a kind that gained its first object between
-refreshes is read from the next refresh. An explicit ``STALL_WATCH_KINDS``
-replaces the wildcard with the rest of the default list, and may name it.
+refreshes is read from the next refresh. A namespace with more kinds than
+the cap is read in turns: the cap's worth this tick, the next ones the next
+tick, round and round, every kind within a few ticks and never one left out
+for good; the ledger's ``unreadable`` entry for the namespace says so while
+it lasts. The discovery lists every namespace in one request (metadata
+only), but only the namespaces the watch reads reach its record: the system
+namespaces, ``STALL_WATCH_EXCLUDE_NAMESPACES`` and the exempt annotation
+keep theirs out of it. An explicit ``STALL_WATCH_KINDS`` replaces the
+wildcard with the rest of the default list, and may name it.
 
 What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
 script as three variables the operator pins in the managed .env on every
@@ -346,9 +354,12 @@ DISCOVERY_COLUMNS = 3
 DISCOVERY_REFRESH_SECONDS = 6 * 60 * 60
 DISCOVERY_RETRY_SECONDS = 60 * 60
 DISCOVERY_REFRESHES_PER_TICK = 2
-#: The most wildcard kinds read in one namespace, the cap the CR puts on an
-#: explicit kind list. Beyond it the first kinds by name are read and the rest
-#: held as unread, and stderr says so.
+#: The most wildcard kinds read in one namespace on one tick, the cap the CR
+#: puts on an explicit kind list. A namespace with more is read in turns:
+#: this many this tick, the next ones the next tick, wrapping, so every kind
+#: is read within ceil(kinds / cap) ticks and none is left out by its name.
+#: The kinds not read this tick are held, and the ledger's unreadable entry
+#: for the namespace says so.
 WILDCARD_KINDS_CAP = 20
 #: stall_report.py exits 0 after skipping a kind or the events it could not
 #: read and says so on stderr, naming the resource; such a scan clears no
@@ -391,6 +402,9 @@ DISCOVERED_KINDS_KEY = "discovered_kinds"
 DISCOVERY_AT_KEY = "at"
 DISCOVERY_KINDS_KEY = "kinds"
 DISCOVERY_UNKNOWN_KEY = "unknown"
+#: Per namespace, where the next tick's window of WILDCARD_KINDS_CAP kinds
+#: starts in that namespace's sorted kind list; absent or stale means 0.
+DISCOVERY_TURN_KEY = "turn"
 CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: What a failed first read on a reused kubeconfig says when the kubeconfig
 #: itself is the problem, so one more fetch repairs it: the shim's refusal of
@@ -763,7 +777,8 @@ def join_kinds(base: str | None, extra: list[str] | None) -> str | None:
     string is a namespace nothing is asked about."""
     if base is None:
         return None
-    return KINDS_SEPARATOR.join([k for k in base.split(KINDS_SEPARATOR) if k] + list(extra or []))
+    # A plain kind the wildcard also found in this namespace is read once.
+    return KINDS_SEPARATOR.join(dict.fromkeys([k for k in base.split(KINDS_SEPARATOR) if k] + list(extra or [])))
 
 
 def excluded_namespaces() -> frozenset[str]:
@@ -980,9 +995,14 @@ def resource_for(kind: str, api_version: str, batch: list[str]) -> str | None:
     return None
 
 
-def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None) -> dict:
-    """Which of `candidates` have objects on the cluster, and in which
-    namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
+def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None, namespaces: set[str] | None = None) -> dict:
+    """Which of `candidates` have objects on the cluster, and in which of
+    `namespaces` (the ones the watch reads; every namespace when None), from
+    DISCOVERY_BATCH_KINDS kinds per `kubectl get`. The listing is one request
+    over every namespace, metadata only, and an object in a namespace the
+    watch does not read (a system namespace, an excluded one, an exempt one)
+    is dropped before the record is made, so the record names no namespace
+    the operator kept the watch out of. A kind
     the `previous` record names whose group is not among the candidates
     (`lost_kinds`) is not listed and is carried into the new record as it
     was, unknown if it was unknown: the api-resources listing lost the
@@ -1030,6 +1050,8 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
                 if resource is None:
                     unmapped.add(f"{kind}.{api_version.split('/', 1)[0]}")
                     continue
+                if namespaces is not None and namespace not in namespaces:
+                    continue
                 seen.setdefault(resource, set()).add(namespace)
         if unmapped:
             sys.stderr.write(f"stall_watch: discovery listed objects of {', '.join(sorted(unmapped))} that match no listed resource name; not read\n")
@@ -1060,12 +1082,15 @@ def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: li
     held as unread wherever they are not read this tick (unknown to the
     record, served since it was made, or in a group the api-resources listing
     no longer shows, which is a listing gap until a discovery says otherwise);
-    and the kinds held in one namespace because the cap cut them there. A
-    kind the record names is read where the record saw it even when it is
-    held: held stops a row clearing, not a read. A kind the record names
-    that the listing no longer serves while its group is served is neither
-    read nor held: a deleted CRD took its objects with it, and its rows
-    clear against the scan."""
+    and the kinds held in one namespace because they wait their turn there:
+    a namespace with more kinds than WILDCARD_KINDS_CAP is read a window at
+    a time, the window moving on each tick (DISCOVERY_TURN_KEY on the record,
+    advanced here), so every kind is read within a few ticks and none is
+    left out by where its name sorts. A kind the record names is read where
+    the record saw it even when it is held: held stops a row clearing, not a
+    read. A kind the record names that the listing no longer serves while
+    its group is served is neither read nor held: a deleted CRD took its
+    objects with it, and its rows clear against the scan."""
     known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
     if not isinstance(known, dict):
         return {}, set(candidates), {}
@@ -1078,14 +1103,22 @@ def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: li
         for namespace in namespaces or []:
             by_namespace.setdefault(str(namespace), []).append(resource)
     cut: dict[str, set[str]] = {}
+    turns = record.get(DISCOVERY_TURN_KEY) if isinstance(record.get(DISCOVERY_TURN_KEY), dict) else {}
+    next_turns: dict[str, int] = {}
     for namespace, resources in by_namespace.items():
-        if len(resources) > WILDCARD_KINDS_CAP:
-            cut[namespace] = set(resources[WILDCARD_KINDS_CAP:])
-            by_namespace[namespace] = resources[:WILDCARD_KINDS_CAP]
-            sys.stderr.write(
-                f"stall_watch: {label} namespace {namespace} has objects of {len(resources)} kinds under {', '.join(wildcards)}; "
-                f"the first {WILDCARD_KINDS_CAP} by name are read and the rest held as unread\n"
-            )
+        if len(resources) <= WILDCARD_KINDS_CAP:
+            continue
+        start = turns.get(namespace, 0)
+        start = start % len(resources) if isinstance(start, int) else 0
+        window = (resources + resources)[start : start + WILDCARD_KINDS_CAP]
+        cut[namespace] = set(resources) - set(window)
+        by_namespace[namespace] = window
+        next_turns[namespace] = (start + WILDCARD_KINDS_CAP) % len(resources)
+        sys.stderr.write(
+            f"stall_watch: {label} namespace {namespace} has objects of {len(resources)} kinds under {', '.join(wildcards)}; "
+            f"{WILDCARD_KINDS_CAP} are read this tick and the rest wait their turn\n"
+        )
+    record[DISCOVERY_TURN_KEY] = next_turns
     return by_namespace, held, cut
 
 
@@ -1610,7 +1643,7 @@ def sweep_fleet(
             if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed, candidates):
                 if record is not None:
                     refreshed += 1
-                record = discover_kinds(kubeconfig, candidates, now, record)
+                record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
                 discoveries[cid] = record
             if wildcards and (candidates or record is not None):
                 extra_kinds, held, cut = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))
@@ -1672,6 +1705,11 @@ def sweep_fleet(
                 sweep.partial_scopes[scope_key(cid, namespace)] = not_asked
             if unread:
                 sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
+            elif cut.get(namespace):
+                sweep.unreadable[scope_key(cid, namespace)] = (
+                    f"partial: {len(cut[namespace])} wildcard kinds wait their turn behind the {WILDCARD_KINDS_CAP} read this tick: "
+                    f"{', '.join(sorted(cut[namespace]))}"
+                )
             for f in findings:
                 # An object with the exempt annotation: its rows are not the
                 # watch's to alert on, and its ledger rows go this tick.
