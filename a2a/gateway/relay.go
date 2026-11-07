@@ -809,7 +809,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		// A Slack Stop answers with its own one reply (slack_stop.go).
+		// A Stop button answers for itself: Slack's with one reply
+		// (slack_stop.go), Google Chat's on the line (chat_stop_press.go).
 		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
@@ -839,7 +840,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
@@ -871,7 +872,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if g.cfg.DisplayMode == displayModeDefault {
 			progress = ""
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs)
+		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -1106,7 +1107,7 @@ func isReasonTokenByte(c byte) bool {
 // split, honoured here rather than reinvented.
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
+	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" || active.LineClosed {
 		return
 	}
 	if rs.busyShown && lineStillSubmitted(rs) {
@@ -1127,14 +1128,23 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// artifact renders this same line, so a failed edit recorded as sent
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
-	if g.renderLine(rec.Key, active.StatusMsgID, line, rs) {
+	// A detached task (a typed stop, its terminal pending) keeps its line
+	// moving, with no Stop control: the stop is sent.
+	stop := taskID
+	if active.Detached {
+		stop = ""
+	}
+	if g.renderLine(rec.Key, active.StatusMsgID, line, rs, stop) {
 		rs.lastLine = lineKey(line, rs) // after the render, which may have found the backend text-only
 	}
 }
 
 // editLine edits one status message and reports whether the edit landed.
-func (g *Gateway) editLine(conversation, messageID, line string) bool {
-	if err := g.adapter.Edit(conversation, messageID, truncateRunes(line, discordChunk)); err != nil {
+// stop names the task when its line is still a running task's, which keeps
+// the Stop control a backend draws on it (OutMessage.Stop); the terminal
+// edit passes none and takes it off.
+func (g *Gateway) editLine(conversation, messageID, line, stop string) bool {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: truncateRunes(line, discordChunk), Stop: stop}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}
