@@ -589,7 +589,8 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if conversation != "" && a.rates(m) {
 		rating.task = m.Feedback
 	}
-	rated := gchatChatLayout{Text: layout.Text, Widgets: gchatWithRating(layout.Widgets, rating)}
+	rated := layout
+	rated.Widgets = gchatWithRating(layout.Widgets, rating)
 	message, landed, err = a.create(space, thread, gchatLayoutBody(rated))
 	if err != nil {
 		err = gchatLayoutError(err, false)

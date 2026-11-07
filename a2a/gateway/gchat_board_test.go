@@ -295,10 +295,10 @@ func TestGchatBoardTapAfterARestartEditsFromTheEventsCopy(t *testing.T) {
 }
 
 // An edit of the message through the notify route refreshes what a tap
-// edits from; one that lays no such rows out forgets it, and a tap then
-// reads the event's copy. A row the text no longer holds is not edited, and
-// the row is released for another tap.
-func TestGchatBoardEditRefreshesTheRecordAndAGoneRowIsReleased(t *testing.T) {
+// edits from; one that lays no such rows out forgets it and marks the
+// message, so a tap from a client still showing the old card is dropped
+// before it acts.
+func TestGchatBoardEditRefreshesTheRecordAndASettleDropsOldTaps(t *testing.T) {
 	a, f, actor := newBoardGchatAdapter(t)
 	postBoardCard(t, a)
 	again := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
@@ -760,5 +760,156 @@ func TestGchatBoardRowTextWithANoteInItIsKept(t *testing.T) {
 	body = checkPatch(t, f, 2, gchatBoardMessage)
 	if want := "*1 task is stuck.*\n\n1. *Triage x — Dropped. from the queue* — Dropped. Test Sender, 15:04 UTC"; body["text"] != want {
 		t.Errorf("after the drop =\n%s\nwant\n%s", body["text"], want)
+	}
+}
+
+// A tap on a message the adapter does not remember (posted before a
+// restart) is dropped before it acts when the click's own copy of the
+// message, the only thing the tap can edit from, no longer draws the row:
+// the message settled to text, or the row's buttons name other cards.
+func TestGchatBoardTapAfterARestartOnASettledMessageIsDroppedBeforeActing(t *testing.T) {
+	a, f, actor := newBoardGchatAdapter(t)
+	settled := gchatBoardTap(t, "drop", 1, "t_1,t_2")
+	settled.Message.Text = "settled: all done"
+	settled.Message.AccessoryWidgets = nil
+	if _, reason := a.classify(settled); reason != gchatBoardStale {
+		t.Errorf("a tap on a settled message with no record: %q", reason)
+	}
+	shown, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := gchatBoardTap(t, "drop", 2, "t_9")
+	other.Message.Text = shown.Text
+	other.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
+	if _, reason := a.classify(other); reason != gchatBoardStale {
+		t.Errorf("a tap whose row now names other cards: %q", reason)
+	}
+	if n := len(actor.taken()); n != 0 {
+		t.Errorf("a dropped tap acted: %d board actions", n)
+	}
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("a dropped tap edited the message: %d relay calls", n)
+	}
+	// The row is not claimed: the same tap with a copy that draws it acts.
+	live := gchatBoardTap(t, "drop", 1, "t_1,t_2")
+	live.Message.Text = shown.Text
+	live.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
+	if _, reason := a.classify(live); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Errorf("the tap with a copy that draws the row: %q", reason)
+	}
+}
+
+// A rated card (posted in a conversation, with the rating buttons after
+// the row buttons) is remembered with the rows where the renderer put them,
+// so a tap edits its row and not a numbered list in the fold as long as the
+// rows. The layouts an answer and a rating edit derive keep the rows too.
+func TestGchatBoardRatedCardIsEditedByTheRecordedRows(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	a.SetFeedbackRecorder(&fakeRecorder{admit: map[string]bool{"sender@example.com": true}})
+	card := gchatBoardCard()
+	card.After = nil
+	card.Fold = &chatmsg.Fold{Title: "why", Text: "1. x\n2. y\n3. z"}
+	if _, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: card, Feedback: "t-root"}); err != nil {
+		t.Fatal(err)
+	}
+	if buttons := bodyButtons(t, callBody(t, f.call(0))); len(buttons) != 6 {
+		t.Fatalf("the rated card's buttons = %+v, want four row buttons and two rating buttons", buttons)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	want := "*2 tasks are stuck and need someone to decide.*\n\n" +
+		"1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n" +
+		"2. *Open GitOps PR for y* · Waiting on you.\n3. *Too many to act on*\n\n*why*\n1. x\n2. y\n3. z"
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); len(texts) != 4 || strings.Join(texts[:2], ",") != "Retry 2,Drop 2" {
+		t.Errorf("buttons after the tap = %v, want row 2's and the rating pair", texts)
+	}
+	layout, err := renderGchatChat(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, derived := range map[string]gchatChatLayout{
+		"answered":       gchatAnsweredLayout(layout, nil, gchatRating{}, "line"),
+		"without rating": gchatWithoutRating(gchatWithRatingLayout(layout, gchatRating{task: "t-root"})),
+	} {
+		if derived.RowsStart != layout.RowsStart || derived.RowsCount != layout.RowsCount {
+			t.Errorf("the %s layout lost the rows: %d for %d, want %d for %d", name, derived.RowsStart, derived.RowsCount, layout.RowsStart, layout.RowsCount)
+		}
+	}
+}
+
+// gchatWithRatingLayout is layout with r's buttons after its own.
+func gchatWithRatingLayout(layout gchatChatLayout, r gchatRating) gchatChatLayout {
+	rated := layout
+	rated.Widgets = gchatWithRating(layout.Widgets, r)
+	return rated
+}
+
+// A tap whose edit fails forgets the message's record, since the edit may
+// have landed. A second tap, claimed while the record stood and whose cards
+// were acted on, then draws its outcome from its own copy of the message,
+// as a tap after a restart does, rather than leaving the row's buttons up
+// over an action already taken. The first tap's row is free again.
+func TestGchatBoardFailedEditLetsAConcurrentTapDrawFromItsCopy(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	a.syncRewrites = false
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 500, reason: "backend error"}}
+	firstGo, secondGo := make(chan struct{}), make(chan struct{})
+	a.SetBoardActor(func(_ context.Context, act lib.BoardAction) (*lib.BoardActionResult, error) {
+		if act.Tasks[0] == "t_1" {
+			<-firstGo
+		} else {
+			<-secondGo
+		}
+		res := &lib.BoardActionResult{Action: act.Action}
+		for _, id := range act.Tasks {
+			res.Results = append(res.Results, lib.BoardActionOutcome{ID: id, Outcome: lib.BoardOutcomeDone})
+		}
+		return res, nil
+	})
+	shown, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("first tap: %q", reason)
+	}
+	second := gchatBoardTap(t, "drop", 2, "t_3")
+	second.Message.Text = shown.Text
+	second.Message.AccessoryWidgets = gchatShownWidgets(t, shown)
+	if _, reason := a.classify(second); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("second tap: %q", reason)
+	}
+	// The first tap's edit fails while the second is still acting.
+	close(firstGo)
+	waitFor(t, "the first tap's failed edit to forget the record", func() bool {
+		_, remembered, _ := a.boardLayoutOf(gchatBoardMessage)
+		return !remembered
+	})
+	close(secondGo)
+	a.rewrites.Wait()
+	if n := relayCallCount(f); n != 3 {
+		t.Fatalf("%d relay calls, want the create, the failed edit and the second tap's edit", n)
+	}
+	body := checkPatch(t, f, 2, gchatBoardMessage)
+	want := strings.Replace(gchatBoardCardText, "Waiting on you.\n", "Waiting on you. — Dropped. Test Sender, 15:04 UTC\n", 1)
+	if body["text"] != want {
+		t.Errorf("the second tap's edit =\n%s\nwant\n%s", body["text"], want)
+	}
+	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 1,Drop 1" {
+		t.Errorf("buttons after the second tap = %v", texts)
+	}
+	a.syncRewrites = true
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 2, "t_3")); reason != gchatBoardBusy {
+		t.Errorf("a tap on the settled row: %q", reason)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Errorf("a tap on the failed edit's row: %q", reason)
 	}
 }

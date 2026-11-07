@@ -630,7 +630,10 @@ func gchatAnsweredLayout(layout gchatChatLayout, links []chatmsg.Link, rating gc
 	if text != "" {
 		text += gchatChatSectionGap
 	}
-	return gchatChatLayout{Text: text + line, Widgets: gchatWithRating(gchatChatWidgets(nil, links), rating)}
+	answered := layout
+	answered.Text = text + line
+	answered.Widgets = gchatWithRating(gchatChatWidgets(nil, links), rating)
+	return answered
 }
 
 // answeredLayout keeps an answered question's line through a later edit of

@@ -202,10 +202,11 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 // list left empty by that removed with them, so gchatWithRating draws one
 // pair on it again (gchatWithoutButtons).
 func gchatWithoutRating(layout gchatChatLayout) gchatChatLayout {
-	widgets := gchatWithoutButtons(layout.Widgets, func(b map[string]any) bool {
+	unrated := layout
+	unrated.Widgets = gchatWithoutButtons(layout.Widgets, func(b map[string]any) bool {
 		return gchatButtonFunction(b) == gchatFeedbackFunction
 	})
-	return gchatChatLayout{Text: layout.Text, Widgets: widgets}
+	return unrated
 }
 
 // classifyGchatButton tells what a decoded button does by its function, or

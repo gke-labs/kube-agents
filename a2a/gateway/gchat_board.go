@@ -256,9 +256,14 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	}
 	// A message laid out again since the client drew its buttons: the row
 	// the tap names is not the row n the message shows now, or the message
-	// shows no rows at all.
+	// shows no rows at all. A message with no record (posted before a
+	// restart) is edited from the click's own copy, so that copy must still
+	// draw the row, or the tap would act on cards it cannot report on.
 	layout, remembered := ux.board[message]
-	if ux.boardMoved[message] || (remembered && !gchatBoardRowHolds(layout, n, tasks)) {
+	if !remembered {
+		layout = gchatEventLayout(ev.Message)
+	}
+	if ux.boardMoved[message] || !gchatBoardRowHolds(layout, n, tasks) {
 		a.mu.Unlock()
 		return gchatBoardStale
 	}
@@ -275,18 +280,15 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
 		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
 	a.goRewrite(func() {
-		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner, remembered: remembered}, verb, n, tasks, name, actor)
+		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner}, verb, n, tasks, name, actor)
 	})
 	return gchatBoardTaken + verb
 }
 
-// gchatBoardClaim is a tap's hold on its row: the claim's key, the tap's
-// own name in it, and whether the message's layout was on record when the
-// tap was taken, so a record gone since is a message laid out again, not
-// one never remembered.
+// gchatBoardClaim is a tap's hold on its row: the claim's key and the tap's
+// own name in it.
 type gchatBoardClaim struct {
 	key, owner string
-	remembered bool
 }
 
 // runBoardTap acts on the row's cards and edits the row. A tap that
@@ -313,11 +315,12 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	// again in it (trackBoard frees the claims and replaces or drops the
 	// record): the outcome belongs to the row the tap named, not to
 	// whatever is row n now, so it is drawn only where that row, with those
-	// cards, still is. A record gone since the tap was taken, or a message
-	// marked as laid out without rows, is such a message, and the tap's own
-	// copy of it (the click's) is stale; only a message never remembered
-	// (posted before a restart) is read from that copy.
-	if moved || (claim.remembered && !remembered) {
+	// cards, still is. A message marked as laid out without rows is such a
+	// message, and the tap's own copy of it (the click's) is stale. A
+	// message with no record, never remembered (posted before a restart) or
+	// forgotten since the tap was taken (an edit that failed, below), is
+	// read from that copy.
+	if moved {
 		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
 		return
