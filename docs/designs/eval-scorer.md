@@ -115,7 +115,8 @@ One conjunction never reaches rung 3: an empty `trajectory` together with `token
 exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
-429s, #1137's unestablishable tunnels), and the launcher writes it too, on a record with no scores
+429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
+guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
 map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
 attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran

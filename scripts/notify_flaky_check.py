@@ -529,7 +529,7 @@ def occurrence(current, previous, pull_request, test_ids=()):
     issue can list every test the flake has surfaced through.
     `triggering_actor` on the green attempt is whoever clicked re-run, which
     on a re-run is a person -- unlike `actor`, which is who opened the pull
-    request or, on `main`, Tide. A re-run made by `/retest`
+    request or, on `main`, the merge queue's bot. A re-run made by `/retest`
     (`rerun_failed_checks.py`) carries the Actions bot here; the comment on
     the pull request names the person.
     """

@@ -142,13 +142,26 @@ class VcsError(RuntimeError):
     """
 
     def __init__(
-        self, message: str, *, code: str | None = None, detail: str | None = None, revision: str | None = None
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        detail: str | None = None,
+        revision: str | None = None,
+        entries: list | None = None,
+        ceiling: int | None = None,
     ):
         super().__init__(message)
         self.code = code or None
         self.detail = detail or None
         # The commit the broker read, on a refusal that has one (`PATH_NOT_FOUND`).
         self.revision = revision or None
+        # On `SNAPSHOT_TOO_LARGE`: the entries one level down, each with what a
+        # snapshot of it alone measures, and the ceiling, for a caller that
+        # asks again with `paths`. Not printed: a listing is for a script, and
+        # it can name thousands of entries.
+        self.entries = entries if isinstance(entries, list) else None
+        self.ceiling = ceiling if isinstance(ceiling, int) and not isinstance(ceiling, bool) else None
 
     def as_json(self) -> dict:
         answer = {"error": str(self)}
@@ -359,6 +372,8 @@ def _call(verb: str, payload: dict) -> dict:
             code=code,
             detail=payload.get("detail"),
             revision=payload.get("revision"),
+            entries=payload.get("entries"),
+            ceiling=payload.get("ceiling"),
         ) from exc
     except credential_proxy_client.TokenUnavailable as exc:
         # The projected token is missing or empty -- the kubelet mid-rewrite,
@@ -422,8 +437,7 @@ def local_git(cwd: Path, *args: str, check: bool = True, text: bool = True) -> s
     repository supplied. A bundle carries objects and refs and no config, so the
     only config this copy has is the one git just wrote — which means a
     `.gitattributes` naming `filter.foo.clean` finds no `foo` defined and is
-    inert, the same reasoning `content_workspace` makes about the broker's
-    trees. `core.hooksPath` is pointed at an empty directory rather than left to
+    inert. `core.hooksPath` is pointed at an empty directory rather than left to
     default, because a hook is the one thing that would not need a config entry
     to have been supplied. `safe.bareRepository=explicit` stops git from
     opening a directory of files laid out as a bare repository, and so from

@@ -964,10 +964,11 @@
 # The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
 # install's Cluster Agent count, which no CI install does yet, so here the
 # block names every agent and the lookup is never called. What the nightly
-# grades is that the card's assignee was seeded-a's agent (kanban_create's
-# arguments, which the inject trace carries) and that the answer named its
-# namespaces; the worker_agents check is set aside on the inject lane, and
-# the lookup route is guarded only once an eval install sets the threshold.
+# grades is that a card was filed and that the answer named seeded-a's
+# namespaces; the route entry (the card's assignee, then the worker) is set
+# aside on the inject lane, whose trace shapes the router's arguments, and
+# is graded over the agent API until #2619; the lookup route is guarded
+# only once an eval install sets the threshold.
 # deployer: noop, read-only, reads seeded-a through its own agent, one
 # front-door turn plus the card round trip: +3 units.
 ./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
@@ -1240,6 +1241,16 @@
 # enabled on the next-mode eval install via profiles.tse.enabled=true in
 # hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
+
+# The API deprecation scan reads a repository over the broker's snapshot
+# ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
+# (#4705), is a public tree over the ceiling with one manifest on a removed
+# apiVersion; the scan reads it with no credential, so it needs no pool change.
+# Red on main 5a4cdc5e and three greens on #4776's build, on the
+# devops-bench-complex-evals dev install (today mode, agent API). On this
+# file's inject lane only the report checks grade (the task header says
+# which), so the api lane is the red's home.
+./tasks/upgrades-api-deprecation-large-repo/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history
 # rule: the capacity failures among each seeded cluster's upgrade and repair

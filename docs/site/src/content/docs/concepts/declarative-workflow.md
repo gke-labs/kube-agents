@@ -102,7 +102,7 @@ Unless the run could not see the whole fleet. A cluster that was skipped, or one
 
 A `manual` finding from the obtainability, compliance and AI security audits and the fleet-wide cost analysis gets notes that say where to make the fix. A `manifest` or `gcloud` finding gets no such note (the [Config Connector paragraph](#when-config-connector-is-not-applying-a-file) is a different note). Neither does a finding whose fix an open remediation pull request carries: a pull request whose delta block names the finding, or one on the branch the audit promised for the fix. A pull request opened by hand, outside the audit, does not count, and the row keeps its notes.
 
-The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. Context repositories are not read. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker holds the repository for the sandbox.
+The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. Context repositories are not read. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker sends one revision of the repository and keeps no copy of it.
 
 The collector writes no location note when:
 
