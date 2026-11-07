@@ -122,6 +122,13 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
 EVAL_VARIANT_FROM_REPORT = "from_report"
+# The greeting for a first turn after the report was filed as a ledger issue:
+# the request carries the issue's address ("url") and, optionally, when it was
+# filed ("filed_at", epoch seconds); the plugin greets exactly as it would from
+# the delivery stage's record, without reading or writing one.
+EVAL_VARIANT_FILED = "filed"
+EVAL_KEY_URL = "url"
+EVAL_KEY_FILED_AT = "filed_at"
 EVAL_KEY_REPORT = "report"
 # A bare file name beside the real report that nothing in onboarding reads.
 EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
@@ -331,13 +338,14 @@ def _set_home_channel_if_unset(**kwargs: Any) -> bool:
     return True
 
 
-def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, bool]]:
+def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[Any, bool]]:
     """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn. Else it returns two values:
-    whether to give the completed greeting, and whether to greet as if this
-    turn set the home channel. The file stays for the stack's destroy step, so
-    a retry of the same turn greets again.
+    which greeting to give (True for the completed one, False for the one in
+    progress, or the filed report's record for the pointer greeting), and
+    whether to greet as if this turn set the home channel. The file stays for
+    the stack's destroy step, so a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -347,6 +355,8 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
             home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
             report_name = str(request.get(EVAL_KEY_REPORT) or "")
+            url = str(request.get(EVAL_KEY_URL) or "")
+            filed_at = request.get(EVAL_KEY_FILED_AT)
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -378,9 +388,14 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
         if variant == EVAL_VARIANT_FROM_REPORT and not EVAL_REPORT_NAME.match(report_name):
             logger.warning("Ignoring %s: %s names no report file matching %s.", marker, EVAL_KEY_REPORT, EVAL_REPORT_NAME.pattern)
             continue
+        if variant == EVAL_VARIANT_FILED and not url.startswith(URL_SCHEME_PREFIX):
+            logger.warning("Ignoring %s: %s names no web address.", marker, EVAL_KEY_URL)
+            continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
         if variant == EVAL_VARIANT_FROM_REPORT:
             return _report_ready(data_dir, report_name), home_channel_set
+        if variant == EVAL_VARIANT_FILED:
+            return {REPORT_FILED_URL_KEY: url, REPORT_FILED_AT_KEY: filed_at}, home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
 
@@ -713,7 +728,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if platform_name == EVAL_PLATFORM:
         eval_request = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
         if eval_request is not None:
-            return _greeting(data_dir, *eval_request)
+            which, home_set = eval_request
+            if isinstance(which, dict):
+                return _filed_greeting(data_dir, which, home_set)
+            return _greeting(data_dir, which, home_set)
 
     # A bridged conversation keeps one session, so if its route could not be
     # read (or the bridge could not record it) on the first message, a later

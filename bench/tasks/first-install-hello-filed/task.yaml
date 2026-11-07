@@ -1,0 +1,157 @@
+---
+id: first-install-hello-filed
+name: The first-install hello, report already filed as an issue, answers first and links it once
+fixtures: []
+# The greeting a new user gets on their first chat turn when nobody wrote to the
+# install within a day of its first inventory sweep, so the delivery stage filed
+# the ranked report as a ledger issue in the GitOps repository instead of
+# posting it into a thread (agents/chat/scripts/bootstrap_delivery.py). The
+# bootstrap_onboarding plugin then greets that turn once with a pointer to the
+# issue, after the answer, never in front of it (plugin.py, _FALLBACK_REPORT_FILED
+# and the chat UX rules). The stack arms the plugin's eval seam with the filed
+# variant, which carries the issue's address; the plugin reads and writes no
+# record for it, so the install's own onboarding state is untouched.
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/first-install-hello"
+  teardown: true
+  variables:
+    case_suffix: "filed"
+    variant: "filed"
+    filed_url: "https://github.com/example-org/gitops/issues/75"
+    phrase: "set you up last week"
+validated: false
+domain: chat-and-routing
+owner: lapis2002
+tool_calls_optional: true
+prompt: "hi! priya here, set you up last week"
+expected_output: |
+  critical requirements:
+  - One short message that opens "Hi there", because the API server carries no
+    Slack profile name and the typed "priya" is not one, and introduces itself as kube-agents,
+    with no internal agent names and no architecture.
+  - After that answer, one sentence says the first-run inventory report was
+    ready before anyone wrote, so it was filed as an issue, and gives the issue's
+    address https://github.com/example-org/gitops/issues/75 exactly once. That
+    sentence is not the first thing in the message.
+  - It does not say the results are in this chat, that it is still looking, or
+    that it will post the findings later.
+  - It asks for nothing else: no SOPs, runbooks, governance or time zone.
+  - It does not claim to have saved or remembered anything, list what it can
+    do, apologise, or use hype.
+verification_spec:
+  - name: greets-with-the-fallback-without-a-profile-name
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["hi there"]
+      forbidden_phrases: ["priya"]
+      forbidden_patterns: ['\A(?!\s*hi there)']
+
+  - name: says-it-is-kube-agents
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["kube-agents"]
+
+  - name: links-the-issue-exactly-once
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["github.com/example-org/gitops/issues/75"]
+      forbidden_patterns:
+        - 'github\.com/example-org/gitops/issues/75[\s\S]*github\.com/example-org/gitops/issues/75'
+
+  # Answer first: the link sentence comes after the greeting, not as its first
+  # sentence. The first sentence ends at the first period, question mark or
+  # exclamation mark; a link inside it is the pointer in front of the answer.
+  - name: the-link-is-not-the-first-sentence
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A[^.!?]*github\.com/example-org/gitops/issues/75']
+
+  - name: says-the-report-was-filed-as-an-issue
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["filed", "as an issue", "in an issue"]
+
+  - name: does-not-place-the-report-in-this-chat
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - "in this chat"
+        - "in the chat"
+        - "still (running|looking|scanning)"
+        - "\\b(i'?ll|i will|will) (post|share|send) (what|the (results|findings|summary))"
+
+  - name: at-most-eighty-words
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\A\s*(?:\S+\s+){80}\S']
+
+  - name: no-architecture
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases:
+        [
+          "planning agent",
+          "platform agent",
+          "cluster agent",
+          "specialist",
+          "kanban",
+          "hierarchy",
+        ]
+
+  - name: no-stacked-asks
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        ['\bsops?\b', '\brunbooks?\b', "time ?zone", "governance"]
+
+  - name: claims-no-save
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns: ['\b(saved|remember(ed)?|noted|stored)\b']
+
+  - name: no-capability-list
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?m)^\s*(?:[-•]|\d+[.)])\s'
+        - "i can help( you)? with"
+
+  - name: no-apology-hype-or-filler
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\b(sorry|apologi[sz]e)'
+        - '\b(excited|thrilled|delighted|supercharge|seamless)'
+        - "let me know"
+        - "good (morning|afternoon|evening)"

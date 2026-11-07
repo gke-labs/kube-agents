@@ -62,6 +62,7 @@ locals {
   request = jsonencode(merge(
     { phrase = var.phrase, variant = var.variant, home_channel_set = var.home_channel_set },
     var.variant == "from_report" ? { report = local.report_name } : {},
+    var.variant == "filed" ? { url = var.filed_url } : {},
   ))
   # The sandbox's data volume, as bootstrap_delivery.py's SANDBOX_HOME names it.
   sandbox_report = "/opt/data/${local.report_name}"

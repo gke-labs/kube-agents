@@ -741,6 +741,23 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIn("SCAN IN PROGRESS", result["context"])
         self.assertIn("IN-PROGRESS-INSTRUCTIONS", result["context"])
 
+    def test_eval_marker_filed_gives_the_pointer_greeting_without_a_record(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="https://github.com/acme/fleet/issues/75", filed_at=1794003335)
+        first = self._eval_call()
+        self.assertIn("REPORT FILED", first["context"])
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertIn("(filed 2026-11-06 22:15 UTC)", first["context"])
+        self.assertFalse((self.data_dir / plugin.REPORT_FILED_MARKER).exists(), "the seam reads and writes no record")
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists(), "a retried turn greets again")
+
+    def test_eval_marker_filed_without_an_address_is_ignored(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="not a url")
+        self.assertIsNone(self._eval_call())
+
+    def test_eval_marker_filed_with_home_channel_set_adds_the_sentence(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="https://github.com/acme/fleet/issues/75", home_channel_set=True)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
+
     def test_eval_marker_variant_picks_the_completed_instructions(self):
         self._plant(variant="completed")
         result = self._eval_call()
