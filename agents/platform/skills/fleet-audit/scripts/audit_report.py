@@ -1358,9 +1358,18 @@ RELATIVE_AGE_RE = re.compile(
 RELATIVE_AGE_ANCHOR = " as of "
 # The date the pass writes after the anchor: the day of the run, in UTC.
 RELATIVE_AGE_DATE_FORMAT = "%Y-%m-%d"
-# What opens and closes a Markdown code span; text inside one is a command
-# or an identifier, which the pass leaves as written.
-CODE_SPAN_DELIMITER = "`"
+# A run of backticks opens a Markdown code span, and the next run of the
+# same length closes it (CommonMark); text inside one is a command or an
+# identifier, which the pass leaves as written. A fence is a run of three
+# or more, closed the same way.
+CODE_SPAN_RUN_RE = re.compile(r"`+")
+# Why a `/remediate` naming a finding the close retires unread is deferred,
+# not answered "no longer reproduces": nobody checked its cluster this run.
+RETIRED_HOLD_REASON = (
+    "`{target}` is on a cluster this run listed in neither `scope.clusters` nor "
+    "`scope.skipped`, so it is retired with the ledger, not confirmed fixed; its "
+    "{noun} stays open, and the install that audits that cluster answers for it."
+)
 # The finding fields whose text the pass dates: the free text a reader sees in
 # the ledger body. The evidence is left as the collector or the worker wrote
 # it: a command is reproduced, not read, and the excerpt is what
@@ -3428,13 +3437,25 @@ def anchor_relative_age_text(text: str, generated_at: datetime) -> str:
         return RELATIVE_AGE_RE.sub(one, segment)
 
     # Prose only: a `--since "2 days ago"` inside a code span is a command,
-    # and a date in it breaks the command. Splitting on the backtick leaves
-    # the odd segments inside spans (and fenced blocks, whose fences are
-    # three of them) as written.
-    segments = text.split(CODE_SPAN_DELIMITER)
-    return CODE_SPAN_DELIMITER.join(
-        dated(segment) if index % 2 == 0 else segment for index, segment in enumerate(segments)
-    )
+    # and a date in it breaks the command. A span opens with a run of
+    # backticks and closes with the next run of the same length, as
+    # CommonMark reads them, so a double-backtick span, a four-backtick
+    # fence and a lone backtick with no partner (literal text) all come out
+    # right; a run with no closing partner opens nothing.
+    pieces = CODE_SPAN_RUN_RE.split(text)
+    runs = CODE_SPAN_RUN_RE.findall(text)
+    out: list[str] = []
+    closing: str | None = None
+    for index, piece in enumerate(pieces):
+        out.append(piece if closing else dated(piece))
+        if index < len(runs):
+            run = runs[index]
+            if closing is None and run in runs[index + 1 :]:
+                closing = run
+            elif run == closing:
+                closing = None
+            out.append(run)
+    return "".join(out)
 
 
 def anchor_relative_ages(findings: list[dict], generated_at: datetime) -> list[str]:
@@ -10388,7 +10409,9 @@ def unaccounted_previous_findings(previous_body: str | None, data: dict) -> list
     return sorted(held, key=lambda entry: entry["id"])
 
 
-def unlisted_previous_findings(previous_body: str | None, data: dict) -> list[dict]:
+def unlisted_previous_findings(
+    previous_body: str | None, data: dict, memory: dict | None = None
+) -> list[dict]:
     """Previous findings on a cluster this run listed in neither scope list.
 
     The clean close retires every finding the ledger carries. For one on a
@@ -10408,9 +10431,17 @@ def unlisted_previous_findings(previous_body: str | None, data: dict) -> list[di
     listed cluster's findings are the ones it exempts. Under an older identity
     scheme a bare cluster name is matched to its qualified spelling, as
     `unaccounted_previous_findings` does. Entries carry the id, title,
-    cluster, namespace and object from the body, sorted by id.
+    cluster, namespace and object from the body, or from the stored
+    document in `memory` for an id the body carries in its hidden block
+    with no row (a held id in the note tier; `unread_held_entries` reads
+    the same places), sorted by id.
     """
-    previous = parse_finding_locations(previous_body)
+    previous = {
+        fid: {key: str(place.get(key, "")) for key in ("title", "cluster", "namespace", "object")}
+        for fid, place in _stored_finding_places(memory).items()
+        if fid in set(parse_delta_block(previous_body))
+    }
+    previous.update(parse_finding_locations(previous_body))
     if not previous:
         return []
     explained = {
@@ -15935,20 +15966,7 @@ def find_existing_issue(
             "it cannot prove it opened."
         )
     if adopted and scope:
-        # Best-effort, as every label write is: a refused write leaves the
-        # ledger unscoped, and the next lookup adopts it again.
-        if try_forge(
-            "issue-update", repo, {"number": int(chosen["number"]), "labelsAdd": [scope.label]}
-        ) is None:
-            log(
-                f"WARNING: could not add {scope.label} to #{chosen.get('number')}; it "
-                "stays the stream's unscoped ledger and the next run adopts it again."
-            )
-        else:
-            log(
-                f"Adopted #{chosen.get('number')} as this install's audit:{audit_id} "
-                f"ledger: it carried no scope label, and now carries {scope.label}."
-            )
+        _adopt_ledger(repo, audit_id, int(chosen["number"]), scope)
     body = chosen.get("body")
     title = chosen.get("title")
     return (
@@ -15957,6 +15975,26 @@ def find_existing_issue(
         body if isinstance(body, str) else None,
         title if isinstance(title, str) else None,
     )
+
+
+def _adopt_ledger(repo: str, audit_id: str, number: int, scope: LedgerScope) -> None:
+    """Put this install's scope label on an unscoped ledger it is taking over.
+
+    Best-effort, as every label write is: a refused write leaves the ledger
+    unscoped, and the next lookup adopts it again. Both lookups call it, the
+    label listing and the store fallback, so a ledger found either way
+    carries the label before `finish` rewrites it as this install's.
+    """
+    if try_forge("issue-update", repo, {"number": number, "labelsAdd": [scope.label]}) is None:
+        log(
+            f"WARNING: could not add {scope.label} to #{number}; it stays the "
+            "stream's unscoped ledger and the next run adopts it again."
+        )
+    else:
+        log(
+            f"Adopted #{number} as this install's audit:{audit_id} ledger: it "
+            f"carried no scope label, and now carries {scope.label}."
+        )
 
 
 def _open_ledgers_labelled(repo: str, audit_id: str, labels: list[str]) -> list[dict]:
@@ -16075,6 +16113,8 @@ def _ledger_the_listing_left_out(
             "which the report store names and which is open and carries the label; "
             f"updating #{number}. The forge's label index can lag a label write."
         )
+        if scope and scope_label_of(labels) is None:
+            _adopt_ledger(repo, audit_id, number, scope)
         body = issue.get("body")
         title = issue.get("title")
         url = issue.get("url")
@@ -17255,7 +17295,11 @@ def open_proposal_on(repo: str, branch: str) -> dict | None:
 
     Labelled or not. One a person opened is not returned, and neither is any
     when the forge cannot say who this install is: adopting rewrites the title
-    and body, and those are not this harness's to overwrite on a guess.
+    and body, and those are not this harness's to overwrite on a guess. Nor
+    is one another install opened under the same credential (its scope
+    label, `belongs_to_scope`): two installs that stage the same path in one
+    repository share a branch name, and the second must not rewrite the
+    first's pull request as its own.
     """
     viewer = viewer_login(repo)
     if not viewer:
@@ -17263,10 +17307,13 @@ def open_proposal_on(repo: str, branch: str) -> dict | None:
     answer = try_forge(
         "proposal-list", repo, {"source": branch, "state": "open", "limit": 1}
     )
+    scope = ledger_scope()
     found = [
         pr_record(p)
         for p in (answer or {}).get("proposals") or []
-        if isinstance(p, dict) and _login_key(str(p.get("author") or "")) == _login_key(viewer)
+        if isinstance(p, dict)
+        and _login_key(str(p.get("author") or "")) == _login_key(viewer)
+        and belongs_to_scope(p.get("labels"), scope)
     ]
     return found[0] if found else None
 
@@ -22444,6 +22491,9 @@ def handle_remediate(args: argparse.Namespace) -> None:
         )
 
     now = datetime.now(timezone.utc)
+    # As `finish` does before it renders: a relative age in the finding's
+    # text is dated to this run, on the preview and on the pull request.
+    anchor_relative_ages(findings, now)
     if args.dry_run:
         log("DRY RUN: no branch is created, nothing is pushed, no PR is opened.")
         # The same missing-manifest question the real run asks, against the same
@@ -23056,6 +23106,12 @@ def render_no_forge_summary(
         lines.append(
             "Not accounted for, so the ledger keeps them and no fix was closed: "
             + ", ".join(unaccounted)
+        )
+    retired = [str(fid) for fid in (prs or {}).get(RETIRED_UNLISTED_KEY) or []]
+    if retired:
+        lines.append(
+            f"{len(retired)} finding(s) retired with the ledger, not confirmed fixed: their "
+            "cluster is no longer in the fleet listing: " + ", ".join(retired)
         )
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
@@ -23685,7 +23741,7 @@ def _finish_store_ledger(
     # listed nowhere leaves the stored ledger, but is not resolved, its fix
     # stays open, and the JSON line names it.
     retired = (
-        unlisted_previous_findings(previous_body, data)
+        unlisted_previous_findings(previous_body, data, memory)
         if not findings and delta_known and not gaps and not unaccounted
         else []
     )
@@ -23779,7 +23835,9 @@ def _finish_store_ledger(
         scheduled_memory,
         scheduled_ids,
         published_ids,
-        not_resolved=reported_under_gap if gaps else (),
+        # An id that left under a gap, or that the close retired unread, is
+        # not resolved.
+        not_resolved=sorted(set(reported_under_gap if gaps else ()) | retired_ids),
     )
 
     pr_by_finding, _ = reconcile_remediation_prs(audit_id, findings, remediation_prs)
@@ -25315,11 +25373,22 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # resolved: nobody read them this run (#4901). Emptied below when the
         # conversation could not be read, because then nothing closes.
         retired = (
-            unlisted_previous_findings(previous_body, data)
+            unlisted_previous_findings(previous_body, data, memory)
             if existing_issue and delta_known and not gaps and not unaccounted
             else []
         )
         retired_ids = {entry["id"] for entry in retired}
+        if retired:
+            # Said again with the retired ids out of `resolved`: the entry
+            # was computed before the clean branch knew them.
+            since_scheduled = since_last_scheduled(
+                ids_moved,
+                scheduled_memory,
+                scheduled_ids,
+                published_ids,
+                not_resolved=sorted(retired_ids),
+                counted_against_record=bool(existing_issue),
+            )
         prs_closed = (
             []
             if (gaps or unaccounted) and not shielded_namespaces
@@ -25398,8 +25467,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                     for t in targets
                     if t in unread_ids and t not in withheld_ids and t not in flagged
                 ]
+                # And one naming a finding the close retires unread: its
+                # cluster is in neither scope list, so "no longer reproduces"
+                # is a claim nobody checked, and the all-clear says so.
+                retired_asked = [
+                    t
+                    for t in targets
+                    if t in retired_ids and t not in withheld_ids and t not in flagged
+                ]
                 covered = [t for t in targets if t in covered_by_id]
-                if held or flagged or unread:
+                if held or flagged or unread or retired_asked:
                     reply_to_deferrals(
                         repo,
                         existing_issue,
@@ -25414,7 +25491,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                                     else collector_candidate_reason(t, noun)
                                     for t in flagged
                                 ]
-                                + [unread_hold_reason(t, noun) for t in unread],
+                                + [unread_hold_reason(t, noun) for t in unread]
+                                + [
+                                    RETIRED_HOLD_REASON.format(target=t, noun=noun)
+                                    for t in retired_asked
+                                ],
                             }
                         ],
                         clean_comments,
@@ -25791,7 +25872,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             issue_number=stored_issue,
             ledger_body=stored_body,
             new_ids=[],
-            resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
+            resolved_ids=(
+                []
+                if body_untouched or gaps or unaccounted
+                else sorted(set(previous_ids) - retired_ids)
+            ),
             rendered_ids=stored_ids,
             ledger_document=ledger_document,
             ledger_held_open=body_untouched,
@@ -25815,7 +25900,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
-        run_resolved = 0 if gaps else len(baseline.ids)
+        run_resolved = 0 if gaps else len(set(baseline.ids) - retired_ids)
         append_chat_report(
             audit_id,
             repo,

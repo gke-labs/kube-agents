@@ -57,9 +57,11 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
   therefore keep one ledger per stream each, where before they rewrote one ledger in turn and a
   clean run over one fleet closed a ledger that carried the other fleet's findings. A relative age in
   a finding's free text ("completed 166 days ago") is dated to the run that published it ("as of
-  2026-11-06"), once, since a finding's wording is carried between runs and the body is rewritten
-  only by a run with findings. The evidence is left as written: the carry of unchanged wording
-  compares it byte for byte between runs.
+  2026-11-06"), once, by `finish` and by `remediate` alike, since a finding's wording is carried
+  between runs and the body is rewritten only by a run with findings. Text inside a code span or a
+  fence, read as CommonMark pairs backtick runs, and the evidence are left as written: a command is
+  reproduced, not read, and the carry of unchanged wording compares the evidence byte for byte
+  between runs.
 - The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
   label and, on a scoped install, the scope label. When that list is empty on a scoped install, a
   second list on the stream label alone finds the ledger from before scopes: an open issue with no
@@ -186,7 +188,10 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   recommendation, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus
   `<!-- audit-id-scheme -->` stamp.
 - Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`, and on a
-  scoped install `audit-scope:<slug>` (§8); the listing drops another install's pull requests.
+  scoped install `audit-scope:<slug>` (§8); the listing drops another install's pull requests, and
+  the open-proposal lookup on a branch adopts none of theirs, so two installs that stage the same
+  path share a branch name without the second rewriting the first's pull request as its own (the
+  forge refuses the second's create on that branch instead).
 
 ## 3. Decisions
 
