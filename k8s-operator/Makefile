@@ -234,8 +234,12 @@ export LITELLM_IMAGE
 export GITHUB_MINTER_IMAGE
 export HINDSIGHT_API_IMAGE
 export HINDSIGHT_POSTGRES_IMAGE
+# The anthropic overlay's system-message cache TTL, "1h" or "5m"; the chart's
+# litellm.promptCache.systemTTL. An unset variable would render an empty ttl.
+LITELLM_SYSTEM_CACHE_TTL ?= 1h
+export LITELLM_SYSTEM_CACHE_TTL
 
-LITELLM_VARS = $$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_IMAGE
+LITELLM_VARS = $$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_IMAGE $$LITELLM_SYSTEM_CACHE_TTL
 LITELLM_VERTEX_VARS = $(LITELLM_VARS) $$PROJECT_ID $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$VERTEX_PROJECT_ID $$VERTEX_LOCATION
 # Hindsight's manifests need no other substitution: the namespace comes from
 # `kubectl apply -n`, and every in-cluster address is a short service name.
