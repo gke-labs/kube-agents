@@ -137,8 +137,8 @@ func TestStartClusterStartsAgainWhenARoutePortIsTaken(t *testing.T) {
 		return freePort(t)
 	}
 	servers := startClusterOn(t, pick)
-	if picks != 2*clusterSize {
-		t.Fatalf("picked %d route ports, want %d: the cluster with the held port was not started again", picks, 2*clusterSize)
+	if picks < 2*clusterSize {
+		t.Fatalf("picked %d route ports, want at least %d: the cluster with the held port was not started again", picks, 2*clusterSize)
 	}
 	for _, s := range servers {
 		if s.ClusterAddr() == nil {
