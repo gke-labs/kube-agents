@@ -1071,6 +1071,20 @@ A monitored project whose ID the scope cannot carry, a legacy `example.com:name`
 
 **A selector the run cannot read** is frozen exactly as a container is: the members the previous snapshot reached through it are carried under that outcome, nothing is created under them, and the scope prune stays off for the run. The `containers` array carries a row for it under its `via` name (`sharedVpcHosts/<host>`, `metricsScopes/<id>`). There is no index and no lag behind either lookup: a project detached from the host or unlinked from the scope leaves the set on that run and retires over the ordinary two clean runs. A rollback to an operator that predates these fields keeps their members, as for containers.
 
+### How the A2A gateway checks a task's target
+
+Under `spec.mode: next`, the A2A gateway checks a profile task's cluster target against this
+block before it routes the task. A project named in `projects`, or the agent's own project, is
+admitted directly. An excluded project or cluster is refused.
+
+A project that only a folder, organisation, Shared VPC host or Metrics Scope reaches is admitted
+only from the resolved scope, which the operator publishes in the `<name>-resolved-scope`
+ConfigMap. The project must be listed there as readable. The list must match this `spec.scope`
+and be refreshed within two publisher cycles: 40 minutes at the default `maxProjects`, longer at
+a higher cap. Otherwise the task is refused as not confirmed in this install's scope, with the
+reason: the resolved scope is stale, it reads too large or failed, or the project cannot be read. The `ScopeResolved`
+condition on the `PlatformAgent` says whether the resolved scope is current.
+
 ### Rolling the release back past the scope fields
 
 Remove the whole `spec.scope` block from the CR first and re-add it after. A `cluster_agent_reconcile.py` from before `folders` and `organizations`, or from before `sharedVpcHosts` and `metricsScopes`, reads the same `scope.json`, ignores those keys, and finds every container or selector member in its previous snapshot but not in its resolved set, which is the ordinary two-run retire; a CR without the block marks nothing newly `retiring`. On a default install the agent image follows the operator's, so an operator rollback is an agent rollback too.

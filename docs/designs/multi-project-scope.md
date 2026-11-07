@@ -405,6 +405,14 @@ Whether the snapshot should also be lifted into `.status` is open (§11). It wou
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the
 pod has no channel to the operator today and building one for this alone is out of proportion.
 
+The A2A gateway reads the scope publisher's `<name>-resolved-scope` ConfigMap (section 4) to
+check a profile task's cluster target, with a `get` on that one name, and fails closed. It admits
+a project that only a container or selector reaches only from a document of the current
+`memberHash` and state `ok`, a row with outcome `ok`, and a `resolvedAt` and `confirmedAt` within
+two publisher cycles (2 × (15 min + 300 s × ceil(maxProjects / 100))), a stamp more than a
+minute in the future counting as stale. Explicit projects, the management project and
+`exclude.clusters` keep their direct checks from `scope.json`.
+
 ## 6. IAM
 
 `kube-agents-iam` gains a `scope` input mirroring `spec.scope`, and the full-install composition
