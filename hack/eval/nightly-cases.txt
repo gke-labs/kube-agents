@@ -1007,8 +1007,9 @@
 # A per-node listing (five columns) arrives in the chat thread as a pipe
 # table, not as a bullet per node: the A2A gateway renders a table on Google
 # Chat as a monospace block, and the personas and report stanza no longer tell
-# the worker that Chat drops it. deployer: noop, read-only, the idle-nodepool
-# fixture, one card.
+# the worker that Chat drops it. deployer: noop, read-only, the three node-pool
+# fixtures of slot a (idle-nodepool, hpa-saturated, default-pool-headroom), one
+# card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
