@@ -185,18 +185,39 @@ def test_a_card_result_the_router_relayed_verbatim_keeps_its_header():
 
 
 def test_a_relay_inside_the_routers_prose_is_lifted_out_behind_the_prose():
-    base = _base(f"Here is what the specialist found: {_RELAYED_RESULT}\n\nAnything else?")
+    base = _base(f"Here is what the specialist found:\n\n{_RELAYED_RESULT}\n\nAnything else?")
     _append_delivered(base, _observed_with_card_result("t1", _RELAYED_RESULT), ["t1"])
     assert base.metadata["final_message"] == f"Here is what the specialist found:\n\nAnything else?\n\n{_SECTION_T1}"
 
 
 def test_the_last_occurrence_of_a_short_result_is_the_relay():
     body = "All pods are Running."
-    base = _base(f"I asked card t1 whether {body} The specialist said: {body}")
+    base = _base(f"I asked card t1 whether:\n{body}\nThe specialist said:\n{body}")
     _append_delivered(base, _observed_with_card_result("t1", body), ["t1"])
     assert base.metadata["final_message"] == (
-        f"I asked card t1 whether {body} The specialist said:\n\nResult of delegated task t1:\n{body}"
+        f"I asked card t1 whether:\n{body}\nThe specialist said:\n\nResult of delegated task t1:\n{body}"
     )
+
+
+@pytest.mark.parametrize(
+    ("prose", "body"),
+    [
+        ("The deploy was abandoned yesterday.", "done"),
+        ("The fleet has 3 clusters.", "3"),
+        ("Clusters: fleet-a, fleet-b, fleet-c.", "fleet-a, fleet-b"),
+        (f"Here is what the specialist found: {_RELAYED_RESULT}", _RELAYED_RESULT),
+    ],
+)
+def test_a_result_woven_into_the_routers_sentence_is_not_cut_out_of_it(prose, body):
+    base = _base(prose)
+    _append_final(base, [f"Result of delegated task t1:\n{body}"])
+    assert base.metadata["final_message"] == f"{prose}\n\nResult of delegated task t1:\n{body}"
+
+
+def test_a_body_already_under_its_header_is_not_lifted_from_the_prose_too():
+    base = _base(f"{_RELAYED_RESULT}\n\n{_SECTION_T1}")
+    _append_final(base, [_SECTION_T1])
+    assert base.metadata["final_message"] == f"{_RELAYED_RESULT}\n\n{_SECTION_T1}"
 
 
 def test_folding_the_same_result_twice_adds_nothing():

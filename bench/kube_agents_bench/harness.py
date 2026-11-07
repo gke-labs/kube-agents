@@ -1207,6 +1207,23 @@ def _attributed(current: str, header: str, body: str) -> bool:
     )
 
 
+def _relayed_at(prose: str, body: str) -> int:
+    """Where ``prose`` relays ``body`` on lines of its own, or -1.
+
+    The match starts a line (indentation allowed) and ends one, so a short
+    result never claims part of the router's own sentence: ``done`` is not
+    the relay in ``abandoned``, nor ``3`` in ``has 3 clusters``. The last
+    such occurrence is the relay.
+    """
+    at = prose.rfind(body)
+    while at >= 0:
+        before, after = prose[:at].rstrip(" \t"), prose[at + len(body) :].lstrip(" \t")
+        if (not before or before.endswith("\n")) and (not after or after.startswith("\n")):
+            return at
+        at = prose.rfind(body, 0, at)
+    return at
+
+
 def _fold_sections(current: str, sections: list[str]) -> str:
     """``current`` with each delivered section in it once, under its header.
 
@@ -1217,39 +1234,35 @@ def _fold_sections(current: str, sections: list[str]) -> str:
     own answer through that header would miss it. The relayed text is lifted
     out of the router's prose and delivered as its section instead, after
     the prose, so the router's words stay contiguous and ahead of every
-    section, and the answer is attributed once and quoted once. Only the
-    prose ahead of the first delivered section is searched, so a card whose
-    answer repeats part of an earlier card's never cuts into that card's
-    section, and the longest body is lifted first, so a card whose answer
-    is part of another card's never cuts into that card's relay. The last
-    occurrence in the prose is the relay: a router that names a short
-    result in its own sentence first quotes it in full last. A body already
-    under its own header is left alone. An artifact already quoted anywhere
-    is not appended again.
+    section, and the answer is attributed once and quoted once. A relay is
+    the body on lines of its own (``_relayed_at``); a body woven into the
+    router's sentence is left there and its section is appended in full.
+    Only the prose ahead of the first delivered section is searched, so a
+    card whose answer repeats part of an earlier card's never cuts into that
+    card's section, and the longest body is lifted first, so a card whose
+    answer is part of another card's never cuts into that card's relay. A
+    body already under its own header is left alone. An artifact already
+    quoted anywhere is not appended again.
     """
     first = _DELIVERED_HEADER_LINE.search(current)
     prose = current if first is None else current[: first.start()]
     delivered = "" if first is None else current[first.start() :].strip()
     parts = [(section, *section.partition("\n")[::2]) for section in sections]
     pending = [(section, header, body.strip()) for section, header, body in parts if body.strip()]
-    lifted: set[str] = set()
+    moved = False
     for section, header, body in sorted(pending, key=lambda part: -len(part[2])):
         if not header.startswith(_RELAYED_SECTION_PREFIXES) or _attributed(current, header, body):
             continue
-        at = prose.rfind(body)
+        at = _relayed_at(prose, body)
         if at >= 0:
             prose = "\n\n".join(filter(None, [prose[:at].rstrip(), prose[at + len(body) :].strip()]))
-            lifted.add(section)
+            moved = True
     appended = [
         section.rstrip()
         for section, header, body in pending
-        if section in lifted
-        or (
-            not _attributed(current, header, body)
-            and (header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current)
-        )
+        if not _attributed(current, header, body) and (header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current)
     ]
-    if not lifted and not appended:
+    if not moved and not appended:
         return current
     return "\n\n".join(filter(None, [prose, delivered, *appended]))
 
