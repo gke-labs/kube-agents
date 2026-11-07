@@ -943,8 +943,16 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night", data, health=health_doc())
         page = dom_text(out / "index.html")
         self.assertIn("1 night on record: 1 green, 0 not", page)
-        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        # Its log_url is a Spyglass link into the private nightly bucket, which is dead: the row links the Console.
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+        # A night that records where it lives (gcs_base) links the Console the same way.
+        night["gcs_base"] = "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700/"
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-night-console", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
+        self.assertNotIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
 
     def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
         """The GHES and GitLab CE lanes (kube-agents#3682) share one

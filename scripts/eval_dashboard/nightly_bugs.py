@@ -61,8 +61,8 @@ assigned to ``infra_owner`` in domains.yaml with ``infra_backup`` mentioned:
 
     a case graded nothing -- every repetition infrastructure, or no line
     for it -- on INFRA_STREAK_NIGHTS nights in a row where its part ran
-    -> one issue for the case with the classifier's reason; a comment on
-       each later such night, and one when it is graded again
+    -> one issue for the case; a comment on each later such night, and one
+       when it is graded again
 
 The domain streak is untouched by either: an infrastructure repetition is
 dropped before a night counts as failing.
@@ -195,8 +195,8 @@ COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
 # The bot's issue carries this, so it re-finds its own whatever the title
 # has been edited to; an issue without one (a human's) is adopted when its
 # title or body names the case as a whole word. A bot issue is matched on
-# its marker alone: an infra issue's body quotes infra reasons, which can name
-# another case.
+# its marker alone: a case named anywhere else in its body does not make it
+# that case's issue.
 # The three kinds of issue, each with a marker of its own: a case's domain
 # bug, a case kept from running by infrastructure, a part's lost nights.
 KIND_RED = "nightly-red"
@@ -231,10 +231,10 @@ NO_DOMAIN_OWNER_LINE = "No domain owner in `docs/designs/domains.yaml`."
 INFRA_DOMAIN_OWNER = "owner @{owner}"
 INFRA_NO_DOMAIN_OWNER = "no owner in `docs/designs/domains.yaml`"
 
-TITLE = "Nightly: {case} fails every run, {nights} nights in a row"
+TITLE = "Nightly: {case} needs triage"
 BODY = """\
 {marker}
-`{case}` failed every graded repetition on its last {nights} graded nightly nights. Domain: **{domain_name}** (`{domain}`).
+`{case}` needs triage: its nights are listed below, with each night's grading on the dashboard. Domain: **{domain_name}** (`{domain}`).
 
 {addressee} {domain_owner}
 
@@ -250,17 +250,13 @@ Nightly report: {nightly_url}
 - **Broken test:** fix the case, or mark it `expected_fail: true` in its `task.yaml` with this issue linked.
 - **Infra:** close this issue and point to the infra issue.
 
-Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here when the case passes every repetition again; it never closes the issue.
+Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here when the case is clear again; it never closes the issue.
 """
 # One line per night: the date and the private links. The night's pass count
 # and the checks' reasons are on the dashboard behind them; the repository is
 # public, so the issue carries neither.
 NIGHT_LINE = "- {date} · [run]({run_url}) · [transcript]({transcript_url})"
 NIGHT_LINE_NO_LINK = "- {date}"
-# An infra reason is quoted as code: it can carry `@login` or `org/repo#N`,
-# which GitHub would otherwise turn into a mention or a cross-reference.
-# What a quoted reason's `<` becomes: SINGLE LEFT-POINTING ANGLE QUOTATION MARK.
-MARKER_SAFE_LT = "\u2039"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
 # A refused login is shown as code, not @-mentioned: GitHub just said it is
@@ -274,7 +270,7 @@ UNASSIGNED = "**Unassigned** ({why})."
 ASSIGNEES_FIELD = gate_issue.ASSIGNEES_FIELD
 RECOVERY_COMMENT = """\
 {marker}
-`{case}` passed every graded repetition on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
+`{case}` is clear on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
 """
 INFRA_TRIAGE = """\
 **What triage decides (within a week)**
@@ -284,10 +280,10 @@ INFRA_TRIAGE = """\
 
 Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here on the newest night like these each time it runs, and once when the job (or case) runs clean again; it never closes the issue.
 """
-INFRA_CASE_TITLE = "Nightly infra: {case} kept from running {nights} nights in a row"
+INFRA_CASE_TITLE = "Nightly infra: {case} kept from running"
 INFRA_CASE_BODY = """\
 {marker}
-`{case}` graded nothing on its last {nights} nights where its part of the nightly (`{job}`) ran to its verdict: every repetition was classified as infrastructure (`classify.py`), or the run recorded no line for the case. Domain: `{domain}` ({domain_owner}).
+`{case}` was kept from running on its last nights where its part of the nightly (`{job}`) ran to its verdict: infrastructure took every repetition (`classify.py`), or the run recorded no line for the case. Domain: `{domain}` ({domain_owner}).
 
 {addressee}
 
@@ -313,8 +309,11 @@ Nightly report: {nightly_url}
 
 {triage}"""
 INFRA_NIGHT_LINE = "- {date}: {how} · [run]({run_url})"
-INFRA_CASE_LINE = "- {date}: {reason} · [run]({run_url}) · [transcript]({transcript_url})"
-INFRA_CASE_LINE_NO_TRANSCRIPT = "- {date}: {reason} · [run]({run_url})"
+# The case kind's night lines and its "again" phrase carry no classifier
+# reason: that text quotes the failing check and the repository is public.
+INFRA_CASE_LINE = "- {date} · [run]({run_url}) · [transcript]({transcript_url})"
+INFRA_CASE_LINE_NO_TRANSCRIPT = "- {date} · [run]({run_url})"
+INFRA_CASE_KEPT = "`{case}` was kept from running"
 INFRA_NIGHT_COMMENT = """\
 {marker}
 Again on the {date} nightly: {what} · [run]({run_url}).
@@ -472,14 +471,6 @@ def recovery_night(verdicts: list[dict], news=lambda v: True) -> dict | None:
 # what the issue says
 
 
-def quoted(text: str | None) -> str:
-    """``text`` as inline code on one line (the comment above MARKER_SAFE_LT says why), with
-    ``<`` swapped for a look-alike so a reason can never carry a bot marker
-    (``<!-- kube-agents-bot:... -->``) that dedupe would read as this
-    issue's."""
-    return "`" + (text or "").replace("\n", " ").replace("`", "'").replace("<", MARKER_SAFE_LT) + "`"
-
-
 def night_block(streak: list[dict]) -> str:
     lines = []
     for v in reversed(streak):
@@ -489,12 +480,11 @@ def night_block(streak: list[dict]) -> str:
 
 
 def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None, why: str, streak: list[dict]) -> tuple[str, str]:
-    title = TITLE.format(case=case, nights=STREAK_NIGHTS)[:TITLE_MAX_CHARS]
+    title = TITLE.format(case=case)[:TITLE_MAX_CHARS]
     backup = domain_row.get("backup")
     body = BODY.format(
         marker=MARKER.format(case=case),
         case=case,
-        nights=STREAK_NIGHTS,
         domain=domain,
         domain_name=domain_row.get("name") or domain,
         addressee=(ASSIGNED if assignee else UNASSIGNED).format(assignee=assignee, why=why),
@@ -839,7 +829,7 @@ class Filer:
                 # issue opened, gets one comment; a graded one, one recovery.
                 result["tracked"].append({"case": case, "issue": issue["number"]})
                 if verdicts[-1]["state"] in nightly_infra.KEPT_STATES:
-                    self.note_night(KIND_INFRA, KEY_CASE, case, issue, verdicts[-1], quoted(verdicts[-1]["reason"]), result)
+                    self.note_night(KIND_INFRA, KEY_CASE, case, issue, verdicts[-1], INFRA_CASE_KEPT.format(case=case), result)
                 graded = nightly_infra.first_graded_after_kept(verdicts, lambda v: opened_before(issue, v))
                 if graded:
                     self.recover_infra(KIND_INFRA, KEY_CASE, case, issue, graded, CASE_RECOVERED.format(case=case), result)
@@ -850,13 +840,13 @@ class Filer:
             if streak:
                 domain = fields.get("domain") or UNKNOWN
                 job = streak[-1]["job"]
-                title = INFRA_CASE_TITLE.format(case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS)
+                title = INFRA_CASE_TITLE.format(case=case)
                 body = functools.partial(
                     INFRA_CASE_BODY.format,
-                    marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS,
+                    marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case,
                     job=job, domain=domain, domain_owner=self.infra_domain_owner(domain),
                     nights_block="\n".join((INFRA_CASE_LINE if v["transcript_url"] else INFRA_CASE_LINE_NO_TRANSCRIPT).format(
-                        date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
+                        date=v["date"], run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
                 cleared = [v for v in verdicts if v["state"] == nightly_infra.STATE_GRADED]
                 self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, cleared, closed_issues, result)
@@ -981,7 +971,7 @@ class Filer:
         if not opened_before(issue, night):
             return None
         marker = RECOVERY_MARKER.format(case=case, date=night["date"])
-        body = RECOVERY_COMMENT.format(marker=marker, case=case, passed=night["passed"], graded=night["graded"], date=night["date"], run_url=night["run_url"])
+        body = RECOVERY_COMMENT.format(marker=marker, case=case, date=night["date"], run_url=night["run_url"])
         posted = self.comment_once(issue, marker, body)
         if posted is None:
             return None

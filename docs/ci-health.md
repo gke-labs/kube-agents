@@ -102,7 +102,11 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it.
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
+and the nightly issues' run and transcript links open the Console too; for a record whose Prow
+link points into it, the Nightly report, the nightly issues and the lane rows link the Console
+instead (`nightly.console_base` via `links.private_gcs_base`), the data unchanged.
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -750,10 +754,12 @@ comments instead.
 When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
 none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
-`presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
-7:30 AM ET`, with the cases, the window, the class, the incident brief link,
-and the line "Filed automatically by the smoke health bot; edit freely. Fix
-PRs: reference this issue." A human's issue that already names the cases is
+`presubmit-gate`: `Smoke gate outage since Sun 7:30 AM ET`, with the window,
+the class and the incident brief link, and the line "Filed automatically by
+the smoke health bot; edit freely. Fix PRs: reference this issue." The issue
+names no failing case and quotes no evidence line: the repository is public,
+and both are on the brief it links; its first line is a hidden marker
+carrying the case ids, by which the bot re-finds its own issue. A human's issue that already names the cases is
 adopted instead and labelled `presubmit-gate`. One rule for a title: any open
 issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
 whose body also carries a word the condition's own evidence uses ("drift" or
@@ -835,7 +841,7 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case passes every repetition again. It runs every tick before the
+once when the case is clear again. It runs every tick before the
 post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
@@ -856,8 +862,7 @@ is the last 14 nightly dates. A case whose `task.yaml` carries
 The issue is labelled `nightly-red`, `domain:<slug>` and `needs-triage`. Its
 body carries a marker naming the case, the domain, the assignee and why, the
 domain owner and backup as @-mentions, each of the three nights with its run
-link and transcript link (the night's pass count and each failing check's
-reason stay on the dashboard behind them: the repository is public), and what
+link and transcript link (into the Cloud Console), and what
 triage decides: a product bug gets a fixer, a priority and a date; a broken
 test is fixed or marked `expected_fail` with the issue linked; an infra
 failure is closed in favour of the infra issue. It is assigned to the case's
@@ -921,8 +926,8 @@ rules). Neither changes the domain streak above.
   that last recorded it, unless the other part was lost that date or has not
   landed yet)
   ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
-  such nights in a row file one issue naming the case and the classifier's
-  reason. A night is skipped, not counted, when the part did not run or was
+  such nights in a row file one issue naming the case, with each night's run
+  and transcript links. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run
   clean: another job's clean build does not vouch for its cases), when it
   predates the case's first recorded night in the last 14 (a case new to the
@@ -1084,9 +1089,9 @@ been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
 or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
 or "start date not recorded" (also for a date that does not parse or is after
 today); why, from the entry
-and the issue it cites; and the candidates. A candidate is a case of the
+and the issue it cites; and the candidates, best first. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
-not on the roster, with its
+not on the roster, ranked by its
 graded repetitions over the last 14 nightly nights (read as [Nightly
 bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
@@ -1096,7 +1101,10 @@ deadline), what the
 store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
-bar, then by pass rate. The body is edited in place when any of this changes,
+bar, then by pass rate. The issue's table names the candidates in that order
+and nothing more, since the repository is public; the records behind it are
+on the domain scorecard (`cases.html#view=domains`), and the Chat digest line
+carries the best candidate's. The body is edited in place when any of this changes,
 about once a day; its assignees are never touched, and the assignment line of an
 open issue names the assignees GitHub holds, with the owner beside them when
 the owner is not one. The body is the bot's: an edit to it or the title is

@@ -597,6 +597,10 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # Cause and advice text. Plain language: the reader is whoever is deciding
 # whether to type /retest.
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
+# The same cause as the public tracking issue states it (gate_issue.py):
+# the failing cases stay on the incident brief, since the repository is
+# public.
+CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -718,6 +722,14 @@ UTC = timezone.utc
 # --------------------------------------------------------------------------- #
 # Reading data.json
 # --------------------------------------------------------------------------- #
+
+
+def public_cause(health_doc: dict) -> str:
+    """``health["cause"]`` as a public text may carry it: a shared break
+    names no case (CAUSE_SHARED_BREAK_PUBLIC); every other cause as is."""
+    if health_doc.get("condition") == SHARED_BREAK:
+        return CAUSE_SHARED_BREAK_PUBLIC
+    return health_doc.get("cause") or CAUSE_SHARED_BREAK_PUBLIC
 
 
 def parse_iso(value) -> datetime | None:

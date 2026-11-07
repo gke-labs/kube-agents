@@ -26,6 +26,10 @@ from datetime import datetime, timedelta, timezone
 from eval_dashboard import post_health
 from eval_dashboard.health import near_deadline_margin
 
+# What a public post must never carry: a pass ratio, a repetition count, a
+# failing-check reason. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\bpassed\b|failed every|failed all|RESOURCE_EXHAUSTED|\b429\b")
+
 SPACE = "spaces/AAAAtestspace"
 TOKEN = "ya29.super-secret-token-value"
 WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=SECRETKEY&token=SECRETTOKEN"
@@ -1496,12 +1500,16 @@ class TrackingIssue(RunHarness):
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
         _, _, body = self.gh.calls[-1]
-        self.assertEqual(body["title"], "Smoke gate outage: 2 cases failing on every PR since Tue 7:30 AM ET")
+        self.assertEqual(body["title"], "Smoke gate outage since Tue 7:30 AM ET")
         self.assertEqual(body["labels"], ["presubmit-gate"])
-        self.assertIn("- `cost-idle-pool-probe`\n- `reliability-pdb-probe`", body["body"])
+        marker, _, rest = body["body"].partition("\n")
+        self.assertEqual(marker, "<!-- kube-agents-bot:gate-outage cases=cost-idle-pool-probe,reliability-pdb-probe -->", "the hidden marker is how the bot re-finds it")
+        self.assertNotIn("cost-idle-pool-probe", rest, "the cases are on the brief, not in the public issue")
         self.assertIn("**Window:** since Tue 7:30 AM ET (2026-09-08T11:30:00+00:00), 3 PRs red so far.", body["body"])
-        self.assertIn("**Class:** shared fixture/environment break: cost-idle-pool-probe, reliability-pdb-probe (`shared_break`).", body["body"])
-        self.assertIn(f"Incident brief: {URL}#since=2026-09-08T11:30:00Z&cases=cost-idle-pool-probe,reliability-pdb-probe&view=gate", body["body"])
+        self.assertIn("**Class:** shared fixture/environment break (`shared_break`).", body["body"])
+        self.assertIn(f"The failing cases and the evidence are on the incident brief: {URL}#since=2026-09-08T11:30:00Z&view=gate", body["body"])
+        for text in (body["title"], body["body"]):
+            self.assertIsNone(RESULTS_RE.search(text), text)
         self.assertTrue(body["body"].rstrip().endswith("Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue."))
         self.assertEqual(self.opener.texts[0].split("\n")[1], "Don't retest yet. Tracking #1300.")
         recorded = self.recorded()
@@ -1511,6 +1519,31 @@ class TrackingIssue(RunHarness):
         self.tick(grown, T0.replace(hour=15), environ=self.environ())
         self.assertEqual(len(self.gh.writes()), 1, "filed once")
         self.assertIn("Tracking #1300.", self.opener.texts[-1])
+
+    def test_the_bots_own_outage_issue_is_re_found_by_its_marker(self):
+        # The body names no case, so only the marker leads back to it.
+        own = {"number": 1301, "html_url": "https://github.com/gke-labs/kube-agents/issues/1301", "title": "Smoke gate outage since Mon 5:00 AM ET",
+               "body": post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO))) + "\nThe smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.", "labels": [{"name": "presubmit-gate"}]}
+        gh = FakeGh(open_issues=[own])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertIn("Tracking #1301.", self.opener.texts[0])
+        self.assertEqual(self.recorded()["issue"]["number"], 1301)
+
+    def test_a_marker_for_other_cases_is_not_this_breaks(self):
+        other = {"number": 1302, "html_url": "https://github.com/gke-labs/kube-agents/issues/1302", "title": "Smoke gate outage since Mon 5:00 AM ET",
+                 "body": post_health.gate_issue.OUTAGE_MARKER.format(cases="a-probe") + "\nin OUTAGE.", "labels": [{"name": "presubmit-gate"}]}
+        gh = FakeGh(open_issues=[other])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertTrue(gh.calls[-1][2]["body"].startswith(post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO)))), "the filed body leads with its marker")
+
+    def test_a_human_issue_naming_the_cases_in_its_title_is_adopted(self):
+        human = {"number": 1279, "html_url": "https://github.com/gke-labs/kube-agents/issues/1279", "title": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain, cluster-agent-crashloop-misleading-symptom red on every PR", "body": "seeded fleet?"}
+        gh = FakeGh(open_issues=[human])
+        self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1279/labels")], "adopted and labelled, nothing filed")
+        self.assertIn("Tracking #1279.", self.opener.texts[0])
 
     def test_a_human_filed_issue_naming_the_cases_is_adopted(self):
         human = {"number": 1278, "html_url": "https://github.com/gke-labs/kube-agents/issues/1278", "title": "Seeded fleet outage", "body": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain and cluster-agent-crashloop-misleading-symptom red every PR", "labels": [{"name": "presubmit-gate"}]}
@@ -1553,7 +1586,7 @@ class TrackingIssue(RunHarness):
         self.assertEqual(rc, 0)
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues", err)
-        self.assertIn("Smoke gate outage: 1 case failing on every PR since", err)
+        self.assertIn("Smoke gate outage since", err)
 
 
 class InfraAddressee(unittest.TestCase):
