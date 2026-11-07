@@ -1612,6 +1612,30 @@ class PersistBudgetHandoffTest(unittest.TestCase):
         )
         self.assertIn(kge.HANDOFF_ORIGINS[kge.HANDOFF_SOURCE_TRANSCRIPT], com.calls[0][2])
 
+    def test_the_text_goes_through_the_board_redactor_before_the_run_write(self):
+        """complete_task's summary and add_comment's body are redacted by the
+        prologue apply_credential_redaction gives them; the run summary this
+        module writes with its own UPDATE is a board writer too."""
+        token_text = "Read the secret: ya29.A0ARrdaM-token; the CronJob image tag is wrong."
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        com = CommentRecorder()
+        seen = []
+
+        def redact(text):
+            seen.append(text)
+            return text.replace("ya29.A0ARrdaM-token", "[REDACTED]")
+
+        did = kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=150, max_iterations=150,
+            text=token_text, author="platform", connect=lambda: ClosableConn(conn), add_comment=com,
+            redact=redact,
+        )
+        self.assertTrue(did)
+        self.assertEqual(seen, [token_text])
+        self.assertEqual(self._summary(conn), token_text.replace("ya29.A0ARrdaM-token", "[REDACTED]"))
+        self.assertNotIn("ya29.", self._summary(conn))
+        self.assertNotIn("ya29.", com.calls[0][2])
+
     def test_a_write_that_fails_is_logged_at_warning(self):
         closable = ClosableConn(closed_by_budget([("t_80ff98c9", "ready", 28)]))
         closable.execute = mock.Mock(side_effect=sqlite3.OperationalError("database is locked"))
@@ -1999,17 +2023,33 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("text=_kanban_handoff_text", call)
         self.assertIn("source=_kanban_handoff_source", call)
         self.assertIn("withhold_comment=lambda _t: bool(_kube_respawn_guard_pr_url_re.search(_t))", call)
+        self.assertIn("redact=_kube_redact_store_text", call)
         self.assertIn("run_id=_kube_worker_run_id()", call)
         self.assertIn("api_call_count=api_call_count", call)
         self.assertIn("max_iterations=agent.max_iterations", call)
         self.assertIn("connect=_kube_kanban_connect", call)
         self.assertIn("add_comment=_kb.add_comment", call)
 
+    def test_the_board_redactor_is_imported_but_its_absence_is_not_fatal(self):
+        """agent/credential_redaction.py is installed by a later Dockerfile
+        step than this patch's build gate, so the import is guarded."""
+        block = self._apply_all()["finalizer"]
+        block = block[block.index("if _kanban_budget_handoff:") :]
+        block = block[: block.index("_kanban_persist_budget_handoff(")]
+        self.assertIn("from agent.credential_redaction import (", block)
+        self.assertIn("redact_store_text as _kube_redact_store_text", block)
+        guard = block[block.index("from agent.credential_redaction import (") :]
+        self.assertIn("except ImportError:", guard)
+        self.assertIn("_kube_redact_store_text = None", guard)
+
     def test_a_handoff_that_did_not_land_is_logged_not_silent(self):
         block = self._apply_all()["finalizer"]
         block = block[block.index("if _kanban_budget_handoff:") :]
         block = block[: block.index("_kanban_should_record_missing")]
         self.assertIn("budget hand-off not saved", block)
+        # A worker that completed or blocked on its last iteration reaches the
+        # same line; it must not announce a retry that does not happen.
+        self.assertNotIn("retry starts cold", block)
         self.assertIn("logger.warning(", block)
 
     def test_the_handoff_predicate_mirrors_upstreams_too(self):

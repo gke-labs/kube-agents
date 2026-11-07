@@ -307,7 +307,12 @@ And the comment is withheld when the text names a GitHub pull request URL:
 ``check_respawn_guard`` reads a card's recent comments for one and holds the
 card for a day as ``active_pr``, which is the opposite of a warm retry; the
 run summary, which that guard does not read, carries the hand-off alone. The
-90% checkpoint upstream injects already asks a kanban worker for a
+text also goes through the board redactor (``redact_store_text``, injected by
+the insert) before the summary write, as every other kanban writer's text
+does through ``apply_credential_redaction``'s prologue: a closing summary that
+quotes a token from a tool result must not leave that token in the run row
+``hermes kanban show`` prints and the retry's prompt renders. The 90%
+checkpoint upstream injects already asks a kanban worker for a
 ``kanban_comment`` hand-off; this module does not touch that prompt, it covers
 the wall after it.
 
@@ -1376,9 +1381,18 @@ def persist_budget_handoff(
     author=None,
     source=HANDOFF_SOURCE_SUMMARY,
     withhold_comment=None,
+    redact=None,
 ) -> bool:
     """Save the hand-off of a run that exhausted its budget. Returns whether
     the summary landed.
+
+    ``redact`` is ``agent.credential_redaction.redact_store_text``, injected
+    like the other Hermes callables: every other writer that puts worker text
+    on the board (``complete_task``'s ``summary``, ``add_comment``'s ``body``)
+    goes through it, by the prologue ``apply_credential_redaction`` gives
+    them, and the ``UPDATE`` below is a writer too. It runs on the text before
+    the summary write, so the run row never holds a token the comment would
+    have had removed; with none given the text is written as it is.
 
     Two writes, in this order. First the text becomes the run's ``summary``,
     the column upstream reserves for a worker's hand-off: ``hermes kanban
@@ -1429,6 +1443,8 @@ def persist_budget_handoff(
         return False
     if author is None:
         author = os.environ.get(PROFILE_ENV) or BUDGET_HANDOFF_COMMENT_AUTHOR
+    if redact is not None:
+        text = redact(text)
     conn = connect()
     try:
         if not budget_charge_landed(conn, task_id, run_id):

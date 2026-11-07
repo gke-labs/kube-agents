@@ -7,7 +7,7 @@ matched exactly once; that says nothing about whether the inserted code is
 reachable, whether it still composes with the upstream helpers it calls, or
 whether the board write it makes lands.
 
-Seven things are checked, and each one is a way the patch could match its anchor
+Eight things are checked, and each one is a way the patch could match its anchor
 and still be useless:
 
 1. **The nudge is reachable and terminal.** Parsed out of the *patched*
@@ -591,6 +591,18 @@ if finalize is not None:
         "the comment is gated on the dispatcher's own respawn-guard pattern",
         "_kube_respawn_guard_pr_url_re.search" in persist_kwargs.get("withhold_comment", ""),
         f"withhold_comment={persist_kwargs.get('withhold_comment')!r}",
+    )
+    finalize_source = ast.unparse(finalize)
+    check(
+        "the run summary goes through the board redactor the other kanban writers use",
+        persist_kwargs.get("redact") == "_kube_redact_store_text"
+        and "from agent.credential_redaction import redact_store_text as _kube_redact_store_text"
+        in finalize_source,
+        f"redact={persist_kwargs.get('redact')!r}",
+    )
+    check(
+        "and its import is guarded, because that module is installed by a later build step",
+        "_kube_redact_store_text = None" in finalize_source,
     )
 
 # The seven ways out of the loop that leak. Each has to be legible in the

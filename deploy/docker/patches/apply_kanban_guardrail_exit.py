@@ -219,6 +219,17 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt exit and six s
                 worker_run_id as _kube_worker_run_id,
             )
 
+            # The board redactor every other kanban writer goes through
+            # (apply_credential_redaction's prologue); the run summary is a
+            # writer too. Its module is installed by a later build step, so
+            # the import is guarded for the build gate that runs before it.
+            try:
+                from agent.credential_redaction import (
+                    redact_store_text as _kube_redact_store_text,
+                )
+            except ImportError:
+                _kube_redact_store_text = None
+
             # The summary request text tells a failed summary call from a
             # summary (handle_max_iterations never returns an empty string);
             # the respawn-guard pattern keeps a comment naming a pull request
@@ -234,6 +245,7 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt exit and six s
                 text=_kanban_handoff_text,
                 source=_kanban_handoff_source,
                 withhold_comment=lambda _t: bool(_kube_respawn_guard_pr_url_re.search(_t)),
+                redact=_kube_redact_store_text,
                 connect=_kube_kanban_connect,
                 add_comment=_kb.add_comment,
             ):
@@ -246,10 +258,14 @@ FINALIZER_INSERT = '''    # kube-agents patch: the guardrail-halt exit and six s
                     _kanban_handoff_source,
                 )
             else:
+                # Also the ordinary case of a worker that completed or blocked
+                # its card on its last permitted iteration: its run was closed
+                # by that call, not by the budget charge, and nothing retries.
                 logger.info(
-                    "kanban task %s run %s: budget hand-off not saved (the run was not "
-                    "closed by the budget charge, already carries a summary, or has no "
-                    "run id); the retry starts cold",
+                    "kanban task %s run %s: budget hand-off not saved: this worker's "
+                    "run was not closed by the budget charge (it ended by its own "
+                    "terminal call, or under a newer run), already carries a summary, "
+                    "or has no run id",
                     _kanban_task_id,
                     _kube_worker_run_id(),
                 )
