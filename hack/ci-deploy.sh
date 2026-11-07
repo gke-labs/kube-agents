@@ -953,7 +953,9 @@ fi
 if [ -n "${JOB_NAME:-}" ]; then
   for required_model_var in MODEL_PROVIDER MODEL_DEFAULT_NAME AGENT_MODEL_OVERRIDE; do
     if [ -z "${!required_model_var:-}" ]; then
-      echo "FATAL: stopping before the build: ${required_model_var} is unset or empty. A Prow job sets it from the build cluster's eval-model Secret (the lane's config in oss-test-infra; docs/ci-pool-projects.md 5.10); this repository's scripts default it only outside Prow." >&2
+      # Two lines: the CI health digest quotes the FATAL line cut at 200 characters.
+      echo "FATAL: ${required_model_var} is unset or empty; a Prow job sets it from the build cluster's eval-model Secret (docs/ci-pool-projects.md 5.10)." >&2
+      echo "The lane's config in oss-test-infra reads the Secret; this repository's scripts default the model only outside Prow." >&2
       exit 1
     fi
   done
