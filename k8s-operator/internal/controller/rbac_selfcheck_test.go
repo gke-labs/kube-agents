@@ -231,7 +231,7 @@ func TestProbeRBACNamesEachDeniedPermission(t *testing.T) {
 		return denyPDBPatch(attrs) ||
 			(attrs.Resource == "pods" && attrs.Subresource == "log" && attrs.Verb == "get")
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews(), "")
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestTheScopedBindProbeCarriesItsResourceName(t *testing.T) {
 		}
 		return attrs.Name != a2aAuthDelegatorRole
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews(), "")
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -303,7 +303,7 @@ func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 		clusterReviews.Add(1)
 		return attrs.Namespace != ""
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews(), operatorNamespace)
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), operatorNamespace, nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 
 	// The bound is real: the same grant probed with no namespace is a
 	// shortfall, and the label says which namespace was meant.
-	denied, err = probeRBAC(context.Background(), authorizer.reviews(), "")
+	denied, err = probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 }
 
 func TestProbeRBACWithEverythingGrantedReportsNothing(t *testing.T) {
-	denied, err := probeRBAC(context.Background(), (&fakeAuthorizer{}).reviews(), "")
+	denied, err := probeLabels(context.Background(), (&fakeAuthorizer{}).reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -342,7 +342,7 @@ func TestProbeRBACWithEverythingGrantedReportsNothing(t *testing.T) {
 
 func TestProbeRBACErrorIsNotADenial(t *testing.T) {
 	authorizer := &fakeAuthorizer{err: errors.New("the API server is away")}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews(), "")
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err == nil {
 		t.Fatal("expected the transport error to surface")
 	}
@@ -411,7 +411,7 @@ func TestProbeRBACReportsDenialsInDeclarationOrder(t *testing.T) {
 		}
 	}
 	for i := 0; i < 5; i++ {
-		denied, err := probeRBAC(context.Background(), authorizer.reviews(), "")
+		denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 		if err != nil {
 			t.Fatalf("probe failed: %v", err)
 		}
@@ -637,7 +637,7 @@ func TestTheEventWriteIsProbed(t *testing.T) {
 	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
 		return attrs.Group == "" && attrs.Resource == "events" && (attrs.Verb == "create" || attrs.Verb == "patch")
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews(), "")
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}

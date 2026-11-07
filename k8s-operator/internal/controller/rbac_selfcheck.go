@@ -85,8 +85,10 @@ const (
 	rbacProbeConcurrency = 16
 	// RBACIncompleteCause is the sentence the boot log line and the condition
 	// both carry: what happened and the two ways to fix it. Exported for main.go.
-	RBACIncompleteCause = "the ClusterRole bound to the operator is older than this image; " +
-		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
+	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image, " +
+		"or a PlatformAgent's namespace has no RoleBinding to the operator's namespaced Role; " +
+		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together, " +
+		"and bind the namespaced Role in every namespace that holds a PlatformAgent"
 	// rbacIncompleteMessagePrefix opens the condition message; the denied
 	// permissions follow it.
 	rbacIncompleteMessagePrefix = "The operator is denied permissions its RBAC markers declare: "
@@ -99,6 +101,12 @@ const (
 	// list, so a shortfall reads "get secrets (in the operator's namespace)"
 	// and nobody goes looking for a missing ClusterRole rule.
 	rbacNamespacedLabelSuffix = " (in the operator's namespace)"
+	// rbacAgentNamespaceLabelFormat is the same mark for a PlatformAgent's own
+	// namespace, when that is not the operator's: "get secrets (in namespace
+	// team-a)". The namespaced Role is bound in the install namespace by both
+	// install paths and nowhere else, so an agent elsewhere is the one install
+	// shape the operator-namespace probe cannot see.
+	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
 )
 
 // requiredPermission is one rule the controller needs, in the shape the
@@ -211,7 +219,19 @@ type permissionTuple struct {
 	group, resource, subresource, verb string
 	name                               string
 	namespaced                         bool
-	label                              string
+	// label is how the denied list names the tuple; for a namespaced tuple
+	// it carries the operator-namespace mark, and baseLabel is the same
+	// without it, for the per-agent-namespace probes to mark their own way.
+	label, baseLabel string
+}
+
+// deniedPermission is one denied review: its label for the condition message
+// and the namespace it was asked about ("" for a cluster-wide review and for
+// the operator's own namespace), so a reconcile can report the denials that
+// concern its agent and not another namespace's.
+type deniedPermission struct {
+	label     string
+	namespace string
 }
 
 func flattenRequiredPermissions() []permissionTuple {
@@ -224,6 +244,7 @@ func flattenRequiredPermissions() []permissionTuple {
 				if permission.Name != "" {
 					label += " (" + permission.Name + ")"
 				}
+				baseLabel := label
 				if permission.Namespaced {
 					label += rbacNamespacedLabelSuffix
 				}
@@ -232,6 +253,7 @@ func flattenRequiredPermissions() []permissionTuple {
 					name:       permission.Name,
 					namespaced: permission.Namespaced,
 					label:      label,
+					baseLabel:  baseLabel,
 				})
 			}
 		}
@@ -248,21 +270,42 @@ func flattenRequiredPermissions() []permissionTuple {
 // A cluster-scoped tuple is reviewed with no namespace: both install paths
 // bind the ClusterRole through a ClusterRoleBinding, so cluster-wide is the
 // grant being checked. A namespaced tuple is reviewed in namespace, the
-// operator's own, where both paths bind the Role; an empty namespace (under
-// `make run`, off the cluster) reviews it cluster-wide, which the developer's
-// own credential answers.
-func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string) ([]string, error) {
-	tuples := flattenRequiredPermissions()
-	denied := make([]bool, len(tuples))
-	errs := make([]error, len(tuples))
+// operator's own, where both paths bind the Role, and once more in each of
+// agentNamespaces: the namespaces of the PlatformAgents the controller has
+// reconciled that are not the operator's own. An agent there reads its
+// Secrets under a RoleBinding nobody installs by default, so without this
+// second review the probe passes while every reconcile of that agent fails
+// forbidden. An empty namespace (under `make run`, off the cluster) reviews
+// the operator-namespace tuple cluster-wide, which the developer's own
+// credential answers.
+func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string, agentNamespaces []string) ([]deniedPermission, error) {
+	type probe struct {
+		tuple     permissionTuple
+		namespace string
+		label     string
+	}
+	var probes []probe
+	for _, tuple := range flattenRequiredPermissions() {
+		if !tuple.namespaced {
+			probes = append(probes, probe{tuple: tuple, label: tuple.label})
+			continue
+		}
+		probes = append(probes, probe{tuple: tuple, namespace: namespace, label: tuple.label})
+		for _, agentNamespace := range agentNamespaces {
+			probes = append(probes, probe{tuple: tuple, namespace: agentNamespace,
+				label: tuple.baseLabel + fmt.Sprintf(rbacAgentNamespaceLabelFormat, agentNamespace)})
+		}
+	}
+	denied := make([]bool, len(probes))
+	errs := make([]error, len(probes))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	slots := make(chan struct{}, rbacProbeConcurrency)
-	for i, tuple := range tuples {
+	for i, p := range probes {
 		wg.Add(1)
-		go func(i int, tuple permissionTuple) {
+		go func(i int, p probe) {
 			defer wg.Done()
 			select {
 			case slots <- struct{}{}:
@@ -272,26 +315,24 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 				return
 			}
 			attributes := &authorizationv1.ResourceAttributes{
-				Group:       tuple.group,
-				Resource:    tuple.resource,
-				Subresource: tuple.subresource,
-				Name:        tuple.name,
-				Verb:        tuple.verb,
-			}
-			if tuple.namespaced {
-				attributes.Namespace = namespace
+				Group:       p.tuple.group,
+				Resource:    p.tuple.resource,
+				Subresource: p.tuple.subresource,
+				Name:        p.tuple.name,
+				Verb:        p.tuple.verb,
+				Namespace:   p.namespace,
 			}
 			review := &authorizationv1.SelfSubjectAccessReview{
 				Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: attributes},
 			}
 			result, err := reviews.Create(ctx, review, metav1.CreateOptions{})
 			if err != nil {
-				errs[i] = fmt.Errorf("SelfSubjectAccessReview for %s: %w", tuple.label, err)
+				errs[i] = fmt.Errorf("SelfSubjectAccessReview for %s: %w", p.label, err)
 				cancel() // one failure fails the probe; stop paying for the rest
 				return
 			}
 			denied[i] = !result.Status.Allowed
-		}(i, tuple)
+		}(i, p)
 	}
 	wg.Wait()
 
@@ -312,10 +353,16 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 	if cancelled != nil {
 		return nil, cancelled
 	}
-	var out []string
-	for i, tuple := range tuples {
+	var out []deniedPermission
+	for i, p := range probes {
 		if denied[i] {
-			out = append(out, tuple.label)
+			// The operator's own namespace is reported to every agent, like a
+			// cluster-wide denial; only another agent namespace is filtered.
+			deniedNamespace := ""
+			if p.namespace != namespace {
+				deniedNamespace = p.namespace
+			}
+			out = append(out, deniedPermission{label: p.label, namespace: deniedNamespace})
 		}
 	}
 	return out, nil
@@ -336,14 +383,76 @@ type RBACChecker struct {
 	timeout  time.Duration
 
 	mu     sync.Mutex
-	denied []string
+	denied []deniedPermission
 	probed bool
+	// agentNamespaces are the namespaces of reconciled PlatformAgents other
+	// than the operator's own, each probed for the namespaced permissions
+	// too. Observe adds one and Forget removes it.
+	agentNamespaces map[string]struct{}
 }
 
 // NewRBACChecker returns a checker that probes through reviews, asking about
 // namespace for the permissions the markers declare namespaced.
 func NewRBACChecker(reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string) *RBACChecker {
-	return &RBACChecker{reviews: reviews, namespace: namespace, interval: rbacReprobeInterval, timeout: RBACProbeTimeout}
+	return &RBACChecker{reviews: reviews, namespace: namespace, interval: rbacReprobeInterval, timeout: RBACProbeTimeout,
+		agentNamespaces: map[string]struct{}{}}
+}
+
+// Observe tells the checker a PlatformAgent lives in namespace. The first
+// time it hears of a namespace that is not the operator's it probes at once,
+// off the caller's goroutine, so the agent's first failed reconcile is
+// followed within seconds by a status that names the missing RoleBinding
+// rather than by five minutes of a bare `Reconciler error` loop; the ticker
+// covers it from then on.
+func (c *RBACChecker) Observe(namespace string) {
+	if c == nil || c.reviews == nil || namespace == "" || namespace == c.namespace {
+		return
+	}
+	c.mu.Lock()
+	_, known := c.agentNamespaces[namespace]
+	if !known {
+		c.agentNamespaces[namespace] = struct{}{}
+	}
+	c.mu.Unlock()
+	if known {
+		return
+	}
+	go func() {
+		if _, err := c.Probe(context.Background()); err != nil {
+			logf.Log.WithName(rbacProbeLogName).Error(err, "RBAC self-check could not probe a PlatformAgent's namespace; the ticker retries", "namespace", namespace)
+		}
+	}()
+}
+
+// Forget drops a namespace Observe added, when its PlatformAgent is deleted,
+// so a namespace that goes away with its RoleBinding does not stand as a
+// denial for the agents that remain.
+func (c *RBACChecker) Forget(namespace string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.agentNamespaces, namespace)
+	kept := c.denied[:0]
+	for _, d := range c.denied {
+		if d.namespace != namespace {
+			kept = append(kept, d)
+		}
+	}
+	c.denied = kept
+}
+
+// sortedAgentNamespaces is the Observe set in a stable order, for the probe.
+func (c *RBACChecker) sortedAgentNamespaces() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.agentNamespaces))
+	for namespace := range c.agentNamespaces {
+		out = append(out, namespace)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // Probe runs the self-check now under the checker's timeout, remembers the
@@ -357,18 +466,26 @@ func (c *RBACChecker) Probe(ctx context.Context) ([]string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	denied, err := probeRBAC(ctx, c.reviews, c.namespace)
+	denied, err := probeRBAC(ctx, c.reviews, c.namespace, c.sortedAgentNamespaces())
 	if err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.probed && !slices.Equal(c.denied, denied) {
-		logf.Log.WithName(rbacProbeLogName).Info("RBAC self-check result changed", "denied", denied)
+		logf.Log.WithName(rbacProbeLogName).Info("RBAC self-check result changed", "denied", labelsOf(denied))
 	}
 	c.denied = denied
 	c.probed = true
-	return append([]string(nil), denied...), nil
+	return labelsOf(denied), nil
+}
+
+func labelsOf(denied []deniedPermission) []string {
+	out := make([]string, 0, len(denied))
+	for _, d := range denied {
+		out = append(out, d.label)
+	}
+	return out
 }
 
 // Denied returns the last probe's denials. It never talks to the API server:
@@ -379,7 +496,26 @@ func (c *RBACChecker) Denied() []string {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return append([]string(nil), c.denied...)
+	return labelsOf(c.denied)
+}
+
+// DeniedFor returns the last probe's denials that concern an agent in
+// namespace: every cluster-wide and operator-namespace denial, plus the ones
+// probed in that namespace. A denial in some other agent's namespace is that
+// agent's condition, not this one's.
+func (c *RBACChecker) DeniedFor(namespace string) []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, d := range c.denied {
+		if d.namespace == "" || d.namespace == namespace {
+			out = append(out, d.label)
+		}
+	}
+	return out
 }
 
 // AgentProfileAccessDenied returns the boot probe's denials on agentprofiles
@@ -441,7 +577,8 @@ func rbacIncompleteMessage(denied []string) string {
 // not make the condition flap between them on every pass — the boot log line
 // still names the denied permissions in that case.
 func (r *PlatformAgentReconciler) reportRBACSkew(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
-	denied := r.RBAC.Denied()
+	r.RBAC.Observe(agent.Namespace)
+	denied := r.RBAC.DeniedFor(agent.Namespace)
 	degraded := len(denied) > 0
 	existing := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType)
 	ownsCondition := existing == nil || existing.Reason == reasonRBACIncomplete
