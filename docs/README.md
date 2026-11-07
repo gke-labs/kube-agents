@@ -268,7 +268,7 @@ identifier appears, add its source here.
 | Controller permissions | `k8s-operator/config/rbac/` |
 | The operator RBAC self-check: the `RBACIncomplete` reason, its re-check interval and condition message; the floating tags `make deploy` refuses and `ALLOW_MUTABLE_IMG` | `k8s-operator/internal/controller/rbac_selfcheck.go`; `k8s-operator/Makefile` |
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
-| The third-party download retry rule: which files are walked and what flags a curl line must carry | `DOWNLOAD_SOURCES`, `RETRY_COUNT` and `RETRY_ALL_ERRORS` in `tests/test_third_party_download_retry.py` |
+| The third-party download retry rule: which files are walked, what flags a curl line must carry, and how long a GitHub release download in an image build must keep retrying | `DOWNLOAD_SOURCES`, `RETRY_COUNT`, `RETRY_ALL_ERRORS`, `IMAGE_BUILDS` and `GITHUB_RELEASE_RETRY_FLOOR_SECONDS` in `tests/test_third_party_download_retry.py` |
 | Harness discovery of this repository's own skills and rules: the `.claude/*` symlink targets, the rule `trigger`/`description` requirements and optional `paths` globs, and the floor a lifecycle skill's description must clear | `CLAUDE_LINKS`, `RULE_TRIGGER`, `LIFECYCLE_ACTIONS` and `PRODUCT` in `tests/test_skill_discovery.py` |
 | The GitHub environment variables an install is configured from, which install.env key each becomes, and which are required to reconcile a long-lived environment | `MAPPING`, `REQUIRED_ALWAYS` and `REQUIRED_STRICT` in `scripts/release/render_install_env.sh` |
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |
