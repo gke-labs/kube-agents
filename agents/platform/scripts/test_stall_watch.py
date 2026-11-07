@@ -2196,6 +2196,41 @@ class ConfigConnector(Base):
         self.assertEqual(fake.discoveries(), [])
         self.assertIsNone(fake.kinds_asked("payments"))
 
+    def test_discovery_filters_every_batch_against_the_namespaces_the_watch_reads(self):
+        kinds = sorted(f"kind{i:03d}s.k{i:03d}.cnrm.cloud.google.com" for i in range(stall_watch.DISCOVERY_BATCH_KINDS + 1))
+        first, last = kinds[0], kinds[-1]
+        objects = [("payments", "Kind000", "k000.cnrm.cloud.google.com/v1beta1"), ("billing", f"Kind{stall_watch.DISCOVERY_BATCH_KINDS:03d}", f"k{stall_watch.DISCOVERY_BATCH_KINDS:03d}.cnrm.cloud.google.com/v1beta1")]
+        _, fake = self.run_tick({"c": {"payments": [], "billing": []}}, served=SERVED_DEFAULT + kinds, objects=objects)
+        self.assertEqual(sorted(len(b) for b in fake.discoveries()), [1, stall_watch.DISCOVERY_BATCH_KINDS])
+        record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_KINDS_KEY]
+        self.assertEqual((record[first], record[last]), (["payments"], ["billing"]), "the second batch is filtered against the read namespaces, not the first batch's findings")
+        self.assertIn(last, fake.kinds_asked("billing"))
+        self.assertIn(first, fake.kinds_asked("payments"))
+
+    def test_a_crowded_namespaces_window_moves_only_when_it_is_read_and_survives_a_refresh(self):
+        cap = stall_watch.WILDCARD_KINDS_CAP
+        kinds = [f"kind{i:02d}s.k{i:02d}.cnrm.cloud.google.com" for i in range(cap + 2)]
+        objects = [("config-control", f"Kind{i:02d}", f"k{i:02d}.cnrm.cloud.google.com/v1beta1") for i in range(len(kinds))]
+        fleet = {"c": {"config-control": []}}
+        _, fake = self.run_tick(fleet, served=SERVED_DEFAULT + kinds, objects=objects, now="2026-11-06T00:00:00+00:00")
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[:cap])
+        # A tick whose budget ends before the namespace is scanned consumes no window.
+        jump = {"seconds": 0}
+        real_served, real_monotonic = stall_watch.served_kinds, stall_watch.time.monotonic
+
+        def served_then_exhaust(kubeconfig):
+            served = real_served(kubeconfig)
+            jump["seconds"] = stall_watch.TICK_BUDGET_SECONDS + 1
+            return served
+
+        with patch.object(stall_watch, "served_kinds", served_then_exhaust), patch.object(stall_watch.time, "monotonic", lambda: real_monotonic() + jump["seconds"]):
+            _, fake = self.run_tick(fleet, served=SERVED_DEFAULT + kinds, objects=objects, now="2026-11-06T00:30:00+00:00")
+        self.assertEqual(fake.scanned(), [])
+        # Seven hours on, the refresh rebuilds the record; the window carries over and the second window is read.
+        _, fake = self.run_tick(fleet, served=SERVED_DEFAULT + kinds, objects=objects, now="2026-11-06T07:00:00+00:00")
+        self.assertTrue(fake.discoveries(), "the refresh ran")
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[cap:] + kinds[: cap - 2])
+
     def test_discovery_splits_the_kinds_into_batches(self):
         kinds = sorted(f"kind{i:03d}s.k{i:03d}.cnrm.cloud.google.com" for i in range(stall_watch.DISCOVERY_BATCH_KINDS + 1))
         _, fake = self.run_tick({"c": {"payments": []}}, served=SERVED_DEFAULT + kinds, objects=[])

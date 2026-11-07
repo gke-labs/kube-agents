@@ -420,7 +420,7 @@ The GKE-events path is live end to end:
   Standard cluster is a fault and still opens a card, and a real workload draws a node-auto-provisioning
   verdict within seconds, which takes it out of the hold.
   `WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD=false` reports them.
-  The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  The twenty-entry `defaultReasons` in the watcher's `filter.go` — which does include
   `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
   `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
   that list produces nothing at all: no session, no card, no report.

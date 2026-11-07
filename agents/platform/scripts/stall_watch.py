@@ -1056,16 +1056,20 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
         if unmapped:
             sys.stderr.write(f"stall_watch: discovery listed objects of {', '.join(sorted(unmapped))} that match no listed resource name; not read\n")
         complete = r is not None and r.returncode == 0 and PROXY_TRUNCATED_TEXT not in (r.stderr or "")
-        for resource, namespaces in seen.items():
-            kinds[resource] = sorted(namespaces)
+        for resource, found in seen.items():
+            kinds[resource] = sorted(found)
         for resource in batch:
             if complete:
                 kinds.setdefault(resource, [])
             else:
                 unknown.append(resource)
+    turns: dict = {}
     if isinstance(previous, dict):
         before = previous.get(DISCOVERY_KINDS_KEY) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else {}
         before_unknown = set(previous.get(DISCOVERY_UNKNOWN_KEY) or [])
+        # Where each crowded namespace's window stands carries over: a
+        # refresh changes what is known, not which kinds were read last.
+        turns = dict(previous.get(DISCOVERY_TURN_KEY) or {}) if isinstance(previous.get(DISCOVERY_TURN_KEY), dict) else {}
         for resource in lost_kinds(previous, candidates):
             # Carried as it was: a kind the previous record could not read
             # stays unknown, so its rows stay held and the hourly retry
@@ -1073,27 +1077,31 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
             kinds.setdefault(resource, list(before.get(resource) or []))
             if resource in before_unknown and resource not in unknown:
                 unknown.append(resource)
-    return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
+    return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown), DISCOVERY_TURN_KEY: turns}
 
 
-def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: list[str], label: str) -> tuple[dict[str, list[str]], set[str], dict[str, set[str]]]:
+def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: list[str], label: str) -> tuple[dict[str, list[str]], set[str], dict[str, set[str]], dict[str, int]]:
     """From a cluster's discovery record: the wildcard kinds to read in each
     namespace (at most WILDCARD_KINDS_CAP, by name); the kinds whose rows are
     held as unread wherever they are not read this tick (unknown to the
     record, served since it was made, or in a group the api-resources listing
     no longer shows, which is a listing gap until a discovery says otherwise);
-    and the kinds held in one namespace because they wait their turn there:
-    a namespace with more kinds than WILDCARD_KINDS_CAP is read a window at
-    a time, the window moving on each tick (DISCOVERY_TURN_KEY on the record,
-    advanced here), so every kind is read within a few ticks and none is
-    left out by where its name sorts. A kind the record names is read where
+    the kinds held in one namespace because they wait their turn there; and,
+    per crowded namespace, where the window starts once this one has been
+    read. A namespace with more kinds than WILDCARD_KINDS_CAP is read a
+    window at a time, from where DISCOVERY_TURN_KEY on the record says; the
+    caller moves that pointer only after the namespace's scan returned
+    (`sweep_fleet`), so a tick the budget ends before the namespace, or that
+    resumes past it, consumes no window, and every kind is read within a few
+    reads of the namespace and none is left out by where its name sorts. A
+    kind the record names is read where
     the record saw it even when it is held: held stops a row clearing, not a
     read. A kind the record names that the listing no longer serves while
     its group is served is neither read nor held: a deleted CRD took its
     objects with it, and its rows clear against the scan."""
     known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
     if not isinstance(known, dict):
-        return {}, set(candidates), {}
+        return {}, set(candidates), {}, {}
     stale = lost_kinds(record, candidates)
     held = (set(candidates) - set(known)) | (set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) & set(candidates)) | stale
     by_namespace: dict[str, list[str]] = {}
@@ -1118,8 +1126,7 @@ def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: li
             f"stall_watch: {label} namespace {namespace} has objects of {len(resources)} kinds under {', '.join(wildcards)}; "
             f"{WILDCARD_KINDS_CAP} are read this tick and the rest wait their turn\n"
         )
-    record[DISCOVERY_TURN_KEY] = next_turns
-    return by_namespace, held, cut
+    return by_namespace, held, cut, next_turns
 
 
 def is_system_namespace(name: str) -> bool:
@@ -1637,7 +1644,7 @@ def sweep_fleet(
             # The wildcard's kinds, per namespace, from this cluster's
             # discovery record, redone when due. A discovery that fails holds
             # the kinds it could not read; it never makes the cluster unreadable.
-            extra_kinds, held, cut = {}, set(), {}
+            extra_kinds, held, cut, next_turns = {}, set(), {}, {}
             candidates = wildcard_candidates(served, wildcards)
             record = discoveries.get(cid)
             if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed, candidates):
@@ -1646,7 +1653,7 @@ def sweep_fleet(
                 record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
                 discoveries[cid] = record
             if wildcards and (candidates or record is not None):
-                extra_kinds, held, cut = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))
+                extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
@@ -1697,6 +1704,10 @@ def sweep_fleet(
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
             sweep.read_scopes.add(scope_key(cid, namespace))
+            if namespace in next_turns and isinstance(record, dict):
+                # The namespace was read: its window moves on for the next
+                # tick that reads it, and only then.
+                record.setdefault(DISCOVERY_TURN_KEY, {})[namespace] = next_turns[namespace]
             # A kind the cluster does not serve holds its rows without making
             # the namespace unreadable: most clusters lack some optional CRD.
             # So does a wildcard kind discovery could not read or the cap cut.
