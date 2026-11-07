@@ -681,7 +681,11 @@ c.commit()
 			submitFrom(t, c, "task-"+tc.name, contextID, tc.conversation, "check prod-a")
 			if tc.holds {
 				time.Sleep(3 * time.Second)
-				if got, err := c.TasksGet(testCtx(t), "platform", "task-"+tc.name); err == nil && got.Final {
+				got, err := c.TasksGet(testCtx(t), "platform", "task-"+tc.name)
+				if err != nil {
+					t.Fatalf("read the console task: %v", err)
+				}
+				if got.Final {
 					t.Fatalf("a console turn ended while its card runs: %+v", got.State)
 				}
 				return
