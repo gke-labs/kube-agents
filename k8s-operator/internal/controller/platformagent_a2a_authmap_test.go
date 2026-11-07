@@ -54,7 +54,7 @@ func authMapTestAgent() *agentv1alpha1.PlatformAgent {
 // render that cuts more than one is a failure here, not a thing to pick from.
 func singleA2AAuthMapShard(t *testing.T, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string) {
 	t.Helper()
-	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMaps: %v", err)
 	}
