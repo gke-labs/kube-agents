@@ -296,10 +296,10 @@ substitutes a placeholder name for it.
 `projectId` has to be the project ID, not the project number. The detector matches it against the
 project on each audit record, which is always the ID, so a value that is nothing but digits can
 match nothing. The operator reports the detector as off rather than starting a sidecar that exits on
-every launch. The `ScopeUndeclared` condition reads the ID off the host cluster's own series when
-this field carries a number, and says nothing until that series exists and names one project. Everything else reading
-`spec.harness` accepts a number, so an install can be healthy in every other respect and still be
-refused here.
+every launch. `ScopeUndeclared` names the project only in a form `spec.scope.projects` accepts: on
+a number it reads the ID off the host cluster's own series, and otherwise it says nothing.
+Everything else reading `spec.harness` accepts a number, so an install can be healthy in every
+other respect and still be refused here.
 
 `subscription` and `gitopsManagers` are the two knobs worth moving from a CR. Leave `subscription`
 unset unless you renamed the one the module creates.

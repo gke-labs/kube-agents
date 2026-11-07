@@ -27,14 +27,25 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// The test agent's host triple is p/l/c (usageTestAgent). These are the
-// neighbours the watcher registers beside it when the reconcile has adopted
-// every cluster in project p.
+// The scope tests' host triple is scope-test-proj/l/c: usageTestAgent's project
+// "p" is shorter than a spec.scope.projects entry may be, and the condition
+// names only a project that field accepts. These are the neighbours the watcher
+// registers beside the host when the reconcile has adopted every cluster in it.
+const scopeTestProject = "scope-test-proj"
+
 var (
-	scopeTestHost       = usageClusterRef{Name: "c", Project: "p", Location: "l"}
-	scopeTestNeighbourA = usageClusterRef{Name: "analytics-dev", Project: "p", Location: "europe-west4"}
-	scopeTestNeighbourB = usageClusterRef{Name: "batch-east", Project: "p", Location: "us-east1-b"}
+	scopeTestHost       = usageClusterRef{Name: "c", Project: scopeTestProject, Location: "l"}
+	scopeTestNeighbourA = usageClusterRef{Name: "analytics-dev", Project: scopeTestProject, Location: "europe-west4"}
+	scopeTestNeighbourB = usageClusterRef{Name: "batch-east", Project: scopeTestProject, Location: "us-east1-b"}
 )
+
+// scopeUndeclaredTestAgent is usageTestAgent with the host project the scope
+// tests use.
+func scopeUndeclaredTestAgent(created time.Time) *agentv1alpha1.PlatformAgent {
+	agent := usageTestAgent(created)
+	agent.Spec.Harness.ProjectID = scopeTestProject
+	return agent
+}
 
 // setClusterRefs gives addr's watcher reading the named cluster_up series,
 // every one monitored, as the scrape would read them.
@@ -62,7 +73,7 @@ func scopeCondition(t *testing.T, h *usageHarness) *metav1.Condition {
 // the condition is True and names them; once only the host is registered it is
 // removed, as the reading no longer calls for it.
 func TestScopeUndeclared_NamesTheClustersBeyondTheHost(t *testing.T) {
-	h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourB, scopeTestNeighbourA)
+	h := scopeHarness(t, scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourB, scopeTestNeighbourA)
 	h.poll(5)
 	cond := scopeCondition(t, h)
 	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != scopeUndeclaredReason {
@@ -70,15 +81,15 @@ func TestScopeUndeclared_NamesTheClustersBeyondTheHost(t *testing.T) {
 	}
 	for _, want := range []string{
 		"2 cluster(s) beyond the host cluster c",
-		"analytics-dev (p/europe-west4), batch-east (p/us-east1-b)",
-		"management project p",
+		"analytics-dev (scope-test-proj/europe-west4), batch-east (scope-test-proj/us-east1-b)",
+		"management project scope-test-proj",
 		scopeUndeclaredHint,
 	} {
 		if !strings.Contains(cond.Message, want) {
 			t.Errorf("message %q lacks %q", cond.Message, want)
 		}
 	}
-	if strings.Contains(cond.Message, "c (p/l)") {
+	if strings.Contains(cond.Message, "c (scope-test-proj/l)") {
 		t.Errorf("message %q lists the host cluster as a neighbour", cond.Message)
 	}
 	if cond.ObservedGeneration != h.agent().Generation {
@@ -99,7 +110,7 @@ func TestScopeUndeclared_NamesTheClustersBeyondTheHost(t *testing.T) {
 // the names on the CR are the clusters registered now; an unchanged set writes
 // nothing.
 func TestScopeUndeclared_MessageFollowsTheSet(t *testing.T) {
-	h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourA)
+	h := scopeHarness(t, scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourA)
 	h.poll(5)
 	first := scopeCondition(t, h)
 	if first == nil || strings.Contains(first.Message, "batch-east") {
@@ -113,7 +124,7 @@ func TestScopeUndeclared_MessageFollowsTheSet(t *testing.T) {
 	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, scopeTestNeighbourA, scopeTestNeighbourB)
 	h.poll(15)
 	second := scopeCondition(t, h)
-	if second == nil || !strings.Contains(second.Message, "batch-east (p/us-east1-b)") || !strings.Contains(second.Message, "2 cluster(s)") {
+	if second == nil || !strings.Contains(second.Message, "batch-east (scope-test-proj/us-east1-b)") || !strings.Contains(second.Message, "2 cluster(s)") {
 		t.Fatalf("condition after a neighbour joined = %+v", second)
 	}
 	if !second.LastTransitionTime.Equal(&first.LastTransitionTime) {
@@ -132,10 +143,10 @@ func TestScopeUndeclared_DeclaredScopeWritesNothing(t *testing.T) {
 		"organizations":                {Organizations: []string{"456"}},
 		"sharedVpcHosts":               {SharedVpcHosts: []string{"net-host"}},
 		"metricsScopes":                {MetricsScopes: []string{"obs-hub"}},
-		"the management project named": {Projects: []string{"p"}},
+		"the management project named": {Projects: []string{scopeTestProject}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+			agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
 			agent.Spec.Scope = scope
 			h := scopeHarness(t, agent, scopeTestHost, scopeTestNeighbourA)
 			h.poll(5)
@@ -144,7 +155,7 @@ func TestScopeUndeclared_DeclaredScopeWritesNothing(t *testing.T) {
 			}
 		})
 	}
-	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
 	agent.Spec.Scope = &agentv1alpha1.ScopeSpec{Exclude: &agentv1alpha1.ScopeExcludeSpec{Projects: []string{"*-sandbox"}}, MaxProjects: ptr.To(int32(100))}
 	h := scopeHarness(t, agent, scopeTestHost, scopeTestNeighbourA)
 	h.poll(5)
@@ -164,7 +175,7 @@ func TestScopeUndeclared_HostOnlyWritesNothing(t *testing.T) {
 		"none":         {},
 	} {
 		t.Run(name, func(t *testing.T) {
-			h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), refs...)
+			h := scopeHarness(t, scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour)), refs...)
 			h.poll(5)
 			if cond := scopeCondition(t, h); cond != nil {
 				t.Fatalf("condition = %+v, want none", cond)
@@ -185,9 +196,13 @@ func TestScopeUndeclared_UnknownHostWritesNothing(t *testing.T) {
 		"no location":       func(h *agentv1alpha1.HarnessSpec) { h.Location = "" },
 		"no project":        func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" },
 		"no harness at all": nil,
+		// An ID spec.scope.projects cannot carry: the remedy names that field, so
+		// the operator names nothing rather than a value the API server refuses.
+		"legacy domain-scoped project": func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "example.com:proj" },
+		"too short an ID":              func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "ab" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+			agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
 			if edit == nil {
 				agent.Spec.Harness = nil
 			} else {
@@ -208,7 +223,7 @@ func TestScopeUndeclared_UnknownHostWritesNothing(t *testing.T) {
 // neighbours still are.
 func TestScopeUndeclared_IgnoresClustersInOtherProjects(t *testing.T) {
 	foreign := usageClusterRef{Name: "payments-prod", Project: "payments", Location: "us-central1"}
-	h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, foreign)
+	h := scopeHarness(t, scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, foreign)
 	h.poll(5)
 	if cond := scopeCondition(t, h); cond != nil {
 		t.Fatalf("condition = %+v, want none for a foreign-project profile alone", cond)
@@ -226,7 +241,7 @@ func TestScopeUndeclared_IgnoresClustersInOtherProjects(t *testing.T) {
 // until that series exists (the host still watched through its bare direct
 // entry) the operator says nothing rather than naming the host as adopted.
 func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing.T) {
-	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
 	agent.Spec.Harness.ProjectID = "123456789012"
 	h := scopeHarness(t, agent, usageClusterRef{Name: "c"}, scopeTestNeighbourA)
 	h.poll(5)
@@ -236,12 +251,12 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, scopeTestNeighbourA)
 	h.poll(10)
 	cond := scopeCondition(t, h)
-	if cond == nil || !strings.Contains(cond.Message, "1 cluster(s) beyond the host cluster c") || !strings.Contains(cond.Message, "analytics-dev") || strings.Contains(cond.Message, "c (p/l)") {
+	if cond == nil || !strings.Contains(cond.Message, "1 cluster(s) beyond the host cluster c") || !strings.Contains(cond.Message, "analytics-dev") || strings.Contains(cond.Message, "c (scope-test-proj/l)") {
 		t.Fatalf("condition = %+v, want the neighbour alone, named under the resolved project", cond)
 	}
 	// The remedy names spec.scope.projects, which refuses a number, so the message
 	// names the project by the ID the series carried, not by the harness's number.
-	if !strings.Contains(cond.Message, "management project p.") || strings.Contains(cond.Message, "123456789012") {
+	if !strings.Contains(cond.Message, "management project scope-test-proj.") || strings.Contains(cond.Message, "123456789012") {
 		t.Fatalf("message names the project by number: %q", cond.Message)
 	}
 
@@ -274,10 +289,21 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 	if again := scopeCondition(t, h); again != nil {
 		t.Fatalf("condition under a numeric project label = %+v, want none", again)
 	}
+
+	// A label the cluster-name grammar admits and the spec.scope.projects grammar
+	// refuses (a leading digit, or too short) is no candidate either: the remedy
+	// names that field.
+	for _, label := range []string{"1abc-proj", "ab"} {
+		h.stub.setClusterRefs(gatewayAddr(), usageClusterRef{Name: "c", Project: label, Location: "l"}, usageClusterRef{Name: "n", Project: label, Location: "l"})
+		h.poll(30)
+		if again := scopeCondition(t, h); again != nil {
+			t.Fatalf("condition under project label %q = %+v, want none", label, again)
+		}
+	}
 }
 
 func TestScopeUndeclaredRemovalCause(t *testing.T) {
-	agent := usageTestAgent(usageClock(0))
+	agent := scopeUndeclaredTestAgent(usageClock(0))
 	if got := scopeUndeclaredRemovalCause(agent, nil); !strings.Contains(got, "no current reading") {
 		t.Errorf("no reading: %q", got)
 	}
@@ -294,12 +320,12 @@ func TestScopeUndeclaredRemovalCause(t *testing.T) {
 	if got := scopeUndeclaredRemovalCause(agent, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "no cluster beyond the host") {
 		t.Errorf("host only: %q", got)
 	}
-	declared := usageTestAgent(usageClock(0))
-	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{Projects: []string{"p"}}
+	declared := scopeUndeclaredTestAgent(usageClock(0))
+	declared.Spec.Scope = &agentv1alpha1.ScopeSpec{Projects: []string{scopeTestProject}}
 	if got := scopeUndeclaredRemovalCause(declared, []usageClusterRef{scopeTestHost, scopeTestNeighbourA}); !strings.Contains(got, "declares a membership") {
 		t.Errorf("declared: %q", got)
 	}
-	numeric := usageTestAgent(usageClock(0))
+	numeric := scopeUndeclaredTestAgent(usageClock(0))
 	numeric.Spec.Harness.ProjectID = "123456789012"
 	if got := scopeUndeclaredRemovalCause(numeric, []usageClusterRef{{Name: "c"}}); !strings.Contains(got, "not known") {
 		t.Errorf("numeric project, host unresolved: %q", got)
@@ -314,7 +340,7 @@ func TestScopeUndeclaredRemovalCause(t *testing.T) {
 // when the watcher is off, so a held condition never outlives what the
 // operator can see.
 func TestScopeUndeclared_ClearsWhenTheReadingGoes(t *testing.T) {
-	h := scopeHarness(t, usageTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourA)
+	h := scopeHarness(t, scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour)), scopeTestHost, scopeTestNeighbourA)
 	h.poll(5)
 	if cond := scopeCondition(t, h); cond == nil {
 		t.Fatal("no condition after the first poll")
@@ -329,7 +355,7 @@ func TestScopeUndeclared_ClearsWhenTheReadingGoes(t *testing.T) {
 		t.Fatalf("condition after the streak = %+v, want it removed", cond)
 	}
 
-	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
 	agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
 	agent.Status.Conditions = []metav1.Condition{{Type: scopeUndeclaredCondition, Status: metav1.ConditionTrue, Reason: scopeUndeclaredReason, LastTransitionTime: metav1.Now()}}
 	off := scopeHarness(t, agent, scopeTestHost, scopeTestNeighbourA)
@@ -344,7 +370,7 @@ func TestScopeUndeclared_ClearsWhenTheReadingGoes(t *testing.T) {
 func TestScopeUndeclared_UnitesTheReplicas(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
-	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), b)...)
+	h := newUsageHarness(t, scopeUndeclaredTestAgent(created), append(usageDefaultObjects(created), b)...)
 	bAddr := usageTestGatewayB + ":9095"
 	h.stub.set(gatewayAddr(), 0, ptr.To(1.0))
 	h.stub.set(bAddr, 0, ptr.To(1.0))
@@ -362,19 +388,19 @@ func TestScopeUndeclared_UnitesTheReplicas(t *testing.T) {
 // the labels are a listener's text, and a hostile or broken value must not
 // reach the CR as written.
 func TestScopeUndeclaredMessage_BoundsAndValidatesNames(t *testing.T) {
-	agent := usageTestAgent(usageClock(0))
+	agent := scopeUndeclaredTestAgent(usageClock(0))
 	var refs []usageClusterRef
 	for i := 0; i < scopeUndeclaredNamesShown+3; i++ {
-		refs = append(refs, usageClusterRef{Name: fmt.Sprintf("n-%02d", i), Project: "p", Location: "l"})
+		refs = append(refs, usageClusterRef{Name: fmt.Sprintf("n-%02d", i), Project: scopeTestProject, Location: "l"})
 	}
-	msg := scopeUndeclaredMessage(agent, "p", refs)
+	msg := scopeUndeclaredMessage(agent, scopeTestProject, refs)
 	if !strings.Contains(msg, fmt.Sprintf("%d cluster(s)", len(refs))) || !strings.Contains(msg, "and 3 more") {
 		t.Errorf("message %q does not bound the list at %d names", msg, scopeUndeclaredNamesShown)
 	}
 	if strings.Contains(msg, fmt.Sprintf("n-%02d", scopeUndeclaredNamesShown)) {
 		t.Errorf("message %q names a cluster past the bound", msg)
 	}
-	hostile := scopeUndeclaredMessage(agent, "p", []usageClusterRef{{Name: "x\ny; rm -rf /", Project: "P R", Location: "l"}})
+	hostile := scopeUndeclaredMessage(agent, scopeTestProject, []usageClusterRef{{Name: "x\ny; rm -rf /", Project: "P R", Location: "l"}})
 	if strings.Contains(hostile, "rm -rf") || strings.Contains(hostile, "P R") || !strings.Contains(hostile, scopeUndeclaredInvalidName) {
 		t.Errorf("hostile labels reached the message: %q", hostile)
 	}

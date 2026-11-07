@@ -63,6 +63,14 @@ const (
 // scopeUndeclaredInvalidName.
 var scopeUndeclaredNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
+// scopeProjectIDPattern is the shape of a spec.scope.projects entry (the CRD's
+// item pattern: 6 to 30 characters, a lowercase letter first, no trailing
+// hyphen), which is the form the remedy tells the reader to write. A management
+// project outside it, a project number or a legacy domain-scoped ID, cannot be
+// declared there, so the operator names nothing rather than a value the API
+// server refuses.
+var scopeProjectIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`)
+
 // scopeDeclared reports whether spec.scope names a project, folder, organisation
 // or selector. Exclusions are not a declaration: a block whose membership lists
 // are all empty, the installer's own render without SCOPE_* values, still
@@ -151,7 +159,12 @@ func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef
 		return ""
 	}
 	if !isProjectNumber(h.ProjectID) {
-		return h.ProjectID
+		// An ID the remedy cannot carry (a legacy domain-scoped project) is not
+		// named either: nothing refuses it on the harness.
+		if scopeProjectIDPattern.MatchString(h.ProjectID) {
+			return h.ProjectID
+		}
+		return ""
 	}
 	// Two clusters may share a name and location in different projects, and a
 	// hand-made profile for the other one would sort first: with more than one
@@ -160,7 +173,7 @@ func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef
 	// candidate: the message would otherwise tell the reader to declare it.
 	found := ""
 	for _, ref := range refs {
-		if ref.Name != h.ClusterName || ref.Location != h.Location || !scopeUndeclaredNamePattern.MatchString(ref.Project) || isProjectNumber(ref.Project) {
+		if ref.Name != h.ClusterName || ref.Location != h.Location || !scopeProjectIDPattern.MatchString(ref.Project) {
 			continue
 		}
 		if found != "" && found != ref.Project {
@@ -193,7 +206,7 @@ func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, management strin
 		listed += fmt.Sprintf(", and %d more", rest)
 	}
 	return fmt.Sprintf("spec.scope names no project, folder, organization or selector, so the Cluster Agent reconcile adopts every GKE cluster in the management project %s. "+
-		"%d cluster(s) beyond the host cluster %s have a Cluster Agent profile and are watched: %s. %s",
+		"%d cluster(s) beyond the host cluster %s have a Cluster Agent profile and are registered with the event watcher: %s. %s",
 		scopeUndeclaredLabel(management), len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
 }
 
@@ -222,7 +235,7 @@ func scopeUndeclaredRemovalCause(agent *agentv1alpha1.PlatformAgent, refs []usag
 	case refs == nil:
 		return "the operator has no current reading from the event watcher"
 	case scopeHostProject(agent, refs) == "":
-		return "the management project's ID is not known: spec.harness does not name the host cluster's name, location and project, or names the project by number and no single project carries a series of the host's name and location"
+		return "the management project's ID is not known: spec.harness does not name the host cluster's name, location and a project ID spec.scope.projects accepts, or names the project by number and no single such project carries a series of the host's name and location"
 	default:
 		return "the watcher registers no cluster beyond the host in the management project"
 	}
