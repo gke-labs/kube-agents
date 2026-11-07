@@ -988,6 +988,11 @@ func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
 	return TaskRef{}, false
 }
 
+// stopTaskStepState closes token's step states for refs (all of token's with
+// no refs) after a stop went out: it cuts short any poll in flight and closes
+// their watches. The states stay keyed, inactive, so the stopped turn's
+// closing poll still knows the steps it reported and does not repeat them;
+// that poll removes them once the turn settles, or eviction does.
 func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
 	matched := c.matchTaskStepStates(token, refs...)
 	if len(matched) == 0 {
@@ -996,13 +1001,6 @@ func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
 	for st := range matched {
 		st.cancelInFlightPoll()
 	}
-	c.mu.Lock()
-	for k, st := range c.steps {
-		if matched[st] {
-			delete(c.steps, k)
-		}
-	}
-	c.mu.Unlock()
 	for st := range matched {
 		st.closeAll()
 	}

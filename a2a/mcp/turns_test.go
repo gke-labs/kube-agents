@@ -2412,10 +2412,16 @@ func TestAStopDuringAStreamedPollGoesOutPromptly(t *testing.T) {
 		t.Fatal("the in-flight poll never returned")
 	}
 	convs.mu.Lock()
-	remaining := len(convs.steps)
+	st := convs.steps["task-stop-root"]
 	convs.mu.Unlock()
-	if remaining != 0 {
-		t.Errorf("len(convs.steps) after the stop = %d, want 0", remaining)
+	if st == nil {
+		t.Fatal("the stop dropped the streamed step state, want it kept closed")
+	}
+	st.mu.Lock()
+	open := st.active.Load() || st.watch != nil || len(st.taskWatches) > 0
+	st.mu.Unlock()
+	if open {
+		t.Error("the streamed step state is still open after the stop, want its watches closed")
 	}
 }
 
@@ -2452,4 +2458,87 @@ func TestAFailedStopKeepsTheStreamedStepState(t *testing.T) {
 		t.Errorf("a failed stop discarded the streamed step state (kept=%v, active=%v)", kept, st.active.Load())
 	}
 	st.closeAll()
+}
+
+// A stop closes the streamed step state but keeps the steps it reported: the
+// stopped turn's closing poll, which the conversation's running task still
+// leads to, reports it canceled without sending every step again. The mutant
+// this kills: a stop that drops the state, so the closing poll starts over.
+func TestTheClosingPollAfterAStopDoesNotRepeatSteps(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	rootID := "task-stop-repeat-root"
+	stepPart := mustStepPart(t, stepmsg.Step{Kind: stepmsg.KindPlan, Title: "Checking cluster nodes", CallIDs: []string{"c1"}})
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+		publishParts(t, js, fakeAddressee, rootID, stepmsg.ArtifactName, stepPart)
+		publishParts(t, js, fakeAddressee, rootID, lib.ArtifactActivity,
+			mustDataPart(t, map[string]any{"tool": "kubectl", "callId": "c1", "title": "kubectl get nodes", "status": "completed"}))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	var first TurnStepOutcome
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && len(first.StepDetails) == 0 {
+		first, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 3*time.Second)
+		if err != nil {
+			t.Fatalf("first WaitForTurnStep: %v", err)
+		}
+	}
+	if !first.StillRunning || len(first.StepDetails) != 1 {
+		t.Fatalf("first poll = running %v, steps %+v; want the running step", first.StillRunning, first.StepDetails)
+	}
+
+	convs.stopTaskStepState(token)
+	publishStatus(t, js, fakeAddressee, rootID, lib.StateCanceled, true)
+
+	ref, ok := convs.knownTaskRef(rootID)
+	if !ok {
+		t.Fatal("the stopped turn's task no longer resolves")
+	}
+	closing, err := b.WaitForTurnStep(t.Context(), convs, nil, ref, 3*time.Second)
+	if err != nil {
+		t.Fatalf("closing WaitForTurnStep: %v", err)
+	}
+	if closing.StillRunning {
+		t.Fatal("the closing poll after the stop still reads the turn as running")
+	}
+	if len(closing.NewStepDetails) != 0 {
+		t.Errorf("the closing poll after the stop repeats steps already shown: %+v", closing.NewStepDetails)
+	}
+	convs.mu.Lock()
+	remaining := len(convs.steps)
+	convs.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("len(convs.steps) after the closing poll = %d, want 0", remaining)
+	}
 }
