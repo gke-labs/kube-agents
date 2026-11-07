@@ -5572,12 +5572,13 @@ ask_gitops_forge() {
   # What the menu was first shown over. An option 2 attempt the validator
   # refuses puts these back, so the next answer -- option 2 again, github.com
   # or no repository -- starts from here and not from the refused host and
-  # CA file. The hostname prompt's default is the host the menu was shown
+  # CA file. The hostname and CA prompts' defaults are what the menu was shown
   # over on the first attempt and nothing after a refusal: prompt_read
-  # substitutes a default for an empty answer, so a refused host offered
+  # substitutes a default for an empty answer, so a refused host or file offered
   # again would make enter resubmit it instead of returning to the menu.
   local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
-  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  local ca_secret_on_entry="${PARAM_GITOPS_CA_SECRET:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}" ghes_ca_file="${PARAM_GITOPS_CA_FILE:-}"
   while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
@@ -5610,12 +5611,15 @@ ask_gitops_forge() {
         fi
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST="$ghes_host"
-        # The CA prompt has no default, so empty stays a way to answer "a
-        # public CA signed it" on every pass.
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+          local ca_prompt="PEM CA file that signed the instance's certificate"
+          [ -z "$ghes_ca_file" ] && ca_prompt="$ca_prompt (empty if a public CA signed it)"
+          prompt_read "$ca_prompt" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
+          # An empty answer means a public CA signed the certificate: clear
+          # any Secret name the early flag check derived from an exported file.
+          # Leave an operator-named Secret alone if it arrived without a file.
+          if [ -z "$PARAM_GITOPS_CA_FILE" ] && [ -n "$ca_file_on_entry" ]; then
+            PARAM_GITOPS_CA_SECRET=""
           fi
         fi
         if validate_gitops_forge_flags; then
@@ -5631,9 +5635,11 @@ ask_gitops_forge() {
         # CA file themselves; option 3 does not, and without this it would
         # offer the refused Enterprise Server host as the GitLab host's default.
         ghes_host=""
+        ghes_ca_file=""
         PARAM_GITOPS_HOST="$host_on_entry"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+          PARAM_GITOPS_CA_SECRET="$ca_secret_on_entry"
         fi
         has_controlling_tty || exit 1
         ;;
