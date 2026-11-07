@@ -30,6 +30,13 @@
 # Ignore on an inert group). A declared gap, expected_fail: no compliance check
 # reads a CA bundle's notAfter; the gap is #4960.
 ./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on a ServiceAccount whose Workload Identity annotation names a Google
+# service account with no workloadIdentityUser binding behind it (the planted
+# kms-signer-sa and the kms-signer Deployment in seeded-identity). A declared
+# gap, expected_fail: no compliance check reads the binding behind an
+# annotation; the gap is #5027.
+./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the compliance audit on a
 # Deployment that pulls an Artifact Registry image through the node identity
 # alone and is refused for lack of the registry reader role (the planted

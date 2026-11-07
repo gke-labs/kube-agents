@@ -987,6 +987,17 @@ class TestNoPdb(unittest.TestCase):
     def test_a_single_replica_workload_is_never_flagged(self):
         self.assertIsNone(collect.check_no_pdb(self.wl(replicas=1), context_of()))
 
+    def test_the_impact_frames_upgrades_and_scale_downs_not_one_drain(self):
+        """#4966: one drain evicts only the pods on that node, so three replicas
+        on three nodes survive it. The risk is co-location and back-to-back
+        drains during upgrades and scale-downs, and the sentence must say so."""
+        impact = next(s for s in collect.OBTAINABILITY_CHECKS if s.slug == "no-pdb").impact
+        for phrase in ("node upgrades", "scale-downs", "every replica on that node", "back-to-back drains"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, impact)
+        self.assertNotIn("single node drain", impact)
+        self.assertNotIn("terminate every replica", impact)
+
 
 class TestBlockingPdb(unittest.TestCase):
     def ctx(self, pdb_entry, replicas=3, labels=None, hpas=None, ns="default"):

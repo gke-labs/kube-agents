@@ -93,6 +93,14 @@ ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "is
 PROPOSALS_COUNTS_URL = "http://127.0.0.1:8699/v1/proposals/opened/counts"
 SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
 PROPOSALS_READ_TIMEOUT_SECONDS = 2
+# Beside the counts, rendered only with them: seconds since the last
+# successful ledger read, on a monotonic clock. 0 right after a good read; it
+# grows while failed reads keep serving the last counts, so a scraper can tell
+# stale counts from fresh (as kubeagents_vcs_readings_age_seconds does for the
+# broker's readings). The family is unlabelled; the consumer sets the limit.
+PROPOSALS_READ_AGE_METRIC = "kubeagents_proposals_opened_read_age_seconds"
+PROPOSALS_READ_AGE_HELP = "Seconds since the proposals ledger was last read successfully; present with kubeagents_proposals_opened, and growing while a failed read keeps its last counts."
+PROPOSALS_READ_AGE_DECIMALS = 3
 # The platform label of an origin the ledger has no row for, and of a row with
 # no platform.
 NO_PLATFORM = ""
@@ -216,12 +224,16 @@ class ProposalsOpenedGauge:
     there are no counts: :meth:`counts` returns None and the family is not
     rendered, so a scraper sees a miss rather than nine zero readings. The
     gauge holds nothing the ledger does not: a new process reads the same.
+    :meth:`reading` also returns the seconds since the last successful read,
+    on ``clock`` (monotonic by default), so kept counts are marked stale.
     """
 
-    def __init__(self, url: str = PROPOSALS_COUNTS_URL) -> None:
+    def __init__(self, url: str = PROPOSALS_COUNTS_URL, clock: Callable[[], float] = time.monotonic) -> None:
         self._url = url
+        self._clock = clock
         self._lock = threading.Lock()
         self._counts: Optional[dict[tuple[str, str], int]] = None
+        self._read_at = 0.0
         self._failing = False
 
     def _read(self) -> dict[tuple[str, str], int]:
@@ -247,6 +259,11 @@ class ProposalsOpenedGauge:
 
     def counts(self) -> Optional[dict[tuple[str, str], int]]:
         """The ledger's counts, the last ones on a failed read, or None before any read succeeded."""
+        reading = self.reading()
+        return None if reading is None else reading[0]
+
+    def reading(self) -> Optional[tuple[dict[tuple[str, str], int], float]]:
+        """The counts as :meth:`counts` returns them and the seconds since the last successful read, or None before one."""
         with self._lock:
             try:
                 counts = self._read()
@@ -256,10 +273,13 @@ class ProposalsOpenedGauge:
                 if not self._failing:
                     logger.warning("chat_metrics: the proposals ledger could not be read, keeping the last counts: %s", type(exc).__name__)
                     self._failing = True
-                return None if self._counts is None else dict(self._counts)
+                if self._counts is None:
+                    return None
+                return dict(self._counts), max(self._clock() - self._read_at, 0.0)
             self._failing = False
             self._counts = counts
-            return dict(counts)
+            self._read_at = self._clock()
+            return dict(counts), 0.0
 
 
 def _label_value(value: str) -> str:
@@ -341,14 +361,20 @@ class ChatMetrics:
             f"# TYPE {KANBAN_GAVE_UP_METRIC} counter",
             f"{KANBAN_GAVE_UP_METRIC} {self._kanban.count()}",
         ]
-        proposals = self._proposals.counts()
-        if proposals is not None:
+        reading = self._proposals.reading()
+        if reading is not None:
+            proposals, read_age = reading
             lines += [
                 f"# HELP {PROPOSALS_OPENED_METRIC} Pull requests the agent opened, by the origin of the work and, for chat, its platform, read from the pod's proposals ledger at scrape time.",
                 f"# TYPE {PROPOSALS_OPENED_METRIC} gauge",
             ]
             for (origin, platform), count in sorted(proposals.items()):
                 lines.append(f'{PROPOSALS_OPENED_METRIC}{{{ORIGIN_LABEL}="{_label_value(origin)}",{PLATFORM_LABEL}="{_label_value(platform)}"}} {count}')
+            lines += [
+                f"# HELP {PROPOSALS_READ_AGE_METRIC} {PROPOSALS_READ_AGE_HELP}",
+                f"# TYPE {PROPOSALS_READ_AGE_METRIC} gauge",
+                f"{PROPOSALS_READ_AGE_METRIC} {read_age:.{PROPOSALS_READ_AGE_DECIMALS}f}",
+            ]
         lines += [
             f"# HELP {CHAT_FEEDBACK_NEGATIVE_METRIC} Thumbs-down reactions a person put on one of the bot's messages, by platform, once per person and message.",
             f"# TYPE {CHAT_FEEDBACK_NEGATIVE_METRIC} counter",
