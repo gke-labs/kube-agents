@@ -1861,6 +1861,10 @@ SINCE_SCHEDULED_KEY = "since_last_scheduled"
 NOT_RECHECKED_KEY = "not_rechecked"
 # The fields of one entry under `NOT_RECHECKED_KEY`.
 NOT_RECHECKED_FIELDS = ("id", "title", "check", "cluster", "namespace", "object")
+# The place of a previous finding as `parse_finding_locations` reads it off a
+# body row; `unlisted_previous_findings` reads the same four off the stored
+# document for an id with no row.
+FINDING_PLACE_FIELDS = ("title", "cluster", "namespace", "object")
 # What `start` hands the worker about the open ledger: every finding its body
 # carries, by id and identity, so a run that finds one gone can say so under
 # `resolved_because` instead of being held over the silence.
@@ -3327,10 +3331,12 @@ def anchor_relative_age_text(text: str, generated_at: datetime) -> str:
 
     # Prose only: a `--since "2 days ago"` inside a code span is a command,
     # and a date in it breaks the command. A span opens with a run of
-    # backticks and closes with the next run of the same length, as
-    # CommonMark reads them, so a double-backtick span, a four-backtick
-    # fence and a lone backtick with no partner (literal text) all come out
-    # right; a run with no closing partner opens nothing.
+    # backticks and closes with the next run of the same length, which is
+    # CommonMark's rule for code spans, so a double-backtick span, a fence
+    # closed by a fence of the same length and a lone backtick with no
+    # partner (literal text) all come out right; a run with no closing
+    # partner opens nothing. Not read: a fence closed by a longer fence, and
+    # a backslash-escaped backtick, both rare in a finding's prose.
     pieces = CODE_SPAN_RUN_RE.split(text)
     runs = CODE_SPAN_RUN_RE.findall(text)
     out: list[str] = []
@@ -4500,6 +4506,7 @@ def run_since_scheduled(
     gaps: list[str],
     stale_scheme: bool,
     reported_under_gap: list[str],
+    retired: Iterable[str] = (),
 ) -> dict:
     """The `SINCE_SCHEDULED_KEY` entry for a later `finish`'s chat report, or `{}`.
 
@@ -4507,7 +4514,8 @@ def run_since_scheduled(
     against what the run's first `finish` read (`context`), and not against
     the record an earlier `finish` of this run stored. The chat report of a
     later `finish` counts the whole run, so its line must also cover the
-    whole run.
+    whole run. `retired` is the ids a clean close retired unread: not
+    resolved on this line either, gap or no gap.
     """
     ids = context[SCHEDULED_CONTEXT_IDS_KEY]
     reported = (
@@ -4523,7 +4531,7 @@ def run_since_scheduled(
         {RUN_SCHEDULED_KEY: context[SCHEDULED_CONTEXT_KIND_KEY]},
         ids,
         published_ids,
-        not_resolved=reported_under_gap if gaps else (),
+        not_resolved=sorted(set(reported_under_gap if gaps else ()) | set(retired)),
         counted_against_record=context[SCHEDULED_CONTEXT_AGAINST_KEY],
     )
 
@@ -4535,13 +4543,15 @@ def whole_run_chat_payload(
     published_ids: set[str],
     gaps: list[str],
     reported_under_gap: list[str],
+    retired: Iterable[str] = (),
 ) -> dict:
     """`payload` for the chat report of a later `finish` that counts the whole run.
 
     Its `SINCE_SCHEDULED_KEY` entry is replaced by the whole run's
     (`run_since_scheduled`). An entry with no saved context keeps the entry
     of this `finish`. The JSON line keeps its own entry, as it keeps its
-    own counts.
+    own counts. `retired` is the ids a clean close retired unread: not
+    resolved on that line either.
     """
     if baseline.scheduled is None:
         return payload
@@ -4554,6 +4564,7 @@ def whole_run_chat_payload(
             gaps,
             baseline.stale_scheme,
             reported_under_gap,
+            retired,
         )
     )
     return chat_payload
@@ -10176,10 +10187,11 @@ def unlisted_previous_findings(
     with no row (a held id in the note tier; `unread_held_entries` reads
     the same places), sorted by id.
     """
+    in_block = set(parse_delta_block(previous_body))
     previous = {
-        fid: {key: str(place.get(key, "")) for key in ("title", "cluster", "namespace", "object")}
+        fid: {key: str(place.get(key, "")) for key in FINDING_PLACE_FIELDS}
         for fid, place in _stored_finding_places(memory).items()
-        if fid in set(parse_delta_block(previous_body))
+        if fid in in_block
     }
     previous.update(parse_finding_locations(previous_body))
     if not previous:
@@ -25198,14 +25210,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
         run_resolved = 0 if gaps else len(set(baseline.ids) - retired_ids)
+        whole_run_payload = whole_run_chat_payload(
+            payload, baseline, scheduled, published_ids, gaps, reported_under_gap, retired_ids
+        )
         append_chat_report(
             audit_id,
             repo,
             render_chat_report(
                 audit_id,
-                whole_run_chat_payload(payload, baseline, scheduled, published_ids, gaps, reported_under_gap)
-                if whole_run
-                else payload,
+                whole_run_payload if whole_run else payload,
                 data,
                 baseline.known if whole_run else delta_known,
                 (0, run_resolved) if whole_run else None,
