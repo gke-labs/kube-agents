@@ -659,6 +659,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_people",
 			"$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+			"$JS.API.STREAM.CREATE.DISPATCH_STOPS",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -670,6 +671,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_people",
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{
@@ -1109,10 +1111,17 @@ func webIdentity() a2aIdentity {
 		// credential had no reason to see either. `a2a.dispatch.>` is
 		// denied for the same reason: neither web nor console reads
 		// dispatch offers, and an offer carries a pod-bound task
-		// credential and per-offer nonce.
-		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
+		// credential and per-offer nonce. The stop records
+		// (`a2a.stop.>`) are no browser's either: each names a task being
+		// cancelled.
+		denySubscribe: a2aBrowserSubscribeDeny,
 	}
 }
+
+// a2aBrowserSubscribeDeny is what web, console and console-mcp may not read
+// under their `a2a.>`: the verifier's subjects (see webIdentity), the
+// dispatcher's hand-off, and the stop records.
+var a2aBrowserSubscribeDeny = []string{"a2a.cap.>", "a2a.dispatch.>", a2aDispatchStopPrefix + ">"}
 
 // console: the web console's credential - the read surface plus narrow
 // publishes: the inbound chat subject the gateway's console adapter
@@ -1181,7 +1190,7 @@ func consoleIdentity() a2aIdentity {
 		// verifier's request subject, and any subscriber may join its
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
-		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
+		denySubscribe: a2aBrowserSubscribeDeny,
 	}
 }
 
@@ -1229,7 +1238,7 @@ func consoleMCPIdentity() a2aIdentity {
 			"chat.console.*.out",
 			"_INBOX." + a2aConsoleMCPUser + ".>",
 		},
-		denySubscribe: []string{"a2a.cap.>", "a2a.dispatch.>"},
+		denySubscribe: a2aBrowserSubscribeDeny,
 	}
 }
 

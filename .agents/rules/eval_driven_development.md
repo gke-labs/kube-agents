@@ -122,7 +122,8 @@ run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request: in that file's sorted section, at its place in case-id order, with its reason as the
-`#` lines above it. The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+`#` lines above it (a case with `suite: certification` registers in
+`hack/eval/certification-cases.txt` instead: [`bench/README.md`](../../bench/README.md#certification-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
 owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
 the case's bugs reach you before the domain owner
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a

@@ -44,8 +44,14 @@ type Source interface {
 // Pool reports the ready worker pods of a (profile, tier) pool: who the
 // dispatcher may offer a task to. OPEN: the contract doesn't say where this
 // comes from yet (see the dispatcher's PR); StaticPool serves the tests.
+//
+// PodUID is the UID of one of those pods as the pool last saw it, or "" when
+// it has none in the pool. A task credential names it (#3889): the callout
+// matches it against the UID the cluster attests, so a credential is good on
+// the pod it was minted for and not on a pod that took its name since.
 type Pool interface {
 	Pods(profile, tier string) []string
+	PodUID(profile, tier, pod string) string
 }
 
 // StaticSource is a Source set whole by the caller.
@@ -75,10 +81,31 @@ func (s *StaticSource) Set(cfg lib.DispatchConfig) {
 type StaticPool struct {
 	mu   sync.RWMutex
 	pods map[string][]string
+	uids map[string]string
 }
 
 // NewStaticPool starts an empty pool.
-func NewStaticPool() *StaticPool { return &StaticPool{pods: map[string][]string{}} }
+func NewStaticPool() *StaticPool {
+	return &StaticPool{pods: map[string][]string{}, uids: map[string]string{}}
+}
+
+// SetUID gives a pod of the (profile, tier) pool a UID. A pod with none has
+// no UID in the pool (PodUID is "").
+func (p *StaticPool) SetUID(profile, tier, pod, uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.uids[profile+"/"+tier+"/"+pod] = uid
+}
+
+// PodUID implements Pool: the UID SetUID gave a pod listed in its pool.
+func (p *StaticPool) PodUID(profile, tier, pod string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !slices.Contains(p.pods[profile+"/"+tier], pod) {
+		return ""
+	}
+	return p.uids[profile+"/"+tier+"/"+pod]
+}
 
 // Set replaces one pool's pods.
 func (p *StaticPool) Set(profile, tier string, pods ...string) {

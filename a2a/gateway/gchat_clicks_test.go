@@ -414,7 +414,7 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 	}
 	msg, reason := a.classify(gchatClickEvent(t))
 	if reason != "" || msg.Conversation != side {
-		t.Errorf("click on a side-thread question = %+v (%s)", msg, reason)
+		t.Errorf("click on a question asked again in its DM thread = %+v (%s)", msg, reason)
 	}
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
 

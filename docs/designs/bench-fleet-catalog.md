@@ -9,9 +9,11 @@ case when one is not.
 
 **The role vocabulary is owned by `bench/tf/fleet/fixtures.json`**, which sits beside the
 Terraform that plants the fixtures and is what `hack/fleet-kubeconfigs.sh` resolves a role
-against at run time. `docs/designs/fleet-fixtures.yaml` is the machine-readable form of
-the rest of this document — the day-N gates below, and the project-scoped fixtures that
-have no cluster slot — and it may not rename a role: `scripts/validate_bench_cases.py`
+against at run time, the project-scoped `startup-fail-vm` and `world-open-ingress`
+included (`cluster_slot: null`). `docs/designs/fleet-fixtures.yaml` is the
+machine-readable form of the rest of this document — the day-N gates below, and
+`orphan-disks`, the one project-scoped fixture the catalog does not probe — and it may not
+rename a role: `scripts/validate_bench_cases.py`
 reads both and fails when they disagree about a slug or a slot. Object names in either are
 copied from `bench/tf/fleet/`, which remains the source of truth for all of them.
 
@@ -94,7 +96,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-eight fixtures: thirty-five across the four cluster slots and three project-scoped. Three
+Thirty-nine fixtures: thirty-six across the four cluster slots and three project-scoped. Two of the project-scoped ones, `startup-fail-vm` and `world-open-ingress`, are catalog roles with `cluster_slot: null`, which the runner probes in the project with gcloud; `orphan-disks` is in the overlay only. Three
 more catalog roles plant nothing: `drift-peer-a`, `-b` and `-d` assert the authorized-networks
 majority `drift-outlier` is measured against. Most in-cluster
 fixtures are on slot `a`, across the thirteen seeded namespaces `seeded-debug`,
@@ -124,7 +126,8 @@ its roles are never published.
 | `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                                         |
 | `deprecated-api-caller`         | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                                 |
 | `idle-nodepool`                 | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                                           |
-| `default-pool-headroom`         | a       | 0   | seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                                     |
+| `default-pool-headroom`         | a       | 0   | seeded-a's default pool itself, three e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                                   |
+| `config-connector-namespaced`   | a       | 0   | the GKE Config Connector add-on and its ConfigConnector object in namespaced mode; not a defect, the cluster the Config Connector eval cases plant their objects on                                                                           |
 | `orphan-disks`                  | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                              |
 | `startup-fail-vm`               | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                                       |
 | `world-open-ingress`            | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                               |
@@ -271,13 +274,13 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Thirty-two of the thirty-five are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+Thirty-three of the thirty-six are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`), `default-pool-headroom` and `scaled-zero-gateway`, covering
+`cuda-pinned-gpu-job`), `default-pool-headroom`, `config-connector-namespaced` and `scaled-zero-gateway`, covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
 API deprecation, zonal skew, the upgrade-failure shapes and the stall watch between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
@@ -397,8 +400,8 @@ writes to a fixture spoils it for someone else, non-deterministically, ten minut
 and in another pull request's logs.
 
 The checks are enforced in a project whose fleet has been re-applied. `bench/tf/fleet`
-provisions `seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing
-else, and `fleet_reader_token_creators` defaults to both runners, the presubmit's and the
+provisions `seeded-fleet-reader@<project>` with `roles/container.viewer` and
+`roles/compute.viewer` (the second for the project-scoped fixtures) and nothing else, and `fleet_reader_token_creators` defaults to both runners, the presubmit's and the
 nightly's, and to the CI health bot, so an apply lets `hack/fleet-kubeconfigs.sh` write per-role kubeconfigs that
 impersonate the reader. A
 check on such a project cannot write what it grades.

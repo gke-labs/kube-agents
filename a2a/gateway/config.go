@@ -342,7 +342,7 @@ type Config struct {
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
-	// MetricsPath and nothing else. It may not be either door's port: a door
+	// MetricsPath and ReadyzPath and nothing else. It may not be either door's port: a door
 	// that lost its port to this listener would fail to bind, and a door
 	// that won it would be what the collector's NetworkPolicy rule admits.
 	MetricsPort int

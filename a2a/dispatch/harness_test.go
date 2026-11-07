@@ -372,14 +372,16 @@ func (b *bus) pending(durable string) (ackPending int, numPending uint64) {
 type fakeVerifier struct {
 	mu     sync.Mutex
 	refuse map[string]bool
-	calls  []string
+	// refuseTarget refuses any ref asked about one of these targets.
+	refuseTarget map[capability.Scope]bool
+	calls        []string
 }
 
 func (v *fakeVerifier) CheckProfileRun(_ context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls = append(v.calls, fmt.Sprintf("%s|%s|%s|%s", ref.Key, profile, tier, target))
-	if v.refuse[ref.Key] {
+	if v.refuse[ref.Key] || v.refuseTarget[target] {
 		return &capability.Refusal{Rule: "the grant does not reach that target"}
 	}
 	return nil
@@ -402,9 +404,19 @@ func (b *bus) runDispatcher(cfg Config, ti *testInstall, v Verifier) (*Dispatche
 // test can kill it.
 func (b *bus) runDispatcherOn(c *lib.Client, cfg Config, ti *testInstall, v Verifier) (*Dispatcher, func()) {
 	b.t.Helper()
+	return b.runPrepared(c, cfg, ti, v, nil)
+}
+
+// runPrepared is runDispatcherOn with prepare called on the dispatcher
+// before it runs (nil for none), so a test can wrap its internals.
+func (b *bus) runPrepared(c *lib.Client, cfg Config, ti *testInstall, v Verifier, prepare func(*Dispatcher)) (*Dispatcher, func()) {
+	b.t.Helper()
 	d, err := New(cfg, c, ti.src, ti.pool, v, quietLog())
 	if err != nil {
 		b.t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(d)
 	}
 	ctx, cancel := context.WithCancel(b.ctx)
 	done := make(chan struct{})
