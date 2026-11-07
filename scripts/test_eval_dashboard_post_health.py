@@ -1521,12 +1521,14 @@ class TrackingIssue(RunHarness):
         self.assertIn("Tracking #1300.", self.opener.texts[-1])
 
     def test_the_bots_own_outage_issue_is_re_found_by_its_marker(self):
-        # The body names no case, so only the marker leads back to it.
+        # The body names the cases in the marker alone, and the label has
+        # been taken off (a human's edit), so the name match on a labelled
+        # body cannot find it: only the marker path does.
         own = {"number": 1301, "html_url": "https://github.com/gke-labs/kube-agents/issues/1301", "title": "Smoke gate outage since Mon 5:00 AM ET",
-               "body": post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO))) + "\nThe smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.", "labels": [{"name": "presubmit-gate"}]}
+               "body": post_health.gate_issue.OUTAGE_MARKER.format(cases=",".join(sorted(TRIO))) + "\nThe smoke gate (`pull-kube-agents-smoke-test`) is in OUTAGE.", "labels": [{"name": "bug"}]}
         gh = FakeGh(open_issues=[own])
         self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
-        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1301/labels")], "re-labelled on adoption, nothing filed")
         self.assertIn("Tracking #1301.", self.opener.texts[0])
         self.assertEqual(self.recorded()["issue"]["number"], 1301)
 
@@ -1544,6 +1546,31 @@ class TrackingIssue(RunHarness):
         self.tick(outage(cases=TRIO), T0, environ=self.environ(), gh=gh)
         self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1279/labels")], "adopted and labelled, nothing filed")
         self.assertIn("Tracking #1279.", self.opener.texts[0])
+
+    def test_the_infrastructure_issues_quote_no_per_case_grading_line(self):
+        """health.assess concatenates shared_break's per-case lines into
+        evidence whether or not the break fires; no public body quotes them."""
+        gi = post_health.gate_issue
+        graded = ["cluster-agent-crashloop-debug failed all graded reps on 4 runs from 3 PRs (#1, #2, #3)",
+                  "these cases explain 4 of 5 red runs (5 of 6 concluded runs red) in the last 6h",
+                  "PR-caused: upgrades-lagging-master-probe failing only on #7 (passing on 2 other PRs built on the same main commit)"]
+        lost_line = "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC"
+        drift_line = f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
+        kill_line = "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC"
+        pool_line = f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
+        bodies = {
+            lost_line: gi.render_lost_pods_body(lost_pods(evidence=[*graded, lost_line]), "Fri 10:05 AM ET", "10:05–10:19 AM ET", "brief"),
+            drift_line: gi.render_fixture_drift_body(fixture_drift(evidence=[*graded, drift_line]), "Mon 9:00 AM ET", "brief"),
+            kill_line: gi.render_deadline_kill_body(deadline_kill(evidence=[*graded, kill_line]), "Tue 3:00 PM ET", "3:40–4:00 PM ET", "brief"),
+            pool_line: gi.render_pool_drift_body(pool_drift(evidence=[*graded, pool_line]), "Mon 9:00 AM ET", "brief"),
+        }
+        for own_line, body in bodies.items():
+            self.assertIn(f"- {own_line}", body)
+            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused"):
+                self.assertNotIn(name, body, own_line)
+            self.assertIsNone(RESULTS_RE.search(body), body)
+        self.assertEqual(gi.public_evidence({"evidence": graded}), [])
+        self.assertEqual(gi.public_evidence({"evidence": [kill_line, lost_line]}, prefix=gi.DEADLINE_EVIDENCE_PREFIX), [kill_line])
 
     def test_a_human_filed_issue_naming_the_cases_is_adopted(self):
         human = {"number": 1278, "html_url": "https://github.com/gke-labs/kube-agents/issues/1278", "title": "Seeded fleet outage", "body": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain and cluster-agent-crashloop-misleading-symptom red every PR", "labels": [{"name": "presubmit-gate"}]}

@@ -81,10 +81,10 @@ import re
 import sys
 
 try:
-    from .health import parse_iso, pool_drift_split, public_cause
+    from .health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_PR_CAUSED, parse_iso, pool_drift_split, public_cause
 except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from health import parse_iso, pool_drift_split, public_cause
+    from health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_PR_CAUSED, parse_iso, pool_drift_split, public_cause
 
 LABEL = "presubmit-gate"
 # Who an infrastructure issue goes to: top-level keys of domains.yaml,
@@ -157,6 +157,11 @@ NAME_START_RE = r"(?<![a-z0-9_]){name}"
 # case clears the shared-break floors, and a body naming those cases would
 # be adopted as the tracker of a break that fires later.
 DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
+# Evidence lines that grade a case: health.shared_break's per-case collapse
+# line, its coverage line and the PR-caused lines, which health.assess
+# concatenates into health["evidence"] whether or not the break fires. No
+# public body quotes them (public_evidence); the incident brief carries them.
+PUBLIC_EVIDENCE_DROP_RE = re.compile("|".join((re.escape(EVIDENCE_CASE_COLLAPSE), "^" + re.escape(EVIDENCE_CASES_EXPLAIN), "^" + re.escape(EVIDENCE_PR_CAUSED))))
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -409,11 +414,22 @@ def render_lost_pods_title(health: dict, when_text: str) -> str:
     return title
 
 
+def public_evidence(health: dict, prefix: str | None = None) -> list[str]:
+    """``health["evidence"]`` as a public body may quote it: without the
+    lines that grade a case (PUBLIC_EVIDENCE_DROP_RE), and, given ``prefix``,
+    only the lines that start with it."""
+    lines = [str(line) for line in health.get("evidence") or []]
+    lines = [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
+    if prefix is not None:
+        lines = [line for line in lines if line.startswith(prefix)]
+    return lines
+
+
 def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     nodes = incident.get("nodes") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health)]
     return LOST_PODS_BODY.format(
         job=JOB_NAME,
         when=when_text,
@@ -436,7 +452,7 @@ def render_deadline_kill_title(health: dict, since_text: str) -> str:
 def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or [] if str(line).startswith(DEADLINE_EVIDENCE_PREFIX)]
+    evidence = [f"- {line}" for line in public_evidence(health, prefix=DEADLINE_EVIDENCE_PREFIX)]
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,
@@ -471,7 +487,7 @@ def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) ->
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
     drift = incident.get("drift") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health)]
     per_project = []
     for project in sorted(drift):
         per_project.append(f"- `{project}`")
@@ -531,7 +547,7 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
         consequence = POOL_DRIFT_REDS_RUNS
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
-    evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
+    evidence = [f"- {line}" for line in _pool_evidence(public_evidence(health), findings)]
     blocks = []
     for project in sorted(drift):
         block = [f"- `{project}`"]
@@ -682,9 +698,9 @@ class Tracker:
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
         bodies. `skip` is the numbers the episode already carries: the bot's
-        own fixture or node issue quotes the evidence, case lines included,
-        and must not become the break's tracker as well, or its close under
-        the live break takes the break's citation with it."""
+        own fixture or node issue quotes the evidence (less the case lines,
+        public_evidence) and must not become the break's tracker as well, or
+        its close under the live break takes the break's citation with it."""
         self._skip = {int(number) for number in skip}
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
