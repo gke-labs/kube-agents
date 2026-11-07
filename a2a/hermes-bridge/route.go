@@ -48,9 +48,9 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive. Such a turn waits on its cards in turn
-	// (waitKanbanInTurn), so only a card still running when the wait ends
-	// is left without a way back; most such turns file none, hence "if".
+	// answer that cannot arrive. Such a turn ends at its acknowledgement
+	// (only a console or MCP turn waits on its cards, waitsForCardsInTurn),
+	// and most file no card, hence "if".
 	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
 
@@ -68,6 +68,16 @@ var routePlatforms = map[string]string{
 // consoleRoutePrefix is the console conversation's key prefix, the one route
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
+
+// waitsForCardsInTurn reports whether a turn holds its task open while the
+// Kanban cards it filed run (waitForKanbanCards): only a console or MCP
+// turn, whose client reads the task's answer and has no thread for a card's
+// post. A chat turn, a turn with no chat conversation (the eval inject lane)
+// and a turn whose route could not be recorded all end at the
+// acknowledgement, and their cards report through the agent's own posts.
+func waitsForCardsInTurn(env *lib.Envelope) bool {
+	return isConsoleOrigin(env)
+}
 
 func isConsoleOrigin(env *lib.Envelope) bool {
 	if env == nil {

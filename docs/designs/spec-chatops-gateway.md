@@ -2507,8 +2507,8 @@ task that handed work to kanban cards and left them unsettled at turn end (the b
 artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
 `waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
 via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; on console and MCP origins
-(`!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`), the bridge's `api` executor instead
+true`, so a client waits for the cards' notify frames; on console and MCP origins only
+(`waitsForCardsInTurn`), the bridge's `api` executor instead
 holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
 turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`
 so no `handoff` or `"cardsPending": true` is emitted once the cards settle in turn. Without
