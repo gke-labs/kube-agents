@@ -205,13 +205,18 @@ type gchatUX struct {
 	// while a rewrite holds or waits on it, so it needs no ring.
 	rewriting map[string]*gchatRewriteLock
 	// board is the layout each message whose rows carry Retry and Drop was
-	// last sent with, by message name, and boardTaps the rows being tapped
-	// or settled, by message and row (gchat_board.go); boardOrder and
-	// boardTapsOrder are their rings.
-	board          map[string]gchatChatLayout
-	boardOrder     []string
-	boardTaps      map[string]bool
-	boardTapsOrder []string
+	// last sent with, by message name; boardTaps the rows being tapped or
+	// settled, by message and row, each holding the tap that claimed it;
+	// and boardMoved the messages laid out again without such rows while
+	// they were remembered, which a tap in flight must not draw on
+	// (gchat_board.go). boardOrder, boardTapsOrder and boardMovedOrder are
+	// their rings.
+	board           map[string]gchatChatLayout
+	boardOrder      []string
+	boardTaps       map[string]string
+	boardTapsOrder  []string
+	boardMoved      map[string]bool
+	boardMovedOrder []string
 }
 
 // gchatRewriteLock orders the patches of one message: a rating tap, an
@@ -230,7 +235,7 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
 			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
 			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{},
-			board: map[string]gchatChatLayout{}, boardTaps: map[string]bool{}}
+			board: map[string]gchatChatLayout{}, boardTaps: map[string]string{}, boardMoved: map[string]bool{}}
 	}
 	return a.ux
 }

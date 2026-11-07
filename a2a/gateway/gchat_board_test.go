@@ -299,7 +299,7 @@ func TestGchatBoardTapAfterARestartEditsFromTheEventsCopy(t *testing.T) {
 // reads the event's copy. A row the text no longer holds is not edited, and
 // the row is released for another tap.
 func TestGchatBoardEditRefreshesTheRecordAndAGoneRowIsReleased(t *testing.T) {
-	a, f, _ := newBoardGchatAdapter(t)
+	a, f, actor := newBoardGchatAdapter(t)
 	postBoardCard(t, a)
 	again := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
 		Rows: []chatmsg.Row{{Text: "**Only z**", Tasks: []string{"t_9"}, Actions: []string{"retry", "drop"}}}}
@@ -319,19 +319,26 @@ func TestGchatBoardEditRefreshesTheRecordAndAGoneRowIsReleased(t *testing.T) {
 	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "settled"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.boardLayoutOf(gchatBoardMessage); ok {
+	if _, remembered, _ := a.boardLayoutOf(gchatBoardMessage); remembered {
 		t.Error("a message laid out without rows that act is still remembered")
 	}
+	// A client still showing the old card: the tap carries the old text and
+	// buttons, and is dropped before it acts.
+	old, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
 	gone := gchatBoardTap(t, "retry", 2, "t_3")
-	gone.Message.Text = "settled"
-	if _, reason := a.classify(gone); !strings.HasPrefix(reason, gchatBoardTaken) {
-		t.Fatalf("tap on a gone row: %q", reason)
+	gone.Message.Text = old.Text
+	gone.Message.AccessoryWidgets = gchatShownWidgets(t, old)
+	if _, reason := a.classify(gone); reason != gchatBoardStale {
+		t.Fatalf("tap on a settled message: %q", reason)
 	}
 	if n := relayCallCount(f); n != 4 {
-		t.Errorf("a row the text no longer holds was edited: %d relay calls", n)
+		t.Errorf("a settled message was edited: %d relay calls", n)
 	}
-	if _, reason := a.classify(gchatBoardTap(t, "retry", 2, "t_3")); !strings.HasPrefix(reason, gchatBoardTaken) {
-		t.Errorf("the gone row was not released: %q", reason)
+	if n := len(actor.taken()); n != 1 {
+		t.Errorf("a stale tap acted: %d board actions", n)
 	}
 }
 
@@ -359,6 +366,8 @@ func TestGchatBoardLineAndRowText(t *testing.T) {
 		{"1. *a* — ✓ Retrying. Ada, 14:04 UTC", "1. *a*"},
 		{"1. *a* — Couldn't drop it just now. Try again.", "1. *a*"},
 		{"1. *a — b* · c", "1. *a — b* · c"},
+		{"1. *a — Dropped. from the queue*", "1. *a — Dropped. from the queue*"},
+		{"1. *a* — Dropped. from the queue", "1. *a* — Dropped. from the queue"},
 	} {
 		if got := gchatBoardRowText(tc.line); got != tc.want {
 			t.Errorf("row text of %q = %q, want %q", tc.line, got, tc.want)
@@ -611,5 +620,145 @@ func TestGchatBoardSkippedRowTakesNoNumber(t *testing.T) {
 	}
 	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 2,Drop 2" {
 		t.Errorf("buttons = %v", texts)
+	}
+}
+
+// A keyed edit that settles the message to text during a tap's round trip
+// (or lays it out without rows that act) leaves nothing for the tap to draw
+// on: the settle stands, the tap patches nothing, and a tap from a client
+// still showing the old buttons is dropped. The actor fake runs the settle
+// from inside the round trip, which is the window.
+func TestGchatBoardSettleDuringTheRoundTripStands(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	a.SetBoardActor(func(_ context.Context, act lib.BoardAction) (*lib.BoardActionResult, error) {
+		if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "settled: all done"}); err != nil {
+			t.Fatal(err)
+		}
+		return &lib.BoardActionResult{Action: act.Action, Results: []lib.BoardActionOutcome{{ID: act.Tasks[0], Outcome: lib.BoardOutcomeDone}}}, nil
+	})
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("%d relay calls, want the create and the settle only", n)
+	}
+	if body := callBody(t, f.call(1)); body["text"] != "settled: all done" {
+		t.Errorf("the settled message = %q", body["text"])
+	}
+	if _, remembered, moved := a.boardLayoutOf(gchatBoardMessage); remembered || !moved {
+		t.Errorf("record after the settle: remembered %v, moved %v", remembered, moved)
+	}
+	old, err := renderGchatChat(gchatBoardCard())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := gchatBoardTap(t, "drop", 2, "t_3")
+	stale.Message.Text = old.Text
+	stale.Message.AccessoryWidgets = gchatShownWidgets(t, old)
+	if _, reason := a.classify(stale); reason != gchatBoardStale {
+		t.Errorf("a tap on the old buttons: %q", reason)
+	}
+	if n := relayCallCount(f); n != 2 {
+		t.Errorf("a stale tap edited the settled message: %d relay calls", n)
+	}
+}
+
+// The row is edited where the renderer put the rows, so a numbered list in
+// the fold (which renders after the rows) is left alone; a layout read back
+// from a click's copy still uses the finder.
+func TestGchatBoardTapEditsTheRowNotAFoldList(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	card := gchatBoardCard()
+	card.After = nil
+	card.Fold = &chatmsg.Fold{Title: "why", Text: "1. x\n2. y"}
+	layout, err := renderGchatChat(card)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.RowsStart != 2 || layout.RowsCount != 3 {
+		t.Fatalf("rows at %d for %d lines, want 2 for 3:\n%s", layout.RowsStart, layout.RowsCount, layout.Text)
+	}
+	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	want := "*2 tasks are stuck and need someone to decide.*\n\n" +
+		"1. *Triage x* · Stopped 1 day ago before finishing. — ✓ Retrying. Test Sender, 15:04 UTC\n" +
+		"2. *Open GitOps PR for y* · Waiting on you.\n3. *Too many to act on*\n\n*why*\n1. x\n2. y"
+	if body["text"] != want {
+		t.Errorf("text =\n%s\nwant\n%s", body["text"], want)
+	}
+	if plain, err := renderGchatChat(&chatmsg.Message{Schema: chatmsg.Schema, Rows: []chatmsg.Row{{Text: "a"}}}); err != nil || plain.RowsCount != 0 {
+		t.Errorf("rows without buttons recorded a block: %+v, %v", plain, err)
+	}
+}
+
+// A tap that finds its row moved frees only its own claim: a newer tap that
+// claimed the same row key in the meantime keeps its hold. The actor fake
+// runs the re-layout and the newer tap from inside the first tap's round
+// trip, which is the window.
+func TestGchatBoardMovedTapFreesOnlyItsOwnClaim(t *testing.T) {
+	a, f, _ := newBoardGchatAdapter(t)
+	postBoardCard(t, a)
+	again := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
+		Rows: []chatmsg.Row{{Text: "**Only z**", Tasks: []string{"t_9"}, Actions: []string{"retry", "drop"}}}}
+	calls := 0
+	a.SetBoardActor(func(_ context.Context, act lib.BoardAction) (*lib.BoardActionResult, error) {
+		calls++
+		if calls == 1 {
+			if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "again", Chat: again}); err != nil {
+				t.Fatal(err)
+			}
+			// The newer tap, on the new row 1, runs to its end here.
+			if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_9")); !strings.HasPrefix(reason, gchatBoardTaken) {
+				t.Fatalf("newer tap: %q", reason)
+			}
+		}
+		return &lib.BoardActionResult{Action: act.Action, Results: []lib.BoardActionOutcome{{ID: act.Tasks[0], Outcome: lib.BoardOutcomeDone}}}, nil
+	})
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1,t_2")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("first tap: %q", reason)
+	}
+	if calls != 2 || relayCallCount(f) != 3 {
+		t.Fatalf("%d board actions, %d relay calls; want 2 and 3 (create, re-layout, the newer tap's edit)", calls, relayCallCount(f))
+	}
+	if body := checkPatch(t, f, 2, gchatBoardMessage); body["text"] != "*1 task is stuck.*\n\n1. *Only z* — Dropped. Test Sender, 15:04 UTC" {
+		t.Errorf("the newer tap's edit = %q", body["text"])
+	}
+	// The newer tap settled its row and keeps the claim: the first tap's
+	// release did not free it.
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_9")); reason != gchatBoardBusy {
+		t.Errorf("a tap on the settled new row: %q", reason)
+	}
+}
+
+// A row whose own text holds a note's words after a separator is kept
+// whole: a tap cuts only a whole line a tap wrote.
+func TestGchatBoardRowTextWithANoteInItIsKept(t *testing.T) {
+	a, f, actor := newBoardGchatAdapter(t)
+	card := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "1 task is stuck.",
+		Rows: []chatmsg.Row{{Text: "**Triage x — Dropped. from the queue**", Tasks: []string{"t_1"}, Actions: []string{"retry", "drop"}}}}
+	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", OutMessage{Text: "fallback", Chat: card}); err != nil {
+		t.Fatal(err)
+	}
+	actor.err = errors.New("no bridge")
+	if _, reason := a.classify(gchatBoardTap(t, "retry", 1, "t_1")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("tap: %q", reason)
+	}
+	body := checkPatch(t, f, 1, gchatBoardMessage)
+	if want := "*1 task is stuck.*\n\n1. *Triage x — Dropped. from the queue* — Couldn't retry it just now. Try again."; body["text"] != want {
+		t.Errorf("after the failed tap =\n%s\nwant\n%s", body["text"], want)
+	}
+	actor.err = nil
+	if _, reason := a.classify(gchatBoardTap(t, "drop", 1, "t_1")); !strings.HasPrefix(reason, gchatBoardTaken) {
+		t.Fatalf("second tap: %q", reason)
+	}
+	body = checkPatch(t, f, 2, gchatBoardMessage)
+	if want := "*1 task is stuck.*\n\n1. *Triage x — Dropped. from the queue* — Dropped. Test Sender, 15:04 UTC"; body["text"] != want {
+		t.Errorf("after the drop =\n%s\nwant\n%s", body["text"], want)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -62,8 +63,14 @@ const (
 	// a choice click on the same message at the same time.
 	gchatBoardSeenPrefix = "board:"
 	// gchatBoardTapSep joins a message name and a row's number into the
-	// key one tap at a time holds.
-	gchatBoardTapSep = "#"
+	// key one tap at a time holds, and gchatBoardOwnerSep the parts of the
+	// tap's own name in that claim: its click id and its cards, so a tap
+	// frees only the claim it made.
+	gchatBoardTapSep   = "#"
+	gchatBoardOwnerSep = "|"
+	// gchatBoardSettledShape is the rest of a settled row's line after the
+	// note: a name, a comma, and the time as gchatBoardTime writes it.
+	gchatBoardSettledShape = ` .+, [0-9]{2}:[0-9]{2} UTC$`
 	// The line a tapped row shows: its note, then who and when
 	// (gchatBoardSettledLine) for a tap that settled the cards, the time in
 	// gchatBoardTime; a tap that did not land shows Slack's whole line.
@@ -93,16 +100,16 @@ const (
 	gchatBoardRowMoved = "gchat: the tapped board row was laid out again before its edit; the message is left as it is"
 )
 
-// gchatBoardNotes are the lines a tapped row may already show, as prefixes,
-// so a later tap replaces the line rather than adding a second. Each is a
-// whole word or sentence, never empty, so no row text is cut by one.
-var gchatBoardNotes = []string{
-	gchatBoardRetriedNote,
-	gchatBoardDroppedNote,
-	gchatBoardMovedNote,
-	slackBoardRetryFailed,
-	slackBoardDropFailed,
-}
+// gchatBoardSettledRE matches the whole line a settled tap leaves on a row
+// (gchatBoardLine), and gchatBoardFailedLines are the two a failed one
+// leaves; a later tap replaces only a line of one of these shapes, so a
+// row whose own text holds a note's words after a separator is kept whole.
+var (
+	gchatBoardSettledRE = regexp.MustCompile("^(" + strings.Join([]string{
+		regexp.QuoteMeta(gchatBoardRetriedNote), regexp.QuoteMeta(gchatBoardDroppedNote), regexp.QuoteMeta(gchatBoardMovedNote),
+	}, "|") + ")" + gchatBoardSettledShape)
+	gchatBoardFailedLines = []string{slackBoardRetryFailed, slackBoardDropFailed}
+)
 
 // errGchatBoardRowGone is a tapped row no longer in the message's text.
 var errGchatBoardRowGone = errors.New("the tapped row is not in the message")
@@ -243,17 +250,20 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	key := message + gchatBoardTapSep + strconv.Itoa(n)
 	a.mu.Lock()
 	ux := a.uxLocked()
-	if ux.boardTaps[key] {
+	if ux.boardTaps[key] != "" {
 		a.mu.Unlock()
 		return gchatBoardBusy
 	}
 	// A message laid out again since the client drew its buttons: the row
-	// the tap names is not the row n the message shows now.
-	if layout, remembered := ux.board[message]; remembered && !gchatBoardRowHolds(layout, n, tasks) {
+	// the tap names is not the row n the message shows now, or the message
+	// shows no rows at all.
+	layout, remembered := ux.board[message]
+	if ux.boardMoved[message] || (remembered && !gchatBoardRowHolds(layout, n, tasks)) {
 		a.mu.Unlock()
 		return gchatBoardStale
 	}
-	ux.boardTaps[key] = true
+	owner := id + gchatBoardOwnerSep + strings.Join(tasks, gchatBoardTaskSeparator)
+	ux.boardTaps[key] = owner
 	remember(&ux.boardTapsOrder, key, func(k string) { delete(ux.boardTaps, k) })
 	a.mu.Unlock()
 	name := click.User.DisplayName
@@ -264,8 +274,19 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	// message, never the event the caller holds.
 	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
 		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
-	a.goRewrite(func() { a.runBoardTap(snapshot, key, verb, n, tasks, name, actor) })
+	a.goRewrite(func() {
+		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner, remembered: remembered}, verb, n, tasks, name, actor)
+	})
 	return gchatBoardTaken + verb
+}
+
+// gchatBoardClaim is a tap's hold on its row: the claim's key, the tap's
+// own name in it, and whether the message's layout was on record when the
+// tap was taken, so a record gone since is a message laid out again, not
+// one never remembered.
+type gchatBoardClaim struct {
+	key, owner string
+	remembered bool
 }
 
 // runBoardTap acts on the row's cards and edits the row. A tap that
@@ -274,7 +295,7 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 // again. The release comes after the edit, under the message's rewrite lock,
 // so a second tap cannot edit the row before the first has drawn its line
 // and then have that line drawn over it.
-func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, key, verb string, n int, tasks []string, name string, actor BoardActor) {
+func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, n int, tasks []string, name string, actor BoardActor) {
 	message := ev.Message.Name
 	ctx, cancel := context.WithTimeout(context.Background(), slackBoardTimeout)
 	defer cancel()
@@ -287,16 +308,25 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, key, verb string, n int,
 	// Under the message's rewrite lock, so the edits of one message land in
 	// turn, each from the layout the last one sent.
 	defer a.lockRewrite(message)()
-	base, remembered := a.boardLayoutOf(message)
+	base, remembered, moved := a.boardLayoutOf(message)
+	// The round trip took time, and the message may have been laid out
+	// again in it (trackBoard frees the claims and replaces or drops the
+	// record): the outcome belongs to the row the tap named, not to
+	// whatever is row n now, so it is drawn only where that row, with those
+	// cards, still is. A record gone since the tap was taken, or a message
+	// marked as laid out without rows, is such a message, and the tap's own
+	// copy of it (the click's) is stale; only a message never remembered
+	// (posted before a restart) is read from that copy.
+	if moved || (claim.remembered && !remembered) {
+		a.releaseBoardTap(claim)
+		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
+		return
+	}
 	if !remembered {
 		base = gchatEventLayout(ev.Message)
 	}
-	// The round trip took time, and the message may have been laid out
-	// again in it (trackBoard frees the claims and replaces the record): the
-	// outcome belongs to the row the tap named, not to whatever is row n
-	// now, so it is drawn only where that row, with those cards, still is.
 	if !gchatBoardRowHolds(base, n, tasks) {
-		a.releaseBoardTap(key)
+		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
 		return
 	}
@@ -305,7 +335,7 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, key, verb string, n int,
 		err = a.patchLayout(message, layout)
 	}
 	if err != nil || !settled {
-		a.releaseBoardTap(key)
+		a.releaseBoardTap(claim)
 	}
 	if err != nil {
 		// The edit may have landed though Chat's answer did not, so the
@@ -317,11 +347,16 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, key, verb string, n int,
 	a.rememberBoard(message, layout)
 }
 
-// releaseBoardTap frees a row's claim, so it can be tapped again.
-func (a *GoogleChatAdapter) releaseBoardTap(key string) {
+// releaseBoardTap frees a tap's claim on its row, so it can be tapped
+// again: only while the claim is still the tap's own, since a re-layout may
+// have freed it and a newer tap may hold the row by now.
+func (a *GoogleChatAdapter) releaseBoardTap(claim gchatBoardClaim) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.uxLocked().releaseBoardTapLocked(key)
+	ux := a.uxLocked()
+	if ux.boardTaps[claim.key] == claim.owner {
+		ux.releaseBoardTapLocked(claim.key)
+	}
 }
 
 // releaseBoardTapLocked is releaseBoardTap under the adapter's lock.
@@ -365,13 +400,17 @@ func gchatBoardLine(verb, outcome, name string, now time.Time) string {
 
 // gchatBoardRowLayout is layout with row n's line put in: after the row's
 // text on its line, in place of the line an earlier tap left, and the row's
-// buttons gone when settled. The row is the nth line of the rows block
-// (gchatBoardRowsBlock), not the first line anywhere that starts "n. ": a
-// detail or a fold may hold a numbered list of its own.
+// buttons gone when settled. The row is the nth line of the rows block: the
+// one the renderer recorded (RowsStart, RowsCount) for a layout the adapter
+// sent, or, for a layout read back from a click's copy of the message, the
+// one gchatBoardRowsBlock finds.
 func gchatBoardRowLayout(layout gchatChatLayout, n int, line string, settled bool) (gchatChatLayout, error) {
 	lines := strings.Split(layout.Text, "\n")
-	start, count := gchatBoardRowsBlock(lines)
-	if n > count {
+	start, count := layout.RowsStart, layout.RowsCount
+	if count == 0 {
+		start, count = gchatBoardRowsBlock(lines)
+	}
+	if n > count || start+n > len(lines) {
 		return gchatChatLayout{}, errGchatBoardRowGone
 	}
 	i := start + n - 1
@@ -382,7 +421,7 @@ func gchatBoardRowLayout(layout gchatChatLayout, n int, line string, settled boo
 			return gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == strconv.Itoa(n)
 		})
 	}
-	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}, nil
+	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets, RowsStart: start, RowsCount: count}, nil
 }
 
 // gchatBoardRowHolds reports whether layout still draws row n's buttons for
@@ -428,15 +467,19 @@ func gchatBoardRowsBlock(lines []string) (start, count int) {
 }
 
 // gchatBoardRowText is a row's line without the line an earlier tap left on
-// it, found by its separator and one of the known lines after it.
+// it: what follows the last separator is cut only when it is, whole, a line
+// a tap writes (gchatBoardSettledRE, gchatBoardFailedLines).
 func gchatBoardRowText(l string) string {
 	i := strings.LastIndex(l, gchatBoardNoteSep)
 	if i < 0 {
 		return l
 	}
 	rest := l[i+len(gchatBoardNoteSep):]
-	for _, note := range gchatBoardNotes {
-		if strings.HasPrefix(rest, note) {
+	if gchatBoardSettledRE.MatchString(rest) {
+		return l[:i]
+	}
+	for _, failed := range gchatBoardFailedLines {
+		if rest == failed {
 			return l[:i]
 		}
 	}
@@ -510,16 +553,23 @@ func (a *GoogleChatAdapter) patchLayout(message string, layout gchatChatLayout) 
 // was last sent with, so a tap edits from it, and forgets one laid out
 // again without such rows.
 // Either way the rows are new, so every claim a tap holds on the message
-// goes (releaseBoardTapsLocked).
+// goes (releaseBoardTapsLocked); a message that had such rows and now has
+// none is marked, so a tap still in flight on it draws nothing on it.
 func (a *GoogleChatAdapter) trackBoard(message string, m *chatmsg.Message, layout gchatChatLayout) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
 	ux.releaseBoardTapsLocked(message)
 	if m == nil || !slackChatRowsAct(m.Rows) {
+		if _, had := ux.board[message]; had {
+			ux.boardMoved[message] = true
+			remember(&ux.boardMovedOrder, message, func(k string) { delete(ux.boardMoved, k) })
+		}
 		ux.forgetBoardLocked(message)
 		return
 	}
+	delete(ux.boardMoved, message)
+	forget(&ux.boardMovedOrder, message)
 	ux.board[message] = layout
 	remember(&ux.boardOrder, message, func(k string) { delete(ux.board, k) })
 }
@@ -544,12 +594,14 @@ func (ux *gchatUX) forgetBoardLocked(message string) {
 	forget(&ux.boardOrder, message)
 }
 
-// boardLayoutOf is the layout message was last sent with, when remembered.
-func (a *GoogleChatAdapter) boardLayoutOf(message string) (gchatChatLayout, bool) {
+// boardLayoutOf is the layout message was last sent with, when remembered,
+// and whether the message was laid out again without rows that act.
+func (a *GoogleChatAdapter) boardLayoutOf(message string) (layout gchatChatLayout, remembered, moved bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	layout, ok := a.uxLocked().board[message]
-	return layout, ok
+	ux := a.uxLocked()
+	layout, remembered = ux.board[message]
+	return layout, remembered, ux.boardMoved[message]
 }
 
 // clock is the adapter's time, time.Now outside a test.
