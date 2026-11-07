@@ -155,7 +155,8 @@ EXEC_NEW_FUNCTIONS_PATCHED = '''def record_skipped_execution(
     kube-agents patch. Written straight into a terminal state because there is
     no claim to transition from: the decision not to run is taken before
     dispatch, which is precisely why upstream had nowhere to put it. See
-    tools/cron_skip_ledger.py for the seven ways this happens.
+    tools/cron_skip_ledger.py for the eight ways this happens (the eighth is
+    written by the ticker's catch-up policy, in this shape, not by this call).
 
     ``pid`` and ``process_started_at`` describe the process that made the
     decision, not a runner — they are what tells two racing tickers apart once
