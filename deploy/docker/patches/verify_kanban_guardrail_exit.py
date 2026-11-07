@@ -1390,9 +1390,10 @@ if len(exits) == 1:
         owner is not None and "_finalize_single_query" in ast.unparse(owner.finalbody),
     )
     check(
-        "and nothing there makes a worker with no turn exit non-zero",
-        "single_query_exit_code" not in "\n".join(calls)
-        and "_kube_kanban_turn_seen" not in "\n".join(calls),
+        "and a worker with no turn exits via close_no_turn_chat",
+        "close_no_turn_chat" in "\n".join(calls)
+        and "_kube_kanban_turn_seen" in "\n".join(calls),
+        f"calls in block: {calls}",
     )
 
 
@@ -1519,6 +1520,16 @@ check(
     "and is not counted as a protocol violation",
     charged is not None and "protocol violation" not in charged,
 )
+no_turn_charged = getattr(GUARD, "NO_TURN_ERROR", None)
+check(
+    "the charged no-turn text is not a respawn blocker in this tree",
+    no_turn_charged is not None and not KD._RESPAWN_BLOCKER_RE.search(no_turn_charged),
+    f"NO_TURN_ERROR={no_turn_charged!r}",
+)
+check(
+    "and is not counted as a protocol violation",
+    no_turn_charged is not None and "protocol violation" not in no_turn_charged,
+)
 
 # One worker, the ka-next-4 401.
 auth_card, auth_run = claimed_card("Count pods in kubeagents-system (401)")
@@ -1612,6 +1623,94 @@ check(
     all(r["status"] == "ready" and r["consecutive_failures"] == 1 for r in rows)
     and not any(k == "gave_up" for tid, _ in burst for k, _ in events(conn, tid)),
     f"rows={[(r['status'], r['consecutive_failures']) for r in rows]} codes={codes} crashed={crashed}",
+)
+
+# One worker whose chat() runs no turn (agent init or credentials unresolved).
+no_turn_card, no_turn_run = claimed_card("Bootstrap agent profile (no turn ran)")
+conn = board()
+worker = spawn_worker(conn, no_turn_card)
+close_no_turn = getattr(GUARD, "close_no_turn_chat", None)
+code = close_no_turn(connect=board, environ=env_for(no_turn_card, no_turn_run)) if close_no_turn else None
+exit_worker(worker, code)
+check(
+    "a kanban worker on the chat path with no turn exits 1, as -Q does",
+    code == 1,
+    f"exit code {code!r}",
+)
+crashed = KD.detect_crashed_workers(board())
+conn = board()
+after = row(conn, no_turn_card)
+run = conn.execute(
+    "SELECT outcome, error, metadata FROM task_runs WHERE id = ?", (no_turn_run,)
+).fetchone()
+comments = [
+    r["body"]
+    for r in conn.execute("SELECT body FROM task_comments WHERE task_id = ?", (no_turn_card,))
+]
+check(
+    "the no-turn reason is on the card as a comment",
+    len(comments) == 1
+    and "ended before any turn ran" in comments[0]
+    and f"Run {no_turn_run} " in comments[0],
+    f"comments: {comments}",
+)
+check(
+    "the no-turn worker charged its own run crashed, not a protocol violation",
+    run["outcome"] == "crashed" and run["error"] == no_turn_charged
+    and "protocol_violation" not in (run["metadata"] or ""),
+    f"outcome={run['outcome']!r} error={run['error']!r} metadata={run['metadata']!r}",
+)
+check(
+    "the reaper left the no-turn card alone: the card was no longer running",
+    no_turn_card not in crashed,
+    f"crashed={crashed}",
+)
+check(
+    "the no-turn failure is counted once and the card is back in ready",
+    after["consecutive_failures"] == 1 and after["status"] == "ready",
+    f"failures={after['consecutive_failures']!r} status={after['status']!r}",
+)
+check(
+    "last_failure_error is the charged no-turn text",
+    after["last_failure_error"] == no_turn_charged,
+    f"last_failure_error={after['last_failure_error']!r}",
+)
+check(
+    "check_respawn_guard lets the no-turn card run again",
+    KD.check_respawn_guard(conn, no_turn_card) is None,
+    f"guard={KD.check_respawn_guard(conn, no_turn_card)!r}",
+)
+check("and the next dispatch_once respawns the no-turn card", respawn_once(no_turn_card))
+
+# A burst of three no-turn workers in the same reaper pass (credentials unresolved
+# or agent init failed across the fleet). The reaper's burst breaker would give up
+# on all three at once if they exited 1 with no board write; charged by the
+# workers, each stays retryable (gke-labs/kube-agents#3505).
+no_turn_burst = [claimed_card(f"No-turn burst card {i}") for i in range(3)]
+nt_workers = []
+conn = board()
+for tid, run_id in no_turn_burst:
+    nt_workers.append(spawn_worker(conn, tid))
+nt_codes = [close_no_turn(connect=board, environ=env_for(tid, run_id)) for tid, run_id in no_turn_burst] if close_no_turn else []
+for worker, c in zip(nt_workers, nt_codes):
+    exit_worker(worker, c)
+crashed = KD.detect_crashed_workers(board())
+conn = board()
+nt_rows = [row(conn, tid) for tid, _ in no_turn_burst]
+check(
+    "three no-turn workers in one pass all stay retryable (no gave_up on attempt 1)",
+    all(r["status"] == "ready" and r["consecutive_failures"] == 1 for r in nt_rows)
+    and not any(k == "gave_up" for tid, _ in no_turn_burst for k, _ in events(conn, tid)),
+    f"rows={[(r['status'], r['consecutive_failures']) for r in nt_rows]} codes={nt_codes} crashed={crashed}",
+)
+check(
+    "and each no-turn worker charged NO_TURN_ERROR and left a comment",
+    all(r["last_failure_error"] == no_turn_charged for r in nt_rows)
+    and all(
+        conn.execute("SELECT 1 FROM task_comments WHERE task_id = ?", (tid,)).fetchone()
+        for tid, _ in no_turn_burst
+    ),
+    f"rows={[(r['last_failure_error'],) for r in nt_rows]}",
 )
 
 # A charge refused because the card changed hands: no comment, no charge, and

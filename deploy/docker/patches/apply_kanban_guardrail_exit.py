@@ -49,8 +49,8 @@ phase:
    neither anchor overlaps it.
 7. ``cli.py`` — ``_run_single_query_mode``'s non-quiet branch, after
    ``chat()`` and the resume summary: exit with the code edit 5 left on the
-   CLI object. A kanban worker whose ``chat()`` returned before any turn ran
-   leaves no code and keeps exit 0 (gke-labs/kube-agents#3505). Without it the chat path exits 0 for every failed turn, and a failure edit
+   CLI object, or when no turn ran (credentials or agent init failed), charge
+   the failure and exit 1 (gke-labs/kube-agents#3505). Without it the chat path exits 0 for every failed turn, and a failure edit
    5 could not record is booked as a protocol violation.
 
 The inserts mirror code that is already in the tree: edit 1 copies the shape of
@@ -310,6 +310,8 @@ CHAT_INSERT = '''        # kube-agents patch: the non-quiet single-query path ev
         # have used (billing aside); _run_single_query_mode exits with it
         # after the summary.
         # See hermes_cli/kanban_guardrail_exit.py.
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            self._kube_kanban_turn_seen = True
         if turn.result and os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from hermes_cli.kanban_guardrail_exit import (
@@ -354,16 +356,29 @@ SINGLE_QUERY_ANCHOR = (
     "        cli._print_exit_summary(clear_screen=False)\n"
 )
 
-SINGLE_QUERY_INSERT = '''        # kube-agents patch: a kanban worker whose turn failed exits the way
-        # the -Q path does (exit 1; 75 for a rate limit) instead of 0.
-        # _chat_render_turn set the code after recording the failure; if that
-        # record was refused, this exit is what the reaper counts instead of
-        # booking a protocol violation. A worker whose chat() returned before
-        # any turn keeps exit 0 (see the module docstring for why).
+SINGLE_QUERY_INSERT = '''        # kube-agents patch: a kanban worker whose turn failed or whose chat()
+        # ran no turn exits the way the -Q path does (exit 1; 75 for a rate
+        # limit) instead of 0.
+        # _chat_render_turn set the code after recording a failed turn. When no
+        # turn ran (credentials or agent init failed), charge the failure here
+        # before exiting 1 so the reaper's burst breaker does not trip.
         # See hermes_cli/kanban_guardrail_exit.py.
         _kube_kanban_exit_code = getattr(cli, "_kube_kanban_exit_code", None)
         if _kube_kanban_exit_code:
             sys.exit(_kube_kanban_exit_code)
+        if os.environ.get("HERMES_KANBAN_TASK") and not getattr(cli, "_kube_kanban_turn_seen", False):
+            try:
+                from hermes_cli.kanban_guardrail_exit import (
+                    close_no_turn_chat as _kube_close_no_turn_chat,
+                )
+
+                _kube_no_turn_code = _kube_close_no_turn_chat()
+                if _kube_no_turn_code is not None:
+                    sys.exit(_kube_no_turn_code)
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    "kanban no-turn exit failed", exc_info=True
+                )
 '''
 
 # The end of ``_record_task_failure``'s signature. The keyword goes last so no
