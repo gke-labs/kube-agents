@@ -6880,7 +6880,9 @@ class TestDeclaredIntent(BaseTestCase):
         self.assertIn("`payments/Deployment/api`", comment)
 
     def test_the_clean_comment_and_the_table_say_what_day_a_dated_declaration_stands_until(self):
-        until = (datetime.now(timezone.utc).date() + timedelta(days=90)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        # A fixed date: neither the validator (no day named) nor the renderer
+        # reads the clock here, and the test must not either.
+        until = date(2027, 2, 4).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
         doc = declaring_doc(findings=[])
         entry = make_declared()
         entry["declaration"]["expires"] = until
@@ -7358,8 +7360,13 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         # the worker left out, and an expired 2.7 note shields no sibling and
         # files no namespace for the stale close; the standing ones still do,
         # and the manifest route copies the standing note's date.
-        yesterday = (datetime.now(timezone.utc).date() - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
-        next_year = (datetime.now(timezone.utc).date() + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        # The join judges the dates against the run's start day; pinned, with
+        # the clock pinned beside it, so the test reads neither live.
+        run_day = date(2026, 11, 6)
+        self.patch_attr("run_start_day", lambda audit_id: run_day)
+        self.patch_attr("_today_utc", lambda: run_day)
+        yesterday = (run_day - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (run_day + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
         lapsed_ns = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/payments", "severity": "major", "excerpt": "no policy"}
         standing_ns = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "billing", "object": "Namespace/billing", "severity": "major", "excerpt": "no policy"}
         manifest = {"clusters": [{"name": "prod-us-east", "candidates": [lapsed_ns, standing_ns]}]}
@@ -9629,6 +9636,29 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         payload = self.finish(doc)
         self.assertEqual(payload["declared"], 1)
         self.assertIn(f"(until {self.day(0)})", self.ledger_body())
+
+    def test_both_routes_judge_a_date_against_the_runs_day_not_the_clock(self):
+        # A `finish` that lands after midnight: the run started on D, the
+        # clock says D+1, and two notes name `expires: D` — one the harness
+        # filed, one the worker hand-wrote. Both still stand, because both
+        # are held to D; before this the filed one lapsed with the clock
+        # while the hand-written one did not, and one run gave one date two
+        # answers.
+        self.patch_attr("_today_utc", lambda: self.TODAY + timedelta(days=1))
+        self.patch_attr("run_start_day", lambda audit_id: self.TODAY)
+        self.record()
+        self.file({**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(0)})
+        hand_written = make_declared(check="no-hpa", namespace="payments", obj="Deployment/api", repo="acme/fleet", path="knowledge/api.md")
+        hand_written["declaration"]["expires"] = self.day(0)
+        findings = [f for f in posture_and_fault_findings() if f["check"] != "no-hpa"]
+        doc = self.doc(findings)
+        doc["declared"] = [hand_written]
+        payload = self.finish(doc)
+        self.assertEqual(payload["declared"], 2)
+        self.assertNotIn("DECLARATION EXPIRED", self.err)
+        body = self.ledger_body()
+        self.assertNotIn("Declared intent expired", body)
+        self.assertEqual(body.count(f"(until {self.day(0)})"), 2)
 
     def test_the_runs_day_comes_from_starts_record(self):
         self.record()

@@ -8430,9 +8430,10 @@ def parse_declarations(
                     f"{item[DECLARATION_EXPIRES_FIELD]!r}; skipped."
                 )
                 continue
-            # Filed as the date, not judged here: `finish` reads the calendar
-            # on the day it joins, so a file `start` wrote before midnight is
-            # still read right after it.
+            # Filed as the date, not judged here: `finish` holds it to the
+            # day the run started (`run_start_day`), the same day it holds a
+            # hand-written entry to, so a file `start` wrote before midnight
+            # is read the same way after it.
             entry[DECLARATION_EXPIRES_FIELD] = expires
         out.append(entry)
     return out
@@ -18168,9 +18169,15 @@ def join_harness_declarations(
     derived ones.
     """
     fold_searched_record(data, record)
-    # Split once: the join reports a lapsed entry against the finding it
-    # covered; the manifest route and the shields read only the standing ones.
-    standing, expired = split_expired_declarations(read_declarations(audit_id, repo=repo))
+    # Split once, against the day the run started — the same day the
+    # validator holds a hand-written `declaration.expires` to — so one
+    # `finish`, or a later `remediate`, gives a date one answer whichever
+    # route filed it, and a retry after midnight reads the run as the run.
+    # The join reports a lapsed entry against the finding it covered; the
+    # manifest route and the shields read only the standing ones.
+    standing, expired = split_expired_declarations(
+        read_declarations(audit_id, repo=repo), today=run_start_day(audit_id)
+    )
     moved = apply_declarations(data, standing, expired=expired)
     from_manifest = declare_collector_candidates(data, standing, manifest)
     shielded = shield_declared_account_siblings(data, standing, manifest)
