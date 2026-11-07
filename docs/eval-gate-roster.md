@@ -591,8 +591,9 @@ with "Not a roster admission."
 - **(a) A recorded red.** The case has failed for the right reason before: against `main`
   without the fix it guards, the red half of the loop in
   [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md). A
-  case nobody has seen fail may be unable to fail. The pull request links that red run: the
-  build or artifact, the check that failed and why, and one line of the agent's report. For an
+  case nobody has seen fail may be unable to fail. The pull request links that red run, the
+  build or artifact, and names the check that failed
+  ([`public_surfaces.md`](../.agents/rules/public_surfaces.md)). For an
   `expected_fail` case, the run that recorded it red counts.
 - **(b) Every miss explained.** In the case's last 20 runs at the current version key, every
   failed repetition is classified. Either it is an agent regression with an issue, or it is an

@@ -64,9 +64,10 @@ Required: an empty section is not an answer. Three forms, by what the change tou
 - It changes what an agent does (prompt, SOP, skill, tool, runtime path, a fix for agent
   behaviour, or a chart/operator/config change that alters it): the eval loop is the live
   validation. Name the case (new or existing); the red run against `main` (install and commit,
-  the failing check and its reason, one line of the agent's report); the three green runs
-  against this branch; where the case is registered. Mechanics:
-  .agents/rules/eval_driven_development.md. A case you file for a gap someone else owns lands
+  the failing check's name, the run's build id or path); the three green runs against this
+  branch; where the case is registered. Mechanics: .agents/rules/eval_driven_development.md.
+  The section names the outcome and where the record is, nothing from inside it:
+  .agents/rules/public_surfaces.md. A case you file for a gap someone else owns lands
   red and marked `expected_fail: true`; the fix that flips it cites that record (same file,
   "When the fix is not yours"). "No cluster" is not an answer: every contributor has a dev
   project. Or, for a deterministic guard or a failure that didn't turn red on demand, the
@@ -145,8 +146,8 @@ The rules are in docs/eval-gate-roster.md, "The five rules a seat meets". Rules 
 are checked by scripts/test_eval_rosters.py; these two are yours to show.
 
 - (a) The red run: the case failing for the right reason against `main` without the fix it
-  guards. Link the build or artifact, name the check that failed and why, and quote one line
-  of the agent's report.
+  guards. Link the build or artifact and name the check that failed
+  (.agents/rules/public_surfaces.md).
 - (b) The misses: every failed repetition in the case's last 20 runs at the current version
   key, each classified as an agent regression (with its issue) or an infra class the harness
   excludes. "None" is a complete answer when there were none.
