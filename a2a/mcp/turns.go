@@ -1840,7 +1840,8 @@ const delegationSettle = 2 * time.Second
 
 // chainAnswered is the rule both waits end a delegated chain on, together
 // with delegationSettle: a followed task other than the root has finished
-// with a result. A child's own result is only interim while the relay has
+// with a result. (A streamed poll also ends it on the root's result frame,
+// see pollTurnStepSnapshotLocked.) A child's own result is only interim while the relay has
 // yet to mint the task that wakes the delegator with it.
 func chainAnswered(out TurnOutcome) bool {
 	return out.AnswerFrom != nil && *out.AnswerFrom != out.Root &&
@@ -2175,11 +2176,16 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	}
 
 	// The chain ends as waitForChain ends it: on an answer with a result
-	// (chainAnswered) and delegationSettle with nothing new. Two cases end
-	// it without one, where waiting on could not bring one into view: a
-	// state with no watch finds no further delegated task, and a followed
-	// task too large to read is never read again.
-	ended := chainAnswered(out) || st.watch == nil || unreadable
+	// (chainAnswered) and delegationSettle with nothing new. Three cases
+	// end it without one, where waiting on could not bring one into view:
+	// the gateway's result frame for the root was heard (it publishes that
+	// frame once, at the chain's end, so a child that ended with no result
+	// and no wake -- canceled from another surface, or failed when the
+	// wake could not start -- has nothing more coming); a state with no
+	// watch finds no further delegated task; and a followed task too large
+	// to read is never read again. A child's interim answer before its
+	// wake task brings no root result frame, so it still waits.
+	ended := chainAnswered(out) || st.rootResultHeardLocked() || st.watch == nil || unreadable
 	if allFollowedFinal && !ended {
 		st.settledFollowedCount = 0
 		st.settledDelegationsAt = time.Time{}
@@ -2202,6 +2208,16 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 		st.settledDelegationsAt = time.Time{}
 	}
 	return out, false, waitedAny, nil
+}
+
+// rootResultHeardLocked reports whether the state's watch heard the
+// gateway's result frame for the turn's root, the chain's end.
+func (st *taskStepState) rootResultHeardLocked() bool {
+	if st.watch == nil {
+		return false
+	}
+	seen, _ := st.watch.rootResult(st.ref.TaskID)
+	return seen
 }
 
 func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, ref TaskRef) (*lib.Task, bool, error) {

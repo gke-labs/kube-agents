@@ -1888,6 +1888,80 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 	}
 }
 
+// A streamed delegated turn whose child ends canceled with no result and no
+// wake (stopped from another surface, say) settles once the gateway's result
+// frame for the root is heard, not after delegationFollowGrace: the gateway
+// publishes that frame at the chain's end. Before the frame, the poll still
+// waits, as it must for a wake task that trails the child.
+func TestAStreamedDelegationSettlesOnTheRootsResultFrame(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	rootID, childID := "task-nowake-root", "task-nowake-child"
+	frame := make(chan string, 1)
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+		publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactDelegate, "cluster-a: inspect")
+		publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+		publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+		publishRun(t, js, "cluster-a", childID, "child notes", false)
+		publishStatus(t, js, "cluster-a", childID, lib.StateCanceled, true)
+		frame <- token
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+	// No frame yet: past delegationSettle, the chain still waits.
+	waitUntil := time.Now().Add(delegationSettle + time.Second)
+	for time.Now().Before(waitUntil) {
+		out, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, time.Second)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep: %v", err)
+		}
+		if !out.StillRunning {
+			t.Fatal("settled on a child with no result before the root's result frame")
+		}
+	}
+	end := resultFrame(rootID, false)
+	end.State, end.Text = string(lib.StateCanceled), "canceled"
+	publishNotify(nc, <-frame, end)
+	deadline := time.Now().Add(delegationSettle + 4*time.Second)
+	for time.Now().Before(deadline) {
+		out, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 2*time.Second)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep: %v", err)
+		}
+		if !out.StillRunning {
+			return
+		}
+	}
+	t.Fatalf("still running %s after the root's result frame (delegationFollowGrace=%s)", delegationSettle+4*time.Second, delegationFollowGrace)
+}
+
 // A poll whose caller is cut off mid-poll leaves the step state as it was:
 // mid-turn its steps stay unseen, and on the settling poll the state is not
 // torn down, so the caller's retry reads the same steps on the same turn.
