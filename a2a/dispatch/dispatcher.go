@@ -636,8 +636,11 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	prof, ok := profileOf(snap, profile)
 	if !ok {
 		// A durable for a profile the config doesn't know yet (or any
-		// more): the config lags the operator, so the task stays held.
+		// more): the config lags the operator, so the task stays held. A
+		// Job an earlier pass launched for it, never confirmed, goes (as at
+		// a drain); a started task's Job stays until the task ends.
 		log.Warn("no config for this profile; the submission stays queued")
+		d.dropUnconfirmedJob(ctx, log, hk)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
@@ -668,8 +671,12 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		// Draining (#5074): listed so its held tasks' terminals still land,
 		// but nothing new is dispatched for it. Its durable goes at the next
 		// refresh; until then a new delivery, or a redelivered one from its
-		// backlog, stays queued as an unknown profile's does.
+		// backlog, stays queued as an unknown profile's does. No lease record,
+		// so never started: a Job an earlier pass launched for it goes, or
+		// its pod would wait for an offer until its deadline, outside every
+		// cap.
 		log.Info("the profile is draining; the submission stays queued")
+		d.dropUnstartedJob(ctx, log, hk)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}

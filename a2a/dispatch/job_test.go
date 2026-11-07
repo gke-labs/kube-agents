@@ -426,6 +426,105 @@ func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
 	waitFor(t, 5*time.Second, "the unstarted task's Job deleted", func() bool { return jobs.deleted("task-1") })
 }
 
+// leaveInstall is how a profile leaves the install while its durables are
+// still bound: it drains (#5074), or the config drops it outright.
+var leaveInstall = map[string]func(*lib.DispatchConfig){
+	"draining": func(c *lib.DispatchConfig) {
+		p := c.Profiles[0]
+		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		c.Profiles[0] = p
+	},
+	"removed": func(c *lib.DispatchConfig) { c.Profiles = nil },
+}
+
+// waitBound waits until every durable of the install's first profile is
+// bound.
+func waitBound(t *testing.T, d *Dispatcher, ti *testInstall) {
+	t.Helper()
+	n := len(ti.src.Config().Profiles[0].Durables)
+	waitFor(t, 10*time.Second, "the durables bound", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return len(d.subs) == n
+	})
+}
+
+// A Job an earlier pass launched but never confirmed (a restart, or a failed
+// hand-off) is deleted when its task's submission arrives for a profile that
+// has left the install, draining or dropped from the config: nothing will
+// offer it the task, so its pod would wait until its deadline, outside every
+// cap. The submission stays queued, and no Job is launched for it.
+func TestAnUnstartedTasksJobIsDeletedWhenItsProfileLeaves(t *testing.T) {
+	for name, edit := range leaveInstall {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "job-task-1")
+			b.ensure("inv", 1, 0, "unattended")
+			jobs := newFakeJobs(0)
+			if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass
+				t.Fatal(err)
+			}
+			ti := unattendedInstall(1, nil)
+			cfg := testConfig()
+			cfg.RefreshInterval = time.Hour // the durables stay bound for the whole test
+			d, _ := b.runDispatcherWith(cfg, ti, &fakeVerifier{}, jobs)
+			waitBound(t, d, ti)
+			ti.update(edit)
+			b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+			waitFor(t, 10*time.Second, "the unstarted task's Job deleted", func() bool { return jobs.deleted("task-1") })
+			if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+				t.Errorf("terminals %+v for a submission that stays queued", ts)
+			}
+			if n := jobs.launchCount(); n != 1 {
+				t.Errorf("%d launches, want only the earlier pass's", n)
+			}
+		})
+	}
+}
+
+// A task confirmed to its Job's pod keeps that Job when its profile leaves
+// the install: its submission, redelivered to a new dispatcher after the old
+// one crashed, finds the lease record, so the Job is not one an unstarted
+// task left. The task runs to its end; a draining profile's is re-adopted,
+// and its Job goes when it ends.
+func TestARunningTasksJobIsKeptWhenItsProfileLeaves(t *testing.T) {
+	for name, edit := range leaveInstall {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "job-task-1")
+			b.ensure("inv", 1, 6*time.Second, "unattended")
+			w := b.worker("inv", "unattended", "job-task-1", answerAccept, 14*time.Second)
+			jobs := newFakeJobs(0)
+			ti := unattendedInstall(1, nil)
+			c1 := b.connect("dispatcher-1")
+			_, stop1 := b.runPrepared(c1, testConfig(), ti, &fakeVerifier{}, func(d *Dispatcher) { d.UseJobs(jobs) })
+			b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+			waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedTask("task-1") })
+			time.Sleep(1500 * time.Millisecond)
+			c1.Close() // no Nak reaches the server: redelivered after AckWait
+			stop1()
+
+			cfg := testConfig()
+			cfg.RefreshInterval = time.Hour // the durables stay bound for the whole test
+			d, _ := b.runDispatcherWith(cfg, ti, &fakeVerifier{}, jobs)
+			waitBound(t, d, ti)
+			ti.update(edit)
+			time.Sleep(8 * time.Second) // past AckWait, and several retry delays
+			if len(b.terminalsOf("task-1")) != 0 {
+				t.Fatal("task-1 ended before its redelivery was checked; the test proves nothing")
+			}
+			if jobs.deleted("task-1") {
+				t.Error("a running task's Job was deleted when its profile left")
+			}
+			if ts := b.waitTerminal("task-1", 20*time.Second); ts.state != lib.StateCompleted {
+				t.Fatalf("terminal %+v, want the worker's completed", ts)
+			}
+			if name != "draining" {
+				return
+			}
+			waitFor(t, 5*time.Second, "the re-adopted task's Job deleted", func() bool { return jobs.deleted("task-1") })
+		})
+	}
+}
+
 // A task re-adopted after its profile's Job template was dropped still ran on
 // a Job, which goes when the task ends.
 func TestAReadoptedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
