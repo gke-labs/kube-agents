@@ -250,17 +250,21 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 		var params struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
-			Meta      map[string]any  `json:"_meta"`
+			Meta      json.RawMessage `json:"_meta"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, msgNeedsToolName)
 		}
+		// _meta is optional client metadata: a non-object one is ignored,
+		// not a reason to refuse the call.
+		var meta map[string]any
+		_ = json.Unmarshal(params.Meta, &meta)
 		// An unknown tool is a protocol error, as the MCP spec has it, so the
 		// host sees it, not the model as a tool that ran and failed.
 		if _, ok := s.tools[params.Name]; !ok {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, fmt.Sprintf(msgUnknownTool, params.Name))
 		}
-		return marshalRPCResult(req.ID, s.CallTool(WithCallMeta(ctx, params.Meta), params.Name, params.Arguments))
+		return marshalRPCResult(req.ID, s.CallTool(WithCallMeta(ctx, meta), params.Name, params.Arguments))
 	// Neither is a capability this server declares; an empty list is the
 	// polite answer to a client that asks anyway.
 	case methodResourcesList:
