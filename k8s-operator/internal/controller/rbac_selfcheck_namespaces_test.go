@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -30,6 +32,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+const (
+	// observeProbeWait bounds how long the test waits for Observe's own probe;
+	// the fake authorizer answers in microseconds, so this is generous.
+	observeProbeWait = 5 * time.Second
+	observeProbePoll = 10 * time.Millisecond
+	// concurrentProbes is how many Probe calls the race test runs at once.
+	concurrentProbes = 8
 )
 
 // probeLabels is probeRBAC with the denials flattened to their labels, which
@@ -177,5 +188,64 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 		if !strings.Contains(degraded.Message, want) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}
+	}
+
+	// Deleting the agent forgets its namespace: the denial must not stand
+	// against whatever reconciles next, and the namespace is not probed again.
+	if _, err := r.handleDeletion(ctx, stored); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	if got := checker.DeniedFor("team-a"); len(got) != 0 {
+		t.Errorf("after deletion the checker still holds team-a's denials: %v", got)
+	}
+	if _, err := checker.Probe(ctx); err != nil {
+		t.Fatalf("probe after deletion: %v", err)
+	}
+	if got := checker.Denied(); len(got) != 0 {
+		t.Errorf("after deletion team-a is still probed: %v", got)
+	}
+}
+
+// Observe of a new namespace probes without waiting for the ticker: the
+// denial has to arrive on its own, with no Probe call from the test, so the
+// agent's first failed reconcile is followed by a status within seconds.
+func TestObserveProbesANewNamespaceAtOnce(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
+	checker.Observe("team-a")
+	deadline := time.Now().Add(observeProbeWait)
+	for len(checker.DeniedFor("team-a")) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Observe did not probe the new namespace on its own; only the ticker would, up to five minutes later")
+		}
+		time.Sleep(observeProbePoll)
+	}
+}
+
+// Probes run one at a time under probeMu, so the ticker, Observe's goroutine
+// and the boot probe can overlap without a staler snapshot overwriting a
+// fresher answer. This test cannot see the ordering from outside; it runs
+// concurrent probes against the shared state so the race detector reads
+// every path, and checks the answer that comes out last is complete.
+func TestConcurrentProbesAreSafeUnderTheRaceDetector(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
+	checker.Observe("team-a")
+	var wg sync.WaitGroup
+	for i := 0; i < concurrentProbes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := checker.Probe(context.Background()); err != nil {
+				t.Errorf("probe: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if _, err := checker.Probe(context.Background()); err != nil {
+		t.Fatalf("final probe: %v", err)
+	}
+	if got := checker.DeniedFor("team-a"); len(got) == 0 {
+		t.Fatal("the stored answer lost team-a's denial to an older probe")
 	}
 }

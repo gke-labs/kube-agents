@@ -85,10 +85,17 @@ const (
 	rbacProbeConcurrency = 16
 	// RBACIncompleteCause is the sentence the boot log line and the condition
 	// both carry: what happened and the two ways to fix it. Exported for main.go.
-	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image, " +
-		"or a PlatformAgent's namespace has no RoleBinding to the operator's namespaced Role; " +
-		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together, " +
-		"and bind the namespaced Role in every namespace that holds a PlatformAgent"
+	RBACIncompleteCause = "the ClusterRole or namespaced Role bound to the operator is older than this image; " +
+		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
+	// rbacAgentNamespaceCause follows RBACIncompleteCause on a condition whose
+	// denials include a PlatformAgent's own namespace: that one is not skew but
+	// a RoleBinding nobody installs by default.
+	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no RoleBinding to the " +
+		"operator's namespaced Role; bind it there"
+	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
+	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
+	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
+	rbacAgentNamespaceLabelMark = " (in namespace "
 	// rbacIncompleteMessagePrefix opens the condition message; the denied
 	// permissions follow it.
 	rbacIncompleteMessagePrefix = "The operator is denied permissions its RBAC markers declare: "
@@ -382,9 +389,16 @@ type RBACChecker struct {
 	interval time.Duration
 	timeout  time.Duration
 
-	mu     sync.Mutex
-	denied []deniedPermission
-	probed bool
+	// probeMu serializes probes. The ticker and Observe can start one each,
+	// and every probe snapshots the namespace set when it starts and stores
+	// its result when it ends; two in flight at once would let the earlier,
+	// staler snapshot finish last and overwrite the fresher answer. Not mu,
+	// which the reconcile worker takes to read the answer and must not wait
+	// on a probe for.
+	probeMu sync.Mutex
+	mu      sync.Mutex
+	denied  []deniedPermission
+	probed  bool
 	// agentNamespaces are the namespaces of reconciled PlatformAgents other
 	// than the operator's own, each probed for the namespaced permissions
 	// too. Observe adds one and Forget removes it.
@@ -464,6 +478,8 @@ func (c *RBACChecker) Probe(ctx context.Context) ([]string, error) {
 	if c == nil || c.reviews == nil {
 		return nil, nil
 	}
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	denied, err := probeRBAC(ctx, c.reviews, c.namespace, c.sortedAgentNamespaces())
@@ -565,7 +581,14 @@ func (c *RBACChecker) NeedLeaderElection() bool { return false }
 
 // rbacIncompleteMessage is the condition message for a set of denials.
 func rbacIncompleteMessage(denied []string) string {
-	return rbacIncompleteMessagePrefix + strings.Join(denied, ", ") + "; " + RBACIncompleteCause + "."
+	message := rbacIncompleteMessagePrefix + strings.Join(denied, ", ") + "; " + RBACIncompleteCause
+	for _, label := range denied {
+		if strings.Contains(label, rbacAgentNamespaceLabelMark) {
+			message += "; " + rbacAgentNamespaceCause
+			break
+		}
+	}
+	return message + "."
 }
 
 // reportRBACSkew writes or clears the Degraded/RBACIncomplete condition on
