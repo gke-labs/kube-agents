@@ -1101,7 +1101,7 @@ func (r *PlatformAgentReconciler) sizingRunningLimitsClamped(ctx context.Context
 // the next pass measures. The first pass of a fresh install never reaches this
 // check, since it has no cluster reading to earn a step with.
 func (r *PlatformAgentReconciler) sizingTierUnsettledWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) string {
-	autopilot := r.clusterAutopilot()
+	autopilot, _ := r.clusterAutopilot()
 	// The proxy Deployment and the shell StatefulSet are rendered with one
 	// replica (credential_proxy_manifests.go, shell_sandbox_manifests.go);
 	// the gateway's count is the spec's, zero under scaleToZero.
@@ -1484,7 +1484,8 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 		}{client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, agentAPIAuthContainerName})
 	}
 	recorded := sizingCappedCondition(agent).message
-	autopilot, clamped, clampRead := r.clusterAutopilot(), false, false
+	autopilot, _ := r.clusterAutopilot()
+	clamped, clampRead := false, false
 	for _, workload := range sized {
 		dep := &appsv1.Deployment{}
 		if err := r.Get(ctx, workload.key, dep); err != nil {
@@ -1791,7 +1792,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
 						"clusters", count)
 				default:
-					autopilot := r.clusterAutopilot()
+					autopilot, _ := r.clusterAutopilot()
 					clamped := r.sizingRunningLimitsClamped(ctx, agent)
 					templates := map[string]corev1.PodTemplateSpec{}
 					if len(ranges) > 0 {

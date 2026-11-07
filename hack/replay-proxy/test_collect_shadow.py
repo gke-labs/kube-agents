@@ -625,10 +625,6 @@ class ProcessTest(unittest.TestCase):
         self.assertIn("FileNotFoundError", out.decode())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class OpenSegmentClosedMidPassTest(unittest.TestCase):
     """The last pass lists an open segment the proxy then closes before the copy."""
 
@@ -647,3 +643,6 @@ class OpenSegmentClosedMidPassTest(unittest.TestCase):
         members = [(m.name, m.size) for m in tarfile.open(fileobj=io.BytesIO(out), mode="r|")]
         self.assertEqual(members, [("logs/p-1-000001.jsonl.open", 9)])
 
+
+if __name__ == "__main__":
+    unittest.main()

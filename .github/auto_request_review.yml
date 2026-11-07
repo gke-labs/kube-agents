@@ -19,7 +19,8 @@ reviewers:
     # scripts/request_reviewers.py draws from this group only when the
     # author's own approval already covers every changed file -- a root
     # approver's pull request, which needs lgtm alone. Any other pull request
-    # takes an approver, at equal weight otherwise. Someone who becomes a root
+    # takes approvers, enough to approve every changed file, at equal weight
+    # otherwise. Someone who becomes a root
     # approver moves to repository-owners; the same test pins that.
     repository-reviewers:
       - lapis2002
@@ -27,10 +28,14 @@ reviewers:
       - Fuxiao-Gao
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
     # change to hack/eval/presubmit-cases.txt, hack/eval/blocking-roster.txt
-    # (#1546) or the inject lane's exclusions and safeguards (hack/OWNERS).
-    # Keep the two lists identical. A mixed pull request routes here alone, so
-    # a member who is not a root approver can clear the roster half and the
-    # rest still waits on a root approver's /approve.
+    # (#1546), the inject lane's exclusions and safeguards, or
+    # hack/replay-proxy/ (hack/OWNERS). Keep the two lists identical. A mixed
+    # pull request routes here alone; scripts/request_reviewers.py draws
+    # approvers until every file has one asked, so when the member drawn is
+    # not a root approver it adds one for the rest, from the defaults when no
+    # member is one. hack/replay-proxy/ needs
+    # no entry here: the catch-all pool holds both members, and the same rule
+    # draws one of them.
     eval-crew:
       - jayantid
       - lapis2002
@@ -59,7 +64,8 @@ options:
     - DO NOT REVIEW
   enable_group_assignment: false
 
-  # Randomly pick reviewers up to this number.
+  # Randomly pick reviewers up to this number. scripts/request_reviewers.py
+  # goes past it when one approver cannot approve every changed file.
   # Do not set this option if you'd like to assign all matching reviewers.
   number_of_reviewers: 1
 

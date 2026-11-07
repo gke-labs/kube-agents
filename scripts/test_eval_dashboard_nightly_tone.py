@@ -124,7 +124,7 @@ class FocusLineTest(unittest.TestCase):
 
 class OneRunPerDateTest(unittest.TestCase):
     """A same-date re-run counts once in the reply-shape typicals, as in the
-    latency line's (nightly_latency.one_per_date)."""
+    latency line's (nightly.one_per_date)."""
 
     def test_a_same_date_re_run_is_one_earlier_night(self):
         # Seven earlier dates: the 27th (run twice), 26th and 25th at 90%

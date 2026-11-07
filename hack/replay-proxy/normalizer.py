@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Hex digits of the normalizer source hash kept in NORMALIZER_VERSION.
 NORMALIZER_VERSION_HEX_CHARS = 16
@@ -33,6 +33,32 @@ NORMALIZER_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:NO
 # collision across a week of logs negligible, short enough to keep a log line
 # with a few hundred messages small.
 MESSAGE_HASH_HEX_CHARS = 16
+# Replay keys a request a second way, each assistant message as a slot any
+# recorded answer to that same context fills (answer_slots). A slot keeps the
+# answer's tool calls, by name and arguments, and blanks its words.
+ASSISTANT_ROLE = "assistant"
+ROLE_FIELD = "role"
+# Tools whose arguments a slot blanks too; the name always stays. A tool is here
+# only when its source shows that calling it changes nothing, with any
+# arguments: then a replay that called it differently and got the same result
+# (the result stays in the key) left the world and what the model saw as the
+# recording did. Hermes' runtime auto-heartbeat ticks on any tool call, so it
+# does not tell one tool from another and does not count against a tool here.
+READ_ONLY_TOOLS = (
+    # Reads a card. hermes-agent v2026.9.14 tools/kanban_tools.py `_handle_show`
+    # resolves the id (`_require_task_id`; no id means the worker's own card) and
+    # returns get_task, parent_ids, child_ids, list_comments, list_events,
+    # list_runs and build_worker_context from hermes_cli/kanban_db.py, each a
+    # SELECT; no claim, heartbeat or write, and no image patch wraps it. The
+    # lane trial's only slot fork was kanban_show() against
+    # kanban_show(task_id=<own card>).
+    "kanban_show",
+)
+ANSWER_SLOT = "recorded-answer"
+CONTENT_FIELD = "content"
+FUNCTION_FIELD = "function"
+NAME_FIELD = "name"
+ARGUMENTS_FIELD = "arguments"
 
 # Request fields that change how the answer is delivered or who asked, never
 # what the model sees. Everything else is in the key.
@@ -40,6 +66,8 @@ KEY_DROP_FIELDS = ("stream", "user", "metadata")
 MESSAGES_FIELD = "messages"
 
 OPEN, CLOSE = "⟦", "⟧"
+# A placeholder in a saved answer, for restoring it with the current request's values.
+PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" + re.escape(CLOSE))
 
 # Opaque fields. LiteLLM embeds Gemini's thought signature in tool-call ids
 # (`call_…__thought__<base64>`), so no rule ever edits inside one: the whole
@@ -67,6 +95,16 @@ RUN_ID_SUFFIX = "_run_id"
 EVENTS_KEY = "events"
 EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
+# gcloud writes warnings to stderr, and the shell tool merges stderr into the
+# output in whatever order the two streams arrive: the same command's warning
+# came before its JSON in one run and after it in the next. Only that shape is
+# rewritten (warnings_last): one JSON document, with blocks of warnings before
+# or after it, each a `WARNING: ` line and the indented lines that continue it.
+STDERR_WARNING_PREFIX = "WARNING: "
+LINE_BREAK = "\n"
+# A line that opens a JSON document, and an indented line continuing a warning.
+JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
+CONTINUATION_PREFIXES = (" ", "\t")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -88,6 +126,10 @@ PID_PROSE_RE = re.compile(r"(?<![A-Za-z0-9_])(pid|PID)(\s+)(\d+)\b")
 AGE_SHAPE = r"\d+[smhdy](?:\d+[smhd])?"
 AGE_FULL_RE = re.compile(r"^" + AGE_SHAPE + r"$")
 AGE_TOKEN_RE = re.compile(r"(?<![\w.])" + AGE_SHAPE + r"(?![\w.])")
+# A table cell under an age column is read only when it starts with an age; a
+# line below the header that is not a row (JSON printed after the table) would
+# otherwise have an age cut out of whatever sits at that column, a uid's `83d`.
+AGE_CELL_RE = re.compile(r"^\s*" + AGE_SHAPE + r"(?![\w.])")
 AGE_CLASS = "AGE"
 # An age is only an age in one of these contexts; `120m` CPU never is.
 AGE_KEYS = ("age", "lastSeen", "last_seen")
@@ -112,6 +154,14 @@ DASH_RULE_RE = re.compile(r"^[\s-]+$")
 # Timestamps become how far they are from the request time, unnumbered:
 # whether a certificate expired is what matters, not which second it did.
 TIME_CLASS = "TIME"
+# The literal text of each bucketed timestamp outside assistant messages is
+# also kept, in order, but only for answers: the key keeps the bucket. An
+# answer quoting one stores `⟦TIMEVAL_<positions>⟧`, every position its text
+# held, and is served with this run's text there, provided the run has the
+# same text at all of them (Mapping.restore). Keys that match have the same
+# buckets at the same positions, so a position names the same field in both.
+TIME_LITERAL_CLASS = "TIMEVAL"
+TIME_POSITION_SEPARATOR = "."
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -263,6 +313,15 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("POD", re.compile(r"\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-([" + K8S_SAFE + r"]{6,10}-[" + K8S_SAFE + r"]{5})\b"), 1),
 ]
 
+# The identifier classes, whose values a stored answer must never keep literal
+# (Mapping.identifier_left_literal). An IP is found only where no digit or
+# `.`+digit borders it.
+IDENTIFIER_CLASSES = tuple(cls for cls, _, _ in ID_CLASSES) + (IP_CLASS,)
+IP_LITERAL_BEFORE = r"(?<![\d.])"
+IP_LITERAL_AFTER = r"(?!\d|\.\d)"
+# The timestamp shapes the key buckets, in the order text() applies them.
+TIMESTAMP_PATTERNS = (ISO_TS_RE, RFC1123_RE, OPENSSL_TS_RE, LS_DATE_RE)
+
 # Hermes appends `## Recent work by @<assignee>` (the assignee's last runs on
 # other cards, one `- ` line each, then a blank line) to every card view. It
 # differs between otherwise identical runs, so it is dropped from the key
@@ -282,6 +341,11 @@ ENCODING_ERRORS = "surrogatepass"
 # characters that may border a token are excluded on each side.
 TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=_-])"
 TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
+# Classes whose value is the tail of a longer name (`web-` + the pod's hash
+# suffix, `gke-…-` + the node's): in an answer that tail follows a `-` or `_`,
+# so those may border it on the left.
+SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT")
+SUFFIX_TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=])"
 # A bare number is a token when no word character, `.` or `-` precedes it and
 # no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
 # `--replicas=-1` is not the number 1, but in `generation is 1.` it is.
@@ -290,12 +354,62 @@ NUMBER_AFTER = r"(?!\w|\.\d)"
 DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
+# Classes keyed apart and never swapped into an answer by value: opaque fields,
+# bare numbers, and timestamp literals (swapped by their own patterns).
+UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, TIME_LITERAL_CLASS)
+
+
+def token_class(token: str) -> str:
+    """The class a placeholder names: `POD` for `⟦POD_2⟧`."""
+    return token[len(OPEN):-len(CLOSE)].rsplit("_", 1)[0]
+
+
+def token_number(token: str) -> str:
+    """What a placeholder carries after its class: `2` for `⟦POD_2⟧`."""
+    return token[len(OPEN):-len(CLOSE)].rsplit("_", 1)[-1]
 
 
 def stable_hash(value: Any) -> str:
     """SHA-256 of a value's canonical JSON."""
     data = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(data.encode(TEXT_ENCODING, ENCODING_ERRORS)).hexdigest()
+
+
+def warning_block(lines: List[str]) -> bool:
+    """Whether `lines` are warnings only: each a `WARNING: ` line or an indented line continuing one."""
+    started = False
+    for line in lines:
+        if line.startswith(STDERR_WARNING_PREFIX):
+            started = True
+        elif not (started and line.startswith(CONTINUATION_PREFIXES)):
+            return False
+    return started
+
+
+def warnings_last(text: str) -> str:
+    """A JSON output with stderr warnings around it, as the JSON and then the warnings, in their order.
+
+    Narrow on purpose: anything but one JSON document between blocks of
+    warnings keeps its order, because there the order of a warning and the
+    line beside it can mean something (`WARNING: disk pressure` then `Pod
+    evicted`). Blank lines at the ends of either side do not count.
+    """
+    if STDERR_WARNING_PREFIX not in text:
+        return text
+    decoder = json.JSONDecoder()
+    for opener in JSON_LINE_RE.finditer(text):
+        before = [line for line in text[: opener.start()].split(LINE_BREAK) if line.strip()]
+        if before and not warning_block(before):
+            return text
+        try:
+            _, end = decoder.raw_decode(text, opener.start())
+        except ValueError:
+            continue
+        after = [line for line in text[end:].split(LINE_BREAK) if line.strip()]
+        if (before or after) and (not after or warning_block(after)):
+            return LINE_BREAK.join([text[opener.start(): end]] + before + after)
+        return text
+    return text
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -397,6 +511,8 @@ class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
 
     to_placeholder: Dict[str, str] = field(default_factory=dict)
+    # The reverse, placeholder -> value, which replay mode restores answers with.
+    to_value: Dict[str, str] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
     # Values swapped that can never be put back in an answer: bare numbers
     # (keyed numbers) and epoch timestamps, which become an unnumbered
@@ -408,6 +524,12 @@ class Mapping:
     # which an answer may also name without the year or by weekday.
     dates: set = field(default_factory=set)
     today_dates: set = field(default_factory=set)
+    # Each bucketed timestamp's text outside assistant messages, in order (TIME_LITERAL_CLASS).
+    time_occurrences: List[str] = field(default_factory=list)
+    # Ages swapped (`5m`, `3 hours`): never put back in an answer. An age is a
+    # reading of the clock, and a served `--since 5m` must not become this
+    # run's `--since 3m`; an answer repeating one is not saved instead.
+    ages: set = field(default_factory=set)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -415,15 +537,24 @@ class Mapping:
             self.today_dates.add(when)
 
     def placeholder(self, cls: str, value: str) -> str:
-        key = (cls if cls in (OPAQUE_CLASS, NUMBER_CLASS) else "") + MAPPING_KEY_SEPARATOR + value
+        age = cls.startswith(AGE_CLASS)
+        key = (cls if cls in UNSWAPPABLE_CLASSES or age else "") + MAPPING_KEY_SEPARATOR + value
         if key not in self.to_placeholder:
             number = self.counts.get(cls, 0) + 1
             self.counts[cls] = number
             token = f"{OPEN}{cls}_{number}{CLOSE}"
             self.to_placeholder[key] = token
+            if not age:
+                self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
+        if age:
+            self.ages.add(value)
         return self.to_placeholder[key]
+
+    def copy(self) -> "Mapping":
+        return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
+                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -435,15 +566,116 @@ class Mapping:
             out[value] = token
         return out
 
+    def bound(self, value: str) -> Optional[str]:
+        """The placeholder a swappable value is bound to, if any."""
+        return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
+
+    def bound_time(self, literal: str) -> Optional[str]:
+        """The placeholder for a timestamp's text: every position it held outside assistant messages, if any."""
+        positions = [str(i + 1) for i, seen in enumerate(self.time_occurrences) if seen == literal]
+        return f"{OPEN}{TIME_LITERAL_CLASS}_{TIME_POSITION_SEPARATOR.join(positions)}{CLOSE}" if positions else None
+
+    def time_at(self, token: str) -> Optional[str]:
+        """This request's text for a `⟦TIMEVAL_…⟧`: its one text at every position named, else None."""
+        try:
+            positions = [int(p) for p in token_number(token).split(TIME_POSITION_SEPARATOR)]
+        except ValueError:
+            return None
+        if any(not 1 <= p <= len(self.time_occurrences) for p in positions):
+            return None
+        texts = {self.time_occurrences[p - 1] for p in positions}
+        return texts.pop() if len(texts) == 1 else None
+
     def apply_to_answer(self, text: str) -> str:
-        """Swap bound values in an answer for their placeholders, by whole token only."""
+        """Swap bound values in an answer for their placeholders.
+
+        Each identifier class is found in the answer by the same pattern, with
+        the same boundaries, that bound it in the request (ID_CLASSES, then IPs),
+        so a value the key swapped after `=`, `/` or `_` is swapped there too. A
+        timestamp the request holds verbatim is swapped for its literal's
+        placeholder. Any bound value still left is then swapped where it is a
+        whole token (an age, a value in a shape its pattern does not match).
+
+        A JSON document (a tool call's arguments) is read as the key reads one:
+        parsed, each string swapped, and written back, but only when a swap
+        changed something, so other answers keep their exact text. The key
+        parses it too, so the rewritten layout keys the same.
+        """
+        parsed = Normalizer.parse_json_document(text)
+        if parsed is not None:
+            swapped = self.apply_to_parsed(parsed)
+            return json.dumps(swapped, ensure_ascii=False) if swapped != parsed else text
+        for cls, pattern, group in ID_CLASSES:
+            text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
+        text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
+        for pattern in TIMESTAMP_PATTERNS:
+            text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
-            before = TOKEN_BEFORE if value[0].isalnum() else ""
+            suffix = token[len(OPEN):].rsplit("_", 1)[0] in SUFFIX_CLASSES
+            before = (SUFFIX_TOKEN_BEFORE if suffix else TOKEN_BEFORE) if value[0].isalnum() else ""
             after = TOKEN_AFTER if value[-1].isalnum() else ""
             text = re.sub(before + re.escape(value) + after, lambda _m, t=token: t, text)
         return text
+
+    def restore(self, text: str) -> Tuple[str, List[str]]:
+        """Put this request's values back for the placeholders in `text`.
+
+        Returns the restored text and the placeholders this request does not
+        bind; a non-empty list means the answer must not be served.
+        """
+        missing: List[str] = []
+
+        def sub(match: "re.Match[str]") -> str:
+            token = match.group(0)
+            value = self.time_at(token) if token_class(token) == TIME_LITERAL_CLASS else self.to_value.get(token)
+            if value is None:
+                missing.append(token)
+                return token
+            return value
+
+        return PLACEHOLDER_RE.sub(sub, text), missing
+
+    def apply_to_parsed(self, value: Any) -> Any:
+        """apply_to_answer on every string of a parsed JSON value; keys stay, as the key leaves them."""
+        if isinstance(value, str):
+            return self.apply_to_answer(value)
+        if isinstance(value, list):
+            return [self.apply_to_parsed(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self.apply_to_parsed(v) for k, v in value.items()}
+        return value
+
+    def identifier_left_literal(self, text: str) -> bool:
+        """Whether a normalized answer still holds, anywhere, an identifier or IP the request bound.
+
+        A backstop for apply_to_answer: such an answer would be served with the
+        recording's value. IPs count only where no digit or `.`+digit borders
+        them, so 10.1.2.3 is not found in 10.1.2.30.
+        """
+        for key, token in self.to_placeholder.items():
+            cls, value = key.split(MAPPING_KEY_SEPARATOR, 1)
+            if cls or token_class(token) not in IDENTIFIER_CLASSES or value not in text:
+                continue
+            if token_class(token) != IP_CLASS or re.search(IP_LITERAL_BEFORE + re.escape(value) + IP_LITERAL_AFTER, text):
+                return True
+        return False
+
+    @staticmethod
+    def has_identifier(text: str) -> bool:
+        """Whether a normalized answer still holds an identifier shape (ID_CLASSES).
+
+        After apply_to_answer, any left is one the key never bound (it sat in
+        text the key drops, like the recent-work digest, or the model made it),
+        so no placeholder can bring it up to date.
+        """
+        return any(pattern.search(text) for _, pattern, _ in ID_CLASSES)
+
+    @staticmethod
+    def has_timestamp(text: str) -> bool:
+        """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
+        return any(pattern.search(text) for pattern in TIMESTAMP_PATTERNS)
 
     def answer_repeats_date(self, text: str) -> bool:
         """Whether an answer names a date the request's key counts by days, which cannot be put back.
@@ -466,6 +698,10 @@ class Mapping:
             except ValueError:
                 continue
         return any(m.group(1).lower() in weekdays for m in ANSWER_WEEKDAY_RE.finditer(text))
+
+    def answer_repeats_age(self, text: str) -> bool:
+        """Whether an answer repeats, as a whole token, an age the request's key swapped."""
+        return any(re.search(TOKEN_BEFORE + re.escape(value) + TOKEN_AFTER, text) for value in self.ages)
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
@@ -490,6 +726,11 @@ class Normalizer:
         self.now = now
         self.keep_ips = keep_ips
         self.mapping = Mapping()
+        # The timestamp texts walked since the caller last cleared this, in order,
+        # and whether bucket_times notes them: not while timed only asks
+        # whether a string holds a time, or every text would be noted twice.
+        self.time_literals: List[str] = []
+        self.noting_times = True
         # Whether a value in any object or list enclosing the one being walked
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
@@ -624,7 +865,7 @@ class Normalizer:
             if value not in self.timed_strings:
                 nested = self.nested_json(value)
                 self.timed_strings[value] = (self.timed(nested) if nested is not None else
-                                             bool(TIME_OF_DAY_RE.search(self.bucket_times(strip_recent_work(value)))))
+                                             bool(TIME_OF_DAY_RE.search(self.bucket_times(strip_recent_work(value), note=False))))
             return self.timed_strings[value]
         if isinstance(value, (dict, list)):
             cache_key = (id(value), key, is_tool_call)
@@ -635,6 +876,7 @@ class Normalizer:
         return False
 
     def text(self, text: str) -> str:
+        text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)
@@ -708,12 +950,21 @@ class Normalizer:
         text = LS_DATE_RE.sub(self.ls_year, text)
         return LONG_DATE_RE.sub(self.long_date, text)
 
-    def bucket_times(self, text: str) -> str:
-        """Replace every timestamp a rule buckets, so no date reads its time as one beside it (TimeIndex.near, timed)."""
-        text = ISO_TS_RE.sub(self.iso_time, text)
-        text = RFC1123_RE.sub(self.rfc1123, text)
-        text = OPENSSL_TS_RE.sub(self.openssl, text)
-        return LS_DATE_RE.sub(self.ls_time, text)
+    def bucket_times(self, text: str, note: bool = True) -> str:
+        """Replace every timestamp a rule buckets, so no date reads its time as one beside it (TimeIndex.near, timed).
+
+        Each timestamp's text is noted for answers (timestamp) unless `note` is
+        False, as when timed only asks the question.
+        """
+        outer = self.noting_times
+        self.noting_times = note
+        try:
+            text = ISO_TS_RE.sub(self.iso_time, text)
+            text = RFC1123_RE.sub(self.rfc1123, text)
+            text = OPENSSL_TS_RE.sub(self.openssl, text)
+            return LS_DATE_RE.sub(self.ls_time, text)
+        finally:
+            self.noting_times = outer
 
     def long_date(self, m: "re.Match[str]") -> str:
         month, day, year, sign, hours, minutes = m.groups()
@@ -741,6 +992,12 @@ class Normalizer:
         days = (when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days
         self.mapping.add_date(when, today=days == 0)
         return day_bucket(days)
+
+    def timestamp(self, literal: str, when: float) -> str:
+        """A timestamp's key token; its text is noted for answers (TIME_LITERAL_CLASS) while noting_times."""
+        if self.noting_times:
+            self.time_literals.append(literal)
+        return time_bucket(when, self.now)
 
     def time_index(self, text: str) -> TimeIndex:
         """The TimeIndex of `text`, built once per string: every date in one sub() pass shares it."""
@@ -772,7 +1029,7 @@ class Normalizer:
             digits = zone[1:].replace(":", "")
             hours, minutes = digits[:ZONE_HOUR_DIGITS], digits[ZONE_HOUR_DIGITS:]
             offset = sign * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
-        return time_bucket(calendar.timegm(when.timetuple()) - offset, self.now)
+        return self.timestamp(m.group(0), calendar.timegm(when.timetuple()) - offset)
 
     def rfc1123(self, m: "re.Match[str]") -> str:
         try:
@@ -781,7 +1038,7 @@ class Normalizer:
             return m.group(0)
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
-        return time_bucket(when.timestamp(), self.now)
+        return self.timestamp(m.group(0), when.timestamp())
 
     def openssl(self, m: "re.Match[str]") -> str:
         month, day, hour, minute, second, year = m.groups()
@@ -789,7 +1046,7 @@ class Normalizer:
             when = datetime(int(year), MONTHS.index(month) + 1, int(day), int(hour), int(minute), int(second))
         except ValueError:
             return m.group(0)
-        return time_bucket(calendar.timegm(when.timetuple()), self.now)
+        return self.timestamp(m.group(0), calendar.timegm(when.timetuple()))
 
     def ls_year(self, m: "re.Match[str]") -> str:
         month, day, _, _, year = m.groups()
@@ -820,7 +1077,7 @@ class Normalizer:
                 )
         except ValueError:
             return m.group(0)
-        return time_bucket(when, self.now)
+        return self.timestamp(m.group(0), when)
 
     def age_columns(self, text: str) -> str:
         """Replace ages in a table's AGE / LAST SEEN / Age column, by column position."""
@@ -843,7 +1100,8 @@ class Normalizer:
                     continue
                 stop = len(line) if end < 0 else end
                 cell = line[start:stop]
-                line = line[:start] + AGE_TOKEN_RE.sub(lambda m: self.age(m.group(0)), cell) + line[stop:]
+                if AGE_CELL_RE.match(cell):
+                    line = line[:start] + AGE_TOKEN_RE.sub(lambda m: self.age(m.group(0)), cell) + line[stop:]
             lines[index] = line
         return "\n".join(lines)
 
@@ -868,6 +1126,11 @@ class NormalizedRequest:
     messages: List[Any]
     settings: Dict[str, Any]
     mapping: Mapping
+    # What the next answer is normalized with (answer_after): the request time,
+    # the IP decision, and the mapping as the messages left it, before the settings.
+    now: float = 0.0
+    keep_ips: bool = False
+    history_mapping: Mapping = field(default_factory=Mapping)
 
     @property
     def message_hashes(self) -> List[str]:
@@ -897,11 +1160,20 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     keep_ips = CIDR_RE.search(json.dumps(kept, ensure_ascii=False)) is not None
     normalizer = Normalizer(now, keep_ips)
     raw_messages = kept.pop(MESSAGES_FIELD, None)
-    messages = [normalizer.walk(m) for m in raw_messages] if isinstance(raw_messages, list) else []
+    messages = []
+    # Timestamp texts outside assistant messages, in order (TIME_LITERAL_CLASS):
+    # a slot blanks an answer's words, so a position counted there could shift.
+    for message in raw_messages if isinstance(raw_messages, list) else []:
+        normalizer.time_literals = []
+        messages.append(normalizer.walk(message))
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
+            normalizer.mapping.time_occurrences += normalizer.time_literals
+    history_mapping = normalizer.mapping.copy()
     settings = {k: normalizer.walk(kept[k], k) for k in sorted(kept)}
     if raw_messages is not None and not isinstance(raw_messages, list):
         settings[MESSAGES_FIELD] = normalizer.walk(raw_messages)
-    return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping)
+    return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping,
+                             now=now, keep_ips=keep_ips, history_mapping=history_mapping)
 
 
 @dataclass(frozen=True)
@@ -928,3 +1200,109 @@ def fingerprint(normalized: NormalizedRequest, context: KeyContext) -> str:
 def settings_hash(normalized: NormalizedRequest, context: KeyContext) -> str:
     """The key without the messages: the root of every per-message prefix chain."""
     return stable_hash({"settings": normalized.settings, "context": context.as_dict()})
+
+
+def answer_actions(message: Any) -> List[Dict[str, Any]]:
+    """A normalized assistant message's tool calls: name and arguments, without ids or signatures."""
+    calls = message.get(TOOL_CALLS_KEY) if isinstance(message, dict) else None
+    actions = []
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+        function = function if isinstance(function, dict) else {}
+        actions.append({NAME_FIELD: function.get(NAME_FIELD), ARGUMENTS_FIELD: function.get(ARGUMENTS_FIELD)})
+    return actions
+
+
+def slot_actions(message: Any) -> List[Dict[str, Any]]:
+    """A normalized assistant message's tool calls as its slot keeps them: arguments blanked for READ_ONLY_TOOLS."""
+    return [
+        {NAME_FIELD: action[NAME_FIELD]} if action[NAME_FIELD] in READ_ONLY_TOOLS else action
+        for action in answer_actions(message)
+    ]
+
+
+def answer_identity(message: Any) -> str:
+    """Which answer a normalized assistant message is: its words and its tool calls.
+
+    Ids, signatures and reasoning are left out: they differ between two
+    deliveries of the same answer. A missing and an empty text are the same.
+    """
+    content = message.get(CONTENT_FIELD) if isinstance(message, dict) else message
+    return stable_hash({CONTENT_FIELD: content or "", TOOL_CALLS_KEY: answer_actions(message)})
+
+
+def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[str, List[Tuple[str, str]]]:
+    """The request's key with each assistant message's words blanked, and each slot's (context, answer).
+
+    The model can word the same action differently from one run to the next,
+    and a conversation recorded after one wording then never matches a replay
+    that was served the other. Keyed this way, it matches as long as each
+    answer it holds is one the model gave to that same context in a recording,
+    which the caller checks per slot. Only the words are blanked, and the
+    arguments of a call to one of READ_ONLY_TOOLS: every tool call's name, and
+    every other call's arguments, stay in the key, so a slot never joins two
+    conversations in which the agent changed different things, however alike
+    the tool results that followed. A slot's context is the
+    chain of everything before it, earlier answers as slots too, so the tool
+    results that followed an answer still have to match. The returned contexts
+    are as this whole request normalizes them; the recorded-answer check
+    computes each from the slot's own prefix instead (answer_variant).
+    """
+    current = settings_hash(normalized, context)
+    slots: List[Tuple[str, str]] = []
+    for message, message_hash, role in zip(normalized.messages, normalized.message_hashes, normalized.roles()):
+        if role == ASSISTANT_ROLE:
+            slots.append((current, answer_identity(message)))
+            part: Any = {ANSWER_SLOT: slot_actions(message)}
+        else:
+            part = message_hash
+        current = stable_hash({"prefix": current, "message": part})
+    return current, slots
+
+
+def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
+    """The identity `answer` has as the next assistant message after `normalized`'s messages.
+
+    Walked with the request's time, IP decision and mapping as its messages
+    left them, so numbering continues where the history stopped, without
+    normalizing the request again.
+    """
+    walker = Normalizer(normalized.now, normalized.keep_ips)
+    walker.mapping = normalized.history_mapping.copy()
+    message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
+    return answer_identity(walker.walk(message))
+
+
+def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:
+    """(context, answer) as record mode notes an answer to the request `normalized` is, and replay checks it.
+
+    Both sides compute it from the request the answer replied to, normalized
+    on its own as of that request's time: record mode when it records that
+    request, replay from a later request's prefix up to the answer, at the
+    time that prefix was first seen. Normalizing the whole later request
+    instead would let its later messages and its later time change how the
+    prefix normalizes (a timestamp's age, a CIDR keeping IPs literal, the
+    numbering of settings placeholders walked after every message).
+    """
+    slot_key, _ = answer_slots(normalized, context)
+    return slot_key, answer_after(normalized, answer)
+
+
+def answer_in_context(body: Dict[str, Any], answer: Dict[str, Any], now: float) -> str:
+    """The identity `answer` has as the next assistant message of `body`'s conversation, as of `now`."""
+    return answer_after(normalize_request(body, now), answer)
+
+
+def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:
+    """The placeholders the request's non-assistant messages hold.
+
+    Served through a slot, a saved answer's placeholder is safe only if one of
+    these binds it: a value only an assistant message named can carry a
+    different number when the answers differ.
+    """
+    found: Set[str] = set()
+    for message, role in zip(normalized.messages, normalized.roles()):
+        if role != ASSISTANT_ROLE:
+            found.update(PLACEHOLDER_RE.findall(json.dumps(message, ensure_ascii=False)))
+    return found
+

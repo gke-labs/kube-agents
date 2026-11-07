@@ -82,7 +82,7 @@ func busyNotice(ahead int) string {
 // render this replaces.
 func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID {
+	if active == nil || active.TaskID != taskID || active.LineClosed {
 		return
 	}
 	line := withLineNote(busyNotice(ahead), active.LineNote)
@@ -98,7 +98,11 @@ func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 			"conversation", rec.Key, "taskId", taskID)
 		return
 	}
-	if g.editLine(rec.Key, active.StatusMsgID, line) {
+	stop := taskID
+	if active.Detached {
+		stop = ""
+	}
+	if g.editLine(rec.Key, active.StatusMsgID, line, stop) {
 		rs.lastLine = line
 		rs.busyShown = true
 		g.log.Info("busy notice shown on the status line",
