@@ -412,7 +412,8 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   day for a human connecting over chat — read it meanwhile with
   `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
   (the report is on the shell sandbox pod, not the agent pod); a day after the sweep it is filed as
-  an issue labelled `agent:onboarding` in the GitOps repository when that is on GitHub, and a report
+  an issue labelled `agent:onboarding` in the GitOps repository when that is on GitHub (else in the
+  install's one managed GitHub repository), and a report
   that could not be filed is retired a week after the sweep (INSTALL.md, "What to Expect After
   Installation").
 

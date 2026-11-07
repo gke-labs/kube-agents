@@ -88,7 +88,9 @@ the gateway (kept by the gateway for its digest when no home channel is set; a `
 install gets the issue and no line), and the same claim is taken; a week after the sweep
 (`UNDELIVERED_RETIRE_SECONDS`, the plugin's own priming limit) an undelivered report, whatever kept it
 from filing, has its findings registered, is claimed without a post, and the scheduled audits stand
-in for it. A report retired that way leaves its items unmarked in the findings queue, so the nudge
+in for it. In between, a refused create releases the claim and is retried on the conversation path's
+waits, five tries in all; no repository, several, an unreadable mount or a body longer than an issue
+may be is recorded in the path's own attempts file and waits for the retire. A report retired that way leaves its items unmarked in the findings queue, so the nudge
 announces them later: nobody saw them.
 
 ## 4. First-run audits

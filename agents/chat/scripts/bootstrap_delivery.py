@@ -566,7 +566,7 @@ REPORT_ISSUE_HOME_POST = (
     "First-run inventory report filed at {url} on {date} UTC: nobody had written to me in chat since the "
     "first look at your fleet."
 )
-# The reasons this path records (CONVERSATION_ATTEMPTS_FILE), one per tick at most.
+# The reasons this path records (REPORT_ATTEMPTS_FILE), one per tick at most.
 NO_LEDGER_REPO_REASON = (
     "no chat thread took the first-run report and the install has no GitOps repository to file it in; "
     "it stays in the report store"
