@@ -339,7 +339,9 @@ grades the summary card: a plain ask for the block reaches the worker as a card,
 carries the script's block (the title, a counter, the `unavailable` line only the resource-only
 render prints) with no rating form and no filing. The opt-in turn and the re-shown draft are not
 in a case: a run that reads a card's result is a second turn, and the filing turn stays out for
-the reason §5 gives.
+the reason §5 gives. The case for the opt-in turn needs a harness directive that sends the
+`/feedback <text>` opening and `add the usage summary` as the second turn, waits for the card that
+turn files, and grades the reply to a third message; the directive and the case are issue #5187.
 
 ## Calls made in the build
 
