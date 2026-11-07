@@ -180,6 +180,13 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// The series' three labels, the cluster's triple as the watcher's profile
+	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
+	// condition (usage_scope.go). Label values are the peer's text and are
+	// validated where they are printed, not here.
+	clusterUpClusterLabel  = "cluster"
+	clusterUpProjectLabel  = "project"
+	clusterUpLocationLabel = "location"
 	// usageClusterGaugeCeiling bounds the series counted into the gauges in one
 	// body. The gauges are a reading, not an accumulation, so the per-poll delta
 	// ceiling does not reach them; this is what bounds what a body on the
@@ -537,6 +544,20 @@ type usageDataVolume struct {
 type usageClusterGauges struct {
 	Registered int64
 	Monitored  int64
+	// Refs is every series' triple as the watcher labelled it, in body order,
+	// one per Registered; read by the ScopeUndeclared condition (usage_scope.go).
+	// The values are the peer's text, unvalidated here.
+	Refs []usageClusterRef
+}
+
+// usageClusterRef is one cluster_up series' labels: the cluster's name, project
+// and location as its profile's identity names them. The watcher's directly
+// reached cluster carries an empty project and location until its profile is
+// absorbed.
+type usageClusterRef struct {
+	Name     string
+	Project  string
+	Location string
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
@@ -789,6 +810,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						if value == clusterUpMonitored {
 							clusters.Monitored++
 						}
+						clusters.Refs = append(clusters.Refs, usageClusterRef{
+							Name:     usageLabelValue(metric, clusterUpClusterLabel),
+							Project:  usageLabelValue(metric, clusterUpProjectLabel),
+							Location: usageLabelValue(metric, clusterUpLocationLabel),
+						})
 						continue
 					}
 					if pairs != nil && name == toolInvocationsSeries {
