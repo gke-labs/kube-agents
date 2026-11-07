@@ -959,7 +959,7 @@ card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the lis
 `/opt/data/INVENTORY.shown.json`, and `bootstrap_delivery.py` marks each of them shown, with
 publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
 The items count as shown when the report's delivery is claimed, not when it is written, so a report
-that is never claimed leaves them new for the nudge, as does one retired unread a week after the sweep (`bootstrap_delivery._retire_undelivered` claims without marking); one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
+that is never claimed leaves them new for the nudge, as does one retired unread a week after the sweep (`bootstrap_delivery._retire_undelivered` registers them and claims without marking); one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
 moment between the claim and the marks can announce the report's items as new. Under
 `spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
 follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),

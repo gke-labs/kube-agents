@@ -11,6 +11,7 @@ the greeting context it returns.
 
 import enum
 import json
+import types
 import os
 import sqlite3
 import subprocess
@@ -426,10 +427,45 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
         self.assertIn("REPORT FILED", first["context"])
+        self.assertIn("(filed 2026-11-06 22:15 UTC)", first["context"])
+        self.assertIn("Answer the ask first", first["context"])
         self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
         self.update_job.assert_not_called()
         self.assertFalse((self.data_dir / ".user_aligned").exists(), "nothing is bound: the report is in the issue")
         self.assertIsNone(self._call(), "once")
+
+    def test_an_alert_turn_does_not_spend_the_filed_greeting(self):
+        """Alert, triage and A2A-door turns are API-server turns with no conversation route."""
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        no_route = types.SimpleNamespace(conversation_route=lambda sid: {})
+        with mock.patch.object(plugin, "_load_chat_notify", return_value=no_route):
+            self.assertIsNone(self._call(platform="api_server", session_id="triage-1"))
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists(), "the one-time greeting is kept for a human")
+        routed = types.SimpleNamespace(
+            conversation_route=lambda sid: {"platform": "slack", "conversation": "slack:D1/1.2", "context_id": "c1"})
+        with mock.patch.object(plugin, "_load_chat_notify", return_value=routed):
+            first = self._call(platform="api_server", session_id="a2a-human-1")
+        self.assertIsNotNone(first)
+        self.assertIn("issues/75", first["context"])
+
+    def test_the_filed_greeting_still_sets_the_home_channel_on_today(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as home:
+            self.assertIsNotNone(self._call())
+        home.assert_called_once()
+
+    def test_a_filed_record_without_a_time_names_no_date(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": "nope"}), encoding="utf-8")
+        first = self._call()
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertNotIn("unknown", first["context"])
+        self.assertNotIn("UTC", first["context"])
 
     def test_a_filed_record_without_an_address_changes_nothing(self):
         (self.data_dir / ".bootstrap_completed").touch()

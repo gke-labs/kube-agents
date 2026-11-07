@@ -75,10 +75,12 @@ REPORT_FILED_URL_KEY = "url"
 REPORT_FILED_AT_KEY = "filed_at"
 _FALLBACK_REPORT_FILED = (
     "This is the first message anyone has sent this install. Its first-run inventory report was "
-    "ready before anyone wrote, so it was filed as an issue at {url} ({date} UTC) instead of being posted "
-    "here. Say so in one sentence with that link, then answer the ask."
+    "ready before anyone wrote, so it is filed as an issue at {url}{dated} instead of being posted here. "
+    "Answer the ask first, as on any turn. Then, after the answer and never in front of a bare "
+    "acknowledgement, add one sentence with that link."
 )
 REPORT_FILED_DATE_FORMAT = "%Y-%m-%d %H:%M"
+REPORT_FILED_DATED_FORMAT = " (filed {date} UTC)"
 
 # The eval seam: requests written only by the first-install-hello bench stack
 # (bench/tf/prebuilt/first-install-hello) as files whose names start with this
@@ -596,6 +598,22 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
             pass
 
 
+def _human_chat_turn(platform_name: str, session_id: str) -> bool:
+    """Whether this turn is a human's chat turn: a durable platform, or an API-server turn the
+    hermes-bridge relayed from one. Alert, triage and A2A-door turns are API-server turns with no
+    conversation route, and must not spend the one-time greeting."""
+    if platform_name in DURABLE_CHAT_PLATFORMS:
+        return True
+    if platform_name != API_SERVER_PLATFORM:
+        return False
+    try:
+        route = _load_chat_notify().conversation_route(session_id)
+    except Exception as e:  # noqa: BLE001 - no route is the safe answer
+        logger.warning("Could not read the conversation route for %s: %s", session_id, e)
+        return False
+    return bool(route) and route.get("platform") in DURABLE_CHAT_PLATFORMS
+
+
 def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
     """The delivery stage's record of the filed report, when it carries the issue's address."""
     try:
@@ -608,13 +626,16 @@ def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
 
 
 def _filed_greeting(record: Dict[str, Any]) -> Dict[str, str]:
+    dated = ""
     try:
-        date = datetime.fromtimestamp(float(record.get(REPORT_FILED_AT_KEY) or 0), timezone.utc).strftime(
-            REPORT_FILED_DATE_FORMAT
-        )
+        stamp = float(record.get(REPORT_FILED_AT_KEY) or 0)
+        if stamp > 0:
+            dated = REPORT_FILED_DATED_FORMAT.format(
+                date=datetime.fromtimestamp(stamp, timezone.utc).strftime(REPORT_FILED_DATE_FORMAT)
+            )
     except (TypeError, ValueError, OverflowError, OSError):
-        date = "unknown date"
-    instructions = _FALLBACK_REPORT_FILED.format(url=record[REPORT_FILED_URL_KEY], date=date)
+        dated = ""
+    instructions = _FALLBACK_REPORT_FILED.format(url=record[REPORT_FILED_URL_KEY], dated=dated)
     logger.info("Injecting onboarding greeting instructions (REPORT FILED).")
     return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — REPORT FILED]\n{instructions}\n"}
 
@@ -692,7 +713,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # first human turn after that is told where it is, once; nothing is bound
     # or primed, since the report is not coming to this thread.
     filed = _report_filed(data_dir)
-    if filed is not None and not (data_dir / GREETED_MARKER).exists():
+    if filed is not None and not (data_dir / GREETED_MARKER).exists() and _human_chat_turn(platform_name, session_id):
+        if platform_name in DURABLE_CHAT_PLATFORMS:
+            # As the greeting turn always did on this platform: the first chat becomes the home
+            # channel when none is configured, or every scheduled report stays dropped.
+            _set_home_channel_if_unset(**kwargs)
         try:
             (data_dir / GREETED_MARKER).touch(exist_ok=True)
         except OSError as e:

@@ -513,6 +513,18 @@ REPORT_ISSUE_LABEL = "agent:onboarding"
 REPORT_ISSUE_LABEL_COLOR = "0E8A16"
 REPORT_ISSUE_LABEL_DESCRIPTION = "Onboarding's first-run inventory report, filed when no chat thread could take it"
 REPORT_ISSUE_MARKER = "<!-- onboarding-first-report -->"
+# The marker that names this install's sweep, so an install that shares the
+# repository with another (dev projects reinstall onto one) reuses only its own
+# issue; REPORT_ISSUE_MARKER alone still finds an older build's issue.
+REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
+# Written by the retire path beside the claim; with REPORT_FILED_FILE it is
+# what tells a claim this path kept from one its run died holding.
+REPORT_RETIRED_FILE = ".bootstrap_report_retired"
+# Written by the no-human path just before it claims, and never removed: a
+# claim beside it with neither record above is one a run died holding, and the
+# stale-claim rule releases it; the origin path, which never writes it, keeps
+# its claim settled the moment it exists, as before.
+REPORT_CLAIMING_FILE = ".bootstrap_report_claiming"
 REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
 REPORT_ISSUE_INTRO = (
     "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
@@ -539,7 +551,8 @@ ISSUE_URL_DEFAULT_HOST = "github.com"
 # NOTIFY_KEPT when the gateway kept it for its digest, which is delivery
 # enough: the digest names it, dated, once a home channel is set.
 REPORT_ISSUE_HOME_POST = (
-    "First-run inventory report filed at {url}: nobody had written to me in chat since the sweep ({date} UTC)."
+    "First-run inventory report filed at {url} on {date} UTC: nobody had written to me in chat since the "
+    "first look at your fleet."
 )
 # The reasons this path records (CONVERSATION_ATTEMPTS_FILE), one per tick at most.
 NO_LEDGER_REPO_REASON = (
@@ -670,9 +683,22 @@ def _outcome_recorded(data_dir: Path) -> bool:
 
 
 def delivery_settled(data_dir: Path) -> bool:
-    """Whether a taken claim may retire the jobs: always on the origin path, and
-    on the conversation path only once the report's post recorded an outcome."""
-    return _bound_conversation(data_dir) is None or _outcome_recorded(data_dir)
+    """Whether a taken claim may retire the jobs: always on the origin path (a human was aligned),
+    on the conversation path once the report's post recorded an outcome, and on the path with no
+    human once the filing or the retire is on record; a claim that run died holding is released
+    like a stale conversation claim."""
+    if _bound_conversation(data_dir) is not None:
+        return _outcome_recorded(data_dir)
+    if not (data_dir / REPORT_CLAIMING_FILE).exists():
+        return True
+    return (data_dir / REPORT_FILED_FILE).exists() or (data_dir / REPORT_RETIRED_FILE).exists()
+
+
+def _mark_claiming(data_dir: Path) -> None:
+    try:
+        (data_dir / REPORT_CLAIMING_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the claim's path: {e}\n")
 
 
 def _release_claim(data_dir: Path) -> None:
@@ -1877,8 +1903,14 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
 
 
 def _ledger_repo() -> str | None:
-    """The one managed GitHub repository, or None; several is a recorded reason, not a guess."""
+    """Where the report is filed: the GitOps repository when it is on GitHub, else the one managed
+    GitHub repository, else None; several GitHub repositories with no GitOps role among them is a
+    recorded reason, not a guess. A GitOps repository on another forge files nothing here, as the
+    chat-delivery ledger files nothing there."""
     repos = sorted(gitops_workspace.get_managed_github_repo_names())
+    gitops = gitops_workspace.get_gitops_repo()
+    if gitops in repos:
+        return gitops
     if len(repos) > 1:
         raise LedgerRepoAmbiguous(len(repos))
     return repos[0] if repos else None
@@ -1928,8 +1960,9 @@ def _issue_url(repo: str, number: int, issue: dict) -> str:
     return ISSUE_URL_FORMAT.format(host=ISSUE_URL_DEFAULT_HOST, slug=repo, number=number)
 
 
-def _existing_report_issue(repo: str) -> tuple[int, str] | None:
-    """The open issue a run before this one filed the report as, by label and marker, or None.
+def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str] | None:
+    """The open issue a run before this one filed this sweep's report as, by label and the sweep
+    marker, or None; another install's issue in a shared repository names another sweep.
 
     An entry without a usable number is skipped rather than raised on: the listing is the
     broker's, and one odd row must not hold the report.
@@ -1937,9 +1970,10 @@ def _existing_report_issue(repo: str) -> tuple[int, str] | None:
     answer = forge.call(
         "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
     )
+    marker = REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep)
     found: list[tuple[int, dict]] = []
     for issue in answer.get("issues") or []:
-        if not isinstance(issue, dict) or REPORT_ISSUE_MARKER not in str(issue.get("body") or ""):
+        if not isinstance(issue, dict) or marker not in str(issue.get("body") or ""):
             continue
         try:
             found.append((int(issue.get("number")), issue))
@@ -1951,14 +1985,14 @@ def _existing_report_issue(repo: str) -> tuple[int, str] | None:
     return number, _issue_url(repo, number, issue)
 
 
-def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> tuple[int, str]:
+def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: float) -> tuple[int, str]:
     """Open the ledger issue holding the report (or reuse the one already open): its number and URL.
 
     Raises ``forge.ForgeError`` when the broker refuses. The label is best effort: the issue is
     worth opening without it, and a repository whose labels this credential may not touch is not
     a reason to hold the report.
     """
-    existing = _existing_report_issue(repo)
+    existing = _existing_report_issue(repo, sweep)
     if existing is not None:
         return existing
     with contextlib.suppress(forge.ForgeError):
@@ -1969,7 +2003,9 @@ def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> tup
         )
     date, filed = _utc(now), _utc(filed_at)
     title = REPORT_ISSUE_TITLE.format(date=date)
-    text = "\n".join([REPORT_ISSUE_MARKER, REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body])
+    text = "\n".join(
+        [REPORT_ISSUE_MARKER, REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body]
+    )
     answer = forge.call("issue-create", {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]}, repo)
     issue = answer.get("issue") if isinstance(answer.get("issue"), dict) else {}
     try:
@@ -2017,15 +2053,30 @@ def _post_home_line(data_dir: Path, url: str, now: float) -> None:
 
 
 def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
-    """Claim the report without posting it and set it aside; the later run's retire removes the jobs."""
+    """Claim the report without posting it and set it aside; the later run's retire removes the jobs.
+
+    Its findings still go into the queue first, as on the other paths, so the nudge brings them up
+    later: nobody saw this report.
+    """
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    _register_findings(data_dir, _no_ranking(data_dir), files)
+    _mark_claiming(data_dir)
     if not _claim_delivery(data_dir):
         return 0
+    try:
+        (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the retire: {e}\n")
     _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // SECONDS_PER_DAY))
     _cleanup(data_dir, in_sandbox)
     return 0
 
 
-def _file_without_thread(data_dir: Path, in_sandbox: bool, filed_at: float, now: float) -> int:
+def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at: float, now: float) -> int:
     """File the report as a ledger issue, after the claim, and say so in the home channel.
 
     The reads come before the claim as on the other paths, so a sandbox that stopped answering
@@ -2079,13 +2130,17 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, filed_at: float, now:
     note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
     body = _with_note(content, note)
 
+    _mark_claiming(data_dir)
     if not _claim_delivery(data_dir):
         return 0
-    # Anything that escapes between the claim and the record releases the claim: on this path
-    # ``delivery_settled`` is true the moment the claim exists, so a held claim with no record
-    # would retire the jobs with the report unfiled.
+    if _someone_is_here(data_dir):
+        # A human arrived during the reads above: the report is theirs, through their thread.
+        _release_claim(data_dir)
+        return 0
+    # Anything that escapes between the claim and the record releases the claim; a run that dies
+    # holding it is released by the stale-claim rule, since ``delivery_settled`` waits for the record.
     try:
-        number, url = _file_report_issue(repo, body, filed_at, now)
+        number, url = _file_report_issue(repo, body, sweep, filed_at, now)
     except forge.ForgeError as e:
         _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True)
         _release_claim(data_dir)
@@ -2139,7 +2194,7 @@ def _deliver_without_thread(data_dir: Path) -> int:
         return 1
     if age >= UNDELIVERED_RETIRE_SECONDS:
         return _retire_undelivered(data_dir, in_sandbox)
-    return _file_without_thread(data_dir, in_sandbox, filed[1], now)
+    return _file_without_thread(data_dir, in_sandbox, filed[0], filed[1], now)
 
 
 def main(data_dir: Path | None = None) -> int:

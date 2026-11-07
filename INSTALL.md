@@ -1330,8 +1330,9 @@ someone sends the bot in Google Chat or Slack
 is ready. A `kubectl exec` session ([Step 6](#step-6-talk-to-the-agent-with-no-chat-platform)) does
 not receive it; with no chat platform enabled, read it from the sandbox once it is written, within
 a day: when nobody has written to the agent in chat a day after the sweep, the report is filed as an
-issue labelled `agent:onboarding` in the GitOps repository instead (a week after it with no
-repository, it is retired in favour of the scheduled audits), as
+issue labelled `agent:onboarding` in the GitOps repository instead, when that repository is on
+GitHub (a week after the sweep, a report that could not be filed is retired in favour of the
+scheduled audits), as
 [the onboarding design](docs/designs/oobe.md#3-onboarding-before-the-fold-for-reference) describes. After
 a delivery run the file is renamed `INVENTORY.delivered.md`.
 

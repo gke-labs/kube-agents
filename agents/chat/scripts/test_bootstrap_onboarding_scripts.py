@@ -1857,6 +1857,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.d = Path(self._tmp.name)
         (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
         self.repos = [self.REPO]
+        self.gitops_repo = None
         self.forge_calls = []
         self.forge_answers = {}
         self.forge_refusals = {}
@@ -1870,6 +1871,8 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             mock.patch.object(bootstrap_delivery, "_post_surfaced"),
             mock.patch.object(bootstrap_delivery.gitops_workspace, "get_managed_github_repo_names",
                               side_effect=lambda: list(self.repos)),
+            mock.patch.object(bootstrap_delivery.gitops_workspace, "get_gitops_repo",
+                              side_effect=lambda *a, **k: self.gitops_repo),
             mock.patch.object(bootstrap_delivery.forge, "call", side_effect=self._forge),
             mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=self._run_cli),
         ):
@@ -1940,6 +1943,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(argv[:4], [chat_notify.A2A_CLI, "notify", "--platform", "slack"])
         self.assertNotIn("--thread", argv)
         self.assertIn(f"https://github.com/{self.REPO}/issues/42", argv[-1], "a link, not a slug")
+        self.assertNotIn("sweep", argv[-1], "a word the reader has never seen")
         self.assertEqual(record["url"], f"https://github.com/{self.REPO}/issues/42")
         self.assertIn(bootstrap_delivery.REPORT_FILED_NOTE.format(ref=f"{self.REPO}#42"), self._note_texts())
         self.assertIn(
@@ -2005,6 +2009,27 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             bootstrap_delivery.NO_LEDGER_REPO_REASON,
         )
 
+    def test_the_gitops_repository_wins_among_several_on_github(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = ["example-org/other", self.REPO]
+        self.gitops_repo = self.REPO
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], self.REPO)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_a_gitops_repository_on_another_forge_falls_back_to_the_one_github_repository(self):
+        self._filed(self.DAY + self.HOUR)
+        self.gitops_repo = "gitlab.example.com/example-org/gitops"
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], self.REPO)
+
+    def test_the_retire_path_registers_the_findings_first(self):
+        self._filed(8 * self.DAY)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", return_value=set()) as reg:
+            self.assertEqual(self._main(), 0)
+        reg.assert_called_once()
+        self.assertTrue((self.d / COMPLETED).exists())
+
     def test_two_repositories_are_recorded_not_guessed(self):
         self._filed(self.DAY + self.HOUR)
         self.repos = [self.REPO, "example-org/other"]
@@ -2019,12 +2044,60 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
     def test_reuses_the_issue_an_earlier_run_opened(self):
         self._filed(self.DAY + self.HOUR)
         self.forge_answers["issue-list"] = {
-            "issues": [{"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\nold"}, {"number": 9, "body": "other"}]
+            "issues": [
+                {"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1") + "\nold"},
+                {"number": 9, "body": "other"},
+            ]
         }
         self.assertEqual(self._main(), 0)
         self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list"])
         self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 7)
         self.assertEqual(bootstrap_delivery._filed_record(self.d)["url"], f"https://github.com/{self.REPO}/issues/7")
+
+    def test_another_installs_issue_in_a_shared_repository_is_not_reused(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [{"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="someone-elses") + "\nold"}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        _, create, _ = self.forge_calls[-1]
+        self.assertIn(bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1"), create["body"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 42)
+
+    def test_a_claim_the_run_died_holding_is_released_as_stale(self):
+        """No record beside the claim on the no-human path: the stale-claim rule applies, as on the conversation path."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
+        (self.d / COMPLETED).touch()
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released")
+        (self.d / bootstrap_delivery.REPORT_FILED_FILE).write_text("{}", encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "settled once the filing is on record")
+
+    def test_an_origin_path_claim_still_settles_at_once(self):
+        (self.d / COMPLETED).touch()
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_the_retire_path_leaves_a_record_so_its_claim_settles(self):
+        self._filed(8 * self.DAY)
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_human_arriving_during_the_reads_gets_the_claim_back(self):
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def arrive(*a, **k):
+            (self.d / ALIGNED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=arrive):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([v for v, _, _ in self.forge_calls], [], "no issue: the thread takes the report")
+        self.assertFalse((self.d / COMPLETED).exists())
 
     def test_the_brokers_url_wins_and_a_ghes_slug_builds_its_own(self):
         self.forge_answers["issue-create"] = {"issue": {"number": 42, "html_url": "https://ghe.example.com/x/y/issues/42"}}
