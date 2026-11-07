@@ -654,3 +654,38 @@ func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
 		}
 	}
 }
+
+// A typed stop whose closing edit fails is still acknowledged: the quiet
+// cancel went, so the typed stop's post says so, and the line stays open
+// for the next stop to close.
+func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-close-fails"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	r.adapter.mu.Lock()
+	r.adapter.failEdits = 1
+	r.adapter.mu.Unlock()
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M2", Text: "stop"}
+	waitFor(t, "the posted acknowledgement", func() bool {
+		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "cancel sent") })
+	})
+	rec := waitForRecord(t, r, conv, "the detached task", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.Detached
+	})
+	if rec.ActiveTask.LineClosed {
+		t.Fatalf("the failed close was recorded as closed")
+	}
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "cancel sent") {
+			t.Fatalf("the failed edit was recorded: %q", e)
+		}
+	}
+}

@@ -83,7 +83,12 @@ func (g *Gateway) stopOnLine(ctx context.Context, rec *SessionRecord, authority 
 	}
 	if g.closeLineOnPress(rec, active, cancelSentNotice) {
 		active.LineClosed = true
+		return true
 	}
+	// The line did not take the edit (a refused patch, an outage): the
+	// cancel is sent and quiet, so the typed stop's post says so instead,
+	// and the next stop retries the close.
+	g.post(rec.Key, cancelSentNotice)
 	return true
 }
 
