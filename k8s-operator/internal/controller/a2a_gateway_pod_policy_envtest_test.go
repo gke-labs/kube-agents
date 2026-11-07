@@ -252,6 +252,13 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 				Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule,
 			})
 		}, scheduling},
+		// Only the key differs from an allowed toleration, one per allowed shape.
+		"another key in the not-ready shape": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
+		"another key in the architecture shape": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpEqual, Value: "", Effect: corev1.TaintEffectNoSchedule}}
+		}, scheduling},
 		"the not-ready key with another effect": {func(p *corev1.Pod) {
 			p.Spec.Tolerations = []corev1.Toleration{{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
 		}, scheduling},
