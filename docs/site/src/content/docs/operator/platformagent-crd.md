@@ -382,9 +382,13 @@ The add-on serves about three hundred kinds, so the watch does not read each one
 namespace. On each cluster that serves them, it discovers once which kinds have objects and in
 which namespaces, with one `kubectl get` over every namespace for each batch of 10 kinds. It
 keeps the result in its ledger and reads in a namespace only the kinds it found there, 20 per
-sweep; a namespace with more is read in turns, the next 20 on the next sweep, so every kind is
-read within a few sweeps, and the ledger says which wait. Objects in the system namespaces, in
-`excludeNamespaces` and in exempt namespaces do not reach the record. It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
+sweep.
+
+A namespace with more is read in turns, the next 20 on the next sweep, so every kind is
+read within a few sweeps. The ledger says which kinds wait. Objects in the system namespaces, in
+`excludeNamespaces` and in exempt namespaces do not reach the record.
+
+It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
 clusters per sweep, so a fleet's refreshes spread out.
 
 A kind that gained its first object between two discoveries is read from the next one. A kind a
