@@ -48,8 +48,10 @@ const (
 	routeMemoryTTL = 24 * time.Hour
 	// routeLostNote follows a completed answer whose route could not be
 	// recorded, so the user is told rather than left waiting for a card's
-	// answer that cannot arrive.
-	routeLostNote = "\n\n(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
+	// answer that cannot arrive. Such a turn waits on its cards in turn
+	// (waitKanbanInTurn), so only a card still running when the wait ends
+	// is left without a way back; most such turns file none, hence "if".
+	routeLostNote = "\n\n(If a card this turn filed is still running, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)"
 )
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
@@ -66,6 +68,17 @@ var routePlatforms = map[string]string{
 // consoleRoutePrefix is the console conversation's key prefix, the one route
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
+
+func isConsoleOrigin(env *lib.Envelope) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), consoleRoutePrefix)
+}
 
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.

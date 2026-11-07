@@ -286,7 +286,7 @@ class Builder:
     def latency_block(self, fields: dict, nights: list[dict]) -> list[str]:
         """The night line and the slow cases (``nightly_latency.py``), or
         nothing when last night carried no timing. ``nights`` is
-        ``nightly.night_reports``: ``last_night``'s night is the newest of
+        ``nightly.night_dates``: ``last_night``'s night is the newest of
         them, read further back for the typicals."""
         line = nightly_latency.night_line(nights)
         if not line:
@@ -318,7 +318,7 @@ class Builder:
         """The latency block, then the reply-shape lines (``nightly_tone.py``,
         every case and the chat-and-routing cases) when last night measured
         a reply, over one build of the reports."""
-        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        nights = nightly.night_dates(self.data, running=nightly.running_nights(self.data, self.now))
         tone = [line for line in (nightly_tone.night_line(nights), nightly_tone.focus_line(nights)) if line]
         return [*self.latency_block(fields, nights), *tone]
 

@@ -22,7 +22,8 @@ import (
 // a mention or a <url|text> in it is defanged as in any post. It lays out
 // and never composes: every word comes from the message, and the only things
 // it adds are its backend's own -- the glyph on a plan item, the step
-// markers, the bullet on a row.
+// markers, the bullet on a row, and the Stop button the gateway asks for
+// under a running task's line (gchat_stop.go).
 const (
 	// gchatChatTextMax bounds the laid-out text: the adapter's one bound on
 	// a posted text (gchatTextMax). A message past it posts as its

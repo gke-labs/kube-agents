@@ -226,6 +226,13 @@ type a2aAuthMapDocument struct {
 // PlatformAgent's own, in name order, and a profile the operator refuses is
 // left out rather than failing the render (agentProfileMapEntries).
 func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aAuthMapDocument, error) {
+	return renderA2AAuthMapDraining(agent, profiles, nil)
+}
+
+// renderA2AAuthMapDraining is renderA2AAuthMap with the profiles still
+// draining (drainingDispatchProfiles): the dispatcher keeps their names, so
+// their .supervisor and stop-record grants, and none of their durables.
+func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
 	for _, id := range calloutIdentities(agent) {
 		identities = append(identities, a2aAuthMapIdentity{
@@ -244,7 +251,7 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	// name each durable the operator creates, so it is built here, from the
 	// same profiles (platformagent_a2a_dispatcher.go).
 	if a2aDispatcherEnabled() {
-		names, durables := dispatcherGrantNames(agent, profiles)
+		names, durables := dispatcherGrantNames(agent, profiles, draining)
 		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
@@ -353,8 +360,8 @@ func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
 
 // buildA2AAuthMapConfigMaps renders the map into the shards the callout
 // watches, in index order, and returns the version it rendered.
-func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]*corev1.ConfigMap, string, error) {
-	doc, err := renderA2AAuthMap(agent, profiles)
+func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
+	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
 	if err != nil {
 		return nil, "", err
 	}

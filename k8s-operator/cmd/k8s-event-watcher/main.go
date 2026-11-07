@@ -661,8 +661,11 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	settles   *settleMemo
+	scaleUps *scaleUpMemo
+	settles  *settleMemo
+	// owners fills an admitted Pod event's controller_ref from the Pod's
+	// owner (ownerResolver); nil sends the field empty, as before.
+	owners    *ownerResolver
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -863,8 +866,8 @@ var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0
 // named workloads held, whoever creates objects on the watched cluster. The
 // daemon keys every non-Pod object by its exact name because its row is a
 // database row, not a series; the label departs from it there and nowhere
-// else. The watcher sets no controller reference on its events (watcher.go),
-// so the name is what there is to fold.
+// else. The label is set before the owner lookup (ownerResolver), so it
+// folds by name only.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
@@ -1018,6 +1021,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
 	}
+	// Looked up only for an event the filter and dedup admitted, so a
+	// cluster's event stream costs one Pod read per incident, not per event.
+	if ev.ControllerRef == "" && ev.KindOfObject == kindPod {
+		ev.ControllerRef = d.owners.ControllerRef(ctx, ev.Namespace, ev.Name, ev.Key.UID)
+	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
 		Reason:       ev.Key.Reason,
@@ -1124,8 +1132,8 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the alert's thread and onto its card, the card alone where no thread is
 // routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
-// since the broker's watcher route serves no pods, and a deleted pod and a
-// recovered one both go quiet. One per incident, held on the dedup entry so
+// since the broker's watcher route serves of a pod only its owner, never its
+// state, and a deleted pod and a recovered one both go quiet. One per incident, held on the dedup entry so
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
@@ -1294,21 +1302,11 @@ func realMain(argv []string) error {
 
 	// Build components.
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
-	// A malformed list fails open, as the entrypoint's tunables do: stopping
-	// here would end incident detection for every cluster to silence a few.
-	// Assigned only on success, so a parse error can never leave a partial
-	// list in force while the log says none is.
-	rules, err := parseAlertExclude(f.alertExclude)
-	switch {
-	case err != nil:
-		log.Printf("k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident", err)
-	case len(rules) > 0:
-		filterCfg.alertExclude = rules
-		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", len(rules), gateAlertExcluded)
-	}
+	m := newMetrics()
+	// A malformed list fails open; see loadAlertExclude.
+	filterCfg.alertExclude = loadAlertExclude(f.alertExclude, m)
 	filter := newFilter(filterCfg)
 
-	m := newMetrics()
 	if f.dataVolume != "" {
 		m.registry.MustRegister(newDataVolumeCollector(f.dataVolume, dataVolumeStatfs))
 	}

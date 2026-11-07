@@ -89,13 +89,12 @@ const (
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
 // not carry: the routes that read it are refused on an exec pod (§12), and
-// the relays and the content workspace are not started there.
+// the relays are not started there.
 var credentialProxyExecTierEnvDropped = map[string]bool{
-	"TOKEN_BROKER_URL":                   true,
-	execTierDroppedMinterEnv:             true,
-	"GOOGLE_CHAT_PROJECT_ID":             true,
-	"GOOGLE_CHAT_SUBSCRIPTION_NAME":      true,
-	"CREDENTIAL_PROXY_CONTENT_WORKSPACE": true,
+	"TOKEN_BROKER_URL":              true,
+	execTierDroppedMinterEnv:        true,
+	"GOOGLE_CHAT_PROJECT_ID":        true,
+	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {
@@ -161,8 +160,8 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
 // stateful broker's, as rendered for this reconcile, so the image, the policy,
 // the caller authentication, the profile identities and the grace period stay
-// the same on both. The grace period is not yet a drain: the exec role does
-// not drain on SIGTERM as the broker does. What differs:
+// the same on both. The exec role drains on SIGTERM as the broker does, inside
+// that grace period (a command longer than the drain is #4780). What differs:
 //   - its own name, selector and labels, without has-credential-proxy, which
 //     opens the github-token-minter to a pod;
 //   - the replica count and RollingUpdate with maxUnavailable 1 and maxSurge

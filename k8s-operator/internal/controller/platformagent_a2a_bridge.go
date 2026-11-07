@@ -356,6 +356,8 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: a2aBridgeMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
 			Resource: a2aBridgeMemoryLimitResource,
 		}}},
+		// Off, whatever an AgentPlugin or an envFrom source says.
+		{Name: a2aBridgeDebugErrorTextEnvVar, Value: "false"},
 	}
 	if executor := a2aRenderedBridgeExecutor(); executor != "" {
 		env = append(env, corev1.EnvVar{Name: a2aBridgeExecutorEnvVar, Value: executor})
@@ -363,26 +365,37 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	return env
 }
 
+// a2aBridgeDebugErrorTextEnvVar is the bridge's debugging switch that adds a
+// failed tool call's error text to its activity entry on TASKS. Error text is
+// free text a tool wrote and can carry a value it was handed, so it is not a
+// customer setting: the rendered bridge drops any inherited copy (an
+// AgentPlugin's env reaches the agent container unfiltered) and sets it false
+// itself, which also overrides an envFrom key. A maintainer turns it on by
+// editing the Deployment with the operator paused; a sidecar the CR declares
+// as its own bridge is the CR author's container and keeps its own env.
+const a2aBridgeDebugErrorTextEnvVar = "BRIDGE_DEBUG_ERROR_TEXT"
+
 // a2aBridgeDroppedAgentEnv are agent env names the bridge must not inherit:
-// its own settings (replaced above, API_SERVER_KEY among them, so no plugin
-// value picks its executor), the agent's bus identity, which names the
-// `agent` principal and its inbox rather than the bridge's, and GOMEMLIMIT,
-// which the Go runtime applies before main and which would otherwise let a
-// plugin's value on the Python agent container override the soft limit the
-// bridge derives from its own admitted memory limit. A bridge-specific
-// GOMEMLIMIT belongs in a2aBridgeOwnEnv.
+// its own settings (replaced above, API_SERVER_KEY and the debug switch among
+// them, so no plugin value picks its executor or turns on error text), the
+// agent's bus identity, which names the `agent` principal and its inbox rather
+// than the bridge's, and GOMEMLIMIT, which the Go runtime applies before main
+// and which would otherwise let a plugin's value on the Python agent container
+// override the soft limit the bridge derives from its own admitted memory
+// limit. A bridge-specific GOMEMLIMIT belongs in a2aBridgeOwnEnv.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
-	sharedStateSetupEnvVar:      true,
-	a2aBridgeNATSURLEnvVar:      true,
-	a2aBridgeNATSUserEnvVar:     true,
-	a2aBridgeNATSPasswordEnvVar: true,
-	a2aBridgeConcurrencyEnvVar:  true,
-	a2aBridgeExecutorEnvVar:     true,
-	a2aActivitySecretEnvVar:     true,
-	a2aBusUserEnv:               true,
-	a2aBridgeAPIServerKeyEnvVar: true,
-	a2aBridgeMemoryLimitEnvVar:  true,
-	memlimit.GoMemLimitEnv:      true,
+	a2aBridgeDebugErrorTextEnvVar: true,
+	sharedStateSetupEnvVar:        true,
+	a2aBridgeNATSURLEnvVar:        true,
+	a2aBridgeNATSUserEnvVar:       true,
+	a2aBridgeNATSPasswordEnvVar:   true,
+	a2aBridgeConcurrencyEnvVar:    true,
+	a2aBridgeExecutorEnvVar:       true,
+	a2aActivitySecretEnvVar:       true,
+	a2aBusUserEnv:                 true,
+	a2aBridgeAPIServerKeyEnvVar:   true,
+	a2aBridgeMemoryLimitEnvVar:    true,
+	memlimit.GoMemLimitEnv:        true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent
