@@ -37,6 +37,11 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
+# one-replica Deployment under the default RollingUpdate strategy that mounts a
+# ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
+# seeded-storage). A baseline: no gap declared.
+./tasks/storage-rwo-pvc-rollingupdate-multiattach-deadlock/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the obtainability audit names a
 # Deployment whose containers set no memory limit (the planted
 # memory-unbounded-worker in seeded-workloads). A baseline: no gap declared.
