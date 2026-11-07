@@ -222,6 +222,23 @@ def test_two_cards_with_the_same_result_each_keep_a_full_section():
     assert final == f"Delegated to t1 and t2.\n\n{_SECTION_T1}\n\nResult of delegated task t2:\n{_RELAYED_RESULT}"
 
 
+def test_a_later_card_whose_answer_repeats_part_of_an_earlier_ones_cuts_nothing():
+    first = f"**Clusters in evals-5:**\n{_RELAYED_RESULT}"
+    base = _base("Delegated to t1 and t2.")
+    _append_final(base, [f"Result of delegated task t1:\n{first}", f"Result of delegated task t2:\n{_RELAYED_RESULT}"])
+    assert base.metadata["final_message"] == (
+        f"Delegated to t1 and t2.\n\nResult of delegated task t1:\n{first}\n\nResult of delegated task t2:\n{_RELAYED_RESULT}"
+    )
+
+
+def test_a_relay_is_lifted_only_out_of_the_prose_ahead_of_the_sections():
+    base = _base(f"{_RELAYED_RESULT}\n\nArtifact a.md produced by delegated task t1:\n{_RELAYED_RESULT}")
+    _append_final(base, [_SECTION_T1])
+    assert base.metadata["final_message"] == (
+        f"Artifact a.md produced by delegated task t1:\n{_RELAYED_RESULT}\n\n{_SECTION_T1}"
+    )
+
+
 def test_an_artifact_keeps_its_indented_first_line():
     section = "Artifact a.yaml produced by delegated task t1:\n  key: v\n  k2: v2"
     base = _base("Read the file.")

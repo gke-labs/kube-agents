@@ -1191,12 +1191,20 @@ _RELAYED_SECTION_PREFIXES = (
     _RESULT_SECTION.partition("{tid}")[0],
     _QUESTION_SECTION.partition("{tid}")[0],
 )
-# A delivered header closing the text ahead of a body, blank lines allowed:
-# that body is already attributed, to the card the header names.
-_ATTRIBUTING_HEADER = re.compile(
+# A delivered header on a line of its own: the text after it, blank lines
+# skipped, is the body it attributes.
+_DELIVERED_HEADER_LINE = re.compile(
     r"(?:\A|\n)(?P<header>(?:Result of delegated task \S+|Question from delegated task \S+"
-    r"|Artifact [^\n]* produced by delegated task \S+):)\s*\Z"
+    r"|Artifact [^\n]* produced by delegated task \S+):)[ \t]*\n"
 )
+
+
+def _attributed(current: str, header: str, body: str) -> bool:
+    """Whether ``body`` already stands under ``header`` in ``current``."""
+    return any(
+        m.group("header") == header and current[m.end() :].lstrip().startswith(body)
+        for m in _DELIVERED_HEADER_LINE.finditer(current)
+    )
 
 
 def _fold_sections(current: str, sections: list[str]) -> str:
@@ -1209,27 +1217,29 @@ def _fold_sections(current: str, sections: list[str]) -> str:
     own answer through that header would miss it. The relayed text is lifted
     out of the router's prose and delivered as its section instead, after
     the prose, so the router's words stay contiguous and ahead of every
-    section, and the answer is attributed once and quoted once. The last
-    occurrence is the relay: a router that names a short result in its own
-    sentence first quotes it in full last. A body already under this
-    section's header is left alone; one under another card's header is a
-    different card's result and is appended in full. An artifact already
-    quoted is not appended again.
+    section, and the answer is attributed once and quoted once. Only the
+    prose ahead of the first delivered section is searched, so a card whose
+    answer repeats part of an earlier card's never cuts into that card's
+    section, and its own section is appended in full. The last occurrence
+    in the prose is the relay: a router that names a short result in its
+    own sentence first quotes it in full last. A body already under its own
+    header is left alone. An artifact already quoted anywhere is not
+    appended again.
     """
     for section in sections:
         header, _, body = section.partition("\n")
         body = body.strip()
-        if not body:
+        if not body or _attributed(current, header, body):
             continue
-        at = current.rfind(body)
-        attributed = _ATTRIBUTING_HEADER.search(current[:at]) if at >= 0 else None
-        if attributed is not None and attributed.group("header") == header:
-            continue
-        if at < 0 or attributed is not None:
+        first = _DELIVERED_HEADER_LINE.search(current)
+        prose = current if first is None else current[: first.start()]
+        delivered = "" if first is None else current[first.start() :].strip()
+        at = prose.rfind(body) if header.startswith(_RELAYED_SECTION_PREFIXES) else -1
+        if at >= 0:
+            prose = "\n\n".join(filter(None, [prose[:at].rstrip(), prose[at + len(body) :].strip()]))
+            current = "\n\n".join(filter(None, [prose, delivered, f"{header}\n{body}"]))
+        elif header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current:
             current = "\n\n".join(filter(None, [current, section.rstrip()]))
-        elif header.startswith(_RELAYED_SECTION_PREFIXES):
-            prose = "\n\n".join(filter(None, [current[:at].rstrip(), current[at + len(body) :].strip()]))
-            current = "\n\n".join(filter(None, [prose, f"{header}\n{body}"]))
     return current
 
 
