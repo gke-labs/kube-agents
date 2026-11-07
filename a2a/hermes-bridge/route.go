@@ -71,10 +71,11 @@ const consoleRoutePrefix = "console:"
 
 // waitsForCardsInTurn reports whether a turn holds its task open while the
 // Kanban cards it filed run (waitForKanbanCards): only a console or MCP
-// turn, whose client reads the task's answer and has no thread for a card's
-// post. A chat turn, a turn with no chat conversation (the eval inject lane)
-// and a turn whose route could not be recorded all end at the
-// acknowledgement, and their cards report through the agent's own posts.
+// turn. Every other turn ends at the acknowledgement, as before the in-turn
+// wait (#5170). On a chat turn with a recorded route a card's answer comes
+// back through the chat.notify route; on a turn whose route was not recorded
+// it cannot (routeLostNote says so); a turn with no chat conversation (the
+// A2A door, the eval inject lane) gets none from the bridge.
 func waitsForCardsInTurn(env *lib.Envelope) bool {
 	return isConsoleOrigin(env)
 }
