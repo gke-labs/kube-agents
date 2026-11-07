@@ -408,10 +408,13 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
   alert-driven triage reach chat only; meanwhile the audit reports stay in the report store on the
-  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits on a
-  human connecting over chat — read it with
+  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits a
+  day for a human connecting over chat — read it meanwhile with
   `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
-  (the report is on the shell sandbox pod, not the agent pod).
+  (the report is on the shell sandbox pod, not the agent pod); a day after the sweep it is filed as
+  an issue labelled `agent:onboarding` in the GitOps repository when that is on GitHub, and a report
+  that could not be filed is retired a week after the sweep (INSTALL.md, "What to Expect After
+  Installation").
 
 ## GitOps Repository & GitHub Token Minter Configuration
 

@@ -38,10 +38,11 @@ cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
 A report nobody aligns to takes a third path (#4058). Once the sweep has been
 filed for ``UNSPOKEN_FILE_AFTER_SECONDS`` with no human marker, the run files
-the report as a ledger issue in the GitOps repository, beside the first-run
-audits' own, claims the delivery, and sends one line naming the issue to the
+the report as a ledger issue, in the GitOps repository when it is on GitHub or
+else in the install's one managed GitHub repository, beside the first-run
+audits' own, claims the delivery, and sends one line linking the issue to the
 platform whose home posts route through the gateway (kept there for the digest
-when no home channel is set). An install with no GitOps repository keeps the
+when no home channel is set). An install with no such repository keeps the
 report in the store, and ``UNDELIVERED_RETIRE_SECONDS`` after the sweep, the
 age past which the plugin primes nothing, the report is claimed without a post
 and retired in favour of the scheduled audits.
@@ -492,8 +493,9 @@ GREETING_WAIT_SECONDS = 300
 # ``.user_aligned`` markers); an install nobody speaks to, or one with no chat
 # platform at all, would otherwise hold the report forever. So once the sweep
 # has been filed for UNSPOKEN_FILE_AFTER_SECONDS with nobody aligned, the report
-# is filed as a ledger issue in the GitOps repository, beside the first-run
-# audits' own, and one line naming it goes to the home channel when a platform
+# is filed as a ledger issue (the GitOps repository when it is on GitHub, else
+# the one managed GitHub repository), beside the first-run audits' own, and one
+# line linking it goes to the home channel when a platform
 # routes there (kept by the gateway for its digest when no home channel is
 # set). The wait is what tells "nobody yet" from "nobody": a chat install's
 # first message usually comes within hours of install, and a report filed as an
