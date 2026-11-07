@@ -139,6 +139,50 @@ def nightly_entries() -> list[str]:
     return [f"./tasks/{name}/task.yaml" for name in eval_rosters.nightly_cases()]
 
 
+# A roster corpus far past a pipe buffer (64 KiB on Linux), with the entry
+# under test on its first line. `printf … | grep -q` over it is red every
+# time: grep exits on the first line, printf dies of SIGPIPE on the rest,
+# and under pipefail the pipeline reads as "no match" whichever way round
+# the check is written. tests/test_release_common.py holds the same shape
+# for scripts/release/common.sh.
+OVERSIZED_ROSTER_BYTES = 400_000
+OVERSIZED_ENTRY = "./tasks/oversized-roster-probe/task.yaml"
+
+
+def certification_one_lane_check() -> str:
+    """The certification tier's loop refusing an entry the presubmit or the
+    nightly also names."""
+    return lifted_block(r"^for ENTRY in \$\{CERTIFICATION_TASKS\[@\]\+.*?^done$")
+
+
+def gitlab_lane_registration_check() -> str:
+    """The GitLab lane's loop refusing an entry neither roster names."""
+    return lifted_block(r'^  for ENTRY in "\$\{GITLAB_LANE_TASKS\[@\]\}"; do\n.*?^  done$')
+
+
+def run_roster_check_over_an_oversized_corpus(check: str, tasks_array: str) -> subprocess.CompletedProcess:
+    """`check` with `tasks_array` holding OVERSIZED_ENTRY alone, over a
+    presubmit roster that names the entry on its first line and runs
+    OVERSIZED_ROSTER_BYTES past it; the script's file-name variables are
+    stand-ins, read only by the error text."""
+    body = "\n".join(
+        [
+            f'big="$(head -c {OVERSIZED_ROSTER_BYTES} /dev/zero | tr "\\0" "y")"',
+            f"PRESUBMIT_ENTRIES=\"{OVERSIZED_ENTRY}\"$'\\n'\"${{big}}\"",
+            'NIGHTLY_ENTRIES=""',
+            "PRESUBMIT_CASES_FILE=presubmit-cases.txt",
+            "NIGHTLY_CASES_FILE=nightly-cases.txt",
+            "CERTIFICATION_CASES_FILE=certification-cases.txt",
+            "LANE_CASES_FILE=gitlab-cases.txt",
+            "EVAL_FORGE=gitlab",
+            f'{tasks_array}=("{OVERSIZED_ENTRY}")',
+            check,
+            "echo CHECK-PASSED",
+        ]
+    )
+    return run_bash(body)
+
+
 class ShellAndPythonAgreeTest(unittest.TestCase):
     def test_the_shell_builds_the_arrays_the_python_parse_reads(self):
         result = load_matrix({"EVAL_TIER": "presubmit"})
@@ -347,6 +391,15 @@ class CertificationTierTest(unittest.TestCase):
         result = self.scratch(f"./tasks/{eval_rosters.nightly_cases()[0]}/task.yaml\n")
         self.assert_refused(result, "certification-cases.txt", "certification lane only")
 
+    def test_a_duplicate_on_the_first_line_of_an_oversized_roster_still_stops_the_job(self):
+        """The pipe form read a duplicate as absent whenever grep stopped
+        before printf had finished (SIGPIPE, 141 under pipefail) and built
+        the matrix; the here-string form has no producer to kill."""
+        result = run_roster_check_over_an_oversized_corpus(certification_one_lane_check(), "CERTIFICATION_TASKS")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("CHECK-PASSED", result.stdout, "the duplicate was accepted")
+        self.assertIn("certification lane only", result.stderr)
+
     def test_an_empty_file_stops_the_certification_tier(self):
         result = self.scratch("# part 1\n")
         self.assert_refused(result, "certification-cases.txt names no case")
@@ -547,6 +600,13 @@ class GitLabLaneTest(unittest.TestCase):
         # A real case directory that neither roster file names is not registered.
         unregistered = next(d.name for d in sorted(TASKS_DIR.iterdir()) if d.is_dir() and d.name not in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases())
         self.refused(f"./tasks/{unregistered}/task.yaml\n", "gitlab-cases.txt", unregistered, "registered cases only")
+
+    def test_a_registered_entry_on_the_first_line_of_an_oversized_roster_is_accepted(self):
+        """The mirror of the certification case: here the pipe form read a
+        registered entry as unregistered and stopped a good job."""
+        result = run_roster_check_over_an_oversized_corpus(gitlab_lane_registration_check(), "GITLAB_LANE_TASKS")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CHECK-PASSED", result.stdout)
 
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
         self.refused("# nothing\n", "gitlab-cases.txt names no case")
