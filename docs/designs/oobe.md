@@ -83,7 +83,7 @@ later removes both jobs. When nobody has spoken a day after the sweep was filed
 (`UNSPOKEN_FILE_AFTER_SECONDS`), the report is filed as a dated ledger issue instead, in the GitOps
 repository when it is on GitHub or else in the install's one managed GitHub repository (so a
 GitOps repository on another forge still files into that one; several GitHub repositories with no
-GitOps role, or none on GitHub, files nothing), with one line linking it sent to the platform whose home posts route through
+GitOps role, or none on GitHub, files nothing; `ONBOARDING_LEDGER_REPO` names one outright), with one line linking it sent to the platform whose home posts route through
 the gateway (kept by the gateway for its digest when no home channel is set; a `spec.mode: today`
 install gets the issue and no line), and the same claim is taken; a week after the sweep
 (`UNDELIVERED_RETIRE_SECONDS`, the plugin's own priming limit) an undelivered report, whatever kept it

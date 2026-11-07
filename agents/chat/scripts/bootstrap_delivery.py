@@ -581,6 +581,10 @@ REPORT_RETIRED_NOTE = (
     "the scheduled audits stand in for it"
 )
 REPORT_FILED_NOTE = "the first-run report went to {ref}: no chat thread took it"
+REPORT_UNLABELLED_NOTE = (
+    "the first-run report issue {ref} carries no " + REPORT_ISSUE_LABEL + " label (the repository refused it); "
+    "the issue resolver will not skip it"
+)
 REPORT_FILING_FAILED_REASON = "filing the first-run report in {repo} failed: {error!r}"
 LEDGER_REPO_UNREADABLE_REASON = "the managed repositories could not be read: {error}; the first-run report waits"
 REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
@@ -704,18 +708,24 @@ def delivery_settled(data_dir: Path) -> bool:
     on the conversation path once the report's post recorded an outcome, and on the path with no
     human once the filing or the retire is on record; a claim that run died holding is released
     like a stale conversation claim."""
+    if (data_dir / REPORT_CLAIMING_FILE).exists():
+        # This path's claim: its own record settles it, whatever a conversation bound a moment
+        # later says; that conversation's run finds the report archived and posts nothing.
+        return (data_dir / REPORT_FILED_FILE).exists() or (data_dir / REPORT_RETIRED_FILE).exists()
     if _bound_conversation(data_dir) is not None:
         return _outcome_recorded(data_dir)
-    if not (data_dir / REPORT_CLAIMING_FILE).exists():
-        return True
-    return (data_dir / REPORT_FILED_FILE).exists() or (data_dir / REPORT_RETIRED_FILE).exists()
+    return True
 
 
-def _mark_claiming(data_dir: Path) -> None:
+def _mark_claiming(data_dir: Path) -> bool:
+    """Mark the claim about to be taken as this path's; without the mark no claim is taken, since an
+    unmarked claim that then dies would read as a delivered origin claim and retire the jobs."""
     try:
         (data_dir / REPORT_CLAIMING_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
     except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not record the claim's path: {e}\n")
+        sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
+        return False
+    return True
 
 
 def _unmark_claiming(data_dir: Path) -> None:
@@ -730,7 +740,8 @@ def _unmark_claiming(data_dir: Path) -> None:
 
 
 def _claim_for_this_path(data_dir: Path) -> bool:
-    _mark_claiming(data_dir)
+    if not _mark_claiming(data_dir):
+        return False
     if _claim_delivery(data_dir):
         return True
     _unmark_claiming(data_dir)
@@ -2002,7 +2013,7 @@ def _issue_url(repo: str, number: int, issue: dict) -> str:
     return ISSUE_URL_FORMAT.format(host=ISSUE_URL_DEFAULT_HOST, slug=repo, number=number)
 
 
-def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str] | None:
+def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str, object] | None:
     """The open issue a run before this one filed this sweep's report as, by label and the sweep
     marker, or None; another install's issue in a shared repository names another sweep.
 
@@ -2013,8 +2024,14 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str] | None:
         "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
     )
     marker = REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep)
+    issues = list(answer.get("issues") or [])
+    if not issues:
+        # An earlier run's issue may carry no label (the repository refused it): one more
+        # listing without the label filter, by the sweep marker alone.
+        answer = forge.call("issue-list", {"state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo)
+        issues = list(answer.get("issues") or [])
     found: list[tuple[int, dict]] = []
-    for issue in answer.get("issues") or []:
+    for issue in issues:
         if not isinstance(issue, dict) or marker not in str(issue.get("body") or ""):
             continue
         try:
@@ -2024,7 +2041,7 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str] | None:
     if not found:
         return None
     number, issue = max(found, key=lambda pair: pair[0])
-    return number, _issue_url(repo, number, issue)
+    return number, _issue_url(repo, number, issue), issue.get("labels")
 
 
 def _issue_text(body: str, sweep: str, filed_at: float, now: float) -> str:
@@ -2035,8 +2052,16 @@ def _issue_text(body: str, sweep: str, filed_at: float, now: float) -> str:
     )
 
 
-def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: float) -> tuple[int, str]:
-    """Open the ledger issue holding the report (or reuse the one already open): its number and URL.
+def _issue_labelled(labels: object) -> bool:
+    """Whether a broker answer's label list carries the report label, in either shape the forge uses."""
+    names = []
+    for item in labels if isinstance(labels, list) else []:
+        names.append(item.get("name") if isinstance(item, dict) else item)
+    return REPORT_ISSUE_LABEL in names
+
+
+def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: float) -> tuple[int, str, object]:
+    """Open the ledger issue holding the report (or reuse the one already open): its number, URL and labels.
 
     Raises ``forge.ForgeError`` when the broker refuses. The label is best effort: the issue is
     worth opening without it, and a repository whose labels this credential may not touch is not
@@ -2061,7 +2086,7 @@ def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: f
         number = 0
     if not number:
         raise forge.ForgeError(forge.REASON_UNREACHABLE, "issue-create answered with no issue number")
-    return number, _issue_url(repo, number, issue)
+    return number, _issue_url(repo, number, issue), issue.get("labels")
 
 
 def _post_home_line(data_dir: Path, url: str, now: float) -> None:
@@ -2194,7 +2219,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     # Anything that escapes between the claim and the record releases the claim; a run that dies
     # holding it is released by the stale-claim rule, since ``delivery_settled`` waits for the record.
     try:
-        number, url = _file_report_issue(repo, body, sweep, filed_at, now)
+        number, url, labels = _file_report_issue(repo, body, sweep, filed_at, now)
     except forge.ForgeError as e:
         _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True, name=REPORT_ATTEMPTS_FILE)
         _release_claim(data_dir)
@@ -2206,6 +2231,8 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     ref = f"{repo}#{number}"
     _record_filed(data_dir, repo, number, url)
     _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
+    if not _issue_labelled(labels):
+        _stage_note(data_dir, REPORT_UNLABELLED_NOTE.format(ref=ref))
     shown = _mark_shown(files, suppressed)
     _cleanup(data_dir, in_sandbox, shown)
     _post_home_line(data_dir, url, now)

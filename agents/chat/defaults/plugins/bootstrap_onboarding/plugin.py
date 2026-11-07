@@ -633,7 +633,14 @@ def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
     return record
 
 
-def _filed_greeting(data_dir: Path, record: Dict[str, Any]) -> Dict[str, str]:
+def _fill(template: str, **values: str) -> str:
+    """Substitute ``{name}`` placeholders one by one: an operator's override may hold other braces."""
+    for name, value in values.items():
+        template = template.replace("{" + name + "}", value)
+    return template
+
+
+def _filed_greeting(data_dir: Path, record: Dict[str, Any], home_channel_set: bool = False) -> Dict[str, str]:
     dated = ""
     try:
         stamp = float(record.get(REPORT_FILED_AT_KEY) or 0)
@@ -643,10 +650,13 @@ def _filed_greeting(data_dir: Path, record: Dict[str, Any]) -> Dict[str, str]:
             )
     except (TypeError, ValueError, OverflowError, OSError):
         dated = ""
-    instructions = _load_instructions(data_dir, REPORT_FILED_INSTRUCTIONS, _FALLBACK_REPORT_FILED).format(
-        url=record[REPORT_FILED_URL_KEY], dated=dated
+    instructions = _fill(
+        _load_instructions(data_dir, REPORT_FILED_INSTRUCTIONS, _FALLBACK_REPORT_FILED),
+        url=str(record[REPORT_FILED_URL_KEY]), dated=dated,
     )
-    logger.info("Injecting onboarding greeting instructions (REPORT FILED).")
+    if home_channel_set:
+        instructions = f"{instructions}\n\n{HOME_CHANNEL_INSTRUCTION}"
+    logger.info("Injecting onboarding greeting instructions (REPORT FILED, home_channel_set=%s).", home_channel_set)
     return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — REPORT FILED]\n{instructions}\n"}
 
 
@@ -730,13 +740,14 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     retired = (data_dir / REPORT_RETIRED_MARKER).exists()
     if (filed is not None or retired) and not (data_dir / GREETED_MARKER).exists() \
             and _human_chat_turn(platform_name, session_id):
-        if platform_name in DURABLE_CHAT_PLATFORMS:
-            _set_home_channel_if_unset(**kwargs)
+        home_set = platform_name in DURABLE_CHAT_PLATFORMS and _set_home_channel_if_unset(**kwargs)
+        # Built before the marker is written, so an instruction that cannot be built spends nothing.
+        greeting = _filed_greeting(data_dir, filed, home_set) if filed is not None else None
         try:
             (data_dir / GREETED_MARKER).touch(exist_ok=True)
         except OSError as e:
             logger.warning("Could not record the greeting: %s", e)
-        return _filed_greeting(data_dir, filed) if filed is not None else None
+        return greeting
 
     # Already delivered, or already primed by an earlier session. Either way
     # onboarding has happened and must not happen again.

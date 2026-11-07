@@ -461,6 +461,25 @@ class PreLlmCallTest(unittest.TestCase):
             self.assertIsNone(self._call())
         again.assert_not_called()
 
+    def test_an_override_with_a_literal_brace_still_greets(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        base = self.data_dir / "onboarding"
+        base.mkdir(exist_ok=True)
+        (base / plugin.REPORT_FILED_INSTRUCTIONS).write_text('Say {"ok": true} and link {url}', encoding="utf-8")
+        first = self._call()
+        self.assertIn('{"ok": true}', first["context"])
+        self.assertIn("issues/75", first["context"])
+
+    def test_the_filed_greeting_says_so_when_it_set_the_home_channel(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True):
+            first = self._call()
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, first["context"])
+
     def test_an_operator_can_override_the_filed_instruction(self):
         (self.data_dir / ".bootstrap_completed").touch()
         (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(

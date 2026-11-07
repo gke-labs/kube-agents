@@ -1887,7 +1887,9 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         if verb in self.forge_refusals:
             raise bootstrap_delivery.forge.ForgeError(self.forge_refusals[verb], "nope")
         if verb == "issue-create":
-            return self.forge_answers.get(verb, {"issue": {"number": 42}})
+            return self.forge_answers.get(verb, {"issue": {"number": 42, "labels": [{"name": bootstrap_delivery.REPORT_ISSUE_LABEL}]}})
+        if verb == "issue-list" and "labels" not in payload:
+            return self.forge_answers.get("issue-list-unlabelled", {"issues": []})
         return self.forge_answers.get(verb, {"issues": []})
 
     def _run_cli(self, argv, **_kwargs):
@@ -1925,7 +1927,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
     def test_files_the_report_as_a_ledger_issue_and_says_so_in_home(self):
         self._filed(self.DAY + self.HOUR)
         self.assertEqual(self._main(), 0)
-        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
         _, create, repo = self.forge_calls[-1]
         self.assertEqual(repo, self.REPO)
         self.assertIn(bootstrap_delivery.REPORT_ISSUE_MARKER, create["body"])
@@ -2188,6 +2190,30 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(self._main(), 0)
         self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)), 1)
         self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
+
+    def test_a_filing_this_path_made_settles_whatever_binds_a_moment_later(self):
+        self._filed(self.DAY + self.HOUR)
+        self.assertEqual(self._main(), 0)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "the filed record settles our claim, not the late binding")
+
+    def test_no_claim_without_its_marker(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery, "_mark_claiming", return_value=False):
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual([v for v, _, _ in self.forge_calls], [])
+
+    def test_an_unlabelled_issue_is_found_again_and_noted(self):
+        """The repository refused the label: a dying run's issue is still found by its sweep marker, and the gap is logged."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list-unlabelled"] = {
+            "issues": [{"number": 11, "labels": [], "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1")}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([v for v, _, _ in self.forge_calls], ["issue-list", "issue-list"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 11)
+        self.assertIn(bootstrap_delivery.REPORT_UNLABELLED_NOTE.format(ref=f"{self.REPO}#11"), self._note_texts())
 
     def test_an_operator_override_names_the_repository(self):
         self._filed(self.DAY + self.HOUR)
