@@ -1048,6 +1048,10 @@ class BaseTestCase(unittest.TestCase):
                 # The sweep is on unless a test says otherwise: a host with the
                 # switch off would otherwise fail every auto-promotion test.
                 audit_report.AUTO_PROMOTE_ENV: "",
+                # No ledger scope unless a test sets one: a host with the GKE
+                # identity exported would put the suite on the scoped path.
+                **{name: "" for name in audit_report.SCOPE_IDENTITY_ENVS},
+                audit_report.LEDGER_SCOPE_ENV: "",
             },
         )
         env.start()
@@ -8049,6 +8053,27 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         )
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    def test_remediate_dates_a_relative_age_in_the_pull_request_body(self):
+        # The direct-ask path renders the same finding text as `finish`, so
+        # it dates a relative age the same way.
+        self.record_run(context=self.CONTEXT)
+        doc = self.doc()
+        for finding in doc["findings"]:
+            finding["impact"] = "The budget last blocked an eviction 5 days ago."
+        findings_file = self.write_findings(doc)
+        fault = derived_id(
+            check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db"
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        bodies = self.harness.bodies_for("proposal-create")
+        self.assertEqual(len(bodies), 1)
+        self.assertIn(f"5 days ago as of {today}.", bodies[0])
 
     # -- a standing /remediate on a withheld posture ---------------------------
 
@@ -34986,6 +35011,10 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(out[audit_report.RETIRED_UNLISTED_KEY], [gone_id])
         self.assertIn("RETIRED UNLISTED:", self.err)
         self.assertNotIn(gone_id, self.latest().get("current_ids") or [])
+        # The summary is a store-ledger run's whole report, so it says so too.
+        self.assertIn("retired with the ledger, not confirmed fixed", out["summary"])
+        self.assertIn(gone_id, out["summary"])
+        self.assertNotIn(gone_id, self.latest().get("resolved_ids") or [])
 
     def test_the_summary_names_proposals_in_the_forge_s_own_noun(self):
         summary = audit_report.render_no_forge_summary(
@@ -35594,13 +35623,12 @@ class TestStoreLedger(HarnessTestCase):
 
 
 HOST_IDENTITY = dict(zip(audit_report.SCOPE_IDENTITY_ENVS, ("acme-prod", "us-central1", "platform-host")))
-NO_IDENTITY = {name: "" for name in audit_report.SCOPE_IDENTITY_ENVS}
 SCOPE_LABEL_RE = re.compile(r"^audit-scope:[a-z0-9-]+-[0-9a-f]{8}$")
 
 
 def scoped(env):
-    """`patch.dict` over the scope variables, with `env` on top of none of them set."""
-    return patch.dict(os.environ, {**NO_IDENTITY, audit_report.LEDGER_SCOPE_ENV: "", **env})
+    """`patch.dict` over the scope variables; `BaseTestCase.setUp` clears them for every test."""
+    return patch.dict(os.environ, env)
 
 
 class TestLedgerScope(BaseTestCase):
@@ -35828,8 +35856,13 @@ class TestScopedLedgerLookup(ScopedHarnessTestCase):
         }
         return self.find()[0]
 
-    def test_the_store_fallback_takes_an_unscoped_ledger(self):
+    def test_the_store_fallback_takes_an_unscoped_ledger_and_labels_it(self):
         self.assertEqual(self.fallback_finds([f"audit:{AUDIT}"]), 42)
+        self.assertEqual(
+            self.harness.forge_calls("issue-update", number=42),
+            [{"number": 42, "labelsAdd": [self.scope.label], "repository": "acme/fleet"}],
+        )
+        self.assertIn("Adopted #42", self.err)
 
     def test_the_store_fallback_takes_this_installs_ledger(self):
         self.assertEqual(self.fallback_finds([f"audit:{AUDIT}", self.scope.label]), 42)
@@ -35888,9 +35921,27 @@ class TestScopedRemediationPrs(ScopedHarnessTestCase):
                 ]
             )
         }
-        with scoped({}):
+        with scoped({audit_report.LEDGER_SCOPE_ENV: ""}):
             listed = audit_report.list_remediation_prs("acme/fleet", AUDIT)
         self.assertEqual([p["number"] for p in listed], [7, 8])
+
+    def test_another_installs_pull_request_on_the_same_branch_is_not_adopted(self):
+        # Two installs that stage the same path share a branch name. The
+        # open-proposal lookup must not hand the second install the first's
+        # pull request to rewrite as its own.
+        self.harness.replies = {
+            "identity": {"login": "kube-agents-bot"},
+            "proposal-list": proposals_view(
+                [self.labelled(7, ["audit:remediation", self.other_label])]
+            ),
+        }
+        self.harness.standing["kube-agents-bot"] = "MEMBER"
+        self.assertIsNone(audit_report.open_proposal_on("acme/fleet", "platform-agent/fix-x"))
+        self.harness.replies["proposal-list"] = proposals_view(
+            [self.labelled(8, ["audit:remediation", self.scope.label])]
+        )
+        found = audit_report.open_proposal_on("acme/fleet", "platform-agent/fix-x")
+        self.assertEqual((found or {}).get("number"), 8)
 
 
 # --------------------------------------------------------------------------- #
@@ -35940,6 +35991,27 @@ class TestAnchorRelativeAges(BaseTestCase):
         )
         fenced = "```\ngh run list --created '>3 days ago'\n```"
         self.assertEqual(self.dated(fenced), fenced)
+
+    def test_code_spans_are_read_as_commonmark_reads_them(self):
+        # A double-backtick span, a four-backtick fence, and a lone backtick
+        # that opens nothing: the span's body stays, the prose around it is
+        # dated, and an unmatched backtick flips no parity.
+        double = "Read ``gcloud logging read 'timestamp>\"2 days ago\"'``, last run 3 days ago."
+        self.assertEqual(
+            self.dated(double),
+            "Read ``gcloud logging read 'timestamp>\"2 days ago\"'``, last run 3 days ago as of 2026-08-01.",
+        )
+        fence4 = "````\njournalctl --since '2 days ago'\n````\nseen 1 day ago"
+        self.assertEqual(
+            self.dated(fence4), "````\njournalctl --since '2 days ago'\n````\nseen 1 day ago as of 2026-08-01"
+        )
+        # A lone backtick with no partner of its length is literal text, so
+        # it neither opens a span nor flips the double span after it.
+        lone = "a stray ` and ``--since \"2 days ago\"`` and prose 4 days ago"
+        self.assertEqual(
+            self.dated(lone),
+            "a stray ` and ``--since \"2 days ago\"`` and prose 4 days ago as of 2026-08-01",
+        )
 
     def test_the_fields_dated_and_the_ones_left_as_written(self):
         finding = make_finding(
@@ -36134,6 +36206,60 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         audit_report.validate_findings(listed, AUDIT)
         self.assertEqual(audit_report.unlisted_previous_findings(previous, listed), [])
         self.assertEqual(audit_report.unlisted_previous_findings("", doc), [])
+
+    def test_a_finding_with_no_row_is_placed_from_the_stored_document(self):
+        # A held id in the note tier rides the hidden block with no `Where:`
+        # line; its place is in the stored document, as `unread_held_entries`
+        # reads it, so the close names it rather than counting it resolved.
+        gone = self.gone()
+        audit_report.validate_findings(
+            stored := make_doc(
+                findings=[gone],
+                clusters=[{"name": RETIRED_CLUSTER, "location": "us-east4", "project": "acme-retired"}],
+            ),
+            AUDIT,
+        )
+        body = "\n".join(audit_report.delta_block([self.gone_id()]).splitlines())
+        retired = audit_report.unlisted_previous_findings(
+            body, make_doc(findings=[]), {"document": stored}
+        )
+        self.assertEqual([entry["id"] for entry in retired], [self.gone_id()])
+        self.assertEqual(retired[0]["cluster"], RETIRED_CLUSTER)
+        # Without the memory the body alone places nothing, as before.
+        self.assertEqual(audit_report.unlisted_previous_findings(body, make_doc(findings=[])), [])
+
+    def test_the_stored_envelope_and_the_scheduled_delta_leave_a_retired_finding_out(self):
+        # The run's JSON `resolved`, its envelope's `resolved_ids`, and the
+        # change since the last scheduled run have to agree.
+        previous = self.previous_ledger(make_finding(fid="a"), self.gone())
+        # The stored record is an on-demand run's, so a scheduled clean close
+        # computes the change since the last scheduled run.
+        self.seed_report(previous, scheduled_record=False)
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = [
+            entry for entry in resolved_for(previous) if entry["cluster"] != RETIRED_CLUSTER
+        ]
+        self.assertEqual(self.run_finish(doc, scheduled=True), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        self.assertNotIn(self.gone_id(), payload.get(audit_report.SINCE_SCHEDULED_KEY, {}).get("resolved", []))
+        runs = sorted((self.store_dir() / audit_report.REPORT_RUNS_DIR).glob("*.json"))
+        envelope = json.loads(runs[-1].read_text(encoding="utf-8"))
+        self.assertNotIn(self.gone_id(), envelope["resolved_ids"])
+        self.assertEqual(len(envelope["resolved_ids"]), 1)
+
+    def test_a_standing_remediate_on_a_retired_finding_is_deferred_not_answered_as_gone(self):
+        self.previous_ledger(self.gone())
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {self.gone_id()}", node_id="IC_9")]}
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        answers = [b for b in self.harness.bodies_for("issue-comment") if self.gone_id() in b]
+        self.assertTrue(answers, self.harness.bodies_for("issue-comment"))
+        for answer in answers:
+            self.assertNotIn("no longer reproduces", answer)
+        self.assertTrue(any("not confirmed fixed" in a for a in answers))
 
 
 if __name__ == "__main__":
