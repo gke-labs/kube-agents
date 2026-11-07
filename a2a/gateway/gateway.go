@@ -130,11 +130,16 @@ const relayDurable = "gateway-relay"
 // the evidence (nothing on the stream in that long), not the inference.
 // cancelSentNotice is the gateway's answer to a stop with a task running:
 // posted for a typed stop, and edited onto the task's line for a Google
-// Chat Stop press (chatStopPress). cancelNotSentNotice is the answer when the
+// Chat Stop press or a stop typed on Google Chat (chat_stop_press.go).
+// cancelAlreadySentNotice answers a stop on a task whose cancel is already
+// on the bus: a second stop while the terminal is pending, posted or on the
+// line, and a named cancel of a task this conversation has already
+// cancelled (cancelNamedTask). cancelNotSentNotice is the answer when the
 // cancel did not reach the bus.
 const (
-	cancelSentNotice    = "🛑 cancel sent — the task ends when the executor confirms"
-	cancelNotSentNotice = "⚠️ could not send the stop; the task is still running — try again"
+	cancelSentNotice        = "🛑 cancel sent — the task ends when the executor confirms"
+	cancelAlreadySentNotice = "🛑 cancel already sent — the task ends when the executor confirms"
+	cancelNotSentNotice     = "⚠️ could not send the stop; the task is still running — try again"
 )
 
 const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
@@ -1356,6 +1361,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// posts nothing (chat_stop_press.go). With the card stop armed the
 		// press was made a typed stop above, and takes that path below.
 		g.chatStopPress(ctx, rec, msg, authority)
+	case stopping && isChatTypedStop(msg, backend) && active != nil && active.StatusMsgID != "" && !g.cardStopWanted(rec, msg):
+		// A stop typed on Google Chat with a line to answer on answers as a
+		// press does, on the line, and posts nothing (chat_stop_press.go):
+		// the cancel, or "cancel already sent" while its terminal is
+		// pending. With the card stop armed, or no line, it takes the typed
+		// stop's path below, posts and all.
+		g.chatTypedStop(ctx, rec, authority)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -1395,7 +1407,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		case active != nil && cardStop:
 			g.stopCards(ctx, rec, authority, backend, false)
 		case active != nil:
-			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
+			g.post(rec.Key, cancelAlreadySentNotice)
 		case msg.TopLevel:
 			g.post(rec.Key, topLevelNothingRunningNotice)
 		case len(rec.Tasks) > 0 && cardStop:
@@ -3178,8 +3190,9 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 
 // cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
 // Slack Stop button's path (slack_stop.go) answers with one reply of its own,
-// Google Chat's on the task's line (chat_stop_press.go), and both mark the
-// task so the relay posts no "canceled" for it either (TaskRef.QuietCancel).
+// Google Chat's button and typed stop on the task's line (chat_stop_press.go),
+// and all mark the task so the relay posts no "canceled" for it either
+// (TaskRef.QuietCancel).
 func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
@@ -3240,7 +3253,7 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	if ref.Canceled {
-		g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
+		g.post(rec.Key, cancelAlreadySentNotice)
 		return
 	}
 	if ref.CorrelationID == "" {
