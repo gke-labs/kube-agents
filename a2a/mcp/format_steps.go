@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -512,7 +513,19 @@ func isAbbrevPeriod(prefix string) bool {
 }
 
 func collapseInlineWhitespace(s string) string {
-	return strings.TrimSpace(inlineWhitespaceRe.ReplaceAllString(s, " "))
+	return strings.TrimSpace(inlineWhitespaceRe.ReplaceAllString(dropFormatChars(s), " "))
+}
+
+// dropFormatChars removes Unicode format characters (bidi overrides and
+// isolates, zero-width marks), which could hide or reorder what the caller is
+// shown, as cell and inertBlock do.
+func dropFormatChars(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func sanitizeInlineBackticks(s string) string {
@@ -532,7 +545,7 @@ func sanitizeInlineItalic(s string) string {
 }
 
 func indentBlockquote(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
+	lines := strings.Split(strings.TrimSpace(dropFormatChars(s)), "\n")
 	for i, line := range lines {
 		lines[i] = "> " + strings.TrimRight(line, "\r")
 	}

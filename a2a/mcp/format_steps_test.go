@@ -980,3 +980,22 @@ func TestCollectTaskStepDetailsAndUnseenStepsAcrossThinkingToActivitiesTransitio
 		t.Fatalf("poll 4 unseen4 = %+v, want published step 'Checked nodes and namespaces'", unseen4)
 	}
 }
+
+func TestStepTextDropsUnicodeFormatCharacters(t *testing.T) {
+	const hidden = "\u202eevil\u200b\u2066x\u2069"
+	sub := stepmsg.Subtask{ID: "7", Title: "Inspect" + hidden, Status: "done", Summary: "found" + hidden + "\nmore" + hidden}
+	for _, d := range []StepDetail{
+		{Step: stepmsg.Step{Kind: stepmsg.KindSubtask, Title: "Inspect" + hidden, Subtask: &sub}, Agent: "kanban", Thought: "think" + hidden},
+		{Step: stepmsg.Step{Title: "Plan" + hidden}, Thought: "think" + hidden},
+	} {
+		for name, text := range map[string]string{
+			"title":         humanizeStepTitle(d),
+			"markdown":      FormatStepDetailMarkdownWithOptions(d, true),
+			"thought title": summarizeThoughtTitle(d.Thought),
+		} {
+			if strings.ContainsAny(text, "\u202e\u200b\u2066\u2069") {
+				t.Errorf("%s keeps a format character: %q", name, text)
+			}
+		}
+	}
+}
