@@ -711,11 +711,13 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_gates_run_in_dependency_order_and_skip_the_two_that_cannot(self) -> None:
         block = lifted(*_MODE_SECTION)
+        # The bus first, through its own gate (quorum, then every server).
+        self.assertEqual(re.findall(r'gate_mode_next_bus "(\S+)"', block), ["statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"])
+        self.assertLess(block.index('gate_mode_next_bus "'), block.index('gate_mode_next_rollout "'))
         gated = re.findall(r'gate_mode_next_rollout "(\S+)"', block)
         self.assertEqual(
             gated,
             [
-                "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats",
                 "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout",
                 "deployment/${AGENT_DEPLOYMENT_NAME}",
                 # Twice: the operator adds the bridge to the agent pod only
@@ -760,6 +762,62 @@ class FlagSetIsNextTest(unittest.TestCase):
                 for line in block.splitlines():
                     if "rollout status" in line or "gate_mode_next_rollout" in line:
                         self.assertNotIn(never_gated, line)
+
+    def test_the_bus_gate_passes_at_a_quorum_and_waits_longer_for_the_rest(self) -> None:
+        """A three-server bus serves on two, and on Autopilot each further
+        server waits on a node scale-up: the gate passes the bus at a quorum
+        within the rollout budget, gives the rest the longer budget, and stops
+        the deploy if either runs out. The function is lifted whole and run
+        against a kubectl stub that answers readyReplicas from a sequence, on
+        budgets of a few seconds."""
+        consts = constants()
+        self.assertGreater(int(consts["MODE_NEXT_BUS_FULL_TIMEOUT"].rstrip("s")), int(consts["MODE_NEXT_ROLLOUT_TIMEOUT"].rstrip("s")))
+
+        def run(replicas: int, ready: list[int]) -> subprocess.CompletedProcess:
+            seq = " ".join(str(r) for r in ready)
+            script = f"""
+MODE_NEXT_GENERATION_ATTEMPTS=1 MODE_NEXT_POLL_SECONDS=0.2 MODE_NEXT_ROLLOUT_TIMEOUT=2s MODE_NEXT_BUS_FULL_TIMEOUT=3s
+NAMESPACE=ns MODE_NEXT_START=$SECONDS
+READY=({seq}); COUNTER="$(mktemp)"; echo 0 > "$COUNTER"
+# kubectl runs in $(...), a subshell, so the read count lives in a file.
+kubectl() {{
+  case "$*" in
+    *"{{.spec.replicas}}"*) echo {replicas} ;;
+    *readyReplicas*)
+      local n; n="$(cat "$COUNTER")"; echo $((n + 1)) > "$COUNTER"
+      local i=$(( n < ${{#READY[@]}} ? n : ${{#READY[@]}} - 1 ))
+      echo "${{READY[$i]}}" ;;
+    *) return 0 ;;
+  esac
+}}
+dump_mode_next_state() {{ echo DUMPED; }}
+{shell_function("gate_mode_next_bus")}
+gate_mode_next_bus "statefulset/x-a2a-nats"
+echo PASSED
+"""
+            return run_bash(script)
+
+        # Quorum at once, the third a little later: passes, after both lines.
+        ok = run(3, [2, 2, 2, 3])
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertIn("serving on 2 of 3 servers (quorum 2)", ok.stdout)
+        self.assertIn("rolled out: 3 of 3", ok.stdout)
+        self.assertIn("PASSED", ok.stdout)
+        # Quorum but the third never schedules: stops after the longer budget.
+        stalled = run(3, [2])
+        self.assertEqual(stalled.returncode, 1, stalled.stdout)
+        self.assertIn("still has 2 of 3 servers Ready", stalled.stdout)
+        self.assertIn("DUMPED", stalled.stdout)
+        self.assertNotIn("PASSED", stalled.stdout)
+        # No quorum within the rollout budget: stops there.
+        short = run(3, [1])
+        self.assertEqual(short.returncode, 1, short.stdout)
+        self.assertIn("short of its quorum of 2", short.stdout)
+        self.assertNotIn("serving on", short.stdout)
+        # A single server's quorum is the one server.
+        one = run(1, [0, 1])
+        self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
+        self.assertIn("rolled out: 1 of 1", one.stdout)
 
     def test_the_provisioning_job_gate_stops_on_either_terminal_condition(self) -> None:
         """The gate polls the Jobs' True conditions and stops on Complete or

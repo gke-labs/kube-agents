@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,6 +123,34 @@ func (l *a2aServerLog) refusedSubscribe(user, subject string) bool {
 	return l.refused("Subscription", user, subject)
 }
 
+// a2aSingleServerTestConf makes a rendered nats.conf startable as ONE embedded
+// server: the per-pod server_name ($POD_NAME, which the pod's env supplies)
+// becomes a literal, and a multi-server render's cluster block is dropped,
+// since a lone server with routes to a Service that does not resolve here
+// would wait for a JetStream quorum it can never reach; and the pid file moves
+// to a temp dir. Everything else is the
+// render's own. TestTheRenderedClusterFormsOverVerifiedRoutes is what runs
+// the cluster block itself.
+func a2aSingleServerTestConf(t *testing.T, conf string) string {
+	t.Helper()
+	if !strings.Contains(conf, "server_name: $POD_NAME") {
+		t.Fatal("the rendered nats.conf no longer takes server_name from $POD_NAME; the substitution below would be inert")
+	}
+	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-0", 1)
+	// The pid file lives on the pod's data volume, which a test process
+	// cannot write; a server that cannot write it does not start.
+	pid := `pid_file: "` + a2aNATSPidFile + `"`
+	if !strings.Contains(conf, pid) {
+		t.Fatal("the rendered nats.conf no longer writes its pid to " + a2aNATSPidFile + "; the substitution below would be inert")
+	}
+	conf = strings.Replace(conf, pid, `pid_file: "`+filepath.Join(t.TempDir(), "nats-server.pid")+`"`, 1)
+	return a2aClusterBlockRe.ReplaceAllString(conf, "")
+}
+
+// a2aClusterBlockRe matches renderA2ANATSCluster's block: from "cluster {" at
+// the start of a line to the first closing brace at the start of a line.
+var a2aClusterBlockRe = regexp.MustCompile(`(?ms)^cluster \{\n.*?^\}\n`)
+
 // a2aStartRenderedServer runs an embedded nats-server on conf, the nats.conf
 // the operator renders, changing only what a test process cannot honour: the
 // listen ports (random), the websocket listener (off) and the store directory
@@ -142,7 +171,7 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "nats.conf")
-	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, a2aSingleServerTestConf(t, conf))), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts, err := natsserver.ProcessConfigFile(path)

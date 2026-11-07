@@ -477,8 +477,15 @@ full applies the key; a re-run of `install.sh` applies it too.
 [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
 has the rules for the key, and
 [`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md)
-what a switch changes inside the install. This section covers what a switch does to chat: Google Chat first, then
-Slack, in order.
+what a switch changes inside the install. This section covers what a switch does: the bus first, then Google Chat, then Slack.
+
+### The A2A bus
+
+A `today` install has no A2A bus, so its first switch to `next` creates one, and a new bus runs three
+NATS servers on separate nodes ([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
+cluster that cannot grow to three nodes, set the chart value
+`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the switch: once the
+bus exists, its server count cannot change.
 
 ### Google Chat
 

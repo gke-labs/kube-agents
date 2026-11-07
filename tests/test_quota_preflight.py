@@ -38,6 +38,7 @@ _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
+_COMMON_TYPES = _ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 
 _HELM = shutil.which("helm")
@@ -893,6 +894,24 @@ class PreflightDecisionTest(unittest.TestCase):
             delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
         return delta
 
+    def test_a_single_server_bus_is_counted_as_one_server(self) -> None:
+        """footprint.yaml counts the bus at three NATS servers; with
+        platformAgent.harness.tuning.busReplicas: 1 the preflight counts one, so a
+        one-server install is not asked for two more pods' and claims' room."""
+        nats = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aNats"]
+        claims = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["storage"]
+        n = int(nats["pods"])
+        self.assertEqual(n, 3)
+        three = self._requirements(["platformAgent.mode=next"])
+        one = self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=1"])
+        self.assertEqual(three["pods"] - one["pods"], n - 1)
+        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], int(claims["persistentVolumeClaims"]) - 1)
+        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(claims["storageBytesRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsCpu"] - one["requestsCpu"], int(nats["cpuMillisRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsMemory"] - one["requestsMemory"], int(nats["memoryBytesRequest"]) * (n - 1) // n)
+        # Set to 3, or unset, it counts three.
+        self.assertEqual(self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=3"]), three)
+
     def test_mode_next_adds_the_next_mode_footprint(self) -> None:
         """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
         base = self._requirements()
@@ -902,7 +921,8 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(following[key] - base[key], value)
         # Not a vacuous zero: the stack is several pods and a JetStream claim.
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
-        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 1)
+        # One JetStream claim per NATS server, three by default.
+        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
 
     def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
         """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
@@ -2509,7 +2529,11 @@ class DocumentedFootprintTest(unittest.TestCase):
         standing_mem_gib = math.floor((standing_mem_bytes / gib) * 10 + 0.5) / 10
 
         # Assert individual workload clauses:
-        self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
+        number_words = {1: "one", 2: "two", 3: "three"}
+        self.assertIn(
+            f"NATS ({number_words[nats_replicas]} servers by default, {nats_cpu} CPU and {nats_mem} memory each",
+            page,
+        )
         self.assertIn(
             f"two auth callout replicas ({callout_cpu} CPU, {callout_mem} memory each)",
             page,
@@ -2557,7 +2581,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         nats_claim_prose = (
             f"a {jetstream_gib} GiB JetStream persistent volume claim"
             if nats_replicas == 1
-            else f"{nats_replicas} {jetstream_gib} GiB JetStream persistent volume claims"
+            else f"{number_words[nats_replicas]} {jetstream_gib} GiB JetStream persistent volume claims"
         )
         self.assertIn(nats_claim_prose, page)
 
@@ -2579,8 +2603,9 @@ class DocumentedFootprintTest(unittest.TestCase):
             rf"renders a namespace-wide `ResourceQuota` on `pods` of `maxSessions` plus a "
             rf"headroom it derives: .*?; {chart_default} without the chart\), and {margin} for "
             rf".*?\({max_sessions + headroom} pods by default, from "
-            rf"`spec\.harness\.tuning\.maxSessions: {max_sessions}`, "
-            rf"{max_sessions + headroom + extras} with Hindsight and the GitHub minter\)"
+            rf"`spec\.harness\.tuning\.maxSessions: {max_sessions}` and three servers, "
+            rf"{max_sessions + headroom + extras} with Hindsight and the GitHub minter; "
+            rf"two fewer with one server\)"
         )
         self.assertRegex(page, quota_clause)
 
