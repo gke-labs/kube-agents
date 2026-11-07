@@ -455,8 +455,8 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
-# The gateway's election: the operator renders its Lease, the grant on it and
-# the gateway's election env only with this set.
+# The gateway's election, on by default; the lane sets it anyway so its runs
+# don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
@@ -1747,8 +1747,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
     --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
     # The gateway's election (k8s-operator platformagent_a2a_gateway_lease.go):
-    # off by default for installs, on here so the next lane runs the gateway
-    # the way it will run with replicas.
+    # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
     # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default

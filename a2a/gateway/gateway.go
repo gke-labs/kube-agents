@@ -20,6 +20,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -81,6 +82,32 @@ const (
 	retireRefusalNotStarted = "⚠️ not started: could not close the previous task on the bus; try again in a moment"
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
+
+// A term start waits for the session-state bucket rather than failing: on a
+// fresh install the provision Job creates it, and can trail the gateway's
+// start. termWaitRetry spaces the attempts, and termWaitLogEvery the log
+// lines while the wait lasts.
+const (
+	termWaitRetry    = 2 * time.Second
+	termWaitLogEvery = 30 * time.Second
+
+	// jetstreamTemporarilyUnavailable is the JetStream API's error code for
+	// "JetStream system temporarily unavailable", while its meta leader is
+	// being elected.
+	jetstreamTemporarilyUnavailable = jetstream.ErrorCode(10008)
+)
+
+// termWaitBusMax bounds a wait on the bus (not on the bucket): a fault local
+// to this pod's path to NATS would otherwise keep the Lease here while a
+// standby whose bus works stands idle. Past it the term start fails with
+// errTermBusGaveUp, the lease is released, and the standby takes it; this
+// replica campaigns again in the same process (Election.Run). A missing
+// bucket is the same for every replica, so that wait has no bound. A var so
+// tests can shorten it.
+var termWaitBusMax = 60 * time.Second
+
+// errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
+var errTermBusGaveUp = errors.New("the bus didn't answer")
 
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
@@ -341,6 +368,12 @@ type Gateway struct {
 	// rather than the stream's.
 	relayBound    atomic.Bool
 	relayHeldBack atomic.Bool
+	// termWaiting is set while BeginTerm waits out a term start that can
+	// clear on its own, and termWaitBus says the wait is for the bus rather
+	// than the session-state bucket, so Readiness names the right one.
+	termWaitBus atomic.Bool
+	// which the provision Job creates, so Readiness names that wait.
+	termWaiting atomic.Bool
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -638,6 +671,12 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // listener answers ReadyzPath from it. It latches: once bound it stays ready,
 // and a later loss of TASKS is the rebuild path's to recover, as before.
 func (g *Gateway) Readiness() (bool, string) {
+	if g.termWaiting.Load() {
+		if g.termWaitBus.Load() {
+			return false, "waiting for the bus: the gateway's term can't start while JetStream isn't answering"
+		}
+		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
+	}
 	if g.relayBound.Load() {
 		return true, "ready"
 	}
@@ -811,8 +850,60 @@ func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 // BeginTerm starts a new gateway term on the registry every write goes
 // through (Registry.BeginTerm). The election calls it on acquiring the
 // lease, before Run.
+//
+// A missing session-state bucket is waited out rather than returned: every
+// replica meets the same wait. A bus that is down is waited out for
+// termWaitBusMax, then returned so the lease can move (Election.Run).
+// Readiness names the wait meanwhile.
 func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
-	return g.reg.BeginTerm(ctx)
+	defer g.termWaiting.Store(false)
+	var loggedAt, busSince time.Time
+	for {
+		term, err := g.reg.BeginTerm(ctx)
+		if err == nil || !g.termCanWait(err) {
+			return term, err
+		}
+		bus := !errors.Is(err, jetstream.ErrBucketNotFound)
+		if !bus {
+			busSince = time.Time{}
+		} else if busSince.IsZero() {
+			busSince = time.Now()
+		} else if time.Since(busSince) >= termWaitBusMax {
+			return 0, fmt.Errorf("%w for %s, so the lease goes to a replica whose bus may: %w", errTermBusGaveUp, termWaitBusMax, err)
+		}
+		g.termWaitBus.Store(bus)
+		g.termWaiting.Store(true)
+		if time.Since(loggedAt) >= termWaitLogEvery {
+			if bus {
+				g.log.Warn("gateway term: waiting for the bus", "err", err, "giveUpAfter", termWaitBusMax)
+			} else {
+				g.log.Warn("gateway term: waiting for the session-state bucket", "bucket", lib.SessionStateBucket, "err", err)
+			}
+			loggedAt = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-time.After(termWaitRetry):
+		}
+	}
+}
+
+// termCanWait reports whether a term start's error is one that clears on its
+// own: the bucket not created yet, the bus unreachable, or JetStream not
+// answering while the connection is up (no responders, an API timeout, or
+// the cluster's meta leader moving, as when a drain takes a NATS server with
+// the gateway's leader). The relay's bind waits on the same class.
+func (g *Gateway) termCanWait(err error) bool {
+	if errors.Is(err, jetstream.ErrBucketNotFound) || (g.client != nil && !g.client.Connected()) {
+		return true
+	}
+	if errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode == jetstreamTemporarilyUnavailable
 }
 
 // OnFenced sets what runs when a registry write is refused because a newer
