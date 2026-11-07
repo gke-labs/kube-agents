@@ -1179,9 +1179,58 @@ def _append_final(result: AgentResult, sections: list[str]) -> None:
     if not sections:
         return
     current = str(result.metadata.get("final_message") or "")
-    add = [s for s in sections if s.split("\n", 1)[-1].strip() not in current]
-    if add:
-        result.metadata["final_message"] = "\n\n".join(filter(None, [current, *add]))
+    folded = _fold_sections(current, sections)
+    if folded != current:
+        result.metadata["final_message"] = folded
+
+
+# The section headers a thread receives as a message of its own (a card's
+# result, a paused card's question). An artifact is a file read back from the
+# pod, so a router that quotes one has not relayed a message.
+_RELAYED_SECTION_PREFIXES = (
+    _RESULT_SECTION.partition("{tid}")[0],
+    _QUESTION_SECTION.partition("{tid}")[0],
+)
+# A delivered header closing the text ahead of a body, blank lines allowed:
+# that body is already attributed, to the card the header names.
+_ATTRIBUTING_HEADER = re.compile(
+    r"(?:\A|\n)(?P<header>(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):)\s*\Z"
+)
+
+
+def _fold_sections(current: str, sections: list[str]) -> str:
+    """``current`` with each delivered section in it once, under its header.
+
+    A router that relays a card's result (or its question) verbatim already
+    has the section's body in its message; dropping the section there, as
+    the artifact rule does, would leave the worker's answer with no
+    ``Result of delegated task`` header, and a check that reads the card's
+    own answer through that header would miss it. The relayed text is lifted
+    out of the router's prose and delivered as its section instead, after
+    the prose, so the router's words stay contiguous and ahead of every
+    section, and the answer is attributed once and quoted once. The last
+    occurrence is the relay: a router that names a short result in its own
+    sentence first quotes it in full last. A body already under this
+    section's header is left alone; one under another card's header is a
+    different card's result and is appended in full. An artifact already
+    quoted is not appended again.
+    """
+    for section in sections:
+        header, _, body = section.partition("\n")
+        body = body.strip()
+        if not body:
+            continue
+        at = current.rfind(body)
+        attributed = _ATTRIBUTING_HEADER.search(current[:at]) if at >= 0 else None
+        if attributed is not None and attributed.group("header") == header:
+            continue
+        if at < 0 or attributed is not None:
+            current = "\n\n".join(filter(None, [current, section.rstrip()]))
+        elif header.startswith(_RELAYED_SECTION_PREFIXES):
+            prose = "\n\n".join(filter(None, [current[:at].rstrip(), current[at + len(body) :].strip()]))
+            current = "\n\n".join(filter(None, [prose, f"{header}\n{body}"]))
+    return current
 
 
 def _append_delivered(
@@ -1206,9 +1255,7 @@ def _append_delivered(
         for tid, text in delivered_results(observed, task_ids).items()
         if tid not in questions
     ] + [_QUESTION_SECTION.format(tid=tid, text=text) for tid, text in questions.items()]
-    sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
-    if sections:
-        result.output = "\n\n".join(filter(None, [result.output, *sections]))
+    result.output = _fold_sections(result.output, all_sections)
     _append_final(result, all_sections)
 
 

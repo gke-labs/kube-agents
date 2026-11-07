@@ -3391,7 +3391,7 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     # found the card still running replayed both earlier messages, and taking
     # that payload whole would put a "still running" restatement per poll in
     # front of the judge.
-    assert result.output == f"I've started this as task {_TASK_ID}.\n\n{_RCA_RESULT}"
+    assert result.output == f"I've started this as task {_TASK_ID}.\n\nResult of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert "is running" not in result.output
 
 
@@ -3801,7 +3801,7 @@ def test_a_card_already_done_in_the_first_reply_skips_the_wait(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert len(stub_agent.requests) == 1
-    assert result.output == _RCA_RESULT
+    assert result.output == f"Result of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert not result.has_errors()
 
 
