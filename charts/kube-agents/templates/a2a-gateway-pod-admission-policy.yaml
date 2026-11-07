@@ -68,8 +68,9 @@
 #   - A mutating webhook that adds any other scheduling field (a nodeSelector, a toleration, a
 #     scheduler) refuses every session pod: closed, but an outage. GKE's default ComputeClass is
 #     one: a cluster default, or a namespace labelled `cloud.google.com/default-compute-class`,
-#     adds a compute-class nodeSelector (and on Standard a toleration) to every pod. So does a
-#     default PriorityClass with a positive value.
+#     adds a compute-class nodeSelector (and on Standard a toleration) to every pod; the refusal
+#     names it. Allowing the install's own class is #5173. So does a default PriorityClass with a
+#     positive value.
 #   - Within the allowed tolerations it checks neither the architecture's value (Autopilot adds
 #     the cluster's default architecture) nor tolerationSeconds (the API server's default is
 #     configurable), so the gateway can tolerate another architecture's taint, or stay on a
@@ -203,8 +204,7 @@ spec:
     # tolerations, and on GKE Autopilot the architecture toleration and its
     # scheduler.
     - expression: >-
-        !has(object.spec.runtimeClassName) &&
-        !has(object.spec.nodeSelector) && !has(object.spec.affinity) &&
+        !has(object.spec.runtimeClassName) && !has(object.spec.affinity) &&
         (!has(object.spec.priority) || object.spec.priority <= 0) &&
         (!has(object.spec.schedulerName) ||
          object.spec.schedulerName in ['default-scheduler', 'gke.io/optimize-utilization-scheduler']) &&
@@ -213,7 +213,17 @@ spec:
            has(t.operator) && t.operator == 'Exists' && has(t.effect) && t.effect == 'NoExecute') ||
           (has(t.key) && t.key == 'kubernetes.io/arch' &&
            has(t.operator) && t.operator == 'Equal' && has(t.effect) && t.effect == 'NoSchedule')))
-      message: "a pod the A2A gateway creates may not set a runtimeClassName, nodeSelector, affinity, positive priority, another scheduler, or a toleration but the not-ready, unreachable and architecture ones"
+      message: "a pod the A2A gateway creates may not set a runtimeClassName, affinity, positive priority, another scheduler, or a toleration but the not-ready, unreachable and architecture ones"
+      reason: Forbidden
+    # Apart, so the refusal names the likeliest cause: GKE's default
+    # ComputeClass writes a nodeSelector onto every pod (#5173).
+    - expression: "!has(object.spec.nodeSelector)"
+      messageExpression: >-
+        has(object.spec.nodeSelector) && 'cloud.google.com/compute-class' in object.spec.nodeSelector ?
+        'a pod the A2A gateway creates may not set a nodeSelector; this one carries cloud.google.com/compute-class=' +
+        object.spec.nodeSelector['cloud.google.com/compute-class'] +
+        ', which a default GKE ComputeClass adds to every pod: leave the gateway namespace out of the default class' :
+        'a pod the A2A gateway creates may not set a nodeSelector'
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

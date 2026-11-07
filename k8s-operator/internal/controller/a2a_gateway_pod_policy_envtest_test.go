@@ -158,6 +158,8 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		identity   = "must run as pa-a2a-session"
 		automounts = "automountServiceAccountToken: false"
 		scheduling = "may not set a runtimeClassName"
+		selector   = "may not set a nodeSelector"
+		class      = "a default GKE ComputeClass adds to every pod"
 	)
 	csc := func(p *corev1.Pod) *corev1.SecurityContext { return p.Spec.Containers[0].SecurityContext }
 	denied := map[string]struct {
@@ -227,7 +229,12 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		"a runtimeClassName": {func(p *corev1.Pod) { p.Spec.RuntimeClassName = ptr.To("gvisor") }, scheduling},
 		"a nodeSelector": {func(p *corev1.Pod) {
 			p.Spec.NodeSelector = map[string]string{"cloud.google.com/gke-nodepool": "system"}
-		}, scheduling},
+		}, selector},
+		// Named in the refusal, so an install with a default ComputeClass can
+		// find why its session pods are refused.
+		"a default ComputeClass's selector": {func(p *corev1.Pod) {
+			p.Spec.NodeSelector = map[string]string{"cloud.google.com/compute-class": "general-purpose"}
+		}, class},
 		"node affinity": {func(p *corev1.Pod) {
 			p.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
