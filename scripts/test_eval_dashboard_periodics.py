@@ -107,6 +107,19 @@ def archive(job, builds, podinfo=None, log=None):
     return objects
 
 
+CERT = periodics.WATCHED_BY_JOB["ci-kube-agents-certification-1"]
+
+
+def archive_at(root, builds):
+    """`archive` for a job with no artifact, under any logs root."""
+    objects = {f"{root}/{periodics.POINTER}": max(builds, key=int) + "\n"}
+    for build, finished_doc in builds.items():
+        objects[f"{root}/{build}/started.json"] = "{}"
+        if finished_doc is not None:
+            objects[f"{root}/{build}/{periodics.FINISHED}"] = json.dumps(finished_doc)
+    return objects
+
+
 PODINFO = {"pod": {"spec": {"nodeName": "gke-kube-agents-prow-default-pool-eb220b2a-ru4s"}, "status": {"phase": "Failed"}}, "events": [{"type": "Normal", "reason": "Scheduled", "message": "assigned"}, {"type": "Warning", "reason": "NodeNotReady", "message": "Node is not ready"}]}
 
 
@@ -115,6 +128,28 @@ def finished(when, passed=True):
 
 
 class FetchTest(unittest.TestCase):
+    def test_a_job_that_logs_beside_the_nightlies_is_read_from_its_own_bucket(self):
+        # The certification slice is decorated like the nightlies, so its
+        # builds live under EVAL_NIGHTLY_LOGS_ROOT; a read under the
+        # periodic-logs root would find nothing and the lane would be unwatched
+        # without anyone knowing.
+        root = f"{periodics.EVAL_NIGHTLY_LOGS_ROOT}/{CERT.job}"
+        # The newest build is still running (no finished.json), so the read
+        # walks back through the `ls` of the job's builds; that listing, the
+        # pointer, finished.json and the failure-cause reads must all stay
+        # under the job's own root.
+        objects = archive_at(root, {"301": None, "300": finished(NOW - timedelta(days=2), passed=False)})
+        gcloud = FakeGcloud(objects)
+        with tempfile.TemporaryDirectory() as tmp:
+            reading = periodics.fetch(pathlib.Path(tmp), watched=(CERT,), runner=gcloud)[CERT.job]
+        self.assertEqual((reading["build"], reading["passed"], reading["artifact"]), ("300", False, None))
+        self.assertIn("ls", [call[2] for call in gcloud.calls], "the walk-back listing ran")
+        self.assertTrue(all(call[-1].startswith(root) for call in gcloud.calls), gcloud.calls)
+        self.assertNotIn(periodics.LOGS_ROOT, "".join(call[-1] for call in gcloud.calls))
+        self.assertEqual(periodics.history_url(CERT.job, CERT.logs_root), f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{CERT.job}")
+        self.assertEqual(periodics.history_url(DAILY.job), f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{DAILY.job}")
+        self.assertEqual(CERT.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
+
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
         report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}
         objects = archive(DAILY.job, {"100": (finished(NOW - timedelta(hours=1), passed=False), report)})
@@ -921,7 +956,9 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(detail[periodics.DETAIL_LIMIT], "and 7 more")
         self.assertEqual(detail[-1], "7 write(s) left for the next run (the run's write budget)")
         self.assertEqual(len(detail), periodics.DETAIL_LIMIT + 2)
-        # A reconcile's first failed build is news, with its own lines untouched.
+        # A reconcile's first failed build is news, with its own lines untouched:
+        # the daily runs once a day, so waiting for a second would hold it a day.
+        self.assertEqual({DAILY.run_alert_after, periodics.WATCHED_BY_JOB[periodics.RECONCILE_POSTSUBMIT_JOB].run_alert_after}, {periodics.FIRST_FAILURE})
         weekly = {"job": DAILY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
                   "artifact": {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}}}
         streaks = periodics.streaks({DAILY.job: weekly}, None)
@@ -1011,7 +1048,7 @@ class WorkflowWiring(unittest.TestCase):
         # can check; a rename there is a rename here.
         self.assertEqual(
             [p.job for p in periodics.WATCHED],
-            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile"],
+            ["ci-kube-agents-pull-sweep", "ci-kube-agents-fleet-reconcile-daily", "post-kube-agents-fleet-reconcile", "ci-kube-agents-certification-1"],
         )
         for periodic in periodics.WATCHED:
             self.assertTrue(periodic.stale_after is None or periodic.stale_after >= timedelta(hours=1))

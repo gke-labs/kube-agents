@@ -453,7 +453,7 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 				return nil
 			}
 
-			if err := serve(ctx, cfg, gateway.NewMetrics(), log, run); err != nil {
+			if err := serve(ctx, cfg, gateway.NewMetrics(), nil, log, run); err != nil {
 				t.Fatalf("serve returned %v, want nil: a metrics listener that cannot start must not end the gateway", err)
 			}
 			if !reached {
@@ -467,6 +467,44 @@ func TestServeKeepsTheGatewayWhenTheMetricsListenerCannotStart(t *testing.T) {
 				t.Errorf("ALERT err = %q, want it to name %q", got, tc.wantErr)
 			}
 		})
+	}
+}
+
+// serve hands the gateway's readiness to the metrics listener, so the
+// kubelet's probe reads whether the relay has bound, with the reason.
+func TestServeAnswersReadyzFromTheGatewaysReadiness(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := &gateway.Config{MetricsPort: port}
+	readiness := func() (bool, string) { return false, "waiting for stream TASKS" }
+
+	var status int
+	var body string
+	run := func(context.Context) error {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", port, gateway.ReadyzPath))
+			if err == nil {
+				b, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				status, body = resp.StatusCode, string(b)
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return nil
+	}
+	if err := serve(ctx, cfg, gateway.NewMetrics(), readiness, slog.New(slog.DiscardHandler), run); err != nil {
+		t.Fatal(err)
+	}
+	if status != http.StatusServiceUnavailable || !strings.Contains(body, "waiting for stream TASKS") {
+		t.Fatalf("GET %s = %d %q, want 503 with the gateway's reason", gateway.ReadyzPath, status, body)
 	}
 }
 

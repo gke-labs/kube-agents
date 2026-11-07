@@ -32,6 +32,9 @@ _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
     "--set", "platformAgent.harness.location=us-central1",
     "--set", "platformAgent.harness.projectId=ci-project",
+    # The fold window defaults to an entry of its own; nulled so these renders
+    # show the watcher settings alone.
+    "--set", "platformAgent.deployment.incidentWorkloadDedupSeconds=null",
 ]
 _VALUE_FROM = {"configMapKeyRef": {"name": "watcher", "key": "span"}}
 # Each key, the variable it becomes, and a value of its kind that is not the default.

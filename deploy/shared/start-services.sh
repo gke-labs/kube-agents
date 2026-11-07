@@ -418,17 +418,17 @@ readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
 # window plus margin, inside a 30s default grace with the Envoy kill after it.
 # In the api-proxy role the runtime installs no handler and exits on the
-# signal, so the wait there is one poll. The broker role drains longer and
-# waits BROKER_RUNTIME_DRAIN_SECONDS instead (below).
+# signal, so the wait there is one poll. The broker and exec roles drain longer
+# and wait BROKER_RUNTIME_DRAIN_SECONDS instead (below).
 readonly RUNTIME_DRAIN_SECONDS=10
-# The standalone broker pod's runtime drains longer: it refuses new requests and
-# gives those in flight up to credential_proxy.py's own SHUTDOWN_DRAIN_SECONDS
-# (30s from the signal, the 3s settle inside it), then ends the commands still
-# running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for their answers, and hands
-# the Chat receipts back (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two
-# relays). Forty seconds holds those 39s and one poll
-# (tests/test_credential_proxy_drain_budget.py), inside the 45s
-# terminationGracePeriodSeconds the operator gives the broker pod
+# The standalone broker pod's runtime, and an exec pod's, drains longer: it
+# refuses new requests and gives those in flight up to credential_proxy.py's own
+# SHUTDOWN_DRAIN_SECONDS (30s from the signal, the 3s settle inside it), then
+# ends the commands still running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for
+# their answers, and hands the Chat receipts back
+# (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two relays). Forty seconds
+# holds those 39s and one poll (tests/test_credential_proxy_drain_budget.py),
+# inside the 45s terminationGracePeriodSeconds the operator gives the broker pod
 # (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
 readonly BROKER_RUNTIME_DRAIN_SECONDS=40
 
@@ -539,8 +539,8 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
 normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 
 # The settle period: how long a failure in the settle family (the crash-loop
-# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
-# last) has to have lasted, by the
+# family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
+# reasons kubelet re-emits while they last) has to have lasted, by the
 # event's own first and last sighting, before the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on
@@ -556,8 +556,8 @@ normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
 # quiet: the watcher sends the Session KV server one k8s-event-followup inject
 # for it, which lands in the alert's thread saying the object has emitted
 # nothing since, so a card read hours later says what was true when. Silence,
-# not recovery: the watcher reads events only and reads no object back, and a
-# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# not recovery: the watcher reads events, and of a Pod only its owner, never
+# its state, and a deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
 # ceiling with margin, so a crash loop still going is never reported quiet
 # between two of its back-offs. Set to 0 to send none.
 readonly WATCHER_QUIET_AFTER_DEFAULT=15m
@@ -681,11 +681,11 @@ wait_for_exit() {
 # SIGTERM the credential runtime alone and wait for it. Not drain_supervised:
 # that sweeps the pid's children first, and the runtime's children are the
 # brokered commands in flight (kubectl, git, gh, gcloud, each in its own
-# session), which the runtime lets finish: in the broker role it drains them
-# for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an answer; in
-# the other roles its exec route stays open for the settle window, and one
-# still running when the runtime exits dies with the pod. A sweep would end
-# them at the first instant of the stop.
+# session), which the runtime lets finish: in the broker and exec roles it
+# drains them for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an
+# answer; in the other roles its exec route stays open for the settle window,
+# and one still running when the runtime exits dies with the pod. A sweep would
+# end them at the first instant of the stop.
 drain_runtime() {
   local budget="$1"
   local pid="$2"
@@ -706,7 +706,9 @@ terminate() {
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
   local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
-  [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]] || runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}"
+  case "${CREDENTIAL_PROXY_ROLE}" in
+    broker | exec) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+  esac
   [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }

@@ -226,6 +226,13 @@ type a2aAuthMapDocument struct {
 // PlatformAgent's own, in name order, and a profile the operator refuses is
 // left out rather than failing the render (agentProfileMapEntries).
 func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (a2aAuthMapDocument, error) {
+	return renderA2AAuthMapDraining(agent, profiles, nil)
+}
+
+// renderA2AAuthMapDraining is renderA2AAuthMap with the profiles still
+// draining (drainingDispatchProfiles): the dispatcher keeps their names, so
+// their .supervisor and stop-record grants, and none of their durables.
+func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
 	for _, id := range calloutIdentities(agent) {
 		identities = append(identities, a2aAuthMapIdentity{
@@ -244,7 +251,7 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	// name each durable the operator creates, so it is built here, from the
 	// same profiles (platformagent_a2a_dispatcher.go).
 	if a2aDispatcherEnabled() {
-		names, durables := dispatcherGrantNames(agent, profiles)
+		names, durables := dispatcherGrantNames(agent, profiles, draining)
 		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
@@ -353,8 +360,8 @@ func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
 
 // buildA2AAuthMapConfigMaps renders the map into the shards the callout
 // watches, in index order, and returns the version it rendered.
-func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]*corev1.ConfigMap, string, error) {
-	doc, err := renderA2AAuthMap(agent, profiles)
+func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
+	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
 	if err != nil {
 		return nil, "", err
 	}
@@ -447,8 +454,8 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //     in this system to read from the outside, because the connection behaves
 //     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
-//     it decides which account a connection lands in. Only APP is mintable;
-//     SYS above all is not.
+//     it decides which account a connection lands in. Only APP and TRUSTED
+//     are mintable, a narrowed entry only into APP; SYS above all is not.
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.
@@ -471,8 +478,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if !isDNS1123LabelToken(id.User) {
 			return fmt.Errorf("identity %d: user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", i, id.User)
 		}
-		if id.Account != a2aAccountApp {
-			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
+		if id.Account != a2aAccountApp && id.Account != a2aAccountControl {
+			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (allowed: [%s %s])", i, id.User, id.Account, a2aAccountControl, a2aAccountApp)
+		}
+		if id.Narrowing != "" && id.Account != a2aAccountApp {
+			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {

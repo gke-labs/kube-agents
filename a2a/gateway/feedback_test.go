@@ -147,6 +147,33 @@ func TestAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
 	}
 }
 
+// TestGchatAnswerFeedbackOffIsReadFromItsEnv: the gateway holds one chat
+// backend, so either backend's off switch turns the one flag off.
+func TestGchatAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
+	setBaseEnv(t)
+	for _, tc := range []struct {
+		slack, gchat string
+		off          bool
+	}{
+		{"", "", false},
+		{"", "false", true},
+		{"", " false ", true},
+		{"false", "", true},
+		{"true", "true", false},
+		{"", "true", false},
+	} {
+		t.Setenv(envSlackAnswerFeedback, tc.slack)
+		t.Setenv(envGchatAnswerFeedback, tc.gchat)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AnswerFeedbackOff != tc.off {
+			t.Errorf("slack %q, gchat %q: AnswerFeedbackOff = %v, want %v", tc.slack, tc.gchat, cfg.AnswerFeedbackOff, tc.off)
+		}
+	}
+}
+
 func TestFeedbackTargetIsTheChainsFinalAnswerOnly(t *testing.T) {
 	g := &Gateway{}
 	g.feedback.Store(&feedbackDesk{g: g, ttl: time.Hour})

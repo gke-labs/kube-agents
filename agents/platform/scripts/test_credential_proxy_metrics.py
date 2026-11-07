@@ -54,6 +54,10 @@ _STATUS_CODE_LABEL = re.compile(r"^[0-9]{3}$")
 _SERIES = re.compile(r"^(?P<name>[a-z_]+)(?:\{(?P<labels>[^}]*)\})? (?P<value>-?[0-9.]+(?:e[+-]?[0-9]+)?)$")
 _LABEL_PAIR = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
 _STUB_FAILING_EXIT = 3
+# The host serve() is handed for the metrics and health listeners: not the
+# loopback address, so an assertion that the listener bound on it cannot be
+# satisfied by a hard-coded loopback bind.
+_PROBE_HOST = "10.96.0.9"
 
 
 def _parse(exposition):
@@ -876,10 +880,9 @@ class BrokerFailureCountingTest(_BrokerFixture):
             ("/v1/chat/post", "502", None),
             ("/v1/chat/api/x", "500", None),
             ("/v1/chat/a2a/events", "502", None),
-            ("/v1/workspace/lease", "500", "other_failed"),
             ("/v1/feedback/report", "502", "other_failed"),
             ("/no/such/route", "500", "other_failed"),
-            ("/v1/workspace/lease", "404", None),
+            ("/no/such/route", "404", None),
         ]
         for path, status, want in cases:
             with self.subTest(path=path, status=status):
@@ -1327,7 +1330,7 @@ class ReadingsMetricTest(_BrokerFixture):
 
     def test_the_failure_counter_carries_every_reason(self):
         metrics = CredentialProxyHandler.metrics
-        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming")
+        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming", "quota_floor")
         for reason in reasons:
             metrics.record_reading_failure(reason)
         metrics.record_reading_failure("rate_limited")
@@ -1682,7 +1685,6 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
             "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
-            "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",
             "/healthz": "/healthz",
             "/metrics": "other",
@@ -1872,11 +1874,9 @@ class PolicyReadCoverageTest(unittest.TestCase):
         self.assertFalse(vocabulary & command_policy._GCLOUD_RELEASE_TRACKS, "a release track is never a label")
 
     def test_every_git_verb_a_gate_reads_labels_as_itself(self):
-        # The lease gate's list and the workspace's list are the vocabulary's
+        # The lease gate's list and the vcs door's list are the vocabulary's
         # sources, so a verb either refuses or runs under its own name.
-        import content_workspace
-
-        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS | content_workspace.WORKSPACE_GIT_SUBCOMMANDS
+        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS
                  | credential_proxy.VCS_GIT_SUBCOMMANDS | credential_proxy.GIT_READ_SUBCOMMANDS)
         for verb in sorted(verbs):
             with self.subTest(verb=verb):
@@ -1902,14 +1902,14 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None):
+    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None, health_port=0, health_started=None, host="127.0.0.1"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
         policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
         args = types.SimpleNamespace(
             policy=str(policy_path),
-            host="127.0.0.1",
+            host=host,
             port=0,
             unix_socket=str(Path(tmp.name) / "backend.sock"),
             timeout_seconds=5,
@@ -1918,6 +1918,7 @@ class ServeWiringTest(unittest.TestCase):
             state_dir=str(Path(tmp.name) / "state"),
             role="full",
             metrics_port=metrics_port,
+            health_port=health_port,
         )
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
@@ -1941,6 +1942,7 @@ class ServeWiringTest(unittest.TestCase):
                 pass
 
         started = started if started is not None else mock.MagicMock(return_value=None)
+        health_started = health_started if health_started is not None else mock.MagicMock(return_value=None)
         unix_server = unix_server if unix_server is not None else credential_proxy.ThreadingUnixHTTPServer
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
@@ -1949,6 +1951,7 @@ class ServeWiringTest(unittest.TestCase):
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
                     mock.patch.object(credential_proxy, "start_metrics_listener", started), \
+                    mock.patch.object(credential_proxy, "start_health_listener", health_started), \
                     self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
                 with self.assertRaises(self._Stop):
                     credential_proxy.serve(args)
@@ -1958,8 +1961,8 @@ class ServeWiringTest(unittest.TestCase):
         return started, logs.output
 
     def test_the_parsed_port_reaches_the_listener(self):
-        started, _ = self._serve(8766)
-        started.assert_called_once_with("127.0.0.1", 8766)
+        started, _ = self._serve(8766, host=_PROBE_HOST)
+        started.assert_called_once_with(_PROBE_HOST, 8766)
 
     def test_a_value_that_is_no_port_is_refused_by_name_and_never_bound(self):
         started, logs = self._serve(70000)
@@ -1987,12 +1990,31 @@ class ServeWiringTest(unittest.TestCase):
         # The harness serves on the socket, where Envoy holds port 8765 in the
         # shipped layout; the refusal has to hold there too.
         args_port = 8765
-        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"))
+        envoy = {8765: "credential_proxy", 8768: "credential_health"}
+        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"), envoy)
         self.assertIn("8765", refusal)
         self.assertIn("credentialed", refusal)
-        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket="")))
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        # Envoy's other listener, the readiness probe's: refused by Envoy's
+        # name for it, and not refused when no config told the broker of it.
+        refusal = credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), envoy)
+        self.assertIn("Envoy", refusal)
+        self.assertIn("credential_health", refusal)
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), {}))
+
+    def test_a_metrics_port_envoy_holds_is_refused_by_name_and_never_bound(self):
+        # serve() reads the ports off the shipped config itself; 8768 is the
+        # readiness probe's listener there, which the operator never gives the
+        # metrics listener, so this is the hand-edit case the refusal is for.
+        with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+            started, logs = self._serve(8768)
+        started.assert_not_called()
+        self.assertTrue(
+            any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "credential_health" in line and "8768" in line for line in logs),
+            logs,
+        )
 
     def test_a_zero_or_refused_port_is_reported_as_what_it_is(self):
         # Three ways to arrive at 0, three different things an operator
@@ -2003,7 +2025,51 @@ class ServeWiringTest(unittest.TestCase):
                 started.assert_not_called()
                 self.assertTrue(any("metrics listener disabled" in line and expected in line for line in logs), logs)
                 if env_value is not None:
-                    self.assertFalse(any("is unset" in line for line in logs), logs)
+                    self.assertFalse(any("metrics listener disabled" in line and "is unset" in line for line in logs), logs)
+
+    def test_the_health_port_reaches_its_listener_after_the_credentialed_server(self):
+        order = []
+
+        class _Recording(credential_proxy.ThreadingUnixHTTPServer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                order.append("credentialed")
+
+        health_started = mock.MagicMock(side_effect=lambda *args: order.append("health"))
+        # A host that is not loopback: the listener binds on the metrics
+        # host, the pod IP in the operator's layout, which is what a kubelet
+        # probe reaches; a regression to a hard-coded loopback bind would
+        # pass an assertion made with the loopback address.
+        self._serve(8766, unix_server=_Recording, health_port=8767, health_started=health_started, host=_PROBE_HOST)
+        health_started.assert_called_once_with(_PROBE_HOST, 8767)
+        self.assertEqual(["credentialed", "health"], order)
+
+    def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):
+        for health_port, named in ((8766, "metrics"), (8768, "credential_health"), (0, None), (70000, "1-65535")):
+            with self.subTest(health_port=health_port):
+                health_started = mock.MagicMock()
+                with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+                    started, logs = self._serve(8766, health_port=health_port, health_started=health_started)
+                health_started.assert_not_called()
+                if named is None:
+                    self.assertTrue(any("health listener disabled" in line for line in logs), logs)
+                else:
+                    self.assertTrue(
+                        any("ALERT" in line and credential_proxy.HEALTH_PORT_ENV in line and named in line for line in logs),
+                        logs,
+                    )
+
+    def test_serve_sets_the_thread_cap_and_leaves_the_stack_size_alone(self):
+        # _serve clears the environment, so the reader is stood in for; the
+        # reader itself is ThreadCapTest's. The stack size stays the
+        # platform's: a smaller one overflows under the C recursion the
+        # shipped interpreter permits on a nested JSON body.
+        with mock.patch.object(credential_proxy.threading, "stack_size") as stack_size, \
+                mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=12):
+            self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
+            self._serve(8766)
+        stack_size.assert_not_called()
+        self.assertEqual(12, credential_proxy.ThreadCap.max_threads)
 
 
 if __name__ == "__main__":

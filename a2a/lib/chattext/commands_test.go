@@ -136,6 +136,19 @@ func TestIsFeedbackCommand(t *testing.T) {
 		}
 	}
 	no := []string{"/feedbacks", "/feedbackform", "feedback", "/ feedback", "please /feedback", "/session feedback", "/", ""}
+	for text, want := range map[string]bool{
+		"/sethome": true, "  /sethome  ": true, "/sethome #ops": true, "/SetHome": true,
+		"/hermes sethome": true, "/HERMES SetHome": true, "/hermes sethome now": true, "/hermes\tsethome": true,
+		"/sethomes": false, "sethome": false, "please /sethome": false, "/session sethome": false,
+		"/hermes": false, "/hermes status": false, "/hermes sethomes": false, "/ sethome": false, "": false,
+	} {
+		if got := IsSetHomeCommand(text); got != want {
+			t.Errorf("IsSetHomeCommand(%q) = %v, want %v", text, got, want)
+		}
+		if want && IsCommand(text) {
+			t.Errorf("IsCommand(%q) is true: a typed /sethome is the gateway's on Slack alone, a turn elsewhere", text)
+		}
+	}
 	for _, in := range no {
 		if got, ok := IsFeedbackCommand(in); ok {
 			t.Errorf("IsFeedbackCommand(%q) = (%q, true), want false", in, got)

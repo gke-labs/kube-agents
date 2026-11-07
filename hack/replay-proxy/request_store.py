@@ -51,7 +51,11 @@ MESSAGES_KEY = "messages"
 TOOLS_KEY = "tools"
 FUNCTION_KEY = "function"
 ARGUMENTS_KEY = "arguments"
-THINKING_KEYS = ("reasoning_content", "thinking_blocks")
+REASONING_KEY = "reasoning_content"
+THINKING_BLOCKS_KEY = "thinking_blocks"
+THINKING_KEYS = (REASONING_KEY, THINKING_BLOCKS_KEY)
+# A thinking block's text, beside its `signature`.
+THINKING_TEXT_KEY = "thinking"
 # Kept as written: they hold no request text.
 PLAIN_KEYS = ("role", "name", "tool_call_id", "type", "index", "id")
 CONTENT_KEY = "content"
@@ -68,6 +72,8 @@ TEXT_ENCODING = "utf-8"
 SKIP_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 SKIP_SCRUB_FAILED = "scrub_failed"
 SKIP_WRITE_FAILED = "write_failed"
+# The data volume's budget is spent (spool.DataBudget): nothing more is written.
+SKIP_BUDGET_SPENT = "budget_spent"
 
 WITHHELD = "[WITHHELD: scrubber unavailable]"
 WITHHELD_READ_RESULT = "[REDACTED_RESULT: the call read a credential; its output is not recorded]"
@@ -100,6 +106,23 @@ def _load_module(name: str, path: str) -> Any:
 def _canonical(value: Any) -> str:
     # ASCII, so a lone surrogate in a request is written as its JSON escape.
     return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def thinking_texts(message: Dict[str, Any]) -> List[str]:
+    """The model's reasoning in a message: `reasoning_content`, and the text of each thinking block.
+
+    A block's signature and a redacted block's encrypted `data` are not text
+    the model wrote, and would read as credentials.
+    """
+    texts = []
+    reasoning = message.get(REASONING_KEY)
+    if isinstance(reasoning, str) and reasoning:
+        texts.append(reasoning)
+    for block in message.get(THINKING_BLOCKS_KEY) or []:
+        text = block.get(THINKING_TEXT_KEY) if isinstance(block, dict) else None
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return texts
 
 
 class Scrubber:
@@ -220,7 +243,8 @@ class Scrubber:
         the withheld marker for text that could not be scrubbed. Reformatting
         (JSON re-serialised, a folded shell command) and masking an email, an
         IP or a configured value do not: replaying those answers puts no
-        secret in the cache.
+        secret in the cache. Its reasoning is read too, with the thinking rules
+        (thinking_texts).
         """
         if not self.available:
             return True
@@ -231,15 +255,17 @@ class Scrubber:
             arguments = ((call.get(FUNCTION_KEY) or {}) if isinstance(call, dict) else {}).get(ARGUMENTS_KEY) or ""
             if isinstance(arguments, str) and arguments and self._adds_credential_marker(KIND_TOOL_CALL, arguments):
                 return True
-        return False
+        return any(self._adds_credential_marker(KIND_THINKING, text) for text in thinking_texts(answer))
 
 
 class RequestStore:
     """Writes scrubbed requests under `root`, each distinct message once."""
 
-    def __init__(self, root: str, scrubber: Scrubber):
+    def __init__(self, root: str, scrubber: Scrubber, budget: Any = None):
         self.root = root
         self.scrubber = scrubber
+        # A spool.DataBudget, or None for no limit.
+        self.budget = budget
         self._lock = threading.Lock()
 
     def _blob(self, value: Any) -> str:
@@ -250,14 +276,15 @@ class RequestStore:
             self._write(path, data)
         return digest
 
-    @staticmethod
-    def _write(path: str, data: str) -> None:
+    def _write(self, path: str, data: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         try:
             with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
                 handle.write(data)
             os.replace(tmp, path)
+            if self.budget is not None:
+                self.budget.note(len(data))
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -277,6 +304,8 @@ class RequestStore:
     def write(self, request_id: str, fingerprint: str, scrubbed: Scrubbed) -> Optional[str]:
         """Write one scrubbed request; returns None when written, else why not."""
         messages, tools, settings = scrubbed
+        if self.budget is not None and not self.budget.allows():
+            return SKIP_BUDGET_SPENT
         try:
             with self._lock:
                 manifest = {

@@ -45,9 +45,9 @@ const (
 	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
 	kubeProxyCACertFile                  = kubeProxyCAMountPath + "/ca.crt"
 	kubeProxyCPURequest                  = "100m"
-	kubeProxyMemoryRequest               = "256Mi"
+	kubeProxyMemoryRequest               = "512Mi"
 	kubeProxyCPULimit                    = "1"
-	kubeProxyMemoryLimit                 = "512Mi"
+	kubeProxyMemoryLimit                 = "1Gi"
 	kubeProxyTLSHashAnnotation           = "kubeagents.x-k8s.io/tls-cert-hash"
 	kubeProxyTLSClockSkew                = 5 * time.Minute
 	kubeProxyTLSValidity                 = 10 * 365 * 24 * time.Hour
@@ -206,8 +206,6 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
-	defaultCluster := hostClusterContextName(agent)
-
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
@@ -215,7 +213,6 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
-		{Name: "KUBE_PROXY_DEFAULT_CLUSTER", Value: defaultCluster},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
 		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, brokerCallerOwnership{})},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},

@@ -44,7 +44,8 @@ const sessionKindGroup = "group"
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
-// command (docs/designs/chat-feedback-command.md): where a report about
+// command (docs/designs/chat-feedback-command.md; a typed "/sethome" on Slack
+// is the Slack adapter's own, answered before the turn reaches here): where a report about
 // kube-agents itself goes, what one needs, and how to have the agent write
 // one up. Deterministic and model-free, like every gateway affordance; the
 // two links are chattext's, shared with the personas. "/feedback <text>" is
@@ -100,6 +101,15 @@ const relayDurable = "gateway-relay"
 // task that produced no first event inside FirstEventGrace: the task id,
 // the grace, and what happens to the message that triggered it. It states
 // the evidence (nothing on the stream in that long), not the inference.
+// cancelSentNotice is the gateway's answer to a stop with a task running:
+// posted for a typed stop, and edited onto the task's line for a Google
+// Chat Stop press (chatStopPress). cancelNotSentNotice is the answer when the
+// cancel did not reach the bus.
+const (
+	cancelSentNotice    = "🛑 cancel sent — the task ends when the executor confirms"
+	cancelNotSentNotice = "⚠️ could not send the stop; the task is still running — try again"
+)
+
 const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
 
 // steerNoFirstEventAck is the steer acknowledgement for a task with nothing
@@ -203,7 +213,13 @@ type Gateway struct {
 	// and peoplePurgeList lists the bucket's keys for one attempt
 	// (listPeopleKeys); tests replace both.
 	peoplePurgeRetry time.Duration
-	peoplePurgeList  func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
+	// feedbackRetry and peopleRetry space the looks for a feedback or people
+	// bucket not found at start (retryFeedback, retryPeople):
+	// feedbackRetryInterval and peopleRetryInterval, per gateway so a test
+	// can shorten them on its own.
+	feedbackRetry   time.Duration
+	peopleRetry     time.Duration
+	peoplePurgeList func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -319,6 +335,12 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// relayBound is set once the event relay has bound; Readiness answers
+	// from it. relayHeldBack is set while a start after a crash holds the
+	// bind back (RunOptions.RelayBindDelay), so Readiness names that wait
+	// rather than the stream's.
+	relayBound    atomic.Bool
+	relayHeldBack atomic.Bool
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -402,8 +424,9 @@ func New(o Options) (*Gateway, error) {
 	// its whole identity join. On Slack the map is an optional override (the
 	// allowlist admits, and an unmapped sender is attributed by member id),
 	// so an empty one is noted, not warned. The console does not use one
-	// either: its grant is the mechanism, since only the console credential
-	// may publish on the console subject. And a gateway whose only ingress
+	// either: its grant is the mechanism, since only the console's
+	// credentials (console and console-mcp, the MCP server's) may publish on
+	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
@@ -520,6 +543,8 @@ func New(o Options) (*Gateway, error) {
 		ps:               ps,
 		peopleKeyer:      peopleKeys,
 		peoplePurgeRetry: peopleRetryInterval,
+		feedbackRetry:    feedbackRetryInterval,
+		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,
 		runCtx:           context.Background(),
@@ -607,6 +632,53 @@ func New(o Options) (*Gateway, error) {
 // Metrics is the gateway's counters, for the metrics listener to serve.
 func (g *Gateway) Metrics() *Metrics { return g.metrics }
 
+// Readiness reports whether Run has bound the event relay, and why not. The
+// adapters and doors start only after the bind, so until then the gateway
+// takes no turns (its chat.notify routes are already up). The metrics
+// listener answers ReadyzPath from it. It latches: once bound it stays ready,
+// and a later loss of TASKS is the rebuild path's to recover, as before.
+func (g *Gateway) Readiness() (bool, string) {
+	if g.relayBound.Load() {
+		return true, "ready"
+	}
+	if g.relayHeldBack.Load() {
+		return false, fmt.Sprintf("the event relay durable %s is held back after a crash start, so the previous process's held events render first", g.relayDurable)
+	}
+	if g.client != nil && !g.client.Connected() {
+		// The relay's wait cannot tell whether the stream exists while the
+		// bus is unreachable, so this, not the stream, is the reason.
+		return false, fmt.Sprintf("waiting for the bus: the NATS connection is down, so the event relay durable %s cannot bind", g.relayDurable)
+	}
+	return false, fmt.Sprintf("waiting for stream %s: the event relay durable %s has not bound yet", lib.TasksStream, g.relayDurable)
+}
+
+// relaySubscribeConfig is the event relay's durable subscription.
+func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
+	// Both task-event subjects, one durable: the executors' events and the
+	// terminals this gateway synthesizes as supervisor, which it relays to
+	// the requester and retires the task on exactly like an executor's own.
+	// Two filter subjects put the filter in the request body, which the
+	// gateway's unscoped consumer-create grant permits and a session's
+	// pinned grant would not; the durable already exists on every install
+	// with the single filter, and rebinding it to the pair is an update the
+	// server accepts (lib's rebind test).
+	agreement := SupervisorAgreement(g.cfg)
+	// WaitForStream: the provision Job creates TASKS, and on a three-server
+	// bus that can trail the gateway's start by more than lib's bind window.
+	// Exiting then only restarted the pod into the same wait (two restarts at
+	// install in CI). The gateway waits instead, reporting not ready
+	// (Readiness), and lib logs the wait and warns while it lasts.
+	return lib.SubscribeConfig{
+		Stream:        lib.TasksStream,
+		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
+		Durable:       g.relayDurable,
+		Session:       gatewayParty.Session,
+		Agreement:     &agreement,
+		MaxAckPending: relayMaxAckPending,
+		WaitForStream: true,
+	}
+}
+
 // Run subscribes the event relay, starts the reap and sweep loops, and runs
 // the adapter until ctx is done.
 func (g *Gateway) Run(ctx context.Context) error {
@@ -635,9 +707,20 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	defer cancel(nil)
 	g.runCtx = ctx
 	// Its first try before the relay starts, so on an install with the
-	// bucket every answer the relay posts is marked alike.
-	g.startFeedback(ctx)
-	g.startPeople(ctx)
+	// bucket every answer the relay posts is marked alike. Their retries
+	// start once the relay binds (afterBind): the provision Job creates both
+	// buckets with TASKS, and a relay that waited for TASKS longer than the
+	// retries last would otherwise come up with both given up on for good.
+	feedbackSettled := g.startFeedback(ctx)
+	peopleSettled := g.startPeople(ctx)
+	afterBind := func() {
+		if !feedbackSettled {
+			g.retryFeedback(ctx)
+		}
+		if !peopleSettled {
+			g.retryPeople(ctx)
+		}
+	}
 
 	var sub lib.Subscription
 	// bindErr is a held-back bind's failure, which ends the run.
@@ -648,9 +731,11 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if sub, err = g.bindRelay(ctx); err != nil {
 			return err
 		}
+		afterBind()
 		close(bound)
 	} else {
 		g.log.Info("relay bind held back: this start follows a crash, so the dead process's held events render first", "delay", o.RelayBindDelay.String())
+		g.relayHeldBack.Store(true)
 		go func() {
 			defer close(bound)
 			select {
@@ -658,6 +743,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 				return
 			case <-time.After(o.RelayBindDelay):
 			}
+			g.relayHeldBack.Store(false)
 			s, err := g.bindRelay(ctx)
 			if err != nil {
 				bindErr = err
@@ -665,6 +751,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 				return
 			}
 			sub = s
+			afterBind()
 		}()
 	}
 	// The batches already rendering finish first, then the subscription's
@@ -704,36 +791,19 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	return err
 }
 
-// bindRelay subscribes the event relay.
+// bindRelay subscribes the event relay. Attributed: the subject each envelope
+// arrived on rides with it, because it is the only thing that tells a
+// supervisor terminal from an executor's, and the relay owes the adapter that
+// distinction (TerminalSource) the same way the heal and the read route give
+// it. Deferred-ack: each event is acked once it has been rendered, not when it
+// is queued, and stopping gives every unrendered one back to the stream, so a
+// gateway that stops with events queued loses none of them.
 func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
-	// Both task-event subjects, one durable: the executors' events and the
-	// terminals this gateway synthesizes as supervisor, which it relays to
-	// the requester and retires the task on exactly like an executor's own.
-	// Two filter subjects put the filter in the request body, which the
-	// gateway's unscoped consumer-create grant permits and a session's
-	// pinned grant would not; the durable already exists on every install
-	// with the single filter, and rebinding it to the pair is an update the
-	// server accepts (lib's rebind test).
-	agreement := SupervisorAgreement(g.cfg)
-	// Attributed: the subject each envelope arrived on rides with it, because
-	// it is the only thing that tells a supervisor terminal from an
-	// executor's, and the relay owes the adapter that distinction
-	// (TerminalSource) the same way the heal and the read route give it.
-	//
-	// Deferred-ack: each event is acked once it has been rendered, not when it
-	// is queued, and stopping gives every unrendered one back to the stream,
-	// so a gateway that stops with events queued loses none of them.
-	sub, err := g.client.SubscribeDurableDeferred(ctx, lib.SubscribeConfig{
-		Stream:        lib.TasksStream,
-		Subjects:      []string{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor},
-		Durable:       g.relayDurable,
-		Session:       gatewayParty.Session,
-		Agreement:     &agreement,
-		MaxAckPending: relayMaxAckPending,
-	}, func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
+	sub, err := g.client.SubscribeDurableDeferred(ctx, g.relaySubscribeConfig(), func(d lib.DeferredDelivery) { g.relayDelivery(ctx, d) })
 	if err != nil {
 		return nil, fmt.Errorf("event relay subscription: %w", err)
 	}
+	g.relayBound.Store(true)
 	g.log.Info("event relay bound", "durable", g.relayDurable)
 	return sub, nil
 }
@@ -1148,6 +1218,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			}
 		}
 	}
+	// Google Chat's Stop button with the card stop armed: a press on the
+	// running task is the typed stop, cards and replies included, which
+	// reads a stop that names no task (cardStopWanted).
+	if stopping && isChatStopPress(msg, backend) && active != nil && active.TaskID == msg.TaskID &&
+		g.cfg.CardStop && g.cardStopRoute(rec) {
+		msg.TaskID = ""
+	}
 	switch {
 	case msg.Intent == "" && bareFeedback:
 		// Answered without touching the record's task state: not a steer,
@@ -1178,6 +1255,16 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
+	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
+		// Google Chat's Stop button names its task (gchat_stop.go): a
+		// press on a task that is not the running one is a stale button,
+		// answered on its own line, and cancels nothing.
+		g.chatStopStale(rec, msg)
+	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
+		// A press on the running task answers on that task's own line, and
+		// posts nothing (chat_stop_press.go). With the card stop armed the
+		// press was made a typed stop above, and takes that path below.
+		g.chatStopPress(ctx, rec, msg, authority)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -1526,6 +1613,18 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
 		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
+		// The task's live message ends with the task, as relayTerminal
+		// ends it: the terminal line for the state the heal found, or
+		// failed for a task that never started, and no Stop control on it
+		// (OutMessage.Stop). Without this the line read working, with a
+		// Stop button on Google Chat, for a task that had ended.
+		if active.StatusMsgID != "" {
+			state := lib.StateFailed
+			if healedTask != nil {
+				state = healedTask.State
+			}
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), "")
+		}
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
@@ -2020,7 +2119,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 }
 
 // sessionCommand resolves the first of the two slash commands the gateway
-// owns (the other, a bare /feedback, is answered inline in routeTurn):
+// owns (the other, a bare /feedback, is answered inline in routeTurn; a
+// typed /sethome on Slack never reaches the gateway, the Slack adapter
+// answers it):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like
@@ -2703,12 +2804,20 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
 	if !lineless {
 		var err error
-		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}
 	}
 
+	// A detached task this turn supersedes (a stop whose terminal has not
+	// arrived, or never will) would keep its line as it was: the relay's
+	// terminal edit finds the active task or a delegating parent, and after
+	// this write the task is neither. Its line closes here, as the record
+	// already counts the task (MarkCanceled), with no Stop control on it.
+	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
+		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
+	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
@@ -2978,8 +3087,8 @@ func (g *Gateway) cancelTask(ctx context.Context, rec *SessionRecord, authority 
 
 // cancelTaskVoiced is cancelTask, and quiet posts neither of its lines: the
 // Slack Stop button's path (slack_stop.go) answers with one reply of its own,
-// and marks the task so the relay posts no "canceled" for it either
-// (TaskRef.QuietCancel).
+// Google Chat's on the task's line (chat_stop_press.go), and both mark the
+// task so the relay posts no "canceled" for it either (TaskRef.QuietCancel).
 func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, authority Authority, quiet bool) bool {
 	active := rec.ActiveTask
 	env, err := lib.NewCancelEnvelope(gatewayParty, active.TaskID, rec.ContextID, active.CorrelationID,
@@ -2992,7 +3101,7 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
 		if !quiet {
-			g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+			g.post(rec.Key, cancelNotSentNotice)
 		}
 		return false
 	}
@@ -3012,7 +3121,7 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 		// The post before the signal: a waiter woken by the signal snapshots
 		// the conversation's entries, and the line saying the cancel went
 		// belongs in what it reads.
-		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+		g.post(rec.Key, cancelSentNotice)
 	}
 	g.observeCancel(rec, active.TaskID)
 	return true

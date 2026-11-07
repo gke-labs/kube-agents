@@ -480,6 +480,57 @@ func TestSubscribeHeldWaitsForTheOperatorToCreateTheDurable(t *testing.T) {
 	}
 }
 
+// A caller's deadline that fires during a look-up, after the server has
+// answered an earlier attempt with a missing durable, ends the bind on an
+// error that carries both: the dispatcher's regrant reads a bare deadline as
+// a refused grant and reconnects again, where a missing durable is left to
+// the bind retries.
+func TestSubscribeHeldKeepsTheAnswerWhenTheDeadlineCutsARetryShort(t *testing.T) {
+	h, worker := newHeldHarness(t, "cutshort")
+	ctx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+	beforeBindAttempt = func(attempt int) {
+		if attempt == 2 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { beforeBindAttempt = nil })
+
+	_, err := worker.SubscribeHeld(ctx, h.cfg(), func(context.Context, Delivery) {})
+	if err == nil {
+		t.Fatal("SubscribeHeld on a durable nobody created = nil, want an error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("SubscribeHeld = %v, want it to carry the context's error", err)
+	}
+	if !errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Errorf("SubscribeHeld = %v, want it to carry the server's last answer, ErrConsumerNotFound", err)
+	}
+}
+
+// The pass-through: a bind whose first attempt is already cut short was
+// never answered, so it ends on the context's error alone, without a
+// consumer verdict the server never gave.
+func TestSubscribeHeldCutShortBeforeAnyAnswerReturnsTheContextError(t *testing.T) {
+	h, worker := newHeldHarness(t, "cutfirst")
+	ctx, cancel := context.WithCancel(h.ctx)
+	defer cancel()
+	beforeBindAttempt = func(attempt int) {
+		if attempt == 1 {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { beforeBindAttempt = nil })
+
+	_, err := worker.SubscribeHeld(ctx, h.cfg(), func(context.Context, Delivery) {})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SubscribeHeld on a cancelled context = %v, want the context's error", err)
+	}
+	if errors.Is(err, jetstream.ErrConsumerNotFound) {
+		t.Errorf("SubscribeHeld = %v, carries a consumer verdict the server never gave", err)
+	}
+}
+
 // The bind-only grant set is enough, and nothing more is needed: a worker
 // whose user may only look up the durable, fetch from it and ack binds, takes
 // a task and acks it, and cannot create a consumer. This is the grant the
@@ -1224,5 +1275,93 @@ func TestSubscribeHeldRefusesADurableWithAForgedMark(t *testing.T) {
 				t.Errorf("bound a durable with a forged mark that %s: %v", name, err)
 			}
 		})
+	}
+}
+
+// Stop gives a held delivery back so that the next holder gets it at once,
+// not after the durable's AckWait: a delivery the server sends back to the
+// stopping subscription is given back again rather than dropped (#4849).
+// Each round holds a task on one connection, stops it, and binds a second.
+func TestHeldStopGivesTheDeliveryToTheNextHolderAtOnce(t *testing.T) {
+	h, first := newHeldHarness(t, "handback")
+	h.ensure(1, time.Minute)
+	second, err := Connect(h.ctx, h.url, WithName("second"))
+	if err != nil {
+		t.Fatalf("Connect second: %v", err)
+	}
+	t.Cleanup(second.Close)
+	holders := []*Client{first, second}
+	h.submit("task-handback")
+	for round := 0; round < 100; round++ {
+		held := make(chan struct{}, 1)
+		sub, err := holders[round%2].SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+			select {
+			case held <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+		})
+		if err != nil {
+			t.Fatalf("round %d: SubscribeHeld: %v", round, err)
+		}
+		select {
+		case <-held:
+		case <-time.After(5 * time.Second):
+			sub.Stop()
+			t.Fatalf("round %d: the task wasn't handed back within 5s of the last holder's stop (AckWait is a minute)", round)
+		}
+		sub.Stop()
+		wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		err = sub.Wait(wctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d: Wait after Stop: %v", round, err)
+		}
+	}
+}
+
+// StopIntake leaves the handler running, and the give-back it sends after
+// reaches the next holder at once, not after AckWait: what the stopping
+// subscription pulls meanwhile is handed back, not dropped (#4849).
+func TestHeldStopIntakeLetsAGiveBackReachTheNextHolderAtOnce(t *testing.T) {
+	h, first := newHeldHarness(t, "intakeback")
+	h.ensure(1, time.Minute)
+	second, err := Connect(h.ctx, h.url, WithName("second"))
+	if err != nil {
+		t.Fatalf("Connect second: %v", err)
+	}
+	t.Cleanup(second.Close)
+	holders := []*Client{first, second}
+	h.submit("task-intakeback")
+	for round := 0; round < 100; round++ {
+		held := make(chan Delivery, 1)
+		sub, err := holders[round%2].SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+			select {
+			case held <- d:
+			default:
+			}
+			<-ctx.Done()
+		})
+		if err != nil {
+			t.Fatalf("round %d: SubscribeHeld: %v", round, err)
+		}
+		var d Delivery
+		select {
+		case d = <-held:
+		case <-time.After(5 * time.Second):
+			sub.Stop()
+			t.Fatalf("round %d: the task wasn't handed back within 5s of the last give-back (AckWait is a minute)", round)
+		}
+		sub.StopIntake()
+		if err := d.Nak(0); err != nil {
+			t.Fatalf("round %d: Nak: %v", round, err)
+		}
+		sub.Stop()
+		wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		err = sub.Wait(wctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d: Wait after Stop: %v", round, err)
+		}
 	}
 }

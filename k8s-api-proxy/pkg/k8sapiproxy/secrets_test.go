@@ -365,7 +365,7 @@ func TestHandlerRedactsSecrets(t *testing.T) {
 
 	upstream := &recordingTransport{response: respond}
 	h, _ := newTestHandler(t, Config{Upstream: upstream})
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/db", nil)
+	req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/secrets/db", nil)
 	req.Header.Set(headerAccept, contentTypeJSON)
 	rec := serve(h, req)
 	if rec.Code != http.StatusOK {
@@ -379,16 +379,16 @@ func TestHandlerRedactsSecrets(t *testing.T) {
 	// A transport may answer with a request of its own, without the handler's context.
 	upstream = &recordingTransport{response: func(*http.Request) *http.Response {
 		resp := jsonResponse([]byte(secretJSON), nil)
-		resp.Request = httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/db", nil).WithContext(context.Background())
+		resp.Request = httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/secrets/db", nil).WithContext(context.Background())
 		return resp
 	}}
 	h, _ = newTestHandler(t, Config{Upstream: upstream})
-	rec = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/db", nil))
+	rec = serve(h, httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/secrets/db", nil))
 	assertNoValue(t, rec.Body.Bytes())
 
 	upstream = &recordingTransport{response: respond}
 	h, _ = newTestHandler(t, Config{Upstream: upstream, Policy: Policy{Mode: ModeReadOnly}})
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/db", nil)
+	req = httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/secrets/db", nil)
 	req.Header.Set(headerAccept, contentTypeJSON)
 	rec = serve(h, req)
 	if !strings.Contains(rec.Body.String(), encoded) || upstream.req.Header.Get(headerAccept) != contentTypeJSON {
@@ -397,7 +397,7 @@ func TestHandlerRedactsSecrets(t *testing.T) {
 
 	upstream = &recordingTransport{}
 	h, _ = newTestHandler(t, Config{Upstream: upstream})
-	req = httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/configmaps", nil)
+	req = httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/configmaps", nil)
 	req.Header.Set(headerAccept, contentTypeJSON)
 	if rec := serve(h, req); rec.Code != http.StatusOK || upstream.req.Header.Get(headerAccept) != contentTypeJSON {
 		t.Errorf("a non-Secret request was rewritten: code %d, Accept %q", rec.Code, upstream.req.Header.Get(headerAccept))
@@ -409,8 +409,8 @@ func TestHandlerRedactsSecretDeletes(t *testing.T) {
 	tests := []struct {
 		name, target, body, wantAccept string
 	}{
-		{"delete", "/api/v1/namespaces/default/secrets/db?dryRun=All", secretJSON, acceptPartial},
-		{"deletecollection", "/api/v1/namespaces/default/secrets?dryRun=All", `{"apiVersion":"v1","kind":"SecretList","items":[` + secretJSON + `]}`, acceptPartialLst},
+		{"delete", "/clusters/in-cluster/api/v1/namespaces/default/secrets/db?dryRun=All", secretJSON, acceptPartial},
+		{"deletecollection", "/clusters/in-cluster/api/v1/namespaces/default/secrets?dryRun=All", `{"apiVersion":"v1","kind":"SecretList","items":[` + secretJSON + `]}`, acceptPartialLst},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -20,7 +20,10 @@ import (
 	"slices"
 	"time"
 
+	"github.com/nats-io/nkeys"
+
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 const (
@@ -69,6 +72,14 @@ const (
 	// tombstone is not swept on this clock: it is kept for the submit
 	// stream's retention plus a margin.
 	DefaultSweepAfter = 30 * time.Minute
+	// DefaultDroppedTerminalGiveUp is how long a failed task's terminal is
+	// retried once its profile is gone from the install config. Its publish
+	// grant goes with the profile at the next reconnect, so past this the
+	// task is settled without one, and the terminal is lost, rather than
+	// hold its slot for good. It is well past the regrant cooldown and an
+	// operator reconcile, so a profile that drops out of the config briefly
+	// (its identity not rendered for a moment) is back before it fires.
+	DefaultDroppedTerminalGiveUp = 15 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
 	// DefaultStream is the stream the durables are on: profile submissions
@@ -106,11 +117,24 @@ type Config struct {
 	// records nothing holds.
 	SweepInterval time.Duration
 	SweepAfter    time.Duration
-	Submitter     string
-	Stream        string
+	// DroppedTerminalGiveUp bounds the retries of a terminal whose profile
+	// the install config no longer lists (DefaultDroppedTerminalGiveUp).
+	DroppedTerminalGiveUp time.Duration
+	Submitter             string
+	Stream                string
 	// UnattendedTiers are the tiers on the unattended side of the
 	// interactive reserve.
 	UnattendedTiers []string
+	// TaskSigningKey, set, is the task-signing key (#3889, a2a/taskcred) the
+	// dispatcher mints each confirmed task's credentials with: a task
+	// credential for the bus and, for a task that names a cluster, a token
+	// for the credential proxy, both on the confirm. Unset, confirms carry
+	// neither and workers keep their pod-level grants.
+	TaskSigningKey nkeys.KeyPair
+	// TaskCredentialMaxLifetime caps those credentials' expiry from the time
+	// they are minted, the callout's A2A_TASK_CREDENTIAL_MAX_LIFETIME. Zero
+	// means the callout's default.
+	TaskCredentialMaxLifetime time.Duration
 }
 
 // DefaultConfig is every default.
@@ -121,18 +145,19 @@ func DefaultConfig() Config {
 		StallAfter:      DefaultStallAfter,
 		RefreshInterval: DefaultRefreshInterval,
 
-		RegrantAttempts:    DefaultRegrantAttempts,
-		RegrantBackoff:     DefaultRegrantBackoff,
-		BindAttemptTimeout: DefaultBindAttemptTimeout,
-		ReconnectTimeout:   DefaultReconnectTimeout,
-		RegrantCooldown:    DefaultRegrantCooldown,
-		BindRetryBase:      DefaultBindRetryBase,
-		BindRetryMax:       DefaultBindRetryMax,
-		SweepInterval:      DefaultSweepInterval,
-		SweepAfter:         DefaultSweepAfter,
-		Submitter:          DefaultSubmitter,
-		Stream:             DefaultStream,
-		UnattendedTiers:    []string{DefaultUnattendedTier},
+		RegrantAttempts:       DefaultRegrantAttempts,
+		RegrantBackoff:        DefaultRegrantBackoff,
+		BindAttemptTimeout:    DefaultBindAttemptTimeout,
+		ReconnectTimeout:      DefaultReconnectTimeout,
+		RegrantCooldown:       DefaultRegrantCooldown,
+		BindRetryBase:         DefaultBindRetryBase,
+		BindRetryMax:          DefaultBindRetryMax,
+		SweepInterval:         DefaultSweepInterval,
+		SweepAfter:            DefaultSweepAfter,
+		DroppedTerminalGiveUp: DefaultDroppedTerminalGiveUp,
+		Submitter:             DefaultSubmitter,
+		Stream:                DefaultStream,
+		UnattendedTiers:       []string{DefaultUnattendedTier},
 	}
 }
 
@@ -147,8 +172,18 @@ func (c Config) Validate() error {
 		return fmt.Errorf("dispatch config: bind retry base must be positive and at most the max")
 	case c.SweepInterval <= 0 || c.SweepAfter <= 0:
 		return fmt.Errorf("dispatch config: sweep interval and sweep age must be positive")
+	case c.DroppedTerminalGiveUp <= 0:
+		return fmt.Errorf("dispatch config: the dropped profile's terminal give-up must be positive")
 	case c.Submitter == "" || c.Stream == "":
 		return fmt.Errorf("dispatch config: submitter and stream are required")
+	case c.TaskCredentialMaxLifetime < 0:
+		return fmt.Errorf("dispatch config: the task credential max lifetime must not be negative")
+	}
+	if c.TaskSigningKey != nil {
+		pub, err := c.TaskSigningKey.PublicKey()
+		if err != nil || !taskcred.ValidPublicKey(pub) {
+			return fmt.Errorf("dispatch config: the task-signing key is not a cluster key (C...)")
+		}
 	}
 	return nil
 }

@@ -3382,6 +3382,95 @@ class JournalModeConversionStepTest(_JournalModeCase):
         self.assertLess(text.index(_JOURNAL_WAIT_OPENER), text.index(_JOURNAL_STEP_OPENER))
 
 
+_RETENTION_SCRIPT = _REPO / "agents" / "platform" / "scripts" / "session_retention.py"
+_PIN_STEP_OPENER = 'if [ -f "$SESSION_RETENTION_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+
+
+def _session_store(path, rows):
+    """A state.db with the columns of Hermes' schema the pinning reads; rows are (id, parent)."""
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, pinned INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);"
+    )
+    conn.executemany("INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _pinned(path):
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    try:
+        return {row[0] for row in conn.execute("SELECT id FROM sessions WHERE pinned = 1")}
+    finally:
+        conn.close()
+
+
+class SessionParentPinStepTest(_JournalModeCase):
+    """Step 1.8: session parents are pinned before the gateway's first prune.
+
+    Same staging as the conversion: the shipped block drives the shipped script through
+    a wrapper at the venv path the entrypoint hard-codes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_PIN_STEP_OPENER)
+
+    def _run(self, script=None):
+        env = {**self.env(), "SESSION_RETENTION_SCRIPT": str(script or _RETENTION_SCRIPT)}
+        return subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+
+    def test_a_parent_with_a_child_is_pinned_in_every_store(self):
+        machine = _session_store(self.target / "state.db", [("root", None), ("tip", "root"), ("alone", None)])
+        profile = _session_store(
+            self.target / "profiles" / "platform" / "state.db", [("p-root", None), ("p-tip", "p-root")]
+        )
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertEqual(_pinned(machine), {"root"})
+        self.assertEqual(_pinned(profile), {"p-root"})
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_store_it_cannot_pin_warns_and_start_up_continues(self):
+        broken = self.target / "profiles" / "broken" / "state.db"
+        broken.parent.mkdir(parents=True)
+        broken.write_text("not a database", encoding="utf-8")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN: pinning session parents did not finish", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_missing_script_is_skipped_not_fatal(self):
+        proc = self._run(script=self.tmp / "absent.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_step_follows_the_conversion_and_precedes_the_default_sync(self):
+        """After the WAL conversion, which wants the stores unopened; before anything that opens them."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        conversion = text.index(_JOURNAL_STEP_OPENER)
+        step = text.index(_PIN_STEP_OPENER)
+        sync = text.index("# 2. Sync default agent files")
+        self.assertLess(conversion, step)
+        self.assertLess(step, sync)
+        self.assertEqual(text.count(_PIN_STEP_OPENER), 1)
+
+
 class JournalModeWaitTest(_JournalModeCase):
     """The non-owner's bounded wait for step 1.7.
 

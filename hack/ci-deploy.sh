@@ -73,8 +73,9 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
 # Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
-# in agents/platform/scripts/session_kv_server.py), on so that
-# incident-triage-workload-fold can see three replicas become one incident.
+# in agents/platform/scripts/session_kv_server.py; on by default at an hour),
+# set shorter here so that incident-triage-workload-fold can see three replicas
+# become one incident without one case's window reaching the next repetition.
 # Like the ceilings above it is install-wide, so it reaches every case, and the
 # value is bounded on both sides by measurements, not medians:
 #
@@ -258,6 +259,12 @@ readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
 # minutes, about as long as a replica keeps the prompt, so splitting them over
 # two ids lets more of them land on a replica that has already dropped it.
 readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# The Secret Manager secret, in the leased project, that holds the agent's Gemini
+# Developer API key under MODEL_PROVIDER=gemini. scripts/provision_ci_pool_gemini_key.sh
+# writes it.
+readonly EVAL_AGENT_GEMINI_KEY_SECRET="${EVAL_AGENT_GEMINI_KEY_SECRET:-kube-agents-eval-gemini-api-key}"
+# The MODEL_PROVIDER value under which the agent reads that key.
+readonly MODEL_PROVIDER_GEMINI="gemini"
 # Both reach `helm --set` and the chart's schema, which refuses anything but a
 # boolean and a positive integer only at step 5c, after the image build. This
 # check is stricter than Helm: lowercase true/false, at most three digits.
@@ -378,15 +385,17 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # the writers part), which grade the full catalog under next (the nightly the dashboard and
 # the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt), beside its today-mode nightly; the GHES and
-# GitLab CE lanes' only nightlies (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
-# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt); and the
+# GitLab CE lanes' weekly jobs (EVAL_FORGE=ghes, hack/eval/ghes-cases.txt;
+# EVAL_FORGE=gitlab-ce, hack/eval/gitlab-cases.txt), with the next-mode
+# nightlies they replace listed until the weekly jobs run; and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
 # is optional, so Tide never batched it, and a pull request's run of it
 # carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
 # one of these (space-separated, matched whole) or that carries a PULL_NUMBER
 # -- a presubmit is admitted by the second on a pull request and the blocking
-# one by the first on a batch Tide ran, the nightlies and the RC
+# one by the first on a batch Tide ran, the nightlies, the certification
+# lane's first slice (EVAL_TIER=certification) and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
@@ -395,7 +404,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -446,6 +455,10 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
+# The gateway's election: the operator renders its Lease, the grant on it and
+# the gateway's election env only with this set.
+readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
+readonly A2A_GATEWAY_ELECTION_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -665,8 +678,10 @@ readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED
 readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
-# Still required with the agent path on vertex_ai below: the judge reads it
-# (JUDGE_API_KEY in ci-eval-pr.sh) and the chart's credentials secret carries it.
+# Required on every provider: the judge reads it (JUDGE_API_KEY in
+# ci-eval-pr.sh). Under vertex_ai the chart's credentials secret also carries it;
+# under gemini the agent uses the leased project's own key instead
+# (resolve_agent_gemini_api_key below).
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
   exit 1
@@ -686,6 +701,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
+# ci-env.sh), checked before anything is built, the way the session-affinity
+# settings are above.
+resolve_replay_shadow || exit 1
 # The failure dump first, because it reads the exit status; then the lease
 # heartbeat started below is stopped (a no-op until it starts).
 DEPLOY_HEARTBEAT_PID=""
@@ -771,6 +790,19 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
+fi
+
+# The shadow-mode replay proxy (on by default; resolved above): the
+# image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
+# chart values step 5 installs it with. Both empty when it is off, so the build
+# and the release are byte-for-byte what they were. resolve_replay_shadow
+# refuses it on the release-candidate path, which builds nothing.
+REPLAY_SHADOW_PROXY_URI=""
+REPLAY_SHADOW_HELM_ARGS=()
+if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
+  REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"
+  replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
+  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
@@ -874,19 +906,51 @@ else
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
-# vertex_ai, not gemini. On 2026-09-02 every smoke run redded on 429s from the
-# Gemini Developer API key's fixed paid-tier-3 quota -- 8,000,000 input
-# tokens/minute for gemini-3.1-pro, named in the error body -- with five
-# concurrent builds drawing ~94k-token turns from one shared minute window
-# (#1097; the full diagnosis with build artifacts is on #1184). Vertex AI
-# serves the same Gemini models under dynamic shared quota, with no fixed
-# per-minute wall, and authenticates the LiteLLM pod through Workload Identity
-# (the kubeagents-litellm KSA annotation below) instead of the API key.
+# vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
+# every smoke run redded on 429s from one shared Gemini Developer API key's
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# named in the error body -- with five concurrent builds drawing ~94k-token
+# turns from one shared minute window (#1097; the full diagnosis with build
+# artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic
+# shared quota, with no fixed per-minute wall, and authenticates the LiteLLM pod
+# through Workload Identity (the kubeagents-litellm KSA annotation below)
+# instead of an API key.
+# When a job exports MODEL_PROVIDER=gemini, the agent reads the leased
+# project's own key from that project's Secret Manager
+# (resolve_agent_gemini_api_key below). Each project's key has its own quota,
+# so the shared-minute 429 storm cannot recur there. The job env's
+# GEMINI_API_KEY stays the judge's key.
 # Overridable so a rollout problem is a job-env flip rather than a revert.
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
+# --- agent key: begin
+# Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.
+# Under gemini it is the leased project's own key, and an unreadable or empty
+# secret stops the deploy here, before any Helm call: no fallback to the job
+# env's key, whose shared quota is what the per-project key replaces. Under any
+# other provider it is GEMINI_API_KEY unchanged. The key is never echoed. A
+# whitespace-only value counts as empty, and the surrounding whitespace of a
+# stored value (a trailing newline, a CRLF's \r) is dropped.
+resolve_agent_gemini_api_key() {
+  if [ "${MODEL_PROVIDER}" != "${MODEL_PROVIDER_GEMINI}" ]; then
+    AGENT_GEMINI_API_KEY="${GEMINI_API_KEY}"
+    return 0
+  fi
+  local key=""
+  if ! key="$(gcloud secrets versions access latest --secret="${EVAL_AGENT_GEMINI_KEY_SECRET}" --project="${PROJECT_ID}")" || [[ -z "${key//[[:space:]]/}" ]]; then
+    echo "FATAL: MODEL_PROVIDER=gemini but Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} cannot be read as this runner or is empty. Run scripts/provision_ci_pool_gemini_key.sh ${PROJECT_ID} to mint the project's key and grant the runner access." >&2
+    exit 1
+  fi
+  # A real key holds no whitespace: drop what surrounds it, a CRLF's \r included.
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  AGENT_GEMINI_API_KEY="${key}"
+  echo "Agent key: Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} (MODEL_PROVIDER=${MODEL_PROVIDER})"
+}
+# --- agent key: end
+resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
@@ -1682,6 +1746,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
     --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
     --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
+    # The gateway's election (k8s-operator platformagent_a2a_gateway_lease.go):
+    # off by default for installs, on here so the next lane runs the gateway
+    # the way it will run with replicas.
+    --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
+    --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
     # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
     # until profiles dispatch end to end, and the lane installs what a
     # default install does. Its image is still built (step 4) so the build
@@ -1724,6 +1793,11 @@ else
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
+  REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
+  if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
+    REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
+    echo "Shadow replay proxy: also building its image"
+  fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
@@ -1747,7 +1821,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1988,7 +2062,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     "${GITHUB_MINTER_ARGS[@]}" \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
-    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
@@ -2016,6 +2090,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
+    ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e

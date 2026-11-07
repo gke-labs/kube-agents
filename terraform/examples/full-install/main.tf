@@ -450,6 +450,16 @@ module "gke_cluster" {
   enable_backup_agent        = var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
+  sizing_profile             = var.sizing_profile
+  standard_machine_type      = var.standard_machine_type
+  standard_node_count        = var.standard_node_count
+  standard_disk_size_gb      = var.standard_disk_size_gb
+  standard_disk_type         = var.standard_disk_type
+  gvisor_machine_type        = var.gvisor_machine_type
+  gvisor_min_node_count      = var.gvisor_min_node_count
+  gvisor_max_node_count      = var.gvisor_max_node_count
+  gvisor_disk_size_gb        = var.gvisor_disk_size_gb
+  gvisor_disk_type           = var.gvisor_disk_type
 
   resource_labels = {
     "kube-agents-host" = "true"

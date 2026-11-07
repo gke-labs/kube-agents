@@ -41,7 +41,13 @@ thread, and the report text is untouched, only laid out.
 
 The event watcher's crashloop alert, posted to a Slack thread with the flag
 on, also records the thread's session title on its routing row, read back by
-:func:`alert_title`; any other alert records none.
+:func:`alert_title`. A drift alert records one too ("checkout-gateway HPA
+drift in seeded-b") and marks the row as drift (:func:`is_drift_alert`), and its
+triage is laid out by :func:`drift_triage`: the rest of the "What's wrong"
+paragraph, which says what changed, who changed it and when, goes on a line
+under the headline, and no button carries the `` (recommended)`` suffix, the
+primary style alone marking the recommended one. Any other alert records
+neither.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
@@ -129,6 +135,9 @@ OPTION_REPLY = "apply Option {letter}: {title}"
 SINGLE_REPLY = "apply: {title}"
 #: Where ``session_kv_server._record_alert_title`` puts the thread's session title.
 ALERT_TITLE_KEY = "title"
+#: Where it marks a drift alert (``session_kv_server.ALERT_KIND_KEY`` / ``ALERT_KIND_DRIFT``).
+ALERT_KIND_KEY = "alert_kind"
+ALERT_KIND_DRIFT = "drift"
 LINK_LABEL = "{label} ↗"
 PRIMARY = "primary"
 #: A report longer than this keeps the threaded reply; triage reports are a
@@ -397,8 +406,32 @@ def render_fold(report: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
+def drift_triage(triage: dict, report: str) -> dict:
+    """``triage`` laid out as a drift alert's: what changed, who and when under the headline.
+
+    The detail is the rest of the report's "What's wrong" paragraph, as plain
+    text. The recommended choice keeps its primary style and loses its
+    `` (recommended)`` suffix, so each button reads as the choice it is.
+    """
+    _headline, body = _presenter.split_answer(_section(_sections(report), WHATS_WRONG))
+    prose = []
+    for line in (body[0].split("\n") if body else []):
+        # A list, a fence or a heading under the sentence ends the detail, by the presenter's own rules.
+        if _presenter.LIST_MARKER.match(line) or _presenter.HEADING.match(line) or _presenter._opens_fence(line):
+            break
+        prose.append(line)
+    detail = _presenter._plain(" ".join(" ".join(prose).split())).strip()
+    return {
+        **triage,
+        "detail": _presenter._clip(detail, _presenter.ROW_TEXT_MAX) if detail else "",
+        # Rebuilt from the reply's title: the recommended label was clipped short to fit the suffix.
+        "choices": [(_presenter._clip(reply.split(": ", 1)[-1], _presenter.BUTTON_TEXT_MAX), reply, recommended)
+                    for _label, reply, recommended in triage["choices"]],
+    }
+
+
 def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
-    """Headline, option and link buttons, and ``fold_blocks`` folded, as Block Kit."""
+    """Headline, any detail line, option and link buttons, and ``fold_blocks`` folded, as Block Kit."""
     buttons = []
     for i, (label, reply, recommended) in enumerate(triage["choices"]):
         button = _presenter._button(label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=reply)
@@ -413,6 +446,8 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
         "type": "rich_text",
         "elements": [{"type": "rich_text_section", "elements": [_text(triage["headline"], bold=True)]}],
     }
+    if triage.get("detail"):
+        headline["elements"].append({"type": "rich_text_section", "elements": [_text(triage["detail"])]})
     fold = {
         "type": "container",
         "title": {"type": "plain_text", "text": triage["fold_title"]},
@@ -424,9 +459,10 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
 
 
 def fallback_text(triage: dict) -> str:
-    """The headline, the links and the replies, as mrkdwn; :func:`message_text` starts with it."""
+    """The headline, any detail, the links and the replies, as mrkdwn; :func:`message_text` starts with it."""
     return _presenter.fallback_text(
-        triage["headline"], links=triage["links"], choices=[reply for _label, reply, _rec in triage["choices"]]
+        triage["headline"], links=triage["links"], choices=[reply for _label, reply, _rec in triage["choices"]],
+        after_rows=triage.get("detail") or "",
     )
 
 
@@ -494,6 +530,16 @@ def is_open_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> b
         return bool(_alert_metas(conn, chat_id, thread_id))
 
 
+def is_drift_alert(chat_id: str, thread_id: str, db_path: str | None = None) -> bool:
+    """Whether the alert posted as ``thread_id`` in ``chat_id`` is a drift alert."""
+    db_path = db_path or _db_path()
+    if not os.path.exists(db_path):
+        return False
+    with closing(_read_only(db_path)) as conn:
+        metas = _alert_metas(conn, chat_id, thread_id)
+    return any(meta.get(ALERT_KIND_KEY) == ALERT_KIND_DRIFT for meta in metas)
+
+
 def alert_title(chat_id: str, thread_id: str, db_path: str | None = None) -> str:
     """The session title the event watcher recorded for the alert posted as ``thread_id``, else ""."""
     db_path = db_path or _db_path()
@@ -543,12 +589,13 @@ class _AlertEditor:
         return await self._adapter.send(chat_id, content, metadata=metadata, **kwargs)
 
 
-def chat_triage(report: str) -> tuple[dict, str] | None:
+def chat_triage(report: str, drift: bool = False) -> tuple[dict, str] | None:
     """``(chat message, its fallback)`` for an alert's triage over chat.notify, or None when it keeps the threaded reply.
 
     :func:`parse_triage`'s headline, choices and links, and the report up to its
     first divider as the fold, refused on the same grounds as :func:`render_fold`
-    but for ``block_kit``'s own, which the renderer replaces.
+    but for ``block_kit``'s own, which the renderer replaces. A ``drift`` alert's
+    is laid out by :func:`drift_triage`.
     """
     if _chat is None:
         return None
@@ -559,6 +606,8 @@ def chat_triage(report: str) -> tuple[dict, str] | None:
     if shown != report and parse_triage(shown) != triage:
         _refuse_fold("a divider comes before the headline, an option or a link")
         return None
+    if drift:
+        triage = drift_triage(triage, report)
     chat = _chat.triage_message(triage, shown)
     if chat is None:
         return None
@@ -644,9 +693,12 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         triage = parse_triage(report)
         if triage is None or (chat_id, thread_id) in _edited or not is_open_alert(chat_id, thread_id):
             return adapter
+        drift = is_drift_alert(chat_id, thread_id)
         if _chat is not None and callable(getattr(adapter, "send_chat", None)):
-            laid_out = chat_triage(report)
+            laid_out = chat_triage(report, drift)
             return adapter if laid_out is None else _ChatAlertEditor(adapter, chat_id, thread_id, *laid_out)
+        if drift:
+            triage = drift_triage(triage, report)
         mrkdwn_fn = getattr(adapter, "format_message", None)
         fold_blocks = render_fold(report, mrkdwn_fn)
         if not fold_blocks:

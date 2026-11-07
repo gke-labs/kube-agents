@@ -453,16 +453,26 @@ def keys(failed_jobs):
     """What one failed attempt files under, as key -> the test ids behind it.
     Each key is one issue.
 
-    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps`
-    and `test_ids`. A job whose log names tests files under their containers
-    -- pooled across jobs, so two legs of a matrix failing the same test are
-    one flake, and two attempts failing different tests of one class are one
-    flake too. A job whose log names none files under its job and step, in
-    the same attempt as the others: a leg that died downloading is not the
-    same flake as the leg that failed a test. When one attempt names more
-    containers than MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not
-    the tests', and every job files under its name with the ids it named.
+    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps` and
+    `test_ids`. A job whose log names tests files under their containers --
+    pooled across jobs, so two legs of a matrix failing the same test are one
+    flake, and two attempts failing different tests of one class are one flake
+    too. A job whose log names none files under its job and step, in the same
+    attempt as the others: a leg that died downloading is not the same flake as
+    the leg that failed a test. One exception: a job with no matrix suffix that
+    names no test drops out when a matrix leg of the same name failed. That is
+    a join over its legs, such as `Run Python Unit Tests` over its `(shard k/3)`
+    shards, failing because a shard did; its log names no test, and filing it
+    would open an issue per failed join step on every shard failure. A failure
+    of the join's own, such as a coverage download, beside a failed shard drops
+    out with it: the tracker cannot tell it from the join steps that fail
+    because a shard did. A join that fails alone still files under its steps,
+    and so does a matrix leg that names no test beside one that does. When one
+    attempt names more containers than MAX_CONTAINERS_PER_ATTEMPT the failure
+    is the jobs', not the tests', and every job files under its name with the
+    ids it named.
     """
+
     with_ids = [job for job in failed_jobs if job["test_ids"]]
     without = [job for job in failed_jobs if not job["test_ids"]]
     ids = all_test_ids(with_ids)
@@ -473,6 +483,12 @@ def keys(failed_jobs):
     else:
         for key in containers:
             found[key] = [test_id for test_id in ids if container(test_id) == key]
+        failed_legs = {
+            MATRIX_SUFFIX.sub("", job["name"]) for job in failed_jobs if MATRIX_SUFFIX.search(job["name"])
+        }
+        without = [
+            job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in failed_legs
+        ]
     for job in without:
         for key in job_keys(job):
             found[key] = sorted(set(found.get(key, [])) | set(job["test_ids"]))
@@ -513,7 +529,7 @@ def occurrence(current, previous, pull_request, test_ids=()):
     issue can list every test the flake has surfaced through.
     `triggering_actor` on the green attempt is whoever clicked re-run, which
     on a re-run is a person -- unlike `actor`, which is who opened the pull
-    request or, on `main`, Tide. A re-run made by `/retest`
+    request or, on `main`, the merge queue's bot. A re-run made by `/retest`
     (`rerun_failed_checks.py`) carries the Actions bot here; the comment on
     the pull request names the person.
     """

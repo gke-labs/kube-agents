@@ -35,12 +35,21 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// consoleEnv is the container's env by name. A Downward API resource
+// reference is recorded as "resourceFieldRef:<resource>"; any other source
+// is an error, since the console takes its credential from a file, not the
+// environment.
 func consoleEnv(t *testing.T, c corev1.Container) map[string]string {
 	t.Helper()
 	env := map[string]string{}
 	for _, e := range c.Env {
 		if e.ValueFrom != nil {
-			t.Errorf("env %s comes from %+v; the console takes its credential from a file, not the environment", e.Name, e.ValueFrom)
+			if e.ValueFrom.ResourceFieldRef == nil {
+				t.Errorf("env %s comes from %+v; the console takes its credential from a file, not the environment", e.Name, e.ValueFrom)
+				continue
+			}
+			env[e.Name] = "resourceFieldRef:" + e.ValueFrom.ResourceFieldRef.Resource
+			continue
 		}
 		env[e.Name] = e.Value
 	}
@@ -83,11 +92,12 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"CONSOLE_BUS_URL":       "https://test-agent-a2a-nats.test-ns.svc:9222",
-		"CONSOLE_USER":          "console",
-		"CONSOLE_PASSWORD_FILE": "/var/run/secrets/a2a-console/console-password",
-		"CONSOLE_ALLOWED_HOSTS": "localhost:8080,127.0.0.1:8080",
-		"NATS_CA_FILE":          "/etc/a2a-nats-ca/ca.crt",
+		"CONSOLE_BUS_URL":                "https://test-agent-a2a-nats.test-ns.svc:9222",
+		"CONSOLE_USER":                   "console",
+		"CONSOLE_PASSWORD_FILE":          "/var/run/secrets/a2a-console/console-password",
+		"CONSOLE_ALLOWED_HOSTS":          "localhost:8080,127.0.0.1:8080",
+		"NATS_CA_FILE":                   "/etc/a2a-nats-ca/ca.crt",
+		"WEB_CONSOLE_MEMORY_LIMIT_BYTES": "resourceFieldRef:limits.memory",
 	}
 	if got := consoleEnv(t, c); !reflect.DeepEqual(got, want) {
 		t.Errorf("env = %v\nwant  %v", got, want)
@@ -97,6 +107,14 @@ func TestBuildA2AConsoleDeployment(t *testing.T) {
 	// the stored Deployment would never match the render.
 	if cpu := c.Resources.Requests.Cpu(); cpu.Cmp(resource.MustParse("50m")) < 0 {
 		t.Errorf("cpu request = %s, want at least 50m (GKE Autopilot raises anything lower on every apply)", cpu)
+	}
+	// Both limits, because a namespace ResourceQuota on limits.cpu or
+	// limits.memory refuses a pod with a container that declares neither (#3847).
+	if lim := c.Resources.Limits.Cpu(); lim.IsZero() || lim.Cmp(resource.MustParse(a2aConsoleCPULimit)) != 0 {
+		t.Errorf("cpu limit = %s, want %s (a limits.cpu quota refuses a container with none)", lim, a2aConsoleCPULimit)
+	}
+	if lim := c.Resources.Limits.Memory(); lim.IsZero() {
+		t.Errorf("memory limit unset; a limits.memory quota refuses a container with none")
 	}
 
 	if len(c.Ports) != 1 || c.Ports[0].ContainerPort != 8080 || c.Ports[0].Name != "http" {
@@ -367,4 +385,63 @@ func TestTheConsoleTrustsTheBusCA(t *testing.T) {
 	if !strings.HasPrefix(consoleEnv(t, c)[a2aConsoleEnvBusURL], "https://") {
 		t.Errorf("%s = %q, want https: the websocket listener serves TLS", a2aConsoleEnvBusURL, consoleEnv(t, c)[a2aConsoleEnvBusURL])
 	}
+}
+
+// The console is sized for GKE Autopilot without Pod bursting, which sets
+// each limit to its request: the pinned pair, both limits declared so a clamp
+// has a figure to clamp to, the requests inside the 1 to 6.5 GiB per vCPU
+// band Autopilot admits unchanged, and the memory limit handed to the binary
+// through the Downward API from the container's own limits.memory, so the Go
+// soft limit follows the admitted figure rather than a2aConsoleMemoryLimit.
+func TestTheConsoleIsSizedForAnAutopilotClamp(t *testing.T) {
+	c := buildA2AConsoleDeployment(a2aTestAgent()).Spec.Template.Spec.Containers[0]
+	want := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("100m"),
+			corev1.ResourceMemory: resource.MustParse("128Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("256Mi"),
+		},
+	}
+	if !reflect.DeepEqual(c.Resources, want) {
+		t.Errorf("resources = %+v, want %+v", c.Resources, want)
+	}
+	if err := autopilotRequestsBandCheck(c.Resources); err != nil {
+		t.Error(err)
+	}
+
+	var ref *corev1.ResourceFieldSelector
+	for _, e := range c.Env {
+		if e.Name == a2aConsoleMemoryLimitEnvVar && e.ValueFrom != nil {
+			ref = e.ValueFrom.ResourceFieldRef
+		}
+	}
+	if ref == nil || ref.Resource != "limits.memory" || ref.ContainerName != "" {
+		t.Errorf("%s = %+v, want a resourceFieldRef to this container's limits.memory", a2aConsoleMemoryLimitEnvVar, ref)
+	}
+}
+
+// autopilotRequestsBandCheck says whether the requests pair sits in the band
+// GKE Autopilot admits unchanged (autopilotMinMemoryBytesPerVCPU to
+// autopilotMaxMemoryBytesPerVCPU per vCPU), and whether each request is at
+// or under its limit, so a no-burst clamp of the limits onto the requests
+// leaves a pod the manifest describes.
+func autopilotRequestsBandCheck(r corev1.ResourceRequirements) error {
+	cpu, mem := r.Requests.Cpu(), r.Requests.Memory()
+	if cpu.IsZero() || mem.IsZero() {
+		return fmt.Errorf("requests = %+v, want both cpu and memory set", r.Requests)
+	}
+	perVCPU := mem.Value() * 1000 / cpu.MilliValue()
+	if perVCPU < autopilotMinMemoryBytesPerVCPU || perVCPU > autopilotMaxMemoryBytesPerVCPU {
+		return fmt.Errorf("requests %s CPU and %s memory are %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU GKE Autopilot admits unchanged",
+			cpu, mem, float64(perVCPU)/float64(bytesPerGiB), autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB))
+	}
+	for name, req := range r.Requests {
+		if lim, ok := r.Limits[name]; ok && req.Cmp(lim) > 0 {
+			return fmt.Errorf("the %s request %s is above its limit %s", name, req.String(), lim.String())
+		}
+	}
+	return nil
 }

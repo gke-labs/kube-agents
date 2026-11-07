@@ -10,8 +10,8 @@ watcher package) against the real server over a real socket.
 
 Skips when no Go toolchain is available, which makes a laptop without `go`
 report OK on four tests it never ran -- install one before you believe a green
-run here. CI's `test` job sets Go up for exactly that reason, since this tier
-gates from inside the `PYTHON_TEST_DIRS` sweep that job runs.
+run here. CI's `test-shard` jobs set Go up for exactly that reason, since this
+tier gates from inside the `PYTHON_TEST_DIRS` sweep those jobs run.
 """
 
 from __future__ import annotations
@@ -164,6 +164,10 @@ class InjectorKVSeamTest(unittest.TestCase):
                 env={
                     "PLATFORM_API_URL": "http://127.0.0.1:1",
                     "ALERT_DAILY_LIMIT_CRITICAL": "1",
+                    # The two injects name one workload, which the daemon folds
+                    # by default before the quota is asked; this test is about
+                    # the quota's answer, so folding is off.
+                    "INCIDENT_WORKLOAD_DEDUP_SECONDS": "0",
                 },
             )
             try:
