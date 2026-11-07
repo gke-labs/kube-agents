@@ -109,6 +109,8 @@ class SimulationTest(unittest.TestCase):
         self.run_sim("--retention-days", "3", "--days", "6")
         cutoffs = [c[2] for c in FakeSessionDB.pruned_with]
         self.assertEqual({86400.0}, {round(b - a, 3) for a, b in zip(cutoffs, cutoffs[1:])})
+        # The last simulated day ends at the run's wall clock, so its cut-off is three days before now.
+        self.assertAlmostEqual(cutoffs[-1], time.time() - 3 * 86400, delta=60)
         self.assertTrue(all(c[0] is None and c[1] is True for c in FakeSessionDB.pruned_with))
 
     def test_the_default_run_is_four_retentions_and_a_month(self):
@@ -151,6 +153,12 @@ class SimulationTest(unittest.TestCase):
         with patch.object(FakeSessionDB, "prune_sessions", prune):
             self.run_sim("--retention-days", "3", "--days", "6")
         self.assertTrue(all(stamp < sim.time.time() - sim.DAY / 4 for stamp in seen), seen)
+
+    def test_a_slack_or_out_path_that_would_fail_after_the_run_is_refused_first(self):
+        for bad in (["--slack", "nan"], ["--slack", "inf"], ["--slack", "0"], ["--out", "/nonexistent-dir/x.json"]):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit), patch("sys.stderr"):
+                self.sim.main(["--cards-per-day", "3", "--bytes-per-card", "2000", *bad])
+        self.assertEqual([], FakeSessionDB.pruned_with)
 
     def test_counts_below_one_are_refused_at_the_parser(self):
         for flag in ("--cards-per-day", "--messages-per-card", "--retention-days", "--bytes-per-card"):

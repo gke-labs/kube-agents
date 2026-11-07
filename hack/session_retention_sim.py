@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import shutil
@@ -105,6 +106,21 @@ def positive_int(value: str) -> int:
     if number < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, got {number}")
     return number
+
+
+def positive_finite(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive finite number, got {value}")
+    return number
+
+
+def writable_path(value: str) -> str:
+    """Checked before the run, so a mistyped path fails at once, not after minutes of simulation."""
+    parent = Path(value).expanduser().resolve().parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK):
+        raise argparse.ArgumentTypeError(f"cannot write to {parent}")
+    return value
 
 
 def text_of(rng: random.Random, nbytes: int) -> str:
@@ -237,7 +253,7 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--warmup-days", type=positive_int, default=5, help="days used to measure stored bytes per card"
     )
-    parser.add_argument("--slack", type=float, default=4.0)
+    parser.add_argument("--slack", type=positive_finite, default=4.0)
     parser.add_argument("--seed", type=int, default=3704)
     parser.add_argument(
         "--vacuum-over",
@@ -246,7 +262,9 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--hermes-src", help="a checkout of the pinned Hermes tag, if Hermes is not importable")
     parser.add_argument("--series", action="store_true", help="include the per-day series in the output")
-    parser.add_argument("--out", help="write the JSON here instead of stdout, which Hermes may also log to")
+    parser.add_argument(
+        "--out", type=writable_path, help="write the JSON here instead of stdout, which Hermes may also log to"
+    )
     args = parser.parse_args(argv)
     result = run(args)
     text = json.dumps(result, indent=1)
