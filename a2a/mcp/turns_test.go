@@ -1722,7 +1722,8 @@ func TestSendAndStreamStepKeepsStepStateOnTransientReadError(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("expected non-error degraded message when turn is running, got error: %s", res.Content[0].Text)
 	}
-	mustContain(t, res.Content[0].Text, "platform/task-transient-err", "reading it failed")
+	// The bridge (a2a/mcpbridge runningTaskRefRegex) reads this line as the turn still running.
+	mustContain(t, res.Content[0].Text, "\nTask `platform/task-transient-err` carries the turn, but reading it failed: ")
 
 	// Step state and watch must remain active for follow-up task_control get.
 	convs.mu.Lock()

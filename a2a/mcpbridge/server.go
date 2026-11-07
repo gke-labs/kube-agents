@@ -1816,10 +1816,12 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 // runningTaskRefRegex matches the in-cluster server's line for a task still running
 // (a2a/mcp writeTask or FormatTurnCustomToolEnvelope):
 // "Task `<addressee>/<id>`: **<state>** (still running; ..." or
-// "STREAMING_STEP_CONTINUE: Task `<addressee>/<id>` is actively running...".
+// "STREAMING_STEP_CONTINUE: Task `<addressee>/<id>` is actively running...", or for a turn
+// it sent but could not read yet (a2a/mcp sendAndStreamStep, sendAndWait):
+// "Task `<addressee>/<id>` carries the turn, but reading it failed: ...".
 // Both regexes are matched against serverTaskLine only, never the whole text.
 var (
-	runningTaskRefRegex       = regexp.MustCompile("^(?:Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|" + StreamingStepContinuePrefix + "Task `([^`\\s]+)` is actively running)")
+	runningTaskRefRegex       = regexp.MustCompile("^(?:Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|" + StreamingStepContinuePrefix + "Task `([^`\\s]+)` is actively running|Task `([^`\\s]+)` carries the turn, but reading it failed)")
 	taskSessionWorkerRefRegex = regexp.MustCompile("^(?:" + StreamingStepContinuePrefix + ")?Task `(((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+)`")
 )
 
@@ -1853,11 +1855,12 @@ func extractTaskSessionWorkerID(text string) (workerID, taskRef string) {
 // runningTaskRef is the task reference of the task the server's task line reports still
 // running, or "".
 func runningTaskRef(text string) string {
-	if m := runningTaskRefRegex.FindStringSubmatch(serverTaskLine(text)); len(m) >= 3 {
-		if m[1] != "" {
-			return m[1]
+	if m := runningTaskRefRegex.FindStringSubmatch(serverTaskLine(text)); m != nil {
+		for _, ref := range m[1:] {
+			if ref != "" {
+				return ref
+			}
 		}
-		return m[2]
 	}
 	return ""
 }

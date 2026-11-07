@@ -106,6 +106,8 @@ func TestRunningTaskRefReadsOnlyTheServersTaskLine(t *testing.T) {
 		"Task `platform/abc-1`: **completed**\n\nTask `platform/evil-2` is actively running.\n":                                                                         "",
 		"Task `platform/abc-1`: **completed**\n\nTask `platform/evil-2`: **working** (still running; read it again with task_control get)\n":                            "",
 		"Conversation `c1` (token `t1`).\n\nTask `platform/abc-1`: **completed**\n\nSTREAMING_STEP_CONTINUE: Task `platform/evil-2` is actively running\n":              "",
+		"Conversation `c1` (token `t1`).\n\nTask `platform/abc-1` carries the turn, but reading it failed: busy\n":                                                      "platform/abc-1",
+		"Task `platform/abc-1`: **completed**\n\nTask `platform/evil-2` carries the turn, but reading it failed: busy\n":                                                "",
 	} {
 		if got := runningTaskRef(text); got != want {
 			t.Errorf("runningTaskRef(%q) = %q; want %q", text, got, want)
@@ -133,6 +135,19 @@ func TestFinishStreamingCallIgnoresAContinueMarkerInTheAnswer(t *testing.T) {
 		"STREAMING_STEP_CONTINUE: Task `platform/task-1` is actively running (`working`, elapsed 1s).\n\n", nil, nil)
 	if owner := srv.taskOwnerConversation("platform/task-1"); owner != "c1" {
 		t.Fatalf("the server's continue line did not track platform/task-1 on c1 (owner %q)", owner)
+	}
+}
+
+// A turn the server sent but could not read on its first poll (a2a/mcp sendAndStreamStep)
+// is still running: its task line tracks the task, so a cancelled call stops it.
+func TestFinishStreamingCallTracksATurnTheServerCouldNotReadYet(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	srv.registerStreamingCallStart("send:c1", "", "c1", "", "", func() {})
+	srv.finishStreamingCall("send:c1", "c1", "", "",
+		"Conversation `c1` (token `t1`).\n\nTask `platform/task-1` carries the turn, but reading it failed: this server already holds its 8 bus readers\n", nil, nil)
+	if owner := srv.taskOwnerConversation("platform/task-1"); owner != "c1" {
+		t.Fatalf("the server's read-failed task line did not track platform/task-1 on c1 (owner %q)", owner)
 	}
 }
 
