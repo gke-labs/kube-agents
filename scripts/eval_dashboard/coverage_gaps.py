@@ -142,7 +142,7 @@ Nightly report: {nightly_url}
 
 **What the owner decides** (one pull request, approved by the eval crew)
 
-- **Seat a candidate:** move its line from `hack/eval/nightly-cases.txt` into `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`, delete the domain's `allowlist` entry in `docs/designs/domains.yaml`, and cite the record above.
+- **Seat a candidate:** move its line from `hack/eval/nightly-cases.txt` into `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`, delete the domain's `allowlist` entry in `docs/designs/domains.yaml`, and cite its record on the domain scorecard.
 - **Fix the demoted case** and restore its roster line the same way.
 - **Keep it held out** on the presubmit (docs/eval-gate-roster.md), with the allowlist entry kept and its exit condition named.
 
