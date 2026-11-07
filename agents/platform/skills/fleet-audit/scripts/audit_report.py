@@ -71,7 +71,7 @@ import tempfile
 import time
 import urllib.parse
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, NamedTuple
 
@@ -2375,6 +2375,35 @@ OKF_TITLE_KEY = "title"
 DECLARES_KEY = "declares"
 DECLARATION_ITEM_FIELDS = ("check", "namespace", "object")
 DECLARATION_CLUSTER_FIELD = "cluster"
+# An optional `expires:` on a `declares:` item: the last UTC calendar day the
+# declaration stands, as an ISO 8601 date. An acceptance with a date on it
+# lapses instead of being forgotten: from the next day the item matches
+# nothing, the posture publishes as a finding again, and the finding's block
+# names the file and the date so the owner renews the date there or
+# remediates. PyYAML reads a bare `2027-01-31` as a `date` and a quoted one
+# as a string, and the owner should not have to know which, so both file the
+# same entry; a time on the date, a day-first spelling, a short month or
+# prose is the owner's typo and skips the one item, as a bad `cluster` does.
+DECLARATION_EXPIRES_FIELD = "expires"
+DECLARATION_EXPIRES_FORMAT = "%Y-%m-%d"
+# How the format is named to an owner, in a warning or a validation error.
+DECLARATION_EXPIRES_FORMAT_HINT = "YYYY-MM-DD"
+# What `finish` writes on a finding an expired declaration covered, for the
+# renderer: the declaration's pointer fields and its `expires`. The validator
+# strips a worker's copy, as it strips the Config Connector stall fields.
+EXPIRED_DECLARATION_FIELD = "declaration_expired"
+# The line the finding's ledger block carries for it. The pointer and the
+# date go through the cell sanitiser, as the Declared intent table's do.
+EXPIRED_DECLARATION_LINE = (
+    "- **Declared intent expired:** `{where}` covered this posture until {expires}. "
+    "Renew its `expires:` date there, or remediate the posture."
+)
+# What the Declared intent row and the clean-run comment add after a
+# declaration that carries a date, so a reader sees the renewal day before
+# it lapses rather than after.
+DECLARED_UNTIL_SUFFIX = " (until {expires})"
+# How a stderr line names the namespace slot of a cluster-scoped object.
+UNNAMESPACED_LOCATION_LABEL = "(cluster)"
 NOTE_SUFFIX = ".md"
 # Linear on purpose: `text` runs to the end of the line and the closing
 # sequence (blanks and `#`) is trimmed afterwards. Giving the tail up lazily
@@ -5455,14 +5484,21 @@ def _scope_spelling_hint(
     return f" Did you mean {' or '.join(map(repr, entries))}?" if entries else ""
 
 
-def validate_findings(data: object, audit_id: str) -> dict:
+def validate_findings(data: object, audit_id: str, expiry_day: date | None = None) -> dict:
     """Validate a findings document. Raises one ValidationError naming every
     missing or empty string field by index, up to MAX_REPORTED_FINDINGS_ERRORS,
-    plus the first other problem it met; a single problem reads as before."""
+    plus the first other problem it met; a single problem reads as before.
+
+    `expiry_day` is the day a hand-written `declared[].declaration.expires`
+    is held against: `finish` passes the day its run started, so a note the
+    worker read that had already lapsed is refused on the day, and a `finish`
+    retried after midnight reads the same document the same way. Without it
+    the date is held to its format only, which is how `remediate` reopens a
+    document on a later day without the calendar turning it bad."""
     errors: list[str] = []
     token = _FIELD_ERRORS.set(errors)
     try:
-        result = _validate_findings_document(data, audit_id)
+        result = _validate_findings_document(data, audit_id, expiry_day=expiry_day)
     except ValidationError as exc:
         # A check that read a field already recorded as wrong repeats that
         # field ("'None' is not a check"); the recorded error is the real one.
@@ -5506,7 +5542,7 @@ def _repeats_a_recorded_field(message: str, recorded: list[str]) -> bool:
     )
 
 
-def _validate_findings_document(data: object, audit_id: str) -> dict:
+def _validate_findings_document(data: object, audit_id: str, expiry_day: date | None = None) -> dict:
     validate_audit_id(audit_id)
 
     if not isinstance(data, dict):
@@ -5793,6 +5829,9 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
         # worker's copy would state a Config Connector stall nobody read.
         finding.pop(KCC_STALLED_FINDING_FIELD, None)
         finding.pop(KCC_STALLED_PARAGRAPH_FIELD, None)
+        # Likewise the lapsed declaration `finish` reports against a finding,
+        # from `start`'s file: a worker's copy would name a note nobody read.
+        finding.pop(EXPIRED_DECLARATION_FIELD, None)
 
         # Which check produced this. Was implicit in the id's first segment,
         # which meant it was only ever as reliable as the id — and the id was
@@ -6199,6 +6238,30 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
                 f"{where}.declaration.excerpt",
                 allow_empty=False,
             )
+            if DECLARATION_EXPIRES_FIELD in declaration:
+                # Optional, one format, and — on the day the run started,
+                # when the caller names it — not in the past: a note whose
+                # date had lapsed when the worker read it justifies nothing,
+                # and the posture it covered is a finding until the owner
+                # renews or remediates. Held against the run's day rather
+                # than the clock, so a `finish` retried after midnight, or a
+                # `remediate` that reopens the document later (no day given),
+                # does not refuse a document that was right when written.
+                raw_expires = declaration[DECLARATION_EXPIRES_FIELD]
+                expires = parse_declaration_expiry(raw_expires)
+                if expires is None:
+                    raise ValidationError(
+                        f"{where}.declaration.{DECLARATION_EXPIRES_FIELD}: must be one date as "
+                        f"{DECLARATION_EXPIRES_FORMAT_HINT} (UTC) when present, got {raw_expires!r}"
+                    )
+                declaration[DECLARATION_EXPIRES_FIELD] = expires
+                if expiry_day is not None and declaration_expired(declaration, expiry_day):
+                    raise ValidationError(
+                        f"{where}.declaration.{DECLARATION_EXPIRES_FIELD}: the declaration expired "
+                        f"on {expires}, before this run started on {expiry_day.strftime(DECLARATION_EXPIRES_FORMAT)}, "
+                        "so it justifies nothing — write the posture under `findings`; the owner "
+                        "renews the date in the note, or remediates"
+                    )
             # Identity, on the same four fields as a finding, so that one
             # posture cannot be both. A worker that writes the finding *and*
             # the declaration has not decided, and the ledger would report the
@@ -8358,8 +8421,97 @@ def parse_declarations(
                 )
                 continue
             entry[DECLARATION_CLUSTER_FIELD] = cluster.strip()
+        if DECLARATION_EXPIRES_FIELD in item:
+            expires = parse_declaration_expiry(item[DECLARATION_EXPIRES_FIELD])
+            if expires is None:
+                log(
+                    f"WARNING: {item_where}: {DECLARATION_EXPIRES_FIELD} must be one date as "
+                    f"{DECLARATION_EXPIRES_FORMAT_HINT} (UTC) when present, got "
+                    f"{item[DECLARATION_EXPIRES_FIELD]!r}; skipped."
+                )
+                continue
+            # Filed as the date, not judged here: `finish` holds it to the
+            # day the run started (`run_start_day`), the same day it holds a
+            # hand-written entry to, so a file `start` wrote before midnight
+            # is read the same way after it.
+            entry[DECLARATION_EXPIRES_FIELD] = expires
         out.append(entry)
     return out
+
+
+def parse_declaration_expiry(value: object) -> str | None:
+    """`value` as the filed `expires` string, or None when it is not one calendar date.
+
+    A `date` is what PyYAML builds from a bare `2027-01-31`; a `datetime` is
+    what it builds from a bare timestamp, and is refused before the `date`
+    test because it is a subclass of it. A string must round-trip through the
+    format: `strptime` alone takes `2027-1-5`, and one spelling is the point.
+    """
+    if isinstance(value, datetime):
+        return None
+    if isinstance(value, date):
+        return value.strftime(DECLARATION_EXPIRES_FORMAT)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.strptime(text, DECLARATION_EXPIRES_FORMAT)
+    except ValueError:
+        return None
+    return text if parsed.strftime(DECLARATION_EXPIRES_FORMAT) == text else None
+
+
+def _today_utc() -> date:
+    """The calendar day a declaration's `expires` is held against."""
+    return datetime.now(timezone.utc).date()
+
+
+def declaration_expired(entry: dict, today: date | None = None) -> bool:
+    """Whether `entry`'s `expires` names a day before `today` (UTC).
+
+    A declaration stands through the day it names: an owner who writes the
+    last day of a review period means that day. An entry without the field,
+    or with one that is not a date, is not expired by this test; the filed
+    shape is `split_expired_declarations`' to refuse.
+    """
+    expires = parse_declaration_expiry(entry.get(DECLARATION_EXPIRES_FIELD))
+    if expires is None:
+        return False
+    return datetime.strptime(expires, DECLARATION_EXPIRES_FORMAT).date() < (today or _today_utc())
+
+
+def split_expired_declarations(
+    declarations: list[dict], today: date | None = None
+) -> tuple[list[dict], list[dict]]:
+    """`start`'s entries as `(standing, expired)`, each in the order filed.
+
+    The standing list is what every consumer of the file joins, shields or
+    declares from; the expired list is what `apply_declarations` reports
+    against a finding it would otherwise have moved. An entry whose filed
+    `expires` is not a date in the format is one `parse_declarations` never
+    wrote, so it is applied on neither side and said on stderr.
+    """
+    standing: list[dict] = []
+    expired: list[dict] = []
+    for entry in declarations:
+        raw = entry.get(DECLARATION_EXPIRES_FIELD)
+        if raw is not None and parse_declaration_expiry(raw) is None:
+            log(
+                f"WARNING: {entry.get('repo', '')}:{entry.get('path', '')}: filed "
+                f"{DECLARATION_EXPIRES_FIELD} {raw!r} is not a {DECLARATION_EXPIRES_FORMAT_HINT} "
+                "date; the entry is not applied."
+            )
+            continue
+        (expired if declaration_expired(entry, today) else standing).append(entry)
+    return standing, expired
+
+
+def _declaration_pointer_fields(match: dict) -> dict[str, str]:
+    """The `declaration` object a moved entry carries: `repo`, `path`, `excerpt`, and `expires` when the note has one."""
+    pointer = {field: str(match.get(field, "")) for field in DECLARATION_FIELDS}
+    if match.get(DECLARATION_EXPIRES_FIELD):
+        pointer[DECLARATION_EXPIRES_FIELD] = str(match[DECLARATION_EXPIRES_FIELD])
+    return pointer
 
 
 def _symlinked_component(tree: Path, relative: str) -> str | None:
@@ -8726,7 +8878,7 @@ def declare_collector_candidates(data: dict, declarations: list[dict], manifest:
                     if _is_cost_declarable(str(keyed.get("check", "")))
                     else f"{keyed.get('check', '')} on {keyed.get('object', '')}: a collector candidate the document did not report"
                 ),
-                "declaration": {field: str(match.get(field, "")) for field in DECLARATION_FIELDS},
+                "declaration": _declaration_pointer_fields(match),
             }
         )
         added.append(_shorten_id(identity))
@@ -8797,7 +8949,9 @@ def cost_declared_title(check: str, obj: str, severity: str, excerpt: str) -> st
     return f"{obj} — {check}, {grade}: {measured}" if measured else f"{obj} — {check}, {grade}"
 
 
-def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
+def apply_declarations(
+    data: dict, declarations: list[dict], expired: list[dict] | None = None
+) -> list[dict]:
     """Move each finding a declaration covers into `declared[]`; return the moved.
 
     The lookup is on the fields the owner wrote, compared case-blind as the
@@ -8814,18 +8968,30 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
 
     The moved entry is what the validator would have accepted from the model:
     the finding's identity and title, and the declaration's `repo`, `path`
-    and `excerpt`. Run after `validate_findings`, on a document whose findings
-    already carry their derived ids, so the caller can name what moved.
+    and `excerpt`, with its `expires` when the note carries one. Run after
+    `validate_findings`, on a document whose findings already carry their
+    derived ids, so the caller can name what moved.
+
+    An entry whose `expires` has passed moves nothing. A finding it would
+    have covered, and no standing entry does, stays a finding and gains
+    `EXPIRED_DECLARATION_FIELD` — the lapsed note's pointer and date — which
+    the ledger block prints beside it, so the owner renews the date in the
+    note or remediates; a standing note for the same posture wins outright,
+    and the lapsed one is not reported against it.
+
+    `declarations` is `start`'s file as read, and the split is made here; a
+    caller that has already split it (`join_harness_declarations`, which
+    hands the standing half on to the manifest route and the shields) passes
+    the standing half as `declarations` and the lapsed half as `expired`, so
+    the file is split, and the calendar read, once per run.
     """
-    if not declarations:
+    if expired is None:
+        declarations, expired = split_expired_declarations(declarations)
+    if not declarations and not expired:
         return []
     declarable = audit_declarable_checks(str(data.get("audit") or ""))
-    scoped: dict[tuple, dict] = {}
-    fleet_wide: dict[tuple, dict] = {}
-    for entry in declarations:
-        has_cluster = bool(entry.get(DECLARATION_CLUSTER_FIELD))
-        target = scoped if has_cluster else fleet_wide
-        target.setdefault(_declaration_key(entry, with_cluster=has_cluster), entry)
+    scoped, fleet_wide = _declaration_lookup(declarations)
+    expired_scoped, expired_fleet_wide = _declaration_lookup(expired)
     declared = list(data.get("declared") or [])
     already = {derive_finding_id(entry) for entry in declared}
     kept: list[dict] = []
@@ -8837,6 +9003,19 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
             match = scoped.get(_declaration_key(finding, with_cluster=True)) or fleet_wide.get(
                 _declaration_key(finding, with_cluster=False)
             )
+        if match is None and expired and derive_finding_id(finding) not in already:
+            # The same shape rules as a standing match, applied silently: a
+            # lapsed note is reported only against a posture it did cover.
+            lapsed = _declaration_covers(finding, expired_scoped, expired_fleet_wide, declarable)
+            if lapsed is not None:
+                finding[EXPIRED_DECLARATION_FIELD] = _declaration_pointer_fields(lapsed)
+                log(
+                    f"DECLARATION EXPIRED: {finding.get('id', '')} — {check} on "
+                    f"{finding.get('cluster', '')}/{finding.get('namespace') or UNNAMESPACED_LOCATION_LABEL}/"
+                    f"{finding.get('object', '')} was declared at {lapsed.get('repo', '')}:"
+                    f"{lapsed.get('path', '')} until {lapsed.get(DECLARATION_EXPIRES_FIELD, '')}; "
+                    "the declaration has expired and the finding publishes."
+                )
         if (
             match is not None
             and check == DUAL_SHAPE_CHECK
@@ -8890,9 +9069,7 @@ def apply_declarations(data: dict, declarations: list[dict]) -> list[dict]:
                     if _is_cost_declarable(check)
                     else str(finding.get("title", ""))
                 ),
-                "declaration": {
-                    field: str(match.get(field, "")) for field in DECLARATION_FIELDS
-                },
+                "declaration": _declaration_pointer_fields(match),
             }
         )
         moved.append(finding)
@@ -11641,6 +11818,16 @@ def render_finding(
                 )
         if blocked_by:
             lines.append(_blocked_note(fid, blocked_by, noun))
+    lapsed = finding.get(EXPIRED_DECLARATION_FIELD)
+    if isinstance(lapsed, dict):
+        # Beside the identity lines, where the reader decides what to do
+        # with the finding: the note that covered it, and until when.
+        _, where = _declared_pointer({"declaration": lapsed})
+        lines.append(
+            EXPIRED_DECLARATION_LINE.format(
+                where=where, expires=_cell(str(lapsed.get(DECLARATION_EXPIRES_FIELD, "")))
+            )
+        )
     lines.append("")
 
     evidence = finding.get("evidence") or {}
@@ -12951,6 +13138,12 @@ def _declared_pointer(entry: dict) -> tuple[str, str]:
     return _cell(obj), _cell(where, limit=MAX_IDENT_CHARS)
 
 
+def _declared_until(entry: dict) -> str:
+    """` (until <date>)` for a `declared[]` entry whose declaration carries `expires`, else empty."""
+    expires = _cell(str((entry.get("declaration") or {}).get(DECLARATION_EXPIRES_FIELD, "") or ""))
+    return DECLARED_UNTIL_SUFFIX.format(expires=expires) if expires else ""
+
+
 def _render_declared(declared: list[dict]) -> list[str]:
     """The postures a check would have flagged and a linked repository declares.
 
@@ -12983,6 +13176,7 @@ def _render_declared(declared: list[dict]) -> list[str]:
         what = _cell(str(entry.get("title", "")))
         if excerpt:
             what = f"{what}: `{excerpt}`"
+        what += _declared_until(entry)
         out.append(
             f"| `{_cell(str(entry.get('check', '')))}` "
             f"| `{_cell(str(entry.get('cluster', '')))}` "
@@ -13660,7 +13854,7 @@ def _comment_declared(data: dict) -> list[str]:
         obj, where = _declared_pointer(entry)
         out.append(
             f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
-            f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
+            f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`{_declared_until(entry)}"
         )
     if len(declared) > MAX_DECLARED_ROWS:
         out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
@@ -17975,14 +18169,37 @@ def join_harness_declarations(
     derived ones.
     """
     fold_searched_record(data, record)
-    declarations = read_declarations(audit_id, repo=repo)
-    moved = apply_declarations(data, declarations)
-    from_manifest = declare_collector_candidates(data, declarations, manifest)
-    shielded = shield_declared_account_siblings(data, declarations, manifest)
-    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(declarations)
+    # Split once, against the day the run started — the same day the
+    # validator holds a hand-written `declaration.expires` to — so one
+    # `finish`, or a later `remediate`, gives a date one answer whichever
+    # route filed it, and a retry after midnight reads the run as the run.
+    # The join reports a lapsed entry against the finding it covered; the
+    # manifest route and the shields read only the standing ones.
+    standing, expired = split_expired_declarations(
+        read_declarations(audit_id, repo=repo), today=run_start_day(audit_id)
+    )
+    moved = apply_declarations(data, standing, expired=expired)
+    from_manifest = declare_collector_candidates(data, standing, manifest)
+    shielded = shield_declared_account_siblings(data, standing, manifest)
+    return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(standing)
 
 
-def load_findings(path: str, audit_id: str, command: str | None = None) -> dict:
+def run_start_day(audit_id: str) -> date:
+    """The UTC day this stream's run started, from `start`'s record; today when there is none.
+
+    What `finish` holds a hand-written `declared[].declaration.expires`
+    against (`validate_findings`): the worker read the note on the run's
+    day, so that is the day a lapsed date is judged on, whatever day the
+    document is reopened.
+    """
+    record = read_run_record(audit_id)
+    started = parse_gh_timestamp(record.get(RUN_RECORD_STARTED_KEY)) if isinstance(record, dict) else None
+    return started.date() if started is not None else _today_utc()
+
+
+def load_findings(
+    path: str, audit_id: str, command: str | None = None, expiry_day: date | None = None
+) -> dict:
     findings_file = Path(path)
     if not findings_file.is_file():
         if command == "finish" and audit_id in COLLECTOR_AUDITS:
@@ -18008,7 +18225,7 @@ def load_findings(path: str, audit_id: str, command: str | None = None) -> dict:
             f"--manifest-file {path} --out <findings file>`, fill each recommendation, then give "
             "that file as --findings-file and the manifest as --manifest-file."
         )
-    return validate_findings(data, audit_id)
+    return validate_findings(data, audit_id, expiry_day=expiry_day)
 
 
 def remediation_file_problem(
@@ -23414,7 +23631,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
     set_sweep_waived(getattr(args, "no_promote", False))
-    data = load_findings(args.findings_file, audit_id, command="finish")
+    data = load_findings(args.findings_file, audit_id, command="finish", expiry_day=run_start_day(audit_id))
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
         raise ValidationError(
