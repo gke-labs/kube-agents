@@ -112,6 +112,10 @@ var (
 	// and name the field in that pod's Warning.
 	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageExecTierCounters are the broker counters the exec tier's pods move:
+	// the commands they run, refuse or fail. The version-control counters are
+	// the stateful broker's alone, because /v1/vcs is not served on an exec pod.
+	usageExecTierCounters = []string{usageCounterToolExecutions, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
 	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
 	// usageRetiredCounters are the counters an earlier release kept and this

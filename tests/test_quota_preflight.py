@@ -42,6 +42,7 @@ _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 
 _HELM = shutil.which("helm")
+_EXEC_VALUE = "platformAgent.deployment.credentialProxy.exec.replicas"
 
 _PROBE_TEMPLATE = """
 {{- if .Values.probe.emitRequirements }}
@@ -306,6 +307,67 @@ class PreflightDecisionTest(unittest.TestCase):
         with self._chart_without("platform-agent-cr.yaml"):
             req = self._requirements(["platformAgent.storage.size=9Ei"])
         self.assertEqual(req["requestsStorage"], 2**63 - 1)
+
+    def test_exec_tier_replicas_add_one_replica_each(self) -> None:
+        """platformAgent.deployment.credentialProxy.exec.replicas adds that many exec-tier
+        pods, each at the footprint's per-replica entry (2 CPU and 2Gi requests and limits,
+        and the broker's ephemeral storage); 0 adds nothing."""
+        base = self._requirements()
+        self.assertEqual(self._requirements([f"{_EXEC_VALUE}=0"]), base)
+        three = self._requirements([f"{_EXEC_VALUE}=3"])
+        per = yaml.safe_load(_FOOTPRINT.read_text())["operatorRenderedPerReplica"]["credentialProxyExecTier"]
+        for key, field in (("pods", "pods"), ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+                           ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+                           ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+                           ("limitsEphemeral", "ephemeralStorageBytesLimit")):
+            self.assertEqual(three[key] - base[key], 3 * per[field], key)
+        self.assertEqual(per["cpuMillisRequest"], 2000)
+        self.assertEqual(three["persistentVolumeClaims"], base["persistentVolumeClaims"])
+
+    def test_exec_tier_follows_a_broker_ephemeral_storage_override(self) -> None:
+        """The operator gives the tier the broker's other resource keys, so a broker
+        ephemeral-storage limit moves every replica (request and limit, as the API server
+        defaults the request to it); the tier's cpu and memory do not move with a cpu or
+        memory override."""
+        ten_gib = 10 * 1024**3
+        override = [f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
+        base = self._requirements(override)
+        three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        cpu_override = [f"{_PROXY_VALUE}.limits.cpu=3", f"{_PROXY_VALUE}.limits.memory=4Gi"]
+        cpu_base = self._requirements(cpu_override)
+        cpu_three = self._requirements(cpu_override + [f"{_EXEC_VALUE}=3"])
+        self.assertEqual(cpu_three["limitsCpu"] - cpu_base["limitsCpu"], 3 * 2000)
+        self.assertEqual(cpu_three["limitsMemory"] - cpu_base["limitsMemory"], 3 * 2 * 1024**3)
+
+    def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
+        footprint = self.chart / "files" / "footprint.yaml"
+        original = footprint.read_text()
+        try:
+            data = yaml.safe_load(original)
+            data.pop("operatorRenderedPerReplica")
+            footprint.write_text(yaml.safe_dump(data))
+            self.assertEqual(self._render({"probe": {"emitRequirements": True}}).returncode, 0)
+            res = self._render({"probe": {"emitRequirements": True}}, [f"{_EXEC_VALUE}=1"])
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("operatorRenderedPerReplica.credentialProxyExecTier", res.stderr)
+        finally:
+            footprint.write_text(original)
+
+    def test_exec_tier_replicas_that_do_not_fit_the_quota_fail_the_render(self) -> None:
+        base = self._requirements()
+        # Room for exactly one exec-tier replica's CPU request above the release.
+        room = _format_cpu(base["requestsCpu"] + 2000)
+        quota = [{
+            "metadata": {"name": "cpu-quota"},
+            "spec": {"hard": {"requests.cpu": room}},
+            "status": {"hard": {"requests.cpu": room}, "used": {"requests.cpu": "0"}},
+        }]
+        self.assertEqual(self._render({"probe": {"quotas": quota}}, [f"{_EXEC_VALUE}=1"]).returncode, 0)
+        refused = self._render({"probe": {"quotas": quota}}, [f"{_EXEC_VALUE}=2"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("requests.cpu", refused.stderr)
 
     def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
         """The one key an install raises moves limits.memory by its difference and nothing else.

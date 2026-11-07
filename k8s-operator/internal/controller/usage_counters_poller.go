@@ -940,6 +940,10 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
 		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		// The exec tier's pods, which run the commands the callers send there.
+		// Its selector matches no pod while the tier is off, and an exec pod
+		// serves none of the broker's readings.
+		{credentialProxyExecTierSelector(agent), usageExecTierCounters, nil, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
