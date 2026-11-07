@@ -498,12 +498,13 @@ GREETING_WAIT_SECONDS = 300
 # set). The wait is what tells "nobody yet" from "nobody": a chat install's
 # first message usually comes within hours of install, and a report filed as an
 # issue before it would pre-empt the thread it was written for.
-UNSPOKEN_FILE_AFTER_SECONDS = 24 * 60 * 60
+SECONDS_PER_DAY = 24 * 60 * 60
+UNSPOKEN_FILE_AFTER_SECONDS = 1 * SECONDS_PER_DAY
 # Past this age the plugin primes nothing (bootstrap_onboarding
 # SCAN_MAX_AGE_SECONDS), so no thread can ever take the report: a run that
 # finds it still undelivered claims it without posting and lets the scheduled
 # audits, which by then say more, stand in. Pinned equal by a test.
-UNDELIVERED_RETIRE_SECONDS = 7 * 24 * 60 * 60
+UNDELIVERED_RETIRE_SECONDS = 7 * SECONDS_PER_DAY
 # The ledger issue: found again by its label and body marker, so a run that
 # died between the create and its record reuses the issue rather than opening
 # a second. The label mirrors chat_delivery_watch's, which the same broker
@@ -525,12 +526,20 @@ REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
 REPORT_FILED_FILE = ".bootstrap_report_filed"
 FILED_REPO = "repo"
 FILED_NUMBER = "number"
+FILED_URL = "url"
 FILED_AT = "filed_at"
-# The one line that goes to the home channel once the issue is up. ``a2a notify``
-# exits NOTIFY_KEPT when the gateway kept it for its digest, which is delivery
+# The issue's web address when the broker's answer carries none: github.com for
+# an `owner/name` slug, the named host for a GitHub Enterprise Server
+# `host/owner/name` one (gitops_workspace.get_managed_github_repo_names).
+ISSUE_URL_FORMAT = "https://{host}/{slug}/issues/{number}"
+ISSUE_URL_DEFAULT_HOST = "github.com"
+# The one line that goes to the home channel once the issue is up: a link, so a
+# reader opens the report from the message (chat_ux.md, no plumbing in user
+# text), and the user's own fact rather than the stage's. ``a2a notify`` exits
+# NOTIFY_KEPT when the gateway kept it for its digest, which is delivery
 # enough: the digest names it, dated, once a home channel is set.
 REPORT_ISSUE_HOME_POST = (
-    "First-run inventory report: no chat thread took it, so it is filed as {ref} ({date} UTC)."
+    "First-run inventory report filed at {url}: nobody had written to me in chat since the sweep ({date} UTC)."
 )
 # The reasons this path records (CONVERSATION_ATTEMPTS_FILE), one per tick at most.
 NO_LEDGER_REPO_REASON = (
@@ -546,6 +555,8 @@ REPORT_RETIRED_NOTE = (
     "the scheduled audits stand in for it"
 )
 REPORT_FILED_NOTE = "the first-run report went to {ref}: no chat thread took it"
+REPORT_FILING_FAILED_REASON = "filing the first-run report in {repo} failed: {error!r}"
+LEDGER_REPO_UNREADABLE_REASON = "the managed repositories could not be read: {error}; the first-run report waits"
 REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
 HOME_LINE_POSTED = "was posted"
 HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
@@ -1887,12 +1898,13 @@ def _filed_record(data_dir: Path) -> dict:
     return record if isinstance(record, dict) else {}
 
 
-def _record_filed(data_dir: Path, repo: str, number: int) -> None:
+def _record_filed(data_dir: Path, repo: str, number: int, url: str) -> None:
     target = data_dir / REPORT_FILED_FILE
     tmp = target.with_name(target.name + ".tmp")
     try:
         tmp.write_text(
-            json.dumps({FILED_REPO: repo, FILED_NUMBER: number, FILED_AT: time.time()}, sort_keys=True) + "\n",
+            json.dumps({FILED_REPO: repo, FILED_NUMBER: number, FILED_URL: url, FILED_AT: time.time()}, sort_keys=True)
+            + "\n",
             encoding="utf-8",
         )
         tmp.replace(target)
@@ -1904,29 +1916,51 @@ def _utc(stamp: float) -> str:
     return datetime.fromtimestamp(stamp, timezone.utc).strftime(REPORT_ISSUE_DATE_FMT)
 
 
-def _existing_report_issue(repo: str) -> int | None:
-    """The open issue a run before this one filed the report as, by label and marker, or None."""
+def _issue_url(repo: str, number: int, issue: dict) -> str:
+    """The issue's web address: the broker's, or built from the slug when the answer carries none."""
+    for key in ("html_url", "url"):
+        value = issue.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    host, slash, rest = repo.partition("/")
+    if slash and "/" in rest:  # host/owner/name
+        return ISSUE_URL_FORMAT.format(host=host, slug=rest, number=number)
+    return ISSUE_URL_FORMAT.format(host=ISSUE_URL_DEFAULT_HOST, slug=repo, number=number)
+
+
+def _existing_report_issue(repo: str) -> tuple[int, str] | None:
+    """The open issue a run before this one filed the report as, by label and marker, or None.
+
+    An entry without a usable number is skipped rather than raised on: the listing is the
+    broker's, and one odd row must not hold the report.
+    """
     answer = forge.call(
         "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
     )
-    numbers = [
-        int(issue["number"])
-        for issue in answer.get("issues") or []
-        if isinstance(issue, dict) and REPORT_ISSUE_MARKER in str(issue.get("body") or "")
-    ]
-    return max(numbers) if numbers else None
+    found: list[tuple[int, dict]] = []
+    for issue in answer.get("issues") or []:
+        if not isinstance(issue, dict) or REPORT_ISSUE_MARKER not in str(issue.get("body") or ""):
+            continue
+        try:
+            found.append((int(issue.get("number")), issue))
+        except (TypeError, ValueError):
+            continue
+    if not found:
+        return None
+    number, issue = max(found, key=lambda pair: pair[0])
+    return number, _issue_url(repo, number, issue)
 
 
-def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> int:
-    """Open the ledger issue holding the report (or reuse the one already open) and return its number.
+def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> tuple[int, str]:
+    """Open the ledger issue holding the report (or reuse the one already open): its number and URL.
 
     Raises ``forge.ForgeError`` when the broker refuses. The label is best effort: the issue is
     worth opening without it, and a repository whose labels this credential may not touch is not
     a reason to hold the report.
     """
-    number = _existing_report_issue(repo)
-    if number is not None:
-        return number
+    existing = _existing_report_issue(repo)
+    if existing is not None:
+        return existing
     with contextlib.suppress(forge.ForgeError):
         forge.call(
             "label-ensure",
@@ -1937,13 +1971,17 @@ def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> int
     title = REPORT_ISSUE_TITLE.format(date=date)
     text = "\n".join([REPORT_ISSUE_MARKER, REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body])
     answer = forge.call("issue-create", {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]}, repo)
-    number = int((answer.get("issue") or {}).get("number") or 0)
+    issue = answer.get("issue") if isinstance(answer.get("issue"), dict) else {}
+    try:
+        number = int(issue.get("number") or 0)
+    except (TypeError, ValueError):
+        number = 0
     if not number:
         raise forge.ForgeError(forge.REASON_UNREACHABLE, "issue-create answered with no issue number")
-    return number
+    return number, _issue_url(repo, number, issue)
 
 
-def _post_home_line(data_dir: Path, ref: str, now: float) -> None:
+def _post_home_line(data_dir: Path, url: str, now: float) -> None:
     """One line naming the filed report, to the platform whose home posts route through the gateway.
 
     After the claim and the issue, so best effort: the issue is the record. ``NOTIFY_KEPT`` is
@@ -1952,7 +1990,7 @@ def _post_home_line(data_dir: Path, ref: str, now: float) -> None:
     platform = chat_notify.routed_platform()
     if not platform:
         return
-    text = REPORT_ISSUE_HOME_POST.format(ref=ref, date=_utc(now))
+    text = REPORT_ISSUE_HOME_POST.format(url=url, date=_utc(now))
     argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
     # A route that is not there right now (a gateway roll) is waited out as
     # the conversation path waits it out; one that stays away is a log line.
@@ -1982,7 +2020,7 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
     """Claim the report without posting it and set it aside; the later run's retire removes the jobs."""
     if not _claim_delivery(data_dir):
         return 0
-    _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // (24 * 60 * 60)))
+    _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // SECONDS_PER_DAY))
     _cleanup(data_dir, in_sandbox)
     return 0
 
@@ -2009,6 +2047,9 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, filed_at: float, now:
         repo = _ledger_repo()
     except LedgerRepoAmbiguous as e:
         _record_attempt(data_dir, str(e), counted=False)
+        return 0
+    except Exception as e:  # noqa: BLE001 - an unreadable mount is a recorded reason, not a tick-long traceback
+        _record_attempt(data_dir, LEDGER_REPO_UNREADABLE_REASON.format(error=e), counted=False)
         return 0
     if repo is None:
         _record_attempt(data_dir, NO_LEDGER_REPO_REASON, counted=False)
@@ -2040,19 +2081,41 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, filed_at: float, now:
 
     if not _claim_delivery(data_dir):
         return 0
+    # Anything that escapes between the claim and the record releases the claim: on this path
+    # ``delivery_settled`` is true the moment the claim exists, so a held claim with no record
+    # would retire the jobs with the report unfiled.
     try:
-        number = _file_report_issue(repo, body, filed_at, now)
+        number, url = _file_report_issue(repo, body, filed_at, now)
     except forge.ForgeError as e:
         _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True)
         _release_claim(data_dir)
         return 0
+    except Exception as e:  # noqa: BLE001 - see above; the next tick retries after the wait
+        _record_attempt(data_dir, REPORT_FILING_FAILED_REASON.format(repo=repo, error=e), counted=True)
+        _release_claim(data_dir)
+        return 0
     ref = f"{repo}#{number}"
-    _record_filed(data_dir, repo, number)
+    _record_filed(data_dir, repo, number, url)
     _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
     shown = _mark_shown(files, suppressed)
     _cleanup(data_dir, in_sandbox, shown)
-    _post_home_line(data_dir, ref, now)
+    _post_home_line(data_dir, url, now)
     return 0
+
+
+def _someone_is_here(data_dir: Path) -> bool:
+    """Whether a human has reached the install, whatever the greeting hold says.
+
+    The plugin binds the conversation and writes its hold before the aligned marker, and drops
+    the hold only once the greeting is on its way; ``_awaiting_delivery`` is False through all of
+    that. None of it is "nobody": the report belongs to that person's thread.
+    """
+    return (
+        (data_dir / ".user_aligned").exists()
+        or (data_dir / CONVERSATION_ALIGNED_MARKER).exists()
+        or _bound_conversation(data_dir) is not None
+        or _greeting_pending(data_dir)
+    )
 
 
 def _deliver_without_thread(data_dir: Path) -> int:
@@ -2060,6 +2123,8 @@ def _deliver_without_thread(data_dir: Path) -> int:
 
     Counted from when the sweep was filed, the one stamp the plugin's own age rule reads too.
     """
+    if _someone_is_here(data_dir):
+        return 0  # a human's thread takes the report once the greeting is out
     filed = oobe.scan_filed(data_dir)
     if filed is None:
         return 0  # the scan has not started

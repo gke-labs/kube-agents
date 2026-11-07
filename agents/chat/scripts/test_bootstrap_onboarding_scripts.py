@@ -1939,7 +1939,8 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         argv = self.runs[0]
         self.assertEqual(argv[:4], [chat_notify.A2A_CLI, "notify", "--platform", "slack"])
         self.assertNotIn("--thread", argv)
-        self.assertIn(f"{self.REPO}#42", argv[-1])
+        self.assertIn(f"https://github.com/{self.REPO}/issues/42", argv[-1], "a link, not a slug")
+        self.assertEqual(record["url"], f"https://github.com/{self.REPO}/issues/42")
         self.assertIn(bootstrap_delivery.REPORT_FILED_NOTE.format(ref=f"{self.REPO}#42"), self._note_texts())
         self.assertIn(
             bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
@@ -2023,6 +2024,61 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(self._main(), 0)
         self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list"])
         self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 7)
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["url"], f"https://github.com/{self.REPO}/issues/7")
+
+    def test_the_brokers_url_wins_and_a_ghes_slug_builds_its_own(self):
+        self.forge_answers["issue-create"] = {"issue": {"number": 42, "html_url": "https://ghe.example.com/x/y/issues/42"}}
+        self.assertEqual(bootstrap_delivery._issue_url(self.REPO, 42, {"html_url": "https://ghe.example.com/x/y/issues/42"}),
+                         "https://ghe.example.com/x/y/issues/42")
+        self.assertEqual(bootstrap_delivery._issue_url("ghe.example.com/acme/fleet", 3, {}),
+                         "https://ghe.example.com/acme/fleet/issues/3")
+        self.assertEqual(bootstrap_delivery._issue_url("acme/fleet", 3, {"url": "not a url"}),
+                         "https://github.com/acme/fleet/issues/3")
+
+    def test_an_odd_listing_row_is_skipped_not_raised(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [{"number": None, "body": bootstrap_delivery.REPORT_ISSUE_MARKER}, {"body": bootstrap_delivery.REPORT_ISSUE_MARKER}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_unexpected_error_after_the_claim_releases_it(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery, "_file_report_issue", side_effect=KeyError("number")):
+            self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "the claim is released, not held with nothing filed")
+        self.assertTrue((self.d / INVENTORY).exists())
+        record = bootstrap_delivery._read_attempts(self.d)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
+
+    def test_an_unreadable_repository_list_is_a_reason_not_a_traceback(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery.gitops_workspace, "get_managed_github_repo_names",
+                               side_effect=RuntimeError("mount unreadable")):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("mount unreadable", bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+
+    def test_a_human_mid_greeting_is_not_nobody(self):
+        """The plugin writes its greeting hold before the aligned marker; neither is the ledger path's cue."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / ALIGNED).touch()
+        (self.d / ".bootstrap_greeting_pending.turn-1").touch()
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [], "the thread takes the report once the greeting is out")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_a_bound_conversation_without_its_marker_yet_is_not_nobody(self):
+        """Under next the plugin writes the conversation file, then the hold, then the marker."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
 
     def test_a_refused_create_releases_the_claim_and_waits(self):
         self._filed(self.DAY + self.HOUR)
@@ -2052,6 +2108,9 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
         self.assertEqual(bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, plugin.SCAN_MAX_AGE_SECONDS)
+        self.assertEqual(bootstrap_delivery.REPORT_FILED_FILE, plugin.REPORT_FILED_MARKER)
+        self.assertEqual(bootstrap_delivery.FILED_URL, plugin.REPORT_FILED_URL_KEY)
+        self.assertEqual(bootstrap_delivery.FILED_AT, plugin.REPORT_FILED_AT_KEY)
         self.assertLess(bootstrap_delivery.UNSPOKEN_FILE_AFTER_SECONDS, bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS)
 
     def test_a_human_who_speaks_first_still_gets_the_thread(self):

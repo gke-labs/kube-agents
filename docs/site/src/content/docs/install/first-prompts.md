@@ -15,7 +15,7 @@ This is the install check. The answer shows that the agent has the scope it was 
 
 What the thread shows, in order:
 
-1. **A greeting around the answer.** The first message anyone sends a new install is also its onboarding: the agent answers the ask, then introduces itself in two sentences. Later, when the first-run inventory scan has finished, its ranked report is posted into this same thread. [First-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) describes each stage.
+1. **A greeting around the answer.** The first message anyone sends a new install is also its onboarding: the agent answers the ask, then introduces itself in two sentences. Later, when the first-run inventory scan has finished, its ranked report is posted into this same thread, provided that first message comes within a day of the sweep. After that the report is an issue in the GitOps repository, and the greeting points at it instead. [First-run onboarding](/kube-agents/concepts/chatops/#first-run-onboarding) describes each stage.
 2. **One short line naming what is being checked**, such as `checking all 5 clusters.` The Planning Agent has filed the work as a card for the Platform Agent; [how a chat question is answered under `next`](/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through the status line and the card.
 3. **The result, as its own message.** One bold sentence gives the verdict, then one row per cluster: name, location, status, whether the agent could reach it, control-plane version, node count. On a one-cluster install the table has one row, the cluster kube-agents runs on, because the scope includes the management cluster unless the `PlatformAgent` excludes it.
 

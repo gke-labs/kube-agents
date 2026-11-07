@@ -415,6 +415,28 @@ class PreLlmCallTest(unittest.TestCase):
 
     # --- one-time means one time ----------------------------------------
 
+    def test_a_first_turn_after_the_report_was_filed_points_at_the_issue_once(self):
+        """Nobody wrote within a day, so the delivery stage filed the report as an issue and
+        claimed delivery; the first human after that gets the link, not a report that is not coming."""
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"repo": "acme/fleet", "number": 75, "url": "https://github.com/acme/fleet/issues/75",
+                        "filed_at": 1794003335.0}), encoding="utf-8")
+        first = self._call()
+        self.assertIsNotNone(first)
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertIn("REPORT FILED", first["context"])
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+        self.update_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists(), "nothing is bound: the report is in the issue")
+        self.assertIsNone(self._call(), "once")
+
+    def test_a_filed_record_without_an_address_changes_nothing(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(json.dumps({"repo": "acme/fleet", "number": 75}), encoding="utf-8")
+        self.assertIsNone(self._call())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
     def test_greets_only_once_across_sessions(self):
         """Every new session opens with is_first_turn=True.
 

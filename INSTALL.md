@@ -1328,7 +1328,11 @@ and ranks the findings. The ranked report is posted once, into the thread of the
 someone sends the bot in Google Chat or Slack
 ([Step 5](#step-5-enable-google-chat--slack-integrations-manual-required-steps)), after the report
 is ready. A `kubectl exec` session ([Step 6](#step-6-talk-to-the-agent-with-no-chat-platform)) does
-not receive it; with no chat platform enabled, read it from the sandbox once it is written. After
+not receive it; with no chat platform enabled, read it from the sandbox once it is written, within
+a day: when nobody has written to the agent in chat a day after the sweep, the report is filed as an
+issue labelled `agent:onboarding` in the GitOps repository instead (a week after it with no
+repository, it is retired in favour of the scheduled audits), as
+[the onboarding design](docs/designs/oobe.md#3-onboarding-before-the-fold-for-reference) describes. After
 a delivery run the file is renamed `INVENTORY.delivered.md`.
 
 ```bash

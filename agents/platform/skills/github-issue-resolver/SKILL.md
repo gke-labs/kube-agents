@@ -9,11 +9,12 @@ description:
 
 > [!CAUTION] **INVIOLABLE SAFETY RED LINE:** NEVER inspect, comment on, edit,
 > close, or modify any issue labeled `status:escalation-needed`, `agent:ignore`,
-> `agent:audit`, `agent:delivery-watch`, or `infra-drift`. Issues labeled
+> `agent:audit`, `agent:delivery-watch`, `agent:onboarding`, or `infra-drift`. Issues labeled
 > `status:escalation-needed` are locked for human intervention and must NEVER be
 > modified or closed autonomously. Issues labeled `agent:audit` are `fleet-audit`
 > ledgers, `agent:delivery-watch` ones are the `chat-delivery-watch` job's ledger
-> of scheduled reports that stopped reaching chat, and `infra-drift` ones are the
+> of scheduled reports that stopped reaching chat, `agent:onboarding` ones hold
+> the first-run inventory report onboarding filed when no chat thread took it, and `infra-drift` ones are the
 > scheduled Terraform drift report — all are machine-owned, one per subject,
 > edited in place by their owner as the picture changes and closed by the run
 > that finds nothing. Touching any of them corrupts a report its owner owns.
@@ -150,18 +151,19 @@ Once your investigation is complete:
    you retry, but it is not free: the comment goes first, so a run that failed
    on the label change or the close posts the report a second time. Say so in
    the re-posted report, or trim it to the part that is new.
-
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
      python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
+
      - Then end the turn per [Ending the turn](#ending-the-turn).
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
      python3 "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number>  --repo <repo> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
+
      - You MUST message the chat room to alert the on-call engineer. Use
        `title_plain`, not `title` — the boundary tags are for you, not for a
        human reading chat:

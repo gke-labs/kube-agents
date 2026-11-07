@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -64,6 +65,20 @@ SESSION_SCOPE_ID_ENV = "HERMES_SESSION_SCOPE_ID"
 # the delivery job at whichever chat spoke last. See the README, "One-time
 # means one time".
 GREETED_MARKER = ".bootstrap_greeted"
+# Written by the delivery stage when it filed the first-run report as a ledger
+# issue because nobody had written in chat within a day of the sweep
+# (bootstrap_delivery.REPORT_FILED_FILE, pinned equal by its tests): the
+# report is in that issue, so the first human turn after it is greeted once
+# with a pointer there rather than with a report that is not coming.
+REPORT_FILED_MARKER = ".bootstrap_report_filed"
+REPORT_FILED_URL_KEY = "url"
+REPORT_FILED_AT_KEY = "filed_at"
+_FALLBACK_REPORT_FILED = (
+    "This is the first message anyone has sent this install. Its first-run inventory report was "
+    "ready before anyone wrote, so it was filed as an issue at {url} ({date} UTC) instead of being posted "
+    "here. Say so in one sentence with that link, then answer the ask."
+)
+REPORT_FILED_DATE_FORMAT = "%Y-%m-%d %H:%M"
 
 # The eval seam: requests written only by the first-install-hello bench stack
 # (bench/tf/prebuilt/first-install-hello) as files whose names start with this
@@ -581,6 +596,29 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
             pass
 
 
+def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
+    """The delivery stage's record of the filed report, when it carries the issue's address."""
+    try:
+        record = json.loads((data_dir / REPORT_FILED_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not str(record.get(REPORT_FILED_URL_KEY) or "").startswith("http"):
+        return None
+    return record
+
+
+def _filed_greeting(record: Dict[str, Any]) -> Dict[str, str]:
+    try:
+        date = datetime.fromtimestamp(float(record.get(REPORT_FILED_AT_KEY) or 0), timezone.utc).strftime(
+            REPORT_FILED_DATE_FORMAT
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
+        date = "unknown date"
+    instructions = _FALLBACK_REPORT_FILED.format(url=record[REPORT_FILED_URL_KEY], date=date)
+    logger.info("Injecting onboarding greeting instructions (REPORT FILED).")
+    return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — REPORT FILED]\n{instructions}\n"}
+
+
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
     if completed:
         instructions = _load_instructions(data_dir, "scan_completed.md", _FALLBACK_COMPLETED)
@@ -649,6 +687,17 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # API-server turn goes on only to _prime_conversation's route check.
     if platform_name not in DURABLE_CHAT_PLATFORMS and platform_name != API_SERVER_PLATFORM:
         return None
+
+    # The report went to a ledger issue because nobody wrote within a day: the
+    # first human turn after that is told where it is, once; nothing is bound
+    # or primed, since the report is not coming to this thread.
+    filed = _report_filed(data_dir)
+    if filed is not None and not (data_dir / GREETED_MARKER).exists():
+        try:
+            (data_dir / GREETED_MARKER).touch(exist_ok=True)
+        except OSError as e:
+            logger.warning("Could not record the greeting: %s", e)
+        return _filed_greeting(filed)
 
     # Already delivered, or already primed by an earlier session. Either way
     # onboarding has happened and must not happen again.

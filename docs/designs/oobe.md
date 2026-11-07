@@ -81,10 +81,12 @@ sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 `.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
 later removes both jobs. When nobody has spoken a day after the sweep was filed
 (`UNSPOKEN_FILE_AFTER_SECONDS`), the report is filed as a dated ledger issue in the GitOps
-repository instead, with one line naming it sent to the home channel (kept by the gateway for its
-digest when none is set), and the same claim is taken; a week after the sweep
+repository instead, with one line linking it sent to the platform whose home posts route through
+the gateway (kept by the gateway for its digest when no home channel is set; a `spec.mode: today`
+install gets the issue and no line), and the same claim is taken; a week after the sweep
 (`UNDELIVERED_RETIRE_SECONDS`, the plugin's own priming limit) an undelivered report is claimed
-without a post and the scheduled audits stand in for it.
+without a post and the scheduled audits stand in for it. A report retired that way leaves its items
+unmarked in the findings queue, so the nudge announces them later: nobody saw them.
 
 ## 4. First-run audits
 
@@ -104,8 +106,8 @@ Neither costs a call into the sandbox.
 
 Two things the trigger must not be:
 
-- **Delivery** (`.bootstrap_completed`). It waits for a human message, so an install nobody talks
-  to would never audit.
+- **Delivery** (`.bootstrap_completed`). It waits for a human message for a day (then files the
+  report as an issue, §3), so an install nobody talks to would audit a day late at best.
 - **The report file.** `INVENTORY.md` and `INVENTORY.raw.md` are on the sandbox's volume when the
   sandbox is on, the default. A gate that tests for them on the Chat Agent's volume never fires,
   and testing across the sandbox every minute costs an ssh call per tick.
@@ -261,15 +263,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                                                                                                                           | Recovery                                                                                              |
-| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                                                                                                              | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                                                                                                               | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                                                                                                         | As today                                                                                              |
-| No GitOps repository   | Reports stay in the report store, the first report included when nobody has spoken; a run that changed something posts a summary saying no GitOps repository is connected                                        | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7), or, when nobody has spoken for a day, is itself a ledger issue, named by one line the gateway keeps for its digest | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                                                                                                                                     | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                                                                                                             | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                                                                                                                                                                                                | Recovery                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                                                                                                                                                                                   | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                                                                                                                                                                                    | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                                                                                                                                                                              | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store, the first report included when nobody has spoken; a run that changed something posts a summary saying no GitOps repository is connected                                                                                                             | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7), or, when nobody has spoken for a day, is itself a ledger issue, linked by one line the gateway keeps for its digest (sent only where a platform's home posts route through the gateway) | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                                                                                                                                                                                                          | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                                                                                                                                                                                  | As today for the report                                                                               |
 
 ## 7. Not in this design
 
@@ -279,9 +281,9 @@ times. It rides with the audits stage, whose eval case covers both.
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
   chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
   it end; nothing holds a finding back to meet a target.
-- **Reaching an install with no home channel, beyond the first-run chain.** Audit summaries go to
-  the home channel only. An audit that finishes before anyone opens the chat posts nothing; the
-  onboarding report, sent on the first message, names every shipped fleet audit that ran since the
+- **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
+  audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
+  onboarding report, sent on the first message or filed as an issue a day on (§3), names every shipped fleet audit that ran since the
   sweep was filed and whose summary was not posted, whether the stage started it, held it, gave up on
   it or skipped the chain, with a request that fetches those reports (`bootstrap_delivery._lost_audits`).
   The lost-summaries stage (`bootstrap_delivery.resend_lost_summaries`) posts a first-run audit's

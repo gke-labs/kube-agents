@@ -157,6 +157,10 @@ SKIP_LABELS = [
     "status:resolved",
     "agent:audit",
     "agent:delivery-watch",
+    # Onboarding's first-run inventory report, filed by the Chat Agent's
+    # delivery stage when no chat thread took it (bootstrap_delivery.py):
+    # a record to read, not a task to resolve.
+    "agent:onboarding",
 ]
 
 # How wide the poll looks before ranking. `comments` is deliberately not asked
