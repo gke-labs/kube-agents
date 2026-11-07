@@ -66,8 +66,17 @@
 #   - configMap volumes are allowed whatever their name: the session pod mounts the bus's CA from
 #     one, and ConfigMaps hold no credentials in this install.
 #   - A mutating webhook that adds any other scheduling field (a nodeSelector, a toleration, a
-#     scheduler) refuses every session pod: closed, but an outage. So does a default PriorityClass
-#     with a positive value.
+#     scheduler) refuses every session pod: closed, but an outage. GKE's default ComputeClass is
+#     one: a cluster default, or a namespace labelled `cloud.google.com/default-compute-class`,
+#     adds a compute-class nodeSelector (and on Standard a toleration) to every pod. So does a
+#     default PriorityClass with a positive value.
+#   - Within the allowed tolerations it checks neither the architecture's value (Autopilot adds
+#     the cluster's default architecture) nor tolerationSeconds (the API server's default is
+#     configurable), so the gateway can tolerate another architecture's taint, or stay on a
+#     not-ready node indefinitely.
+#   - topologySpreadConstraints, schedulingGates, preemptionPolicy and resource requests are
+#     unchecked. None reaches a node, runtime or priority the rule above holds; a scheduling gate
+#     only parks the gateway's own pod.
 #   - It constrains pod CREATE only. The gateway holds no update, patch or ephemeralcontainers verb
 #     on pods, so CREATE is the whole of what its Role lets it shape.
 #

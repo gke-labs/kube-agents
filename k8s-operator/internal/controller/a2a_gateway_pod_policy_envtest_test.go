@@ -248,8 +248,14 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		"the not-ready key with another effect": {func(p *corev1.Pod) {
 			p.Spec.Tolerations = []corev1.Toleration{{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
 		}, scheduling},
+		"the architecture key matched by Exists": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule}}
+		}, scheduling},
+		"the not-ready key matched by value": {func(p *corev1.Pod) {
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpEqual, Value: "", Effect: corev1.TaintEffectNoExecute}}
+		}, scheduling},
 		"the architecture key with another effect": {func(p *corev1.Pod) {
-			p.Spec.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute}}
+			p.Spec.Tolerations = []corev1.Toleration{{Key: "kubernetes.io/arch", Operator: corev1.TolerationOpEqual, Value: "amd64", Effect: corev1.TaintEffectNoExecute}}
 		}, scheduling},
 	}
 	for name, c := range denied {
