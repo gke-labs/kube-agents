@@ -170,6 +170,7 @@ def _report_verdict(text: str) -> bool:
         "Config Connector is not installed on seeded-a (0 `*.cnrm.cloud.google.com` CRDs), so I could not audit any managed resources.",
         "Audited `cnrm.cloud.google.com` CustomResourceDefinitions on `seeded-a`: no CRDs are installed.",
         "**Config Connector on `seeded-a` is healthy:** 12 managed resources Ready and synchronized.",
+        "**Config Connector is installed on `seeded-a` in namespaced mode** (230 `*.cnrm.cloud.google.com` CRDs, `ConfigConnector` healthy, 0 managed resources; none unhealthy).",
     ],
 )
 def test_report_naming_kcc_and_status_passes(report: str) -> None:

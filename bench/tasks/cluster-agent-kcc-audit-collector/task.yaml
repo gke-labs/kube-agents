@@ -21,11 +21,13 @@
 # check requires Config Connector / `cnrm.cloud.google.com` and the installation
 # or synchronization summary.
 #
-# No planted defect: on a cluster without Config Connector CRDs the collector
-# completes in one CRD-discovery RPC and reports `0` installed KCC CRDs with
-# `CLEAN_AUDIT_STOP: YES`; on a KCC-enabled cluster it batches active CRDs in
-# parallel chunks and reports synchronization status. Isolation class:
-# read-only. Eligible tier: nightly.
+# No planted defect: since #4742, seeded-a runs the GKE Config Connector add-on
+# in namespaced mode (~230 `*.cnrm.cloud.google.com` CRDs, 1 Healthy
+# `ConfigConnector` operator object, 0 managed custom resources outside an eval
+# stack), so the collector exercises its parallel batched path and prints
+# `CLEAN_AUDIT_STOP: YES`; on a cluster without Config Connector CRDs it
+# completes in one CRD-discovery RPC and reports `0` installed KCC CRDs.
+# Isolation class: read-only. Eligible tier: nightly.
 id: cluster-agent-kcc-audit-collector
 name: A Cluster Agent runs the batched Config Connector collector for a KCC audit
 prompt: >-
@@ -79,6 +81,6 @@ verification_spec:
       required_patterns:
         - '(?i)\bconfig[ -]?connector\b|\bcnrm\.cloud\.google\.com\b'
       any_of_patterns:
-        - '(?i)\bnot installed\b|\b0 [a-z0-9 .*`-]*crds?\b|\bno [a-z0-9 .*`-]*crds?\b|\bready\b|\bsynchroniz(?:ed|ation)\b'
+        - '(?i)\bnot installed\b|\b0 [a-z0-9 .*`-]*crds?\b|\bno [a-z0-9 .*`-]*crds?\b|\bready\b|\bsynchroniz(?:ed|ation)\b|\bhealthy\b|\b(?:0|no) (?:managed |custom )?resources?\b|\b(?:0|no|none) unhealthy\b'
       forbidden_patterns:
         - '(?i)(?:\bcrd listing failed\b|\bverdict:\s*incomplete\b|\bcould not read(?::\s*customresourcedefinitions|\s+customresourcedefinitions|\s+[a-z0-9.-]+\.cnrm\.cloud\.google\.com)\b|\bfailed to audit[^\n]*timed out\b)'
