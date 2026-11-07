@@ -111,6 +111,10 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Hold Unresolved Threads",
     "Merge Gate",
     "Risk Classification",
+    # A measurement lane, not a check on the tree: it downloads a control
+    # plane and seeds a cluster, gates nothing, and a red there is the
+    # fixture not running, reported by its own job and artifact.
+    "Scale Lane",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
 REPO_SCRIPTS = REPO_ROOT / "scripts"
