@@ -196,6 +196,18 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # A self-managed instance behind a private CA: the Secret holding that CA
 # under the key `ca.crt` (install.sh writes it from --gitops-ca-file).
 # gitlab_ca_secret_name     = "gitlab-forge-ca"
+# Or Bitbucket Cloud (gitops_forge = "bitbucket", no host) or Bitbucket Data
+# Center (gitops_forge = "bitbucket-datacenter", with gitops_host, served at the
+# root path on port 443). gitops_repo_path is workspace/repo-slug on Cloud and
+# PROJECTKEY/repo-slug on Data Center. The token is never a variable: create
+# Secret gitops_token_secret_name (default bitbucket-forge-token), key `token`,
+# in the agent's namespace. gitops_identity is the account UUID a Cloud
+# workspace, project or repository access token acts as.
+# gitops_forge             = "bitbucket"
+# gitops_repo_path         = "acme/gitops"
+# gitops_token_secret_name = "bitbucket-forge-token"
+# gitops_identity          = "{0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e}"
+# gitops_ca_secret_name    = "bitbucket-forge-ca" # Data Center behind a private CA
 
 # Optional Slack integration. Needs no GCP resources: the tokens go into the
 # credentials Secret and the CR's slack section turns on. Creating the Slack

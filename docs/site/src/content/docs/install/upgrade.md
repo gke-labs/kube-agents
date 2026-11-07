@@ -21,8 +21,9 @@ GitHub, the links between pages do not work: open each linked page at the same t
 
 ## Before you start
 
-A GitLab install needs nothing extra for an upgrade: no token and no flag. See
-[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall).
+A GitLab or Bitbucket install needs nothing extra for an upgrade: no token and no flag. See
+[Upgrade and uninstall](/kube-agents/install/gitlab/#upgrade-and-uninstall) for GitLab and
+[Upgrade and uninstall](/kube-agents/install/bitbucket/#upgrade-and-uninstall) for Bitbucket.
 
 Record what the install runs now, so you can tell afterwards what moved:
 

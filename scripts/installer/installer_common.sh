@@ -1989,7 +1989,7 @@ load_install_env() {
   # install the file records as GitHub, and an inherited GITOPS_HOST would
   # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
   # --gitops-host are the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -2292,8 +2292,8 @@ check_github_org_is_organization() {
   local where="GitHub"
   [ -n "$host" ] && where="$host"
   [ -z "$org" ] && return 0
-  # A GitLab install has no token minter, so no GitHub account to check.
-  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
+  # A GitLab or Bitbucket install has no token minter, so no GitHub account to check.
+  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "github" ] || return 0
 
   if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
     print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
@@ -2478,6 +2478,12 @@ print_minter_restore_advice() {
 hcl_str() {
   local s="${1//\\/\\\\}"
   s="${s//\"/\\\"}"
+  # HCL reads ${ and %{ in a quoted string as a template sequence; doubling
+  # the first character writes them literally. Through variables, because
+  # bash 3.2 and bash 5 read escapes in a replacement string differently.
+  local tpl='${' tpl_lit='$${' dir='%{' dir_lit='%%{'
+  s="${s//"$tpl"/$tpl_lit}"
+  s="${s//"$dir"/$dir_lit}"
   printf '"%s"' "$s"
 }
 
@@ -5061,9 +5067,9 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  # A GitLab install has no GitHub App: the GitOps repository is on GitLab and
-  # the composition refuses the minter beside it.
-  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+  # A GitLab or Bitbucket install has no GitHub App: the GitOps repository is
+  # on that forge and the composition refuses the minter beside it.
+  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" != "github" ]; then
     :
   elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
@@ -5472,6 +5478,19 @@ write_tfvars_from_state() {
       # it always has.
       if [ -n "${GITOPS_CA_SECRET:-}" ]; then
         echo "gitlab_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+    elif [ "${GITOPS_FORGE:-}" = "bitbucket" ] || [ "${GITOPS_FORGE:-}" = "bitbucket-datacenter" ]; then
+      # A Bitbucket install, Cloud or Data Center: the neutral variables.
+      # GITOPS_REPO is workspace/slug on Cloud and KEY/slug on Data Center.
+      echo "gitops_forge              = $(hcl_str "${GITOPS_FORGE}")"
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitops_repo_path          = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitops_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_BITBUCKET_TOKEN_SECRET:-bitbucket-forge-token}}")"
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitops_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+      if [ -n "${GITOPS_IDENTITY:-}" ]; then
+        echo "gitops_identity           = $(hcl_str "${GITOPS_IDENTITY}")"
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"

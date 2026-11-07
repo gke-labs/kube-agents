@@ -1693,7 +1693,8 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #     provider: github        # github (default), gitlab, gitea, bitbucket (Cloud) or
+    #                             # bitbucket-datacenter; required when host is not github.com
     #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
     #                             # Server hostname; required for gitea, which has none
     #     scheme: https           # https (default); http only for gitea on an
@@ -1713,6 +1714,22 @@ platformAgent:
     #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
     #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
     #                             # it for all of its calls
+    #   - name: bitbucket
+    #     provider: bitbucket     # Bitbucket Cloud, at bitbucket.org only: no host, port or caBundleRef
+    #     namespace: my-workspace # the workspace ID
+    #     credentialsRef:         # required: a Secret with the token under `token`, and an optional
+    #       name: bitbucket-forge-token # read-only token for context repositories under `read-token`
+    #     identity: ""            # only for a workspace, project or repository access token: the
+    #                             # account UUID that token acts as, from the author of a pull
+    #                             # request it opened. An API token names its own account
+    #   - name: bitbucket-dc
+    #     provider: bitbucket-datacenter
+    #     host: bitbucket.example.com # required; served at the root path on port 443
+    #     namespace: INFRA        # the project key
+    #     credentialsRef:         # required: a Secret with a project HTTP access token under `token`
+    #       name: bitbucket-dc-token
+    #     caBundleRef:            # optional: the private CA that signed the instance's certificate
+    #       name: bitbucket-dc-ca
     forges: []
     # repositories:
     #   - forge: github
