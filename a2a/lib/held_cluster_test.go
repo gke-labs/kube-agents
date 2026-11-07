@@ -49,8 +49,15 @@ func freePort(t *testing.T) int {
 // server is shut down and started again on fresh ports.
 func startCluster(t *testing.T) []*natsserver.Server {
 	t.Helper()
+	return startClusterOn(t, freePort)
+}
+
+// startClusterOn is startCluster with the route ports taken from pick, so a
+// test can hand it a port that another socket holds.
+func startClusterOn(t *testing.T, pick func(*testing.T) int) []*natsserver.Server {
+	t.Helper()
 	for attempt := 1; ; attempt++ {
-		servers, unrouted := tryStartCluster(t)
+		servers, unrouted := tryStartCluster(t, pick)
 		if unrouted == nil {
 			return servers
 		}
@@ -66,11 +73,11 @@ func startCluster(t *testing.T) []*natsserver.Server {
 
 // tryStartCluster starts one cluster, and returns with it the server that
 // listens for clients but not for routes, or nil when every server is ready.
-func tryStartCluster(t *testing.T) ([]*natsserver.Server, *natsserver.Server) {
+func tryStartCluster(t *testing.T, pick func(*testing.T) int) ([]*natsserver.Server, *natsserver.Server) {
 	t.Helper()
 	ports := make([]int, clusterSize)
 	for i := range ports {
-		ports[i] = freePort(t)
+		ports[i] = pick(t)
 	}
 	var routes []*url.URL
 	for _, p := range ports {
@@ -106,6 +113,38 @@ func tryStartCluster(t *testing.T) ([]*natsserver.Server, *natsserver.Server) {
 		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
 	}
 	return servers, nil
+}
+
+// TestStartClusterStartsAgainWhenARoutePortIsTaken pins the #5056 retry and
+// the nats-server behaviour it rests on: a server whose route port another
+// socket holds still listens for clients, tryStartCluster names it, and
+// startCluster starts the cluster again on fresh ports. If a nats-server
+// upgrade stops binding the client listener first, this test fails rather
+// than the flake coming back under another message.
+func TestStartClusterStartsAgainWhenARoutePortIsTaken(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer held.Close()
+	heldPort := held.Addr().(*net.TCPAddr).Port
+	picks := 0
+	pick := func(t *testing.T) int {
+		picks++
+		if picks == 1 {
+			return heldPort
+		}
+		return freePort(t)
+	}
+	servers := startClusterOn(t, pick)
+	if picks != 2*clusterSize {
+		t.Fatalf("picked %d route ports, want %d: the cluster with the held port was not started again", picks, 2*clusterSize)
+	}
+	for _, s := range servers {
+		if s.ClusterAddr() == nil {
+			t.Fatalf("nats-server %s has no route listener", s.Name())
+		}
+	}
 }
 
 func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
