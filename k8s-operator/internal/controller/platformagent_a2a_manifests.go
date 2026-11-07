@@ -708,8 +708,13 @@ const (
 	// remedy -- a report that could steer the remedy could steer it to any
 	// subject.
 	a2aProvisionReportTopicsStateSubjectKey = "topics_state_subject"
-	a2aProvisionReportMissingKey            = "missing"
-	a2aTopologySkewSubject                  = "a2a.topics.agent.platform.topology-skew"
+	// a2aProvisionReportSubmitMaxAgeKey is PROFILE_SUBMITS' live max age, in
+	// seconds under a2aProvisionReportLiveKey (0 for none), written when it
+	// is longer than this render's a2aProfileSubmitMaxAge: a stream an older
+	// operator created, which provisioning never edits (#4948).
+	a2aProvisionReportSubmitMaxAgeKey = "submit_max_age"
+	a2aProvisionReportMissingKey      = "missing"
+	a2aTopologySkewSubject            = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -3499,6 +3504,28 @@ if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|p
   echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
   echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
 fi
+#
+# PROFILE_SUBMITS older than this render: read its live max age back. The
+# dispatcher keeps a finished task's tombstone for the max age the operator
+# renders, and a submission still on the stream past its tombstone would be
+# run again; provisioning never edits the stream (lowering a max age evicts
+# queued submissions), so a stream an older operator created longer than this
+# render's ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s is reported, and the operator
+# renders the longer one (#4948). 0 is no age limit. Same stance as the
+# extractors above: an answer with no readable max_age FAILS.
+submits_json="$($NATS stream info PROFILE_SUBMITS --json | tr -d ' \t\r\n')"
+live_submit_max_age_ns="$(printf '%s' "${submits_json}" \
+  | grep -o '"max_age":[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_submit_max_age_ns}" ]; then
+  echo "could not read max_age off the PROFILE_SUBMITS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+live_submit_max_age=$((live_submit_max_age_ns / 1000000000))
+if [ "${live_submit_max_age_ns}" = "0" ] || [ "${live_submit_max_age}" -gt ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + ` ]; then
+  report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportSubmitMaxAgeKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_submit_max_age}}"
+  echo "NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s (0 is no limit); this render creates it at ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s." >&2
+  echo "  The dispatcher is told the longer one, so a finished task's tombstone outlives its submission." >&2
+fi
 report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
@@ -3836,6 +3863,7 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
 			outcome = a2aProvisionReportOutcomeReported
 		}
+		r.recordProfileSubmitMaxAge(ctx, agent, findings.submitMaxAge)
 	}
 	patch := client.MergeFrom(job.DeepCopy())
 	if job.Annotations == nil {
@@ -3844,6 +3872,25 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 	job.Annotations[a2aProvisionReportAnnotation] = outcome
 	if err := r.Patch(ctx, job, patch); err != nil {
 		log.Error(err, "could not stamp the A2A provision Job as reported; the next pass reports it again")
+	}
+}
+
+// recordProfileSubmitMaxAge keeps what a readable report said about
+// PROFILE_SUBMITS' live max age on the PlatformAgent's status, for
+// desiredDispatchConfig: the value when the stream is longer than this
+// render's, absent when it isn't. Only a readable report changes it; one the
+// operator could not read leaves the last value. Best effort, like the rest
+// of the report: a failed write is logged, and the Job's next run reports it
+// again.
+func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context, agent *agentv1alpha1.PlatformAgent, live *int64) {
+	have := agent.Status.ProfileSubmitMaxAgeSeconds
+	if (have == nil && live == nil) || (have != nil && live != nil && *have == *live) {
+		return
+	}
+	patch := client.MergeFrom(agent.DeepCopy())
+	agent.Status.ProfileSubmitMaxAgeSeconds = live
+	if err := r.Status().Patch(ctx, agent, patch); err != nil {
+		logf.FromContext(ctx).Error(err, "could not record PROFILE_SUBMITS' live max age; the provision Job's next run reports it again")
 	}
 }
 
@@ -3877,10 +3924,13 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 
 // a2aProvisionFindings is what parseA2AProvisionReport read out of one
 // report: each finding the reader knows, absent when the script did not
-// write it. Both nil/false is the clean report, {}.
+// write it. All nil/false is the clean report, {}.
 type a2aProvisionFindings struct {
 	tasksSubjectCap           *tasksSubjectCapFinding
 	topicsStateSubjectMissing bool
+	// submitMaxAge is PROFILE_SUBMITS' live max age in seconds when the
+	// script found it longer than this render's (0: no age limit), else nil.
+	submitMaxAge *int64
 }
 
 // parseA2AProvisionReport reads the termination message and returns the
@@ -3929,6 +3979,13 @@ func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
 			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without %s=1; not a report the script writes", message, a2aProvisionReportTopicsStateSubjectKey, a2aProvisionReportMissingKey)
 		}
 		findings.topicsStateSubjectMissing = true
+	}
+	if fields, present := report[a2aProvisionReportSubmitMaxAgeKey]; present {
+		live, ok := fields[a2aProvisionReportLiveKey]
+		if !ok || live < 0 || (live != 0 && live <= int64(a2aProfileSubmitMaxAge/time.Second)) {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without a %s longer than %ds or 0; not a report the script writes", message, a2aProvisionReportSubmitMaxAgeKey, a2aProvisionReportLiveKey, int64(a2aProfileSubmitMaxAge/time.Second))
+		}
+		findings.submitMaxAge = &live
 	}
 	return findings, nil
 }
@@ -3990,7 +4047,7 @@ const defaultA2AMaxSessions = 10
 //   - a2aStandingPods: what this operator keeps running for the agent;
 //   - the chart's pods (its standing workloads in kube-agents.chartWorkloads:
 //     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
-//     and the web console, plus one surge pod for each that rolls surge-first,
+//     and the web console, plus the surge pods each one's rollout can add,
 //     since a chart bump rolls several in one upgrade), which only the chart
 //     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
 //     The CR is in the namespace those pods run in, and the chart renders it
@@ -5796,7 +5853,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -5981,7 +6045,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
-	if dispatcherProfileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, profileFenced); err != nil {
+	if dispatcherProfileErr, err := r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileFenced, draining); err != nil {
 		return state, err
 	} else if dispatcherProfileErr != nil {
 		*profileErr = goerrors.Join(*profileErr, dispatcherProfileErr)

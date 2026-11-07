@@ -545,6 +545,11 @@ EOF
   chmod 0600 "$target_file"
 }
 
+# A rewritten kubeconfig keeps its file's current-context, which is all the
+# credential-proxy kubectl shim of an image from before the kube-proxy reads: it
+# sends that name to the broker and ignores server, certificate-authority and
+# tokenFile. A sandbox rolled back past the kube-proxy therefore reaches the
+# same cluster through these files without regenerating them.
 if [ -n "${KUBE_PROXY_URL:-}" ]; then
   default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
   ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"

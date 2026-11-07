@@ -6474,14 +6474,14 @@ class FootprintSummaryTest(unittest.TestCase):
         # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
         # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
         self.assertIn("CPU requests:        5.850 cores", proc.stdout)
-        self.assertIn("Memory requests:     13.81 GiB", proc.stdout)
+        self.assertIn("Memory requests:     14.31 GiB", proc.stdout)
         standard = self._run(
             f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
             tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
         )
         self.assertIn("rc=0", standard.stdout, standard.stderr)
         self.assertIn("CPU requests:        4.350 cores", standard.stdout)
-        self.assertIn("Memory requests:     12.81 GiB", standard.stdout)
+        self.assertIn("Memory requests:     13.31 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one

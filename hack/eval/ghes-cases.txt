@@ -1,5 +1,5 @@
 # The GHES lane's matrix: what pull-kube-agents-smoke-test-ghes runs on a
-# pull request and ci-kube-agents-eval-nightly-ghes-next runs once a night
+# pull request and ci-kube-agents-eval-weekly-ghes-next runs once a week
 # (kube-agents#3684), both under spec.mode next (EVAL_MODE_NEXT=1, through
 # the inject door).
 # hack/ci-eval-pr.sh reads this file in place of the catalogue whenever
@@ -9,8 +9,8 @@
 # cases below grade the forge the way gitlab-cases.txt's do, and the same rules
 # hold: one `./tasks/<id>/task.yaml` path per line, every entry a registered
 # case (presubmit-cases.txt or nightly-cases.txt) with a positive forge check,
-# pinned by scripts/test_eval_rosters.py. The nightly does not append to the
-# evidence store.
+# pinned by scripts/test_eval_rosters.py. The weekly job does not append to
+# the evidence store.
 #
 # WHAT A PASS PROVES. The agent reached the forge at the GHES host: the pull
 # request it links is on https://<ghes-host>/..., which the proxy writes only
@@ -33,7 +33,7 @@
 # per repetition measured under spec.mode next on a six-cluster fleet),
 # vcs-spent-branch-reuse (1000s) and vcs-review-feedback-read-back (700s),
 # plus the forge VM's ~2 minutes before the deploy. Inside the presubmit's
-# 360-minute deadline and the nightly's 480.
+# 360-minute deadline and the weekly job's 480.
 
 ./tasks/vcs-spent-branch-reuse/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml

@@ -18,13 +18,13 @@ You need four things:
 
 ## Turn on the MCP server
 
-The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`; any other value leaves it off. Set the variable in the chart's `operator.extraEnv` list, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
+The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
 
 ```bash
-TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_MCP_DOOR",value="true"}]}}'
+TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
 ```
 
-The variable applies to every `PlatformAgent` the operator manages. If the line already carries other `extraEnv` entries, add this one to the same list, since there is one such line. On a bare Helm install, add the entry to `operator.extraEnv` in your values file.
+The setting applies to every `PlatformAgent` the operator manages. If the line already sets other values, add `mcpServer={enabled=true}` inside its `operator` object, since there is one such line. On a bare Helm install, pass `--set operator.mcpServer.enabled=true` or set it in your values file. An install that turned the server on with an `A2A_MCP_DOOR` entry in `operator.extraEnv` keeps working, and that entry wins over the value.
 
 Once the operator has restarted and reconciled, the install's namespace holds four objects named after the `PlatformAgent` (`platform-agent` on a default install): the server's Deployment and Service, its token Secret, and a NetworkPolicy that limits who can reach it:
 

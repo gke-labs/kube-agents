@@ -898,12 +898,17 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
-Once the `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the five nightlies
-merges, they move the agent from Vertex AI to the Gemini Developer API, each with the leased pool
-project's own key ([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge does
-not move. The version key does not carry the serving provider, so rung 6 compares nights on both
-sides of the switch at the same key. Date that night here when it happens, because a step in cost
-or latency from that night has this cause.
+On the night of 2026-11-06 the five nightlies moved the agent from Vertex AI to the Gemini
+Developer API (`MODEL_PROVIDER=gemini`), each with the leased pool project's own key
+([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge did not move. The
+version key does not carry the serving provider
+([#4932](https://github.com/gke-labs/kube-agents/issues/4932)), so rung 6 compares nights on both
+sides of the switch at the same key. A step in cost or latency from that night has this cause.
+The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
+6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
+transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
+2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
+smoke jobs and the forge smoke variants stay on Vertex AI.
 
 ## The GitLab lane
 
@@ -916,7 +921,7 @@ presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
-(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode nightly, around the
+(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode weekly job, around the
 per-run GitLab CE that `hack/ci-forge.sh` stands up, `docs/ci-pool-projects.md` 5.8), since the cases grade the forge and not where it is; a GitHub Enterprise
 Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
 `hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
@@ -953,8 +958,8 @@ a pull request.
 
 ## The GHES lane
 
-The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-nightly-ghes-next`
-nightly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-weekly-ghes-next`
+weekly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
 [#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
 Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
 on a VM the job stands up per run in front of the leased project's github.com repository

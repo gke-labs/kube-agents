@@ -40,19 +40,21 @@ The repo is named literally in both: Phase −1 runs before Phase 0 defines `$RE
 
 ```bash
 # Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
-# actually read, the commit graph, and the open threads. The filter reports the
-# commits *after* the review's commit, which is what the currency test needs.
+# actually read, the commit graph, the open threads, and the contested ones: a
+# resolved thread whose last reply starts `declined:` or `deferred to`. The filter
+# reports the commits *after* the review's commit, which is what the currency
+# test needs.
 gh api graphql -f query='
 query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
   headRefOid isDraft state author{login}
   reviews(last:20){nodes{author{login} state submittedAt body commit{oid}}}
   commits(last:100){nodes{commit{oid messageHeadline parents(first:2){totalCount nodes{oid}}}}}
-  reviewThreads(first:100){nodes{isResolved path}}
+  reviewThreads(first:100){nodes{isResolved path last: comments(last:1){nodes{body}}}}
 }}}' -F pr=<N> --jq '.data.repository.pullRequest as $p
 | ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
 | ($p.commits.nodes | map(.commit)) as $cs
 | ($cs | map(.oid) | index($r.commit.oid // "")) as $i
-| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length)",
+| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length) contested=\([$p.reviewThreads.nodes[]|select(.isResolved and ((.last.nodes[0].body // "") | (startswith("declined:") or startswith("deferred to"))))]|length)",
   (if $r == null then "lastbot: NONE"
    else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
         ($r.body | split("\n") | [.[0], (.[] | select(startswith("### Findings outside") or startswith("#### ") or startswith("_This was a")))] | join("\n")),
@@ -415,7 +417,9 @@ Otherwise proceed. If a prior review exists but new commits landed, review the c
 and note in your report which findings from the prior review the new commits resolved. Read the
 existing PR conversation carefully either way — a finding the author has already answered in a
 thread is either resolved (drop it) or contested (address their argument directly rather than
-restating the claim).
+restating the claim). A resolved thread whose last reply starts `declined:` or `deferred to` is
+contested, not settled: the author resolves a declined bot finding after the reply, so read it and
+rule on the decline.
 
 ### Phase 2b — Establish intent
 
