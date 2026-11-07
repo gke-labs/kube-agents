@@ -34,9 +34,9 @@ import (
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
-	//: matches its own block's shape (the script adds the performance figures and
+	//: matches its own block's shape (the script adds the live LiteLLM figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 53
+	usageSummaryMaxLines = 56
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -63,9 +63,22 @@ const (
 	//: The window never drops below one day, so the label never reads "0 days"
 	//: on an install with a sub-day SessionTTL.
 	usageSummaryWindowFloor = hoursPerDay * time.Hour
-	//: The performance figures the script reads in-pod (tokens, spend,
-	//: latency) are not the gateway's to see; the block says where they are.
-	usageSummaryPerformanceNote   = "tokens, spend and latency are in scripts/feedback-summary.sh's block"
+	//: The performance block: the token and spend totals since install, which
+	//: the operator keeps on status.usage from LiteLLM's counters across its
+	//: restarts, and the latency figure the script reads in-pod, which is not
+	//: the gateway's to see; that line says where it is.
+	usageSummaryPerformanceHeader = "performance:"
+	usageSummaryTokensLabel       = "  tokens (since install): "
+	usageSummarySpendLabel        = "  spend (since install): "
+	usageSummaryLatencyNote       = "  latency: in scripts/feedback-summary.sh's block"
+	usageSummarySpendCurrency     = "USD"
+	//: status.usage's three inference totals, read in the order the script's
+	//: PERFORMANCE_TOTAL_FIELDS names them, which its GatewayCopyTest holds to
+	//: the render below; the spend is in micro-dollars (usageSummaryMicrosPerUSD).
+	usageSummaryInputTokensField  = "inputTokensTotal"
+	usageSummaryOutputTokensField = "outputTokensTotal"
+	usageSummarySpendMicrosField  = "spendMicrosUSDTotal"
+	usageSummaryMicrosPerUSD      = 1_000_000.0
 	usageSummaryUnavailableNotice = "⚠️ The usage summary is unavailable: the PlatformAgent resource could not be read. From a workstation, scripts/feedback-summary.sh prints the workstation block."
 	usageSummaryRefusedNotice     = "⚠️ The usage summary was not posted: the block would have named an identifier of this install. From a workstation, scripts/feedback-summary.sh prints the workstation block with the same check."
 	//: What the roll-up counts. The script's line with the same window counts
@@ -549,7 +562,10 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	}
 	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
 	lines = append(lines, renderTopTools(usage)...)
-	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
+	lines = append(lines, usageSummaryPerformanceHeader,
+		fmt.Sprintf("%sin %d / out %d", usageSummaryTokensLabel, asInt(usage[usageSummaryInputTokensField]), asInt(usage[usageSummaryOutputTokensField])),
+		fmt.Sprintf("%s%.2f %s", usageSummarySpendLabel, float64(asInt(usage[usageSummarySpendMicrosField]))/usageSummaryMicrosPerUSD, usageSummarySpendCurrency),
+		usageSummaryLatencyNote)
 	days := windowDays(window)
 	if !haveTasks {
 		lines = append(lines, fmt.Sprintf("%s (%d days): %s", usageSummaryTurnsLabel, days, usageSummaryUnavailable))

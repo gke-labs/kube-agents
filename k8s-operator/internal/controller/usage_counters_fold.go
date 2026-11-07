@@ -39,8 +39,21 @@ const (
 	// ceiling far below it. A body whose addition would exceed it is refused
 	// with the baseline advanced, so an honest burst past it costs that
 	// interval's count once, and a body that is not the listener's can raise
-	// a total by at most this much per poll.
+	// a total by at most this much per poll. The three inference totals take
+	// their own ceilings (usageDeltaCeilingFor): a model call bills thousands
+	// of tokens, and one five-minute interval of a busy install is millions.
 	usageDeltaCeiling int64 = 10000
+	// usageTokenDeltaCeiling bounds what one LiteLLM pod's body may add to a
+	// token total in one poll: a hundred million tokens in five minutes is
+	// three hundred thousand a second, past what any model the install can
+	// reach bills through one gateway pod, so an honest interval always
+	// folds, and a body that is not LiteLLM's can raise a token total by at
+	// most this much per poll.
+	usageTokenDeltaCeiling int64 = 100_000_000
+	// usageSpendDeltaCeiling bounds what one LiteLLM pod's body may add to
+	// the spend total in one poll, in micro-dollars: a thousand dollars in
+	// five minutes, the same reasoning at the price of the dearest model.
+	usageSpendDeltaCeiling int64 = 1_000_000_000
 	// usageTotalCeiling is the read-back bound on a stored total: the largest
 	// integer a float64 holds exactly. The operator keeps a total as an int64
 	// end to end, but a reader that decodes the CR's JSON untyped, a dynamic
@@ -68,6 +81,11 @@ const (
 	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
 	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
 	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
+	// The three inference totals, read from the LiteLLM pods: the tokens in
+	// and out, and the spend in micro-dollars (usageSpendMicrosPerUSD).
+	usageCounterInputTokens  = "inputTokensTotal"
+	usageCounterOutputTokens = "outputTokensTotal"
+	usageCounterSpendMicros  = "spendMicrosUSDTotal"
 	// The two counters an earlier release kept for the proposals merged and
 	// closed unmerged, which are readings now (usageReadingSpecs): a document
 	// that carries them has their totals and pod entries dropped on read
@@ -112,8 +130,12 @@ var (
 	// and name the field in that pod's Warning.
 	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageLiteLLMCounters are the counters each LiteLLM pod's body feeds, in
+	// the order the status names them; the three share one pruning record
+	// (usageNewerFieldInference), since they arrived in one release.
+	usageLiteLLMCounters = []string{usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterInputTokens, usageCounterOutputTokens, usageCounterSpendMicros}
 	// usageRetiredCounters are the counters an earlier release kept and this
 	// one does not: migrateUsageDocument drops them from a document.
 	usageRetiredCounters = []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged}
@@ -123,8 +145,14 @@ var (
 	// an install nobody is using; the failed turns, each a failure whose
 	// message already moved the time; and a background card giving up, a
 	// failure, not the agent at work; and a thumbs-down, a person's verdict on
-	// a message that already moved it.
-	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true}
+	// a message that already moved it; and the three inference totals, which
+	// memory consolidation and the scheduled jobs move through LiteLLM with
+	// nobody asking, where the turn or command that billed them has already
+	// moved the time when it was activity.
+	usageQuietCounters = map[string]bool{
+		usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true,
+		usageCounterInputTokens: true, usageCounterOutputTokens: true, usageCounterSpendMicros: true,
+	}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 	// usageHumanCounters is the counter only a person moves: a chat message.
@@ -135,6 +163,19 @@ var (
 	// with a message this counter already counted.
 	usageHumanCounters = map[string]bool{usageCounterChatMessagesInbound: true}
 )
+
+// usageDeltaCeilingFor is the per-poll delta ceiling a counter takes, on every
+// adding branch: the token ceiling for the two token totals, the spend
+// ceiling for the spend total, and usageDeltaCeiling for every other counter.
+func usageDeltaCeilingFor(counter string) int64 {
+	switch counter {
+	case usageCounterInputTokens, usageCounterOutputTokens:
+		return usageTokenDeltaCeiling
+	case usageCounterSpendMicros:
+		return usageSpendDeltaCeiling
+	}
+	return usageDeltaCeiling
+}
 
 // usageStatusFieldFor is the status.usage field a document counter projects
 // to: the counter's own name, except the two sessions halves, which share one.
@@ -499,6 +540,16 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// first read later is the under-count that rule already accepts, taken
 	// over a set kept per pod.
 	folded := map[string]bool{}
+	// refusedInference is the pods whose body put one of the three inference
+	// totals past its ceiling this poll, on either adding branch. The three
+	// are one reading of one process, so they refuse together: a LiteLLM pod
+	// whose history is past the token ceiling when it is first read (an
+	// operator upgrade onto a pod that has run for weeks) would otherwise
+	// keep its spend and lose its tokens, or the reverse, and the status
+	// would carry a spend with no tokens behind it. Their candidates are
+	// dropped below, baselines advanced, and the three start together from
+	// the next poll's deltas.
+	refusedInference := map[string]bool{}
 	for _, s := range ordered {
 		key := usagePodEntryKey(s.UID, s.Counter)
 		entry, known := doc.Pods[key]
@@ -552,7 +603,11 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// interval of messages counts. Max counters are read on every
 			// replica from the first poll, so none reaches here that way.
 			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
-			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
+			wholeSample := s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess
+			if wholeSample && s.Sample > usageDeltaCeilingFor(s.Counter) && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
+			if wholeSample && s.Sample <= usageDeltaCeilingFor(s.Counter) {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
@@ -586,7 +641,10 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		}
 
 		delta, adds := usageBranch(entry, s)
-		if !adds || delta > usageDeltaCeiling {
+		if !adds || delta > usageDeltaCeilingFor(s.Counter) {
+			if adds && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
 			// Refused, and because the body parsed the baseline advances to
 			// it: a refusal that kept the baseline would be repeated on every
 			// poll until the pod restarted.
@@ -602,6 +660,28 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		doc.Unfolded = slices.DeleteFunc(doc.Unfolded, func(counter string) bool { return folded[counter] })
 		if len(doc.Unfolded) == 0 {
 			doc.Unfolded = nil
+		}
+	}
+	for _, counter := range usageLiteLLMCounters {
+		if len(refusedInference) == 0 {
+			break
+		}
+		kept := candidates[counter][:0]
+		for _, c := range candidates[counter] {
+			if !refusedInference[c.entry.PodUID] {
+				kept = append(kept, c)
+				continue
+			}
+			// A sibling of a refused total: dropped as the refused one was,
+			// its baseline advanced to the body it would have added.
+			if advanceUsageBaseline(c.entry, c.sample, c.startTime) {
+				changed = true
+			}
+		}
+		if len(kept) == 0 {
+			delete(candidates, counter)
+		} else {
+			candidates[counter] = kept
 		}
 	}
 

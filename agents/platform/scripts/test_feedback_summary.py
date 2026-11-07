@@ -70,6 +70,9 @@ CR = {
             "proposalsFromScheduled": 0,
             "proposalsFromIssue": 0,
             "proposalsFromOther": 0,
+            "inputTokensTotal": 98765432,
+            "outputTokensTotal": 1234567,
+            "spendMicrosUSDTotal": 2512345678,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "lastHumanActiveTime": "2026-10-20T16:10:00Z",
             "activeInterfaces": ["googlechat"],
@@ -300,6 +303,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("tokens: in 1200100 / out 34000", text)
         self.assertIn("spend: 2.91 USD", text)
         self.assertIn("latency p50 2.3s / p95 17.5s", text)
+
+    def test_the_totals_since_install_come_from_the_status_above_the_live_lines(self):
+        text = fs.render(full_snapshot())
+        self.assertIn(
+            "performance:\n  tokens (since install): in 98765432 / out 1234567\n  spend (since install): 2512.35 USD\n  tokens: in 1200100 / out 34000\n",
+            text,
+        )
+
+    def test_a_status_without_the_totals_prints_zeroes_and_the_live_lines_still_degrade(self):
+        cr = json.loads(json.dumps(CR))
+        for field in fs.PERFORMANCE_TOTAL_FIELDS:
+            del cr["status"]["usage"][field]
+        text = fs.render(full_snapshot(cr=cr, litellm_metrics=None, sources={"session-kv": True, "litellm-metrics": False}))
+        self.assertIn("  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n  tokens: unavailable\n  spend: unavailable\n", text)
+        self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
 
     def test_missing_sources_degrade_to_unavailable_lines(self):
         cr = json.loads(json.dumps(CR))
@@ -904,6 +922,17 @@ class GatewayCopyTest(unittest.TestCase):
 
     def test_the_gateway_prints_the_same_environment_lines(self):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
+
+    def test_the_gateway_prints_the_same_totals_since_install(self):
+        """The fields the gateway's render reads, in the order it reads them, through the
+        constants it names; the test reads the render itself, not a list beside it."""
+        source = self.GO_FILE.read_text()
+        start = source.index("func renderUsageSummary(")
+        body = source[start : source.index("\nfunc ", start + 1)]
+        names = re.findall(r"usage\[(usageSummary\w+Field)\]", body)
+        values = [re.search(rf'{name}\s*=\s*"([A-Za-z0-9]+)"', source).group(1) for name in names]
+        self.assertEqual(list(fs.PERFORMANCE_TOTAL_FIELDS), values)
+        self.assertEqual(fs.MICROS_PER_USD, int(float(re.search(r'usageSummaryMicrosPerUSD\s*=\s*([0-9_.]+)', source).group(1).replace("_", ""))))
 
     def test_the_gateway_names_the_same_source_for_each_reading(self):
         source = self.GO_FILE.read_text()

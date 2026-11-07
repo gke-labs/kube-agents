@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -55,6 +56,7 @@ const (
 	usageTestBrokerIP  = "10.0.0.20"
 	usageTestGatewayB  = "10.0.0.11"
 	usageTestA2AIP     = "10.0.0.12"
+	usageTestLiteLLMIP = "10.0.0.30"
 )
 
 func usageClock(minute int) time.Time {
@@ -146,6 +148,37 @@ func usageBrokerPod(name, uid, ip string, created time.Time) *corev1.Pod {
 	}
 }
 
+// usageLiteLLMPod is a running LiteLLM pod as the chart renders it: the
+// app label alone, the litellm-container with its port declared by number
+// and no name, and the container Ready.
+func usageLiteLLMPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: usageTestNamespace, UID: types.UID(uid),
+			CreationTimestamp: metav1.NewTime(created),
+			Labels:            litellmPodSelector(),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: litellmContainerName, Ports: []corev1.ContainerPort{{ContainerPort: litellmPort}}}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: ip,
+			ContainerStatuses: []corev1.ContainerStatus{{Name: litellmContainerName, Ready: true}},
+		},
+	}
+}
+
+// usageReplayShadowPod is the chart's replay-shadow proxy: the same app
+// label as LiteLLM, a different container, forwarding to LiteLLM behind it.
+func usageReplayShadowPod(name, uid, ip string, created time.Time) *corev1.Pod {
+	pod := usageLiteLLMPod(name, uid, ip, created)
+	pod.Spec.Containers[0].Name = "replay-shadow-proxy"
+	pod.Status.ContainerStatuses[0].Name = "replay-shadow-proxy"
+	return pod
+}
+
+func litellmAddr() string { return usageTestLiteLLMIP + ":8080" }
+
 // stubUsageSource answers scrapes from a table keyed by address.
 type stubUsageSource struct {
 	mu       sync.Mutex
@@ -153,15 +186,22 @@ type stubUsageSource struct {
 	errs     map[string]error
 	blocking map[string]bool
 	calls    []string
+	// paths records the path each address was last scraped at, so a test can
+	// hold a target to the path its listener serves.
+	paths map[string]string
 	// hook, when set, is called at the start of every Scrape with the address
 	// being scraped, before the blocking wait: a seam for a test that must act
 	// (cancel a parent context, say) while a scrape is in flight.
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr, path string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
+	if s.paths == nil {
+		s.paths = map[string]string{}
+	}
+	s.paths[addr] = path
 	block := s.blocking[addr]
 	err := s.errs[addr]
 	reading, ok := s.readings[addr]
@@ -363,6 +403,13 @@ func (s *stubUsageSource) scraped(addr string) bool {
 	return false
 }
 
+// pathOf is the path addr was last scraped at, "" for an address never read.
+func (s *stubUsageSource) pathOf(addr string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paths[addr]
+}
+
 // gaugeValue reads a gauge field as a test compares it: -1 for absent.
 func gaugeValue(v *int64) int64 {
 	if v == nil {
@@ -390,6 +437,10 @@ const usageTestPeopleNulls = `"peopleSeen7d":null,"peopleSeen30d":null`
 
 // usageTestOriginsNulls is the nine origin readings as merge-patch deletions.
 const usageTestOriginsNulls = `"proposalsFromChat":null,"proposalsFromConsole":null,"proposalsFromApi":null,"proposalsFromEvent":null,"proposalsFromDrift":null,"proposalsFromAudit":null,"proposalsFromScheduled":null,"proposalsFromIssue":null,"proposalsFromOther":null`
+
+// usageTestInferenceNulls is the three inference totals as merge-patch
+// deletions.
+const usageTestInferenceNulls = `"inputTokensTotal":null,"outputTokensTotal":null,"spendMicrosUSDTotal":null`
 
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
@@ -440,6 +491,8 @@ type usageHarness struct {
 	pruningTopTools bool
 	// pruningOrigins is a CRD serving all but the nine origin readings.
 	pruningOrigins bool
+	// pruningInference is a CRD serving all but the three inference totals.
+	pruningInference bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -456,8 +509,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools || h.pruningOrigins) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `,` + usageTestOriginsNulls + `}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools || h.pruningOrigins || h.pruningInference) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `,` + usageTestOriginsNulls + `,` + usageTestInferenceNulls + `}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -493,6 +546,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningOrigins {
 					strip = `{"status":{"usage":{` + usageTestOriginsNulls + `}}}`
+				}
+				if h.pruningInference {
+					strip = `{"status":{"usage":{` + usageTestInferenceNulls + `}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -550,6 +606,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOrigins) {
 					*usageReadingStatusField(&pa.Status.Usage, spec.field) = nil
 				}
+			}
+			if isAgent && (h.pruningGauges || h.pruningInference) {
+				pa.Status.Usage.InputTokensTotal = 0
+				pa.Status.Usage.OutputTokensTotal = 0
+				pa.Status.Usage.SpendMicrosUSDTotal = 0
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -850,7 +911,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0, usageCounterInputTokens: 0, usageCounterOutputTokens: 0, usageCounterSpendMicros: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
@@ -2693,7 +2754,13 @@ func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
 // for the counter, so a later pod older than the document is baselined.
 func TestUsagePoller_MigratesAVersionOneDocument_BrokerFailsTheMigratingPoll(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	// A LiteLLM pod beside the default set: the three inference totals are
+	// counters the migrated document lacks too, and the poll that first reads
+	// the pod adds its whole sample and clears them from the unfolded set, as
+	// the proposals counter's first read does for it.
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), litellm)...)
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
 	moved := metav1.NewTime(usageClock(3))
 	h.writeDocument(&usageDocument{
 		Version:       usageDocumentVersionPodKeyed,
@@ -2723,6 +2790,9 @@ func TestUsagePoller_MigratesAVersionOneDocument_BrokerFailsTheMigratingPoll(t *
 	doc = h.document()
 	if doc.Totals[usageCounterRemediationsProposed] != 2 || doc.Totals[usageCounterToolExecutions] != 13 {
 		t.Fatalf("totals after the recovery poll: %v, want remediationsProposedTotal 2 (the whole sample) and toolExecutionsTotal 13", doc.Totals)
+	}
+	if doc.Totals[usageCounterInputTokens] != 1_000_000 || doc.Totals[usageCounterOutputTokens] != 50_000 || doc.Totals[usageCounterSpendMicros] != 5_000_000 {
+		t.Fatalf("totals after the recovery poll: %v, want the LiteLLM pod's whole samples, added on its first read", doc.Totals)
 	}
 	if len(doc.Unfolded) != 0 {
 		t.Fatalf("the unfolded set outlived the first recorded sample: %v", doc.Unfolded)
@@ -4561,5 +4631,210 @@ func TestUsagePoller_TheOriginReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 	}
 	if held[usageExportRemediationsMerged] || held[usageExportPeopleSeen7d] {
 		t.Fatalf("held fields %v, want remediationsMergedTotal and peopleSeen7d published", held)
+	}
+}
+
+// usageLiteLLMObjects is the default pod set plus a Ready LiteLLM pod, the
+// chart's replay-shadow proxy under the same label, and a LiteLLM pod whose
+// container is not Ready yet.
+func usageLiteLLMObjects(created time.Time) []client.Object {
+	notReady := usageLiteLLMPod("litellm-ddd", "litellm-d", "10.0.0.31", created)
+	notReady.Status.ContainerStatuses[0].Ready = false
+	return append(usageDefaultObjects(created),
+		usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created),
+		usageReplayShadowPod("inference-replay-shadow-eee", "replay-e", "10.0.0.32", created),
+		notReady,
+	)
+}
+
+// setLiteLLM plants one LiteLLM body's three samples at addr.
+func (s *stubUsageSource) setLiteLLM(addr string, tokensIn, tokensOut, spendMicros int64, start *float64) {
+	s.set(addr, tokensIn, start)
+	s.setSample(addr, usageCounterOutputTokens, tokensOut)
+	s.setSample(addr, usageCounterSpendMicros, spendMicros)
+}
+
+// The fifth group: every Ready LiteLLM pod is read at the fixed port and the
+// slashed path, the replay-shadow proxy under the same label and a pod whose
+// container is not Ready are not, the three totals fold under the token and
+// spend ceilings rather than the common one, land in their three status
+// fields, and move neither lastActiveTime nor lastHumanActiveTime.
+func TestUsagePoller_InferenceTotalsCountFromTheLiteLLMPods(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageLiteLLMObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
+	h.poll(5)
+	if got := h.stub.pathOf(litellmAddr()); got != usageLiteLLMMetricsPath {
+		t.Fatalf("LiteLLM was read at %q, want %q", got, usageLiteLLMMetricsPath)
+	}
+	for _, addr := range []string{"10.0.0.31:8080", "10.0.0.32:8080"} {
+		if h.stub.scraped(addr) {
+			t.Fatalf("%s was read: a not-Ready LiteLLM pod or the replay-shadow proxy", addr)
+		}
+	}
+	doc := h.document()
+	for _, counter := range usageLiteLLMCounters {
+		if doc.Pods[usagePodEntryKey("litellm-c", counter)] == nil {
+			t.Fatalf("no entry for the LiteLLM pod's %s: %v", counter, doc.Pods)
+		}
+	}
+	if status := h.status(); status.InputTokensTotal != 0 || status.LastActiveTime != nil {
+		t.Fatalf("the first poll wrote the status: %+v", status)
+	}
+
+	// Sixty thousand tokens in, a thousand out and thirty cents in five
+	// minutes: past the common ceiling, under the token and spend ceilings.
+	h.stub.setLiteLLM(litellmAddr(), 1_060_000, 51_000, 5_300_000, ptr.To(300.0))
+	h.poll(10)
+	status := h.status()
+	if status.InputTokensTotal != 60_000 || status.OutputTokensTotal != 1_000 || status.SpendMicrosUSDTotal != 300_000 {
+		t.Fatalf("after the second poll: %+v, want 60000 in, 1000 out, 300000 micros", status)
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("an inference advance moved a time: %+v", status)
+	}
+	if status.ToolExecutionsTotal != 0 || status.ChatMessagesInboundTotal != 0 {
+		t.Fatalf("an inference advance moved another counter: %+v", status)
+	}
+	// A LiteLLM restart: the pod's counters start again at zero under a new
+	// start time, and the totals hold, then grow from the new process.
+	h.stub.setLiteLLM(litellmAddr(), 500, 20, 2_500, ptr.To(400.0))
+	h.poll(15)
+	status = h.status()
+	if status.InputTokensTotal != 60_500 || status.OutputTokensTotal != 1_020 || status.SpendMicrosUSDTotal != 302_500 {
+		t.Fatalf("after a LiteLLM restart: %+v, want the totals plus the new process's whole sample", status)
+	}
+}
+
+// A LiteLLM pod replaced by a rollout folds from its first body: the new
+// pod was created after the document and adds its whole sample, under the
+// token ceiling rather than the common one, on top of the stored total.
+func TestUsagePoller_AReplacedLiteLLMPodFoldsOntoTheStoredTotal(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	old := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), old)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000_000, 50_000, 5_000_000, ptr.To(300.0))
+	h.poll(5)
+	h.stub.setLiteLLM(litellmAddr(), 1_060_000, 51_000, 5_300_000, ptr.To(300.0))
+	h.poll(10)
+	if status := h.status(); status.InputTokensTotal != 60_000 {
+		t.Fatalf("before the rollout: %+v", status)
+	}
+
+	ctx := context.Background()
+	if err := h.cl.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	replacement := usageLiteLLMPod("litellm-fff", "litellm-f", "10.0.0.33", usageClock(12))
+	if err := h.cl.Create(ctx, replacement); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.setLiteLLM("10.0.0.33:8080", 70_000, 2_000, 400_000, ptr.To(720.0))
+	h.poll(15)
+	status := h.status()
+	if status.InputTokensTotal != 130_000 || status.OutputTokensTotal != 3_000 || status.SpendMicrosUSDTotal != 700_000 {
+		t.Fatalf("after the rollout: %+v, want the stored totals plus the new pod's whole sample", status)
+	}
+	doc := h.document()
+	if doc.Pods[usagePodEntryKey("litellm-c", usageCounterInputTokens)] != nil {
+		t.Fatalf("the departed pod kept its entry: %v", doc.Pods)
+	}
+	if doc.Pods[usagePodEntryKey("litellm-f", usageCounterSpendMicros)] == nil {
+		t.Fatalf("the replacement has no entry: %v", doc.Pods)
+	}
+}
+
+// A served CRD from before the three inference totals prunes them together:
+// their absence is one record, the other counters keep landing, the three
+// gauge rows are held back, and a poll with the three alone behind does not
+// re-patch while the record is fresh.
+func TestUsagePoller_TheInferenceTotalsShareOnePruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, agent, append(usageDefaultObjects(created), litellm)...)
+	h.pruningInference = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 10, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 1_000, 100, 10_000, ptr.To(300.0))
+	h.poll(5)
+	h.stub.set(brokerAddr(), 13, ptr.To(200.0))
+	h.stub.setLiteLLM(litellmAddr(), 2_000, 200, 20_000, ptr.To(300.0))
+	h.poll(10)
+	if status := h.status(); status.ToolExecutionsTotal != 3 || status.InputTokensTotal != 0 || status.SpendMicrosUSDTotal != 0 {
+		t.Fatalf("status under a CRD without the inference totals: %+v, want 3 tool executions and no totals", status)
+	}
+	if !h.p.newerFieldPruned(agent, usageNewerFieldInference) {
+		t.Fatal("the absence of the three totals was not recorded against their shared record")
+	}
+	for _, counter := range usageLiteLLMCounters {
+		if h.p.newerFieldPruned(agent, counter) {
+			t.Fatalf("a record was kept under %s alone", counter)
+		}
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of the three totals was recorded as the counters' pruning")
+	}
+	if doc := h.document(); doc.Totals[usageCounterInputTokens] != 1_000 || doc.Totals[usageCounterSpendMicros] != 10_000 {
+		t.Fatalf("the ConfigMap fell behind under the pruning CRD: %v", doc.Totals)
+	}
+	patches := h.patches
+	h.stub.setLiteLLM(litellmAddr(), 3_000, 300, 30_000, ptr.To(300.0))
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the inference totals alone behind re-patched the status while their record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	for _, counter := range usageLiteLLMCounters {
+		if !held[counter] {
+			t.Errorf("held fields %v, want %s held", held, counter)
+		}
+	}
+	if held[usageCounterToolExecutions] {
+		t.Errorf("held fields %v, want toolExecutionsTotal published", held)
+	}
+
+	// The CRD applied and the record expired: the next poll lands everything
+	// the ConfigMap accumulated, in one patch.
+	h.pruningInference = false
+	h.p.expireNewerFieldsRecordForTest(agent)
+	h.poll(20)
+	if status := h.status(); status.InputTokensTotal != 2_000 || status.OutputTokensTotal != 200 || status.SpendMicrosUSDTotal != 20_000 {
+		t.Fatalf("after the CRD landed: %+v, want the accumulated totals", status)
+	}
+	if h.p.newerFieldPruned(agent, usageNewerFieldInference) {
+		t.Fatal("the echo carried the totals and the record was not cleared")
+	}
+}
+
+// The Warning for a failing LiteLLM listener names the three status fields
+// and the response guidance, as a 307 from the bare path would: the listener
+// answered, and what it answered could not be used.
+func TestUsagePoller_AFailingLiteLLMListenerNamesItsThreeFields(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	litellm := usageLiteLLMPod("litellm-ccc", "litellm-c", usageTestLiteLLMIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), litellm)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.errs[litellmAddr()] = &usageScrapeError{Kind: usageScrapeKindStatus, Status: http.StatusTemporaryRedirect}
+	h.poll(5)
+	h.poll(10)
+	select {
+	case event := <-h.recorder.Events:
+		for _, want := range []string{usageScrapeFailingReason, "pod litellm-ccc (status.usage.inputTokensTotal, status.usage.outputTokensTotal, status.usage.spendMicrosUSDTotal): status: HTTP 307", usageScrapeResponseGuidance} {
+			if !strings.Contains(event, want) {
+				t.Errorf("event %q lacks %q", event, want)
+			}
+		}
+	default:
+		t.Fatal("no Warning after two failed polls of the LiteLLM listener")
 	}
 }

@@ -66,6 +66,11 @@ const (
 	// carries, the summary block's "top 5"; the CRD caps the list at the same
 	// number.
 	usageTopToolsShown = 5
+	// usageNewerFieldInference names the three inference totals' shared
+	// pruning record (inputTokensTotal, outputTokensTotal and
+	// spendMicrosUSDTotal): they arrived in one release and a CRD serves all
+	// three or none.
+	usageNewerFieldInference = "the three inference totals"
 	// gatewayLeaderLabel is the label leader_elect.py stamps on the gateway pod
 	// that holds the lease and runs Hermes, the one the gateway Service selects
 	// (platformagent_manifests.go); the chat listener lives in that process.
@@ -138,13 +143,14 @@ const (
 // eventsIngestedTotal, remediationsProposedTotal, chatMessagesInboundTotal,
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
-// negativeFeedbackTotal, lastActiveTime and lastHumanActiveTime on every
+// negativeFeedbackTotal, inputTokensTotal, outputTokensTotal,
+// spendMicrosUSDTotal, lastActiveTime and lastHumanActiveTime on every
 // PlatformAgent, the two cluster gauges, the six proposal readings, the
 // two people readings (peopleSeen7d, peopleSeen30d), the broker's top
 // tools (topTools) and the nine origin readings (proposalsFromChat to
-// proposalsFromOther), from the broker's, the watcher's, the chat plugin's
-// and the A2A gateway's metrics listeners, as a manager Runnable on the
-// leader, off the reconcile path.
+// proposalsFromOther), from the broker's, the watcher's, the chat plugin's,
+// the A2A gateway's and LiteLLM's metrics listeners, as a manager Runnable
+// on the leader, off the reconcile path.
 // docs/designs/usage-counters-producer.md is the design; the rules the
 // counters follow are in usage_counters_fold.go, the scrape in
 // usage_counters_scrape.go. This file is the loop and the two
@@ -227,7 +233,8 @@ func (t usageTarget) streakKey() usageStreakKey {
 }
 
 // usageTarget is a running pod whose listener the poll reads, the counters
-// its body feeds, and the readings it serves, none for most.
+// its body feeds, the readings it serves, none for most, and the path its
+// exposition is served at.
 type usageTarget struct {
 	uid      types.UID
 	name     string
@@ -236,6 +243,7 @@ type usageTarget struct {
 	readings []usageReadingKind
 	port     string
 	addr     string
+	path     string
 }
 
 // NewUsageCounterPoller returns the poller for r's PlatformAgents, reading
@@ -543,7 +551,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
 	for _, target := range targets {
-		reading, err := p.source.Scrape(ctx, target.addr, target.counters, target.readings)
+		reading, err := p.source.Scrape(ctx, target.addr, target.path, target.counters, target.readings)
 		if err != nil {
 			if ctx.Err() != nil {
 				// A poll cut short by shutdown, a leader change, or the poll
@@ -902,7 +910,14 @@ func (p *UsageCounterPoller) reader() client.Reader {
 // start that is going well. A listener this poll decided not to read has
 // its streak closed, since a count left open behind a leadership change or
 // a restart would meet the next cold start's one failed read and make it a
-// Warning.
+// Warning. The LiteLLM pods, the chart's rather than this CR's, are read on
+// the same terms from their litellm-container alone once it is Ready: the
+// container declares its port by number and no name, so the group names the
+// port the operator pins for LiteLLM's NetworkPolicy (litellmPort) rather
+// than looking one up, and reads it at usageLiteLLMMetricsPath; a pod under
+// the same app label without that container, the replay-shadow proxy the
+// chart can run in front of LiteLLM, is left unread, since its answer would
+// be whichever LiteLLM pod it forwarded to.
 // usagePollGatewayReplicas is the gateway replica count targets reads the leader
 // rule against: the rendered count, which the operator caps at one
 // (supportedGatewayReplicas). It is a variable so the multi-replica tests can
@@ -920,6 +935,9 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		return leads && usageContainerReady(pod, platformAgentContainerName)
 	}
 	everyPod := func(*corev1.Pod) bool { return true }
+	servesLiteLLM := func(pod *corev1.Pod) bool {
+		return usagePodHasContainer(pod, litellmContainerName) && usageContainerReady(pod, litellmContainerName)
+	}
 	groups := []struct {
 		selector  map[string]string
 		counters  []string
@@ -929,17 +947,28 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		read      bool
 		// podRead narrows read to the pods whose container serves the port.
 		podRead func(*corev1.Pod) bool
+		// fixedPort, when set, is the listener's port by number, for a
+		// container that declares its port without a name; port is then the
+		// streak key's label for it rather than a name to look up.
+		fixedPort int32
+		// path is where the listener serves its exposition.
+		path string
 	}{
-		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
+		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod, 0, usageMetricsPath},
 		// The chat listener also serves the origins reading, from the proposals
 		// ledger, on the same gate as its counters.
-		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway, 0, usageMetricsPath},
 		// The A2A gateway, a pod a next-mode install runs and a today install
 		// does not: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
 		// elsewhere.
-		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
-		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod, 0, usageMetricsPath},
+		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod, 0, usageMetricsPath},
+		// LiteLLM, the chart's inference gateway in the CR's namespace: the
+		// three inference totals, from every pod that runs the LiteLLM
+		// container, on the fixed port its NetworkPolicy admits the
+		// namespace's pods on, at the slashed path its router serves.
+		{litellmPodSelector(), usageLiteLLMCounters, nil, litellmContainerName, strconv.Itoa(int(litellmPort)), true, servesLiteLLM, litellmPort, usageLiteLLMMetricsPath},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -982,9 +1011,12 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 				continue
 			}
-			port, ok := usagePodPort(pod, group.container, group.port)
-			if !ok {
-				continue
+			port := group.fixedPort
+			if port == 0 {
+				var ok bool
+				if port, ok = usagePodPort(pod, group.container, group.port); !ok {
+					continue
+				}
 			}
 			targets = append(targets, usageTarget{
 				uid:      pod.UID,
@@ -994,10 +1026,27 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				readings: group.readings,
 				port:     group.port,
 				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
+				path:     group.path,
 			})
 		}
 	}
 	return targets, live, nil
+}
+
+// usagePodHasContainer reports whether pod declares a container of that name,
+// among its containers or its native sidecars.
+func usagePodHasContainer(pod *corev1.Pod, container string) bool {
+	for _, candidate := range pod.Spec.InitContainers {
+		if candidate.Name == container {
+			return true
+		}
+	}
+	for _, candidate := range pod.Spec.Containers {
+		if candidate.Name == container {
+			return true
+		}
+	}
+	return false
 }
 
 // usageContainerReady reports whether the named container of pod has passed
@@ -1029,6 +1078,14 @@ func a2aGatewayPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string
 // covers and the watcher's listener runs in.
 func gatewayPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{"app": agent.Name + gatewayAppSuffix}
+}
+
+// litellmPodSelector selects the LiteLLM pods: the chart's label, the one
+// LiteLLM's NetworkPolicy and the agent's egress rules select on, in the CR's
+// namespace. The chart runs one LiteLLM per namespace, so several CRs in one
+// namespace would each count the same pods.
+func litellmPodSelector() map[string]string {
+	return map[string]string{podLabelApp: litellmAppName}
 }
 
 // usagePodPort finds the port named name on the container named container,
@@ -1212,6 +1269,9 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterChatTurnsErrored:      usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
 		usageCounterBackgroundTasksGaveUp: usageStatusFloor(agent.Status.Usage.BackgroundTasksGaveUpTotal),
 		usageCounterNegativeFeedback:      usageStatusFloor(agent.Status.Usage.NegativeFeedbackTotal),
+		usageCounterInputTokens:           usageStatusFloor(agent.Status.Usage.InputTokensTotal),
+		usageCounterOutputTokens:          usageStatusFloor(agent.Status.Usage.OutputTokensTotal),
+		usageCounterSpendMicros:           usageStatusFloor(agent.Status.Usage.SpendMicrosUSDTotal),
 		// sessionsTotal split between the halves (usageStatusSessionsSeed);
 		// the read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        triageSessions,
@@ -1393,6 +1453,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	errored := doc.Totals[usageCounterChatTurnsErrored]
 	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	negative := doc.Totals[usageCounterNegativeFeedback]
+	tokensIn := doc.Totals[usageCounterInputTokens]
+	tokensOut := doc.Totals[usageCounterOutputTokens]
+	spend := doc.Totals[usageCounterSpendMicros]
 	sessions := usageSessionsTotal(doc.Totals)
 	chatSessions := doc.Totals[usageCounterSessionsChat]
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
@@ -1419,6 +1482,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
 	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
+	inferencePruned := p.newerFieldPruned(agent, usageNewerFieldInference)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
 	topToolsPruned := p.newerFieldPruned(agent, usageNewerFieldTopTools)
 	topToolsMoved := topToolsKnown && !topToolsPruned && !usageTopToolsEqual(usage.TopTools, topTools)
@@ -1435,7 +1499,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
 		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) ||
-		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) || readingsMoved || topToolsMoved
+		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) ||
+		(!inferencePruned && (usage.InputTokensTotal < tokensIn || usage.OutputTokensTotal < tokensOut || usage.SpendMicrosUSDTotal < spend)) || readingsMoved || topToolsMoved
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
@@ -1458,6 +1523,13 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// carry it and refresh a fresh pruning record.
 	if !chatSessionsPruned {
 		usage.ChatSessionsTotal = chatSessions
+	}
+	// The three inference totals share one record and are written on the
+	// same terms as the chat half: only while unpruned.
+	if !inferencePruned {
+		usage.InputTokensTotal = tokensIn
+		usage.OutputTokensTotal = tokensOut
+		usage.SpendMicrosUSDTotal = spend
 	}
 	usage.ToolExecutionsBlockedTotal = blocked
 	if doc.LastMoved != nil {
@@ -1551,6 +1623,13 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// that cleared the field says nothing either way.
 	if topToolsKnown && !topToolsPruned && len(topTools) > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldTopTools, usageTopToolsEqual(agent.Status.Usage.TopTools, topTools))
+	}
+	// One echo for the three inference totals: a CRD serves all three or
+	// none, so the record is theirs together, and a patch that wrote any of
+	// them non-zero says whether the served CRD carries them.
+	if !inferencePruned && (tokensIn > 0 || tokensOut > 0 || spend > 0) {
+		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldInference,
+			agent.Status.Usage.InputTokensTotal == tokensIn && agent.Status.Usage.OutputTokensTotal == tokensOut && agent.Status.Usage.SpendMicrosUSDTotal == spend)
 	}
 	return nil
 }

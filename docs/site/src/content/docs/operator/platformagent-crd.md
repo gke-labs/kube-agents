@@ -1370,8 +1370,8 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
-minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. So are the three inference totals, `usage.inputTokensTotal`, `usage.outputTokensTotal` and `usage.spendMicrosUSDTotal`. Every five
+minutes it reads the credential broker's, the event watcher's, the chat plugin's, LiteLLM's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
 restarts, and patches the status only when it is behind.
@@ -1490,7 +1490,7 @@ record. Under a served CRD that predates `status.usage` they accumulate in the
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
 later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal`, the three inference totals and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.
