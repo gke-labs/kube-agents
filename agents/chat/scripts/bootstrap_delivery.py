@@ -522,10 +522,10 @@ REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
 # Written by the retire path beside the claim; with REPORT_FILED_FILE it is
 # what tells a claim this path kept from one its run died holding.
 REPORT_RETIRED_FILE = ".bootstrap_report_retired"
-# Written by the no-human path just before it claims, and never removed: a
-# claim beside it with neither record above is one a run died holding, and the
-# stale-claim rule releases it; the origin path, which never writes it, keeps
-# its claim settled the moment it exists, as before.
+# Written by the no-human path just before it claims and removed with every
+# release of that claim: a claim beside it with neither record above is one a
+# run died holding, and the stale-claim rule releases it; the origin path, which
+# never writes it, keeps its claim settled the moment it exists, as before.
 REPORT_CLAIMING_FILE = ".bootstrap_report_claiming"
 REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
 REPORT_ISSUE_INTRO = (
@@ -547,6 +547,16 @@ FILED_AT = "filed_at"
 # `host/owner/name` one (gitops_workspace.get_managed_github_repo_names).
 ISSUE_URL_FORMAT = "https://{host}/{slug}/issues/{number}"
 ISSUE_URL_DEFAULT_HOST = "github.com"
+# The keys a broker answer may carry the issue's address under, and what an address starts with.
+ISSUE_URL_KEYS = ("html_url", "url")
+URL_SCHEME_PREFIX = "http"
+# GitHub refuses an issue body past this many characters; a report that long is
+# recorded as unfilable rather than retried five times for a 422.
+ISSUE_BODY_MAX_CHARS = 65536
+# This path's own record of attempts that released the claim (the conversation
+# path keeps CONVERSATION_ATTEMPTS_FILE): the two must not share a count, or
+# five refused creates would stop the thread delivery a human binds later.
+REPORT_ATTEMPTS_FILE = ".bootstrap_report_attempts.json"
 # The one line that goes to the home channel once the issue is up: a link, so a
 # reader opens the report from the message (chat_ux.md, no plumbing in user
 # text), and the user's own fact rather than the stage's. ``a2a notify`` exits
@@ -576,6 +586,10 @@ REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
 HOME_LINE_POSTED = "was posted"
 HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
 HOME_LINE_FAILED = "was not posted (a2a notify exited {code}: {detail})"
+HOME_LINE_NO_EXIT = "none"
+REPORT_TOO_LONG_REASON = (
+    "the first-run report is longer than an issue body may be ({chars} characters, limit {limit}); not filing it"
+)
 
 
 def _data_dir() -> Path:
@@ -645,9 +659,9 @@ def _bound_conversation(data_dir: Path) -> dict | None:
     return {key: str(record.get(key) or "").strip() for key in CONVERSATION_KEYS}
 
 
-def _read_attempts(data_dir: Path) -> dict:
+def _read_attempts(data_dir: Path, name: str = CONVERSATION_ATTEMPTS_FILE) -> dict:
     try:
-        record = json.loads((data_dir / CONVERSATION_ATTEMPTS_FILE).read_text(encoding="utf-8"))
+        record = json.loads((data_dir / name).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     return record if isinstance(record, dict) else {}
@@ -658,10 +672,10 @@ def _attempt_count(record: dict) -> int:
     return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
 
 
-def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
+def _record_attempt(data_dir: Path, reason: str, counted: bool, name: str = CONVERSATION_ATTEMPTS_FILE) -> None:
     """Record why the report is not out; ``counted`` adds one post that released the claim."""
     sys.stderr.write(f"bootstrap_delivery: {reason}\n")
-    record = _read_attempts(data_dir)
+    record = _read_attempts(data_dir, name)
     count = _attempt_count(record) + (1 if counted else 0)
     if not counted and record.get(ATTEMPTS_REASON) == reason:
         return  # the same block as the last tick's: no write each minute
@@ -671,7 +685,7 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
         record[ATTEMPTS_AT] = time.time()
     if counted and count >= CONVERSATION_MAX_ATTEMPTS:
         _stage_note(data_dir, f"the report was not posted after {count} attempts and now waits: {reason}")
-    target = data_dir / CONVERSATION_ATTEMPTS_FILE
+    target = data_dir / name
     tmp = target.with_name(target.name + ".tmp")
     try:
         tmp.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
@@ -704,12 +718,13 @@ def _mark_claiming(data_dir: Path) -> None:
 
 
 def _release_claim(data_dir: Path) -> None:
-    try:
-        (data_dir / ".bootstrap_completed").unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not release the claim: {e}\n")
+    for name in (".bootstrap_completed", REPORT_CLAIMING_FILE):
+        try:
+            (data_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not release the claim ({name}): {e}\n")
 
 
 def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
@@ -1905,10 +1920,10 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
 
 
 def _ledger_repo() -> str | None:
-    """Where the report is filed: the GitOps repository when it is on GitHub, else the one managed
-    GitHub repository, else None; several GitHub repositories with no GitOps role among them is a
-    recorded reason, not a guess. A GitOps repository on another forge files nothing here, as the
-    chat-delivery ledger files nothing there."""
+    """Where the report is filed: the GitOps repository when it is on GitHub, else the install's one
+    managed GitHub repository (so a GitOps repository on another forge still files into that one, as
+    the chat-delivery ledger does); several GitHub repositories with no GitOps role among them is a
+    recorded reason, not a guess; none on GitHub files nothing."""
     repos = sorted(gitops_workspace.get_managed_github_repo_names())
     gitops = gitops_workspace.get_gitops_repo()
     if gitops in repos:
@@ -1952,9 +1967,9 @@ def _utc(stamp: float) -> str:
 
 def _issue_url(repo: str, number: int, issue: dict) -> str:
     """The issue's web address: the broker's, or built from the slug when the answer carries none."""
-    for key in ("html_url", "url"):
+    for key in ISSUE_URL_KEYS:
         value = issue.get(key)
-        if isinstance(value, str) and value.startswith("http"):
+        if isinstance(value, str) and value.startswith(URL_SCHEME_PREFIX):
             return value
     host, slash, rest = repo.partition("/")
     if slash and "/" in rest:  # host/owner/name
@@ -2039,7 +2054,7 @@ def _post_home_line(data_dir: Path, url: str, now: float) -> None:
                 timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code="none", detail=e)))
+            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)))
             return
         if not chat_notify.route_unavailable(res.returncode) or delay is None:
             break
@@ -2085,7 +2100,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     leaves no claim to undo. A refused create releases the claim and counts an attempt, with the
     conversation path's waits between tries; past its last, the report waits for the retire.
     """
-    record = _read_attempts(data_dir)
+    record = _read_attempts(data_dir, REPORT_ATTEMPTS_FILE)
     count = _attempt_count(record)
     if count >= CONVERSATION_MAX_ATTEMPTS:
         return 0
@@ -2099,13 +2114,13 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     try:
         repo = _ledger_repo()
     except LedgerRepoAmbiguous as e:
-        _record_attempt(data_dir, str(e), counted=False)
+        _record_attempt(data_dir, str(e), counted=False, name=REPORT_ATTEMPTS_FILE)
         return 0
     except Exception as e:  # noqa: BLE001 - an unreadable mount is a recorded reason, not a tick-long traceback
-        _record_attempt(data_dir, LEDGER_REPO_UNREADABLE_REASON.format(error=e), counted=False)
+        _record_attempt(data_dir, LEDGER_REPO_UNREADABLE_REASON.format(error=e), counted=False, name=REPORT_ATTEMPTS_FILE)
         return 0
     if repo is None:
-        _record_attempt(data_dir, NO_LEDGER_REPO_REASON, counted=False)
+        _record_attempt(data_dir, NO_LEDGER_REPO_REASON, counted=False, name=REPORT_ATTEMPTS_FILE)
         return 0
 
     try:
@@ -2131,6 +2146,12 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     suppressed = _register_findings(data_dir, no_ranking, files)
     note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
     body = _with_note(content, note)
+    if len(body) > ISSUE_BODY_MAX_CHARS:
+        _record_attempt(
+            data_dir, REPORT_TOO_LONG_REASON.format(chars=len(body), limit=ISSUE_BODY_MAX_CHARS), counted=False,
+            name=REPORT_ATTEMPTS_FILE,
+        )
+        return 0
 
     _mark_claiming(data_dir)
     if not _claim_delivery(data_dir):
@@ -2144,11 +2165,11 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     try:
         number, url = _file_report_issue(repo, body, sweep, filed_at, now)
     except forge.ForgeError as e:
-        _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True)
+        _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True, name=REPORT_ATTEMPTS_FILE)
         _release_claim(data_dir)
         return 0
     except Exception as e:  # noqa: BLE001 - see above; the next tick retries after the wait
-        _record_attempt(data_dir, REPORT_FILING_FAILED_REASON.format(repo=repo, error=e), counted=True)
+        _record_attempt(data_dir, REPORT_FILING_FAILED_REASON.format(repo=repo, error=e), counted=True, name=REPORT_ATTEMPTS_FILE)
         _release_claim(data_dir)
         return 0
     ref = f"{repo}#{number}"

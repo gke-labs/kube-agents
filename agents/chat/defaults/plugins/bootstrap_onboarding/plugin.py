@@ -72,6 +72,7 @@ GREETED_MARKER = ".bootstrap_greeted"
 # with a pointer there rather than with a report that is not coming.
 REPORT_FILED_MARKER = ".bootstrap_report_filed"
 REPORT_FILED_URL_KEY = "url"
+URL_SCHEME_PREFIX = "http"
 REPORT_FILED_AT_KEY = "filed_at"
 _FALLBACK_REPORT_FILED = (
     "This is the first message anyone has sent this install. Its first-run inventory report was "
@@ -620,7 +621,7 @@ def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
         record = json.loads((data_dir / REPORT_FILED_MARKER).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(record, dict) or not str(record.get(REPORT_FILED_URL_KEY) or "").startswith("http"):
+    if not isinstance(record, dict) or not str(record.get(REPORT_FILED_URL_KEY) or "").startswith(URL_SCHEME_PREFIX):
         return None
     return record
 

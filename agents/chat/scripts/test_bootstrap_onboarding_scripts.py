@@ -2005,9 +2005,10 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertEqual(
-            bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON),
             bootstrap_delivery.NO_LEDGER_REPO_REASON,
         )
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "the conversation path's record is untouched")
 
     def test_the_gitops_repository_wins_among_several_on_github(self):
         self._filed(self.DAY + self.HOUR)
@@ -2037,7 +2038,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(self.forge_calls, [])
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual(
-            bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON),
             bootstrap_delivery.LEDGER_REPO_AMBIGUOUS_REASON.format(count=2),
         )
 
@@ -2123,8 +2124,40 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             self.assertEqual(self._main(), 0)
         self.assertFalse((self.d / COMPLETED).exists(), "the claim is released, not held with nothing filed")
         self.assertTrue((self.d / INVENTORY).exists())
-        record = bootstrap_delivery._read_attempts(self.d)
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
+
+    def test_refused_creates_do_not_block_a_thread_a_human_binds_later(self):
+        """The ledger path's attempts live in their own record; the conversation path's count stays zero."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        for _ in range(bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS):
+            self._main()
+            record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+            record[bootstrap_delivery.ATTEMPTS_AT] = 0.0  # past the wait
+            (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)),
+                         bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self.assertTrue(bootstrap_delivery._conversation_ready(self.d, CONVERSATION), "the human's thread is not charged the ledger's refusals")
+
+    def test_an_origin_claim_after_a_released_ledger_claim_settles(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self._main()  # released
+        (self.d / ALIGNED).touch()
+        (self.d / COMPLETED).touch()  # the origin path's own claim, later
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_report_too_long_for_an_issue_is_recorded_not_retried(self):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.ISSUE_BODY_MAX_CHARS + 10), encoding="utf-8")
+        with mock.patch.object(bootstrap_delivery, "REPORT_MAX_BYTES", bootstrap_delivery.ISSUE_BODY_MAX_CHARS * 2):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("longer than an issue body", bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
 
     def test_an_unreadable_repository_list_is_a_reason_not_a_traceback(self):
         self._filed(self.DAY + self.HOUR)
@@ -2133,7 +2166,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             self.assertEqual(self._main(), 0)
         self.assertEqual(self.forge_calls, [])
         self.assertFalse((self.d / COMPLETED).exists())
-        self.assertIn("mount unreadable", bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertIn("mount unreadable", bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
 
     def test_a_human_mid_greeting_is_not_nobody(self):
         """The plugin writes its greeting hold before the aligned marker; neither is the ledger path's cue."""
@@ -2160,9 +2193,11 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertEqual(self.runs, [])
-        record = bootstrap_delivery._read_attempts(self.d)
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
         self.assertIn("FORGE_FORBIDDEN", record[bootstrap_delivery.ATTEMPTS_REASON])
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "the release takes the marker with it")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "a later origin claim would settle at once")
         calls = len(self.forge_calls)
         self.assertEqual(self._main(), 0, "inside the wait after a refused create")
         self.assertEqual(len(self.forge_calls), calls)
