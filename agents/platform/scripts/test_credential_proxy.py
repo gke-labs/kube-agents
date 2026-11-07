@@ -20165,6 +20165,67 @@ class TeamsRelayTest(unittest.TestCase):
             )
             self.assertEqual(res, {"id": "act-resp-1"})
 
+    def test_teams_relay_upstream_rejection_carries_the_error_code(self):
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        body = json.dumps({"error": {"code": "BotNotInConversationRoster", "message": "The bot is not part of the conversation roster."}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay.api_call(service_url="https://smba.trafficmanager.net/teams/", path="v3/conversations/123/activities", payload={"text": "hi"})
+        self.assertEqual(caught.exception.fields["status"], 403)
+        self.assertEqual(caught.exception.fields["code"], "BotNotInConversationRoster")
+        self.assertIn("BotNotInConversationRoster", str(caught.exception))
+
+    def test_teams_relay_identity_rejection_carries_entras_error_and_description(self):
+        """Entra answers a bad secret with ``error`` / ``error_description`` strings,
+        not Bot Framework's ``error`` object; both shapes reach the 502's fields."""
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="wrong-password")
+        body = json.dumps({"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}).encode()
+        err = urllib.error.HTTPError("https://login.microsoftonline.com/t/oauth2/v2.0/token", 401, "Unauthorized", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay._get_access_token()
+        self.assertEqual(caught.exception.fields["status"], 401)
+        self.assertEqual(caught.exception.fields["code"], "invalid_client")
+        self.assertIn("AADSTS7000215", caught.exception.fields["message"])
+        self.assertEqual(str(caught.exception), "HTTP 401: invalid_client AADSTS7000215: Invalid client secret provided.")
+
+    def test_teams_relay_identity_faults_are_upstream_errors(self):
+        """A non-JSON identity body or a non-numeric expires_in is an upstream
+        fault (502 with its reason logged), not a ValueError the route answers
+        400 and logs nothing for."""
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        for raw in (
+            b"<html>captive portal</html>",
+            b"[1, 2]",
+            json.dumps({"access_token": "t", "expires_in": "soon"}).encode(),
+        ):
+            resp = mock.MagicMock()
+            resp.read.return_value = raw
+            resp.__enter__.return_value = resp
+            with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp):
+                with self.assertRaises(credential_proxy.TeamsUpstreamError, msg=raw):
+                    relay._get_access_token()
+
+    def test_teams_relay_api_call_replaces_a_lone_surrogate_instead_of_raising(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+        resp.__enter__.return_value = resp
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp) as opened:
+            result = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/123/activities",
+                payload={"type": "message", "text": "ok \ud83d done"},
+            )
+        self.assertEqual(result, {"id": "act-1"})
+        posted = opened.call_args.args[0].data.decode("utf-8")
+        self.assertIn("ok ? done", posted)
+
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
@@ -20188,7 +20249,9 @@ class TeamsRelayTest(unittest.TestCase):
             mock.patch.object(
                 credential_proxy, "is_trusted_teams_service_url", return_value=True
             ),
-            self.assertRaisesRegex(ValueError, "Teams API redirect refused \\(HTTP 302\\)"),
+            self.assertRaisesRegex(
+                credential_proxy.TeamsUpstreamError, "Teams API redirect refused \\(HTTP 302\\)"
+            ),
         ):
             relay.api_call(
                 service_url=f"http://127.0.0.1:{server.server_port}/teams/",
