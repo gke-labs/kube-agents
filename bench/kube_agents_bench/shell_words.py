@@ -358,3 +358,202 @@ def _command_word_index(
             continue
         return None
     return None
+
+
+_GREP_PROGRAMS = frozenset(("grep", "egrep", "fgrep"))
+# grep's options that take a value, so the word after them (or the rest of the cluster) is that
+# value and not the pattern. -e and --regexp give a pattern; -f and --file give patterns from a
+# file, so no positional word is the pattern then.
+_GREP_SHORT_VALUE_FLAGS = frozenset("ABCDdefm")
+_GREP_LONG_VALUE_FLAGS = frozenset((
+    "--after-context", "--before-context", "--context", "--max-count", "--regexp", "--file",
+    "--include", "--exclude", "--exclude-dir", "--exclude-from", "--directories", "--devices",
+    "--label", "--binary-files",
+))
+_GREP_QUIET_REDIRECT_RE = re.compile(r"^(?:[12]?>|&>)$")
+_GREP_QUIET_TARGET = "/dev/null"
+_COLLAPSED_ROW_RE = re.compile(r"\s\+\s\d+\scommands?\s*$")
+# The places a grep's own name may sit: bare, or in a system bin directory. A grep in any other
+# directory is a program the worker may have written.
+_GREP_SYSTEM_DIRS = ("/bin/", "/usr/bin/", "/usr/local/bin/")
+# Outside quotes, a character that groups commands, runs one, or makes the shell read the
+# quotes differently: a subshell or a group can feed a grep's output on (`(grep …) | sh`), a
+# substitution runs its text, `$'…'` quotes by other rules, and a word that starts with `#`
+# comments out the rest of its line. A row with any of them has no exempt grep.
+_GREP_ROW_REFUSED = frozenset("(){}`")
+_BRACED_PARAMETER_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
+
+
+def _raw_words(command: str) -> list[tuple[str | None, int, int, bool]] | None:
+    """The line's words and bare operators as ``(text, start, end, is_operator)``, with their
+    places in the raw line; a word's text keeps its quotes. A word that holds a substitution
+    (``$(``, a backtick, ``<(``, ``>(``) is marked by ``None`` for its text, since the shell runs
+    it. None when the quotes do not balance."""
+    out: list[tuple[str | None, int, int, bool]] = []
+    i, n = 0, len(command)
+    while i < n:
+        char = command[i]
+        if char in " \t\r\f\v":
+            i += 1
+            continue
+        if char == _SHELL_LINE_END or char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS:
+            j = i + 1
+            if char in _SHELL_OPERATOR_RUN_CHARS:
+                while j < n and command[j] in _SHELL_OPERATOR_RUN_CHARS and command[j] != ";":
+                    j += 1
+            out.append((command[i:j], i, j, True))
+            i = j
+            continue
+        start, quote, runs = i, None, False
+        while i < n:
+            char = command[i]
+            if quote is None and (char in " \t\r\f\v\n" or char in _SHELL_OPERATOR_RUN_CHARS or char in _SHELL_PARENS):
+                if char in "<>" and command.startswith(("<(", ">("), i):
+                    runs = True
+                break
+            if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+                i += 2
+                continue
+            if char == quote:
+                quote = None
+            elif quote is None and char in _SHELL_QUOTE_CHARS:
+                quote = char
+            elif quote != _SHELL_SINGLE_QUOTE and (char == _SHELL_BACKTICK or command.startswith("$(", i)):
+                runs = True
+            i += 1
+        if quote is not None:
+            return None
+        # A digit run glued to a redirect (`2>`) is the redirect's fd, read with the operator.
+        if i < n and command[i] in "<>" and command[start:i].isdigit():
+            j = i + 1
+            while j < n and command[j] in "<>&":
+                j += 1
+            out.append((command[start:j], start, j, True))
+            i = j
+            continue
+        out.append((None if runs else command[start:i], start, i, False))
+    return out
+
+
+def grep_pattern_spans(command: str) -> list[tuple[int, int]]:
+    """The places in ``command`` of each grep invocation's pattern argument, for a case that
+    exempts a grep mention of a forbidden word: the ``-e``/``--regexp`` values, or else the first
+    word after the options. A segment counts only when its command word is grep, egrep or fgrep
+    (bare or in a system bin directory), its output is not piped on, and its only redirects send
+    stdout or stderr to /dev/null. A row counts for nothing when it is a collapsed chain (a row
+    ending `` + N command(s)``, which hides what followed), or when it groups commands, runs a
+    substitution, quotes with `$'…'` or holds a comment (:func:`_grep_row_refused`). The other segments, and the grep's options and file
+    operands, are left to the forbidden list."""
+    if _COLLAPSED_ROW_RE.search(command) or _grep_row_refused(command):
+        return []
+    words = _raw_words(command)
+    if not words:
+        return []
+    segments: list[list[tuple[str | None, int, int, bool]]] = [[]]
+    joins: list[str] = []
+    for word in words:
+        text, _, _, operator = word
+        if operator and text is not None and (text == _SHELL_LINE_END or set(text) <= _SHELL_OPERATOR_CHARS):
+            segments.append([])
+            joins.append(text)
+            continue
+        segments[-1].append(word)
+    spans: list[tuple[int, int]] = []
+    for index, segment in enumerate(segments):
+        piped_on = index < len(joins) and joins[index] in ("|", "|&")
+        if not segment or piped_on or segment[0][0] is None or segment[0][3]:
+            continue
+        name = segment[0][0]
+        directory = name[: len(name) - len(os.path.basename(name))]
+        if os.path.basename(name) not in _GREP_PROGRAMS or directory not in ("", *_GREP_SYSTEM_DIRS):
+            continue
+        found = _grep_patterns(segment[1:])
+        if found is not None:
+            spans.extend(found)
+    return spans
+
+
+def _grep_row_refused(command: str) -> bool:
+    """Whether the row groups commands, runs a substitution, uses `$'…'` quoting or holds a
+    comment outside quotes, or carries a newline inside quotes; the grep exemption reads none."""
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            elif char == _SHELL_LINE_END or (quote == _SHELL_DOUBLE_QUOTE and command.startswith("$(", i)):
+                return True
+            elif quote == _SHELL_DOUBLE_QUOTE and char == _SHELL_BACKTICK:
+                return True
+        elif char in _SHELL_QUOTE_CHARS:
+            if char == _SHELL_SINGLE_QUOTE and i > 0 and command[i - 1] == _SHELL_EXPANSION_PREFIX:
+                return True
+            quote = char
+        elif char == _SHELL_EXPANSION_PREFIX and _BRACED_PARAMETER_RE.match(command, i):
+            # `${NAME}` expands a variable and runs nothing.
+            i = _BRACED_PARAMETER_RE.match(command, i).end()
+            continue
+        elif char in _GREP_ROW_REFUSED:
+            return True
+        elif char == _SHELL_COMMENT_CHAR and (i == 0 or command[i - 1] in _SHELL_WORD_OPENERS):
+            return True
+        i += 1
+    return False
+
+
+def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple[int, int]] | None:
+    """The pattern spans of one grep segment's words after ``grep``; None when the segment does
+    not qualify (a substitution, or a redirect other than to /dev/null)."""
+    patterns: list[tuple[int, int]] = []
+    positional: tuple[int, int] | None = None
+    from_flags = False
+    options_over = False
+    take: str | None = None
+    index = 0
+    while index < len(words):
+        text, start, end, operator = words[index]
+        if text is None:
+            return None
+        if operator:
+            target = words[index + 1] if index + 1 < len(words) else None
+            if not _GREP_QUIET_REDIRECT_RE.match(text) or target is None or target[0] != _GREP_QUIET_TARGET:
+                return None
+            index += 2
+            continue
+        if take is not None:
+            if take == "pattern":
+                patterns.append((start, end))
+            take = None
+        elif not options_over and text == _SHELL_OPTIONS_END:
+            options_over = True
+        elif not options_over and text.startswith("--"):
+            name, has_value, value = text.partition("=")
+            if name in ("--regexp", "--file"):
+                from_flags = True
+                if name == "--regexp" and has_value:
+                    patterns.append((start + len(name) + 1, end))
+            if name in _GREP_LONG_VALUE_FLAGS and not has_value:
+                take = "pattern" if name == "--regexp" else "value"
+        elif not options_over and text.startswith("-") and len(text) > 1:
+            for offset, flag in enumerate(text[1:], start=1):
+                if flag in _GREP_SHORT_VALUE_FLAGS:
+                    if flag in "ef":
+                        from_flags = True
+                    rest = text[offset + 1:]
+                    if rest:
+                        if flag == "e":
+                            patterns.append((start + offset + 1, end))
+                    else:
+                        take = "pattern" if flag == "e" else "value"
+                    break
+        elif positional is None and not from_flags:
+            positional = (start, end)
+        index += 1
+    if from_flags:
+        return patterns
+    return [positional] if positional else []

@@ -100,7 +100,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, grep_pattern_spans
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2759,17 +2759,27 @@ class WorkerCommandsVerifier(BaseVerifier):
     match did not cover stays on the line and is graded. A command an
     exemption touched is left out of the required list altogether, a logged
     card's typed call in the required read included, and the reason says how
-    many were. For a command that can fetch and send nothing
+    many were. Write a pattern exemption to cover the argument that carries
+    the word and no more. A collapsed chain (a line ending
+    `` + N command(s)``) hides what followed, so an exemption refuses it and
+    the first command's own words are graded.
+    ``exempt_grep_patterns``: for a command that can fetch and send nothing
     but carries a forbidden word as its argument: a worker told the helper
-    holds no token may ``grep`` for the word before running it, and a case
-    that exempts the ``grep`` invocation through its pattern argument, on a
-    line that is one grep and nothing else (no shell join, pipe, substitution
-    or redirection), grades what the worker did, not what it read: the file
-    operands stay on the line, so a fetch that arrives among them is read.
-    Write the exemption to cover the argument that carries the word and no
-    more. A collapsed chain (a line ending `` + N command(s)``) hides what
-    followed, so an exemption refuses it and the first command's own words
-    are graded.
+    holds no token may ``grep`` for the word before running it. With this set,
+    the verifier cuts each grep's pattern argument (each ``-e``/``--regexp``
+    value, or else the first word after the options) out of the text the
+    forbidden list reads, and grades the rest: the options, the file operands,
+    and every other segment of the line (:func:`grep_pattern_spans`). It
+    decides on the line's shell segments, not a regex over the row, so an
+    operator glued to the pattern (``grep x;curl …``) ends the segment as it
+    does in bash, and a call joined onto the row stays a graded operand. A
+    grep does not qualify when its output is piped on, when it redirects
+    anywhere but /dev/null, or when it sits outside a system bin directory;
+    nor does any grep on a row that groups commands, runs a substitution,
+    quotes with ``$'…'``, holds a comment or is a collapsed chain. The pattern
+    exemptions read the row first, and the grep cut reads what they left. The
+    required list reads the rest of a grep-cut command (a clone beside a grep
+    still runs the clone), and the reason counts the command as exempted.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2869,6 +2879,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    exempt_grep_patterns: bool = False
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
@@ -2894,10 +2905,21 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
-    def _without_exempt_text(self, command: str) -> str:
+    def _without_grep_patterns(self, command: str) -> str:
+        if self.exempt_grep_patterns:
+            for start, end in reversed(grep_pattern_spans(command)):
+                command = command[:start] + command[end:]
+        return command
+
+    def _without_pattern_exemptions(self, command: str) -> str:
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
+
+    def _without_exempt_text(self, command: str) -> str:
+        # The pattern exemptions read the row as written, then the grep cut
+        # reads what they left.
+        return self._without_grep_patterns(self._without_pattern_exemptions(command))
 
     def verify(self, timeout_sec: float) -> VerificationResult:
         start = time.monotonic()
@@ -3049,9 +3071,14 @@ class WorkerCommandsVerifier(BaseVerifier):
         # of the line is what the forbidden list reads, and a command an
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
+        # The grep exemption removes only grep's pattern arguments, so the
+        # required list reads the rest of that command (a clone piped into a
+        # grep still runs the clone); a command a pattern exemption touched is
+        # out of it.
         with_calls = typed + beside_rows
-        commands = [c for c in with_calls if self._without_exempt_text(c) == c]
-        exempted = f" ({len(with_calls) - len(commands)} exempted)" if len(commands) < len(with_calls) else ""
+        commands = [self._without_grep_patterns(c) for c in with_calls if self._without_pattern_exemptions(c) == c]
+        touched = sum(1 for c in with_calls if self._without_exempt_text(c) != c)
+        exempted = f" ({touched} exempted)" if touched else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
