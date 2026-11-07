@@ -13,7 +13,7 @@ At 06:20 UTC the next day, the `compliance-audit` job (Security & RBAC Posture A
 
 The run publishes to the GitOps repository:
 
-- One ledger issue, `[audit] Security & RBAC Posture Audit — 2 findings (2 critical)`, with the labels `agent:audit`, `audit:compliance-audit` and `severity:critical`. Each finding carries the command that produced it, so a reviewer can run it again.
+- One ledger issue, `[audit] Security & RBAC Posture Audit (platform-agent-host) — 2 findings (2 critical)`, with the labels `agent:audit`, `audit:compliance-audit`, `audit-scope:platform-agent-host-…` (this install's) and `severity:critical`. Each finding carries the command that produced it, so a reviewer can run it again.
 - One remediation pull request for the Service, titled `fix(compliance-audit): <finding title>`, on a branch that starts with `platform-agent/fix-compliance-audit-`. It edits the Service's own declaration. The run opens pull requests unasked, at most five per run, only for findings whose fix is a manifest change. These are `critical` findings, and `major` findings on `unbound-sa-automount`. If a fix can break something the audit does not see, it waits in the ledger for `/remediate`.
 
 The privileged container gets no pull request. Its fix is `manual`, because dropping privilege can break a workload that needs one capability, so the ledger gives the steps and the owner decides. The harness opens pull requests and never merges them ([what the agent can and cannot do](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do)).
