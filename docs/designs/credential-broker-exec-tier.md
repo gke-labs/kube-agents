@@ -482,6 +482,9 @@ No issue tracks the second step.
 
 ## 4. Priority admission
 
+[`resource-broker-admission-control.md`](resource-broker-admission-control.md) proposes the next
+step: a memory guard per container, a fair share per capability, and a cost check on large reads.
+
 ### 4.1 The class
 
 Each exec request has a class: `interactive` or `background`. The broker sets it from what the

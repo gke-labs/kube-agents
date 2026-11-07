@@ -1,0 +1,588 @@
+# Resource Broker: Fair, Cost-Aware Admission Control
+
+## High level summary
+
+The resource broker is the set of components that run tool calls for the agents. It runs every
+`kubectl`, `gcloud` and Git command, every Cloud API call, and every skill script. Today three
+components make up the resource broker: the credential proxy, the Kubernetes API proxy and the
+sandbox shell. Each one runs in a container with a memory limit.
+
+An OOMKill is the kernel stopping a container that uses more memory than its limit. When agents
+send more work than the resource broker can hold, a container is OOMKilled. All work in that
+container stops, and the agents often send the same work again. A reproduction on a fleet of two
+clusters with 45,000 Pods each OOMKilled the credential proxy five times in five minutes. Two
+commands caused each kill. One command can use more than 2 GiB.
+
+This document specifies admission control for the resource broker. Admission control decides,
+before a tool call starts, whether the resource broker accepts it. It has three layers:
+
+1. A memory guard in each container that runs tool calls. The guard stops the largest tool
+   process before the container reaches its memory limit. The container stays up, and only one
+   tool call fails.
+2. A fair share per capability. A capability is the unit of agent work that sends tool calls, for
+   example one audit job or one chat turn. Each capability gets an equal share of the slots and a
+   rate limit. A capability that sends too much gets an immediate refusal with a wait time. Other
+   capabilities continue.
+3. A cost check. Before a large read starts, the resource broker estimates its memory. A read that
+   does not fit gets a refusal that tells the agent how to make the read smaller.
+
+The memory guard prevents the OOMKill. The fair share prevents one capability from blocking the
+others. The cost check gives the agent a useful answer before work starts. The number of slots and
+the rates change with the memory and CPU that the containers have.
+
+On current builds, `kubectl` runs in the sandbox shell, so the shell is the container that is
+OOMKilled. The `compliance-audit` job holds 94 to 100 % of the shell's memory at each peak. One
+`kubectl` list of all workloads on a cluster of 105,000 Pods uses 10.1 GiB, about 100 KiB per
+object. The cost check therefore goes in the shell's `kubectl` wrapper, which every `kubectl` call
+in the shell passes through. The credential proxy's existing admission no longer applies to
+`kubectl`, because `kubectl` no longer runs there.
+
+A prototype of the memory guard and the cost check ran on the reproduction fleet at the default
+shell limit (§6.3). With the guard alone, the shell had no OOMKill; the guard stopped three
+`kubectl` processes instead of the whole shell. With the guard and the cost check, the audit's two
+oversized reads were refused in under a second, the guard stopped nothing, and the shell peaked at
+468 MiB.
+
+## 1. Scope
+
+**Owns:** the admission rules of the resource broker: the memory guard, the per-capability fair
+share and rate, the cost check on reads, and how slot counts and rates follow the containers'
+resources.
+
+**Does not own:**
+
+- The credential proxy's existing slot cap, child memory budget and watermark gate
+  ([`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md),
+  [`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §2.1 and §4). This design keeps
+  them and adds to them.
+- The Kubernetes API proxy's request policy ([`kube-proxy.md`](kube-proxy.md)).
+- How the event watcher pages its Event lists. Section 7 states the bound it must meet.
+
+**Names.** "Resource broker" is the role. The components that fill it are the credential proxy
+(`envoy-credential-proxy` container, `agents/platform/scripts/credential_proxy.py`), the Kubernetes
+API proxy (`k8s-api-proxy`, [`kube-proxy.md`](kube-proxy.md)), and the sandbox shell
+(`platform-agent-shell`), where `kubectl` and the skill scripts run.
+
+## 2. The problem, measured
+
+The OOM reproduction harness (`bench/oom-repro/`, a manual test in the bench harness) builds a fleet
+of KWOK nodes: Node objects in real GKE clusters with no VM behind them. On two clusters of 1,500
+nodes and 45,000 Pods each, at the credential proxy's default limit of 2 GiB, the following held
+the memory in the last sample before each OOMKill:
+
+| Process class                                    | Share of the container's memory |
+| ------------------------------------------------ | ------------------------------- |
+| `kubectl` children (one or two fleet-wide lists) | 85 to 92 %                      |
+| Envoy                                            | 4 %                             |
+| the broker process (`credential_proxy.py`)       | 3 to 4 %                        |
+| `gcloud` children                                | 0 to 7 %                        |
+
+Single `kubectl` children measured at the XL size, where nothing was killed:
+
+| Command                                                                             | Pods listed | Resident memory |
+| ----------------------------------------------------------------------------------- | ----------- | --------------- |
+| `get nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,…,ingress -A -o json` | 45,000      | 4,402 MiB       |
+| `get deploy,sts,ds,cronjob,pod -A -o json`                                          | 45,000      | 3,314 MiB       |
+| `get pods -A -o jsonpath={.status.phase}`                                           | 45,000      | 3,236 MiB       |
+| `get pods -A -o json`                                                               | 90,000      | 5,610 MiB       |
+| `gcloud logging read …`                                                             | —           | 289 MiB         |
+
+Six facts follow:
+
+1. **The cost of one call varies by a factor of 100.** A `kubectl get node X` uses about 45 MiB;
+   a fleet-wide list uses 1 to 5.6 GiB. A limit on calls per minute does not bound memory: two
+   calls killed the container.
+2. **The output format does not reduce the cost.** `kubectl` decodes the whole list before it
+   applies `jsonpath` or `custom-columns`.
+3. **The existing child memory budget estimates 176 MiB per call.** That estimate is right for
+   small reads and wrong by a factor of up to 30 for fleet-wide lists, so the budget admitted the
+   calls that killed the container.
+4. **A killed container takes all its work with it, and the work comes back.** `compliance-audit`
+   sent the same two listings after each restart, until `CrashLoopBackOff`.
+5. **The resource broker cannot tell capabilities apart.** Every command in the reproduction came
+   from the shell's ServiceAccount. An audit, a chat question and a triage card look the same.
+6. **Admission on current memory stops the crash loop, not the first kill.** On a build with the
+   credential proxy's watermark gate, the same scenario OOMKilled the proxy once, 90 s after the
+   audit started. The gate then refused 68 calls with `429` and 19 with `503`, and no second kill
+   followed. The gate reads memory when it admits a call; a `kubectl` child admitted at low memory
+   grows past the limit afterwards. Only a rule that acts on running processes closes that gap.
+
+Since the Kubernetes API proxy landed, stock `kubectl` runs inside the sandbox shell and reads
+through the Kubernetes API proxy, which streams responses. The memory of fact 2 therefore moved
+from the credential proxy to the shell, whose default limit is 2 CPU and 2 GiB
+(`spec.harness.experimental.shellSandbox.resources` raises it). Measured on
+a build with the Kubernetes API proxy, the same audit OOMKilled the shell three times in about
+three minutes and sent it into `CrashLoopBackOff`; two `kubectl get deploy,sts,ds,cronjob,pod -A
+-o json` processes held 91 to 95 % of its memory. Every agent's terminal runs in the shell, so each
+kill ends all of them. Raising the shell's limit moves the threshold, as the next paragraph
+shows for the other containers.
+
+**Which capability holds the memory.** The harness samples each shell process with its parent, so
+each process can be traced to the capability that started it. In the last sample before each kill
+and at each peak:
+
+| Run (shell limit)         | `compliance-audit` (`collect.py` and its `kubectl` children) | Agent terminals | Other    |
+| ------------------------- | ------------------------------------------------------------ | --------------- | -------- |
+| Default 2 GiB, three runs | 94 to 99 %                                                   | 0 to 5 %        | 1 to 2 % |
+| L size 8 GB, two runs     | 100 %                                                        | 0 %             | 0 %      |
+
+In one 2 GiB run, agent terminals that ran `kubectl get pods -A` held most of the memory above
+512 MiB over the run, and the audit held the peak.
+
+**The cost of one call, measured alone.** One `kubectl`, with no other process, against one KWOK
+cluster of 105,000 Pods, read directly from the API server:
+
+| Command                                    | Peak resident memory | Output  | Per object |
+| ------------------------------------------ | -------------------- | ------- | ---------- |
+| `get deploy,sts,ds,cronjob,pod -A -o json` | 10,357 MiB           | 1.16 GB | ~100 KiB   |
+| `get pods -A -o json`                      | 9,955 MiB            | 1.15 GB | ~97 KiB    |
+| `get pods -A` (table)                      | 4,452 MiB            | 12 MB   | ~43 KiB    |
+
+The audit's one call for one large cluster does not fit in the L shell (8 GB) even when it runs
+alone. `kubectl` reads a list in pages of 500 objects, but it keeps every page until it prints, so
+its memory grows with the size of the list. The Kubernetes API proxy sees only one page per request
+and holds little: under the audit it stayed under 20 MiB. A table output halves the cost per object,
+which corrects fact 2 for that format only; `jsonpath` and `custom-columns` still decode the whole
+list.
+
+**The existing admission does not cover `kubectl` in the shell.** The fleet audit sizes its sweep
+from the credential proxy's admitted count (`broker_admission.sweep_width()`). That count assumes
+176 MiB per call (fact 3) and describes the credential proxy's memory. On current builds the calls
+run in the shell, so the audit sweeps four clusters at once into a shell that cannot hold one.
+
+**The Kubernetes API proxy has its own limit.** It runs as a separate Deployment with a memory limit
+of 512Mi, set by operator constants (`kube_proxy_manifests.go`), and no field changes it. It counts
+the requests in flight but does not limit them. Concurrent unpaged Pod lists, sent with `curl` from
+the shell to two clusters, raised its memory to 147, 198 and 465 MiB at 20, 20 and 80 requests in
+flight. At 129 requests it reached 509 MiB and was OOMKilled. Each stream held about 3.6 MiB, and the
+memory did not return between bursts. Normal agent traffic does not reach this, because the shell is
+OOMKilled first, but a larger shell limit moves the failure here.
+
+**Raising the limits moves the threshold, not the failure.** At the L size (credential proxy
+8 GB, event watcher 4 GB), the credential proxy was OOMKilled by the same two listings on clusters
+of 80,000 Pods (4,272 and 3,238 MiB), and the event watcher by four clusters of 900,000 Events.
+
+## 3. Goals and non-goals
+
+**Goals.**
+
+- G1. No container of the resource broker is OOMKilled by tool calls, at any fleet size, at the
+  default limits.
+- G2. A capability that sends more than its share cannot delay another capability by more than
+  one share's worth of work.
+- G3. A refused call fails fast (under 1 s), and the refusal says why and what to do.
+- G4. Slot counts and rates follow the containers' memory and CPU without a code change.
+- G5. Simple: each layer is small, testable alone, and uses mechanisms that run on very large
+  numbers of machines.
+
+**Non-goals.**
+
+- Making every large read succeed. A read that cannot fit fails; the agent narrows it.
+- Security isolation between capabilities. The fair share is a scheduling key, not an identity
+  claim (§5.1).
+- Replacing the credential proxy's slot cap or watermark gate.
+
+## 4. Layer 1: the memory guard
+
+### 4.1 The rule
+
+A thread in each container that runs tool calls (the credential proxy's broker process, and a
+small process in the sandbox shell) does this every Δ = 100 ms:
+
+1. Read the container's cgroup: `memory.max` (the limit L) and, from `memory.stat`, the anonymous
+   memory plus the unreclaimable kernel memory. Call that sum M. Page cache is left out because
+   the kernel reclaims it before it OOMKills.
+2. If M ≥ H, the high watermark, send SIGKILL to the tool process with the largest resident
+   memory. A tool process is a child the resource broker started for a call. The broker, Envoy,
+   `sshd` and the shell's init are never candidates.
+3. Answer the killed call with a refusal (§6) that names the process, its memory and the limit.
+4. Repeat from step 1 without waiting while M ≥ H, at most once per Δ per kill.
+
+H = L − headroom. The default headroom is max(256 MiB, 12.5 % of L).
+
+### 4.2 Why this prevents the OOMKill
+
+Definitions, per container:
+
+- L: the memory limit. K: the memory of the processes that are never killed (broker, Envoy, init).
+- N: the maximum number of concurrent tool processes (the slot cap).
+- r: the maximum rate at which one tool process grows its memory. `kubectl` decoding a list grew
+  at 45 to 60 MiB/s in the reproduction; the design uses r = 100 MiB/s.
+- R = N · r: the maximum rate at which the container's memory grows.
+- Δ: the guard's interval. τ: the time from SIGKILL until the kernel frees the process's memory
+  (under 10 ms for anonymous memory).
+
+**Claim.** If K < H and headroom > R · (Δ + τ), then M stays below L, and the kernel never
+OOMKills the container because of tool processes.
+
+**Proof.**
+
+1. While M < H the guard does nothing, and the container is below its limit.
+2. Take the first sample at which M ≥ H, at time t₀. The previous sample, at t₀ − Δ, was below H.
+   So at t₀, M < H + R · Δ.
+3. At t₀ the guard kills the largest tool process. Until its memory is free, at t₀ + τ, the
+   container grows by at most R · τ. So the peak is below H + R · (Δ + τ) < L.
+4. The killed process held at least (M − K) / N, because it was the largest of at most N. After
+   the kill, the growth rate falls to at most (N − 1) · r.
+5. If M is still at least H at the next sample, step 3 repeats with fewer processes. Each round
+   removes one process. After at most N rounds, no tool process is left, and M ≤ K < H.
+6. In every round the peak stays below H + R · (Δ + τ) < L. So M never reaches L. ∎
+
+**The numbers at the default.** L = 2 GiB, N = 8, r = 100 MiB/s, so R = 800 MiB/s. With Δ = 100
+ms and τ = 10 ms, R · (Δ + τ) = 88 MiB. The headroom is 256 MiB, nearly three times the bound.
+K is about 250 MiB (broker and Envoy at their highest in the reproduction), well below H = 1,792 MiB.
+
+**What the proof assumes, and what breaks it.**
+
+- A tool process grows no faster than r. A process that allocates and touches a gigabyte in one
+  step breaks this. `kubectl`, `gcloud` and Python scripts grow as they decode, which the
+  measurements show. A guard at Δ = 50 ms halves the risk if a faster grower appears.
+- The guard thread itself runs. A guard that is starved of CPU does not sample. The guard runs at
+  a higher CPU priority than the tool processes (§4.3).
+- K is bounded. The broker's own memory is bounded by its output cap and slot count
+  ([`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2.1).
+  Envoy's buffers are bounded by its configuration.
+
+### 4.3 Implementation
+
+- **Where.** The sandbox shell first, because on current builds that is where `kubectl` runs and
+  where the kills happen: a small process started by its entrypoint, which reads `/proc` for the
+  processes under the session tree. The credential proxy: a thread in the broker process, which
+  already starts the children and knows their PIDs.
+- **Libraries.** The Python standard library reads the cgroup files and `/proc`, and
+  `os.kill` sends the signal. `psutil` is an option for the process tree.
+- **Priority.** The guard sets its own `nice` value lower than the tool processes. The broker
+  already proposes a higher `nice` for background children ([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2).
+- **No privileges.** Reading the container's own cgroup files and killing its own children need
+  no capability. A per-child cgroup with its own `memory.max` would be stronger, but a container
+  cannot create sub-cgroups without a writable cgroup filesystem, which a default Pod does not
+  have. Section 9 compares the two.
+- **Signals.** A counter `tool_process_killed_total{container, class}` and a log line per kill with
+  the command, its memory and M.
+
+## 5. Layer 2: a fair share per capability
+
+### 5.1 The capability key
+
+The key says which unit of agent work sent a call. It is used for scheduling only. A caller that
+lies about its key gains no access; at most it moves its calls to another share.
+
+- **Now:** the role (shell, profile, session, watcher) and the profile (the Platform Agent or one
+  Cluster Agent), which the resource broker already learns from the caller's token and from
+  `HERMES_PROFILE_HOME`, which the sandbox already forwards.
+- **Next:** the card or job. The kanban worker, the cron runner and the no-agent watches set
+  `KUBEAGENTS_CAPABILITY` (for example `cron:compliance-audit` or `card:t_c2b04354`) in the
+  session, the sandbox forwards it as it forwards `HERMES_PROFILE_HOME`, and the shims send it as a
+  header. The turn token of the exec-tier design (§4.1 there, open question 9) can carry it later.
+
+### 5.2 The rule
+
+Each resource broker component holds N slots (§8 computes N). Requests wait in one queue per
+capability key.
+
+- **Rate.** Each capability has a token bucket: rate ρ calls per minute, burst b. A call with no
+  token is refused at once with `429` and a `Retry-After` that says when a token returns. It does
+  not wait and does not reach a tool.
+- **Slots.** When a slot is free, the scheduler takes the next call by deficit round robin across
+  the capabilities that have calls waiting: each capability gets one turn per round.
+- **Wait.** A call that waits longer than W = 10 s for a slot is refused with `429`. Today's 60 s
+  wait (`COMMAND_SLOT_WAIT_SECONDS`) holds a caller for a minute and then answers `503`; a short
+  wait answers sooner and with a reason the agent can act on.
+- **Classes.** The interactive and background classes of the exec-tier design (§4.2 there) stay.
+  Deficit round robin runs inside each class, and the interactive reserve stays.
+
+### 5.3 What this guarantees
+
+With k capabilities that have calls waiting, each gets at least ⌊N / k⌋ slot-turns per round, and
+at least one per k turns (the property of deficit round robin). A capability that floods the
+broker fills only its own queue and its own bucket. It cannot take another capability's turn. Its
+excess is refused at the bucket, before any tool runs. This is G2.
+
+The fair share bounds concurrency and rate, not memory. One admitted call can still be a 5 GiB
+read. Layer 1 bounds memory; layer 3 refuses most such reads before they start.
+
+### 5.4 Implementation
+
+- **Credential proxy, HTTP routes:** Envoy's local rate-limit filter
+  (`envoy.filters.http.local_ratelimit`), with a token bucket per descriptor keyed on the
+  capability header. Envoy answers `429` before the request reaches Python. Envoy already fronts
+  the broker.
+- **Credential proxy, exec admission:** the existing `_admit` queue, changed from one arrival-order
+  queue to one queue per key with deficit round robin. The standard library (`collections.deque`,
+  `threading.Condition`) is enough.
+- **Kubernetes API proxy:** a Go middleware in front of the reverse proxy, with
+  `golang.org/x/time/rate` (one limiter per key) and a weighted semaphore
+  (`golang.org/x/sync/semaphore`) for the slots.
+- **Agents:** the refusal is a normal tool result (§6), not a transport failure, so the agent does
+  not retry it as "the broker is down".
+
+## 6. Layer 3: the cost check
+
+### 6.1 The rule
+
+The check runs in the shell's `kubectl` wrapper (`/usr/local/bin/kubectl`, built in
+`deploy/sandbox/Dockerfile`), in front of the real binary. Every `kubectl` in the shell passes
+through it: the skill scripts, the agents' terminals and the jobs. It is in the container that
+decodes the list, so it can read that container's free memory, and it sees the output format.
+
+Before it runs a potentially large list, the wrapper counts the objects. A potentially large list
+is a `get` of one or more kinds across all namespaces (`-A`), or of a cluster-scoped kind such as
+`nodes`. A `get` of named objects, of one namespace, a watch and a `--raw` read pass straight
+through. For each kind, one request with `?limit=20` returns `remainingItemCount` and a sample of
+20 objects. The estimate is `KUBECTL_BASE + Σ items × factor × mean raw size`, where the mean raw
+size is the sample's mean JSON size as the API server sends it (with `managedFields`, which
+`kubectl` decodes even though its output leaves them out). `KUBECTL_BASE` is 64 MiB, and the factor
+comes from the output format:
+
+| Output format                                      | Factor (× raw size) | Fixed value without a sample |
+| -------------------------------------------------- | ------------------- | ---------------------------- |
+| `-o json`, `-o yaml`, `jsonpath`, `custom-columns` | 6.1                 | 100 KiB                      |
+| table, `-o wide`, `-o name`                        | 2.7                 | 45 KiB                       |
+
+The factors come from §2: 99.5 and 43.4 KiB per KWOK Pod of 16.7 KB. Object size varies: the scale
+test host's real Pods are 4 to 33 KB (mean 13.1 KB), so a fixed cost per object would be wrong in
+both directions, and the sample follows each cluster. Checked against measured peaks: the audit's
+dump of 107,994 objects was estimated at 10,476 MiB (measured 10,357), `get pods -A` of 104,944 Pods
+at 4,621 MiB (measured 4,452), and `get nodes -o json` of 2,895 Nodes at 334 MiB (measured 226).
+
+**Reservations.** Admission does not read free memory alone. Two wrappers that read it at the same
+time both see room, and both start; this is the gap of fact 6. Each admitted call writes a
+reservation, a file named by the wrapper's PID that holds its estimate, in a shared directory. A
+lock (`flock`) on one file makes each admission decision atomic. The free budget is
+
+    B = H − (memory in use − memory of admitted calls) − Σ reservations
+
+so every running call counts at its full estimate, even while it is still small. A reservation is
+removed when its call exits, and pruned when its PID no longer exists.
+
+- A call whose estimate fits B runs. The wrapper runs `kubectl` as a child and keeps the
+  reservation until the child exits.
+- A call that does not fit B now waits up to W = 30 s for reservations to end, then fails with
+  exit code 75 (temporary failure) and a message that says how much memory it needs and how much
+  is free.
+- A call whose estimate is above C = H − K, so it cannot fit even alone, fails at once with exit
+  code 3 and a message: "this read lists 105,000 objects and would need about 10,300 MiB in the
+  shell, which can hold at most 1,536 MiB for one read; narrow it: add `-n`, `-l` or
+  `--field-selector`; or read one namespace at a time and handle each before the next: list them with
+  `kubectl get ns -o name`, then `kubectl get pods -n <namespace>` for each". The advice names no
+  `--chunk-size`, because `kubectl` already reads in chunks of 500 and keeps every chunk. It names
+  no `kubectl get --raw` page loop either: `--raw` replaces the server URL's path, so through the
+  Kubernetes API proxy (server `…/clusters/<cluster>`) it reads the proxy's default cluster, not the
+  fleet cluster. The wrapper's own count request joins the path onto the server URL for the same
+  reason.
+- **Selectors.** The API server does not return `remainingItemCount` for a list with a label or
+  field selector, and a selector such as `status.phase=Running` can match most objects. A call with
+  a selector is never refused for its size. It reserves the smaller of its unfiltered estimate and
+  C, so large selector calls run one after another instead of together.
+- The count is cached per (kubeconfig, context, collection) for 60 s, so one estimate covers a
+  burst of reads.
+- If the guard kills an admitted call, the wrapper prints the guard's reason (the memory of the
+  call and of the shell) and the same advice, so the agent sees why the call stopped.
+
+At the default shell limit (2 GiB, H = 1,792 MiB, K = 256 MiB) C allows about 15,000 objects in
+`-o json`; at the L size (8 GB) about 65,000; at 16 GiB about 140,000. One cluster of 105,000 Pods
+therefore needs a paged read at every size below 16 GiB.
+
+The Kubernetes API proxy is not the place for this check. It sees each 500-object page as a separate
+small request, so it cannot see that `kubectl` keeps every page.
+
+This is the same idea as Kubernetes API Priority and Fairness, which charges a list request more
+seats in proportion to the number of objects it returns.
+
+### 6.2 What this guarantees
+
+Nothing on its own. The check covers only `kubectl` calls that pass through the wrapper. A script
+that calls the binary at `/usr/local/libexec/kubectl`, a Python Kubernetes client, `curl` to the
+Kubernetes API proxy, or a script that loads a large file all go around it. An estimate can also be
+low. Layer 1 is the guarantee, because it acts on every process in the container, whatever started
+it. The cost check changes the common failure from "the call ran for 30 s and was killed" to "the
+call was refused in under a second with advice", and the reservations stop two large calls from
+starting together.
+
+A refusal is text the model reads, so the wrapper ships with an evaluation case: an agent asked a
+fleet-wide question on a large cluster narrows or pages the read after a refusal, and does not
+send the same read again.
+
+### 6.3 Prototype results
+
+A prototype of layers 1 and 3 ran in the sandbox shell of a scale test install, against the OOM
+reproduction fleet: two clusters of about 105,000 Pods each and two Events-only clusters. The guard
+is one Python process (standard library, Δ = 100 ms). The wrapper is a Python script in front of the
+existing `kubectl` wrapper, with the reservation directory and the per-format costs of §6.1. Each run
+is the harness's `proxy` scenario at the default shell limit (2 GiB) for 10 minutes.
+
+| Run                  | Shell OOMKills | Shell peak (`memory.current`) | Guard kills | Admission                                                                                                         |
+| -------------------- | -------------- | ----------------------------- | ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| No guard (§2)        | 3 in 2.5 min   | 2,048 MiB (killed)            | —           | —                                                                                                                 |
+| Guard only           | 0              | 1,781 MiB                     | 3           | —                                                                                                                 |
+| Guard and cost check | 0              | 468 MiB                       | 0           | 2 refused for size (the audit's workload dump of each large cluster, about 108,000 objects, 10.6 GiB), 8 admitted |
+
+- **Guard only.** The guard killed the audit's two `get deploy,sts,ds,cronjob,pod -A -o json` calls
+  at 943 and 1,753 MiB, and an agent's `get pods -A` at 1,800 MiB. The shell peaked 28 to 44 MiB
+  above H, within the 256 MiB headroom. A process that allocated 100 MiB per second to 3 GiB was
+  killed at 1,808 MiB with the shell at 1,820 MiB.
+- **Guard and cost check.** A refusal took 256 ms with a count request and under 80 ms with a
+  cached count. The audit sent neither refused read again. A call with a selector that matched
+  most Pods was admitted with the capped reservation and killed by the guard at 1,771 MiB: the
+  estimate missed, and layer 1 held. A second large call that arrived while it ran waited W and was
+  refused as busy (exit code 75).
+
+The prototype found four requirements that §6.1 now states or that the implementation must meet:
+
+1. **Fail open.** In the first run with the wrapper, it could not open its lock file and exited
+   with a traceback. The audit's reads failed, and the agent started to improvise (`curl` to the API
+   server, `kubectl get pods -A --chunk-size=1`). An error in the admission must run the command
+   unchanged; layer 1 still bounds it.
+2. **State shared across users.** Sessions run as separate users (`agent`, `hermes`) with
+   `umask 077`. The reservation directory is world-writable with the sticky bit, the lock file is
+   created world-writable at start, and the wrapper sets `umask 022` so that every user can read
+   every reservation. The count cache is per user.
+3. **Count from the server URL.** `kubectl get --raw` drops the server URL's path, so through the
+   Kubernetes API proxy it counted the host cluster (78 Pods instead of 104,944). The count request
+   joins the path onto the server URL and authenticates as the kubeconfig says.
+4. **Advice that works through the proxy.** The refusal names per-namespace reads, not a `--raw`
+   page loop, for the same reason.
+5. **Both layers on one defect.** A later version of the wrapper read a count cache entry in an
+   older format and raised an error. It failed open, the oversized `kubectl` ran, and the guard
+   killed it before the shell reached its limit. The cache now treats an entry it cannot read as a
+   miss.
+
+## 7. The event watcher
+
+The event watcher is one Go process in the `agent-api-auth` container. Layer 1 does not apply,
+because killing the watcher is the OOMKill. Its memory must be bounded inside the process:
+
+- **Bound.** Peak memory ≤ base + Σ over the lists in flight of (page size × bytes per Event),
+  with the number of lists in flight limited by a weighted semaphore whose weights are each list's
+  estimated size (`remainingItemCount` × bytes per Event), not a fixed count of 4.
+- **How.** The watcher handles each page of the initial list and then drops it, instead of
+  collecting the whole list first. The reproduction killed the watcher at 2 GiB with four clusters
+  of 400,000 Events each; with pages of 500, the same lists need under 10 MiB in flight.
+- **Signal.** The watcher logs and counts a relist after its initial sync.
+
+## 7a. The Kubernetes API proxy
+
+The Kubernetes API proxy is one Go process. As for the event watcher, layer 1 does not apply,
+because stopping the process is the failure. It needs a bound inside the process:
+
+- **An in-flight limit.** A weighted semaphore in front of the reverse proxy refuses a request
+  past the limit with `429` and `Retry-After`. The initial limit is 24 at the 512Mi limit. It is
+  measured with paged traffic, as `kubectl` sends it (pages of 500 Pods, about 3.7 MB each, with
+  `continue` tokens), from N threads in the shell:
+
+  | Paged readers | In flight | kube-proxy memory  | Throughput           |
+  | ------------- | --------- | ------------------ | -------------------- |
+  | 20            | 16 to 20  | 119 to 157 MiB     | 232 MB/s, no errors  |
+  | 64            | 43 to 48  | 428 MiB, OOMKilled | 232 MB/s, 128 errors |
+  | 128 and 192   | —         | OOMKilled 4 times  | 56 and 18 MB/s       |
+
+  A paged stream holds about 7 to 9 MiB, about two pages, which is more than an unpaged stream
+  (about 3.6 MiB). (512 MiB − about 60 MiB) / 9 MiB is about 50, halved for margin. Throughput
+  peaks by 20 streams, so the limit costs no throughput. The limit follows the live memory limit
+  and the page size, as N does in §8.
+
+- **A Go memory limit.** `GOMEMLIMIT` at about 80 % of the container limit (400MiB at 512Mi) makes
+  the Go runtime collect and return memory before the kernel acts.
+- **A settable limit.** The proxy's resources become a `PlatformAgent` field, like the credential
+  proxy's and the shell's, so the install sizes can raise them.
+
+## 8. Dynamic slots and rates
+
+The slot count N and the rate ρ follow the containers' resources. They are recomputed once a
+minute from live values, with no restart.
+
+**Slots from memory.**
+
+    N = clamp(1, N_max, ⌊(H − K_measured) / c_p95⌋)
+
+H comes from the live `memory.max`. K_measured is the measured memory of the processes the guard
+never kills. c_p95 is the 95th-percentile memory of completed tool processes over the last hour. A
+container whose limit is raised to the L size (8 GiB for the credential proxy) gets more slots
+without a code change.
+
+**Back-off from pressure.** Linux reports pressure stall information (PSI) in each cgroup's
+`memory.pressure` and `cpu.pressure`: the share of time tasks waited for memory or CPU. When
+`some avg10` passes a threshold (default 20 % for memory, 50 % for CPU), N falls to ⌈0.7 · N⌉. When
+pressure stays under half the threshold for a minute, N rises by one, up to the value from memory.
+This is additive increase, multiplicative decrease, the rule TCP uses for its congestion window.
+
+**Rates from throughput.** By Little's law, throughput X = N / S, where S is the mean time a call
+holds a slot. The rate per capability is ρ = X / k_active, with k_active the number of capabilities
+active in the last minute and a floor of 6 calls per minute. A larger N, or faster calls, raise ρ
+for everyone.
+
+## 9. Alternatives and trade-offs
+
+| Option                               | For                                                               | Against                                                                                                              |
+| ------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **Userspace memory guard (chosen)**  | No privileges; small; the container stays up; proven bound (§4.2) | Needs a growth-rate assumption; one sampling thread per container                                                    |
+| Per-child cgroup with `memory.max`   | Kernel-enforced per call; no growth assumption                    | Needs a writable cgroup filesystem in the container (privileged or a custom runtime); not available in a default Pod |
+| Raise the limits                     | One-line change                                                   | Moves the threshold, not the failure: the L size still fails at a larger fleet (the harness's L run measures where)  |
+| Rate limit only (calls per minute)   | Simple                                                            | Does not bound memory: two calls killed the container                                                                |
+| Count-based slots only (today)       | Simple                                                            | A slot's cost varies by a factor of 100                                                                              |
+| Cost check only                      | Refuses most large reads early                                    | Estimates can be wrong; no guarantee                                                                                 |
+| Kill the container (today's outcome) | None                                                              | Kills every call in flight; work comes back                                                                          |
+
+**Pros of the design as a whole.**
+
+- The guarantee comes from a small, testable mechanism (layer 1), not from estimates.
+- A flood is contained to the capability that sends it.
+- Refusals are fast and tell the agent what to do.
+- Slots and rates follow the containers' resources.
+
+**Cons.**
+
+- A large read that the agent truly needs is refused or killed. The agent must narrow it, or the
+  skill must page it. Skills that list fleet-wide (`collect.py`, `fleet_upgrade_report.py`) need
+  paged reads to keep working at large fleets.
+- The capability key depends on new plumbing (`KUBEAGENTS_CAPABILITY`) until the turn token exists.
+- A refusal is text the model reads, so each one needs an evaluation case
+  ([`.agents/rules/eval_driven_development.md`](../../.agents/rules/eval_driven_development.md)).
+- Three components to change: the credential proxy, the Kubernetes API proxy and the sandbox shell.
+
+## 10. Rollout
+
+0. **Measure.** Done: on a build with the Kubernetes API proxy the `kubectl` memory lands in the
+   sandbox shell, which the audit OOMKilled (§2). The audit holds 94 to 100 % at the peak, and one
+   of its calls costs about 100 KiB per object.
+1. **Paged reads in the fleet audit.** `collect.py` reads its workload dump with the Python
+   client, one page at a time, and reduces each page before the next. Its memory then follows the
+   page size, not the cluster size. Its sweep width follows the shell's memory, not the credential
+   proxy's admitted count. This removes the largest consumer before any admission rule is needed.
+2. **Memory guard** in the sandbox shell and the credential proxy. This alone meets G1 for those
+   containers. A prototype met the acceptance below in the shell (§6.3). Acceptance: the harness's `proxy` scenario at the default limits ends with zero
+   OOMKills and one guard kill per oversized read.
+3. **Event watcher** paged initial lists and the size-weighted gate (§7). Acceptance: the
+   harness's `watcher` scenario at the default limits ends with zero OOMKills.
+4. **Capability key** from role and profile, then `KUBEAGENTS_CAPABILITY`.
+5. **Fair share and rate** in Envoy, the exec queue and the Kubernetes API proxy. Acceptance: a
+   flood from one capability in the harness leaves another capability's p95 wait under W.
+6. **Cost check** in the shell's `kubectl` wrapper (§6), and the in-flight limit and
+   `GOMEMLIMIT` in the Kubernetes API proxy (§7a).
+7. **Dynamic N and ρ.**
+
+Each step is a pull request with its own evaluation case where the model reads new text.
+
+## 11. Prior art
+
+| System                                                         | What it does                                                                                   | What this design takes                                           |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| Linux cgroup v2 `memory.high` / `memory.max`                   | Throttles a group above `high`, kills inside it at `max`                                       | The watermark-then-kill shape of layer 1                         |
+| Linux PSI (`memory.pressure`, `cpu.pressure`)                  | Time tasks stalled on a resource                                                               | The back-off signal for N (§8)                                   |
+| `systemd-oomd`, `earlyoom`, Android `lmkd`                     | Userspace killers that act on PSI or free memory before the kernel's OOM killer                | Layer 1 itself: kill the largest worker, keep the system up      |
+| Linux CFS / EEVDF and `cpu.weight`                             | Weighted fair CPU time between groups                                                          | Fair turns per capability                                        |
+| Kubernetes API Priority and Fairness                           | Priority levels, fair queuing by flow, shuffle sharding, list requests charged by object count | Layers 2 and 3: fair queues per capability, cost by object count |
+| Envoy local rate limit, overload manager, adaptive concurrency | Token buckets per descriptor; shedding on memory; concurrency from latency                     | The rate per capability (§5.4); pressure back-off                |
+| TCP congestion control (AIMD)                                  | Additive increase, multiplicative decrease of a window                                         | The rule for N (§8)                                              |
+| Netflix `concurrency-limits`                                   | Concurrency limits that adapt to latency (Vegas, Gradient)                                     | An option for N if latency proves a better signal than PSI       |
+
+## 12. Open questions
+
+1. Is r = 100 MiB/s a safe bound for every tool the shell runs (Python scripts that load large
+   JSON, `jq`)? The harness can measure each skill script's growth rate.
+2. Should the guard kill the most recent large process instead of the largest, to favour long
+   calls that are nearly done?
+3. Where does the capability key come from for the platform MCP server's tools?
+4. The output format changes the cost per object by a factor of two (§2), so the cost check needs
+   it; the shell's `kubectl` wrapper sees it. Should the wrapper also estimate calls that name one
+   namespace, for namespaces with very many objects?
