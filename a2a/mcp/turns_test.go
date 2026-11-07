@@ -2591,3 +2591,45 @@ func TestAStreamedTurnLeavesAReaderSlotForOthers(t *testing.T) {
 		t.Errorf("a concurrent ReadTask = %v, want a free reader slot", err)
 	}
 }
+
+// A poll waiting out delegationSettle on tasks all read final (and cached)
+// does not parse their steps again on every idle tick: nothing it reads can
+// change. The mutant this kills: re-collecting the steps each iteration.
+func TestAPollOnCachedFinalTasksDoesNotReparseThem(t *testing.T) {
+	url, js := testBus(t)
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+
+	root := TaskRef{Addressee: fakeAddressee, TaskID: "task-cached-root"}
+	child := TaskRef{Addressee: "cluster-a", TaskID: "task-cached-child"}
+	publishSubmission(t, js, fakeAddressee, root.TaskID, "console:cached", "delegate", "")
+	publishRun(t, js, fakeAddressee, root.TaskID, "", false)
+	publishArtifact(t, js, fakeAddressee, root.TaskID, lib.ArtifactDelegate, "cluster-a: inspect")
+	publishStatus(t, js, fakeAddressee, root.TaskID, lib.StateCompleted, true)
+	publishSubmission(t, js, child.Addressee, child.TaskID, "console:cached", "inspect", root.TaskID)
+	publishRun(t, js, child.Addressee, child.TaskID, wakeAnswer, true)
+
+	st := convs.getOrCreateTaskStepState(root, &turnWatch{stop: make(chan struct{}), followed: []TaskRef{child}})
+	t.Cleanup(st.closeAll)
+
+	var collects atomic.Int32
+	collectTurnStepDetails = func(out TurnOutcome) ([]StepDetail, int) {
+		collects.Add(1)
+		return CollectTurnStepDetails(out)
+	}
+	t.Cleanup(func() { collectTurnStepDetails = CollectTurnStepDetails })
+
+	// Inside delegationSettle: the chain is answered but not yet settled.
+	out, err := b.WaitForTurnStep(t.Context(), convs, nil, root, delegationSettle/2)
+	if err != nil {
+		t.Fatalf("WaitForTurnStep: %v", err)
+	}
+	if !out.StillRunning {
+		t.Fatal("the turn settled inside delegationSettle")
+	}
+	// The first look reads both tasks off the bus; every look after it
+	// finds them cached.
+	if n := collects.Load(); n > 2 {
+		t.Errorf("the poll parsed the cached tasks' steps %d times, want at most 2", n)
+	}
+}

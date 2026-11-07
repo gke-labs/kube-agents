@@ -1913,6 +1913,8 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		details      []StepDetail
 		totalActs    int
 		chainSettled bool
+		collected    bool
+		prevOut      TurnOutcome
 	)
 
 	for {
@@ -1933,7 +1935,13 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 			}
 			return TurnStepOutcome{}, err
 		}
-		details, totalActs = CollectTurnStepDetails(out)
+		// Tasks read final are cached, so a snapshot of nothing but them
+		// is the last one again: its steps need not be parsed anew while
+		// the poll waits out a settle.
+		if !collected || !sameTurnSnapshot(prevOut, out) {
+			details, totalActs = collectTurnStepDetails(out)
+			collected, prevOut = true, out
+		}
 		unseen := unseenStepDetails(details, st.seenStepKeys)
 
 		if len(unseen) > 0 {
@@ -2070,6 +2078,25 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		StillRunning:      stillRunning,
 		WaitStepTitle:     waitTitle,
 	}, nil
+}
+
+// collectTurnStepDetails is CollectTurnStepDetails, a variable for tests to
+// count the polls that parse a snapshot's steps.
+var collectTurnStepDetails = CollectTurnStepDetails
+
+// sameTurnSnapshot reports whether b read the very tasks a did, which is all
+// CollectTurnStepDetails reads: a task read live is folded anew each time, so
+// only cached tasks compare equal.
+func sameTurnSnapshot(a, b TurnOutcome) bool {
+	if a.Root != b.Root || a.Task != b.Task || len(a.Followed) != len(b.Followed) {
+		return false
+	}
+	for i := range a.Followed {
+		if a.Followed[i].Ref != b.Followed[i].Ref || a.Followed[i].Task != b.Followed[i].Task {
+			return false
+		}
+	}
+	return true
 }
 
 // unseenStepDetails returns the steps not yet reported, and a plan step
