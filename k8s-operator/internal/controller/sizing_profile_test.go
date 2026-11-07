@@ -1179,7 +1179,9 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 		if workloads == nil {
 			workloads = sizedWorkloadsAt(agent, sizingTierSmall)
 		}
-		objs := append([]client.Object{agent, quota}, workloads...)
+		// A copy: the subtests share the quota fixtures and run in parallel,
+		// and the fake client stamps a ResourceVersion on what it is given.
+		objs := append([]client.Object{agent, quota.DeepCopy()}, workloads...)
 		var seen []*corev1.Pod
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
@@ -1315,7 +1317,7 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 		standing := fmt.Sprintf(sizingCappedByQuotaMessageFormat, sizingTierMedium, inDefault.Name, corev1.ResourceRequestsMemory, sizingTierSmall, sizingTierSmall)
 		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: standing}, metav1.Now())
-		objs := append([]client.Object{agent, inDefault}, sizedWorkloadsAt(agent, sizingTierSmall)...)
+		objs := append([]client.Object{agent, inDefault.DeepCopy()}, sizedWorkloadsAt(agent, sizingTierSmall)...)
 		var seen []*corev1.Pod
 		scheme := setupScheme()
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).
