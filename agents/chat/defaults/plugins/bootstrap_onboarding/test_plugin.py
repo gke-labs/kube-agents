@@ -450,6 +450,27 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertIn("issues/75", first["context"])
 
+    def test_after_a_retire_the_first_turn_still_sets_the_home_channel_and_says_nothing(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / ".bootstrap_report_retired").touch()
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as home:
+            self.assertIsNone(self._call())
+        home.assert_called_once()
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as again:
+            self.assertIsNone(self._call())
+        again.assert_not_called()
+
+    def test_an_operator_can_override_the_filed_instruction(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        base = self.data_dir / "onboarding"
+        base.mkdir(exist_ok=True)
+        (base / plugin.REPORT_FILED_INSTRUCTIONS).write_text("Custom: {url}{dated}", encoding="utf-8")
+        first = self._call()
+        self.assertIn("Custom: https://github.com/acme/fleet/issues/75", first["context"])
+
     def test_the_filed_greeting_still_sets_the_home_channel_on_today(self):
         (self.data_dir / ".bootstrap_completed").touch()
         (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(

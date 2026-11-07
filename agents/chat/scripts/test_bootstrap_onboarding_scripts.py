@@ -2150,14 +2150,51 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         (self.d / COMPLETED).touch()  # the origin path's own claim, later
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
 
-    def test_a_report_too_long_for_an_issue_is_recorded_not_retried(self):
+    def test_a_report_too_long_for_an_issue_is_counted_before_the_second_read(self):
+        """Sized as filed, header included, before the sweep files are read or anything registered."""
         self._filed(self.DAY + self.HOUR)
-        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.ISSUE_BODY_MAX_CHARS + 10), encoding="utf-8")
-        with mock.patch.object(bootstrap_delivery, "REPORT_MAX_BYTES", bootstrap_delivery.ISSUE_BODY_MAX_CHARS * 2):
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.ISSUE_BODY_MAX_CHARS - 200), encoding="utf-8")
+        with mock.patch.object(bootstrap_delivery, "REPORT_MAX_BYTES", bootstrap_delivery.ISSUE_BODY_MAX_CHARS * 2), \
+                mock.patch.object(bootstrap_delivery, "_read_sweep_files") as sweep, \
+                mock.patch.object(bootstrap_delivery, "_register_findings") as reg:
             self.assertEqual(self._main(), 0)
+        sweep.assert_not_called()
+        reg.assert_not_called()
         self.assertEqual(self.forge_calls, [])
         self.assertFalse((self.d / COMPLETED).exists())
-        self.assertIn("longer than an issue body", bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE).get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("longer than an issue body", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1, "counted, so it stops after the waits")
+
+    def test_a_lost_claim_leaves_no_marker_behind(self):
+        """An origin run claimed first during this path's reads: its claim must not read as a dead one of ours."""
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def origin_claims(*a, **k):
+            (self.d / COMPLETED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=origin_claims):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_a_stale_no_human_claim_is_counted_in_its_own_record(self):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
+        (self.d / COMPLETED).touch()
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)), 1)
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
+
+    def test_an_operator_override_names_the_repository(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = ["example-org/other", self.REPO]
+        with mock.patch.dict(os.environ, {bootstrap_delivery.REPORT_LEDGER_REPO_ENV: "example-org/chosen"}):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls[-1][2], "example-org/chosen")
 
     def test_an_unreadable_repository_list_is_a_reason_not_a_traceback(self):
         self._filed(self.DAY + self.HOUR)
@@ -2217,6 +2254,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         spec.loader.exec_module(plugin)
         self.assertEqual(bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, plugin.SCAN_MAX_AGE_SECONDS)
         self.assertEqual(bootstrap_delivery.REPORT_FILED_FILE, plugin.REPORT_FILED_MARKER)
+        self.assertEqual(bootstrap_delivery.REPORT_RETIRED_FILE, plugin.REPORT_RETIRED_MARKER)
         self.assertEqual(bootstrap_delivery.FILED_URL, plugin.REPORT_FILED_URL_KEY)
         self.assertEqual(bootstrap_delivery.FILED_AT, plugin.REPORT_FILED_AT_KEY)
         self.assertLess(bootstrap_delivery.UNSPOKEN_FILE_AFTER_SECONDS, bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS)

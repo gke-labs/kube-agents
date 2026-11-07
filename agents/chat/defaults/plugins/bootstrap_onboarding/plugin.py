@@ -71,6 +71,11 @@ GREETED_MARKER = ".bootstrap_greeted"
 # report is in that issue, so the first human turn after it is greeted once
 # with a pointer there rather than with a report that is not coming.
 REPORT_FILED_MARKER = ".bootstrap_report_filed"
+# Written by the delivery stage when it retired the report a week after the sweep
+# with nobody aligned (bootstrap_delivery.REPORT_RETIRED_FILE, pinned equal by
+# its tests): nothing to point at, but the first human turn on a durable
+# platform still makes the chat the home channel.
+REPORT_RETIRED_MARKER = ".bootstrap_report_retired"
 REPORT_FILED_URL_KEY = "url"
 URL_SCHEME_PREFIX = "http"
 REPORT_FILED_AT_KEY = "filed_at"
@@ -82,6 +87,8 @@ _FALLBACK_REPORT_FILED = (
 )
 REPORT_FILED_DATE_FORMAT = "%Y-%m-%d %H:%M"
 REPORT_FILED_DATED_FORMAT = " (filed {date} UTC)"
+# An operator's override of the filed-report instruction, under onboarding/ like the others.
+REPORT_FILED_INSTRUCTIONS = "report_filed.md"
 
 # The eval seam: requests written only by the first-install-hello bench stack
 # (bench/tf/prebuilt/first-install-hello) as files whose names start with this
@@ -626,7 +633,7 @@ def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
     return record
 
 
-def _filed_greeting(record: Dict[str, Any]) -> Dict[str, str]:
+def _filed_greeting(data_dir: Path, record: Dict[str, Any]) -> Dict[str, str]:
     dated = ""
     try:
         stamp = float(record.get(REPORT_FILED_AT_KEY) or 0)
@@ -636,7 +643,9 @@ def _filed_greeting(record: Dict[str, Any]) -> Dict[str, str]:
             )
     except (TypeError, ValueError, OverflowError, OSError):
         dated = ""
-    instructions = _FALLBACK_REPORT_FILED.format(url=record[REPORT_FILED_URL_KEY], dated=dated)
+    instructions = _load_instructions(data_dir, REPORT_FILED_INSTRUCTIONS, _FALLBACK_REPORT_FILED).format(
+        url=record[REPORT_FILED_URL_KEY], dated=dated
+    )
     logger.info("Injecting onboarding greeting instructions (REPORT FILED).")
     return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — REPORT FILED]\n{instructions}\n"}
 
@@ -713,17 +722,21 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # The report went to a ledger issue because nobody wrote within a day: the
     # first human turn after that is told where it is, once; nothing is bound
     # or primed, since the report is not coming to this thread.
+    # The report left without a human (filed as an issue, or retired a week on): the first human
+    # chat turn after that is told where it went, once, when it went anywhere; and on a durable
+    # platform that turn still makes the chat the home channel when none is configured, as the
+    # greeting turn always did, or every scheduled report stays dropped.
     filed = _report_filed(data_dir)
-    if filed is not None and not (data_dir / GREETED_MARKER).exists() and _human_chat_turn(platform_name, session_id):
+    retired = (data_dir / REPORT_RETIRED_MARKER).exists()
+    if (filed is not None or retired) and not (data_dir / GREETED_MARKER).exists() \
+            and _human_chat_turn(platform_name, session_id):
         if platform_name in DURABLE_CHAT_PLATFORMS:
-            # As the greeting turn always did on this platform: the first chat becomes the home
-            # channel when none is configured, or every scheduled report stays dropped.
             _set_home_channel_if_unset(**kwargs)
         try:
             (data_dir / GREETED_MARKER).touch(exist_ok=True)
         except OSError as e:
             logger.warning("Could not record the greeting: %s", e)
-        return _filed_greeting(filed)
+        return _filed_greeting(data_dir, filed) if filed is not None else None
 
     # Already delivered, or already primed by an earlier session. Either way
     # onboarding has happened and must not happen again.

@@ -571,9 +571,10 @@ NO_LEDGER_REPO_REASON = (
     "no chat thread took the first-run report and the install has no GitOps repository to file it in; "
     "it stays in the report store"
 )
+REPORT_LEDGER_REPO_ENV = "ONBOARDING_LEDGER_REPO"
 LEDGER_REPO_AMBIGUOUS_REASON = (
-    "no chat thread took the first-run report and the install manages {count} GitHub repositories; "
-    "not choosing one to file it in"
+    "no chat thread took the first-run report and the install manages {count} GitHub repositories with no "
+    "GitOps role among them; not choosing one to file it in (set " + REPORT_LEDGER_REPO_ENV + " to name it)"
 )
 REPORT_RETIRED_NOTE = (
     "the first-run report was not delivered within {days} days of the sweep and is retired; "
@@ -717,6 +718,25 @@ def _mark_claiming(data_dir: Path) -> None:
         sys.stderr.write(f"bootstrap_delivery: could not record the claim's path: {e}\n")
 
 
+def _unmark_claiming(data_dir: Path) -> None:
+    """A lost claim is someone else's (an origin run that got there first): the marker must not
+    make theirs read as one of this path's with no record."""
+    try:
+        (data_dir / REPORT_CLAIMING_FILE).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not drop the claim's path marker: {e}\n")
+
+
+def _claim_for_this_path(data_dir: Path) -> bool:
+    _mark_claiming(data_dir)
+    if _claim_delivery(data_dir):
+        return True
+    _unmark_claiming(data_dir)
+    return False
+
+
 def _release_claim(data_dir: Path) -> None:
     for name in (".bootstrap_completed", REPORT_CLAIMING_FILE):
         try:
@@ -728,19 +748,21 @@ def _release_claim(data_dir: Path) -> None:
 
 
 def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
-    """Release a conversation-path claim whose run never recorded an outcome.
+    """Release a claim whose run never recorded an outcome: a conversation-path one, or a no-human
+    one (``REPORT_CLAIMING_FILE`` beside it), each counted in its own record.
 
     Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. It
     counts as an attempt unless one was already recorded after the claim.
     """
     if time.time() - claimed_at < STALE_CLAIM_SECONDS:
         return
+    name = REPORT_ATTEMPTS_FILE if (data_dir / REPORT_CLAIMING_FILE).exists() else CONVERSATION_ATTEMPTS_FILE
     try:
-        last = float(_read_attempts(data_dir).get(ATTEMPTS_AT))
+        last = float(_read_attempts(data_dir, name).get(ATTEMPTS_AT))
     except (TypeError, ValueError):
         last = 0.0
     if last <= claimed_at:
-        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=True)
+        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=True, name=name)
     _release_claim(data_dir)
 
 
@@ -1924,6 +1946,9 @@ def _ledger_repo() -> str | None:
     managed GitHub repository (so a GitOps repository on another forge still files into that one, as
     the chat-delivery ledger does); several GitHub repositories with no GitOps role among them is a
     recorded reason, not a guess; none on GitHub files nothing."""
+    configured = os.environ.get(REPORT_LEDGER_REPO_ENV, "").strip()
+    if configured:
+        return configured
     repos = sorted(gitops_workspace.get_managed_github_repo_names())
     gitops = gitops_workspace.get_gitops_repo()
     if gitops in repos:
@@ -2002,6 +2027,14 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str] | None:
     return number, _issue_url(repo, number, issue)
 
 
+def _issue_text(body: str, sweep: str, filed_at: float, now: float) -> str:
+    """The issue body as filed: the two markers, the intro, a blank line, the report with its note."""
+    date, filed = _utc(now), _utc(filed_at)
+    return "\n".join(
+        [REPORT_ISSUE_MARKER, REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body]
+    )
+
+
 def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: float) -> tuple[int, str]:
     """Open the ledger issue holding the report (or reuse the one already open): its number and URL.
 
@@ -2018,11 +2051,8 @@ def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: f
             {"name": REPORT_ISSUE_LABEL, "color": REPORT_ISSUE_LABEL_COLOR, "description": REPORT_ISSUE_LABEL_DESCRIPTION},
             repo,
         )
-    date, filed = _utc(now), _utc(filed_at)
-    title = REPORT_ISSUE_TITLE.format(date=date)
-    text = "\n".join(
-        [REPORT_ISSUE_MARKER, REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body]
-    )
+    title = REPORT_ISSUE_TITLE.format(date=_utc(now))
+    text = _issue_text(body, sweep, filed_at, now)
     answer = forge.call("issue-create", {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]}, repo)
     issue = answer.get("issue") if isinstance(answer.get("issue"), dict) else {}
     try:
@@ -2081,8 +2111,7 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
         sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
         return 0
     _register_findings(data_dir, _no_ranking(data_dir), files)
-    _mark_claiming(data_dir)
-    if not _claim_delivery(data_dir):
+    if not _claim_for_this_path(data_dir):
         return 0
     try:
         (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
@@ -2137,24 +2166,26 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
         sys.stderr.write(f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not filing it\n")
         return 1
     content = raw.decode("utf-8", errors="replace")
+    # Sized as filed (markers, intro, report, note), before the second sandbox read and the
+    # findings registration; counted, so a report that will never fit stops after the waits.
+    no_ranking = _no_ranking(data_dir)
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
+    body = _with_note(content, note)
+    composed = len(_issue_text(body, sweep, filed_at, now))
+    if composed > ISSUE_BODY_MAX_CHARS:
+        _record_attempt(
+            data_dir, REPORT_TOO_LONG_REASON.format(chars=composed, limit=ISSUE_BODY_MAX_CHARS), counted=True,
+            name=REPORT_ATTEMPTS_FILE,
+        )
+        return 0
     try:
         files = _read_sweep_files(data_dir, in_sandbox)
     except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
         sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
         return 0
-    no_ranking = _no_ranking(data_dir)
     suppressed = _register_findings(data_dir, no_ranking, files)
-    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
-    body = _with_note(content, note)
-    if len(body) > ISSUE_BODY_MAX_CHARS:
-        _record_attempt(
-            data_dir, REPORT_TOO_LONG_REASON.format(chars=len(body), limit=ISSUE_BODY_MAX_CHARS), counted=False,
-            name=REPORT_ATTEMPTS_FILE,
-        )
-        return 0
 
-    _mark_claiming(data_dir)
-    if not _claim_delivery(data_dir):
+    if not _claim_for_this_path(data_dir):
         return 0
     if _someone_is_here(data_dir):
         # A human arrived during the reads above: the report is theirs, through their thread.
