@@ -272,7 +272,7 @@ resource "null_resource" "deleted_policy" {
       # stderr, which is the honest failure.
       policy_managers="$(kubectl get networkpolicy "${local.policy}" -n "${local.ns}" \
         -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}')"
-      if ! printf '%s\n' "$policy_managers" | grep -qxF "${var.gitops_field_manager}"; then
+      if ! grep -qxF "${var.gitops_field_manager}" <<<"$policy_managers"; then
         echo "ERROR: ${local.policy} does not record field manager '${var.gitops_field_manager}', so the policy this run is about to delete was never owned by the GitOps manager and the scenario would be a fiction. Managers found:" >&2
         printf '%s\n' "$policy_managers" >&2
         exit 1
