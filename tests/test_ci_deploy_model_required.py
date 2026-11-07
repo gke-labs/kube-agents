@@ -12,6 +12,8 @@ import pathlib
 import subprocess
 import unittest
 
+from scripts.eval_dashboard import periodics
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CI_DEPLOY = REPO_ROOT / "hack" / "ci-deploy.sh"
 CI_EVAL = REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -41,8 +43,12 @@ class DeployRequiresTheModelInAProwJob(unittest.TestCase):
         self.assertNotIn("REACHED", result.stdout)
         self.assertIn(variable, result.stderr)
         self.assertIn("eval-model", result.stderr, "the message says where a lane sets it")
-        # The dashboard's error-line regex (scripts/eval_dashboard/periodics.py) keys on this prefix.
-        self.assertTrue(result.stderr.startswith("FATAL: "), result.stderr)
+        # The dashboard's error-line regex (scripts/eval_dashboard/periodics.py) keys on this
+        # prefix and quotes the line cut at LAST_LINE_MAX_CHARS, so the pointer fits in it.
+        first_line = result.stderr.splitlines()[0]
+        self.assertTrue(first_line.startswith("FATAL: "), first_line)
+        self.assertLessEqual(len(first_line), periodics.LAST_LINE_MAX_CHARS, first_line)
+        self.assertIn("ci-pool-projects.md 5.10", first_line)
 
     def test_a_prow_job_without_a_provider_stops_before_deploying(self) -> None:
         env = {k: v for k, v in ALL_SET.items() if k != "MODEL_PROVIDER"}
