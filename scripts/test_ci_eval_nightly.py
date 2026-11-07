@@ -1124,7 +1124,10 @@ class NightlyPartTest(unittest.TestCase):
         shards = self.main_shards()
         stack = self.stack_cases(self.names(sum(shards, [])))
         plain = [sum(1 for n in self.names(shard) if n not in stack) for shard in shards]
-        self.assertLessEqual(max(plain) - min(plain), max(6, sum(plain) // 5), plain)
+        # Within a quarter of one shard's share (7 today, against a spread of
+        # 6): a fifth of all plain cases would be a whole share and let a bad
+        # shift through.
+        self.assertLessEqual(max(plain) - min(plain), max(6, sum(plain) // len(shards) // 4), plain)
 
     def test_every_main_list_line_names_a_stack_case_of_main_once(self):
         main = self.names([e for e in self.nightly_matrix() if not self.is_writer(e)])
