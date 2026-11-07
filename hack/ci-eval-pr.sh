@@ -2957,8 +2957,11 @@ while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
 check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
-# A here-string, not `printf | grep -q`: grep exits on its first match, the
-# producer dies of SIGPIPE, and under pipefail the duplicate reads as absent.
+# A here-string, not `printf | grep -q`: grep exits on its first match, a
+# producer still writing dies of SIGPIPE, and under pipefail the duplicate
+# reads as absent. printf hands the pipe a few KiB per write, so on today's
+# rosters that is a rare race (the flake this replaced); past a pipe buffer
+# it is every run.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
   if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
     echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
@@ -3012,9 +3015,10 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # which check_case_entries has already proven to be a case path with a
   # directory behind it; the lane picks from the catalogue, it does not
   # register.
-  # A here-string, not `printf | grep -q`: grep exits on its first match, the
-  # producer dies of SIGPIPE, and under pipefail a registered entry reads as
-  # unregistered.
+  # A here-string, not `printf | grep -q`: grep exits on its first match, a
+  # producer still writing dies of SIGPIPE, and under pipefail a registered
+  # entry reads as unregistered. A rare race on today's rosters, every run
+  # past a pipe buffer; the certification check above says why.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
     if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
