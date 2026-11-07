@@ -2976,6 +2976,208 @@ def test_tool_called_arguments_must_be_patterns():
         ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], arguments={"title": "("})
 
 
+def test_tool_called_fold_arguments_requires_arguments():
+    with pytest.raises(ValueError, match="fold_arguments cannot be used without arguments"):
+        ToolCalledVerifier(type="tool_called", tool_names=["kanban_create"], fold_arguments=True)
+
+
+def test_tool_called_fold_arguments_normalizes_markdown_emphasis_whitespace_and_case():
+    raw_reason = "No registered repository declares `seeded-a`.\n\n**Stop** now."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"no registered repository declares seeded-a\. stop now\."
+
+    # Without fold_arguments (default False): raw markdown and newlines cause fullmatch to fail
+    raw_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+    )
+    assert raw_check.verify(5.0).status == "fail"
+
+    # With fold_arguments=True: _normalize strips markdown backticks and bold, collapses whitespace, and lowercases
+    folded_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert folded_check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_works_with_clipped_worker_call():
+    raw_reason = "The manifest `clusters/seeded-a/kcc.yaml` has _no_ Config Connector."
+    # Embedded in a clipped json raw string
+    clipped = json.dumps({"reason": raw_reason, "other": "x" * 100}) + " ...[clipped 900 chars]"
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"raw": clipped},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"the manifest clusters/seeded-a/kcc\.yaml has no config connector\."
+
+    raw_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+    )
+    assert raw_check.verify(5.0).status == "fail"
+
+    folded_check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert folded_check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_rewrites_inner_underscores_to_hyphens():
+    raw_reason = "NO_REGISTERED_REPO: acme/other is not registered on this install (preflight stop)."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    # Spells the hyphen the fold produces: with the inner-underscore rewrite
+    # gone the token collapses to `noregisteredrepo` and this must fail.
+    pattern = r"(?is).*(?:no-registered-repo|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b).*"
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_strips_boundary_whitespace():
+    # Value ends in newline or whitespace
+    raw_reason = "No registered repository declares `seeded-a`.\n"
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    # Pattern without trailing .* or \s*
+    pattern = r"no registered repository declares seeded-a\."
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_strips_invisible_characters():
+    # Value contains zero-width space (\u200b) inside matched phrase
+    raw_reason = "No registered\u200b repository declares seeded-a."
+    transcript.set(
+        "done",
+        [
+            {
+                "name": "kanban_block",
+                "args": {"reason": raw_reason},
+                "status": "completed",
+                "agent": "platform",
+            }
+        ],
+    )
+    pattern = r"no registered repository declares seeded-a\."
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        scope="workers",
+        agent="platform",
+        arguments={"reason": pattern},
+        fold_arguments=True,
+    )
+    assert check.verify(5.0).status == "pass"
+
+
+def test_tool_called_fold_arguments_refuses_patterns_with_underscores_or_backticks():
+    with pytest.raises(ValueError, match="carries '_' or '`'"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"(?is).*NO_REGISTERED_REPO.*"},
+            fold_arguments=True,
+        )
+    with pytest.raises(ValueError, match="carries '_' or '`'"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"`seeded-a`"},
+            fold_arguments=True,
+        )
+
+
+def test_tool_called_fold_arguments_refuses_uppercase_without_ignorecase():
+    with pytest.raises(ValueError, match="carries uppercase characters without re.IGNORECASE"):
+        ToolCalledVerifier(
+            type="tool_called",
+            tool_names=["kanban_block"],
+            arguments={"reason": r"No-registered-repo"},
+            fold_arguments=True,
+        )
+    # Permitted when re.IGNORECASE is present (e.g. (?i) or (?is))
+    check = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        arguments={"reason": r"(?i)No-registered-repo"},
+        fold_arguments=True,
+    )
+    assert check.fold_arguments is True
+    # Escapes like \S are permitted without (?i)
+    check_escape = ToolCalledVerifier(
+        type="tool_called",
+        tool_names=["kanban_block"],
+        arguments={"reason": r"\bno-repo\s+\S+"},
+        fold_arguments=True,
+    )
+    assert check_escape.fold_arguments is True
+
+
 def test_tool_called_result_counts_only_the_calls_that_answered_so():
     spilled = "<persisted-output>\nThis tool result was too large (109,963 characters, 107.4 KB)."
     transcript.set(
