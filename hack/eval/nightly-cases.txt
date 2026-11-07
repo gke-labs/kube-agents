@@ -1113,6 +1113,21 @@
 # sandbox. No fixture.
 ./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
 
+# The GCE compute stream's chat route (#2386): a plain question about the
+# fleet's VMs runs the collector once and answers in chat, with no ledger run.
+# Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
+# every boot; deployer: noop, read-only. The fixture-state scan of 2026-11-06
+# reads the role healthy on all 40 pool projects. Nightly from the merge that
+# removes its FIXTURE_NOT_READY entry.
+./tasks/gce-chat-request-runs-collector/task.yaml
+
+# The GCE compute audit end to end over the same standing plant (#2483): the
+# collector's gce-startup-script-status check flags the startup-fail-vm role's
+# VM, and the run files the ledger. deployer: noop, read-only on the project;
+# a full audit, in the band of the other fleet-audit cases. Nightly from the
+# merge that removes its FIXTURE_NOT_READY entry.
+./tasks/gce-startup-script-failure/task.yaml
+
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the
@@ -1185,6 +1200,14 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# The networking audit's firewall-world-open-ingress check over a standing
+# plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
+# the internet on one VM with an external IP. deployer: noop, read-only on the
+# project; a full audit, in the band of the other fleet-audit cases. The
+# fixture-state scan of 2026-11-06 reads the role healthy on all 40 pool
+# projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
+./tasks/networking-world-open-ingress/task.yaml
+
 # The obtainability audit's sweep opens a pull request for a major finding
 # with a declared workload: checkout-gateway's no-pdb fix, beside the
 # clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
@@ -1194,6 +1217,14 @@
 # runs before each repetition. Nightly from the merge that removes its
 # FIXTURE_NOT_READY entry.
 ./tasks/obtainability-major-pdb-auto-pr/task.yaml
+
+# A new PodDisruptionBudget file in a Kustomize root that the kustomization
+# does not list is a manual fix, not a pull request (#2686).
+# prebuilt/kustomize-overlay-declaration plants the kustomization for each
+# run with the stack write token and removes it at destroy, so the case has
+# no pool fixture: its first nightly run is the pool proof of the plant and
+# the teardown. writes_alone, so it runs alone in the writers part.
+./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its

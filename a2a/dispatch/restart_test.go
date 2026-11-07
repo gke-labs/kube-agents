@@ -140,7 +140,10 @@ func TestAFinishBetweenHoldersIsSettledNotFailed(t *testing.T) {
 	c1 := b.connect("dispatcher-1")
 	_, stop1 := b.runDispatcherOn(c1, testConfig(), ti, &fakeVerifier{})
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
-	waitFor(t, 10*time.Second, "the offer", func() bool { return w.offerCount() == 1 })
+	// Closed after the lease record lands but before the confirm goes out,
+	// the worker never starts and the task fails lease-expired: a lost
+	// confirm, not a finish between holders.
+	waitFor(t, 10*time.Second, "the task to start", func() bool { return w.startedCount() == 1 })
 	c1.Close()
 	stop1()
 	b.runDispatcher(testConfig(), ti, &fakeVerifier{})

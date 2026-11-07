@@ -8,3 +8,7 @@ aliases:
   eval-crew:
     - jayantid
     - lapis2002
+  # Who may approve quarantining a security or conformance test
+  # (hack/quarantine-approved.txt, hack/OWNERS).
+  security-approvers:
+    - bnaylor
