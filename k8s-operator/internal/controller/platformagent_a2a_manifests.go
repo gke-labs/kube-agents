@@ -4087,8 +4087,9 @@ const (
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
 	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
-	// operator does not use a chart-pods count it finds, from the annotation or
-	// the ConfigMap, once per spec generation and reason (a2aQuotaAgent): the
+	// operator does not use a chart-pods count it finds, from the annotation, the
+	// ConfigMap or the chart's workloads, once per spec generation and reason
+	// (a2aQuotaAgent): the
 	// quota then counts a2aDefaultChartPods, which can sit below what the
 	// namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
@@ -4229,7 +4230,7 @@ func a2aWithChartPods(agent *agentv1alpha1.PlatformAgent, raw string) *agentv1al
 // This operator's workloads carry its field owner as managed-by, so they are
 // not counted here; they are in a2aStandingPods.
 var a2aChartWorkloadSelector = client.MatchingLabels{
-	labelManagedBy: "Helm",
+	labelManagedBy: managedByHelm,
 	labelPartOf:    partOfKubeAgents,
 }
 
