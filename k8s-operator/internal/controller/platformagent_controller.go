@@ -4416,7 +4416,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
 		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
-		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) {
+		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
+		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
@@ -4429,7 +4430,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
 			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
-			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas)
+			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas) &&
+			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
 		return nil
 	}
@@ -4444,6 +4446,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
+	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	writtenBusReplicas := agent.Status.BusReplicas
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
@@ -4844,6 +4847,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
+	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
+	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4912,6 +4917,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		busProvisionedUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
+		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4997,6 +5003,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
 	writtenBusReplicas := agent.Status.BusReplicas

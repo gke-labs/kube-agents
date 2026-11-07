@@ -865,12 +865,21 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             footprint_path.write_text(original_footprint)
 
-    def _next_mode_delta(self, agent_replicas: int = 1) -> dict:
-        """What footprint.yaml's nextMode adds, summed independently of the template."""
+    def _next_mode_delta(self, agent_replicas: int = 1, gateway_standby: bool = True) -> dict:
+        """What footprint.yaml's nextMode adds, summed independently of the template.
+
+        `gateway_standby` adds the A2A gateway's second pod, which the operator runs once a
+        gateway holds the election's Lease and no golden renders (the election on, its
+        default), at the footprint's per-pod figures.
+        """
         following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
         bridge = following["agentPod"]["hermesBridge"]
         workloads = [v for k, v in following.items() if k not in ("agentPod", "storage")]
         self.assertTrue(workloads, "footprint.yaml has no nextMode workloads")
+        if gateway_standby:
+            gateway = following["a2aGateway"]
+            workloads.append({k: (v // gateway["pods"] if isinstance(v, int) and k != "pods" else v)
+                              for k, v in gateway.items() if k not in ("requests", "limits", "surges")} | {"pods": 1})
         delta = {
             "pods": sum(w["pods"] for w in workloads),
             "persistentVolumeClaims": following["storage"]["persistentVolumeClaims"],
@@ -914,6 +923,18 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
         # One JetStream claim per NATS server, three by default.
         self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
+
+    def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
+        """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
+        preflight counts the footprint's one gateway pod and nothing more."""
+        base = self._requirements()
+        following = self._requirements(
+            ["platformAgent.mode=next"],
+            values={"operator": {"extraEnv": [{"name": "A2A_GATEWAY_ELECTION", "value": "false"}]}},
+        )
+        for key, value in self._next_mode_delta(gateway_standby=False).items():
+            with self.subTest(key=key):
+                self.assertEqual(following[key] - base[key], value)
 
     def test_mode_today_counts_what_an_unset_mode_does(self) -> None:
         self.assertEqual(self._requirements(["platformAgent.mode=today"]), self._requirements())
@@ -2420,6 +2441,9 @@ class DocumentedFootprintTest(unittest.TestCase):
         callout_cpu, callout_mem, callout_replicas = per_pod("a2aCallout")
         verifier_cpu, verifier_mem, verifier_replicas = per_pod("a2aVerifier")
         gateway_cpu, gateway_mem, gateway_replicas = per_pod("a2aGateway")
+        # The gateway's standby, which no golden renders (it runs once a gateway holds
+        # the election's Lease), is one more gateway pod by default.
+        gateway_replicas += 1
         console_cpu, console_mem, console_replicas = per_pod("a2aConsole")
         provision_cpu, provision_mem, _ = per_pod("a2aProvision")
         bridge = following["agentPod"]["hermesBridge"]
@@ -2468,6 +2492,9 @@ class DocumentedFootprintTest(unittest.TestCase):
                 if k not in ("agentPod", "storage", "a2aProvision")
             )
         )
+        # The gateway's standby and a rollout's surge pod (a2aGatewayStandbyPods), which the
+        # footprint can't show: no golden renders the scale-out.
+        operator_standing += 2
         headroom = operator_standing + chart_default + margin
 
         page = " ".join(self._PREREQUISITES.read_text().split())
@@ -2515,7 +2542,7 @@ class DocumentedFootprintTest(unittest.TestCase):
             f"two capability verifier replicas ({verifier_cpu} CPU, {verifier_mem} memory each)",
             page,
         )
-        self.assertIn(f"the A2A gateway ({gateway_cpu} CPU, {gateway_mem} memory)", page)
+        self.assertIn(f"two A2A gateway replicas ({gateway_cpu} CPU, {gateway_mem} memory each", page)
         self.assertIn(f"the console ({console_cpu} CPU, {console_mem} memory)", page)
         self.assertIn(
             f"`hermes-bridge` container in the agent pod ({bridge_cpu} CPU, {bridge_mem} memory under the default `api` executor",
