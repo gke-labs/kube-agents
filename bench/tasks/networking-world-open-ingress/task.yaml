@@ -1,7 +1,7 @@
-# NIGHTLY-TIER once its fixture is applied: a full audit, the same cost band
-# as the other fleet-audit cases. Until then a FIXTURE_NOT_READY entry in
-# scripts/validate_bench_cases.py, naming #2682, because the rule below exists
-# in no pool project yet.
+# NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
+# cases, registered in hack/eval/nightly-cases.txt. The rule and the VM below
+# are on every pool project: the fixture-state scan of 2026-11-06 reads the
+# world-open-ingress role healthy on all 40 (#2682).
 #
 # The check this case grades is `firewall-world-open-ingress`, networking SOP
 # §2.6: an enabled INGRESS rule opening a management port to the whole
@@ -17,9 +17,10 @@
 # (cluster_slot null), which the runner probes with gcloud. No check reads it
 # by `fixture_role:`, because the role has no kubeconfig.
 #
-# Eval-driven development (.agents/rules/eval_driven_development.md): red on
-# main, whose roster has no `firewall-world-open-ingress`, so no finding can
-# carry it; green once the collector and §2.6 land.
+# Eval-driven development (.agents/rules/eval_driven_development.md): the
+# case was red before the collector check and §2.6 landed. The roster then
+# had no `firewall-world-open-ingress`, so no finding could carry it. The
+# collector now has the check, and the case is green.
 #
 # Isolation class: read-only on the project; writes the ledger issue to the
 # eval GitOps repo, as every fleet-audit stream does.
@@ -37,6 +38,9 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
 
 # Documentation, and the role the lease-time fixture-drift pass reads for
 # this case (bench/kube_agents_bench/fixture_drift.py).
