@@ -9,7 +9,9 @@
   ([`spec-a2a-payloads.md`](spec-a2a-payloads.md)) - envelope, subjects, authority; the NATS
   deployment spec ([`spec-nats-deployment.md`](spec-nats-deployment.md)) - streams, accounts,
   consumer narrowing; the chatops gateway spec
-  ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)) - doors and delegation. This spec
+  ([`spec-chatops-gateway.md`](spec-chatops-gateway.md)) - doors and delegation; the scheduling
+  on profiles spec ([`scheduling-on-profiles.md`](scheduling-on-profiles.md)) - `AgentSchedule`,
+  unattended triggers, and migrating cron jobs off Hermes. This spec
   changes parts of each; [Changes to companion specs](#changes-to-companion-specs) lists them.
 
 ## Purpose
