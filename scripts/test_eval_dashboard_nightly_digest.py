@@ -614,13 +614,31 @@ class LatencyBlockTest(Harness):
         reports = nightly.night_reports(doc)
         for key in ("running_parts", "missing_parts"):
             partial = [{**reports[0], key: ["main-b"]}, *reports[1:]]
-            with mock.patch.object(post_health.nightly, "night_reports", return_value=partial):
+            with mock.patch.object(post_health.nightly, "night_dates", return_value=partial):
                 self.assertTrue(post_health.nightly_latency_line(doc, NOW).endswith("(partial: over the cases on record)"))
         self.assertNotIn("partial", post_health.nightly_latency_line(doc, NOW))
 
     def test_the_one_line_fallback_carries_the_night_line(self):
         text = post_health.render_digest({"state": "GREEN", "metrics": {}}, NOW, self.timed_nights(), section="a reason")
         self.assertIn("⏱ *Latency*: turn 1 p50 10.0 s", text)
+
+    def test_same_date_re_runs_do_not_push_a_date_out_of_the_typicals(self):
+        """A cron run on 10-13 to 10-20 and a 09:00 re-run on 10-14 to 10-20
+        are 15 runs. Taken in runs, the newest 14 reach back to 10-14 only:
+        case-red's typical reads 550 s and the night's 325 s. Taken in dates,
+        both blocks see seven earlier dates."""
+        agent = {13: 1000.0, 14: 1000.0, 15: 1000.0, 16: 1000.0, 17: 100.0, 18: 100.0, 19: 100.0, 20: 2500.0}
+        runs = []
+        for day, red_s in agent.items():
+            for rerun in (False, True) if day > 13 else (False,):
+                run = night(day, [timed(green("case-green"), 100.0, 10.0), timed(green("case-red"), red_s, 10.0)])
+                if rerun:
+                    run.update(build_id=f"30000000000000{day:02d}0009", started=f"2026-10-{day:02d}T09:00:00+00:00",
+                               finished=f"2026-10-{day:02d}T09:59:00+00:00")
+                runs.append(run)
+        doc = data(*runs)
+        self.assertIn("• Capacity: case-red 1000 s → 2500 s (2.5×) · <users/1001>", self.build(doc).lines)
+        self.assertIn("(typical 550 s)", post_health.nightly_latency_line(doc, NOW))
 
 if __name__ == "__main__":
     unittest.main()

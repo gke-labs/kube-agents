@@ -2075,7 +2075,7 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 
 {{/*
 The chart's own workloads in the release namespace, as a JSON list of (name, resources
-subtree, pod count, rolls-with-a-surge-pod, standing). Two readers, so a workload is added
+subtree, pod count, rolls-with-a-surge-pod, standing, maxSurge as its template renders it). Two readers, so a workload is added
 once (#4893): kube-agents.quotaRequirements sums them for the quota preflight, and
 kube-agents.chartQuotaPods counts the standing ones and their surge pods for the operator's
 session quota. One list rather than a block per workload: the blocks it replaced were
@@ -2085,36 +2085,78 @@ wrong key and how the replay proxy came to be left out of the operator's count.
 cleanup hook is a Job that runs at uninstall while the release still stands: the preflight
 needs headroom for it, but it is not standing, so the session quota leaves it out.
 */}}
+{{/*
+The surge pods a rollout of one workload can add, from its maxSurge and its replicas
+(#4876): an integer as written, or a percentage of the replicas rounded up, as the
+Deployment controller rounds it, and never more than the replicas, since the controller
+never scales the new ReplicaSet past the desired count. None for a workload scaled to zero.
+A maxSurge that is neither a whole number nor a whole percentage counts as the replicas, the
+most a rollout can add: the schema admits it, and validate.yml requires such a value to
+render rather than be refused, so the count bounds it from above. Takes a dict with
+"maxSurge" and "replicas".
+*/}}
+{{- define "kube-agents.surgePods" -}}
+{{- $replicas := .replicas | int64 -}}
+{{- $v := .maxSurge -}}
+{{- $raw := "" -}}
+{{- /* A Deployment's replicas are an int32, so a maxSurge of 11 or more digits, or a
+       percentage of 1000% or more, already reaches past any replica count: it counts as the
+       replicas outright, with no conversion that could overflow. Only smaller values are
+       converted, which keeps every number well inside int64 and float64 (#4876's review:
+       a 20-digit value wrapped through int64, and a 309-digit one read 0 through float64). */ -}}
+{{- if or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v) -}}
+  {{- /* A number past int64 doesn't survive the round trip, so it keeps its float spelling
+         ("1e+20"), which isn't digits and counts as the replicas below. */ -}}
+  {{- $raw = toString ($v | int64) -}}
+  {{- if ne (float64 ($v | int64)) (float64 $v) -}}{{- $raw = toString $v -}}{{- end -}}
+{{- else -}}
+  {{- $raw = trim (toString $v) -}}
+{{- end -}}
+{{- $n := $replicas -}}
+{{- if regexMatch "^[0-9]+%?$" $raw -}}
+  {{- $digits := regexReplaceAll "^0+([0-9])" (trimSuffix "%" $raw) "${1}" -}}
+  {{- if hasSuffix "%" $raw -}}
+    {{- if lt (len $digits) 4 -}}
+      {{- $n = include "kube-agents.clampInt64" (ceil (divf (mulf ($digits | float64) (float64 $replicas)) 100.0)) | int64 -}}
+    {{- end -}}
+  {{- else if lt (len $digits) 11 -}}
+    {{- $n = $digits | int64 -}}
+  {{- end -}}
+{{- end -}}
+{{- if le $replicas (int64 0) -}}0{{- else -}}{{- min $n $replicas -}}{{- end -}}
+{{- end }}
+
 {{- define "kube-agents.chartWorkloads" -}}
 {{- $w := list -}}
 {{- if .Values.operator.enabled -}}
-  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.operator.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "operator.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- if .Values.litellm.enabled -}}
-  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
        beside LiteLLM and only with it. */ -}}
 {{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
 {{- if and .Values.litellm.enabled $replayShadow.enabled -}}
-  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" $replayShadow.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "litellm.replayShadow.rollingUpdate") | fromYaml).maxSurge) -}}
 {{- end -}}
 {{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
-  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
+  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true "maxSurge" (include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.hindsight.api.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "hindsight.api.rollingUpdate") | fromYaml).maxSurge) -}}
+  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false "maxSurge" 0) -}}
 {{- end -}}
 {{- if .Values.githubMinter.enabled -}}
-  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true "maxSurge" 1) -}}
 {{- end -}}
 {{- if .Values.webConsole.enabled -}}
-  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
-  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true) -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. It sets no
+         strategy, so it rolls with Kubernetes' default maxSurge of 25%. */ -}}
+  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true "maxSurge" "25%") -}}
 {{- end -}}
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}
   {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
-  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false) -}}
+  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false "maxSurge" 0) -}}
 {{- end -}}
 {{- toJson $w -}}
 {{- end }}
@@ -2122,9 +2164,9 @@ needs headroom for it, but it is not standing, so the session quota leaves it ou
 {{/*
 The pods the chart may run at once in the release namespace, for the next-mode session quota:
 the standing workloads in kube-agents.chartWorkloads at their replica counts (every one but
-the pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each that
-rolls surge-first and runs at least one replica (every one but Hindsight's PostgreSQL
-StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
+the pre-delete cleanup hook, which runs only at uninstall), plus the surge pods each one's
+rollout can add: its maxSurge, a percentage rounded up against its replicas, none at zero
+replicas, and none for Hindsight's PostgreSQL StatefulSet (#4876). quotaRequirements reads the same list, so a workload added there is counted
 here too. A chart bump rolls several of them in one upgrade, since the chart's version label
 is in their pod templates, and each surge pod counts against the quota while it starts.
 platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
@@ -2138,12 +2180,14 @@ it to the Deployments and StatefulSets a render actually puts in the release nam
 {{- range $w := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
   {{- if $w.standing -}}
     {{- $n := $w.pods | int64 -}}
-    {{- $pods = add $pods $n -}}
-    {{- /* A workload scaled to zero has no pod to surge from. */ -}}
-    {{- if and $w.surges (gt $n (int64 0)) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+    {{- $pods = include "kube-agents.satAdd" (dict "a" $pods "b" $n) | int64 -}}
+    {{- /* As many surge pods as its maxSurge allows; none at zero replicas. */ -}}
+    {{- if $w.surges -}}
+      {{- $surges = include "kube-agents.satAdd" (dict "a" $surges "b" (include "kube-agents.surgePods" (dict "maxSurge" $w.maxSurge "replicas" $n) | int64)) | int64 -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
-{{- add $pods $surges -}}
+{{- include "kube-agents.satAdd" (dict "a" $pods "b" $surges) -}}
 {{- end }}
 
 {{/*
@@ -2803,7 +2847,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
        used+required fits the release at rest and then stalls its first rollout, which is the
        failure values.yaml warns about under hindsight.api.rollingUpdate. Rollouts are
        per-workload, so room for one surge Pod at a time is enough. */ -}}
-{{- /* How many chart workloads roll with a surge pod: kube-agents.chartQuotaPods counts one each. */ -}}
+{{- /* The surge pods every chart workload's rollout can add (kube-agents.surgePods), the figure
+       kube-agents.chartQuotaPods stamps. */ -}}
 {{- $chartSurgePods := 0 -}}
 {{- $surgeCpuReq := 0 -}}
 {{- $surgeCpuLim := 0 -}}
@@ -2826,8 +2871,16 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $reqEph = add $reqEph (mul $res.ephemeralRequest $replicas) -}}
   {{- $limEph = add $limEph (mul $res.ephemeralLimit $replicas) -}}
   {{- /* A workload scaled to zero has no pod to surge from, so it sizes no patch. */ -}}
-  {{- if and $workload.surges (gt $replicas (int64 0)) -}}
-    {{- $chartSurgePods = add $chartSurgePods 1 -}}
+  {{- $surgePods := 0 -}}
+  {{- if $workload.surges -}}
+    {{- $surgePods = include "kube-agents.surgePods" (dict "maxSurge" $workload.maxSurge "replicas" $replicas) | int64 -}}
+  {{- end -}}
+  {{- if gt $surgePods (int64 0) -}}
+    {{- /* chartSurgePods totals every rollout's surge pods, the figure chartQuotaPods stamps
+           for the operator's session quota. The patch's surge room stays one pod of the
+           largest surging workload: enough for a rollout to make progress, since the
+           ReplicaSet controller creates the next surge pod as quota frees up. */ -}}
+    {{- $chartSurgePods = include "kube-agents.satAdd" (dict "a" $chartSurgePods "b" $surgePods) | int64 -}}
     {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
     {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
     {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}

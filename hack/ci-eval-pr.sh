@@ -4201,6 +4201,12 @@ unit_cost_hint() {
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
+    # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
+    # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
+    # kustomize case runs in the second phase (writes_alone), so its hint
+    # orders it only among that phase's units.
+    gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
+    obtainability-pdb-kustomize-overlay) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
@@ -4233,6 +4239,10 @@ unit_cost_hint() {
     # A general fleet health question that runs the health sweep (#3302): one
     # card and a sweep of seconds; the drift chat route's band.
     health-chat-request-runs-collector) echo 400 ;;
+    # A plain chat request that runs the GCE compute collector (#2386): it
+    # reads the serial console of every instance with a startup script; the
+    # audit band, without the ledger write.
+    gce-chat-request-runs-collector) echo 900 ;;
     # On the blocking roster since 2026-11-02 (#2013 step 4); presubmit held
     # out 2026-09-29 to then (#2013 step 2); nightly-only 2026-09-22 to
     # 2026-09-29 (#1023; held out on #1171, closed 2026-09-08). The canary
@@ -4392,7 +4402,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the eight
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -4430,6 +4440,8 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
+    obtainability-pdb-kustomize-overlay) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
     # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
     fleet-audit-as-many-excluded-as-managed) echo 3000 ;;
