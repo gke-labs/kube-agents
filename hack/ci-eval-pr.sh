@@ -59,7 +59,8 @@ readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
 # main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
 # shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
 # where no shift dealt it 37/38/21/30/20. scripts/test_ci_eval_nightly.py
-# holds the split within a fifth; if the matrix drifts past that, change it.
+# holds the spread within a quarter of a shard's share; if the matrix
+# drifts past that, change it.
 readonly NIGHTLY_MAIN_SHARDS=5
 readonly NIGHTLY_MAIN_CKSUM_SHIFT=3
 # A fifth file, read beside them and applied on one lane only (#2039): the
