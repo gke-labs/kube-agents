@@ -1317,6 +1317,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
 		}
+		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
+		if a2aState.busPodRequeue > 0 {
+			requeue = min(requeue, a2aState.busPodRequeue)
+		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
@@ -1365,6 +1369,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// else wakes the pass that creates it.
 	if a2aNext && a2aState.leaseRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
+	}
+	// A bus pod stuck on an old revision inside its grace period: the pass
+	// that replaces it has to be asked for, since pods are not watched.
+	if a2aNext && a2aState.busPodRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -5469,8 +5478,10 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the usage poll (its four groups share three distinct selectors, every
 // usageCountersPollInterval), one per reconcile while the CR has plugins, and
 // three more per reconcile while the agent is not Ready — five of those where
-// the A2A stack renders — and one per reconcile while the exec tier is short
-// of its count (credentialProxyExecUnschedulablePod). Each is namespace-scoped and label-selected
+// the A2A stack renders — one per reconcile while the exec tier is short
+// of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
+// pod per reconcile while a bus replica is not on the StatefulSet's update
+// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
