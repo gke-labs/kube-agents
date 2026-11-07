@@ -23929,7 +23929,8 @@ metadata:
     def test_the_live_run_a_degraded_fix_names_the_planted_declaration(self):
         """The worker named a file it never wrote, so the fix degraded to
         `manual`; the planted declaration was in the repository. The paragraph
-        keeps the eval's first sentence and names the planted file."""
+        names the planted file in its first sentence, and does not say "this
+        file", because the fix's file is not the declaration."""
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
         finding = self.pool_finding({"kind": "manifest", "path": "clusters/fa2-seeded-a/pinned-inference-pool.tf", "note": "Append zones."})
         audit_report.degrade_missing_remediations([finding], self.root)
@@ -23937,11 +23938,115 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), ["pool"])
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:120])
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertTrue(paragraph.startswith(f"**Config Connector is not applying `{self.PLANTED}`.**"), paragraph[:120])
+        self.assertNotIn("this file", paragraph)
         self.assertIn("`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`", paragraph)
         self.assertIn("DependencyNotFound", paragraph)
         self.assertIn("pinned-inference-pool", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_copied_paragraph_that_names_a_file_is_stripped_and_written_again(self):
+        """The strip-and-rewrite pattern covers the first sentence that names
+        a file, as it covers the two fixed forms."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        once = finding["remediation"]["note"]
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_MARK_PREFIX), 1)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
+        self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_guard_the_workers_own_text_stays_before_the_paragraph(self):
+        """A guard, not a fix test: it passed before any change. Two live
+        ledger rows showed only the paragraph as the fix's text, because the
+        worker gave no note. The pass keeps the worker's own text, when there
+        is any, before the paragraph, for a manifest fix of the declaring
+        file, a fix of another file, a manual fix and a note long enough to
+        be cut; with no worker text, the paragraph is the whole note and
+        nothing is made up in its place."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
+        for remediation, expected in (
+            ({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."}, "Append zones."),
+            ({"kind": "manifest", "path": "clusters/fa2-seeded-a/other.yaml", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": long_text}, long_text[:200]),
+        ):
+            with self.subTest(kind=remediation["kind"], path=remediation.get("path")):
+                finding = self.pool_finding(dict(remediation))
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                note = finding["remediation"]["note"]
+                self.assertTrue(note.startswith(expected), note[:200])
+                self.assertLess(note.index(expected), note.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        for remediation in ({"kind": "manifest", "path": self.PLANTED, "note": ""}, {"kind": "manifest", "path": self.PLANTED}):
+            finding = self.pool_finding(dict(remediation))
+            audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+            self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+
+    def test_a_worker_sentence_with_the_same_start_is_not_stripped(self):
+        """Review finding: the strip pattern took everything after the shared
+        start of the paragraph's first sentence, so a worker sentence that
+        starts the same way lost its end. Only an exact first sentence is a
+        copied paragraph."""
+        worker = ("Raise maxNodeCount to 6 in the pool file. **Config Connector is not applying the pool's last change**, "
+                  "so check its status first, then merge the pull request.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_exact_first_sentence_is_stripped(self):
+        tail = " When the audit ran, Config Connector reported `Ready=False` on `X a/b` (`UpdateFailed`)."
+        for mark in (
+            audit_report.KCC_STALLED_NOTE_MARK,
+            audit_report.KCC_STALLED_OBJECT_MARK,
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml`"),
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml` in the repository `acme/infra`"),
+        ):
+            with self.subTest(mark=mark):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + mark + tail}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_worker_sentence_with_a_code_span_is_not_stripped(self):
+        """Review finding: the first-sentence pattern took any code span, so a
+        worker sentence that names an object in one lost the sentence and the
+        rest of its line, and the log called it a copied paragraph. A copied
+        paragraph is one that goes on as `finish` writes it."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying `pinned-inference-pool`.** "
+                  "Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+            audit_report.disclose_manual_routes_and_log([finding], kcc_manifest(), set())
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("copied", err.getvalue())
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_paragraph_finish_writes_is_stripped(self):
+        """Every step of each paragraph form, the context-repository form
+        included, is stripped and written again."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        texts = [audit_report.KCC_STALLED_NOTE.format(objects=objects), audit_report.KCC_STALLED_NOTE_CORE.format(objects=objects)]
+        for path in ("`a/b.yaml`", "`a/b.yaml` in the repository `acme/infra`"):
+            texts += [audit_report.KCC_STALLED_DECLARED_NOTE.format(path=path, objects=objects),
+                      audit_report.KCC_STALLED_DECLARED_CORE.format(path=path, objects=objects)]
+        for search in (audit_report.KCC_DECLARATION_NOT_NAMED, audit_report.KCC_DECLARATION_SEARCH_MANY.format(count=2)):
+            texts += [audit_report.KCC_STALLED_UNDECLARED_NOTE.format(search=search, objects=objects),
+                      audit_report.KCC_STALLED_UNDECLARED_CORE.format(search=search, objects=objects)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + text}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -23973,10 +24078,10 @@ metadata:
         self.assertEqual(changed, ["pool"])
         self.assertEqual(finding["remediation"]["note"], command)
         paragraph = finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD]
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", paragraph)
         rendered = "\n".join(audit_report.render_finding(finding))
-        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_NOTE_MARK))
-        self.assertIn("```\n\n" + audit_report.KCC_STALLED_NOTE_MARK, rendered)
+        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        self.assertIn("```\n\n" + audit_report.KCC_STALLED_MARK_PREFIX, rendered)
         # A worker's copy of the field is dropped.
         finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD] = "made up"
         validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
@@ -24002,7 +24107,7 @@ metadata:
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan)
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", finding["remediation"]["note"])
 
     def test_content_mode_indexes_every_config_connector_kind(self):
         """A PubSubTopic, not only the container kinds, and a file whose only
@@ -24018,7 +24123,7 @@ metadata:
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan)
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
 
     def test_the_gcloud_check_reads_the_container_kinds_and_the_paragraph_every_kind(self):
         """The gcloud check reads only the files that name the container
@@ -24072,7 +24177,7 @@ metadata:
             with self.subTest(mode=label):
                 finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
                 audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     def test_the_absence_sentence_is_gone(self):
         """No text the audit writes says that no file declares an object."""
@@ -24124,7 +24229,7 @@ metadata:
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
         )
-        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `projects/b/cluster.yaml`.**", finding["remediation"]["note"])
         # The gcloud check still takes the first declaration of the name, as before.
         command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
                                remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
@@ -24151,7 +24256,7 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertEqual(paragraph, audit_report.KCC_STALLED_NOTE.format(objects=finding[audit_report.KCC_STALLED_FINDING_FIELD]))
-        self.assertNotIn("The declaration is", paragraph)
+        self.assertNotIn("**Config Connector is not applying `", paragraph)
 
     def test_both_first_sentences_are_stripped_and_written_again(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24177,7 +24282,7 @@ metadata:
                 manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
                     {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
                 audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
                   "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
@@ -24213,6 +24318,36 @@ metadata:
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
+
+    def test_a_shortened_kustomize_block_keeps_the_location_note(self):
+        """The copied file fills the cap beside a declared-file note and the
+        reconciler note. The shorter block makes room for the paragraph's
+        core and for both route notes: the location note is not pushed out."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/a/provisioning/pool.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        routes = "\n\n" + declared + "\n\n" + reconciled
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b + routes)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap." + routes)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn(declared, note)
+        self.assertIn(reconciled, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertIn("the fix says so", err.getvalue())
 
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
@@ -24319,12 +24454,12 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
         # The fix of the declaring file gets the paragraph about that file.
         finding = self.wedged("p/us-central1/hub-a")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
-        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        self.assertNotIn("**Config Connector is not applying `", finding["remediation"]["note"])
         manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
@@ -24386,6 +24521,26 @@ metadata:
                 self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
                 self.assertNotIn(path, note)
 
+    def test_the_paragraph_never_pushes_out_a_location_note(self):
+        """Review finding: a paragraph step was accepted as shorter although
+        it pushed out the location note (here the declared file), and only the
+        reconciler note was held. Every route note already on the note stays."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/c1/pool.yaml")
+        for repeats in range(20, 40):
+            command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * repeats
+            note = f"{prose}\n\n```bash\n{command.strip()}\n```" + "\n\n" + declared + "\n\n" + reconciled
+            finding = self.harness_finding(note)
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+            with self.subTest(repeats=repeats):
+                result = finding["remediation"]["note"]
+                self.assertIn(declared, result)
+                self.assertIn(reconciled, result)
+                self.assertIn(audit_report.KCC_STALLED_MARK_PREFIX, result)
+
     def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
         """A note of a reverted gcloud command (about 1,400 characters), which
         `finish` wrote and never cuts, leaves room for the reconciler note or
@@ -24423,7 +24578,7 @@ metadata:
         self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
         finding["remediation"]["note"] = "Set the channel."
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
-        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `b/prod.yaml`.**", finding["remediation"]["note"])
 
     def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
         """A compliance `lb-world-open` finding on the Kubernetes Service

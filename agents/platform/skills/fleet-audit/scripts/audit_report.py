@@ -2224,13 +2224,21 @@ KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
+# How every first sentence of the Config Connector paragraph starts, in all
+# its forms. The strip-and-rewrite pattern and the log look for it.
+KCC_STALLED_MARK_PREFIX = "**Config Connector is not applying "
 # The note `disclose_stalled_kcc_remediations` adds after a `manifest` fix
 # whose file declares an object Config Connector does not apply. One line, so
-# `KCC_STALLED_NOTE_PATTERN` removes all of it.
-KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
+# `KCC_STALLED_NOTE_PATTERN` removes all of it. Only this form says "this
+# file": the fix edits the declaring file.
+KCC_STALLED_NOTE_MARK = KCC_STALLED_MARK_PREFIX + "this file.**"
 # Each paragraph is a core and a tail. The tail is the part a note can lose
 # when the core does not fit otherwise (`_fit_kcc_paragraph`).
-KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
+# What follows the first sentence in every paragraph `finish` writes, in each
+# form and at each step of `KCC_PARAGRAPH_STEPS`. The strip pattern requires
+# it, so a worker sentence that only starts like the paragraph stays.
+KCC_STALLED_CONTINUATION = " When the audit ran, Config Connector reported "
+KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_NOTE_TAIL = (
     "The cloud resource does not change after the merge until Config Connector applies the object again. "
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
@@ -2239,13 +2247,13 @@ KCC_STALLED_NOTE_TAIL = (
 KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # The paragraph for any other fix of a finding whose own object Config
 # Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
-# `manual`, or a `manifest` fix to another file. When exactly one file in the
-# repository declares the object, the paragraph keeps the first sentence above
-# and names that file; otherwise it starts with `KCC_STALLED_OBJECT_MARK` and
-# names no file.
-KCC_STALLED_DECLARED_CORE = (
-    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}."
-)
+# `manual`, or a `manifest` fix to another file. The fix's file is not the
+# declaration, so the first sentence does not say "this file". When exactly
+# one file in the repository declares the object, the first sentence names
+# that file (`KCC_STALLED_DECLARED_MARK`); otherwise it is
+# `KCC_STALLED_OBJECT_MARK` and the paragraph names no file.
+KCC_STALLED_DECLARED_MARK = KCC_STALLED_MARK_PREFIX + "{path}.**"
+KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
     "does not take effect before then, and this finding comes back on each run until then."
@@ -2253,8 +2261,8 @@ KCC_STALLED_OBJECT_TAIL = (
 KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
-KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
-KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
+KCC_STALLED_OBJECT_MARK = KCC_STALLED_MARK_PREFIX + "the declaration of this object.**"
+KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + KCC_STALLED_CONTINUATION + "{objects}. {search}"
 # What the paragraph says when it names no file: that more than one file
 # declares the object, or only that it names none. It never says that no
 # file declares the object: a search can skip a file it cannot parse (a
@@ -2266,9 +2274,6 @@ KCC_STALLED_UNDECLARED_NOTE = (
 )
 # How the paragraph names a declaration in a context repository.
 KCC_DECLARATION_IN_REPO = "{path} in the repository {repo}"
-# The first sentences of both paragraphs, which the strip-and-rewrite pattern
-# and the log look for.
-KCC_STALLED_NOTE_MARKS = (KCC_STALLED_NOTE_MARK, KCC_STALLED_OBJECT_MARK)
 # The finding field that holds the paragraph of a `gcloud` fix: its note is
 # the command, which renders in a bash block, so the paragraph renders after
 # the block. Only `finish` writes it: `validate_findings` removes it.
@@ -2276,8 +2281,19 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # An earlier copy of either paragraph, which a worker can copy from the
 # previous ledger. The pass removes it from every note and writes it again
 # when the stall is still there, as the route-note pass does with its notes.
+# Each first sentence is matched to its exact end ("this file.**", "the
+# declaration of this object.**", or a file in a code span, also with
+# " in the repository `<repo>`": `KCC_STALLED_DECLARED_MARK`,
+# `KCC_DECLARATION_IN_REPO`), and then the text every paragraph `finish`
+# writes goes on with (`KCC_STALLED_CONTINUATION`). So a worker sentence that
+# only starts the same way is not a copied paragraph. The rest of the
+# paragraph's line goes with it.
 KCC_STALLED_NOTE_PATTERN = re.compile(
-    r"[ \t]*(?:" + "|".join(re.escape(mark) for mark in KCC_STALLED_NOTE_MARKS) + r")[^\n]*"
+    r"[ \t]*"
+    + re.escape(KCC_STALLED_MARK_PREFIX)
+    + r"(?:this file\.\*\*|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
+    + re.escape(KCC_STALLED_CONTINUATION)
+    + r"[^\n]*"
 )
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
@@ -7617,7 +7633,7 @@ def _strip_route_notes(remediation: object) -> None:
     # The Config Connector note is stripped and written again the same way
     # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
     # stall that this run's manifest does not show.
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
@@ -19843,7 +19859,7 @@ def kcc_stalled_objects(
 def _without_kcc_paragraph(note: str) -> str:
     """`note` with either paragraph of `disclose_stalled_kcc_remediations`
     removed."""
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         return KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     return note
 
@@ -19854,7 +19870,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
     if not isinstance(remediation, dict):
         return
     note = str(remediation.get("note") or "")
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_NOTE_PATTERN.search(note):
         remediation["note"] = _without_kcc_paragraph(note)
 
 
@@ -19866,12 +19882,12 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     worker's own text and never the text `finish` wrote (the Kustomize note
     and its copied file, the closing text of `degrade_missing_remediations`,
     the note of `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`),
-    and never inside a code block. The route notes already on the note stay,
-    and a paragraph that would push out the reconciler note does not fit, so
-    the reconciler note is always shown. When even the core does not fit
-    beside the text `finish` wrote and the note carries the Kustomize note's
-    copied file, that block is made shorter by whole lines, with its fences
-    closed, to make room for the core and the reconciler note, as
+    and never inside a code block. Every route note already on the note
+    stays: a paragraph step that would push one out (a location note or the
+    reconciler note) does not fit. When even the core does not fit beside the
+    text `finish` wrote and the note carries the Kustomize note's copied file,
+    that block is made shorter by whole lines, with its fences closed, to make
+    room for the core and the route notes, as
     `_fit_route_notes` does for the reconciler note (`_sized_manifest_block`).
     Only when that does not fit either does the core go after the text
     `finish` wrote, past `MAX_NOTE_CHARS`. The worker's note before a cut goes
@@ -19885,7 +19901,6 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
     route = [found.group(0) for found in ROUTE_NOTE_PATTERN.finditer(note)]
     worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
-    reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
     fitted, added = _fit_route_notes(worker, route)
     outcome = KCC_FIT_PAST_CAP
     for step, paragraph in enumerate(paragraphs):
@@ -19893,12 +19908,14 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
         # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
         shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
         candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
-        if shown in candidate_added and all(text in candidate_added for text in reconciler):
+        # Every route note already on the note stays: a step that pushes one
+        # out (a location note or the reconciler note) does not fit.
+        if shown in candidate_added and all(text in candidate_added for text in route):
             fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
             outcome = KCC_FIT_WHOLE if step == 0 else KCC_FIT_SHORTER
             break
     else:
-        shortened = _kcc_core_with_shorter_block(worker, reconciler, paragraphs[-1])
+        shortened = _kcc_core_with_shorter_block(worker, route, paragraphs[-1])
         if shortened is not None:
             fitted, added = shortened
             outcome = KCC_FIT_SHORTER
@@ -19914,18 +19931,19 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     return outcome
 
 
-def _kcc_core_with_shorter_block(worker: str, reconciler: list[str], core: str) -> "tuple[str, str] | None":
+def _kcc_core_with_shorter_block(worker: str, route: list[str], core: str) -> "tuple[str, str] | None":
     """The worker's note with its Kustomize copied file made shorter by whole
-    lines (`_sized_manifest_block`, fences closed) so that the reconciler
-    note and the paragraph's `core` fit `MAX_NOTE_CHARS`, as `(note, added)`;
+    lines (`_sized_manifest_block`, fences closed) so that every route note
+    already on the note (`route`) and the paragraph's `core` fit
+    `MAX_NOTE_CHARS`, as `(note, added)`;
     None when the note has no copied file or even an empty block leaves no
     room. Only the block is shortened; the Kustomize note's own text stays
     whole, and the worker's text after it is cut as needed."""
     head = _split_kustomize_head(worker)
     if head.lines is None:
         return None
-    shown = ROUTE_PARAGRAPH_BREAK + core if reconciler else core
-    added = NOTE_SEPARATOR.join([*reconciler, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+    shown = ROUTE_PARAGRAPH_BREAK + core if route else core
+    added = NOTE_SEPARATOR.join([*route, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
     block = _sized_manifest_block(
         head.lines, head.whole, lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None
     )
@@ -20066,7 +20084,7 @@ def disclose_stalled_kcc_and_log(
                 f"{prefix}WARNING: {fid}: Config Connector is not applying the finding's own object, and the "
                 "paragraph that says so does not fit beside the text the audit wrote; the renderer cuts its end."
             )
-        elif any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+        elif KCC_STALLED_NOTE_PATTERN.search(note) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")
