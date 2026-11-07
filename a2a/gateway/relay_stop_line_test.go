@@ -464,17 +464,7 @@ func TestAChatTypedStopAnswersOnTheLine(t *testing.T) {
 		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
 	})
 	line := r.adapter.stopLinesCopy()[0].MessageID
-	editsOf := func(id string) []string {
-		r.adapter.mu.Lock()
-		defer r.adapter.mu.Unlock()
-		var out []string
-		for _, e := range r.adapter.edits {
-			if e.MessageID == id {
-				out = append(out, e.Text)
-			}
-		}
-		return out
-	}
+	editsOf := r.adapter.editsOf
 	say("spaces/S1/messages/M2", "stop")
 	waitFor(t, "the line closed on cancel sent", func() bool {
 		return slices.ContainsFunc(editsOf(line), func(s string) bool { return strings.Contains(s, "cancel sent") })

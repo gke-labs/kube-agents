@@ -2469,8 +2469,9 @@ put them back after the link buttons, filled as last rated, from the adapter's r
 message from before a restart the click's rewrite reads them from the event's copy
 (`gchatMessageButtons`, which reads the `task` parameter and the `FILLED` button) and remembers
 them, so a later edit draws the same. Buttons are told
-apart by function (`kage.choice`, `kage.feedback`, `kage.feedback-note`, and `kage.stop`, The Stop
-button above) or link (`classifyGchatButton`), never by position. Google Chat has no Home tab, so the weekly count
+apart by function (`kage.choice`, `kage.feedback`, `kage.feedback-note`) or link
+(`classifyGchatButton`), never by position; the Stop button's `kage.stop` is none of its kinds, since
+`classifyClick` dispatches a click by that function first (The Stop button above). Google Chat has no Home tab, so the weekly count
 above is Slack's only; it shows nothing more after a 👍, as Slack does not.
 
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
