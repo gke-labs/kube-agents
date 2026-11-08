@@ -1076,11 +1076,16 @@ runs: the charged reads, and the reads of one namespace or one object that pass 
 that passes through keeps its pid across the exec, so its slot lasts exactly as long as kubectl.
 Only verbs that decode objects take one (`get`, `describe`, `events`, `top`, `logs`, `diff`,
 `apply`, `delete`, `api-resources`); a watch, `logs -f`, `exec`, `rollout status` or `wait` stays
-open as long as the session likes and takes none. The shell runs at most one read's capacity in
-96 MiB slots at once: 16 at the default limit, fewer under gVisor, whose reserve lowers the
-watermark.
-A command past that waits up to 30 s and then fails with exit 75 and a `capacity:` reason. The slots
-answer the shape the guard cannot: 60 concurrent per-namespace reads, each under the 64 MiB floor,
+open as long as the session likes and takes none.
+
+The limits are hard and come from the container's size. Every waiting command is a process holding
+about 16 MiB that the guard never stops, so the queue is bounded as well as the running reads: one
+read's capacity (the watermark less 256 MiB) is divided into pairs of a 96 MiB slot and a 16 MiB
+place in the queue. At the default 2 GiB that is 13 running and 13 waiting; under gVisor the reserve
+lowers the watermark and the count. A command that finds the slots full waits in the queue up to
+30 s, then fails with exit 75 and a `capacity:` reason. A command that finds the queue full too, or
+cannot take the lock within 5 s, fails at once, before it takes the lock, with the same exit and
+reason. The slots answer the shape the guard cannot: 60 concurrent per-namespace reads, each under the 64 MiB floor,
 grew together by about 1 GiB in a second, faster than kills could follow.
 
 The admission is advisory. A session can run `/usr/local/libexec/kubectl` directly, and the shared

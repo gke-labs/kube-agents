@@ -91,9 +91,9 @@ JSON line with the program and its size in the sandbox's log
 (`kubectl -n kubeagents-system logs <name>-shell-0`). A read that large fails at any limit below its
 size; narrow it to a namespace or a batch of clusters.
 
-Many small commands are bounded by the kubectl admission instead: the sandbox runs at most 16
-kubectl reads at once at the default limit (fewer under gVisor), and the next one waits, then fails with a
-`capacity:` reason.
+Many small commands are bounded by the kubectl admission instead. Its limits come from the
+sandbox's memory limit: at the default 2 GiB, 13 kubectl reads run at once and 13 more may wait
+(fewer under gVisor). A read that finds both full fails at once with a `capacity:` reason.
 
 The shell's kubectl admission refuses such a read before it starts, with a reason that names a
 narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet

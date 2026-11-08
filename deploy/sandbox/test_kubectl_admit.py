@@ -178,7 +178,9 @@ class AdmitTest(unittest.TestCase):
         state = Path(tmp.name)
         (state / "reservations").mkdir()
         (state / "slots").mkdir()
-        for name, value in [("LEDGER_DIR", str(state / "reservations")), ("SLOT_DIR", str(state / "slots")), ("LEDGER_LOCK", str(state / "ledger.lock")),
+        (state / "waiting").mkdir()
+        for name, value in [("LEDGER_DIR", str(state / "reservations")), ("SLOT_DIR", str(state / "slots")),
+                            ("WAIT_DIR", str(state / "waiting")), ("LEDGER_LOCK", str(state / "ledger.lock")),
                             ("EVENTS_LOG", str(state / "events.log")), ("ADMIT_WAIT_SECONDS", 0.0),
                             ("ADMIT_POLL_SECONDS", 0.0)]:
             patcher = mock.patch.object(admit, name, value)
@@ -261,7 +263,7 @@ class AdmitTest(unittest.TestCase):
 
     def test_a_command_past_the_slot_cap_waits_then_is_refused(self):
         slots = admit.max_slots(guard.high_watermark(2 * GIB))
-        self.assertEqual(slots, 16)
+        self.assertEqual(slots, 13)  # (1,792 - 256) MiB in pairs of 96 + 16 MiB
         for pid in range(slots):
             admit.write_shared(os.path.join(admit.SLOT_DIR, str(10000 + pid)), {"pid": 10000 + pid})
         with mock.patch.object(admit, "alive", return_value=True):
@@ -269,7 +271,7 @@ class AdmitTest(unittest.TestCase):
                 with self.subTest(argv=argv):
                     self.assertEqual(self.admit(*argv), admit.REFUSED_BUSY)
                     reason = self.stderr.getvalue()
-                    self.assertTrue(reason.startswith("capacity: the shell is already running 16 kubectl commands"))
+                    self.assertTrue(reason.startswith("capacity: the shell is already running 13 kubectl commands"))
                     self.assertIn("Options: ", reason)
                     self.stderr.truncate(0), self.stderr.seek(0)
         admit.run.assert_not_called()
@@ -303,14 +305,49 @@ class AdmitTest(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "pass_through"):
             self.admit("get", "pods", "-A", "-o", "json")
 
-    def test_a_lock_it_cannot_take_waits_then_is_refused_and_never_runs_unslotted(self):
+    def test_a_lock_it_cannot_take_is_refused_at_once_and_never_runs_unslotted(self):
         with mock.patch.object(admit, "take_lock", return_value=False):
             for argv in [("get", "nodes", "-o", "json"), ("logs", "x")]:
                 with self.subTest(argv=argv):
                     self.assertEqual(self.admit(*argv), admit.REFUSED_BUSY)
         admit.run.assert_not_called()
         self.assertTrue(self.stderr.getvalue().startswith("capacity: the shell is too busy"))
-        self.assertEqual(self.logged(), ["lock-timeout", "refused-lock"] * 2)
+        self.assertEqual(self.logged(), ["refused-lock"] * 2)
+
+    def fill(self, directory, count, base):
+        for pid in range(base, base + count):
+            admit.write_shared(os.path.join(directory, str(pid)), {"pid": pid})
+
+    def test_a_flood_is_refused_at_once_without_the_lock(self):
+        slots = admit.max_slots(guard.high_watermark(2 * GIB))
+        self.fill(admit.SLOT_DIR, slots, 10000)
+        self.fill(admit.WAIT_DIR, slots, 20000)
+        with mock.patch.object(admit, "alive", return_value=True), \
+                mock.patch.object(admit, "take_lock", side_effect=AssertionError("took the lock")), \
+                mock.patch.object(admit.time, "sleep", side_effect=AssertionError("waited")):
+            self.assertEqual(self.admit("logs", "x"), admit.REFUSED_BUSY)
+        self.assertTrue(self.stderr.getvalue().startswith(
+            f"capacity: the shell is already running {slots} kubectl commands and {slots} more are waiting"))
+        self.assertIn("Options: ", self.stderr.getvalue())
+        self.assertEqual(self.logged(), ["refused-flood"])
+
+    def test_a_waiter_holds_a_place_in_the_queue_only_while_it_waits(self):
+        slots = admit.max_slots(guard.high_watermark(2 * GIB))
+        self.fill(admit.SLOT_DIR, slots, 10000)
+        seen = []
+        with mock.patch.object(admit, "alive", side_effect=lambda pid: pid != 99999), \
+                mock.patch.object(admit.time, "sleep", side_effect=lambda _s: seen.append(os.listdir(admit.WAIT_DIR))), \
+                mock.patch.object(admit, "ADMIT_WAIT_SECONDS", 0.05):
+            self.assertEqual(self.admit("logs", "x"), admit.REFUSED_BUSY)
+        self.assertIn([str(os.getpid())], seen)
+        self.assertEqual(os.listdir(admit.WAIT_DIR), [])
+        self.assertEqual(self.logged(), ["refused-slots"])
+
+    def test_dead_entries_do_not_count_toward_a_flood(self):
+        slots = admit.max_slots(guard.high_watermark(2 * GIB))
+        self.fill(admit.WAIT_DIR, slots, 20000)  # dead pids: nothing waits
+        self.assertEqual(admit.count_alive(admit.WAIT_DIR), 0)
+        self.assertEqual(self.admit("get", "nodes", "-o", "json"), 0)
 
 
 class LockTest(unittest.TestCase):

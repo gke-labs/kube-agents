@@ -24,7 +24,9 @@ up to its charge, and waits like any read only while nothing is free.
 
 Every command that reads objects (`SLOTTED_VERBS`; not a watch or `logs -f`) also takes a
 slot for as long as it runs, the charged reads and those that pass through alike: the
-shell runs at most one read's capacity / `SLOT_BYTES` such commands at once. A command past that waits, then fails with exit 75.
+shell runs at most one read's capacity / (`SLOT_BYTES` + `WAITER_BYTES`) such commands at
+once, and as many may wait. A command that finds the slots full waits, then fails with exit
+75; one that finds the queue full too, or cannot take the lock, fails at once.
 A command that passes through keeps its pid across the exec, so its slot lasts exactly as
 long as kubectl does.
 
@@ -56,6 +58,7 @@ STATE_DIR = f"{RUN_DIR}/kubectl-admission"
 LEDGER_DIR = f"{STATE_DIR}/reservations"
 LEDGER_LOCK = f"{STATE_DIR}/ledger.lock"
 SLOT_DIR = f"{STATE_DIR}/slots"
+WAIT_DIR = f"{STATE_DIR}/waiting"
 EVENTS_LOG = f"{STATE_DIR}/events.log"
 DEFAULT_TIER = "default"
 CLUSTER_SCOPE = "cluster"
@@ -74,6 +77,11 @@ HEAVY_FORMATS = ("json", "yaml", "jsonpath", "custom-columns", "go-template", "t
 # takes one read's capacity / SLOT_BYTES of them at once, and at least MIN_SLOTS.
 SLOT_BYTES = 96 * MIB
 MIN_SLOTS = 4
+# Every waiting command is a live process holding memory the guard never stops (each is far
+# under its floor), so the queue has a hard size too: as many may wait as may run, and each
+# pair of slot and place in the queue is charged SLOT_BYTES + WAITER_BYTES of the one read's
+# capacity. Past that, a command is refused at once, before it takes the lock.
+WAITER_BYTES = 16 * MIB
 # Only verbs that decode objects take a slot. Local verbs read none, and a session holds a
 # stream (`exec`, `attach`, `logs -f`, `rollout status`, `wait`) open as long as it likes, so a
 # slot there would let a few open streams refuse every other session's reads.
@@ -403,8 +411,32 @@ def take_lock(lock) -> bool:
 
 
 def max_slots(high: int) -> int:
-    """How many kubectl commands the shell runs at once: one read's capacity in SLOT_BYTES."""
-    return max(MIN_SLOTS, (high - SHELL_FLOOR_BYTES) // SLOT_BYTES)
+    """How many kubectl commands the shell runs at once, and how many may wait: one read's
+    capacity, from the container's limit, in pairs of SLOT_BYTES and WAITER_BYTES."""
+    return max(MIN_SLOTS, (high - SHELL_FLOOR_BYTES) // (SLOT_BYTES + WAITER_BYTES))
+
+
+def count_alive(directory: str) -> int:
+    """Entries whose pid still runs, read without the lock and without removing anything."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    return sum(1 for name in names if name.isdecimal() and alive(int(name)))
+
+
+def unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def refuse_flood(running: int, waiting: int, tier: str, key) -> int:
+    sys.stderr.write(f"capacity: the shell is already running {running} kubectl commands and {waiting} more are "
+                     f"waiting, the most it takes; the install cannot take this one now. {SLOT_ALTERNATIVES}\n")
+    log({"event": "refused-flood", "tier": tier, "key": key, "slots": running, "waiting": waiting})
+    return REFUSED_BUSY
 
 
 def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> int:
@@ -432,47 +464,51 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
                              f"the install cannot take this read. {advice(cmd)}\n")
             log({"event": "refused-size", "tier": tier, "key": key, "need": need, "cap": cap})
             return REFUSED_NOW
+    # A flood is refused at once and without the lock: every command blocked on it is one more
+    # process in memory.
+    running, waiting = count_alive(SLOT_DIR), count_alive(WAIT_DIR)
+    if running >= slots_max and waiting >= slots_max:
+        return refuse_flood(running, waiting, tier, key)
     deadline = time.monotonic() + ADMIT_WAIT_SECONDS
     mine = str(os.getpid())
-    slots, free, reservations = [], 0, []
-    while True:
-        with open(LEDGER_LOCK, "a", encoding="utf-8") as lock:
-            # A command that cannot take the lock waits like one that finds no room: running it
-            # unslotted is how a starved burst outgrew the shell.
-            locked = take_lock(lock)
-            if not locked:
-                log({"event": "lock-timeout", "tier": tier, "key": key})
-            else:
+    my_wait = os.path.join(WAIT_DIR, mine)
+    slots, free, reservations, queued = [], 0, [], False
+    try:
+        while True:
+            with open(LEDGER_LOCK, "a", encoding="utf-8") as lock:
+                # A command that cannot take the lock is refused, never run unslotted: unslotted
+                # commands after a lock timeout are how a starved burst outgrew the shell.
+                if not take_lock(lock):
+                    sys.stderr.write("capacity: the shell is too busy to admit this kubectl command now; the "
+                                     f"install cannot take it now. {SLOT_ALTERNATIVES}\n")
+                    log({"event": "refused-lock", "tier": tier, "key": key})
+                    return REFUSED_BUSY
                 slots = live_reservations(SLOT_DIR)
                 free, reservations, book = 0, [], 0
-            if locked and len(slots) < slots_max:
-                if not charged:
-                    write_shared(os.path.join(SLOT_DIR, mine), {"pid": os.getpid()})
-                    break
-                reservations = live_reservations(LEDGER_DIR)
-                free = free_budget(high, guard.memory_in_use() or 0, reservations)
-                book = min(need, free) if cmd["selector"] else need
-                if book <= free and (book > 0 or not cmd["selector"]):
-                    write_shared(os.path.join(SLOT_DIR, mine), {"pid": os.getpid()})
-                    reservation = {"pid": os.getpid(), "bytes": book, "key": key}
-                    write_shared(os.path.join(LEDGER_DIR, mine), reservation)
-                    break
-        if time.monotonic() >= deadline:
-            if not locked:
-                sys.stderr.write("capacity: the shell is too busy to admit this kubectl command now; the install "
-                                 f"cannot take it now. {SLOT_ALTERNATIVES}\n")
-                log({"event": "refused-lock", "tier": tier, "key": key})
-            elif len(slots) >= slots_max or not charged:
-                sys.stderr.write(f"capacity: the shell is already running {len(slots)} kubectl commands, the most it "
-                                 f"takes at once; the install cannot take this one now. {SLOT_ALTERNATIVES}\n")
-                log({"event": "refused-slots", "tier": tier, "key": key, "slots": len(slots)})
-            else:
-                sys.stderr.write(f"capacity: this read needs about {need // MIB} MiB and the shell has "
-                                 f"{max(free, 0) // MIB} MiB free beside {len(reservations)} running reads; the "
-                                 f"install cannot take it now. Retry in a minute, or narrow it. {advice(cmd)}\n")
-                log({"event": "refused-busy", "tier": tier, "key": key, "need": need, "free": free})
-            return REFUSED_BUSY
-        time.sleep(ADMIT_POLL_SECONDS)
+                if len(slots) < slots_max:
+                    if not charged:
+                        write_shared(os.path.join(SLOT_DIR, mine), {"pid": os.getpid()})
+                        break
+                    reservations = live_reservations(LEDGER_DIR)
+                    free = free_budget(high, guard.memory_in_use() or 0, reservations)
+                    book = min(need, free) if cmd["selector"] else need
+                    if book <= free and (book > 0 or not cmd["selector"]):
+                        write_shared(os.path.join(SLOT_DIR, mine), {"pid": os.getpid()})
+                        reservation = {"pid": os.getpid(), "bytes": book, "key": key}
+                        write_shared(os.path.join(LEDGER_DIR, mine), reservation)
+                        break
+                if not queued:
+                    waiting = len(live_reservations(WAIT_DIR))
+                    if waiting >= slots_max:
+                        return refuse_flood(len(slots), waiting, tier, key)
+                    write_shared(my_wait, {"pid": os.getpid()})
+                    queued = True
+            if time.monotonic() >= deadline:
+                return refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, key)
+            time.sleep(ADMIT_POLL_SECONDS)
+    finally:
+        if queued:
+            unlink_quietly(my_wait)
     if not charged:
         pass_through(argv)  # the same pid, so the slot lasts exactly as long as kubectl
     log({"event": "admitted", "tier": tier, "key": key, "need": book, "free": free})
@@ -486,10 +522,21 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
         return REFUSED_BUSY
     finally:
         for path in (os.path.join(SLOT_DIR, mine), os.path.join(LEDGER_DIR, mine)):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            unlink_quietly(path)
+
+
+def refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, key) -> int:
+    """The refusal after the wait: no slot came free, or the charge never fit."""
+    if len(slots) >= slots_max or not charged:
+        sys.stderr.write(f"capacity: the shell is already running {len(slots)} kubectl commands, the most it "
+                         f"takes at once; the install cannot take this one now. {SLOT_ALTERNATIVES}\n")
+        log({"event": "refused-slots", "tier": tier, "key": key, "slots": len(slots)})
+    else:
+        sys.stderr.write(f"capacity: this read needs about {need // MIB} MiB and the shell has "
+                         f"{max(free, 0) // MIB} MiB free beside {len(reservations)} running reads; the "
+                         f"install cannot take it now. Retry in a minute, or narrow it. {advice(cmd)}\n")
+        log({"event": "refused-busy", "tier": tier, "key": key, "need": need, "free": free})
+    return REFUSED_BUSY
 
 
 def main(argv: list[str]) -> int:
