@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -24,7 +25,7 @@ func TestDelegateTargetsNamePlatformThenEachProfile(t *testing.T) {
 	d := newProfileDirectory()
 	d.put("e2e5", &lib.AgentCard{Name: "e2e5", Description: "reads one\ncluster's workloads"})
 	d.put("cluster", &lib.AgentCard{Name: "cluster", Tiers: []string{"read"}})
-	got := g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
+	got := g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if want := []string{"platform", "cluster", "e2e5"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("targets = %v, want %v", targetNames(got), want)
 	}
@@ -50,21 +51,21 @@ func TestDelegateTargetsLeaveOutWhatTheDelegationWouldRefuse(t *testing.T) {
 		"listed":   {"discord": {"u2": true}},
 		"platform": {"discord": {"u2": true}},
 	}}
-	got := g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
+	got := g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if want := []string{"open"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("u1's targets = %v, want %v (listed and platform hold only u2; writers is write-tier)", targetNames(got), want)
 	}
-	got = g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u2"}, d)
+	got = g.delegateTargets(TaskRequester{Backend: "discord", Subject: "u2"}, nil, false, d)
 	if want := []string{"platform", "listed", "open"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("u2's targets = %v, want %v", targetNames(got), want)
 	}
 	// The A2A door delegates only under a list of its own.
-	got = g.delegateTargets(TaskRequester{Backend: a2aBackend, Subject: "u2"}, d)
+	got = g.delegateTargets(TaskRequester{Backend: a2aBackend, Subject: "u2"}, nil, false, d)
 	if len(got.Targets) != 0 {
 		t.Fatalf("door caller's targets = %v, want none", targetNames(got))
 	}
 	// No attested identity reaches no profile.
-	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord"}, d)
+	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord"}, nil, false, d)
 	if want := []string{"platform"}; !reflect.DeepEqual(targetNames(got), want) {
 		t.Fatalf("no-identity targets = %v, want %v", targetNames(got), want)
 	}
@@ -80,7 +81,7 @@ func TestDelegateTargetsSkipBadNamesAndStopAtTheCap(t *testing.T) {
 		name := "p" + string(rune('a'+i%26)) + string(rune('a'+i/26))
 		d.put(name, &lib.AgentCard{Name: name})
 	}
-	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
+	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if len(got.Targets) != lib.DelegateTargetsMax || !got.Truncated {
 		t.Fatalf("%d targets, truncated=%v; want the cap %d, truncated", len(got.Targets), got.Truncated, lib.DelegateTargetsMax)
 	}
@@ -128,7 +129,7 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 	d.put("a-cluster", &lib.AgentCard{Name: "a-cluster", Parameters: clusterParams})
 	d.put("b-bad", &lib.AgentCard{Name: "b-bad", Parameters: []lib.ProfileParameter{{Name: "Not-An-Identifier"}}})
 	d.put("c-open", &lib.AgentCard{Name: "c-open"})
-	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
+	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
 	if want := []string{"platform", "a-cluster", "c-open"}; !reflect.DeepEqual(targetNames(got), want) || got.Truncated {
 		t.Fatalf("targets = %v truncated=%v, want %v untruncated", targetNames(got), got.Truncated, want)
 	}
@@ -146,11 +147,58 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 		}
 		big.put(name, &lib.AgentCard{Name: name, Description: blurb, Parameters: params})
 	}
-	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, big)
+	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, big)
 	if !got.Truncated || len(got.Targets) >= lib.DelegateTargetsMax {
 		t.Fatalf("%d targets, truncated=%v; want fewer than the cap, truncated by bytes", len(got.Targets), got.Truncated)
 	}
 	if _, err := lib.DelegateTargetsPart(got); err != nil {
 		t.Fatalf("the truncated list doesn't build a part: %v", err)
+	}
+}
+
+// Everyone whose text reached the session is held to the target's lists, as
+// the delegation holds them: an off-list author takes a listed profile out,
+// and an incomplete set leaves nothing.
+func TestDelegateTargetsHoldEveryoneInTheSession(t *testing.T) {
+	d := newProfileDirectory()
+	d.put("listed", &lib.AgentCard{Name: "listed"})
+	d.put("open", &lib.AgentCard{Name: "open"})
+	g := &Gateway{targetAllowed: map[string]map[string]map[string]bool{"listed": {"discord": {"u1": true}}}}
+	u1 := TaskRequester{Backend: "discord", Subject: "u1"}
+	u3 := TaskRequester{Backend: "discord", Subject: "u3"}
+	if got := g.delegateTargets(u1, []TaskRequester{u1}, false, d); !reflect.DeepEqual(targetNames(got), []string{"platform", "listed", "open"}) {
+		t.Fatalf("u1 alone: %v", targetNames(got))
+	}
+	if got := g.delegateTargets(u1, []TaskRequester{u1, u3}, false, d); !reflect.DeepEqual(targetNames(got), []string{"platform", "open"}) {
+		t.Fatalf("u1 with off-list u3 in the session: %v, want listed left out", targetNames(got))
+	}
+	if got := g.delegateTargets(u1, nil, true, d); len(got.Targets) != 0 {
+		t.Fatalf("an incomplete author set: %v, want none", targetNames(got))
+	}
+}
+
+// A wake runs without the delegate tool, so its submission carries no list.
+func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	rec := &SessionRecord{Key: "discord:g1/t-wk", ContextID: "ctx-wk", Kind: "group"}
+	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wk-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	session := spawn.calls()[0].Session
+	r.awaitTask(t, session)
+	got := waitForRecord(t, r, rec.Key, "the record", func(rec *SessionRecord) bool { return rec.BusSession == session })
+	taskID, ok := r.g.startTaskWith(context.Background(), got, taskStart{Text: "the child came back", Role: taskRoleWake,
+		Requester: TaskRequester{Backend: "discord", Subject: "u1"}})
+	if !ok {
+		t.Fatal("the wake wasn't submitted")
+	}
+	var wake *lib.Envelope
+	waitFor(t, "the wake on the bus", func() bool {
+		for _, e := range streamEnvelopes(t, r.url, lib.TaskInSubject(session, taskID)) {
+			wake = e.env
+		}
+		return wake != nil
+	})
+	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, wake)); found {
+		t.Fatal("a wake carried delegate targets")
 	}
 }

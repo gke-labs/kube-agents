@@ -38,18 +38,31 @@ func (d *profileDirectory) sortedCards() []lib.AgentCard {
 // delegateTargets is the agents r may delegate to, as a session turn's
 // delegateTargets part carries them: platform first, then each profile in
 // name order. It applies the checks a delegation meets when it arrives
-// (handleDelegateRequest): the door's own-list rule and the target's list for
-// r's backend, and for a profile the tier r would run at against the card's
-// tiers. It stops at DelegateTargetsMax, or before the part would pass
+// (handleDelegateRequest): the door's own-list rule and the target's list,
+// for r and for everyone else whose text reached the session (authors), and
+// for a profile the tier r would run at against the card's tiers. With that
+// set incomplete (authorsUnknown) the delegation refuses every target, so the
+// list is empty. Steers that arrive during the turn, and a pinned profile
+// whose own cluster is out of scope, are checked only when a delegation
+// arrives; the list is a hint, and those cost a refused delegation. It stops at DelegateTargetsMax, or before the part would pass
 // DelegateTargetsMaxBytes, and says so (Truncated), so an install with more
 // profiles than that shows the first ones by name. Resolving a target (a
 // pinned profile's cluster, an ambiguous name) is the delegation's step, not
 // the list's.
-func (g *Gateway) delegateTargets(r TaskRequester, profiles profileLister) lib.DelegateTargets {
-	allowed := func(target string) bool {
-		return !g.doorUnlisted(target, r.Backend) && g.targetAllows(target, r.Backend, r.Subject)
-	}
+func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, authorsUnknown bool, profiles profileLister) lib.DelegateTargets {
 	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}}
+	if authorsUnknown {
+		return out
+	}
+	everyone := append([]TaskRequester{r}, authors...)
+	allowed := func(target string) bool {
+		for _, a := range everyone {
+			if g.authorRefusal(target, a, ruleDelegationSessionAuthor) != "" {
+				return false
+			}
+		}
+		return true
+	}
 	if allowed(targetPlatform) {
 		out.Targets = append(out.Targets, lib.DelegateTarget{Name: targetPlatform, Description: platformTargetDescription})
 	}

@@ -361,7 +361,9 @@ func DelegateTargetDescription(s string) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut]
+	// A cut that lands after a space would leave it trailing, and the
+	// description would no longer read back as itself.
+	return strings.TrimRight(s[:cut], " ")
 }
 
 func validateDelegateTargets(t DelegateTargets) error {

@@ -368,3 +368,16 @@ func TestDelegateTargetsHoldParametersAndTheByteBound(t *testing.T) {
 		t.Errorf("a list past %d bytes: built, want refused", DelegateTargetsMaxBytes)
 	}
 }
+
+// A cut that lands after a space doesn't leave it trailing: the description
+// reads back as itself, so the gateway's own cut never fails the reader.
+func TestDelegateTargetDescriptionIsStableAcrossTheCut(t *testing.T) {
+	s := strings.Repeat("a", DelegateTargetDescriptionMax-1) + " tail words here"
+	got := DelegateTargetDescription(s)
+	if strings.HasSuffix(got, " ") || DelegateTargetDescription(got) != got {
+		t.Fatalf("cut to %q, which doesn't read back as itself", got[len(got)-5:])
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "p", Description: got}}}); err != nil {
+		t.Fatalf("the cut description doesn't build a part: %v", err)
+	}
+}

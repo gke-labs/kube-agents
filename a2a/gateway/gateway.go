@@ -2942,9 +2942,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A turn for the conversation's own session pod carries the agents its
 	// requester may delegate to, which the pod's delegate tool names. Per
 	// turn, so a reused pod sees profiles as they come and go.
+	// A wake runs without the tool, so it carries none.
 	var extra []lib.Part
-	if ts.Route == nil && rec.AddressedToOwnSession() {
-		if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, g.profiles)); err != nil {
+	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
+		authors, unknown, _ := rec.sessionAuthorsOf()
+		if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
 			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
 		} else {
 			extra = append(extra, part)
@@ -3396,9 +3398,9 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 }
 
 // messagePayloadParts builds the A2A Message for one submission or steer
-// from its parts. Every chat turn's are its text alone (messagePayload); the
-// card-stop control's are the cardStop data part alone (cardStopPayload),
-// which no text a person types can produce.
+// from its parts. A chat turn's are its text, then any data parts the gateway
+// adds (submissionPayload); the card-stop control's are the cardStop data
+// part alone (cardStopPayload), which no text a person types can produce.
 func messagePayloadParts(parts []lib.Part, taskID, contextID string) ([]byte, error) {
 	return marshalMessage(lib.Message{
 		Role:      "user",
