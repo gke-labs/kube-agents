@@ -184,14 +184,27 @@ def plant_state_path(audit_report) -> Path:
 
 
 def stored_envelope(audit_report) -> tuple[dict | None, str]:
-    """The newest envelope of the ledger this install publishes the stream to, and its repository."""
-    repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+    """The newest published envelope of the ledger this install publishes the stream to, and its repository.
+
+    None, and the caller tears down and abandons, where the resolver refuses
+    (several repositories and no `gitops` role: `finish` kept the run under
+    the no-forge repository) or the newest envelope is a diverted run's
+    (`is_diverted`: the repository was unreachable, so `finish` recorded no
+    digest). Neither is a baseline the fired run can close from.
+    """
+    try:
+        repo = audit_report.resolve_repo_or_no_forge(AUDIT)
+    except RuntimeError as exc:
+        print(f"{AUDIT} resolves no repository: {exc}", file=sys.stderr)
+        return None, audit_report.NO_FORGE_REPO
     latest = audit_report.reports_dir_for(AUDIT, repo) / audit_report.REPORT_LATEST_NAME
     try:
         envelope = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None, repo
-    return (envelope if isinstance(envelope, dict) else None), repo
+    if not isinstance(envelope, dict) or audit_report.is_diverted(envelope):
+        return None, repo
+    return envelope, repo
 
 
 def abandon(audit_report, why: str) -> int:
@@ -251,7 +264,8 @@ def plant(audit_report, mark: str, scripts: str, collector_args: list[str]) -> i
     if envelope is None or not envelope.get("scheduled") or finished is None or finished < started:
         teardown(audit_report, mark)
         return abandon(
-            audit_report, f"the report store of {repo} does not hold this scheduled run (newest: {finished_at or 'none'})."
+            audit_report,
+            f"the report store of {repo} does not hold this scheduled run as a published one (newest: {finished_at or 'none'}).",
         )
     plant_state_path(audit_report).write_text(json.dumps({"repo": repo, "finished_at": finished_at}), encoding="utf-8")
     recorded = digest_record_path(audit_report).is_file()

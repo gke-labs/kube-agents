@@ -106,10 +106,16 @@ def _pause_again(home, state):
     """Put the pause back that `trigger_job` lifted; best effort, recorded in the state."""
     if not state.get("was_paused") or state.get("repaused"):
         return
-    done = subprocess.run(
-        [HERMES_BIN, "-p", PROFILE, "cron", "pause", state["job_id"]],
-        capture_output=True, text=True, timeout=HERMES_TIMEOUT_S, check=False,
-    )
+    try:
+        done = subprocess.run(
+            [HERMES_BIN, "-p", PROFILE, "cron", "pause", state["job_id"]],
+            capture_output=True, text=True, timeout=HERMES_TIMEOUT_S, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A hung or missing CLI is no reason for `wait` or `clean` to fail:
+        # the pause is best effort, and the state file is still removed.
+        print(f"WARNING: could not pause {state['job_id']} again: {exc}", file=sys.stderr)
+        return
     if done.returncode == 0:
         state["repaused"] = True
         print(f"paused {state['job_id']} again, as the eval run had it")

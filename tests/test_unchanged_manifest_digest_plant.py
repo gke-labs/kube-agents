@@ -31,6 +31,7 @@ import io
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -257,6 +258,41 @@ class PlantTest(unittest.TestCase):
             self.assertEqual(self.run_plant(_MANIFEST), 1)
         self.assertIn("does not hold this scheduled run", self.err)
 
+    def test_a_diverted_newest_envelope_is_no_stored_envelope(self):
+        self.store().mkdir(parents=True, exist_ok=True)
+        diverted = {"scheduled": True, "finished_at": "2099-01-01T06:30:00+00:00", "document": {"findings": []}}
+        for marker in (self.audit_report.UNREACHABLE_REPO_KEY, self.audit_report.NO_REPOSITORY_CHOSEN_KEY):
+            with self.subTest(marker=marker):
+                (self.store() / "latest.json").write_text(json.dumps({**diverted, marker: {"repo": "acme/fleet", "reason": "HTTP 404"}}), encoding="utf-8")
+                self.assertEqual(self.plant.stored_envelope(self.audit_report), (None, "no_forge/local"))
+        (self.store() / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
+        self.assertEqual(self.plant.stored_envelope(self.audit_report), (diverted, "no_forge/local"))
+
+    def test_a_plant_whose_repository_was_unreachable_fails_and_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
+        diverted = self.audit_report.no_forge_decision(("acme/fleet", "HTTP 404 from the broker"))
+        with (
+            mock.patch.object(self.audit_report, "resolve_reachable_repo", lambda audit_id, repo=None: diverted),
+            mock.patch.object(self.audit_report, "resolve_repo_or_no_forge", lambda audit_id, repo=None: "acme/fleet"),
+        ):
+            self.assertEqual(self.run_plant(_MANIFEST, ["--scope-projects", "p"]), 1)
+        self.assertIn("the report store of acme/fleet does not hold this scheduled run as a published one", self.err)
+        self.assertFalse(note.exists())
+        self.assertFalse(self.plant.plant_state_path(self.audit_report).exists())
+        self.assertFalse(self.plant.digest_record_path(self.audit_report).exists())
+        store = self.root / "reports" / self.plant.AUDIT / "acme" / "fleet"
+        self.assertFalse(any(_MARK in p.read_text(encoding="utf-8") for p in store.rglob("*.json")), "the diverted envelope was not torn down")
+
+    def test_a_resolver_that_refuses_fails_the_plant_and_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
+        refused = self.audit_report.NoGitOpsRepo("several repositories are managed and none has the gitops role")
+        with mock.patch.object(self.audit_report, "resolve_repo_or_no_forge", side_effect=refused):
+            self.assertEqual(self.run_plant(_MANIFEST), 1)
+        self.assertIn("resolves no repository: several repositories", self.err)
+        self.assertIn("the report store of no_forge/local does not hold this scheduled run as a published one", self.err)
+        self.assertFalse(note.exists())
+        self.assertFalse(self.plant.plant_state_path(self.audit_report).exists())
+
     def test_become_data_owner_does_nothing_when_not_root(self):
         with mock.patch.object(self.plant.os, "geteuid", return_value=1000):
             self.assertIn("running as uid 1000", self.plant.become_data_owner(str(self.root)))
@@ -312,6 +348,54 @@ class ArmTest(unittest.TestCase):
             self.arm.clean(str(self.home))
         self.assertEqual(run.call_args.args[0][-3:], ["cron", "pause", "fleet-consistency-drift"])
         self.assertFalse((self.home / self.arm.STATE_NAME).exists())
+
+    def test_clean_removes_the_state_when_the_pause_cannot_be_put_back(self):
+        """A hung or missing `hermes` is a warning, not a failed `clean` with the state file left behind."""
+        failures = {
+            "timeout": subprocess.TimeoutExpired(cmd=["hermes"], timeout=self.arm.HERMES_TIMEOUT_S),
+            "missing binary": FileNotFoundError(2, "No such file or directory", self.arm.HERMES_BIN),
+        }
+        for name, failure in failures.items():
+            with self.subTest(failure=name):
+                (self.home / self.arm.STATE_NAME).write_text(
+                    json.dumps({"job_id": "fleet-consistency-drift", "fired_at": "2026-11-05T08:20:00+00:00", "was_paused": True, "repaused": False}),
+                    encoding="utf-8",
+                )
+                err = io.StringIO()
+                with mock.patch.object(self.arm.subprocess, "run", side_effect=failure) as run, contextlib.redirect_stderr(err):
+                    self.arm.clean(str(self.home))
+                self.assertEqual(run.call_args.args[0][-3:], ["cron", "pause", "fleet-consistency-drift"])
+                self.assertIn("WARNING: could not pause fleet-consistency-drift again", err.getvalue())
+                self.assertFalse((self.home / self.arm.STATE_NAME).exists())
+
+    def test_wait_returns_the_finished_run_when_the_pause_cannot_be_put_back(self):
+        """`wait`'s `finally` re-pause is best effort: the run it saw finish is still the result."""
+        (self.home / self.arm.STATE_NAME).write_text(
+            json.dumps({"job_id": "fleet-consistency-drift", "fired_at": "2026-11-05T08:20:00+00:00", "was_paused": True, "repaused": False}),
+            encoding="utf-8",
+        )
+        db = self.home / "profiles" / "platform" / "cron" / "executions.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE executions (job_id, status, claimed_at, started_at, finished_at, delivery_outcome)")
+        conn.execute(
+            "INSERT INTO executions VALUES (?, ?, ?, ?, ?, ?)",
+            ("fleet-consistency-drift", "completed", "2026-11-05T08:20:10+00:00", "2026-11-05T08:20:11+00:00", "2026-11-05T08:23:00+00:00", "suppressed"),
+        )
+        conn.commit()
+        conn.close()
+        err, out = io.StringIO(), io.StringIO()
+        timed_out = subprocess.TimeoutExpired(cmd=["hermes"], timeout=self.arm.HERMES_TIMEOUT_S)
+        with (
+            mock.patch.object(self.arm.subprocess, "run", side_effect=timed_out),
+            contextlib.redirect_stderr(err),
+            contextlib.redirect_stdout(out),
+        ):
+            self.arm.wait(str(self.home), "fleet-consistency-drift", "5")
+        self.assertIn("finished at 2026-11-05T08:23:00+00:00: completed, suppressed", out.getvalue())
+        self.assertIn("WARNING: could not pause fleet-consistency-drift again", err.getvalue())
+        state = json.loads((self.home / self.arm.STATE_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(state["last_run_at"], "2026-11-05T08:23:00+00:00")
+        self.assertFalse(state["repaused"])
 
     def test_clean_leaves_an_unpaused_job_alone(self):
         (self.home / self.arm.STATE_NAME).write_text(
