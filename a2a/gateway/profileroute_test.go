@@ -779,3 +779,38 @@ func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
 		})
 	}
 }
+
+// A profile that takes no target goes down profileRouteFor's no-target path,
+// which holds parameters to its card too: one it doesn't declare is refused
+// before any submission, not handed on to a profile that ignores it.
+func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
+	r := startProfileRig(t)
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("triage", &lib.AgentCard{Name: "triage"})
+	ctx := context.Background()
+	const conv = "console:tab-notarget-params"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: "triage", Text: "look at web", Parameters: map[string]string{"namespace": "web"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-nt-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+		Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the refusal on the parent's entry", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && strings.Contains(ref.DelegationEnd, `triage doesn't take parameter "namespace"`)
+	})
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"triage.>"); len(envs) != 0 {
+		t.Fatalf("%d submission(s) for a refused delegation", len(envs))
+	}
+}

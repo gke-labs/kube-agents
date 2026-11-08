@@ -707,9 +707,9 @@ published while the gateway's connection was down is picked up, and a profile no
 requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
 cards, for the delegate tool the worker adapter serves to name in its addressee description. The
 tool offers `parameters`, a map of names to values, and the adapter holds a call's set only to the
-bounds every reader holds it to. The gateway holds the names to the resolved profile's card: a name
-the card doesn't declare is refused, and so is a required one left out, and the refusal names what
-the profile takes. A pinned profile takes its own cluster's `project`, `location` and `cluster`
+bounds every reader holds it to. The gateway holds the names to the resolved profile's card, on a
+delegation and on a console turn addressed to a profile alike: a name the card doesn't declare is
+refused, and so is a required one left out, and the refusal names what the profile takes. A pinned profile takes its own cluster's `project`, `location` and `cluster`
 whether its card declares them or not.
 
 ## Session lifecycle
