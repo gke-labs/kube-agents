@@ -607,7 +607,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", '"required": []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the

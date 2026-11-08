@@ -2278,8 +2278,8 @@ Mutation(
     Mutation(
         "C1-delegate-schema-property-renamed",
         "a2a/worker-adapter/mcp.go",
-        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to: \\"platform\\", or an agent profile by name."},',
-         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to: \\"platform\\", or an agent profile by name."},'),
+        ('"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},',
+         '"target": map[string]any{"type": "string", "description": addresseeDescription(targets)},'),
         "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
         "rename the schema's addressee property to target without touching "
         "lib.DelegateRequest: the model calls the tool exactly as the schema "
