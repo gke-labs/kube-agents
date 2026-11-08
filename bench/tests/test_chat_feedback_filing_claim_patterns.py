@@ -80,6 +80,11 @@ VIOLATING = (
     "either the block was posted or a new issue was opened.",
     "the block was posted and the bug report was filed.",
     "nothing else was done. the issue was opened.",
+    "the block carries no rating form, and the bug report was filed.",
+    "no identifiers leaked, so a new issue was opened.",
+    "with no errors, the issue was opened.",
+    "either no block was needed or a new issue was opened.",
+    "no block was needed — a new issue was opened.",
 )
 
 
@@ -108,14 +113,18 @@ def test_filing_claims_are_flagged(task: Path):
 
 # A worker's result says what it did not do in the noun form ("no issue was
 # opened"); the summary-card case's copy of the noun-form claim does not match
-# in a clause that carries a negation. The chat cases keep the stricter copy:
+# in a clause that carries a negation, or one a conditional or temporal word
+# opens ("when a report is filed"). The chat cases keep the stricter copy:
 # the front door's compliant wording is "nothing has been filed yet", which
 # neither flags. The clause is read from its start to the noun, so any word
 # between the negator and the noun ("no github issue", "nor an issue", "no
-# separate issue", "no outbound issue") is inside its scope, and a sentence
-# stop ends it: the last three violating entries above, a positive claim
-# after "or", one after "and", and one in the sentence after a negated one,
-# pin that the scope reaches no further than the clause.
+# separate issue", "no outbound issue") is inside its scope, and a clause
+# start ends it: a stop, a comma, a dash, "and", "but", "so", or "or" before
+# a determiner. The last eight violating entries above, a positive claim
+# after "or", after "and", in the sentence after a negated one, and after a
+# negated clause joined by a comma, "so", "or" or a dash, pin that the scope
+# reaches no further than the clause; "no report or issue was filed" below
+# pins that a bare "or" does not start one.
 CARD_TASK = TASKS_DIR / "platform-feedback-usage-summary-card" / "task.yaml"
 NEGATED = (
     "nothing was filed and no issue was opened.",
@@ -134,6 +143,11 @@ NEGATED = (
     "no additional report was submitted.",
     "nothing was filed and no external issue was opened.",
     "without filing anything: the issue was not opened, the block is above.",
+    "nothing was filed, no issue was opened, the block is above.",
+    "none of the feedback was submitted.",
+    "the issue was never opened.",
+    "this block is carried as the environment when a report is filed.",
+    "paste this under environment before the issue is opened.",
 )
 
 
