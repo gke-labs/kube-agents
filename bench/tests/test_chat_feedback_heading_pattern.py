@@ -34,7 +34,8 @@ BODY = (
 # row, a plain label, a dash, the label alone above its line, the form's
 # other word for it, and the label with a qualifier: the form's own name for
 # the field (`One-line summary`, feedback_broker.QUESTION_LABELS["title"]),
-# `Issue title`, and a parenthesis after the label.
+# `Issue title`, and a parenthesis after the label, on the value's line and
+# alone above it (where the fold takes the closing `)` with the colon).
 HEADINGS = (
     "**Summary:** Weekly cost report posted twice in one thread\n",
     "- **Summary**: Weekly cost report posted twice in one thread\n",
@@ -49,6 +50,9 @@ HEADINGS = (
     "| One-line summary | Weekly cost report posted twice in one thread |\n",
     "Issue title: Weekly cost report posted twice in one thread\n",
     "**Summary (issue title):** Weekly cost report posted twice in one thread\n",
+    "**Summary (issue title):**\nWeekly cost report posted twice in one thread\n",
+    "**Summary (issue title)**\nWeekly cost report posted twice in one thread\n",
+    "**One-line summary:**\nWeekly cost report posted twice in one thread\n",
 )
 # The word "summary" or "title" without a heading: the offer as the persona
 # words it (already in BODY), hyphenated, wrapped across a line, paraphrased
