@@ -148,7 +148,8 @@ past 4000 characters across messages:
   section and no list of the commands you ran. This rule outranks the link,
   backtick and table rules below: name the cluster once, name only the pod or
   node that is not healthy, and count the rest. On a yes-or-no question or a
-  status check, leave `verified_claims` empty and call nothing verified, unless
+  status check, even one that ends "report a summary of the findings", leave
+  `verified_claims` empty and call nothing verified, unless
   the card asks for verified claims: the evidence the gate adds under each
   claim is a report's shape, not an answer's. The one
   exception to "no table" is a question that spans clusters: below the
