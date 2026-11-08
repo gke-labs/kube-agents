@@ -276,3 +276,27 @@ func TestTheTurnsTargetsReachTheMCPServer(t *testing.T) {
 		t.Fatalf("an invalid list read as %+v, want none", got)
 	}
 }
+
+// Each target's declared parameters are named, required or optional, so the
+// model passes a pinned profile's cluster (or a profile's own parameters)
+// rather than learning them from a refusal; and a list the gateway cut short
+// says so, so the model doesn't take an agent missing from it as unreachable.
+func TestDelegateMCPNamesEachTargetsParametersAndATruncatedList(t *testing.T) {
+	desc := addresseeOf(t, &lib.DelegateTargets{Targets: []lib.DelegateTarget{
+		{Name: "platform", Description: "the platform agent"},
+		{Name: "e2e5", Description: "reads one cluster's workloads", Parameters: []lib.ProfileParameter{
+			{Name: "cluster", Required: true}, {Name: "namespace"},
+		}},
+	}, Truncated: true})
+	for _, want := range []string{`"e2e5" (reads one cluster's workloads; parameters: cluster required, namespace optional)`, `"platform" (the platform agent)`} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("description %q lacks %q", desc, want)
+		}
+	}
+	if !strings.Contains(desc, addresseeTruncatedNote) {
+		t.Errorf("a truncated list's description %q doesn't say it was cut short", desc)
+	}
+	if strings.Contains(addresseeOf(t, &lib.DelegateTargets{Targets: []lib.DelegateTarget{{Name: "platform"}}}), addresseeTruncatedNote) {
+		t.Errorf("a whole list says it was cut short")
+	}
+}

@@ -82,6 +82,9 @@ const (
 	addresseeFallbackDescription = "The agent to hand the task to: \"platform\", the platform agent."
 	addresseeListLead            = "The agent to hand the task to, by the name given here. When the person names one of these agents, address it by that name. You may delegate to: "
 	addresseeNoneDescription     = "No agent is available to this conversation for delegation, so don't call this tool."
+	// addresseeTruncatedNote ends a list the gateway cut short: an agent
+	// missing from it may still be reachable, and the gateway is the judge.
+	addresseeTruncatedNote = " The list is cut short: if the person names an agent not on it, address it by that name and the gateway will say whether it can be reached."
 )
 
 // delegateToolSchema is the tool as tools/list reports it, its addressee
@@ -112,13 +115,32 @@ func addresseeDescription(targets *lib.DelegateTargets) string {
 	}
 	items := make([]string, 0, len(targets.Targets))
 	for _, t := range targets.Targets {
-		item := strconv.Quote(t.Name)
+		var about []string
 		if t.Description != "" {
-			item += " (" + t.Description + ")"
+			about = append(about, t.Description)
+		}
+		if len(t.Parameters) > 0 {
+			params := make([]string, 0, len(t.Parameters))
+			for _, p := range t.Parameters {
+				need := "optional"
+				if p.Required {
+					need = "required"
+				}
+				params = append(params, p.Name+" "+need)
+			}
+			about = append(about, "parameters: "+strings.Join(params, ", "))
+		}
+		item := strconv.Quote(t.Name)
+		if len(about) > 0 {
+			item += " (" + strings.Join(about, "; ") + ")"
 		}
 		items = append(items, item)
 	}
-	return addresseeListLead + strings.Join(items, "; ") + "."
+	desc := addresseeListLead + strings.Join(items, "; ") + "."
+	if targets.Truncated {
+		desc += addresseeTruncatedNote
+	}
+	return desc
 }
 
 // DelegateTargetsFromEnv is the turn's targets as the adapter wrote them into
