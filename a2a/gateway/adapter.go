@@ -139,14 +139,16 @@ type Adapter interface {
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
 	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
-	// marks an answer a backend draws rating controls on (feedback.go).
+	// marks an answer a backend draws rating controls on (feedback.go), or
+	// m.Stop a task's live message a backend draws a Stop control on.
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
 	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
 	// message, which the gateway answers with Edit. With m.Chat nil a
 	// backend that laid the message out before replaces the layout with the
-	// text; any other backend makes it Edit.
+	// text; any other backend makes it Edit. m.Stop is read as on
+	// PostMessage, and an edit without it takes the Stop control off.
 	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
@@ -233,6 +235,12 @@ type OutMessage struct {
 	// feedback, feedback.go). A backend that draws rating controls draws
 	// them on this message; every other backend ignores it.
 	Feedback string
+	// Stop, when set, is the id of the running task whose live message
+	// this is: the status line the gateway posts for a task and edits as
+	// it moves (relay.go). A backend that draws a Stop control draws it on
+	// this message, naming that task, and an edit without Stop takes it
+	// off, which is the terminal edit; every other backend ignores it.
+	Stop string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

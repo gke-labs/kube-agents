@@ -21,9 +21,12 @@
 // is 410 Gone, and injects the faults a reflector has to live through: 429s
 // with Retry-After on the first requests, and the expiry of every open watch.
 //
-// The event watcher reads Events only; Nodes and Pods are served, at the
-// sizes the issue of fleet scale names, for the collectors that page through
-// them, which have no Go consumer here yet.
+// The event watcher reads Events, and one named Pod's metadata for its owner
+// lookup, which this fake answers 404 (the Pod reads as having no owner);
+// Nodes and Pods are served, at the sizes the issue of fleet scale names, for
+// the collectors that page through them, which have no Go consumer here yet.
+// The generator has one more consumer: cmd/kwok-seed creates its Nodes, Pods
+// and Events on a real API server for the scale lane under tests/scale/kwok.
 //
 // What it does not do: selectors beyond `reason=<value>` on Events (every other request sees every object), namespaced
 // paths (the three resources are served at the cluster scope only), writes
@@ -335,16 +338,20 @@ func Start(opts Options) *Server {
 // reused connection signals the channel once more, the parked reader takes
 // it, and the reader of the new response parks in its place until the
 // connection closes, by the idle timeout at the latest; a reflector's
-// re-stream after an expiry delivers nothing for that long. The code is
-// older than Go 1.27.1, where it was traced; this Transport can go once
-// net/http hands the signal to the reader of the response it belongs to.
-// A connection per request leaves nothing to reuse, at one dial per request,
-// which the paged soaks absorb. It fixes the fake's clients only: the
-// watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
-// (clusterprofiles.Broker.ClientConfig) and is open to the same stall. A
-// test that sets a CA, a client certificate, a certificate callback or
-// Insecure on this config fails at client construction, since client-go
-// refuses those next to a Transport.
+// re-stream after an expiry delivers nothing for that long. This is
+// golang/go#81404, in Go 1.27.0 and 1.27.1 and fixed in Go 1.27.2. go.mod's
+// toolchain line selects a Go with the fix, but GOTOOLCHAIN=local ignores
+// that line, so the Transport stays for a test binary built that way by
+// Go 1.27.0 or 1.27.1. It can go once go.mod's go line is 1.27.2 or later,
+// since an older Go then refuses to build the module. A connection per
+// request leaves nothing to reuse, at one dial per request, which the paged
+// soaks absorb. It fixes the fake's clients only. The watcher's broker route
+// reaches profile clusters over pooled plain HTTP/1.1
+// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its
+// watches now open on a non-pooled twin
+// (cmd/k8s-event-watcher/watchtransport.go). A test that sets a CA, a client
+// certificate, a certificate callback or Insecure on this config fails at
+// client construction, since client-go refuses those next to a Transport.
 func (s *Server) Config() *rest.Config {
 	return &rest.Config{Host: s.URL, Transport: &http.Transport{DisableKeepAlives: true}}
 }

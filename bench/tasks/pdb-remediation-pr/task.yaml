@@ -1,6 +1,6 @@
 # PRESUBMIT-ACTIVE, ON THE ROSTER again since 2026-10-26, after #3145 seeded
 # checkout-gateway's manifest into every pool -infra repository: 21/21 on the
-# writers nightlies since the claude-opus-5-5 agent model of 2026-10-19, 9/9
+# writers nightlies since the agent model change of 2026-10-19, 9/9
 # on the three since #3145, all three under spec.mode next (docs/eval-gate-roster.md
 # has the entry). Nightly-only 2026-10-17 to 2026-10-26, demoted on #3120 (it
 # collapsed on unrelated pull requests: the worker declined to open a pull

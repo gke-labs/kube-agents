@@ -1,0 +1,51 @@
+name: Quarantine Check
+
+# Once a day, read the issue each quarantined test cites and fail when one is
+# closed, unlabelled, unowned, or missing its suspected cause, so a test does
+# not stay skipped after its fix lands. Each issue with a problem gets one
+# comment naming its assignees (once per kind of problem, never repeated), and
+# the run summary lists every quarantine and its age. `scripts/check_quarantine.py` holds the checks;
+# `docs/pull-request-workflow.md` ("Quarantining a flaky test") holds the
+# policy. The offline half of the check runs on every pull request with the
+# Python unit tests.
+
+on:
+  schedule:
+    - cron: "23 13 * * *"
+  workflow_dispatch:
+
+# One run at a time: two overlapping runs would both read an issue's comments
+# before either posts, and both post the same notice.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  check:
+    name: Check quarantined tests
+    # Required of any workflow that starts on its own (AGENTS.md, Pull Request
+    # Hygiene): a fork inherits the schedule, and would comment on its own copies.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    # A stalled API call would otherwise hold the job for GitHub's six hours.
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the tree to find the quarantines
+      issues: write # read each cited issue, its comments and timeline; comment on one with a problem; create the label
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Check the quarantines against their issues
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/check_quarantine.py --github --notify

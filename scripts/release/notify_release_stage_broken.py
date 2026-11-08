@@ -32,7 +32,8 @@ The promotion pipeline has a second issue of its own. A night red on the
 eval's RED verdict alone is no stage failure, but `STALL_NIGHTS` of them in
 a row (a night is a UTC date; several RED runs on one date are one night) cut no staging tag and stall the release chain; that opens one
 `ci:release-stalled` issue with a row per RED run (the night, the run, the
-candidate commit, the eval build the step-5 log links), adds a row for each
+candidate commit, the eval build the step-5 log links, and the red cases that
+log names, each with its rung and its owner), adds a row for each
 later RED run, and closes on the next run whose eval passed. A night that fails on a
 stage before the eval passes leaves it alone. A night that skips the eval
 step, a `skip_promotion` night or a hand-dispatched `skip_pipeline` one,
@@ -95,6 +96,7 @@ Test: cd scripts && python3 -m unittest test_notify_release_stage_broken
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -113,7 +115,19 @@ from eval_dashboard.post_health import SPACE_ENV, TOKEN_ENV, Sender  # noqa: E40
 from github_api import is_refusal, log  # noqa: E402
 from notify_broken_main import FAILING_CONCLUSIONS, decide, newest_reporting_run, reporting_history  # noqa: E402
 from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
-from poll_rc_eval_verdict import SETTLED_TRUE, VERDICT_LINE_FORMAT, VERDICT_RED  # noqa: E402
+from case_owner import effective_owner_of_case  # noqa: E402
+from poll_rc_eval_verdict import (  # noqa: E402
+    RED_CASE_NAME_KEY,
+    RED_CASE_RUNG_KEY,
+    RED_CASE_RUNG_NAME_KEY,
+    RED_CASES_CASES_KEY,
+    RED_CASES_LINE_FORMAT,
+    RED_CASES_PARTIAL_KEY,
+    SETTLED_TRUE,
+    VERDICT_LINE_FORMAT,
+    VERDICT_RED,
+    is_red_case,
+)
 
 # The release workflows, by the `name:` each declares, which is how the
 # Actions API lists them. `test_notify_release_stage_broken.py` holds this
@@ -336,14 +350,45 @@ STALL_STAMP = "<!-- release-stalled runs={run_ids} -->"
 _STALL_STAMP_RE = re.compile(r"<!-- release-stalled runs=((?:\d+(?::\d+)?(?:,\d+(?::\d+)?)*)?) -->")
 STALL_TITLE = "🔴 release chain stalled: the RC eval has returned RED {n} nights in a row"
 STALL_LEAD = "The promotion pipeline has cut no staging tag because the release-candidate eval verdict was RED on each of these nights."
-STALL_TABLE_HEADER = "| Night (UTC) | Promotion run | Candidate | Eval build |"
-STALL_TABLE_RULE = "| --- | --- | --- | --- |"
-STALL_ROW = "| {night} | {run} | {candidate} | {build} |"
+STALL_TABLE_HEADER = "| Night (UTC) | Promotion run | Candidate | Eval build | Red cases (rung, owner) |"
+STALL_TABLE_RULE = "| --- | --- | --- | --- | --- |"
+# The rule line of an issue written before the red-cases column; a rewrite
+# finds its rows under either rule, and pads them.
+STALL_TABLE_RULE_WITHOUT_CASES = "| --- | --- | --- | --- |"
+STALL_TABLE_RULES = (STALL_TABLE_RULE, STALL_TABLE_RULE_WITHOUT_CASES)
+STALL_ROW = "| {night} | {run} | {candidate} | {build} | {cases} |"
 STALL_CELL_SEPARATOR = "|"
-STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
+# A row written before the red-cases column existed has this many cells;
+# a rewrite pads it rather than leaving it short under the wider header.
+STALL_ROW_CELLS_WITHOUT_CASES = 4
+# The case, rung and rung name reach the issue body, the comment and the
+# Chat line from the step-5 log. They are accepted only in bench-gate's own
+# vocabulary, the poller's `is_red_case`, the same check the poller applies
+# before it prints the line. Nothing else is rendered: one entry outside it
+# makes the whole line read as unavailable, with a warning, so no line
+# break, pipe, backtick, mention or link can ever reach Markdown from the
+# log, and no sanitiser has to keep up with the reader. Every field still
+# sits inside a code span in the cell.
+# How much of a line that did not parse the warning quotes.
+CELL_PREVIEW_CHARS = 120
+# The red-cases cell: each blocking case the step-5 log named, with its rung
+# and its owner (`scripts/case_owner.py`: the case's `owner:` in task.yaml,
+# else its domain's owner in docs/designs/domains.yaml), as an @-mention so
+# the owner is told. A log with no red-cases line, a run before the poller
+# printed one, reads as unavailable; a case the checkout cannot resolve
+# reads as having no owner.
+STALL_CASE = "`{case}` (rung `{rung} {rung_name}`, {owner})"
+STALL_CASE_OWNER = "@{owner}"
+STALL_NO_OWNER = "(no owner)"
+STALL_CASES_SEPARATOR = "; "
+STALL_CASES_UNAVAILABLE = "(cases unavailable)"
+STALL_NO_BLOCKING_CASE = "(no blocking case in the roll-up)"
+STALL_CASES_PARTIAL = " (partial: the eval stopped before grading every case)"
+STALL_FOOTER = "A case's owner is its `owner:` in `bench/tasks/<case>/task.yaml`, else its domain's owner in `docs/designs/domains.yaml`. The release pipeline owner is listed in `docs/ownership.md`."
 STALL_COMMENT = "RED again: {runs}. The RC eval has now returned RED {n} nights in a row."
+STALL_COMMENT_RUN = "{run}: {cases}"
 STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
-CHAT_STALLED = STALL_TITLE + " — {url}"
+CHAT_STALLED = STALL_TITLE + ". Red cases: {cases}. Tracking {url}"
 CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
 # The close for a run whose eval passed and a later stage then failed: the
 # stall is over, but the chain is not moving, and the same sweep has filed
@@ -367,6 +412,9 @@ _RED_VERDICT_LINE_RE = re.compile(
     + re.escape(VERDICT_LINE_FORMAT.format(verdict=VERDICT_RED, settled=SETTLED_TRUE, build_id=_LINE_FIELD, url=_LINE_FIELD)).replace(_LINE_FIELD, _LINE_FIELD_RE)
     + "$"
 )
+# The poller's red-cases line, the same way: its format is the poller's own.
+_LINE_REST_RE = r"(.+)"
+_RED_CASES_LINE_RE = re.compile("^" + re.escape(RED_CASES_LINE_FORMAT.format(cases=_LINE_FIELD)).replace(_LINE_FIELD, _LINE_REST_RE) + "$")
 JOB_PASSED = "success"
 # The outcome word of the stalled-chain half of a reconcile, and how it is
 # joined to the stage half's when both wrote.
@@ -739,6 +787,69 @@ def extract_red_verdict_build(log_text: str) -> tuple | None:
     return None
 
 
+def extract_red_cases(log_text: str) -> dict | None:
+    """What the poller's red-cases line carried, `{"cases": [...],
+    "partial": bool}`, or None when the log has no such line or the line
+    does not parse."""
+    for raw in log_text.splitlines():
+        match = _RED_CASES_LINE_RE.match(clean_log_line(raw).strip())
+        if not match:
+            continue
+        try:
+            data = json.loads(match.group(1))
+        except ValueError:
+            warn(f"the step-5 log's red-cases line is not JSON ({match.group(1)[:CELL_PREVIEW_CHARS]!r}); the night's cases read as unavailable")
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get(RED_CASES_CASES_KEY), list):
+            warn(f"the step-5 log's red-cases line has no {RED_CASES_CASES_KEY!r} list ({match.group(1)[:CELL_PREVIEW_CHARS]!r}); the night's cases read as unavailable")
+            return None
+        if not all(is_red_case(case) for case in data[RED_CASES_CASES_KEY]):
+            warn(f"the step-5 log's red-cases line carries an entry outside bench-gate's vocabulary ({match.group(1)[:CELL_PREVIEW_CHARS]!r}); the night's cases read as unavailable")
+            return None
+        return {RED_CASES_CASES_KEY: data[RED_CASES_CASES_KEY], RED_CASES_PARTIAL_KEY: data.get(RED_CASES_PARTIAL_KEY) is True}
+    return None
+
+
+def owner_of_case(case: str) -> str | None:
+    """The case's effective owner from the checkout, or None. A case or a
+    task.yaml that is absent is None without an error; a lookup that raises
+    (an unreadable `domains.yaml`, a permissions error on the tree) is a
+    warning and no owner: naming the owner must never stop the issue."""
+    try:
+        return effective_owner_of_case(case)
+    except Exception as exc:  # noqa: BLE001 - the issue files either way
+        warn(f"owner lookup for case {case!r} failed ({exc!r}); shown as no owner")
+        return None
+
+
+def stall_cases_cell(cases: dict | None) -> str:
+    """The red-cases cell of one row, and the same text in the comment and
+    the Chat line."""
+    if cases is None:
+        return STALL_CASES_UNAVAILABLE
+    parts = []
+    for case in cases[RED_CASES_CASES_KEY]:
+        owner = owner_of_case(case[RED_CASE_NAME_KEY])
+        parts.append(
+            STALL_CASE.format(
+                case=case[RED_CASE_NAME_KEY],
+                rung=case[RED_CASE_RUNG_KEY],
+                rung_name=case[RED_CASE_RUNG_NAME_KEY],
+                owner=STALL_CASE_OWNER.format(owner=owner) if owner else STALL_NO_OWNER,
+            )
+        )
+    text = STALL_CASES_SEPARATOR.join(parts) or STALL_NO_BLOCKING_CASE
+    return text + STALL_CASES_PARTIAL if cases[RED_CASES_PARTIAL_KEY] else text
+
+
+def pad_stall_row(row: str) -> str:
+    """A row from before the red-cases column, padded to the wider table."""
+    cells = row.strip().strip(STALL_CELL_SEPARATOR).split(STALL_CELL_SEPARATOR)
+    if len(cells) == STALL_ROW_CELLS_WITHOUT_CASES:
+        return f"{row.rstrip()} {STALL_CASES_UNAVAILABLE} {STALL_CELL_SEPARATOR}"
+    return row
+
+
 def night_of(run: dict) -> str:
     """The run's night: the UTC date it was created on. Several runs on one
     date are one night."""
@@ -753,13 +864,15 @@ def row_night(row: str) -> str:
 
 def stall_row(repo: str, row: dict) -> str:
     """One RED run of the stall table: the night, the run, the candidate
-    commit and the eval build, each a link where the logs gave one."""
+    commit and the eval build, each a link where the logs gave one, and the
+    red cases with their owners."""
     run, sha, build = row["run"], row["candidate"].get("sha"), row["build"]
     return STALL_ROW.format(
         night=night_of(run),
         run=run_link(run),
         candidate=f"[`{sha[:SHORT_SHA]}`]({COMMIT_URL.format(repo=repo, sha=sha)})" if sha else CANDIDATE_UNKNOWN,
         build=f"[{build[0]}]({build[1]})" if build else EVAL_LINK_UNAVAILABLE,
+        cases=row["cases_cell"],
     )
 
 
@@ -767,10 +880,11 @@ def stall_rows_in(body: str | None) -> list:
     """The table rows an earlier render wrote, newest first, so a rewrite
     keeps the nights it no longer reads the logs of."""
     lines = (body or "").splitlines()
-    if STALL_TABLE_RULE not in lines:
+    rule = next((each for each in STALL_TABLE_RULES if each in lines), None)
+    if rule is None:
         return []
     rows = []
-    for line in lines[lines.index(STALL_TABLE_RULE) + 1 :]:
+    for line in lines[lines.index(rule) + 1 :]:
         if not line.startswith("|"):
             break
         rows.append(line)
@@ -792,7 +906,7 @@ def render_stall_body(workflow_id: int, stamped: list, rows: list) -> str:
             "",
             STALL_TABLE_HEADER,
             STALL_TABLE_RULE,
-            *rows,
+            *(pad_stall_row(row) for row in rows),
             "",
             STALL_FOOTER,
         ]
@@ -1096,12 +1210,18 @@ def reconcile_stage(api: GitHubAPI, workflow: dict, current: dict, decision: dic
 
 def stall_details(api: GitHubAPI, run: dict, jobs: list) -> dict:
     """One RED night's row: the candidate from the first jobs' logs, and
-    the eval build from the step-5 log's verdict line. A log that cannot be
-    read leaves its cell saying so; the issue still files."""
+    the eval build and the red cases from the step-5 log's two poller
+    lines. A log that cannot be read leaves its cells saying so; the issue
+    still files."""
     candidate = run_details(api, run, with_failure=False, jobs=jobs)["candidate"]
     wait = next((job for job in jobs if is_eval_wait(job)), None)
     text = api.job_log(wait["id"]) if wait is not None else None
-    return {"run": run, "candidate": candidate, "build": extract_red_verdict_build(text) if text else None}
+    return {
+        "run": run,
+        "candidate": candidate,
+        "build": extract_red_verdict_build(text) if text else None,
+        "cases_cell": stall_cases_cell(extract_red_cases(text) if text else None),
+    }
 
 
 def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, decision: dict, jobs_for, sender: Sender, dry_run: bool, environ=os.environ) -> str:
@@ -1192,12 +1312,13 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         old_rows = stall_rows_in(issue.get("body"))
         old_nights = {row_night(row) for row in old_rows}
         nights = len(old_nights | new_nights)
-        rows = [stall_row(api.repo, stall_details(api, run, jobs)) for run, jobs in new]
+        details = [stall_details(api, run, jobs) for run, jobs in new]
+        rows = [stall_row(api.repo, each) for each in details]
         entries = [stamp_entry(run) for run, _ in new]
         # Comment first, as on the stage issue: the rewrite stamps the run. A
         # RED run on a night already counted adds its row and says nothing.
         if nights > len(old_nights):
-            api.comment(issue["number"], STALL_COMMENT.format(runs=", ".join(run_link(run) for run, _ in new), n=nights))
+            api.comment(issue["number"], STALL_COMMENT.format(runs=", ".join(STALL_COMMENT_RUN.format(run=run_link(each["run"]), cases=each["cases_cell"]) for each in details), n=nights))
         api.update_issue(
             issue["number"],
             title=render_stall_title(nights),
@@ -1210,7 +1331,8 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     if nights < STALL_NIGHTS:
         log(f"{name}: {nights} settled-RED night{'' if nights == 1 else 's'} in a row; {STALL_NIGHTS} open the stalled-chain issue")
         return NOTHING
-    rows = [stall_row(api.repo, stall_details(api, run, jobs)) for run, jobs in new]
+    details = [stall_details(api, run, jobs) for run, jobs in new]
+    rows = [stall_row(api.repo, each) for each in details]
     api.ensure_label(STALL_LABEL, STALL_LABEL_COLOR, STALL_LABEL_DESCRIPTION)
     created = api.create_issue(
         render_stall_title(nights),
@@ -1218,7 +1340,8 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         (STALL_LABEL, TRIAGE_LABEL),
     )
     log(f"{name}: {nights} settled-RED nights in a row; opened stalled-chain #{created['number']}")
-    post(sender, CHAT_STALLED.format(n=nights, url=ISSUE_URL.format(repo=api.repo, number=created["number"])), dry_run, environ)
+    # The newest night's cases: the ones whoever reads the Chat line acts on.
+    post(sender, CHAT_STALLED.format(n=nights, cases=chat_plain(details[0]["cases_cell"]), url=ISSUE_URL.format(repo=api.repo, number=created["number"])), dry_run, environ)
     return "opened"
 
 

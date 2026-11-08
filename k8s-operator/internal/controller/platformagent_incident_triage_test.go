@@ -24,7 +24,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-const incidentTriageOpenPullRequestEnv = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+const (
+	incidentTriageOpenPullRequestEnv     = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+	incidentTriageMaxOpenPullRequestsEnv = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
+)
 
 func TestSafeSandboxEnvOverridesPassesIncidentTriageOpenPullRequest(t *testing.T) {
 	// session_kv_server.py reads the opt-in from its own environment; off the
@@ -32,6 +35,15 @@ func TestSafeSandboxEnvOverridesPassesIncidentTriageOpenPullRequest(t *testing.T
 	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: incidentTriageOpenPullRequestEnv, Value: "true"}})
 	if len(got) != 1 || got[0].Name != incidentTriageOpenPullRequestEnv || got[0].Value != "true" {
 		t.Errorf("expected %s=true to pass, got %#v", incidentTriageOpenPullRequestEnv, got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesIncidentTriageMaxOpenPullRequests(t *testing.T) {
+	// The limit on triage pull requests is read by session_kv_server.py from
+	// the same environment as the opt-in, so it takes the same allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: incidentTriageMaxOpenPullRequestsEnv, Value: "5"}})
+	if len(got) != 1 || got[0].Name != incidentTriageMaxOpenPullRequestsEnv || got[0].Value != "5" {
+		t.Errorf("expected %s=5 to pass, got %#v", incidentTriageMaxOpenPullRequestsEnv, got)
 	}
 }
 

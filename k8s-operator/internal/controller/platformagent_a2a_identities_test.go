@@ -598,7 +598,7 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 	if want := a2aServiceAccountName(agent.Namespace, gatewayServiceAccountName(agent)); agentSA != want {
 		t.Fatalf("the `agent` identity is keyed on %q, want the gateway's own %q", agentSA, want)
 	}
-	if _, _, err := buildA2AAuthMapConfigMaps(agent, nil); err != nil {
+	if _, _, err := buildA2AAuthMapConfigMaps(agent, nil, nil); err != nil {
 		t.Errorf("an override of the broker's ServiceAccount broke the bus map: %v", err)
 	}
 }

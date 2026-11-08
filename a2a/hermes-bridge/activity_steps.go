@@ -4,28 +4,27 @@ package hermesbridge
 // the task's `steps` artifact (a2a/lib/stepmsg), so a renderer lists a
 // turn's steps without parsing them out of `thinking`.
 //
-// A plan step is made from the trace itself: each pre_tool_call opens or
-// extends one, titled with the call's tool name and carrying its call id,
-// the same name and id its activity entry carries. Consecutive calls of one
-// tool within one model request share a step; a call of another tool, the
-// next model request, or the task's drain closes it and publishes it. The
-// model request itself (hermes's post_api_request) is read only for where
-// one request ends and the next begins, and for the synthesis step: a
-// request of the turn's own session that stops after work. It is never the
-// source of a title or an id. It fires before hermes validates and repairs
-// the calls' names and de-duplicates their ids, so a name read off it could
-// be one the model invented (or one injected into its context), and an id
-// one the trace never carries.
-//
-// What a step carries is structure only, the same posture as the trace
-// beside it: a tool's name, call ids, a kind and a fixed title. Not the
-// model's text, not a call's arguments, not a tool's result or error text.
-// Nothing here knows a particular tool: a title is never built from what a
-// call is about.
+// Two executors feed `steps`:
+//   - Under the `cli` executor (no sessionID bound), a plan step is made
+//     from the trace itself: each pre_tool_call opens or extends one,
+//     titled with the call's tool name and carrying its call id, the same
+//     name and id its activity entry carries. Consecutive calls of one tool
+//     within one model request share a step; a call of another tool, the
+//     next model request, or the task's drain closes it and publishes it.
+//     Here post_api_request is read only for request boundaries and the
+//     synthesis step, and steps carry structure only (tool name, call ids,
+//     kind, and fixed title).
+//   - Under the `api` executor (sessionID bound, activity_thinking.go and
+//     kanban.go), post_api_request also produces descriptive plan/synthesis
+//     titles (a tool's name and the short identifier it acts on), and
+//     settled Kanban cards emit `subtask` step records. The model's
+//     reasoning marks a step boundary and is not published; a step's
+//     `thought` is set only on a `subtask` record, from the card's report.
 
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
@@ -61,6 +60,33 @@ type apiResponse struct {
 	AssistantMessage struct {
 		ToolCalls []json.RawMessage `json:"tool_calls"`
 	} `json:"assistant_message"`
+}
+
+// observeExecutorStepsLocked is observe's step half, under a.mu: on the CLI
+// executor (a.sessionID == "") it delegates to observeStepsLocked; on the
+// API executor (a.sessionID != "") it reads the planned tool titles from
+// post_api_request and falls back to opening a step on pre_tool_call only
+// when the call was not already planned.
+func (a *activityState) observeExecutorStepsLocked(d hookDelivery) []stepmsg.Step {
+	if a.sessionID == "" {
+		return a.observeStepsLocked(d)
+	}
+	a.initSessionTraceLocked()
+	switch d.Event {
+	case hookPreToolCall:
+		callID := strings.TrimSpace(d.Extra.ToolCallID)
+		if callID != "" && a.trace.plannedTitles[callID] != "" {
+			return a.closeStepLocked()
+		}
+		if d.SessionID != "" && d.SessionID != a.sessionID {
+			return nil
+		}
+		return a.observeStepsLocked(d)
+	case hookPostAPIRequest:
+		closed := a.closeStepLocked()
+		return append(closed, a.observePostAPIRequestLocked(d)...)
+	}
+	return nil
 }
 
 // observeStepsLocked is observe's step half, under a.mu, for a delivery
@@ -137,6 +163,9 @@ func (a *activityState) beginTurn() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.turnCalls = 0
+	a.trace.apiCalls = 0
+	a.trace.turnCardsFiled = false
+	a.trace.prevBatchKey = ""
 }
 
 // closeStepLocked returns the open step, if any, and forgets it.

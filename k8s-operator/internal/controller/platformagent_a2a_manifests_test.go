@@ -848,6 +848,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -1680,8 +1682,16 @@ func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
 	if len(names) == 0 {
 		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
 	}
-	if got := a2aStandingPods(agent); got != rendered {
-		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
+	// The golden runs the gateway at the one replica it starts with: no pod
+	// holds the election's Lease there, so the scale-out to its standby (and a
+	// rollout's surge pod) never renders, and a2aGatewayStandbyPods counts them.
+	standby := a2aGatewayStandbyPods(agent)
+	if standby == 0 {
+		t.Fatal("the next-mode golden's CR runs no gateway standby, so this proves nothing about it")
+	}
+	if got := a2aStandingPods(agent); got != rendered+standby {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v, plus %d for the gateway's standby",
+			got, rendered, names, standby)
 	}
 
 }
@@ -2318,6 +2328,17 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.
@@ -8543,6 +8564,41 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
 		}
 	})
+}
+
+// One parse decides both the count and the discard (#4893): a value is used
+// exactly when no reason is given, an absent annotation takes the default
+// without one, and every discarded value takes the default with one.
+func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
+	absent := a2aTestAgent()
+	if n, why := a2aChartPodsCount(absent); n != a2aDefaultChartPods || why != "" {
+		t.Fatalf("absent: (%d, %q), want the default and no reason", n, why)
+	}
+	for _, c := range []struct {
+		raw  string
+		want int64
+		used bool
+	}{
+		{"0", 0, true},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{fmt.Sprint(a2aMaxChartPods), a2aMaxChartPods, true},
+		{fmt.Sprint(a2aMaxChartPods + 1), a2aDefaultChartPods, false},
+		{"-1", a2aDefaultChartPods, false},
+		{"", a2aDefaultChartPods, false},
+		{"seven", a2aDefaultChartPods, false},
+		{"99999999999999999999", a2aDefaultChartPods, false},
+	} {
+		agent := a2aTestAgent()
+		agent.SetAnnotations(map[string]string{a2aChartPodsAnnotation: c.raw})
+		n, why := a2aChartPodsCount(agent)
+		if n != c.want || (why == "") != c.used {
+			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
+		}
+		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
+			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		}
+	}
 }
 
 // A chart-pods annotation the operator discards is reported, once per spec

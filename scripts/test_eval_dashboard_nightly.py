@@ -163,6 +163,21 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual(nightly.night_reports(data, limit=1)[0]["previous_build"], NIGHT_1, "the night outside the window still serves as the comparison")
         self.assertEqual(nightly.nightly_document({"runs": [], "cases": []}), {"job": JOB, "nights": [], "running": []})
 
+    def test_night_dates_takes_the_window_in_dates(self):
+        """A cron run on 09-01 to 09-14 and a 09:00 re-run on the newest three
+        dates: the newest 14 runs cover 11 dates, the newest 14 dates are the
+        three re-runs and eleven cron runs, newest first."""
+        passed = [task("case-a", "pass", "pass", "pass")]
+        cron = {d: f"30000000000000001{d:02d}" for d in range(1, 15)}
+        reruns = {d: f"30000000000000002{d:02d}" for d in (12, 13, 14)}
+        runs = [night(cron[d], f"2026-09-{d:02d}T00:00:00+00:00", f"2026-09-{d:02d}T06:40:00+00:00", passed) for d in cron]
+        runs += [night(reruns[d], f"2026-09-{d:02d}T09:00:00+00:00", f"2026-09-{d:02d}T15:40:00+00:00", passed) for d in reruns]
+        data = {"schema_version": 1, "generated_at": NOW, "cases": copy.deepcopy(CASES), "runs": runs}
+        self.assertEqual(len({n["started"][:10] for n in nightly.night_reports(data)}), 11, "the window in runs, as before")
+        dates = nightly.night_dates(data)
+        self.assertEqual([n["build"] for n in dates], [reruns[14], reruns[13], reruns[12], *[cron[d] for d in range(11, 0, -1)]])
+        self.assertEqual([n["build"] for n in nightly.night_dates(data, limit=2)], [reruns[14], reruns[13]])
+
     def test_turn1_and_agent_medians_per_case_and_the_nights_turn1_percentiles(self):
         data = two_nights()
         a, b, c = data["runs"][-1]["tasks"]

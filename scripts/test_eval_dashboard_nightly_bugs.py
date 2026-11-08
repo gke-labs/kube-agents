@@ -208,10 +208,10 @@ class StreakTest(Harness):
         self.assertIn("@carol", body, "the domain owner is mentioned")
         self.assertIn("backup @dave", body)
         for day in (15, 16, 17):
-            self.assertIn(f"2026-10-{day}: 0/3 passed", body)
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
         self.assertIn(f"/logs/{JOB}/30000000000000170001", body, "the run link")
         self.assertIn("eval_case-red_rep1.log", body, "the transcript link")
-        self.assertIn("failed: `names-the-pool: required phrases absent`", body, "the check's reason, score prefix dropped")
+        self.assertNotIn("names-the-pool", body, "the check's reason stays on the dashboard")
         self.assertIn("**Broken test:**", body)
         self.assertLess(body.index("2026-10-17"), body.index("2026-10-15"), "newest night first")
         self.assertIn("filed 1,", out)
@@ -270,7 +270,7 @@ class StreakTest(Harness):
         # say nothing: three real reds around them still file.
         gh, _, _ = self.run_once(data(night(13, [red()]), night(14, [all_infra]), night(15, [storm_graded_fail]), night(16, [red()]), night(17, [task("case-red", "fail", "infra", "fail")])))
         [issue] = self.filed(gh)
-        self.assertIn("2026-10-17: 0/2 passed, 1 infra", issue["body"])
+        self.assertIn("- 2026-10-17 · [run](", issue["body"])
         self.assertNotIn("2026-10-14", issue["body"])
         self.assertNotIn("2026-10-15", issue["body"])
         # Without the real reds, the infra nights alone file no domain bug
@@ -471,7 +471,7 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(after, FakeGh(closed_issues=[closed]))
         [issue] = self.filed(gh)
         for day in (18, 19, 20):
-            self.assertIn(f"2026-10-{day}: 0/3 passed", issue["body"])
+            self.assertIn(f"- 2026-10-{day} · [run](", issue["body"])
         self.assertNotIn("2026-10-17", issue["body"])
 
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
@@ -1280,6 +1280,35 @@ class RunAsAScript(Harness):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues?labels=nightly-red", proc.stderr)
         self.assertIn("nightly bugs (dry run): would file 0", proc.stdout)
+
+
+
+class PublicIssueCarriesNoCaseResultsTest(Harness):
+    """The repository is public. A nightly-red issue names the case and links
+    the run, the transcript and the nightly report; the per-night pass counts
+    and the checks' reasons stay on the dashboard behind those links."""
+
+    def test_the_issue_body_has_no_counts_and_no_reasons(self):
+        gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), green()])))
+        [issue] = self.filed(gh)
+        body = issue["body"]
+        self.assertIn("case-red", issue["title"])
+        for day in (15, 16, 17):
+            self.assertIn(f"- 2026-10-{day} · [run](", body)
+        self.assertNotIn("passed", body.split("**Nights**")[1].split("Nightly report")[0], body)
+        self.assertNotIn("failed: ", body)
+        self.assertNotIn("names-the-pool", body, "the check's reason stays off the public issue")
+        self.assertIn(f"/logs/{JOB}/30000000000000170001", body)
+        self.assertIn("eval_case-red_rep1.log", body)
+        self.assertIn("Nightly report:", body)
+
+    def test_the_recovery_comment_has_no_counts(self):
+        issue = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
+        recovered = data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]), night(18, [green("case-red")]))
+        gh, _, _ = self.run_once(recovered, FakeGh(open_issues=[issue]))
+        [(_, _, body)] = gh.writes()
+        self.assertIn("passed every graded repetition on the 2026-10-17 nightly", body["body"])
+        self.assertNotIn("3/3", body["body"])
 
 
 if __name__ == "__main__":

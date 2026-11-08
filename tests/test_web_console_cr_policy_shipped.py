@@ -41,18 +41,15 @@ POLICY_NAME = "kube-agents-web-console-cr"
 HELPER = "kube-agents.webConsoleCRPolicyEnabled"
 HELPER_GATE = '{{- if include "kube-agents.webConsoleCRPolicyEnabled" . }}'
 CONSOLE_KEY_PREFIX = "kubeagents.x-k8s.io/"
-# The comment lines hack/sync-chart-manifests.sh writes between the gate and the source.
-GENERATED_HEADER_LINES = 4
-
 
 def policy_objects(text: str) -> list[dict]:
     return [d for d in yaml.safe_load_all(text) if d]
 
 
 def chart_body() -> str:
-    """The chart copy without its gate lines and the generated-file header the sync script writes."""
+    """The chart copy without its gate lines, as YAML; its comments do not reach the parsed objects."""
     lines = CHART_TEMPLATE.read_text(encoding="utf-8").splitlines()
-    return "\n".join(lines[1 + GENERATED_HEADER_LINES : -1])
+    return "\n".join(line for line in lines if not line.startswith("{{"))
 
 
 def helper_body(name: str) -> str:
@@ -105,7 +102,7 @@ class DeliveryTest(unittest.TestCase):
             self.assertIn(condition, body)
 
     def test_the_chart_copy_matches_the_source(self):
-        self.assertEqual(chart_body().strip(), POLICY_SRC.read_text(encoding="utf-8").strip())
+        self.assertEqual(policy_objects(POLICY_SRC.read_text(encoding="utf-8")), policy_objects(chart_body()))
 
     def test_the_sync_script_generates_it(self):
         text = SYNC_SCRIPT.read_text(encoding="utf-8")

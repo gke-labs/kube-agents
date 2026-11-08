@@ -67,6 +67,14 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// incidentWorkloadDedupDefaultSeconds is the default INCIDENT_WORKLOAD_DEDUP_SECONDS:
+	// the seconds an admitted event folds its workload's later events into
+	// one incident (session_kv_server.py). Rendered into the platform
+	// container so the window is on for every install and visible on the
+	// Deployment; the daemon's own fallback is the same hour. A
+	// spec.deployment.env entry replaces it (mergeEnvVars), and "0" turns
+	// folding off.
+	incidentWorkloadDedupDefaultSeconds = "3600"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
 	// and what the broker keeps of it while the command runs;
 	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
@@ -2929,6 +2937,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "GITOPS_STATE_PATH",
 			Value: path.Join(gitopsStateDir, "managed_repos"),
 		},
+		{
+			Name:  "INCIDENT_WORKLOAD_DEDUP_SECONDS",
+			Value: incidentWorkloadDedupDefaultSeconds,
+		},
 	}
 
 	// Two of the three exceptions to "no credentials in the sandbox", and the
@@ -4264,22 +4276,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -4437,7 +4441,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4665,12 +4669,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
 	// unset, so a broker rendered without these would crash-loop at boot rather
 	// than serve credentials to whoever reached the port.
-	//
-	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
-	// share no volume, so a working-tree clone in a directory the agent named is
-	// not something the broker can do at all — the fallback the flag guards
-	// elsewhere does not exist here, and an install that could switch it off
-	// would only be choosing to have the GitHub-writing skills fail.
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
@@ -4714,7 +4712,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
@@ -5191,9 +5188,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
-		// session_kv_server.py). Parsed as a whole number and capped at a
-		// day, and a value that does not parse means off, so it bounds a
-		// count of chat messages and triage turns and reaches nothing else.
+		// session_kv_server.py). The container carries the default
+		// (incidentWorkloadDedupDefaultSeconds); an entry here replaces it,
+		// and "0" turns folding off. Parsed as a whole number and capped at a
+		// day, and a value that does not parse means the default, so it
+		// bounds a count of chat messages and triage turns and reaches
+		// nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 
 		// "true" has an event triage also file a card that opens the
@@ -5203,6 +5203,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
 
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
@@ -5221,6 +5228,18 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// list_agents filter, and no value adds an agent, a path or a
 		// destination.
 		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
+
+		// The idle policy's two thresholds, in days
+		// (agents/chat/scripts/cron_idle_policy.py): after this many days
+		// without a chat message the dispatcher holds the Platform Agent's
+		// model-run cron jobs to once a window, and after the second it holds
+		// them until a message arrives. Each is parsed as a whole number; `0`
+		// turns its stage off and anything else means the default. A value
+		// changes only how often jobs already on the roster run, by moving
+		// their next_run_at in the profile's own store, and adds no job, path,
+		// destination or credential.
+		"CRON_IDLE_HIBERNATE_DAYS": {},
+		"CRON_IDLE_THROTTLE_DAYS":  {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

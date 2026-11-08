@@ -9,15 +9,15 @@ The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) en
 
 ## Turning it on
 
-The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, an operator setting like the ones [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, on top of `spec.mode: next`. With it set, the operator renders beside the console server:
+The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, on top of `spec.mode: next`. The chart value `operator.mcpServer.enabled: true` sets it. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins over the value. With it set, the operator renders beside the console server:
 
 - `<name>-a2a-mcp`: a Deployment running the MCP binary from the `a2a-console` image, a ClusterIP Service on port 8089, and the ServiceAccount of the same name;
 - `<name>-a2a-mcp-netpol`: a deny-all ingress NetworkPolicy on that pod, so the only way in is `kubectl port-forward`;
 - `<name>-a2a-mcp-token`: a Secret holding the bearer token callers present, minted once by the operator.
 
-If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Unset the flag and all of it is removed, the token included.
+If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Turn the flag off and all of it is removed, the token included.
 
-Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it when `operator.extraEnv` sets the flag ([Prerequisites](/kube-agents/install/prerequisites/)).
+Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it whenever the flag is on and `platformAgent.mode` is `next` ([Prerequisites](/kube-agents/install/prerequisites/)).
 
 ## Connecting a client
 
@@ -42,6 +42,8 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
 The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
+
+The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
 
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 
