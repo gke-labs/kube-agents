@@ -647,9 +647,13 @@ func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
 
 // A command sent as a quote-reply to one of the bot's posts is the command:
 // the words go over unchanged, with no read and no frame, so routeTurn's
-// matchers see them. Ordinary words beside a quote are still framed.
+// matchers see them. The bare delegate word is one too, since framed it
+// would read as a delegation of the frame. Ordinary words beside a quote are
+// still framed, a question that only looks like a status ask included:
+// routeTurn reads the wide form only on a running task, and a quoted
+// question that lost its quote would reach no one.
 func TestGchatQuoteReplyCommandStaysTheCommand(t *testing.T) {
-	for _, words := range []string{"stop", "/session off", "status", "/feedback", "delegate check node-3"} {
+	for _, words := range []string{"stop", "/session off", "/session", "status", "/feedback", "/feedback summary", "delegate check node-3", "delegate", "Delegate."} {
 		t.Run(words, func(t *testing.T) {
 			f := newFakeChatRelay(t)
 			f.responses["spaces.messages/get"] = quotedResponse(humanSender("Alex"), gchatQuotedAlert)
@@ -671,13 +675,23 @@ func TestGchatQuoteReplyCommandStaysTheCommand(t *testing.T) {
 			}
 		})
 	}
-	f := newFakeChatRelay(t)
-	a := newTestGchatAdapterWithRelay(t, f)
-	ev := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M2", "@bot stop the bleeding, what is this?", "stop the bleeding, what is this?", gchatQuotedName),
-		"REPLY", "Alex", gchatQuotedAlert)
-	msg, _ := quotedTurn(a, ev)
-	if !quotedAskNeeded(ev, msg) || !strings.HasSuffix(msg.Text, shortcutAskRule) {
-		t.Errorf("ordinary words = %q, want the frame", msg.Text)
+	for i, words := range []string{"stop the bleeding, what is this?", "what is happening here?", "how is the deploy doing?", "/session what is this alert?", "/feedback the alert text is wrong"} {
+		t.Run(words, func(t *testing.T) {
+			f := newFakeChatRelay(t)
+			a := newTestGchatAdapterWithRelay(t, f)
+			ev := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", fmt.Sprintf("spaces/S1/messages/W%d", i), "@bot "+words, words, gchatQuotedName),
+				"REPLY", "Alex", gchatQuotedAlert)
+			msg, reason := quotedTurn(a, ev)
+			if reason != "" {
+				t.Fatalf("dropped: %s", reason)
+			}
+			if !quotedAskNeeded(ev, msg) || msg.Text != fmt.Sprintf(gchatQuotedAskWithWords, words, "> Posted by Alex:\n> "+gchatQuotedAlert) {
+				t.Errorf("ordinary words = %q, want the frame around them", msg.Text)
+			}
+			if len(f.calls) != 0 {
+				t.Errorf("relay calls = %+v, want none: the snapshot is the message", f.calls)
+			}
+		})
 	}
 }
 

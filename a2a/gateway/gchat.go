@@ -1444,12 +1444,39 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 
 // quotedAskNeeded reports a message whose turn is composed from the message
 // it quotes (quotedAsk): one that quotes a message and whose own words are
-// not a command. A command sent as a quote-reply to one of the bot's posts,
-// a stop, a status question, /session, /feedback or a delegate, is the
-// command, which routeTurn matches on the words alone; the quote is where
-// the member typed it, not what they asked.
+// not a command the gateway answers itself (gchatQuotedWordsAreACommand).
 func quotedAskNeeded(ev *gchatEvent, msg InboundMessage) bool {
-	return ev.Message.QuotedMessageMetadata.Name != "" && !chattext.IsCommand(msg.Text)
+	return ev.Message.QuotedMessageMetadata.Name != "" && !gchatQuotedWordsAreACommand(msg.Text)
+}
+
+// gchatQuotedWordsAreACommand reports words typed beside a quote that are a
+// command the gateway answers without an agent, so the quote must not be
+// framed around them: routeTurn matches these on the words alone, and the
+// quote is where the member typed them, not what they asked. It is
+// narrower than chattext.IsCommand on purpose: that one is the button
+// validator's superset and takes the status ask in its wide form ("what is
+// happening here?", "how is the deploy doing?"), which routeTurn reads only
+// under wideStatus on a running task, so a quoted question that merely
+// looks like one would lose its quote and reach no one. The forms, as
+// routeTurn parses them: a stop; a bare "/feedback" and "/feedback summary";
+// "/session" bare or "off" (a "/session <text>" is an agent's turn); the
+// exact status phrases; and a delegation, with its task or the bare word,
+// which routeTurn would otherwise read with the frame's line break as its
+// separator and spawn a worker whose task is the frame.
+func gchatQuotedWordsAreACommand(text string) bool {
+	if chattext.IsStop(text) || chattext.IsStatusQuery(text, false) {
+		return true
+	}
+	if rest, ok := chattext.IsFeedbackCommand(text); ok && (rest == "" || chattext.IsFeedbackSummaryCommand(text)) {
+		return true
+	}
+	if rest, ok := chattext.IsSessionCommand(text); ok && (rest == "" || chattext.IsSessionOff(rest)) {
+		return true
+	}
+	if _, ok := chattext.IsDelegate(text); ok {
+		return true
+	}
+	return chattext.Normalize(text) == chattext.DelegateWord
 }
 
 // quotedAsk is the turn for a message that quotes another in reply, Chat's
