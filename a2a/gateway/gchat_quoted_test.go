@@ -717,3 +717,80 @@ func TestGchatSenderAdmissionReachesTheAdapterThroughMuxAndDoor(t *testing.T) {
 		t.Error("SetSenderAdmission did not reach the Chat adapter")
 	}
 }
+
+// The captured quote-in-reply event: Chat published it in the legacy wire
+// layout, with quotedMessageMetadata carrying the REPLY snapshot (sender and
+// text, no formattedText). Through Run it is acked once and handed over off
+// the pump, composed from the snapshot with no read; the quoted message is
+// the app's own DM post, so the frame is the own-message one.
+func TestGchatCapturedLegacyQuotedReplyThroughRun(t *testing.T) {
+	const (
+		message = "spaces/rj0PRyAAAAE/messages/eU4g-jRGHss.eU4g-jRGHss"
+		quoted  = "spaces/rj0PRyAAAAE/messages/ooygSHQq_qM.ooygSHQq_qM"
+		poster  = "Kage (bhoekstra)"
+		text    = "✅ stall cleared in `kube-agents-evals-2/platform-agent-host` (us-central1) / `eval-controller-stall`: Deployment/eval-stalled-workload; card `t_8ba511a8` closed"
+	)
+	ev := gchatFixtureEvent(t, "legacy-dm-quoted-reply.json", nil)
+	if ev.shape != gchatShapeLegacy || ev.Type != "MESSAGE" {
+		t.Fatalf("shape=%q type=%q, want the legacy MESSAGE layout", ev.shape, ev.Type)
+	}
+	if q := ev.Message.QuotedMessageMetadata; q.Name != quoted || q.QuoteType != "REPLY" || q.Snapshot.Sender != poster || q.Snapshot.Text != text || q.Snapshot.FormattedText != "" {
+		t.Fatalf("the legacy layout did not decode quotedMessageMetadata: %+v", q)
+	}
+
+	f := newFakeChatRelay(t)
+	_, b64 := realGchatFixture(t, "legacy-dm-quoted-reply.json")
+	acked, _ := f.serveEvents([]map[string]any{{"receipt": "r1", "data": b64, "messageId": "1"}})
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	var mu sync.Mutex
+	var got []InboundMessage
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx, func(m InboundMessage) {
+			mu.Lock()
+			got = append(got, m)
+			mu.Unlock()
+		})
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n == 1 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("no turn handed over after 5s")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v", err)
+	}
+	f.mu.Lock()
+	settled := append([]string(nil), *acked...)
+	calls := len(f.calls)
+	f.mu.Unlock()
+	if len(settled) != 1 || settled[0] != "r1" {
+		t.Errorf("acked = %v, want the event acked once", settled)
+	}
+	if calls != 0 {
+		t.Errorf("relay calls = %d, want none: the snapshot is the message", calls)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	msg := got[0]
+	want := fmt.Sprintf(gchatQuotedOwnAskWithWords, "what was this about?", shortcutAskQuote("Posted by "+poster+":\n"+text))
+	if msg.Text != want {
+		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	}
+	if msg.Shortcut || msg.Conversation != "gchat:dm/spaces/rj0PRyAAAAE/threads/eU4g-jRGHss" || msg.Kind != "dm" ||
+		msg.MessageID != message || msg.AuthorID != "sender@example.com" || !msg.TopLevel {
+		t.Errorf("turn = %+v", msg)
+	}
+}

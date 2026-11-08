@@ -2010,7 +2010,9 @@ a message in reply, or forwards one, instead, and the MESSAGE event's message th
 `quotedMessageMetadata`: the quoted message's `name` and `lastUpdateTime`, its `quoteType`
 (`REPLY` from the same thread or space, `FORWARD` from another), and Chat's output-only
 `quotedMessageSnapshot` of it, the author's name as a string and the `text`, with
-`formattedText` and `attachments[]` on a forward. The snapshot is what the agent gets when it
+`formattedText` and `attachments[]` on a forward (measured 2026-11-08: a reply quoting one of
+the app's own DM posts arrived in the legacy wire layout with the snapshot's sender and text,
+`testdata/gchat/legacy-dm-quoted-reply.json`). The snapshot is what the agent gets when it
 carries content, because it has no scope limit and a forward names a message in a space the
 app is not in; only a snapshot with nothing in it sends the adapter to the relay's
 `spaces.messages.get` (`text`, or `formattedText` when that is empty, `sender`,
