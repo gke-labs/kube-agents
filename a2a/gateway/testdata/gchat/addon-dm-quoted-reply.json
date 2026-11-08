@@ -1,0 +1,81 @@
+{
+  "commonEventObject": {
+    "userLocale": "en",
+    "hostApp": "CHAT",
+    "platform": "WEB",
+    "timeZone": {
+      "id": "America/Toronto",
+      "offset": -14400000
+    }
+  },
+  "chat": {
+    "user": {
+      "name": "users/100000000000000000042",
+      "displayName": "Test Sender",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
+      "email": "sender@example.com",
+      "type": "HUMAN",
+      "domainId": "REDACTED"
+    },
+    "eventTime": "2026-11-08T10:12:05.118877Z",
+    "messagePayload": {
+      "space": {
+        "name": "spaces/_c2fixtureAA",
+        "type": "DM",
+        "singleUserBotDm": true,
+        "spaceThreadingState": "THREADED_MESSAGES",
+        "spaceType": "DIRECT_MESSAGE",
+        "spaceHistoryState": "HISTORY_ON",
+        "lastActiveTime": "2026-11-08T10:12:05.118877Z",
+        "membershipCount": {
+          "joinedDirectHumanUserCount": 1
+        },
+        "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls\u003d11"
+      },
+      "message": {
+        "name": "spaces/_c2fixtureAA/messages/Qu0teDr3ply.Qu0teDr3ply",
+        "sender": {
+          "name": "users/100000000000000000042",
+          "displayName": "Test Sender",
+          "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
+          "email": "sender@example.com",
+          "type": "HUMAN",
+          "domainId": "REDACTED"
+        },
+        "createTime": "2026-11-08T10:12:05.118877Z",
+        "text": "is this one ours?",
+        "thread": {
+          "name": "spaces/_c2fixtureAA/threads/Qu0teDr3ply",
+          "retentionSettings": {
+            "state": "PERMANENT"
+          }
+        },
+        "space": {
+          "name": "spaces/_c2fixtureAA",
+          "type": "DM",
+          "singleUserBotDm": true,
+          "spaceThreadingState": "THREADED_MESSAGES",
+          "spaceType": "DIRECT_MESSAGE",
+          "spaceHistoryState": "HISTORY_ON",
+          "lastActiveTime": "2026-11-08T10:12:05.118877Z",
+          "membershipCount": {
+            "joinedDirectHumanUserCount": 1
+          },
+          "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls\u003d11"
+        },
+        "argumentText": "is this one ours?",
+        "quotedMessageMetadata": {
+          "name": "spaces/_c2fixtureAA/messages/AlertB0tMsg.AlertB0tMsg",
+          "lastUpdateTime": "2026-11-08T10:09:41.000000Z"
+        },
+        "retentionSettings": {
+          "state": "PERMANENT"
+        },
+        "messageHistoryState": "HISTORY_ON",
+        "formattedText": "is this one ours?",
+        "markupSyntax": "MARKUP_SYNTAX_CHAT"
+      },
+      "configCompleteRedirectUri": "https://dynamite-preprod.sandbox.google.com/api/bot_config_complete?token\u003dREDACTED"
+    }
+  }
+}

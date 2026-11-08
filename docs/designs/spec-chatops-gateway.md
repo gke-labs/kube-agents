@@ -2003,6 +2003,19 @@ member of, and a conversation it cannot see at all (a private channel or a DM it
 `response_url` (posted only when it is on `hooks.slack.com`), and no turn. A failed read is
 not a refusal: the turn goes ahead.
 
+**The Google Chat sibling: a quoted message.** Chat has no message shortcut; a member quotes
+a message in reply instead, and the MESSAGE event's message then carries
+`quotedMessageMetadata` (the quoted message's `name` and `lastUpdateTime`). The adapter reads
+the quoted message through the relay's `spaces.messages.get` (its `text`, or `formattedText`
+when that is empty, its `sender` and its `attachment[].contentName`) and frames it as the Slack
+shortcut does: the poster's name inside the quote, every line quoted, the same clip, and the
+same closing rule (`shortcut_ask.go` holds the shared wording). The member's own words, when
+they typed any beside the quote, come first; a bare mention with a quote is the quoted ask with
+the shortcut's opening. Nothing else about the turn changes: the member typed the message, so
+its conversation is that message's thread and it is no `Shortcut`. The read runs off the event
+pump under a ten-second budget, after the dedupe; a read that fails leaves the member's words as
+the turn, and a quote alone is then no turn, logged with the reason.
+
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
 admitted sender's immutable `user_id` to an identity sourced from our own IdP; never

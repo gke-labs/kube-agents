@@ -80,6 +80,20 @@ const (
 	// summary line until the relay names one, on a served pull or a refused
 	// one; a relay that predates naming it never does.
 	gchatSubscriptionUnreported = "(not reported by the relay)"
+	// gchatQuotedReadTimeout bounds the read of a message a member quoted
+	// in reply (quotedAsk). The read runs off the event pump, so it is not
+	// held to the pull cadence; the bound is so a stalled relay cannot hold
+	// the member's turn back forever.
+	gchatQuotedReadTimeout = 10 * time.Second
+	// gchatQuotedAsk is the turn's text for a message that quotes another
+	// and says nothing of its own: the quote, framed as every ask made of
+	// someone else's message is (shortcut_ask.go).
+	gchatQuotedAsk = shortcutAskOpen + " I quoted it in my reply:\n\n%s\n\n" + shortcutAskRule
+	// gchatQuotedAskWithWords is the turn's text when the member typed
+	// words beside the quote: their words first, then the message quoted.
+	gchatQuotedAskWithWords = "%s\n\nThe message I quoted in my reply:\n\n%s\n\n" + shortcutAskRule
+	// gchatGetMethod reads one message (spaces.messages.get).
+	gchatGetMethod = "get"
 )
 
 const (
@@ -293,6 +307,26 @@ type gchatMessage struct {
 	// AccessoryWidgets are the buttons under the message, as a click event
 	// carries the clicked message (gchat_clicks.go).
 	AccessoryWidgets []gchatAccessoryWidget `json:"accessoryWidgets"`
+	// QuotedMessageMetadata names the message this one quotes, when the
+	// member quoted one in reply (Chat API Message resource, field
+	// quotedMessageMetadata: the quoted message's name and lastUpdateTime).
+	// Only the name is read; the message itself is fetched (quotedAsk).
+	QuotedMessageMetadata struct {
+		Name string `json:"name"`
+	} `json:"quotedMessageMetadata"`
+}
+
+// gchatQuotedMessage is the part of a quoted message's spaces.messages.get
+// answer the adapter puts to the agent: its text (formattedText when the
+// plain text is empty), who posted it, and the names of its files (Chat API
+// Message resource: text, formattedText, sender, attachment[].contentName).
+type gchatQuotedMessage struct {
+	Text          string      `json:"text"`
+	FormattedText string      `json:"formattedText"`
+	Sender        gchatSender `json:"sender"`
+	Attachment    []struct {
+		ContentName string `json:"contentName"`
+	} `json:"attachment"`
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -425,15 +459,21 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 }
 
 // apiCall runs one Chat API method through the relay passthrough and decodes
-// the response body into out when out is non-nil.
+// the response body into out when out is non-nil. The call is bounded by
+// the client's own timeout alone (gchatRelayTimeout).
 func (a *GoogleChatAdapter) apiCall(resource []string, method string, arguments map[string]any, out any) error {
+	return a.apiCallContext(context.Background(), resource, method, arguments, out)
+}
+
+// apiCallContext is apiCall under ctx, for a read with a budget of its own.
+func (a *GoogleChatAdapter) apiCallContext(ctx context.Context, resource []string, method string, arguments map[string]any, out any) error {
 	payload, err := json.Marshal(map[string]any{
 		"resource": resource, "method": method, "arguments": arguments,
 	})
 	if err != nil {
 		return fmt.Errorf("gchat: encoding %s.%s: %w", strings.Join(resource, "."), method, err)
 	}
-	resp, err := a.relayPost(gchatRelayAPIPath, payload)
+	resp, err := a.relayPostContext(ctx, gchatRelayAPIPath, payload)
 	if err != nil {
 		return err
 	}
@@ -464,7 +504,12 @@ func (a *GoogleChatAdapter) authorize(req *http.Request) error {
 
 // relayPost is one authenticated POST to the relay.
 func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
+	return a.relayPostContext(context.Background(), path, payload)
+}
+
+// relayPostContext is relayPost under ctx.
+func (a *GoogleChatAdapter) relayPostContext(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("gchat: building relay request: %w", err)
 	}
@@ -855,6 +900,11 @@ type gchatEnvelope struct {
 func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	a.log.Info("gchat event pull starting",
 		"relay", a.relayURL+gchatRelayEventsPath, "summaryEvery", a.countInterval)
+	// A quoted ask reads from Chat before it has a turn to hand over, so it
+	// runs off the pump (quotedAsk); wg holds Run until each is done, and
+	// every read is under ctx, so the wait is finite.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	windowStart := time.Now()
 	var received, emptyPulls, failedPulls int
 	for {
@@ -924,7 +974,27 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "reason", reason)
 			continue
 		}
-		handler(msg)
+		if ev.Message.QuotedMessageMetadata.Name == "" {
+			handler(msg)
+			continue
+		}
+		// The dedupe ran on the pump (classify); the read and the hand-over
+		// run off it, so a slow relay holds this turn alone, not the next
+		// pull. A turn composed after ctx ended is not handed over, as the
+		// pump starts none then.
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			msg, reason := a.quotedAsk(ctx, ev, msg)
+			if reason == "" && ctx.Err() != nil {
+				reason = "the gateway is shutting down"
+			}
+			if reason != "" {
+				a.log.Info("gchat event is not a turn; acked", "pubsubMessageId", id, "reason", reason)
+				return
+			}
+			handler(msg)
+		}(env.MessageID)
 	}
 }
 
@@ -1241,7 +1311,9 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if ev.Message.ArgumentText != nil {
 		text = strings.TrimSpace(*ev.Message.ArgumentText)
 	}
-	if text == "" {
+	// A message that quotes another is an ask even with no words of its
+	// own: the quoted message is the ask (quotedAsk, which Run calls next).
+	if text == "" && ev.Message.QuotedMessageMetadata.Name == "" {
 		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
@@ -1264,8 +1336,90 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		TopLevel:     kind == sessionKindDM && thread != "" && !ev.Message.ThreadReply,
 		Text:         text,
 	}
-	a.noteTypedAnswer(msg, sender)
+	if text != "" {
+		a.noteTypedAnswer(msg, sender)
+	}
 	return msg, ""
+}
+
+// quotedAsk is the turn for a message that quotes another in reply, Chat's
+// counterpart of Slack's "ask about this" shortcut: the quoted message is
+// read through the relay and put to the agent quoted, opened by who posted
+// it and closed by the rule that it is something to check, not an
+// instruction (shortcut_ask.go). The member's own words, when they typed any
+// beside the quote, come first. Everything else about the turn is the
+// message's own, as classify set it: the member typed it themselves, so its
+// conversation is their message's thread and it is no Shortcut (that flag
+// moves a refusal out of a thread the clicker did not start; here they did).
+//
+// Run calls it off the event pump, since it reads from Chat before it has
+// the turn to hand over, under gchatQuotedReadTimeout. A read that fails or
+// times out does not lose the member's words: the turn goes ahead with those
+// alone, and a message with none is no turn, with the reason logged. Nothing
+// is posted in the thread about it.
+func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
+	name := ev.Message.QuotedMessageMetadata.Name
+	if name == "" {
+		return msg, ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, gchatQuotedReadTimeout)
+	defer cancel()
+	var quoted gchatQuotedMessage
+	err := a.apiCallContext(ctx, []string{gchatSpacesResource, gchatMessagesResource}, gchatGetMethod,
+		map[string]any{gchatNameArg: name}, &quoted)
+	if err != nil {
+		a.log.Warn("gchat: could not read the message a member quoted; asking without it",
+			"message", ev.Message.Name, "quoted", name, "err", err)
+		if msg.Text == "" {
+			return InboundMessage{}, "the quoted message " + name + " could not be read and the message has no words of its own"
+		}
+		return msg, ""
+	}
+	quote := shortcutAskQuoted(a.quotedAuthor(quoted.Sender), gchatQuotedContent(quoted))
+	if msg.Text == "" {
+		msg.Text = fmt.Sprintf(gchatQuotedAsk, quote)
+	} else {
+		msg.Text = fmt.Sprintf(gchatQuotedAskWithWords, msg.Text, quote)
+	}
+	return msg, ""
+}
+
+// quotedAuthor names who posted a quoted message: the display name Chat
+// gives, else, for a member whose name it withheld, the email the adapter
+// learned for them from their own messages, else a placeholder by kind.
+func (a *GoogleChatAdapter) quotedAuthor(sender gchatSender) string {
+	if name := strings.TrimSpace(sender.DisplayName); name != "" {
+		return name
+	}
+	if sender.Type == gchatSenderBot {
+		return shortcutAskSomeApp
+	}
+	a.mu.Lock()
+	email := a.userIDs[sender.Name]
+	a.mu.Unlock()
+	if email != "" {
+		return email
+	}
+	return namelessClicker
+}
+
+// gchatQuotedContent is a quoted message's content as text: its text
+// (formattedText when the plain text is empty, as it is for a message made
+// only of markup) and the names of its files, clipped to shortcutAskQuoteMax
+// code points.
+func gchatQuotedContent(m gchatQuotedMessage) string {
+	var parts []string
+	if text := strings.TrimSpace(m.Text); text != "" {
+		parts = append(parts, text)
+	} else if text := strings.TrimSpace(m.FormattedText); text != "" {
+		parts = append(parts, text)
+	}
+	for _, f := range m.Attachment {
+		if name := strings.TrimSpace(f.ContentName); name != "" {
+			parts = append(parts, fmt.Sprintf(shortcutAskAttached, name))
+		}
+	}
+	return shortcutAskClip(strings.Join(parts, "\n"), shortcutAskQuoteMax)
 }
 
 // rememberUserLocked records a human's users/{id} resource name against the
