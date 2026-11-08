@@ -1753,9 +1753,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
 
         The session's harness speaks MCP to the worker-adapter's own server,
-        which answers `tools/list` with `delegateToolSchema` -- a
-        `map[string]any` literal, because that is what an MCP tool definition
-        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        which answers `tools/list` with `delegateToolSchema` -- built from
+        `map[string]any` literals (per turn, to name that turn's delegate
+        targets), because that is what an MCP tool definition is on the
+        wire, so it cannot reference `lib.DelegateRequest`'s json
         tags the way Go code can. The two are independent spellings of one
         shape: the model calls the tool using the schema's field names, the
         adapter decodes the call straight into `lib.DelegateRequest`
@@ -1775,7 +1776,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
         mcp = h.text("a2a_worker_adapter_mcp")
-        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
+        schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
         # A property opens its own line; `additionalProperties` inside one doesn't.
         properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
