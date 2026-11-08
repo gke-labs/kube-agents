@@ -304,7 +304,9 @@ one the last scheduled `finish` of the stream recorded at
 `first-run` (no record), `findings-changed` (the digest differs, a target was not collected, or a
 check went unevaluated), `periodic-refresh` (seven days since the last full synthesis) or
 `unchanged`. With `--scheduled` and `unchanged`, when the newest stored run of the ledger is the
-scheduled run the record names, with a findings document `finish` can run again (no remediation
+scheduled run the record names, one that did not hold the ledger open (a held-open run's document
+is the empty set its comment measured the ledger against, and replaying it would post that comment
+again), with a findings document `finish` can run again (no remediation
 that names a file or carries a note `finish` wrote, no withheld postures, every `declared[]` entry
 filed again by this run's `start`, and this run's own search covering every repository the step
 names), and the ledger carries no `/remediate` request still owed an answer (a writer's, `all`

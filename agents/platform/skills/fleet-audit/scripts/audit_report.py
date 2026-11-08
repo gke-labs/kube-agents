@@ -1805,6 +1805,10 @@ PRECHECK_RECORD_MISMATCH_REASON = (
     "the digest record was written for the scheduled run that finished at {recorded}, and the newest "
     "stored run finished at {stored}"
 )
+PRECHECK_HELD_OPEN_REASON = (
+    "the newest stored run held the ledger open over findings it neither reported nor explained, "
+    "so its document is no baseline"
+)
 PRECHECK_REMEDIATION_REASON = (
     "the stored document's remediation for {ids} names a file this run has not written, or "
     "carries a note finish wrote, which a close cannot write again"
@@ -22472,8 +22476,10 @@ def _finish_without_forge(
     scheduled: bool = False,
     unreachable: tuple[str, str] | None = None,
     probe: str = REACHABILITY_PROBE_VERB,
-) -> None:
+) -> dict | None:
     """Keep a run on an install with no forge in the report store, and print its line.
+
+    Returns the envelope the store kept, or None when the write failed.
 
     `unreachable` is the repository and the reason when a repository resolved
     but the broker cannot reach it (`resolve_reachable_repo`); the note then
@@ -22691,6 +22697,7 @@ def _finish_without_forge(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 class _FixPlan(NamedTuple):
@@ -22861,8 +22868,10 @@ def _finish_store_ledger(
     timers: Callable[[], dict],
     scheduled: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
-) -> None:
+) -> dict | None:
     """Keep the ledger in the report store and chat, and open the fixes on the forge.
+
+    Returns the envelope the store kept, or None when the write failed.
 
     The run of a repository whose forge has no issue tracker, or no labels
     (version-control-support.md §8). `finish` has already validated the
@@ -23394,6 +23403,7 @@ def _finish_store_ledger(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 def handle_finish(args: argparse.Namespace) -> None:
@@ -23403,7 +23413,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         _finish(args, audit_id)
         return
     try:
-        _finish(args, audit_id)
+        stored = _finish(args, audit_id)
     except ValidationError:
         # The validator rejected the document and nothing was published. Every
         # SOP's next step is "fix the findings file and re-run `finish`", so
@@ -23428,7 +23438,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         release_in_flight(audit_id)
         raise
     release_in_flight(audit_id)
-    _record_scheduled_digest(args, audit_id)
+    _record_scheduled_digest(args, audit_id, stored)
 
 
 def raise_if_broker_lost(exc: BaseException, command: str) -> None:
@@ -23440,14 +23450,16 @@ def raise_if_broker_lost(exc: BaseException, command: str) -> None:
         ) from exc
 
 
-def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
+def _record_scheduled_digest(args: argparse.Namespace, audit_id: str, stored: dict | None) -> None:
     """Leave the gate's record after a scheduled `finish` published. Best-effort: never fails the run.
 
-    Only a scheduled run with a manifest records one: the digest is what the
-    next scheduled run's `precheck` compares its manifest with, and a run
-    that waived the manifest leaves nothing to compare, so its record is
-    removed and the next run is a first run. A `finish` that `precheck` ran
-    from the stored document keeps the previous `last_full_run_at`.
+    `stored` is what `_finish` handed back: the envelope the store kept of
+    this run, or None when the store did not keep it. Only a scheduled run
+    with a manifest records one: the digest is what the next scheduled run's
+    `precheck` compares its manifest with, and a run that waived the manifest
+    leaves nothing to compare, so its record is removed and the next run is
+    a first run. A `finish` that `precheck` ran from the stored document
+    keeps the previous `last_full_run_at`.
     """
     if not getattr(args, "scheduled", False):
         return
@@ -23465,9 +23477,11 @@ def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
         # scheduled one: a run that was diverted (its repository unreachable)
         # published nothing, so the next run must not read its digest as the
         # ledger's state, and a run the store did not keep leaves nothing for
-        # `precheck` to republish.
-        newest = newest_stored_envelope(audit_id, getattr(args, "repo", None))
-        if not newest or is_diverted(newest) or newest.get(RUN_SCHEDULED_KEY) is not True:
+        # `precheck` to republish. What this run stored is what `_finish`
+        # handed back, never read back from the store: after a failed write
+        # the store's newest envelope is an earlier run's, and a record naming
+        # it would pair this run's digest with that run's document.
+        if not stored or is_diverted(stored) or stored.get(RUN_SCHEDULED_KEY) is not True:
             record_path.unlink(missing_ok=True)
             log(
                 f"precheck: no manifest digest recorded for {audit_id}; the store holds no published "
@@ -23480,7 +23494,7 @@ def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
             time.time(),
             full_run=_PRECHECK_VERDICT is None,
             scratch_dir=SCRATCH_DIR,
-            envelope_finished_at=str(newest.get("finished_at") or ""),
+            envelope_finished_at=str(stored.get("finished_at") or ""),
         )
         log(f"precheck: recorded this scheduled run's manifest digest at {path}")
     except Exception as exc:  # noqa: BLE001 -- the record is for the next run; this one has published
@@ -23491,27 +23505,18 @@ def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
         )
 
 
-def newest_stored_envelope(audit_id: str, repo: str | None) -> dict | None:
-    """The newest envelope in the store of the ledger a run of `repo` publishes to, diverted included.
-
-    `{}` when the store holds none; None when the repository cannot be
-    resolved or the store cannot be read.
-    """
-    try:
-        directory = reports_dir_for(audit_id, resolve_repo_or_no_forge(audit_id, repo))
-    except Exception:  # noqa: BLE001 -- unresolvable is unknowable, and the callers treat None so
-        return None
-    return first_stored_record(directory, lambda envelope: True)
-
-
 def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | None = None) -> tuple[dict | None, str]:
     """The findings document of the last scheduled run of the ledger this run publishes to, or why not.
 
     The newest published envelope of that ledger's store (`first_stored_record`,
     skipping a diverted one) has to be a scheduled run's (`RUN_SCHEDULED_KEY`),
-    under this id scheme, with a `document` that has a findings list, and the
-    run the digest `record` names (`envelope_finished_at`), so the digest and
-    the document are one run's. The ledger must carry no `/remediate` request
+    one that did not hold the ledger open (`ledger_held_open`: its document
+    is the empty set the ledger's findings were held against, and replaying
+    it would hold the ledger again, with another comment, instead of the full
+    run the comment asks for), under this id scheme, with a `document` that
+    has a findings list, and the run the digest `record` names
+    (`envelope_finished_at`), so the digest and the document are one run's.
+    The ledger must carry no `/remediate` request
     still owed an answer (`pending_ledger_requests`): the stored document
     answers none, and `finish` opens a fix only for a `manifest` remediation,
     so a request on a `manual` finding would wait until the fleet changed. A
@@ -23536,6 +23541,8 @@ def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | No
         return None, f"the report store holds no published run of {audit_id} for {store_repo}"
     if newest.get(RUN_SCHEDULED_KEY) is not True:
         return None, "the newest stored run of this ledger was not a scheduled run"
+    if newest.get("ledger_held_open"):
+        return None, PRECHECK_HELD_OPEN_REASON
     if newest.get("id_scheme") != ID_SCHEME:
         return None, "the newest stored run was written under another id scheme"
     recorded = str((record or {}).get(_manifest_delta().RECORD_ENVELOPE_KEY) or "")
@@ -23753,7 +23760,7 @@ def _close_from_stored_document(
     # `precheck` once more, then the rest of the SOP, whose own `finish`
     # releases it), so only a close that published releases it here.
     try:
-        _finish(close, audit_id)
+        stored = _finish(close, audit_id)
     except BrokerUnavailable:
         put_back()
         raise
@@ -23772,7 +23779,7 @@ def _close_from_stored_document(
     else:
         # While the verdict is still set: the record keeps `last_full_run_at`.
         release_in_flight(audit_id)
-        _record_scheduled_digest(close, audit_id)
+        _record_scheduled_digest(close, audit_id, stored)
     finally:
         set_precheck_verdict(None)
     return None
@@ -23881,7 +23888,13 @@ def _kcc_paragraph_scan(repo: str, probe: _RepositoryProbe) -> "dict[KccKey, Kcc
     return kcc_declarations_via_broker(repo, snap, every_kind=True)
 
 
-def _finish(args: argparse.Namespace, audit_id: str) -> None:
+def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
+    """Publish the run and hand back the envelope the store kept of it, or None.
+
+    None after a dry run, and after a publish whose store write failed:
+    `_record_scheduled_digest` reads it as "no envelope of this run to
+    record", since reading the store back would find an earlier run's.
+    """
     # Only a scheduled run can be silent. The cron prompt passes
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
@@ -24057,7 +24070,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     repo = repo_hint
     if repo == NO_FORGE_REPO:
-        _finish_without_forge(
+        return _finish_without_forge(
             audit_id,
             data,
             now,
@@ -24068,7 +24081,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             unreachable=unreachable,
             probe=decision.probe if decision is not None else REACHABILITY_PROBE_VERB,
         )
-        return
     earlier = earlier_finish(audit_id, repo, now)
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
@@ -24245,7 +24257,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if decision is not None and decision.store_ledger:
         # The forge has no issue tracker, or no labels: the ledger goes to the
         # report store and chat, and the fixes still open on the forge.
-        _finish_store_ledger(
+        return _finish_store_ledger(
             audit_id,
             decision,
             args,
@@ -24271,7 +24283,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             scheduled=scheduled,
             kcc_index=kcc_index,
         )
-        return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
         repo, audit_id
     )
@@ -25084,41 +25095,37 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             news=not clean_quiet or bool(payload.get(SILENT_FLOOR_KEY)),
         )
-        write_report(
+        envelope = report_envelope(
             audit_id,
-            report_envelope(
-                audit_id,
-                payload,
-                data,
-                now,
-                repo=repo,
-                issue_number=stored_issue,
-                ledger_body=stored_body,
-                new_ids=[],
-                resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
-                rendered_ids=stored_ids,
-                ledger_document=ledger_document,
-                ledger_held_open=body_untouched,
-                delta_known=delta_known,
-                reported_under_gap=reported_under_gap,
-                scheduled=scheduled,
-                scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
-                # A body left untouched still publishes the previous ids, so
-                # a scheduled run stores those as the scheduled baseline,
-                # with what the run published: the postures it withheld are
-                # in no body block.
-                scheduled_published_ids=(
-                    sorted(set(stored_ids) | published_ids)
-                    if scheduled and body_untouched
-                    else next_scheduled_ids
-                ),
-                scheduled_reported_under_gap=next_scheduled_reported,
-                open_issue_number=open_issue,
-                not_rechecked=not_rechecked,
-            ),
+            payload,
+            data,
             now,
-            ledger_unchanged=body_untouched,
+            repo=repo,
+            issue_number=stored_issue,
+            ledger_body=stored_body,
+            new_ids=[],
+            resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
+            rendered_ids=stored_ids,
+            ledger_document=ledger_document,
+            ledger_held_open=body_untouched,
+            delta_known=delta_known,
+            reported_under_gap=reported_under_gap,
+            scheduled=scheduled,
+            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
+            # A body left untouched still publishes the previous ids, so
+            # a scheduled run stores those as the scheduled baseline,
+            # with what the run published: the postures it withheld are
+            # in no body block.
+            scheduled_published_ids=(
+                sorted(set(stored_ids) | published_ids)
+                if scheduled and body_untouched
+                else next_scheduled_ids
+            ),
+            scheduled_reported_under_gap=next_scheduled_reported,
+            open_issue_number=open_issue,
+            not_rechecked=not_rechecked,
         )
+        stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
         run_resolved = 0 if gaps else len(baseline.ids)
@@ -25139,7 +25146,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             whole_run=whole_run,
         )
         print(json.dumps(payload))
-        return
+        return envelope if stored else None
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
     # Every finding in the document reproduces by definition — the resolved ones
@@ -25644,32 +25651,29 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         now,
         news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
     )
-    write_report(
+    envelope = report_envelope(
         audit_id,
-        report_envelope(
-            audit_id,
-            payload,
-            data,
-            now,
-            repo=repo,
-            issue_number=number,
-            ledger_body=ledger_body,
-            new_ids=new_ids if delta_known else [],
-            resolved_ids=[] if (gaps or stale_scheme or not delta_known) else resolved_ids,
-            # The block as published, held ids included, so the stored set
-            # is the one the next run's memory parses out of `ledger_body`.
-            rendered_ids=parse_delta_block(ledger_body),
-            delta_known=delta_known,
-            reported_under_gap=reported_under_gap,
-            scheduled=scheduled,
-            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
-            scheduled_published_ids=next_scheduled_ids,
-            scheduled_reported_under_gap=next_scheduled_reported,
-            # Their places, which the note and id-only tiers do not render.
-            not_rechecked=unread_entries,
-        ),
+        payload,
+        data,
         now,
+        repo=repo,
+        issue_number=number,
+        ledger_body=ledger_body,
+        new_ids=new_ids if delta_known else [],
+        resolved_ids=[] if (gaps or stale_scheme or not delta_known) else resolved_ids,
+        # The block as published, held ids included, so the stored set
+        # is the one the next run's memory parses out of `ledger_body`.
+        rendered_ids=parse_delta_block(ledger_body),
+        delta_known=delta_known,
+        reported_under_gap=reported_under_gap,
+        scheduled=scheduled,
+        scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
+        scheduled_published_ids=next_scheduled_ids,
+        scheduled_reported_under_gap=next_scheduled_reported,
+        # Their places, which the note and id-only tiers do not render.
+        not_rechecked=unread_entries,
     )
+    stored = write_report(audit_id, envelope, now)
     run_counts = None
     if baseline.from_entry and baseline.known:
         # The run's delta, on the yardsticks and filters this run's own took.
@@ -25697,6 +25701,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         whole_run=baseline.from_entry,
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 # --------------------------------------------------------------------------- #

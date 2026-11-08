@@ -35885,15 +35885,66 @@ class TestPrecheck(BaseTestCase):
     def test_a_diverted_finish_records_no_digest(self):
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
         self.assertIsNotNone(self.digest_record())
-        latest = self.store() / "latest.json"
-        envelope = json.loads(latest.read_text(encoding="utf-8"))
-        envelope[audit_report.UNREACHABLE_REPO_KEY] = {"repo": "acme/fleet", "reason": "the broker refused it"}
-        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        diverted = {
+            **self.latest(),
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "the broker refused it"},
+        }
         close = argparse.Namespace(scheduled=True, manifest_file=self.manifest_file("day2"), repo=None)
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            audit_report._record_scheduled_digest(close, AUDIT)
+            audit_report._record_scheduled_digest(close, AUDIT, diverted)
         self.assertIsNone(self.digest_record())
         self.assertIn("no manifest digest recorded", err.getvalue())
+
+    def test_a_finish_the_store_did_not_keep_records_no_digest(self):
+        # The recorder is told what this finish stored; it never reads the
+        # store back, where the newest envelope is still the earlier run's.
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.assertIsNotNone(self.digest_record())
+        close = argparse.Namespace(scheduled=True, manifest_file=self.manifest_file("day2"), repo=None)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report._record_scheduled_digest(close, AUDIT, None)
+        self.assertIsNone(self.digest_record())
+        self.assertIn("no manifest digest recorded", err.getvalue())
+        self.assertTrue((self.store() / "latest.json").exists())
+
+    def test_a_scheduled_finish_whose_store_write_failed_records_no_digest(self):
+        # Day 1 published and recorded. Day 2's store write fails: `latest.json`
+        # goes and the ring still holds day 1, so a record would pair day 2's
+        # digest with day 1's envelope, and day 3 would republish day 1's
+        # document as if it were day 2's. The record goes instead, and day 3
+        # is a first run.
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        day_one = self.latest()
+        self.assertEqual(self.digest_record()["envelope_finished_at"], day_one["finished_at"])
+        with patch.object(audit_report, "_make_store_dirs", side_effect=PermissionError("a root-owned store")):
+            second = self.finish(make_doc(findings=[]), self.manifest_file("day2"))
+        self.assertFalse(second["silent_ok"])
+        self.assertIn("report store write for", self.err)
+        self.assertFalse((self.store() / "latest.json").exists())
+        ring = sorted((self.store() / "runs").glob("*.json"))
+        self.assertEqual([json.loads(p.read_text(encoding="utf-8"))["finished_at"] for p in ring], [day_one["finished_at"]])
+        self.assertIsNone(self.digest_record())
+        self.assertIn("no manifest digest recorded", self.err)
+
+        rc = self.precheck(self.manifest_file("day3"))
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out, {"verdict": "first-run", "closed": False, "reason": audit_report.PRECHECK_REASON_FIRST_RUN})
+
+    def test_a_stored_run_that_held_the_ledger_open_means_a_full_run(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        latest = self.store() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["ledger_held_open"] = True
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        rc = self.precheck(self.manifest_file("day2"))
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn(audit_report.PRECHECK_HELD_OPEN_REASON, out["reason"])
+        self.assertIn(audit_report.PRECHECK_CONTINUES_SUFFIX, out["reason"])
+        self.assertEqual(self.latest(), envelope)
 
     def test_a_record_of_another_run_than_the_stored_one_means_a_full_run(self):
         self.finish(make_doc(findings=[]), self.manifest_file("day1"))
@@ -36214,6 +36265,46 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertEqual(latest[audit_report.PRECHECK_KEY], "unchanged")
         self.assertEqual(latest["issue_number"], 42)
         self.assertEqual([f["id"] for f in latest["document"]["findings"]], audit_report.parse_delta_block(body))
+
+    def test_a_scheduled_run_that_held_the_ledger_open_is_not_replayed(self):
+        # Day 1: an empty document over a body that carries `a` under a check
+        # the manifest says ran, neither reported nor explained: the ledger is
+        # held open with a comment, and the stored document is the empty set.
+        # Day 2, same manifest: replaying that document would hold the ledger
+        # again and post the comment again; the run goes on in full instead.
+        a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file("day1")])
+        self.assertEqual(rc, 0, self.err)
+        first = self.stdout_json()
+        self.assertEqual(first["status"], "HELD")
+        comments = len(self.harness.forge_calls("issue-comment", number=42))
+        self.assertEqual(comments, 1)
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertTrue(latest["ledger_held_open"])
+        self.assertEqual(latest["document"]["findings"], [])
+        record = audit_report._manifest_delta().read_record(AUDIT, audit_report.SCRATCH_DIR)
+        self.assertEqual(record["envelope_finished_at"], latest["finished_at"])
+
+        self.searched_this_run()
+        rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2"), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn(audit_report.PRECHECK_HELD_OPEN_REASON, out["reason"])
+        self.assertEqual(len(self.harness.forge_calls("issue-comment", number=42)), comments)
 
     def test_a_pending_remediate_request_keeps_the_run_a_full_one(self):
         a = make_finding(fid="a", severity="major", remediation=REPLAYABLE_REMEDIATION)

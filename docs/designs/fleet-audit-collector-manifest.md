@@ -573,14 +573,19 @@ and `(False, "unchanged")` otherwise.
 `finish --scheduled` with a manifest writes that record after it published (`version`, `audit`,
 `digest`, `checks_revision`, `recorded_at`, `last_full_run_at`, and `envelope_finished_at`, the
 `finished_at` of the envelope it stored; a record whose `audit` is another stream's reads as no
-record). It writes none, and removes any, when the store's newest envelope is not this run's
-published one: a run diverted because its repository was unreachable (`is_diverted`) published
-nothing, and a digest of its manifest would make the next close republish an older document over
-a fleet that changed. A scheduled `finish` that waived the manifest removes it too. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
+record). It writes none, and removes any, when this run stored no published scheduled envelope.
+`finish` hands the recorder the envelope the store kept, or None when the write failed; the
+recorder reads nothing back from the store, because after a failed write the store's newest
+envelope is an earlier run's, and a record naming it would pair this run's digest with that run's
+document, which the next close would republish over the ledger this run updated. A run diverted
+because its repository was unreachable (`is_diverted`) published nothing, and a digest of its
+manifest would make the next close republish an older document over a fleet that changed. A
+scheduled `finish` that waived the manifest removes it too. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
 `unchanged`, the line is `{"verdict": …, "closed": false, "reason": …}` and the SOP continues. On
 `unchanged` with the flag, when the newest stored envelope of the ledger this run publishes to
-(`stored_scheduled_document`: not diverted, `scheduled: true`, this id scheme, the run the record's
-`envelope_finished_at` names, a `document` with a findings list) is there, and the open ledger issue
+(`stored_scheduled_document`: not diverted, `scheduled: true`, not `ledger_held_open`, this id
+scheme, the run the record's `envelope_finished_at` names, a `document` with a findings list) is
+there, and the open ledger issue
 carries no `/remediate` request still owed an answer (`pending_ledger_requests`: a writer's
 request, `all` included, that no acked or refused marker has answered, read with
 `unanswered_remediate_comments`; a conversation `read_comments` could not read whole, or any other
@@ -623,9 +628,12 @@ baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finis
 rejects the stored document puts the findings file back as it was and reports `closed: false`
 with the rejection, and a close that dies on anything else puts it back and fails as any command
 does; on either the stream's in-flight note stays, since the run goes on and the SOP's own
-`finish` releases it, and only a close that published releases it. A newer on-demand run, a store
-with nothing, a document from another scheme, a record of another run, a pending request or a
-document the close cannot run `finish` on again are reasons to run in full, never errors. An
+`finish` releases it, and only a close that published releases it. A newer on-demand run, a run
+that held the ledger open (its stored document is the empty set the held-open comment measured the
+ledger against, and a replay would hold the ledger again and post the comment again on every
+unchanged day, instead of the full run the comment asks for), a store with nothing, a document
+from another scheme, a record of another run, a pending request or a document the close cannot
+run `finish` on again are reasons to run in full, never errors. An
 on-demand run never passes the flag, so it is never closed from a stored document.
 
 What a close waives, by design: the SOP steps after the collector. On the stockout and cost

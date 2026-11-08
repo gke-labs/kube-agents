@@ -208,7 +208,9 @@ operator restoring ownership clears it.
 A scheduled `finish` with a collector manifest also leaves a second, smaller memory outside the
 store: `/opt/data/scratch/last_scheduled_digest_<audit-id>.json`, the digest of its manifest with
 the `finished_at` of the envelope it stored, which the next scheduled run's `precheck` reads
-([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). It is checked only
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). `finish` hands
+the recorder that envelope itself, so a run whose store write failed leaves no record rather than
+one naming the earlier envelope the store still holds. It is checked only
 by its `audit` and that `finished_at` against the store's newest envelope; losing it costs one
 full run (`first-run`), and nothing rebuilds it from the store.
 
