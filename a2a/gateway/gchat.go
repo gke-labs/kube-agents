@@ -375,6 +375,12 @@ type GoogleChatAdapter struct {
 	// syncRewrites runs an answered question's rewrite inline, under test.
 	ux           *gchatUX
 	syncRewrites bool
+	// rewrites counts the rewrites goRewrite runs off the inbox worker,
+	// so a test can wait for them to finish.
+	rewrites sync.WaitGroup
+	// feedback is the answer-feedback recorder the gateway hands over
+	// (FeedbackSink); until then no rating buttons are drawn.
+	feedback FeedbackRecorder
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -520,10 +526,19 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 // PostMessage posts a message value: a chat message laid out as a text
 // message with accessory buttons (renderGchatChat, gchat_chat.go), with
 // m.Text as the fallback the gateway posts when the layout is refused; one
-// with no chat message is Post. A layout this renderer will not send, or one
-// Chat's API refuses, is ErrLayoutRefused, so the gateway posts the text
-// instead (Gateway.chatOutcome); a failed call is returned as it is.
+// with no chat message is Post, or postStopLine for a running task's line
+// (gchat_stop.go; a laid-out line is only ever an edit, so m.Stop is read
+// on EditMessage alone for one), or postRatedText for a rated answer. A
+// layout this renderer will not send, or one Chat's API refuses, is
+// ErrLayoutRefused, so the gateway posts the text instead
+// (Gateway.chatOutcome); a failed call is returned as it is.
 func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil && m.Stop != "" {
+		return a.postStopLine(conversation, m.Text, m.Stop)
+	}
+	if m.Chat == nil && a.rates(m) {
+		return a.postRatedText(conversation, m)
+	}
 	if m.Chat == nil {
 		return a.Post(conversation, m.Text)
 	}
@@ -550,7 +565,10 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 
 // createLaidOut lays m.Chat out and creates it in space, as a reply on
 // thread when one is given, and remembers it when it carries choices,
-// bound to conversation (empty for a home post).
+// bound to conversation (empty for a home post). A rated answer in a
+// conversation ends with the rating buttons; when Chat refuses that layout
+// it is created once more without them, and that outcome is returned. The
+// question is remembered without the rating buttons.
 func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
 	layout, err := renderGchatChat(m.Chat)
 	if err != nil {
@@ -559,9 +577,24 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if conversation == "" {
 		layout = gchatHomeButtons(layout)
 	}
-	message, landed, err = a.create(space, thread, gchatLayoutBody(layout))
+	var rating gchatRating
+	if conversation != "" && a.rates(m) {
+		rating.task = m.Feedback
+	}
+	rated := gchatChatLayout{Text: layout.Text, Widgets: gchatWithRating(layout.Widgets, rating)}
+	message, landed, err = a.create(space, thread, gchatLayoutBody(rated))
 	if err != nil {
-		return "", "", gchatLayoutError(err, false)
+		err = gchatLayoutError(err, false)
+		if rating.task == "" || !errors.Is(err, ErrLayoutRefused) {
+			return "", "", err
+		}
+		rating = gchatRating{}
+		if message, landed, err = a.create(space, thread, gchatLayoutBody(layout)); err != nil {
+			return "", "", gchatLayoutError(err, false)
+		}
+	}
+	if rating.task != "" {
+		a.rememberRating(message, rating)
 	}
 	a.trackQuestion(message, conversation, m.Chat, layout)
 	return message, landed, nil
@@ -616,7 +649,11 @@ func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutM
 // under conversation, or under no conversation for a home post. A re-ask whose
 // layout is refused forgets the earlier answer, since the notifier's text
 // edit follows and must not carry the answer's line; one that fails with the
-// message left as it was keeps the answer the message still shows.
+// message left as it was keeps the answer the message still shows. A
+// running task's line (m.Stop) takes the Stop button after its own buttons.
+// A text line Chat refuses with the button is patched once more without it;
+// a laid-out line's refusal is the layout's, answered as any refused layout
+// is (the relay edits the text instead, which then takes this path).
 func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMessage) error {
 	layout := gchatChatLayout{Text: toGchatText(m.Text)}
 	asks := m.Chat != nil && len(m.Chat.Choices) > 0
@@ -632,13 +669,30 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 			layout = gchatHomeButtons(layout)
 		}
 	}
+	// Under the message's rewrite lock, so a rating tap's patch never lands
+	// over this one and a tap after it redraws what it left.
+	defer a.lockRewrite(messageID)()
 	layout = a.answeredLayout(messageID, m, layout)
-	arguments := map[string]any{
-		"name":       messageID,
-		"updateMask": gchatLayoutUpdateMask,
-		"body":       gchatLayoutBody(layout),
+	if m.Stop != "" {
+		layout = gchatStopButtons(layout, conversation, m.Stop)
 	}
-	if err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil); err != nil {
+	patch := func(layout gchatChatLayout) error {
+		return a.apiCall([]string{"spaces", "messages"}, "patch", map[string]any{
+			"name":       messageID,
+			"updateMask": gchatLayoutUpdateMask,
+			"body":       gchatLayoutBody(layout),
+		}, nil)
+	}
+	err := patch(layout)
+	if err != nil && m.Stop != "" && m.Chat == nil && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
+		// The text line once more without the button, under the same
+		// lock: a second entry here would wait on it for good.
+		a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
+		m.Stop = ""
+		layout = a.answeredLayout(messageID, m, gchatChatLayout{Text: toGchatText(m.Text)})
+		err = patch(layout)
+	}
+	if err != nil {
 		err = gchatLayoutError(err, true)
 		if asks && errors.Is(err, ErrLayoutRefused) {
 			a.forgetAnswer(messageID)

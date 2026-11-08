@@ -8,10 +8,13 @@ is the same trio redding everyone (#1278) or their own ImagePullBackOff.
 This is the health job answering that on the pull request itself, every
 tick, for the runs that finished since the last tick:
 
-    ### ❌ Smoke gate: failed · 3 of 14 cases
-    > 🔴 Gate outage in progress since Sun 7:30 AM ET. ... not your code.
-    | Case | Result | Also failing on |
-    11 cases passed. Run 132 min on evals-23 · build log
+    ### ❌ Smoke gate: failed
+    > 🔴 Gate outage in progress since Sun 7:30 AM ET: ... not your code.
+    Run 132 min · build log
+
+The pull request is public, so the comment names no case and prints no
+count, reason or pool project: which cases failed, how many repetitions and
+why are on the dashboard's run page behind the link, for a project reader.
 
 Which runs: pull-kube-agents-smoke-test builds in data.json that finished
 after the state file's `last_comment_tick` (data.json's horizon at the last
@@ -47,12 +50,12 @@ A run the suite itself could not evaluate (`runs[].eval_outcome`,
 SCHEMA.md: an admitted case, or every case, lost every repetition to
 infrastructure, so the job exited 2) is not a red either, whatever Prow's
 FAILURE and the final line's `Failed` word say: `is_red` is false for it,
-and it gets the same one-line shape naming the cases the suite listed in
-`runs[].not_evaluated`, that nothing was graded for them, that nothing
-about the change is implied, and to retest once the environment is healthy:
+and it gets the same one-line shape: that some cases lost every repetition
+to infrastructure, that nothing was graded for them, that nothing about the
+change is implied, and to retest once the environment is healthy:
 
     ### ⚪ Smoke gate: run not evaluated
-    > `security-overgrant-probe` lost every repetition to infrastructure ...
+    > Some cases lost every repetition to infrastructure ...
 
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
@@ -116,54 +119,54 @@ CLS_STORM = classify.CLS_STORM
 OUTCOME_PASSED = classify.OUTCOME_PASSED
 OUTCOME_PARTIAL = classify.OUTCOME_PARTIAL
 OUTCOME_FAILED = classify.OUTCOME_FAILED
-# "passed on the last N runs from other PRs" counts inside classify.py's
-# only-this-PR window.
-ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
 
 # Links. The run page and the brief are the dashboard's, written by
-# post_health.run_link and post_health.incident_link (post_health owns the
-# URL contract); the build log is Prow's Deck for this job.
+# post_health.run_link and, for the brief, brief_link below (post_health's
+# incident_link names the failing cases in the URL; this comment is public);
+# the build log is Prow's Deck for this job.
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
 # For a run that records where it lives (runs[].gcs_base): the lanes' log
 # bucket is not Deck-readable, so Spyglass shows nothing for it, while a
 # project reader opens the build in the Console's bucket browser.
 GCS_BROWSER_URL = "https://console.cloud.google.com/storage/browser/"
 GS_SCHEME = "gs://"
-# "kube-agents-evals-23" reads as "evals-23".
-PROJECT_PREFIX = "kube-agents-"
 # GitHub REST paths, relative to the repository (`gh.path` prefixes it), and
 # the page size the comment search reads; the marker search needs every
 # comment on the pull request, so it paginates from the largest page.
 COMMENTS_PATH = "issues/{pr}/comments"
 COMMENT_PATH = "issues/comments/{comment_id}"
 COMMENTS_PAGE_SIZE = 100
-UNKNOWN_PROJECT = "an unknown project"
 
 # Wording. Plain words for whoever is deciding whether to type /retest.
-HEADING = "### ❌ Smoke gate: failed · {failed} of {total} cases"
+HEADING = "### ❌ Smoke gate: failed"
 HEADING_HARD = "### ❌ Smoke gate: failed · hard failure"
-BOX_OUTAGE = "🔴 **Gate outage in progress** since {since}. {what} fail on every PR ({prs} PRs so far)."
+BOX_OUTAGE = "🔴 **Gate outage in progress** since {since}: the same cases fail on every PR ({prs} PRs so far)."
 # An OUTAGE that is not a shared break (deadline kills, #1894) names no
 # failing case; post_health's sentence for the condition says what it is.
 # It is the state's sentence whatever this run's failures are classed, and
 # during the recovering hold it must not say nothing is being graded.
 BOX_OUTAGE_OTHER = "🔴 **Gate outage in progress** since {since}. {cause}"
 BOX_RECOVERING_OTHER = "🟡 **Gate recovering** from a deadline-kill outage that began {since}: runs are reaching verdicts again, and GREEN follows 3 of them on distinct PRs."
-ALL_THEIRS_RECOVERING = "**Your {n} {failures} {are} exactly {those}, so this red is likely the gate's.** A retest is reasonable now."
+ALL_THEIRS_RECOVERING = "**Your failures are exactly the gate's, so this red is likely the gate's.** A retest is reasonable now."
 BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
+# post_health.cause_sentence names the failing cases for a shared break (the
+# Chat space reads that); the public comment gets this sentence instead.
+SHARED_BREAK_CAUSE = "the same cases fail on every PR since {since} ({prs} PRs so far). Shared test fixture, not your code."
 BOX_HEALTHY = "🟢 **Gate healthy.**"
-ALL_THEIRS = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
-SOME_THEIRS = "**{theirs} of your {n} failures {are_theirs} the gate's ({their_cases}); {yours_text}.** Fix {that}; don't retest for the rest until the gate is healthy."
-YOURS_ONLY = "{case} passed on the last {elsewhere} {runs} from other PRs and failed on your last {streak}."
+ALL_THEIRS = "**Your failures are exactly the gate's, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
+SOME_THEIRS = "**Some of your failures are the gate's; {yours_text}.** Fix those; don't retest for the rest until the gate is healthy."
+SOME_YOURS = "the rest look specific to your PR"
+SOME_UNCLEAR = "the rest are unexplained so far"
+SOME_YOURS_AND_UNCLEAR = "some of the rest look specific to your PR and some are unexplained so far"
+YOURS_ONLY = "What failed here passes on other PRs' recent runs and failed on your recent runs."
 LOOKS_YOURS = "**This looks specific to your PR.**"
-LOOK_YOURS = "**These look specific to your PR.**"
-SHARED_NO_INCIDENT = "{case} is also failing on {also} right now, so it may not be your code; no outage is declared yet."
-UNEXPLAINED = "{case} failed here and nothing on other PRs matches it yet; read the transcript."
+SHARED_NO_INCIDENT = "Part of what failed here is also failing on other PRs right now, so it may not be your code; no outage is declared yet."
+UNEXPLAINED = "Part of what failed here matches nothing on other PRs yet; read the transcript."
 HARD_FAILURE = (
     "🔴 **The run failed without a gate case failing all of its repetitions.** An absolute check tripped"
     " (a forbidden cluster change, a verifier that errored; the run's artifacts/eval-grading.log has the reason) or the log was cut short (the build log says where)."
 )
-HELD_OUT_NOTE = " {n} held-out {cases} also failed; held-out cases do not block."
+HELD_OUT_NOTE = " Held-out cases also failed; held-out cases do not block."
 LINK_RUN = "[Why this run failed →]({url})"
 LINK_BRIEF = "[Incident brief →]({url})"
 # The lost-pod comment (module docstring).
@@ -213,8 +216,8 @@ CONDITION_LOST_PODS = health.LOST_PODS
 # command itself.
 HEADING_NOT_EVALUATED = "### ⚪ Smoke gate: run not evaluated"
 BOX_NOT_EVALUATED = (
-    "{cases} lost every repetition to infrastructure before the agent could be graded{storm}."
-    " The suite could certify nothing, so Prow reports the run red; nothing was graded for {them}"
+    "Some cases lost every repetition to infrastructure before the agent could be graded{storm}."
+    " The suite could certify nothing, so Prow reports the run red; nothing was graded for them"
     " and nothing about your change is implied. Retest once the environment is healthy."
 )
 BOX_NOT_EVALUATED_EVERY = (
@@ -228,15 +231,10 @@ BOX_NOT_EVALUATED_STORM = " — a quota storm is declared on the gate right now"
 # A gate case that failed every graded repetition on the same run. The suite
 # did not count it (its roster is the branch's; the dashboard's can be
 # newer), so the heading stays ⚪, but the author is told before retesting.
-BOX_NOT_EVALUATED_COLLAPSED = " {cases} also failed every graded repetition here; read {its} transcript before retesting."
-FOOTER_NOT_EVALUATED = "Ran {minutes} min on {project} · [build log]({url})"
+BOX_NOT_EVALUATED_COLLAPSED = " Other cases also failed every graded repetition here; read their transcripts before retesting."
+FOOTER_NOT_EVALUATED = "Ran {minutes} min · [build log]({url})"
 CONDITION_STORM = health.STORM
-TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
-TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
-HELD_OUT_CELL = " (held out)"
-FOOTER = "{passed} {cases} passed. Run {minutes} min on {project} · [build log]({url})"
-NO_OTHER_PR = "no other PR"
-OTHER_PRS = "{n} other {prs}"
+FOOTER = "Run {minutes} min · [build log]({url})"
 
 UTC = timezone.utc
 
@@ -327,86 +325,41 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
     return [newest[pr] for pr in sorted(newest)]
 
 
-def elsewhere_and_streak(case: str, red: Red, runs: list[dict]) -> tuple[int, int]:
-    """How many other-PR runs in the last day passed `case`, and how many of
-    this PR's newest runs in a row (this one included) collapsed it."""
-    finish = red.run.finished
-    elsewhere = 0
-    mine = []
-    for raw in runs:
-        other = health.Run(raw)
-        if not other.finished or not other.full or other.finished > finish:
-            continue
-        if other.pr == red.run.pr:
-            mine.append(other)
-        elif finish - ONLY_PR_WINDOW <= other.finished and case in other.passing_cases():
-            elsewhere += 1
-    streak = 0
-    for own in sorted(mine, key=lambda r: r.finished, reverse=True):
-        if case in own.collapsed_cases():
-            streak += 1
-        else:
-            break
-    return elsewhere, streak
-
-
 # --------------------------------------------------------------------------- #
 # Rendering (GitHub Markdown)
 # --------------------------------------------------------------------------- #
 
 
-def code(case: str) -> str:
-    return f"`{case}`"
+def cause_text(health_doc: dict) -> str:
+    """post_health.cause_sentence, except that a shared break names no case."""
+    if health_doc.get("condition") == health.SHARED_BREAK:
+        incident = health_doc.get("incident") or {}
+        return SHARED_BREAK_CAUSE.format(since=post_health.clock(post_health.parse_iso(health_doc.get("since"))), prs=len(incident.get("prs") or []))
+    return post_health.cause_sentence(health_doc)
 
 
-def join_names(cases: list[dict]) -> str:
-    names = [code(c["case"]) for c in cases]
-    if len(names) <= 1:
-        return "".join(names)
-    return ", ".join(names[:-1]) + " and " + names[-1]
+def brief_link(health_doc: dict) -> str:
+    """The incident brief's URL with no case names in it: post_health's
+    incident_link lists the failing cases in the query string, and this
+    comment is public."""
+    return post_health.dashboard_link(post_health.DASHBOARD_VIEW_GATE, [], post_health.parse_iso(health_doc.get("since")), None)
 
 
-def also_text(count) -> str:
-    count = len(count) if isinstance(count, (list, set, tuple)) else int(count or 0)
-    return OTHER_PRS.format(n=count, prs=plural(count, "PR")) if count else NO_OTHER_PR
-
-
-def result_cell(case: dict) -> str:
-    reps = case.get("reps") or {}
-    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0) + reps.get("fixture", 0)
-    cell = f"{reps.get('pass', 0)} / {total} reps"
-    notes = []
-    if reps.get("infra"):
-        notes.append(f"{reps['infra']} infra")
-    if reps.get("ceiling"):
-        notes.append(f"{reps['ceiling']} at the delegation ceiling")
-    if reps.get("fixture"):
-        notes.append(f"{reps['fixture']} not run, fixture drifted")
-    if notes:
-        cell += f" ({', '.join(notes)})"
-    return cell
-
-
-def capitalize(text: str) -> str:
-    return text[:1].upper() + text[1:] if text else text
-
-
-def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
+def health_box(red: Red, health_doc: dict) -> str:
     """The paragraph that answers "is it me?"."""
     state = health_doc.get("state")
     incident = state not in (None, health.GREEN)
     since = post_health.parse_iso(health_doc.get("since"))
     links = [LINK_RUN.format(url=post_health.run_link(red.run.build_id))]
     if incident:
-        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+        links.append(LINK_BRIEF.format(url=brief_link(health_doc)))
     if red.hard:
         text = HARD_FAILURE
         if red.held_out_failed:
-            text += HELD_OUT_NOTE.format(n=len(red.held_out_failed), cases=plural(len(red.held_out_failed), "case"))
+            text += HELD_OUT_NOTE
         return f"> {text} {' · '.join(links)}"
 
     theirs, yours, unclear = red.theirs(), red.yours(), red.unclear()
-    n = len(red.failed)
     sentences = []
     incident_doc = health_doc.get("incident") or {}
     recovering = bool(health_doc.get("recovering"))
@@ -414,67 +367,40 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     if other_outage:
         # Dated from the outage's first kill, as the deadline comment is.
         start = post_health.parse_iso(incident_doc.get("first_kill") or incident_doc.get("window_start")) or since
-        sentences.append((BOX_RECOVERING_OTHER if recovering else BOX_OUTAGE_OTHER).format(since=post_health.clock(start, weekday=True), cause=post_health.cause_sentence(health_doc)))
+        sentences.append((BOX_RECOVERING_OTHER if recovering else BOX_OUTAGE_OTHER).format(since=post_health.clock(start, weekday=True), cause=cause_text(health_doc)))
     if incident and theirs:
         if state == health.OUTAGE and health_doc.get("condition") == health.SHARED_BREAK:
             prs = len(incident_doc.get("prs") or [])
-            sentences.append(BOX_OUTAGE.format(since=post_health.clock(since, weekday=True), what=capitalize(post_health.describe_cases(health_doc.get("failing_cases"))), prs=prs))
+            sentences.append(BOX_OUTAGE.format(since=post_health.clock(since, weekday=True), prs=prs))
         elif not other_outage:
-            sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
+            sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=cause_text(health_doc)))
         if not yours and not unclear:
-            theirs_all = ALL_THEIRS_RECOVERING if other_outage and recovering else ALL_THEIRS
-            sentences.append(theirs_all.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
+            sentences.append(ALL_THEIRS_RECOVERING if other_outage and recovering else ALL_THEIRS)
         else:
-            yours_text = []
-            if yours:
-                yours_text.append(f"{len(yours)} ({join_names(yours)}) {plural(len(yours), 'looks', 'look')} specific to your PR")
-            if unclear:
-                yours_text.append(f"{len(unclear)} ({join_names(unclear)}) {plural(len(unclear), 'is', 'are')} unexplained so far")
-            sentences.append(
-                SOME_THEIRS.format(
-                    theirs=len(theirs),
-                    n=n,
-                    are_theirs=plural(len(theirs), "is", "are"),
-                    their_cases=join_names(theirs),
-                    yours_text=" and ".join(yours_text),
-                    that=plural(len(yours) + len(unclear), "that one", "those"),
-                )
-            )
+            yours_text = SOME_YOURS_AND_UNCLEAR if (yours and unclear) else (SOME_YOURS if yours else SOME_UNCLEAR)
+            sentences.append(SOME_THEIRS.format(yours_text=yours_text))
     else:
         if not other_outage:
-            sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
-        for case in theirs:
-            sentences.append(SHARED_NO_INCIDENT.format(case=code(case["case"]), also=also_text(case.get("also_failing_prs"))))
-        for case in yours:
-            elsewhere, streak = elsewhere_and_streak(case["case"], red, runs)
-            sentences.append(YOURS_ONLY.format(case=code(case["case"]), elsewhere=elsewhere, runs=plural(elsewhere, "run"), streak=streak))
+            sentences.append(BOX_HEALTHY if not incident else BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=cause_text(health_doc)))
+        if theirs:
+            sentences.append(SHARED_NO_INCIDENT)
         if yours:
-            sentences.append(LOOKS_YOURS if len(yours) == 1 else LOOK_YOURS)
-        for case in unclear:
-            sentences.append(UNEXPLAINED.format(case=code(case["case"])))
+            sentences.append(YOURS_ONLY)
+            sentences.append(LOOKS_YOURS)
+        if unclear:
+            sentences.append(UNEXPLAINED)
     return "> " + " ".join(sentences + [" · ".join(links)])
 
 
-def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
-    total = len(red.graded)
-    lines = [MARKER, HEADING_HARD if red.hard else HEADING.format(failed=len(red.failed), total=total), "", health_box(red, health_doc, runs), ""]
-    rows = red.failed + red.held_out_failed
-    if rows:
-        lines.append(TABLE_HEAD)
-        for case in rows:
-            note = "" if case["admitted"] else HELD_OUT_CELL
-            lines.append(TABLE_ROW.format(case=case["case"], note=note, result=result_cell(case), also=also_text(case.get("also_failing_prs"))))
-        lines.append("")
+def render_comment(red: Red, health_doc: dict) -> str:
+    lines = [MARKER, HEADING_HARD if red.hard else HEADING, "", health_box(red, health_doc), ""]
     # No grading text: the check's reason (`reps[].reason`) and the agent's
     # words (`reps[].excerpt`) are the detail the smoke keeps off the public
     # record (docs/ci-health.md, "The smoke lanes log to"). The run link in
     # the box carries both for a project reader.
-    project = red.raw.get("project") or UNKNOWN_PROJECT
-    project = project.removeprefix(PROJECT_PREFIX)
     wall = red.run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"
-    passed = red.passed
-    lines.append(FOOTER.format(passed=passed, cases=plural(passed, "case"), minutes=minutes, project=project, url=build_url(red.run)))
+    lines.append(FOOTER.format(minutes=minutes, url=build_url(red.run)))
     return "\n".join(lines) + "\n"
 
 
@@ -496,7 +422,7 @@ def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
     tail = BOX_DEADLINE_DOWN.format(**counts) if down else BOX_DEADLINE_RECOVERING.format(**counts) if recovering else BOX_DEADLINE_QUIET
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if on:
-        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+        links.append(LINK_BRIEF.format(url=brief_link(health_doc)))
     box = BOX_DEADLINE.format(minutes=int(health.PROW_JOB_TIMEOUT.total_seconds() // 60), when=post_health.clock(run.finished)) + tail
     wall = run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"
@@ -521,7 +447,7 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     node = f" ({run.pod_node})" if run.pod_node else ""
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if in_event:
-        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+        links.append(LINK_BRIEF.format(url=brief_link(health_doc)))
     box = BOX_LOST.format(when=post_health.clock(run.finished), node=node, event=event)
     wall = run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"
@@ -536,11 +462,11 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dict, project: str | None = None) -> str:
-    """The not-evaluated comment: the cases the suite could not grade, that
+def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dict) -> str:
+    """The not-evaluated comment: that cases the suite could not grade were
+    lost to infrastructure (unnamed: the pull request is public), that
     nothing about the change is implied, and when to retest -- with the
-    storm named while health.json's condition is `storm`. `project` is the
-    raw record's (health.Run does not carry it)."""
+    storm named while health.json's condition is `storm`."""
     in_storm = health_doc.get("condition") == CONDITION_STORM and health_doc.get("state") != health.GREEN
     storm = BOX_NOT_EVALUATED_STORM if in_storm else ""
     lost = list(verdict.get("not_evaluated") or run.not_evaluated_cases)
@@ -548,24 +474,22 @@ def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dic
     if lost and recorded and recorded <= set(lost):
         box = BOX_NOT_EVALUATED_EVERY.format(storm=storm)
     else:
-        named = join_names([{"case": c} for c in lost]) or "An admitted case"
-        box = BOX_NOT_EVALUATED.format(cases=named, storm=storm, them=plural(len(lost) or 1, "it", "them"))
+        box = BOX_NOT_EVALUATED.format(storm=storm)
     collapsed = [c for c in verdict.get("cases") or [] if c.get("outcome") == OUTCOME_FAILED and c.get("admitted", True)]
     if collapsed:
-        box += BOX_NOT_EVALUATED_COLLAPSED.format(cases=join_names(collapsed), its=plural(len(collapsed), "its", "their"))
+        box += BOX_NOT_EVALUATED_COLLAPSED
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if in_storm:
-        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+        links.append(LINK_BRIEF.format(url=brief_link(health_doc)))
     wall = run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"
-    project = (project or UNKNOWN_PROJECT).removeprefix(PROJECT_PREFIX)
     lines = [
         MARKER,
         HEADING_NOT_EVALUATED,
         "",
         f"> {box} {' · '.join(links)}",
         "",
-        FOOTER_NOT_EVALUATED.format(minutes=minutes, project=project, url=build_url(run)),
+        FOOTER_NOT_EVALUATED.format(minutes=minutes, url=build_url(run)),
     ]
     return "\n".join(lines) + "\n"
 
@@ -640,12 +564,12 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
         elif run.not_evaluated:
             admitted = roster.at(run.started or run.finished)
             verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
-            body = render_not_evaluated_comment(run, verdict, health_doc, project=raw.get("project"))
+            body = render_not_evaluated_comment(run, verdict, health_doc)
         else:
             admitted = roster.at(run.started or run.finished)
             verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
             red = Red(raw, verdict, admitted)
-            body = render_comment(red, health_doc, runs)
+            body = render_comment(red, health_doc)
         rendered.append((run.pr, run.build_id, body))
         known = entry.get("comment_id")
         comment_id = post(gh, run.pr, body, known)

@@ -71,6 +71,9 @@ readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
 # helpers. tests/test_upgrade_script.py checks the two agree.
 readonly BREAKING_CHANGE_SUBJECT_REGEX='^[a-z]+(\([^)]+\))?!:'
 readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+'
+# The site's rollback page, which a refused downgrade names: it has the steps a
+# breaking change asks for, such as going through `today` first.
+readonly ROLLBACK_DOC="https://gke-labs.github.io/kube-agents/deploy/rollback/"
 # The downgrade check reads commit messages and ancestry only, so a history it
 # has to fetch carries commits and no trees or file contents.
 readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
@@ -1385,6 +1388,7 @@ check_downgrade() {
     return 0
   fi
   print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to move anyway."
+  print_info "Rolling back a release (${ROLLBACK_DOC}) has the steps a breaking change can need, such as going through today first."
   exit 1
 }
 

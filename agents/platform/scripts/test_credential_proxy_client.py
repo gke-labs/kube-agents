@@ -7,7 +7,6 @@ reaches the right cluster - or is rejected outright.
 Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 """
 
-import base64
 import http.client
 import http.server
 import io
@@ -968,376 +967,32 @@ class StdinGateTest(unittest.TestCase):
         self.assertEqual(captured["body"]["stdin"], "kind: X\n")
 
 
-class WorkspaceClientTest(unittest.TestCase):
-    """The client half of content-passing. No path crosses this boundary."""
+class VcsCallErrorTest(unittest.TestCase):
+    """`vcs_call` hands a refusal through whole, and tells "not built" from "no"."""
 
-    def setUp(self):
-        self.endpoint = "http://127.0.0.1:8765"
-        self.calls = []
+    endpoint = "http://127.0.0.1:8765"
 
-    def _serve(self, answers):
-        # `open_broker_request`, not `urlopen`: the workspace routes go through
-        # the client's own opener so that a clone that legitimately runs for
-        # minutes is not cut off by a total socket timeout.
-        def fake_open(request, *args, **kwargs):
-            body = json.loads(request.data)
-            self.calls.append((request.full_url, body))
-            verb = request.full_url.rsplit("/", 1)[-1]
-            return RecordingResponse(json.dumps(answers[verb]).encode())
-
-        return patch.object(credential_proxy_client, "open_broker_request", fake_open)
-
-    def test_open_commit_push_close(self):
-        answers = {
-            "open": {
-                "handle": "a" * 32,
-                "repo": "acme/infra",
-                "base": "main",
-                "baseSha": "b" * 40,
-            },
-            "commit": {
-                "committed": True,
-                "branch": "fix/x",
-                "base": "main",
-                "baseSha": "c" * 40,
-                "commit": "d" * 40,
-            },
-            "push": {"pushed": True, "branch": "fix/x", "commit": "d" * 40},
-            "close": {"closed": True},
-        }
-        with self._serve(answers):
-            with credential_proxy_client.Workspace.open(
-                self.endpoint, "acme/infra"
-            ) as workspace:
-                workspace.commit(
-                    branch="fix/x",
-                    message="m",
-                    changes={"a.yaml": b"kind: X\n", "gone.yaml": None},
-                    expected_base_sha=workspace.base_sha,
-                )
-                workspace.push()
-
-        verbs = [url.rsplit("/", 1)[-1] for url, _ in self.calls]
-        self.assertEqual(verbs, ["open", "commit", "push", "close"])
-        commit_body = self.calls[1][1]
-        self.assertEqual(commit_body["expectedBaseSha"], "b" * 40)
-        entries = {entry["path"]: entry for entry in commit_body["changes"]}
-        self.assertEqual(
-            base64.b64decode(entries["a.yaml"]["contentBase64"]), b"kind: X\n"
-        )
-        self.assertTrue(entries["gone.yaml"]["delete"])
-        self.assertNotIn("contentBase64", entries["gone.yaml"])
-
-    def test_the_branch_lease_follows_the_workspace_across_rounds(self):
-        """Round two must expect what round one pushed, not what `open` saw.
-
-        The broker defaults the expectation, so the client sends nothing; what
-        it owes is the tracked value, which a caller reads to decide whether
-        the branch it is about to write is the one it last saw.
-        """
-        answers = {
-            "open": {
-                "handle": "a" * 32,
-                "repo": "acme/infra",
-                "base": "main",
-                "baseSha": "b" * 40,
-                "branchSha": "e" * 40,
-            },
-            "commit": {
-                "committed": True,
-                "branch": "fix/x",
-                "base": "main",
-                "baseSha": "c" * 40,
-                "branchSha": "e" * 40,
-                "commit": "d" * 40,
-            },
-            "push": {
-                "pushed": True,
-                "branch": "fix/x",
-                "commit": "d" * 40,
-                "branchSha": "d" * 40,
-            },
-            "close": {"closed": True},
-        }
-        with self._serve(answers):
-            with credential_proxy_client.Workspace.open(
-                self.endpoint, "acme/infra", branch="fix/x"
-            ) as workspace:
-                self.assertEqual("e" * 40, workspace.branch_sha)
-                workspace.commit(
-                    branch="fix/x", message="m", changes={"a.yaml": b"kind: X\n"}
-                )
-                self.assertNotIn("expectedBranchSha", self.calls[1][1])
-                workspace.push()
-                self.assertEqual("d" * 40, workspace.branch_sha)
-
-        # A caller that learned the sha elsewhere overrides the broker's default.
-        self.calls.clear()
-        with self._serve(answers):
-            with credential_proxy_client.Workspace.open(
-                self.endpoint, "acme/infra"
-            ) as workspace:
-                workspace.commit(
-                    branch="fix/x",
-                    message="m",
-                    changes={"a.yaml": b"kind: X\n"},
-                    expected_branch_sha="f" * 40,
-                )
-        self.assertEqual("f" * 40, self.calls[1][1]["expectedBranchSha"])
-
-    def test_a_disabled_broker_is_distinguishable_from_a_refusal(self):
-        """Callers that can do either need to tell "off" from "no"."""
-
-        def disabled(request, *args, **kwargs):
+    @staticmethod
+    def _refuse(status, answer):
+        def refuse(request, *args, **kwargs):
             raise urllib.error.HTTPError(
-                request.full_url,
-                404,
-                "Not Found",
-                {},
-                io.BytesIO(
-                    json.dumps(
-                        {"error": "not enabled", "code": "CONTENT_WORKSPACES_DISABLED"}
-                    ).encode()
-                ),
+                request.full_url, status, "refused", {}, io.BytesIO(json.dumps(answer).encode())
             )
 
-        with patch.object(credential_proxy_client, "open_broker_request", disabled):
-            with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
-                credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
-            self.assertFalse(credential_proxy_client.workspaces_available(self.endpoint))
-
-    def test_an_unauthenticated_caller_is_not_told_workspaces_are_armed(self):
-        """401 answers about the caller, not about the route.
-
-        The broker rejects an unauthenticated request before it looks at the
-        path, so treating any non-404 as proof the feature exists reports armed
-        workspaces on a broker that never reached the question. A sandbox with no
-        token file did exactly that live, then failed on the first real verb.
-        """
-
-        def unauthorized(request, *args, **kwargs):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                401,
-                "Unauthorized",
-                {},
-                io.BytesIO(
-                    json.dumps({"error": "caller could not be authenticated"}).encode()
-                ),
-            )
-
-        with patch.object(credential_proxy_client, "open_broker_request", unauthorized):
-            self.assertFalse(
-                credential_proxy_client.workspaces_available(self.endpoint)
-            )
+        return patch.object(credential_proxy_client, "open_broker_request", refuse)
 
     def test_a_refusal_carries_the_brokers_answer_through(self):
-        def conflict(request, *args, **kwargs):
-            raise urllib.error.HTTPError(
-                request.full_url,
-                409,
-                "Conflict",
-                {},
-                io.BytesIO(
-                    json.dumps(
-                        {
-                            "error": "the base branch moved",
-                            "code": "BASE_MOVED",
-                            "paths": ["manifests/app.yaml"],
-                        }
-                    ).encode()
-                ),
-            )
-
-        with patch.object(credential_proxy_client, "open_broker_request", conflict):
-            with self.assertRaises(
-                credential_proxy_client.WorkspaceRequestError
-            ) as caught:
-                credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
+        answer = {"error": "the base branch moved", "code": "BASE_MOVED", "paths": ["manifests/app.yaml"]}
+        with self._refuse(409, answer), self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+            credential_proxy_client.vcs_call(self.endpoint, "publish", {})
         self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(caught.exception.payload["code"], "BASE_MOVED")
-        self.assertEqual(
-            caught.exception.payload["paths"], ["manifests/app.yaml"]
-        )
+        self.assertEqual(caught.exception.payload, answer)
+        self.assertEqual(str(caught.exception), "the base branch moved")
 
-    def test_push_before_commit_is_refused_client_side(self):
-        answers = {
-            "open": {
-                "handle": "a" * 32,
-                "repo": "acme/infra",
-                "base": "main",
-                "baseSha": "b" * 40,
-            },
-            "close": {"closed": True},
-        }
-        with self._serve(answers):
-            workspace = credential_proxy_client.Workspace.open(
-                self.endpoint, "acme/infra"
-            )
-            with self.assertRaises(ValueError):
-                workspace.push()
-
-
-class WorkspaceReadVerbsTest(unittest.TestCase):
-    """The read half: what the client sends, and what it refuses to hide.
-
-    Every verb here can answer partially -- a listing that stopped at the
-    broker's ceiling, a batch that dropped a file, a search that hit its match
-    cap. A client that returns only the payload and drops the "and there is
-    more" flag turns each of those into a wrong conclusion about the
-    repository, so each test asserts the flag survives the call.
-    """
-
-    HANDLE = "a" * 32
-
-    def setUp(self):
-        self.endpoint = "http://127.0.0.1:8765"
-        self.calls = []
-
-    def _workspace(self, answers, **opened):
-        def fake_open(request, *args, **kwargs):
-            body = json.loads(request.data)
-            verb = request.full_url.rsplit("/", 1)[-1]
-            self.calls.append((verb, body))
-            answer = answers[verb]
-            if isinstance(answer, list):
-                answer = answer[sum(1 for call in self.calls if call[0] == verb) - 1]
-            return RecordingResponse(json.dumps(answer).encode())
-
-        answers.setdefault(
-            "open",
-            {
-                "handle": self.HANDLE,
-                "repo": "acme/infra",
-                "base": "main",
-                "baseSha": "b" * 40,
-                **opened,
-            },
-        )
-        patcher = patch.object(
-            credential_proxy_client, "open_broker_request", fake_open
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
-
-    def test_a_shallow_open_names_its_depth_and_says_it_is_shallow(self):
-        workspace = self._workspace({}, shallow=True, startedFrom="origin/main")
-        self.assertTrue(workspace.shallow)
-        self.assertEqual("origin/main", workspace.started_from)
-
-        # `depth` and `branch` reach the wire only when asked for; an ordinary
-        # open must stay the payload the broker has always accepted.
-        self.assertEqual({"repo": "acme/infra"}, self.calls[0][1])
-        credential_proxy_client.Workspace.open(
-            self.endpoint, "acme/infra", branch="fix/x", depth=1
-        )
-        self.assertEqual(
-            {"repo": "acme/infra", "branch": "fix/x", "depth": 1}, self.calls[1][1]
-        )
-
-    def test_an_open_labels_itself_with_the_card_or_session_it_runs_under(self):
-        self._workspace({})
-        card = {"HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_SESSION_ID": "20260925_001944_b09c64"}
-        with patch.dict(os.environ, card):
-            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
-            self.assertEqual({"repo": "acme/infra", "caller": "t_f660e9c5"}, self.calls[-1][1])
-            # The card outranks the session; without a card the session is the label.
-            del os.environ["HERMES_KANBAN_TASK"]
-            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
-            self.assertEqual("20260925_001944_b09c64", self.calls[-1][1]["caller"])
-            # An explicit label wins over both.
-            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra", caller="explicit-1")
-            self.assertEqual("explicit-1", self.calls[-1][1]["caller"])
-        # A value the broker would refuse is dropped, not sent: the label is
-        # for the log and must never be what fails an open.
-        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "not a token", "HERMES_SESSION_ID": ""}):
-            credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
-            self.assertEqual({"repo": "acme/infra"}, self.calls[-1][1])
-
-    def test_a_batch_read_hands_back_what_it_did_not_read(self):
-        workspace = self._workspace(
-            {
-                "read": {
-                    "files": [
-                        {
-                            "path": "a.yaml",
-                            "contentBase64": base64.b64encode(b"kind: A\n").decode(),
-                        }
-                    ],
-                    "skipped": [{"path": "big.yaml", "reason": "tooLarge", "size": 9999}],
-                }
-            }
-        )
-        files, skipped = workspace.read_many(["a.yaml", "big.yaml"])
-        self.assertEqual({"a.yaml": b"kind: A\n"}, files)
-        self.assertEqual([{"path": "big.yaml", "reason": "tooLarge", "size": 9999}], skipped)
-        # One round trip, on the same verb as the single read, keyed on `paths`.
-        self.assertEqual(
-            ("read", {"handle": self.HANDLE, "paths": ["a.yaml", "big.yaml"]}),
-            self.calls[1],
-        )
-
-    def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
-        workspace = self._workspace(
-            {
-                "list": [
-                    {"entries": ["a/0.yaml", "a/1.yaml"], "total": 3, "truncated": True},
-                    {
-                        "entries": ["a/2.yaml"],
-                        "symlinks": ["a/1b.yaml"],
-                        "symlinkedDirectories": [{"path": "a/linked", "target": "../b"}],
-                        "total": 1,
-                        "truncated": False,
-                    },
-                ]
-            }
-        )
-        first = workspace.list(prefix="a")
-        self.assertEqual(["a/0.yaml", "a/1.yaml"], list(first))
-        self.assertTrue(first.truncated)
-        self.assertEqual(3, first.total)
-        # A broker older than the field reports no symlinks rather than failing.
-        self.assertEqual([], first.symlinks)
-        self.assertEqual([], first.symlinked_directories)
-
-        second = workspace.list(prefix="a", after=first[-1])
-        self.assertFalse(second.truncated)
-        self.assertEqual(["a/1b.yaml"], second.symlinks)
-        self.assertEqual(
-            [{"path": "a/linked", "target": "../b"}], second.symlinked_directories
-        )
-        self.assertEqual(
-            {"handle": self.HANDLE, "prefix": "a", "after": "a/1.yaml"},
-            self.calls[2][1],
-        )
-
-    def test_grep_returns_the_ceiling_alongside_the_matches(self):
-        workspace = self._workspace(
-            {
-                "grep": {
-                    "matches": [{"path": "a.yaml", "line": 3, "text": "nginx"}],
-                    "total": 1,
-                    "truncated": True,
-                }
-            }
-        )
-        result = workspace.grep("nginx")
-        self.assertTrue(result["truncated"])
-        # Fixed-string is the default, so neither flag is sent unless asked for.
-        self.assertEqual({"handle": self.HANDLE, "pattern": "nginx"}, self.calls[1][1])
-
-        workspace.grep("kind: (Deployment|Service)", prefix="manifests", regex=True, ignore_case=True)
-        self.assertEqual(
-            {
-                "handle": self.HANDLE,
-                "pattern": "kind: (Deployment|Service)",
-                "prefix": "manifests",
-                "regex": True,
-                "ignoreCase": True,
-            },
-            self.calls[2][1],
-        )
+    def test_a_broker_without_version_control_is_distinguishable_from_a_refusal(self):
+        with self._refuse(404, {"error": "not available", "code": "VCS_UNAVAILABLE"}):
+            with self.assertRaises(credential_proxy_client.WorkspaceUnavailable):
+                credential_proxy_client.vcs_call(self.endpoint, "snapshot", {})
 
 
 class TestCallerCredential(SubmittedPayloadTestCase):
@@ -2805,6 +2460,12 @@ BUSY_SLOT = {
     "bound": "slot",
     "error": "the credential proxy is at its limit of 8 concurrent commands",
 }
+BUSY_DRAINING = {
+    "status": "busy",
+    "code": "CREDENTIAL_PROXY_BUSY",
+    "bound": "draining",
+    "error": "the credential proxy is stopping",
+}
 BUSY_SESSION = {
     "status": "busy",
     "code": "CREDENTIAL_PROXY_BUSY",
@@ -3220,6 +2881,31 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertLessEqual(self.sleeps[0], 4.0)
         self.assertEqual(2, len(err.getvalue().strip().splitlines()))
 
+    def test_a_draining_refusal_drops_the_pooled_connections_before_the_retry(self):
+        # A draining exec pod answers on the caller's keep-alive connection to
+        # its Envoy; only a new connection reaches another replica.
+        class ClosingHttp(self.ScriptedHttp):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.events = []
+
+            def get(self, url, **kwargs):
+                self.events.append("get")
+                return super().get(url, **kwargs)
+
+            def close(self):
+                self.events.append("close")
+
+        ok = self.Response(200, {"timeSeries": []})
+        draining = ClosingHttp([self.Response(503, BUSY_DRAINING), ok])
+        slot = ClosingHttp([self.Response(503, BUSY_SLOT), ok])
+        for http_ in (draining, slot):
+            session = credential_proxy_client.ApiSession(http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3))
+            with patch("sys.stderr", new=io.StringIO()):
+                self.assertIs(ok, session.get(self.URL))
+        self.assertEqual(["get", "close", "get"], draining.events)
+        self.assertEqual(["get", "get"], slot.events)
+
     def test_a_broker_that_stays_busy_hands_back_its_last_answer(self):
         busy = self.Response(503, BUSY_SLOT)
         http_, session = self.session([busy])
@@ -3275,6 +2961,124 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         http_, session = self.session(["upstream-response"])
         self.assertEqual("upstream-response", session.get(self.URL))
         self.assertEqual([], self.sleeps)
+
+
+class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
+    """The exec body carries the card or session id the shim runs under, so the
+    broker can count the run's commands; absent when there is none."""
+
+    ENV = {"KUBECONFIG": "", "HERMES_KANBAN_TASK": "", "HERMES_CRON_RUN": "", "HERMES_SESSION_ID": ""}
+
+    def test_the_card_comes_first(self):
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {
+                **self.ENV, "HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_CRON_RUN": "job_7c1e2a_e6b9f0d1",
+                "HERMES_SESSION_ID": "20260925_001944_b09c64",
+            },
+        )
+        self.assertEqual("t_f660e9c5", payload["sessionId"])
+
+    def test_the_scheduled_run_comes_next(self):
+        # The ForceCommand in the shell sandbox derives this one from the run's
+        # cwd (tests/test_sandbox_session_command.py); the shim sends it.
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {**self.ENV, "HERMES_CRON_RUN": "job_7c1e2a_e6b9f0d1", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+        )
+        self.assertEqual("job_7c1e2a_e6b9f0d1", payload["sessionId"])
+
+    def test_the_session_otherwise(self):
+        payload = self.submit(["gcloud", "projects", "list"], {**self.ENV, "HERMES_SESSION_ID": "20260925_001944_b09c64"})
+        self.assertEqual("20260925_001944_b09c64", payload["sessionId"])
+
+    def test_absent_when_neither_is_set(self):
+        payload = self.submit(["gcloud", "projects", "list"], self.ENV)
+        self.assertNotIn("sessionId", payload)
+
+    def test_a_value_outside_the_grammar_is_dropped_not_sent(self):
+        payload = self.submit(["gcloud", "projects", "list"], {**self.ENV, "HERMES_SESSION_ID": "not a token"})
+        self.assertNotIn("sessionId", payload)
+        # A malformed card falls through to the session.
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {**self.ENV, "HERMES_KANBAN_TASK": "not a token", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+        )
+        self.assertEqual("20260925_001944_b09c64", payload["sessionId"])
+
+
+class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
+    """The broker's two per-session refusals print like a policy block and exit
+    EXIT_SECURITY_POLICY_BLOCKED, so the runtime does not read them as a missing
+    executable; the message is what tells the model to stop."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("valid-token\n")
+
+    def _refused_with(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        opened = []
+
+        def fake_open(req, *args, **kwargs):
+            opened.append(req)
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", http.client.HTTPMessage(), io.BytesIO(body))
+
+        stderr = io.StringIO()
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+            "HERMES_SESSION_ID": "robot-4726-a",
+        }
+        with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            with patch("sys.stderr", new=stderr):
+                code = credential_proxy_client.execute("http://proxy", ["gcloud", "projects", "list"])
+        return code, stderr.getvalue(), opened
+
+    def test_the_loop_breaker(self):
+        message = (
+            "BROKER_LOOP_BREAKER: identical command failed or was blocked 5 consecutive times in this "
+            "session; stop retrying this command and report the refusal/error."
+        )
+        code, err, opened = self._refused_with(
+            {"status": "blocked", "code": "BROKER_LOOP_BREAKER", "rule": "session.loop-breaker", "message": message}
+        )
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual(f"{message}\npolicy rule: session.loop-breaker\n", err)
+        # Refused, not retried: one request was sent, and it carried the id.
+        self.assertEqual(1, len(opened))
+        self.assertEqual("robot-4726-a", json.loads(opened[0].data)["sessionId"])
+
+    def test_the_ceiling(self):
+        message = (
+            "BROKER_SESSION_BUDGET_EXCEEDED: session exceeded 1500 tool invocations; "
+            "summarize current findings and finish the turn."
+        )
+        code, err, opened = self._refused_with(
+            {"status": "blocked", "code": "BROKER_SESSION_BUDGET_EXCEEDED", "rule": "session.tool-budget", "message": message}
+        )
+        self.assertEqual(77, code)
+        self.assertEqual(f"{message}\npolicy rule: session.tool-budget\n", err)
+        self.assertEqual(1, len(opened))
+
+    def test_an_unknown_code_is_still_a_plain_error(self):
+        code, err, _ = self._refused_with({"status": "blocked", "code": "SOMETHING_ELSE", "error": "no"})
+        self.assertEqual(1, code)
+        self.assertEqual("no\n", err)
+
+    def test_a_code_that_is_not_a_string_is_a_plain_error_and_not_a_traceback(self):
+        # Membership in the code set is asked only of a string: a JSON body
+        # whose `code` is a list or an object (not hashable) is the far
+        # side's to compose and reads as the plain error it is.
+        for code_value in (["x"], {"k": "v"}, None, 7):
+            with self.subTest(code=code_value):
+                code, err, opened = self._refused_with({"status": "blocked", "code": code_value, "error": "no"})
+                self.assertEqual(1, code)
+                self.assertEqual("no\n", err)
+                self.assertEqual(1, len(opened))
 
 
 if __name__ == "__main__":

@@ -29,6 +29,15 @@ const (
 	pwProfile = "auditor"
 	pwTier    = "read"
 	pwPod     = "auditor-read-7f9c"
+
+	// reofferPause and reofferBound pace offerAccepted: a pod that declines
+	// as busy is re-offered after the pause until the bound runs out.
+	reofferPause = 50 * time.Millisecond
+	reofferBound = 5 * time.Second
+	// busyWindowHold is how long TestEachTaskGetsItsOwnConfigAndAFreshHarness
+	// holds the first after-task reset, so the second offer is declined as
+	// busy and re-offered on every run.
+	busyWindowHold = 500 * time.Millisecond
 )
 
 // fakeDispatcher is the dispatcher's side of the hand-off: it offers,
@@ -102,6 +111,30 @@ func (d *fakeDispatcher) nextAccept(within time.Duration) lib.DispatchAccept {
 	case <-time.After(within):
 		d.t.Fatal("no answer to the offer")
 		return lib.DispatchAccept{}
+	}
+}
+
+// offerAccepted offers task and reads the answer, re-offering while the pod
+// declines as busy, as the dispatcher does with a pod still putting away
+// its last task (the after-task reset runs past the final renewal). Any
+// other decline, an answer for another task, or the bound running out fails
+// the test with the last answer. The bound covers the re-offers; each
+// answer gets its own wait of the same length, so a pod that goes silent
+// fails the test in about twice the bound.
+func (d *fakeDispatcher) offerAccepted(task string, env *lib.Envelope, acceptSeconds int) {
+	d.t.Helper()
+	deadline := time.Now().Add(reofferBound)
+	var last lib.DispatchAccept
+	for {
+		d.offer(task, env, acceptSeconds)
+		last = d.nextAccept(reofferBound)
+		if last.TaskID == task && last.Accepted {
+			return
+		}
+		if last.TaskID != task || last.Reason != declineBusy || !time.Now().Before(deadline) {
+			d.t.Fatalf("offer of %s = %+v, want an accept", task, last)
+		}
+		time.Sleep(reofferPause)
 	}
 }
 
@@ -652,19 +685,37 @@ echo "$CLAUDE_CONFIG_DIR $*" >> %s/runs
 echo '{"type":"result","subtype":"success","result":"ok"}'
 `, root))
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
 	ln, addr := readyListener(t)
+	// The first after-task reset is held, so task-two's offer lands while
+	// the worker still holds task-one and is declined as busy on every run,
+	// not only on a loaded runner: the re-offer is what the test exercises.
+	var slowOnce sync.Once
+	configRoot, resetDir := t.TempDir(), t.TempDir()
+	done := make(chan error, 1)
 	go func() {
-		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
+		done <- RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
 			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
-			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
+			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: configRoot,
+			ResetPaths: []string{resetDir},
+			resetHook: func(phase string) {
+				if phase == "after-task" {
+					slowOnce.Do(func() { time.Sleep(busyWindowHold) })
+				}
+			},
 		})
 	}()
+	// Registered after the temp dirs, so it runs before they are removed:
+	// task-two's after-task reset may still be reading resetDir.
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("the worker ended with an error: %v", err)
+		}
+	})
 	waitReady(t, addr)
 	for _, task := range []string{"task-one", "task-two"} {
-		d.offer(task, profileSubmission(t, task, "go", nil), 5)
-		d.nextAccept(5 * time.Second)
+		d.offerAccepted(task, profileSubmission(t, task, "go", nil), 5)
 		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 		if _, final := drainLeases(d, task, 20*time.Second); !final {
 			t.Fatalf("%s: no final renewal", task)
@@ -789,10 +840,7 @@ printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
 	run := func(task, text string) *lib.Task {
 		t.Helper()
 		origins[task] = profileSubmission(t, task, text, nil)
-		d.offer(task, origins[task], 5)
-		if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
-			t.Fatalf("offer of %s = %+v, want an accept", task, a)
-		}
+		d.offerAccepted(task, origins[task], 5)
 		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 		waitState(t, c, pwProfile, task, lib.StateCompleted)
 		drainLeases(d, task, time.Second)
@@ -1163,10 +1211,7 @@ esac
 	c := testClient(t, url)
 	run := func(task, text string) string {
 		t.Helper()
-		d.offer(task, profileSubmission(t, task, text, nil), 5)
-		if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
-			t.Fatalf("offer of %s = %+v, want an accept", task, a)
-		}
+		d.offerAccepted(task, profileSubmission(t, task, text, nil), 5)
 		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 		waitState(t, c, pwProfile, task, lib.StateCompleted)
 		drainLeases(d, task, time.Second)

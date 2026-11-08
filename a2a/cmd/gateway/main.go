@@ -297,7 +297,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	defer standby.Stop()
-	return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {
+	return serve(ctx, cfg, gw.Metrics(), gateway.ElectedReadiness(gw, election.View, election.Identity), log, func(ctx context.Context) error {
 		return election.Run(ctx, gw, leadAfterStandby(standby, lead))
 	})
 }

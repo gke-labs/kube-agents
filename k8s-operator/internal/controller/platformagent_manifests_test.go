@@ -1267,6 +1267,21 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
+	// The site documents CRON_IDLE_THROTTLE_DAYS and CRON_IDLE_HIBERNATE_DAYS
+	// as spec.deployment.env entries, and the opt-out for an install driven
+	// only through the A2A inject door is the throttle at 0; neither reaches
+	// the ticker except through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_IDLE_THROTTLE_DAYS", Value: "0"},
+		{Name: "CRON_IDLE_HIBERNATE_DAYS", Value: "30"},
+	})
+	if len(got) != 2 || got[0].Name != "CRON_IDLE_THROTTLE_DAYS" || got[0].Value != "0" ||
+		got[1].Name != "CRON_IDLE_HIBERNATE_DAYS" || got[1].Value != "30" {
+		t.Fatalf("expected both cron idle thresholds to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -1512,6 +1527,52 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}})
 	if len(got) != 0 {
 		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
+	}
+}
+
+// dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
+// the platform container's env, in order.
+func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
+	t.Helper()
+	pod := buildPodTemplateSpec(agent, "cfg", "fb", "settings", "policy", nil, renderOptions{})
+	container := containerByName(t, pod.Spec.Containers, "platform-agent")
+	var values []string
+	for _, env := range container.Env {
+		if env.Name == "INCIDENT_WORKLOAD_DEDUP_SECONDS" {
+			values = append(values, env.Value)
+		}
+	}
+	return values
+}
+
+func TestPlatformContainerFoldsWorkloadEventsByDefault(t *testing.T) {
+	// The window is on for every install at an hour, as the daemon's own
+	// fallback and the chart's key both say; the Deployment shows the value.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "3600" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=3600 entry, got %v", got)
+	}
+}
+
+func TestPlatformContainerDedupWindowOverrideReplacesTheDefault(t *testing.T) {
+	// A spec.deployment.env entry replaces the default rather than joining it:
+	// the API server refuses a duplicate env name, and "0" has to turn it off.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "p", ClusterName: "c", Location: "us-central1"},
+			Deployment: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "0"}},
+			},
+		},
+	}
+	if got := dedupWindowEntries(t, agent); len(got) != 1 || got[0] != "0" {
+		t.Fatalf("expected one INCIDENT_WORKLOAD_DEDUP_SECONDS=0 entry, got %v", got)
 	}
 }
 

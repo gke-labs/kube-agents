@@ -189,5 +189,37 @@ class GitHubAPITest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class HasMarkerCommentTest(unittest.TestCase):
+    """The check both sweeps use for a comment they already posted."""
+
+    MARKER = "<!-- a-sweep -->"
+    _api = GitHubAPITest._api
+
+    def test_only_a_body_that_starts_with_the_marker_counts(self):
+        api, _ = self._api([[{"body": "lgtm"}, {"body": None}, {"body": f"see {self.MARKER}"}]])
+        self.assertFalse(github_api.has_marker_comment(api, 7, self.MARKER))
+        api, _ = self._api([[{"body": "lgtm"}, {"body": f"{self.MARKER}\nposted earlier"}]])
+        self.assertTrue(github_api.has_marker_comment(api, 7, self.MARKER))
+
+    def test_since_reads_only_the_comments_from_then_on(self):
+        api, calls = self._api([[]])
+        github_api.has_marker_comment(api, 7, self.MARKER, since="2026-10-13T11:00:00Z")
+        self.assertTrue(
+            calls[0].full_url.endswith(
+                "/repos/gke-labs/kube-agents/issues/7/comments?since=2026-10-13T11:00:00Z&per_page=100&page=1"
+            ),
+            calls[0].full_url,
+        )
+        api, calls = self._api([[]])
+        github_api.has_marker_comment(api, 7, self.MARKER)
+        self.assertTrue(calls[0].full_url.endswith("/repos/gke-labs/kube-agents/issues/7/comments?per_page=100&page=1"))
+
+    def test_a_failed_read_is_raised_not_taken_for_none(self):
+        refused = urllib.error.HTTPError("https://api.github.com/x", 404, "Not Found", {}, None)  # type: ignore[arg-type]
+        api, _ = self._api([refused])
+        with self.assertRaises(urllib.error.HTTPError):
+            github_api.has_marker_comment(api, 7, self.MARKER)
+
+
 if __name__ == "__main__":
     unittest.main()
