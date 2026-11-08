@@ -91,10 +91,13 @@ memory:
 web:
   backend: "ddgs"
 
+# pr_opened claims each pull request this profile opens through the broker and
+# counts it in the proposals ledger by origin (plugins/pr_opened/__init__.py).
 plugins:
   enabled:
     - hermes_otel
     - tool_call_audit
+    - pr_opened
 
 agent:
   environment_probe: false

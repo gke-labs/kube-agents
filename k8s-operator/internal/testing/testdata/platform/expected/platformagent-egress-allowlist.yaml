@@ -722,13 +722,16 @@ metadata:
       name: platformagent
       uid: ""
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: platformagent-kube-proxy
       kubeagents.x-k8s.io/component: kube-proxy
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
       annotations:
@@ -756,8 +759,6 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
-            - name: KUBE_PROXY_DEFAULT_CLUSTER
-              value: gke_example-project_us-central1-a_cluster-a
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -774,6 +775,10 @@ spec:
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           name: kube-proxy
           ports:
             - containerPort: 8443
@@ -794,10 +799,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -818,6 +823,16 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: kubeagents-platform-agent
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-kube-proxy
+              kubeagents.x-k8s.io/component: kube-proxy
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - name: kube-proxy-tls
           secret:
@@ -836,6 +851,36 @@ spec:
                       path: ca.crt
                   name: kube-root-ca.crt
 status: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-kube-proxy
+      kubeagents.x-k8s.io/component: kube-proxy
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -1370,8 +1415,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1651,6 +1694,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:

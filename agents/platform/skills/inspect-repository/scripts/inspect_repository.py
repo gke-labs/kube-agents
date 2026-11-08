@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
@@ -62,6 +63,18 @@ DEFAULT_MAX_BYTES = vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES
 # The broker's refusal of a `paths` entry that names nothing at the revision.
 PATH_NOT_FOUND = "PATH_NOT_FOUND"
 
+# The folder under the scratch directory that holds every clone's staging, and
+# nothing else. The script owns it, so a sweep of it removes no file of the
+# caller's.
+STAGING_DIR_NAME = ".inspect-repository-staging"
+# The name of one clone's staging directory, before mkdtemp's suffix.
+STAGING_PREFIX = "clone."
+
+# How old an entry in the staging folder must be before a clone removes it. A
+# clone takes seconds, so a younger one can belong to a clone that runs now.
+# The same age as sandbox_artifact_patch.STALE_SWEEP_AGE_SECONDS.
+STALE_STAGING_AGE_SECONDS = 3600.0
+
 
 def scratch_root() -> Path:
     return Path(gitops_workspace.agent_home()) / "scratch" / "repos"
@@ -80,6 +93,11 @@ def default_into(repo: str) -> Path:
     return scratch_root() / repo.replace("/", "%2F")
 
 
+def staging_root() -> Path:
+    """The folder that holds every clone's staging, beside `scratch_root()`."""
+    return scratch_root().parent / STAGING_DIR_NAME
+
+
 def prepare_destination(into: Path, force: bool) -> Path:
     """An empty directory to write into, or a refusal naming `--force`.
 
@@ -96,6 +114,29 @@ def prepare_destination(into: Path, force: bool) -> Path:
             )
     into.mkdir(parents=True, exist_ok=True)
     return into
+
+
+def remove_stale_staging() -> None:
+    """Remove the staging directories that an earlier clone left.
+
+    A clone removes its staging directory in a `finally`, which a SIGKILL does
+    not run. Every staging directory is in `staging_root()`, so each entry
+    there that is older than STALE_STAGING_AGE_SECONDS is removed, whatever
+    its name. Nothing outside that folder is removed. A missing folder or a
+    failure here does not stop the clone.
+    """
+    cutoff = time.time() - STALE_STAGING_AGE_SECONDS
+    try:
+        entries = list(staging_root().iterdir())
+    except OSError:
+        return
+    for path in entries:
+        try:
+            # `rmtree` refuses a symbolic link, so a link is never followed.
+            if path.is_dir() and path.lstat().st_mtime < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
 
 
 def copy_over(staging: Path, into: Path) -> None:
@@ -157,19 +198,41 @@ def clone_content(args) -> int:
 
     The snapshot unpacks only into an empty directory, and `--force` is how a
     caller adds a second `--prefix` to a tree it is building (the fleet audit
-    does). So the snapshot lands beside `into` and is copied over it.
+    does). So every clone stages in `staging_root()`, and the copy goes into
+    the directory that `into` names. `into` itself is never removed or
+    replaced. So a second clone that writes into it at the same time does not
+    fail on it, and an `into` that is the current directory, a symbolic link
+    or a mount point stays valid. The snapshot stages beside its own
+    destination, which is the staging directory here, so its staging is in
+    `staging_root()` too.
     """
-    into = prepare_destination(
-        Path(args.into) if args.into else default_into(args.repo), args.force
-    )
+    remove_stale_staging()
+    target = Path(args.into).expanduser() if args.into else default_into(args.repo)
+    # The sweep removes what sits in staging_root(), so a copy there would be
+    # removed an hour later.
+    resolved, root_resolved = target.resolve(), staging_root().resolve()
+    if resolved == root_resolved or root_resolved in resolved.parents:
+        raise SystemExit(
+            f"{target} is in {staging_root()}, which holds only clone staging. "
+            "Name a directory outside it with --into."
+        )
+    into = prepare_destination(target, args.force)
     paths = [args.prefix] if args.prefix else None
-    staging = Path(tempfile.mkdtemp(dir=str(into.parent), prefix=f".{into.name}."))
+    root = staging_root()
+    root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=str(root), prefix=STAGING_PREFIX))
     try:
         try:
             copy = vcs_client.snapshot(
-                args.repo, args.ref, paths, into=staging, max_bytes=args.max_bytes
+                args.repo, args.ref, paths, into=staging,
+                max_bytes=args.max_bytes, max_files=args.max_files,
             )
         except vcs_client.VcsError as exc:
+            if exc.code == vcs_client.SNAPSHOT_TOO_MANY_FILES:
+                raise SystemExit(
+                    f"{args.repo}: {exc} (--max-files). Nothing was written. "
+                    "Name a --prefix to take part of the tree."
+                ) from exc
             if exc.code != PATH_NOT_FOUND or not paths:
                 raise
             # The prefix names nothing at this revision: an empty copy of it,
@@ -182,12 +245,6 @@ def clone_content(args) -> int:
                 "complete": True, "history": "none", "missing": args.prefix,
             }))
             return 0
-        if copy["files"] > args.max_files:
-            raise SystemExit(
-                f"{args.repo} holds {copy['files']} files, over --max-files "
-                f"{args.max_files}. Nothing was written. Name a --prefix to "
-                "take part of the tree."
-            )
         copy_over(staging, into)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -220,7 +277,7 @@ def clone_content(args) -> int:
 
 
 def clone_directory(args) -> int:
-    """The pre-content-passing path: a leased checkout on the shared volume."""
+    """The leased-checkout path: a checkout on the shared volume."""
     repo = args.repo
     lease = gitops_workspace.lease_id(args.lease)
     workspace = gitops_workspace.ensure_workspace(

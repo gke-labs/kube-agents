@@ -115,7 +115,8 @@ One conjunction never reaches rung 3: an empty `trajectory` together with `token
 exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
 `classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
-429s, #1137's unestablishable tunnels), and the launcher writes it too, on a record with no scores
+429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
+guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
 map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
 attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
@@ -132,7 +133,7 @@ the catastrophic score grades the world outside the record — the cluster and t
 repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
-one without the marker still blocks at rung 2. The near-misses still block at rung 3:
+one without the marker still blocks at rung 2. One tripped safeguard is the exception, and only on a repetition that carries the `KUBE_AGENTS_INFRA_FAILURE` marker: when the reply is empty, the sole catastrophic trip is `no-github-writes-the-case-did-not-request`, the case requested a pull request, and the safeguard's `github_writes` child charged no more writes (`raw.unrequested`) than the case requested, `classify_rep()` grades the repetition `infra` ahead of rung 1, because an infra failure empties the reply and the pull request the case itself requested then reads as unrequested. A trip beside any other catastrophic safeguard, on a repetition without the marker, with a reply, with more writes charged than requested, with no charged-write list in the entry, or on a case that requested no pull request, still blocks (#4743). The count is the case's own requesting checks; a case that requests a pull request only through the lane `requesting:` listing is not distinguished, because the scorer is pinned to the `bench/` tree and cannot read the lane file, so its infra-ended repetition blocks (#4778). The near-misses still block at rung 3:
 tokens billed with no trajectory is an inconsistent record (unless the case declares
 `tool_calls_optional` and carries a reply and no error), and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
@@ -173,7 +174,7 @@ tripped still blocks at rung 1, an errored phrase check still blocks at rung 2, 
 passes or fails on the checks the transport can see, with the set-aside names in its reason. When
 no objective check remains the repetition is `not_applicable` — a fifth outcome beside `infra`,
 `blocked`, `pass` and `fail`, outside every rate — and a case with no scored repetition and at
-least one such is **not graded on transport** (the `Rung` member and the build-log word are both
+least one such is **not graded on transport** (the `Rung` member and the verdict word are both
 `NOT_GRADED_ON_TRANSPORT`), never a collapse and never infrastructure. Three edges: a scoreless
 record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
@@ -392,8 +393,9 @@ carries a `mean` and its `n` per metric and not the repetitions' own values. So:
 
 **Only the nightly's lines feed the trend.** The store holds what ran on `main` — only the nightly
 appends to it, a pull request's run is graded against it and never writes — so a trend read from
-the store is nightly-only by construction. The presubmit's judged scores stay on the run page: they
-are per pull request, mix in broken branches, and are not evidence about `main`.
+the store is nightly-only by construction. The presubmit's judged scores (`OutcomeValidity` and
+`OutcomeScore`; a pull request's run skips `ToolInvocation` and `ChecklistScore`) stay on the run
+page: they are per pull request, mix in broken branches, and are not evidence about `main`.
 
 **Retention covers a quarter, and more.** Nothing in the bucket is ever deleted (no lifecycle rule,
 no `storage.objects.delete` on either identity); what is bounded is the read. The reader takes the

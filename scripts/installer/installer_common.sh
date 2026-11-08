@@ -1485,8 +1485,8 @@ refuse_next_slack_gateway_settings_from_env() {
 # Under spec.mode next the A2A gateway, not the agent, makes the agent's
 # proactive posts (alerts, drift reports, scheduled reports), and it arms them
 # only on a home channel. A reply in a conversation still arrives without one,
-# so an install with none looks healthy while every unprompted post is dropped
-# (#3320). The front doors warn rather than refuse: some installs want chat
+# so an install with none looks healthy while every unprompted post is refused
+# by the gateway and kept for one digest (#3320). The front doors warn rather than refuse: some installs want chat
 # with no posts, and a CI install never posts. The operator reports the same
 # state as the HomeChannelUnset condition.
 #
@@ -1514,7 +1514,13 @@ next_home_channel_unset_key() {
 
 # The warning for that key ($1), one line.
 next_home_channel_unset_message() {
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so it will drop every one of them; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  local meanwhile="it refuses them and keeps them for one digest"
+  # Only the Chat key can have Slack beside it: Slack holds the gateway only
+  # with Chat off, so with the Slack key the posts are kept, never sent on.
+  if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
+    meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
+  fi
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
@@ -1562,7 +1568,7 @@ warn_next_home_channel_unset_from_env() {
 print_next_home_channel_unset_summary() {
   [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
   echo ""
-  print_warning "No home channel: proactive posts are dropped. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
+  print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
   print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
@@ -2431,21 +2437,39 @@ kms_key_scheduled_version() {
       --filter='state=DESTROY_SCHEDULED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
 }
 
+# The basename of the first DISABLED version of a Cloud KMS key, or nothing:
+# what a restore leaves until the version is enabled. Every failure reads as
+# "none".
+kms_key_disabled_version() {
+  local key="$1" keyring="$2" location="$3" project="$4"
+  { gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DISABLED' --format='value(name.basename())' 2>/dev/null || true; } | head -1
+}
+
 # For a minter key with no ENABLED version: when its versions are scheduled for
-# destruction, prints how to restore them and returns 0; otherwise prints
-# nothing and returns 1, so the caller's import advice stands. The advice is
-# gcloud's restore and enable, which work whether or not the key is in
-# Terraform state: the next apply's adopt_kms imports a key that is out of it.
-# A lifecycle.sh adopt-kms run would need this install's checkout and state
-# backend, which install.sh and upgrade.sh do not have in hand at this point.
+# destruction, prints how to restore them and returns 0; when they are only
+# disabled, prints how to enable them and returns 0; otherwise prints nothing
+# and returns 1, so the caller's import advice stands. The advice is gcloud's
+# restore and enable, which work whether or not the key is in Terraform state:
+# the next apply's adopt_kms imports a key that is out of it. A lifecycle.sh
+# adopt-kms run would need this install's checkout and state backend, which
+# install.sh and upgrade.sh do not have in hand at this point.
 print_minter_restore_advice() {
   local key="$1" keyring="$2" location="$3" project="$4"
-  [ -n "$(kms_key_scheduled_version "$key" "$keyring" "$location" "$project")" ] || return 1
-  print_info "Its versions are scheduled for destruction, as a destroy of the key leaves them."
-  print_info "Restore them rather than re-importing the key; a restore works only until their destruction time."
-  print_info "Restore and enable each version with gcloud, then re-run:"
-  print_info "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+  if [ -n "$(kms_key_scheduled_version "$key" "$keyring" "$location" "$project")" ]; then
+    print_info "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+    print_info "Restore them rather than re-importing the key; a restore works only until their destruction time."
+    print_info "Restore and enable each version with gcloud, then re-run:"
+    print_info "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+    print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    return 0
+  fi
+  [ -n "$(kms_key_disabled_version "$key" "$keyring" "$location" "$project")" ] || return 1
+  print_info "Its versions are disabled, as a restore leaves them."
+  print_info "Enable each version with gcloud rather than re-importing the key, then re-run:"
   print_info "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+  print_info "If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key with install.sh --kms-key instead."
   return 0
 }
 

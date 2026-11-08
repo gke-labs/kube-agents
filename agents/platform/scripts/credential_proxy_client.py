@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import http.client
 import json
 import math
@@ -47,6 +46,21 @@ BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
 # runtime does not attach an execution/chmod hint that misleads the agent
 # into seeking local file workarounds for a policy boundary (#2179).
 EXIT_SECURITY_POLICY_BLOCKED = getattr(os, "EX_NOPERM", 77)
+# Exit code returned when the broker cut the command's output at its per-stream
+# cap. 74 is EX_IOERR from sysexits.h ("input/output error"): the command may
+# well have exited 0, but what the caller holds is a partial payload, and a
+# partial `-o json` dump read as success is the false all-clear this code
+# exists to prevent. Scripts that already gate on the stderr marker below see
+# the same marker; the exit code is what the model's own kubectl sees.
+EXIT_OUTPUT_TRUNCATED = getattr(os, "EX_IOERR", 74)
+# The stderr line a cut command gets. Its prefix is what every reader matches
+# (`PROXY_TRUNCATED_MARKER` in the collectors); the counts after it say how
+# much of stdout was kept and the cap it was held to, when the broker said.
+OUTPUT_TRUNCATED_MARKER = "credential proxy output truncated"
+OUTPUT_TRUNCATED_COUNTS = " at {limit} bytes (kept {kept} bytes of stdout; exit {code})"
+# The cut fell on stderr alone: stdout is whole, so the exit code is the
+# command's own and only the diagnostics are short.
+OUTPUT_TRUNCATED_STDERR_ONLY = " (stderr only; stdout is complete)"
 # The `policy verb:` line is read by the agent runtime one line at a time, so a
 # verb word (an argv token) must not carry a line break or a quote.
 _VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
@@ -78,6 +92,11 @@ EXEC_ROLE = "exec"
 EXEC_URL_ENV = "CREDENTIAL_PROXY_EXEC_URL"
 EXEC_REPLICAS_FILE_ENV = "CREDENTIAL_PROXY_EXEC_REPLICAS_FILE"
 EXEC_REPLICAS_FILE = "/etc/credential-proxy-exec-tier/replicas"
+# The keys the admission route adds for the whole tier when the replicas file
+# holds a count (§3.5); `broker_admission` sizes a sweep by them.
+ADMISSION_REPLICAS_KEY = "replicas"
+ADMISSION_TIER_ADMITTED_KEY = "tier_admitted"
+ADMISSION_TIER_INTERACTIVE_CAP_KEY = "tier_interactive_cap"
 BUSY_BOUND_KEY = "bound"
 ADMISSION_BOUND_DRAINING = "draining"
 ADMISSION_BOUND_BACKGROUND = "background"
@@ -176,6 +195,29 @@ BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
 # shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
 # refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
 EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# The broker route `execute` sends a command to, under the broker's URL.
+EXEC_ROUTE = "/v1/exec"
+# The exec body's session key (the broker's SESSION_ID_FIELD): the card or
+# session id this process runs under, `default_caller_label`, so the broker
+# can count a run's commands and break its retry loops. Omitted when there is
+# none; a request without one is uncounted.
+SESSION_ID_FIELD = "sessionId"
+# The refusal codes the shim prints as a policy block (the message, then
+# `policy rule: <rule>`) and exits EXIT_SECURITY_POLICY_BLOCKED on: the policy's
+# own, and the broker's two per-session bounds. The exit code keeps the runtime
+# from reading the refusal as a missing executable; the runtime's refusal stop
+# (deploy/docker/patches/permission_refusal_stop.py) halts on the read-only
+# rule's write refusals only, so for the two session bounds the message is
+# what tells the model to stop.
+SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
+SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
+LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
+POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
+# The line a malformed exec URL writes, once per process, when the stateful
+# broker takes its place. No "credential proxy" prefix, for the same reason as
+# EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
+EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
+_exec_url_notice_written = False
 # A connection that closed once the request was sent: the command may have run,
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
@@ -197,12 +239,18 @@ KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
-# What a workspace `open` labels itself with, so the broker's log can say who
-# holds a slot when the store is full: the kanban card first, the session
-# otherwise. The grammar mirrors `content_workspace.CALLER_LABEL_RE`; a value
-# outside it is dropped rather than sent, because a label is a courtesy to the
-# log and must never be what fails an open.
-CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+# What an exec request sends as its `sessionId`, so the broker can count the
+# run's commands: the kanban card first, then the scheduled run, then the
+# session. Where each comes from matters, because no process environment
+# crosses the SSH hop into the shell sandbox: there the ForceCommand
+# (deploy/sandbox/session-command.sh) recovers the card and the cron run from
+# the command's cwd, and a chat turn, which runs from neither, sends no key.
+# HERMES_SESSION_ID reaches the shim only where the terminal runs in the
+# shim's own pod, the profile and session pods. The grammar mirrors the
+# broker's SESSION_ID_RE; a value outside it is dropped rather than sent,
+# because the key serves the broker's count and must never be what fails a
+# command.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_CRON_RUN", "HERMES_SESSION_ID")
 CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -270,10 +318,11 @@ class BrokerConnection(http.client.HTTPConnection):
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
         try:
             super().connect()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             # The one point where "nothing was sent" is certain. urllib wraps
             # this in a URLError as before, so a caller that reads only that
-            # sees no change.
+            # sees no change. UnicodeError is the resolver's IDNA step refusing
+            # the host (an empty or over-long label), before any lookup.
             raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
 
@@ -285,12 +334,14 @@ class BrokerUnreachable(OSError):
 def exec_endpoints() -> tuple[str | None, str | None]:
     """The broker an exec-role call goes to, and the one it falls back on.
 
-    The exec tier when the operator set its URL, with the stateful broker as
-    the fallback; else the stateful broker alone, as before the exec tier.
-    `execute` falls back only when no connection to the exec tier could be
-    made (`BrokerUnreachable`): then no request reached a broker, and nothing
-    ran. `ApiSession` also falls back after a dropped connection, because its
-    relay calls are GETs, which are safe to send again.
+    The exec tier when the operator set a well-formed URL, with the stateful
+    broker as the fallback; else the stateful broker alone, as before the exec
+    tier. A malformed URL is ignored with one stderr line (`_exec_url_fault`).
+    `execute` falls back only on a failure before a byte was sent (no
+    connection to the exec tier, or a URL it could not build a request from):
+    then no request reached a broker, and nothing ran. `ApiSession` also falls
+    back after a dropped connection, because its relay calls are GETs, which
+    are safe to send again.
     """
     # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
     # (C1) pins that the shim reads this name, across the module boundary to
@@ -298,8 +349,57 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     stateful = os.getenv("CREDENTIAL_PROXY_URL")
     exec_url = os.getenv(EXEC_URL_ENV, "").strip()
     if exec_url:
-        return exec_url, stateful or None
+        reason = _exec_url_fault(exec_url)
+        if reason is None or not stateful:
+            # With no stateful broker to use instead, a malformed URL is
+            # reported when the call is made, as before this check.
+            return exec_url, stateful or None
+        global _exec_url_notice_written
+        if not _exec_url_notice_written:
+            print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=sys.stderr)
+            _exec_url_notice_written = True
+        return stateful, None
     return stateful, None
+
+
+def _exec_url_fault(url: str) -> str | None:
+    """Why the exec URL can't be used, or None.
+
+    The broker opener's connect bound and its `BrokerUnreachable` signal are on
+    plain http only, so an https URL would get neither the bound nor the
+    fallback. A bad port or a missing scheme fails before any socket opens.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # A bracketed host that is not an IPv6 address, such as `http://[::1`.
+        return "not a valid URL"
+    if parts.scheme != "http":
+        return "not an http:// URL"
+    if not parts.hostname:
+        return "no host"
+    try:
+        parts.port
+    except ValueError:
+        return "the port is not a number from 0 to 65535"
+    if "?" in url or "#" in url:
+        # The route is appended to the URL, so it would land in the query or
+        # be cut off with the fragment.
+        return "it has a query or a fragment"
+    try:
+        # What execute() builds from the raw string, short of a socket: the
+        # resolver's IDNA step, the connection's host check and the request
+        # line's path check. urlsplit's view drops a tab or newline and keeps
+        # a %-escape, so it can't answer for them.
+        parts.hostname.encode("idna")
+        request = urllib.request.Request(url.rstrip("/") + EXEC_ROUTE)
+        connection = http.client.HTTPConnection(request.host)
+        # urllib sends its own Host header, which http.client encodes as latin-1.
+        connection.putrequest("POST", request.selector, skip_host=True)
+        connection.putheader("Host", request.host)
+    except (ValueError, http.client.InvalidURL):
+        return "not a valid URL"
+    return None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -1330,7 +1430,9 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
             file=sys.stderr,
         )
         return 1
-    if payload.get("code") == "SECURITY_POLICY_BLOCKED":
+    # The far side composes the payload: a `code` that is not a string (a
+    # list, an object) is not a refusal code, and must not raise out of here.
+    if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
         print(
             payload.get("message", "Command blocked for security reasons."),
             file=sys.stderr,
@@ -1562,6 +1664,9 @@ def execute(
     }
     if context:
         request_payload["kubeconfigContext"] = context
+    session_label = default_caller_label()
+    if session_label:
+        request_payload[SESSION_ID_FIELD] = session_label
     if destination is not None or implicit_destination:
         request_payload["wantsKubeconfig"] = True
     if stdin is not None:
@@ -1592,13 +1697,18 @@ def execute(
     while True:
         try:
             request = urllib.request.Request(
-                targets[0].rstrip("/") + "/v1/exec",
+                targets[0].rstrip("/") + EXEC_ROUTE,
                 data=body,
                 headers=headers,
                 method="POST",
             )
         except ValueError as exc:
-            # A URL with no scheme, such as a bare Service name: nothing was sent.
+            # A URL with no scheme, such as a bare Service name: nothing was
+            # sent, so a fallback is safe.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         try:
@@ -1637,9 +1747,15 @@ def execute(
                 continue
             print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
             return 1
-        except http.client.InvalidURL as exc:
-            # Raised while the connection is built, before a socket opens:
-            # nothing was sent.
+        except (http.client.InvalidURL, UnicodeEncodeError) as exc:
+            # Raised while the connection, the request line or the Host header
+            # is built, before a socket opens: nothing was sent, so a fallback
+            # is safe. A reply is decoded, never encoded, so a UnicodeEncodeError
+            # here is the request's own.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         except (http.client.HTTPException, OSError) as exc:
@@ -1650,8 +1766,12 @@ def execute(
 
     sys.stdout.write(payload.get("stdout", ""))
     sys.stderr.write(payload.get("stderr", ""))
-    if payload.get("truncated"):
-        print("credential proxy output truncated", file=sys.stderr)
+    truncated = bool(payload.get("truncated"))
+    # The exit code is for a cut payload. A broker older than the field says
+    # only that a stream was cut, and that is read as the payload.
+    stdout_cut = bool(payload.get("stdoutTruncated", truncated))
+    if truncated:
+        print(_truncated_marker(payload, stdout_cut), file=sys.stderr)
     generated = payload.get("kubeconfig")
     if generated and os.environ.get("KUBE_PROXY_URL", "").strip():
         generated = rewrite_kubeconfig_for_kube_proxy(generated)
@@ -1671,11 +1791,27 @@ def execute(
         except OSError as exc:
             print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
             return 1
+    if stdout_cut:
+        # Whatever the command itself exited: a cut payload is not the
+        # command's answer, and exit 0 on one is what a caller reads as success.
+        return EXIT_OUTPUT_TRUNCATED
     return int(payload.get("exitCode", 1))
 
 
+def _truncated_marker(payload: dict, stdout_cut: bool) -> str:
+    """The stderr line for a cut reply: the bare marker when the broker gave no
+    counts (one older than the fields), the counts after it otherwise, and the
+    stderr-only form when the payload is whole and the cut fell on stderr."""
+    if not stdout_cut:
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_STDERR_ONLY
+    kept, limit = payload.get("bytesWritten"), payload.get("limit")
+    if isinstance(kept, int) and isinstance(limit, int) and not isinstance(kept, bool) and not isinstance(limit, bool):
+        return OUTPUT_TRUNCATED_MARKER + OUTPUT_TRUNCATED_COUNTS.format(limit=limit, kept=kept, code=EXIT_OUTPUT_TRUNCATED)
+    return OUTPUT_TRUNCATED_MARKER
+
+
 class WorkspaceUnavailable(RuntimeError):
-    """The broker does not have content workspaces armed."""
+    """The broker has no version control built (`VCS_UNAVAILABLE`)."""
 
 
 class BrokerDisconnected(RuntimeError):
@@ -1702,58 +1838,30 @@ class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
     def __init__(self, status: int, payload: dict) -> None:
-        # Two spellings of the same field, because the broker has two error
-        # shapes: a refusal from `ContentWorkspaceError` answers `{status,
-        # code, message}`, while a malformed body answers `{error}`. Reading
+        # Two spellings of the same field: the vcs routes answer `{error,
+        # code}`, and a broker policy refusal answers `{status, code,
+        # message}`. Reading
         # only one of them would render half the broker's refusals as the
         # generic fallback below, which is the sentence that tells a caller
         # nothing.
         super().__init__(
             payload.get("message")
             or payload.get("error")
-            or f"workspace request failed ({status})"
+            or f"broker request failed ({status})"
         )
         self.status = status
         self.payload = payload
 
 
-class Listing(list):
-    """The entries `list` returned, plus what it did not return.
-
-    A plain list, so every existing caller keeps working, carrying the two
-    fields that say whether it is the whole answer. A listing that stops at the
-    broker's ceiling and looks complete is how a caller ends up asking `read`
-    for a path it inferred rather than one it saw. `symlinks` names the files
-    in the page's range that `read` refuses and so are never entries, and
-    `symlinked_directories` the links to directories the listing does not
-    enter, each a `{"path", "target"}` mapping.
-    """
-
-    def __init__(
-        self,
-        entries,
-        total: int = 0,
-        truncated: bool = False,
-        symlinks=(),
-        symlinked_directories=(),
-    ) -> None:
-        super().__init__(entries)
-        self.total = total or len(self)
-        self.truncated = truncated
-        # Symlinked files in this page's range, which `read` refuses and so
-        # are never entries; a broker older than the field reports none.
-        self.symlinks = list(symlinks)
-        self.symlinked_directories = list(symlinked_directories)
-
-
 def default_caller_label() -> str:
-    """The card or session id this process runs under, or "" when it has none.
+    """The card, scheduled run or session id this process runs under, or ""
+    when it has none.
 
     Read at call time, like `session_lease` in the skill, because the agent
     runs each command in a fresh process and the identity lives in its
     environment. A value the broker's grammar would refuse is dropped here:
-    the label exists so the log can name who filled the store, and it must
-    never be the reason an open fails.
+    the key exists so the broker can count a run's commands, and it must
+    never be the reason a command fails.
     """
     for name in CALLER_LABEL_ENV:
         value = os.environ.get(name, "").strip()
@@ -1762,301 +1870,12 @@ def default_caller_label() -> str:
     return ""
 
 
-class Workspace:
-    """A git repository the broker owns and this process cannot see.
-
-    There is no path anywhere in this class, which is the point. A caller says
-    "write these bytes to `manifests/app.yaml` and commit them"; it never learns
-    where that file lands, so it cannot be talked into reading or writing
-    anything else there -- including `.git/config`, which is where a filter
-    driver or a hook path would have to be defined for the sixteen known
-    code-execution routes to work.
-
-    Typical use, replacing a clone/add/commit/push sequence:
-
-        with Workspace.open(endpoint, "acme/infra") as workspace:
-            current = workspace.read_text("manifests/app.yaml")
-            workspace.commit(
-                branch="fix/replicas",
-                message="raise replicas",
-                changes={"manifests/app.yaml": patched.encode()},
-            )
-            workspace.push()
-    """
-
-    def __init__(self, endpoint: str, opened: dict) -> None:
-        self.endpoint = endpoint
-        self.handle = opened["handle"]
-        self.repo = opened["repo"]
-        self.base = opened["base"]
-        self.base_sha = opened["baseSha"]
-        self.branch_sha = opened.get("branchSha", "")
-        self.started_from = opened.get("startedFrom", "")
-        self.shallow = bool(opened.get("shallow", False))
-        self.branch: str | None = None
-        self._closed = False
-
-    @classmethod
-    def open(
-        cls,
-        endpoint: str,
-        repo: str,
-        base: str | None = None,
-        branch: str | None = None,
-        depth: int | None = None,
-        caller: str | None = None,
-    ) -> "Workspace":
-        """`branch` names the branch this session will commit to, if known.
-
-        `caller` labels the workspace in the broker's log; left None, it is the
-        card or session id from the environment (`default_caller_label`).
-
-        Naming it decides what `read` and `list` answer with: when the branch
-        already exists on the remote -- a second round of review feedback -- the
-        broker checks that out rather than the base, so a file read here is the
-        file as the pull request has it.
-
-        `depth` opens a shallow single-branch clone for reading. The broker
-        refuses `commit` on one and refuses `depth` together with `branch`.
-        """
-        payload = {"repo": repo}
-        if base:
-            payload["base"] = base
-        if branch:
-            payload["branch"] = branch
-        if depth:
-            payload["depth"] = depth
-        label = default_caller_label() if caller is None else caller
-        if label:
-            payload["caller"] = label
-        return cls(endpoint, _workspace_call(endpoint, "open", payload))
-
-    def read(self, path: str) -> bytes:
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "path": path}
-        )
-        return base64.b64decode(result["contentBase64"])
-
-    def read_text(self, path: str, encoding: str = "utf-8") -> str:
-        return self.read(path).decode(encoding)
-
-    def read_many(self, paths: list[str]) -> tuple[dict[str, bytes], list[dict]]:
-        """Several files in one round trip.
-
-        Returns what came back and what did not, the second as the broker's own
-        `{path, reason}` records. A caller that ignores the second half will
-        materialise a partial tree and not know it -- `requestBudget` means ask
-        again for the rest, `tooLarge` means that file is never coming, and
-        `symlink` means the file is there but the broker will not follow a link
-        to it, so ask for the target's own name.
-        """
-        result = _workspace_call(
-            self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}
-        )
-        files = {
-            entry["path"]: base64.b64decode(entry["contentBase64"])
-            for entry in result.get("files", [])
-        }
-        return files, result.get("skipped", [])
-
-    def list(self, prefix: str | None = None, after: str | None = None) -> Listing:
-        """One page of tracked names. `after` is the last path of the page before.
-
-        `total` on the result counts what is still in scope after the cursor, so
-        a caller pages until `truncated` is false. `symlinks` on the result
-        names the symlinked files the page's range holds, each once across the
-        pages; a caller rebuilding the tree needs them to know what it lacks,
-        and `symlinked_directories` the links to directories with their targets.
-        """
-        payload = {"handle": self.handle}
-        if prefix:
-            payload["prefix"] = prefix
-        if after:
-            payload["after"] = after
-        result = _workspace_call(self.endpoint, "list", payload)
-        return Listing(
-            result.get("entries", []),
-            total=result.get("total", 0),
-            truncated=bool(result.get("truncated")),
-            symlinks=result.get("symlinks") or [],
-            symlinked_directories=result.get("symlinkedDirectories") or [],
-        )
-
-    def grep(
-        self,
-        pattern: str,
-        prefix: str | None = None,
-        regex: bool = False,
-        ignore_case: bool = False,
-    ) -> dict:
-        """Search the checked-out tree. Fixed-string unless `regex` is set.
-
-        The whole answer, `{matches, total, truncated}`, rather than the matches
-        alone: a search that hit the broker's ceiling and looks complete sends a
-        reader off with a wrong conclusion about the repository.
-        """
-        payload = {"handle": self.handle, "pattern": pattern}
-        if prefix:
-            payload["prefix"] = prefix
-        if regex:
-            payload["regex"] = True
-        if ignore_case:
-            payload["ignoreCase"] = True
-        return _workspace_call(self.endpoint, "grep", payload)
-
-    def commit(
-        self,
-        branch: str,
-        message: str,
-        changes: dict[str, bytes | None],
-        expected_base_sha: str | None = None,
-        expected_branch_sha: str | None = None,
-    ) -> dict:
-        """`changes` maps a repository-relative path to bytes, or to None to delete.
-
-        Pass `expected_base_sha` (normally `self.base_sha`) to have the broker
-        refuse with 409 when the base branch has moved under a file this commit
-        also writes. Leaving it out means last-writer-wins against whatever
-        landed in the meantime.
-
-        The working branch is checked the same way and needs no argument: the
-        broker compares against the sha it last saw for that branch, which is
-        the only place the value exists. `expected_branch_sha` overrides it for
-        a caller that learned the sha somewhere else.
-        """
-        entries = []
-        for path, content in changes.items():
-            if content is None:
-                entries.append({"path": path, "delete": True})
-            else:
-                entries.append(
-                    {
-                        "path": path,
-                        "contentBase64": base64.b64encode(content).decode("ascii"),
-                    }
-                )
-        payload = {
-            "handle": self.handle,
-            "branch": branch,
-            "message": message,
-            "changes": entries,
-        }
-        if expected_base_sha:
-            payload["expectedBaseSha"] = expected_base_sha
-        if expected_branch_sha:
-            payload["expectedBranchSha"] = expected_branch_sha
-        result = _workspace_call(self.endpoint, "commit", payload)
-        self.branch = result["branch"]
-        # `committed: false` is an ordinary answer rather than an error -- a
-        # re-run whose fix is already on the branch has nothing to add -- and it
-        # carries neither a sha nor a commit. Callers read the flag; reading
-        # `result["commit"]` unconditionally is how that case turns into a
-        # KeyError several frames from the decision that produced it.
-        if result.get("baseSha"):
-            self.base_sha = result["baseSha"]
-        if result.get("branchSha") is not None:
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def push(self, branch: str | None = None) -> dict:
-        branch = branch or self.branch
-        if not branch:
-            raise ValueError("nothing has been committed on this workspace yet")
-        result = _workspace_call(
-            self.endpoint, "push", {"handle": self.handle, "branch": branch}
-        )
-        if result.get("branchSha"):
-            self.branch_sha = result["branchSha"]
-        return result
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        _workspace_call(self.endpoint, "close", {"handle": self.handle})
-
-    def __enter__(self) -> "Workspace":
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        # Best effort: a failure to clean up a broker-side tree must not mask
-        # the exception that is already propagating out of the with-block.
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-def workspaces_available(endpoint: str) -> bool:
-    """Whether this broker has content workspaces armed.
-
-    Both mechanisms run side by side while the skills migrate, so a caller that
-    can do either asks first rather than assuming.
-    """
-    try:
-        _workspace_call(endpoint, "open", {"repo": ""})
-    except WorkspaceUnavailable:
-        return False
-    except WorkspaceRequestError as exc:
-        # 401 is the one status that says nothing about the route: the broker
-        # rejects the caller before it looks at the path, so a client with no
-        # token would read "workspaces are armed" off a broker that never
-        # reached the question. Every other status is an answer about the
-        # payload, and an answer about the payload means the route exists.
-        #
-        # Reported live: a sandbox with no CREDENTIAL_PROXY_TOKEN_FILE saw this
-        # return True and then failed on the first real verb.
-        if exc.status == 401:
-            return False
-        return True
-    except TokenUnavailable:
-        # No token to present, so nothing here is reachable whatever the broker
-        # is serving.
-        return False
-    except urllib.error.URLError:
-        return False
-    return True
-
-
-def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    # The same credential and the same opener `execute` uses. These routes
-    # spend the broker's GitHub token exactly as /v1/exec does, so a
-    # cross-Pod call that omitted the header would earn a 401, and one that
-    # went through the stock opener would carry a total socket timeout onto a
-    # clone that legitimately runs for minutes.
-    headers.update(authorization_headers())
-    request = urllib.request.Request(
-        endpoint.rstrip("/") + f"/v1/workspace/{verb}",
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with open_broker_request(request) as response:
-            return json.load(response)
-    except urllib.error.HTTPError as exc:
-        try:
-            answer = json.load(exc)
-        except (ValueError, TypeError):
-            raise WorkspaceRequestError(exc.code, {"error": f"HTTP {exc.code}"}) from exc
-        if answer.get("code") == "CONTENT_WORKSPACES_DISABLED":
-            raise WorkspaceUnavailable(answer.get("error", "not enabled")) from exc
-        raise WorkspaceRequestError(exc.code, answer) from exc
-
-
 def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
     """One `POST /v1/vcs/<verb>`.
 
-    Its own function rather than a parameter on `_workspace_call`, because the
-    two namespaces are different protocols that happen to share a transport:
-    every `/v1/vcs/*` call stands alone and holds nothing across a session.
-    Folding them together would put a `handle` argument on routes that have
-    none and invite a caller to hold one.
-
-    Public, unlike its neighbour, because the version-control skill is the
-    caller and it lives outside this module.
+    Every `/v1/vcs/*` call stands alone and holds nothing across a session.
+    Public, because the version-control skill is the caller and it lives
+    outside this module.
     """
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -2194,6 +2013,18 @@ class ApiSession:
                 return response
             report_retry(response.status_code, refusal_text(self._json_body(response)), attempts_made, delay)
             self._sleep(delay)
+            if (self._json_body(response) or {}).get(BUSY_BOUND_KEY) == ADMISSION_BOUND_DRAINING:
+                # A draining exec pod keeps answering this on the pooled
+                # keep-alive connection to its Envoy, so the retry would go back
+                # to it. A new connection reaches a ready replica, or fails over
+                # to the stateful broker.
+                self._drop_pooled_connections()
+
+    def _drop_pooled_connections(self) -> None:
+        close = getattr(self._http, "close", None)
+        if close is not None:
+            with self._lock:
+                close()
 
     @staticmethod
     def _json_body(response):
@@ -2278,7 +2109,15 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
         import requests
     except ImportError:
         return (ConnectionError,)
-    return (requests.exceptions.ConnectionError, ConnectionError)
+    # The URL errors are raised while the request is prepared, before a byte is
+    # sent, so moving to the fallback is as safe as for a connection error.
+    return (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.InvalidURL,
+        requests.exceptions.MissingSchema,
+        requests.exceptions.InvalidSchema,
+        ConnectionError,
+    )
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:
@@ -2301,11 +2140,13 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # No default: a named endpoint is used as given, with no exec routing and
-    # no fallback, and an unnamed one is resolved by `exec_endpoints`.
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from
+    # the environment here, not through `exec_endpoints`, which would write its
+    # malformed-URL line even when an endpoint is named.
     parser.add_argument(
         "--endpoint",
         default=None,
-        required=exec_endpoints()[0] is None,
+        required=not os.getenv(EXEC_URL_ENV, "").strip() and os.getenv(BROKER_URL_ENV) is None,
     )
     parser.add_argument(
         "executable",

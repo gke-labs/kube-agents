@@ -810,11 +810,14 @@ class Task:
 
 
 class Run:
-    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The build directory the run was read from (SCHEMA.md, optional):
+        # the comment's build link follows it. Absent on older documents.
+        self.gcs_base = run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None
         # The main commit the run was built on (SCHEMA.md, optional): rule 4
         # compares a PR's red with passes on the same base. Absent is unknown.
         self.base_sha = run.get("base_sha") if isinstance(run.get("base_sha"), str) else None

@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -65,6 +67,14 @@ func ManagerCacheOptions() cache.Options {
 		// field, but an Update built from a cached copy without it would
 		// delete it from the live object.
 		DefaultTransform: cache.TransformStripManagedFields(),
+		// Leases are watched for one object per agent, the A2A gateway's
+		// election Lease (ensureA2AGatewayLease). Every node renews a
+		// Lease of its own every ten seconds in kube-node-lease, and
+		// controllers keep theirs, so an unscoped informer would cache and
+		// wake on all of them. The gateway's Lease carries the label.
+		ByObject: map[client.Object]cache.ByObject{
+			&coordinationv1.Lease{}: {Label: labels.SelectorFromSet(labels.Set{a2aGatewayLeaseLabel: "true"})},
+		},
 	}
 }
 

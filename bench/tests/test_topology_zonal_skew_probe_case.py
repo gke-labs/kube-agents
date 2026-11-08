@@ -76,7 +76,8 @@ def _fleet_dir(root: Path) -> None:
     """A runner-shaped directory with every catalogue slot reached: the
     objectives' ``fixture_roles`` resolve to slot d's credential."""
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
-    roles = catalog["roles"]
+    # The roles on a cluster slot; a project-scoped role has no slot line.
+    roles = {role: spec for role, spec in catalog["roles"].items() if spec["cluster_slot"] is not None}
     (root / "clusters").mkdir(exist_ok=True)
     lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
     for slot in sorted({spec["cluster_slot"] for spec in roles.values()}):
@@ -127,6 +128,10 @@ def test_the_declared_line_passes_its_objective(objective: str, tmp_path: Path) 
         (
             "report-attributes-node-pool-skew",
             "first-zone-sponge: cause is node-pool; primary evidence: single-zone node pool; blast-radius zone: europe-west10-a; running there: 6/6",
+        ),
+        (
+            "report-attributes-node-pool-skew",
+            "first-zone-sponge: cause is node-pool; primary evidence: selector_confined (confines placement to 1 of 2 usable domains); blast-radius zone: europe-west10-a; running there: 6/6",
         ),
     ],
 )

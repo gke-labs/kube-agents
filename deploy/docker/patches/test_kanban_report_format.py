@@ -231,6 +231,31 @@ class StanzaTest(unittest.TestCase):
         self.assertIn("=== Title ===", REPORT_FORMAT_STANZA)
         self.assertIn("pipe table", REPORT_FORMAT_STANZA)
 
+    def test_the_question_budget_is_the_cases(self):
+        """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
+
+        The case grades the shape of a delivered answer with ``max_chars`` and
+        ``max_sentences``; the stanza tells the worker the same numbers, in the
+        bullet that outranks the link, backtick and table rules. Read from the
+        case file so neither can move alone.
+        """
+        import pathlib
+        import re
+
+        case = pathlib.Path(__file__).resolve().parents[3] / "bench" / "tasks" / "chat-voice-answer-first" / "task.yaml"
+        text = case.read_text()
+        max_chars = int(re.search(r"^\s*max_chars:\s*(\d+)", text, re.MULTILINE).group(1))
+        max_sentences = int(re.search(r"^\s*max_sentences:\s*(\d+)", text, re.MULTILINE).group(1))
+        words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+        self.assertIn(max_sentences, words, f"the case's max_sentences {max_sentences} has no word here")
+        bullet = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            f"A question gets that paragraph and nothing more: at most {words[max_sentences]} sentences and "
+            f"{max_chars} characters in all",
+            bullet,
+        )
+        self.assertIn("A report stays under 2,000 characters", REPORT_FORMAT_STANZA)
+
     def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""
         self.assertEqual(serious_defects(REPORT_FORMAT_STANZA), ())

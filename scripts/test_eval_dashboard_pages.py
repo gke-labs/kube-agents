@@ -904,6 +904,19 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_a_lane_run_that_records_where_it_lives_links_the_console_browser(self):
+        """gcs_base (the lanes' own bucket, which Deck cannot read) turns the
+        row's build link into the Console's bucket browser; a night's
+        log_url still wins, and a record without either keeps Spyglass."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600/"
+        lane_run = dict(data["runs"][0], build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED", gcs_base=base)
+        data["runs"].append(lane_run)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-moved", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/", page)
+
     def test_the_gitlab_lane_has_its_own_section_outside_the_gates_numbers(self):
         """A tier-gitlab run is listed under "GitLab lane" with its own
         Spyglass link and never among the gate's runs; without one the
@@ -932,6 +945,49 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("1 night on record: 1 green, 0 not", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+
+    def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
+        """The GHES and GitLab CE lanes (kube-agents#3682) share one
+        "Self-managed lanes" section beside the GitLab one, saying how each is
+        run until one has a run; their rows name their forge, so a red says
+        which broke. The GitLab lane's nights are listed per nightly job."""
+        app = dom_text(self.index)
+        self.assertIn("Self-managed lanes", app)
+        self.assertNotIn(">GHES lane<", app)
+        self.assertIn("No run on record", app)
+        for job in ("pull-kube-agents-smoke-test-ghes", "pull-kube-agents-smoke-test-gitlab-ce"):
+            self.assertIn(f"/test {job}", app)
+        self.assertIn("No scheduled run on record", app)
+        self.assertIn("once a week", app)
+        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
+        data = copy.deepcopy(self.data)
+        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
+        data["runs"] += [
+            dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
+            dict(base, build_id="2097282860221206802", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"),
+            dict(base, build_id="2097282860221206803", tier="gitlab-ce", job="ci-kube-agents-eval-nightly-gitlab-ce-next", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/2097282860221206803"),
+            dict(base, build_id="2097282860221206801", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"),
+        ]
+        out = render_to(pathlib.Path(self.tmp.name) / "lanes", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800"', page)
+        self.assertNotIn('href="run.html#build=2097282860221206800"', page, "not the gate's")
+        # One table each for the pull-request and the scheduled runs, each row naming its forge.
+        self.assertIn("<th>Forge</th>", page)
+        self.assertIn("<td>GitLab CE</td>", page)
+        self.assertIn("<td>GHES</td>", page)
+        self.assertIn("Scheduled runs", page)
+        self.assertIn("GHES 1 run, 0 green; GitLab CE 1 run, 1 green", page)
+        # Each scheduled row names its job, so a retired nightly's night reads as its own.
+        self.assertIn("<th>Job</th>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
+        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        self.assertIn("1 night on record: 0 green, 1 not", page)
+        self.assertIn("No night of", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
@@ -1226,11 +1282,9 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Smoke gate is healthy", app)
         sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
         self.assertIn(sentence, app)
-        # The 🐢 message's own link lands on this headline, not on a
-        # synthetic past incident: a `since` at the note's GREEN start would.
-        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
-        self.assertEqual(fragment, "#view=agent")
-        linked = dom_text(out / "index.html", fragment=fragment)
+        # The bare agent view lands on this headline, not on a synthetic past
+        # incident: a `since` at the note's GREEN start would.
+        linked = dom_text(out / "index.html", fragment="#view=agent")
         self.assertIn("Smoke gate is healthy", linked)
         self.assertIn(sentence, linked)
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
@@ -1519,6 +1573,21 @@ class BrowserTest(unittest.TestCase):
         hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", fragment=f"#{hand_written}"))
+
+    def test_a_run_that_records_where_it_lives_links_its_build_and_transcripts_there(self):
+        """The run page's build link opens the Console's bucket browser and a
+        transcript link the object itself, for a run with gcs_base; the
+        Spyglass link under the old bucket is gone from that page."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/"
+        moved = [r for r in data["runs"] if r["build_id"] == "2097282860221206528"]
+        self.assertEqual(len(moved), 1)
+        moved[0]["gcs_base"] = base
+        out = render_to(pathlib.Path(self.tmp.name) / "moved", data, health=health_doc())
+        app = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
+        self.assertIn("storage.cloud.google.com/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")
@@ -1951,7 +2020,7 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
 
 # --- the Scenarios page -----------------------------------------------------
 
-SCENARIO_KEY = {"setup_id": "claude-opus-5-5-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
 SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
 SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
 # The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the

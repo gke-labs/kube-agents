@@ -194,6 +194,9 @@ class SequenceTest(unittest.TestCase):
             "api off": (1, "", "ERROR: SERVICE_DISABLED: GKE Hub API has not been used in project acme-fleet-host"),
             "timed out": (-1, "", "timed out after 60 seconds"),
             "truncated": (0, recorded_list()[:40], f"{shared.PROXY_TRUNCATION_MARKER} at 1048576 bytes"),
+            # The shipped shim's shape: exit 74 with the counts after the marker. Reaches the
+            # marker branch only because it is read before the exit code.
+            "cut, exit 74": (74, recorded_list()[:40], "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)"),
             "not a list": (0, '{"error": "unexpected"}', ""),
             "not json": (0, "ERROR printed on stdout", ""),
         }
@@ -208,6 +211,9 @@ class SequenceTest(unittest.TestCase):
         self.assertIn("PERMISSION_DENIED", evaluate(record, [record], FakeRunner({HOST: cases["refused"]}))[0]["unknown"][0])
         self.assertIn("rc=-1", evaluate(record, [record], FakeRunner({HOST: cases["timed out"]}))[0]["unknown"][0])
         self.assertIn("cut at the credential proxy's output cap", evaluate(record, [record], FakeRunner({HOST: cases["truncated"]}))[0]["unknown"][0])
+        cut_74 = evaluate(record, [record], FakeRunner({HOST: cases["cut, exit 74"]}))[0]["unknown"][0]
+        self.assertIn("cut at the credential proxy's output cap", cut_74)
+        self.assertNotIn("rc=74", cut_74)
         self.assertIn("not a JSON list", evaluate(record, [record], FakeRunner({HOST: cases["not a list"]}))[0]["unknown"][0])
         # No runner in the context: unknown, naming it, and no crash.
         member, context = context_for(record, [record], None)

@@ -118,9 +118,10 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
-window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch and its `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` limit, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
 cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
-roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+roster count, the `CRON_IDLE_THROTTLE_DAYS` and `CRON_IDLE_HIBERNATE_DAYS` thresholds of the
+idle-install hold on model-run cron jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
@@ -218,9 +219,17 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
-listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus series whose label values are
+caller can bypass Envoy by reaching the runtime directly. The runtime opens up
+to two TCP listeners of its own. The health-only one, closed unless
+`CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
+`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
+a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
+ten-second deadline as the metrics listener, so that a probe an operator
+points at the broker directly reads it as alive while the credentialed
+listener is at its thread cap; the operator's readiness probe reads `/healthz`
+through Envoy's health listener on 8768 instead (below), and the broker's
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator) serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
@@ -259,7 +268,8 @@ three refusals remove the Pod from the Service. That ceiling is declared rather 
 inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
 requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
 backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
-refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+refuses first, and the runtime's thread cap is derived from the same thresholds at startup
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
 no watch can mark the Pod unready; any other path on it is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
@@ -267,7 +277,7 @@ NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
 passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
 behind. There is no `livenessProbe`: the start script
 supervises both processes and restarts the runtime in place, and a probe-driven restart
-would drop every open watch and the broker's workspace state. Envoy's admin interface stays
+would drop every open watch. Envoy's admin interface stays
 on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
@@ -336,7 +346,8 @@ to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
-`/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
+`/var/run/secrets/kubeagents/serviceaccount/token` in the stateful broker's credential
+runtime (the exec tier does not mount it). A token
 for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
 read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
@@ -383,7 +394,7 @@ including:
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
 - background processes or commands that outlive the request;
-- commands exceeding request, output, or timeout limits; and
+- commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
@@ -391,7 +402,31 @@ including:
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
-  `Retry-After`; the session role keeps one slot up to a higher ceiling.
+  `Retry-After`; the session role keeps one slot up to a higher ceiling; and
+- more commands in one session than its budget allows. The wrapper sends the key of
+  the run it belongs to as the request's `sessionId`: the kanban card, else the
+  scheduled run, else the session (`HERMES_KANBAN_TASK`, `HERMES_CRON_RUN`,
+  `HERMES_SESSION_ID`). No process environment crosses the SSH hop into the shell
+  sandbox, so there the ForceCommand recovers the first two from the command's working
+  directory, the card workspace or the run directory the cron workdir patch minted, and
+  a chat turn, which runs from neither, sends no key; the session id reaches the wrapper
+  where the terminal runs in its own pod, the profile and session pods. The broker counts
+  per key: a shell or profile session past `BROKER_SESSION_MAX_TOOL_CALLS`
+  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED` (the scope publisher is
+  a script whose Job sets no key, so its calls are uncounted; a busy reply the wrapper
+  re-sends is not charged, since the retries are one invocation), and any keyed session
+  is refused the same command, on the same cluster, after it failed or was blocked
+  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times with no success of the session's between
+  (counted per command over the session's last eight failing ones, so a loop over two
+  failing commands trips on each), with `403 BROKER_LOOP_BREAKER`;
+  the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
+  carry the defaults and the operator's knobs. A key's counts last as long as the broker remembers it: a
+  scheduled run's key names one execution, a card's names the card, so a card's ceiling
+  and streak span its dispatches on a replica. The key is a loop guard, never an
+  identity: it comes from the body, which the model composes, so no policy decision
+  reads it, a request with no key is uncounted, and the authenticated principal stays
+  the only input to who may do what. Each broker process counts alone, in a bounded
+  LRU of sessions, so an exec tier of N replicas admits about N times the ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -640,7 +675,7 @@ the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
 As a latent defence-in-depth layer behind `/v1/exec` (which currently refuses
 `git` at `EXEC_ROUTE_EXECUTABLES`, while broker-internal git uses
-`WORKSPACE_GIT_SUBCOMMANDS` and `VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
+`VCS_GIT_SUBCOMMANDS`), `git_argument_violation`
 enforces an explicit allowlist of subcommands (`ALLOWED_GIT_SUBCOMMANDS`)
 alongside the denylist, failing closed on unknown or custom verbs if `git` is
 ever re-admitted to `/v1/exec`. Writing configuration via repository-local
@@ -660,84 +695,60 @@ is what makes repository-local configuration reachable at all, and it is the
 reason enumeration cannot finish — the dangerous keys carry an arbitrary name
 inside the key, so there is no finite set to deny.
 
-The alternative is to stop passing a directory. The sandbox sends `{path, bytes}`
-pairs, a branch and a message; the runtime writes them into a tree on its own
-volume, commits and pushes; the sandbox never names a path and never sees one
-come back. `CREDENTIAL_PROXY_CONTENT_WORKSPACE` arms it and it is off by default.
-While it is off the `/v1/workspace/*` routes do not exist — they answer 404, which
-is also what an older runtime answers, so a client can detect support by asking.
+The alternative is to stop passing a directory. The version-control routes
+(`/v1/vcs/*`) do that. The sandbox sends a git bundle, a branch and a message,
+or names a repository to read. The runtime runs its own git in a scratch
+directory on its own volume and deletes that directory before it answers. The
+sandbox never names a path and never sees one come back. The content workspace
+(`/v1/workspace/*`) kept `{path, bytes}` trees open across requests for the same
+purpose. It is retired (#4243): its reads go through `POST /v1/vcs/snapshot`, and
+its writes through `clone`, `publish` and `proposal-create`.
 
 Four things hold it together, and they are not equally strong:
 
-- **Disjoint roots, checked.** The tree root is under the runtime's own state
-  directory and the check that it does not overlap any other configured path runs
-  at construction. A mount rearrangement that collapses the two is a runtime that
-  refuses to start rather than one that starts without the property.
-- **One path validator.** The same function decides what a path may name on
-  reads and on writes, refuses rather than normalises, and refuses every spelling
-  of `.git` that a filesystem treats as `.git`. A checker that disagrees with
-  itself about what `manifests/../.git/config` means is the defect class this
-  document keeps describing.
+- **Disjoint roots, checked.** The scratch root is under the runtime's own state
+  directory, and `assert_disjoint_roots` checks at construction that it does not
+  overlap the agent-shared workspace root. A mount rearrangement that collapses
+  the two is a runtime that refuses to start rather than one that starts without
+  the property.
+- **One path validator.** One function (`validate_path` in
+  `agents/platform/scripts/workspace_paths.py`) decides what a path in a
+  `snapshot` request may name, refuses rather than normalises, and refuses every
+  spelling of `.git` that a filesystem treats as `.git`. A checker that disagrees
+  with itself about what `manifests/../.git/config` means is the defect class
+  this document keeps describing.
 - **A separate door for the runtime's own git.** Broker-internal git does not go
-  through `/v1/exec`. It accepts a literal allowlist of the subcommands this
-  mechanism issues (`WORKSPACE_GIT_SUBCOMMANDS` in
-  `agents/platform/scripts/content_workspace.py`), refuses `-C`, and is contained
-  to the tree root. Keeping the two apart is what lets the sandbox-facing
+  through `/v1/exec`. It accepts a literal allowlist of the subcommands the
+  version-control broker issues (`VCS_GIT_SUBCOMMANDS` in
+  `agents/platform/scripts/credential_proxy.py`), refuses `-C`, and is contained
+  to the scratch root. Keeping the two apart is what lets the sandbox-facing
   answer stay "git is not reachable" rather than "git is reachable, narrowly".
-- **Geometry, not checked here.** The tree root is on
+- **Geometry, not checked here.** The scratch root is on
   the runtime's own volume, which the sandbox container does not mount. Nothing in
   the process can verify that; it is the same argument this document already makes
   about `$HOME/.gitconfig` and `KUBECTL_KUBERC`, and it is exactly as weak. The
   structural form of it is the separate broker Pod, where there is no shared mount
   to name.
 
-Resource notes, because the trees are on the runtime's own emptyDir and that is
-node ephemeral storage rather than a disk of its own.
+The scratch trees are on the runtime's own emptyDir, which is node ephemeral
+storage rather than a disk of its own. Each tree lives for one request. A clone
+over `CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is refused, and the
+resource watermark relief step (below) removes scratch that no request of this
+process owns. [The seam](designs/version-control-support.md#3-the-seam) owns the
+ceilings.
 
-The number of open workspaces is capped, and a clone that comes in over
-`CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB by default) is removed rather than
-kept, so a repository the runtime cannot afford does not sit half-cloned on the
-node. Read those two together rather than separately: the ceiling is **per
-clone**, so the two defaults multiply out to about 2 GiB retained across eight
-open workspaces, by design. Size the node's ephemeral storage against the
-product, not against either number.
+Be precise about what this does and does not do. It does not change what `git`
+executes: a repository-local `.git/config` in the runtime's own tree would still
+run what it names. What changes is who can write that file: the sandbox sends
+file contents and names, never a `.git` path, so nothing it sends can define a
+key in the scratch repository's configuration.
 
-The cap counts a list the runtime keeps in memory, so a worker that dies without
-closing its workspace would otherwise hold a slot until the pod restarts. Two
-things bound that. A workspace no verb has named for
-`CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
-the next `open` or by the broker's resource watermark relief step (below), and every
-tree a previous process left under the root is removed when the runtime starts. A refusal at the cap logs each holder's handle prefix,
-repository, caller label (the card or session id the client sends), age and idle
-time, so a full store is diagnosable from the runtime's log.
-
-The ceiling is also measured after the clone finishes, so it bounds what is
-_retained_ and not the peak: a repository far over the limit still lands on the
-disk before it is removed, and the only thing bounding that is the runtime's
-per-invocation timeout. A shallow clone plus the ceiling would bound both and is
-the right follow-up; neither alone does.
-
-Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so
-peak heap on those routes is roughly concurrency times that figure: the bodies
-are read before any command runs, so the broker's command cap does not bound
-them, and the git these verbs run is serialised by the store's lock rather than
-counted against that cap. None of this is reachable from outside the Pod, but
-it is worth knowing before the flag is armed anywhere it matters.
-
-Every verb takes a lock for its whole duration. The handler is threaded, so two
-requests naming one handle genuinely interleave, and each verb is a read-then-act
-on a working tree the other is entitled to delete or reset underneath it. Without
-it a `close` landing inside a `commit` leaves the commit re-creating the tree the
-close just removed, with no handle pointing at it.
-
-Be precise about what arming this does and does not do. It does not change what
-`git` executes: a repository-local `.git/config` planted in the runtime's own tree
-still runs what it names, measured both ways. What changes is who can write that
-file. And `/v1/exec` is unchanged while the flag is on — both mechanisms run side
-by side deliberately, so that landing this does not have to be reverted to fix the
-migration. The finding class above therefore closes for work that goes through the
-content routes and stays open for work that does not, which today is all of it.
+The listener is threaded, one connection per thread, up to
+`CREDENTIAL_PROXY_MAX_THREADS`: by default the sum of Envoy's connection ceilings
+to the broker's socket, read from the Envoy config shipped beside the broker
+(4160 as shipped: the credentialed route's 4096 and the probe's 64, and 1024 for
+a cluster that sets none). A connection past it is answered `503` with
+`Retry-After` and closed.
 
 ### Agent-supplied kubeconfigs
 
@@ -888,7 +899,17 @@ Consequences:
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. The same bound applies to the decoded
   text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
-  three-byte replacement character, cannot cost more than text does. At most
+  three-byte replacement character, cannot cost more than text does. The reply
+  says when it was cut: `truncated` is true when either stream was cut,
+  `stdoutTruncated` when the cut fell on stdout, `bytesWritten` is the stdout
+  the caller receives in UTF-8 bytes, and `limit` is the cap (all four are
+  present on every completed reply). When stdout was cut the shim exits
+  `EXIT_OUTPUT_TRUNCATED` (74, `EX_IOERR`) whatever the command exited, and
+  prints the counts after its `credential proxy output truncated` stderr
+  marker, so a cut `-o json` dump reads as a failure to the model's own
+  `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
+  cut on stderr alone keeps the command's exit code, and the marker says stdout
+  is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (8; the operator sets it, as it sets the output cap, and
   reserves the name). A slot is held from admission until the response is on
@@ -919,8 +940,7 @@ Consequences:
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
-  The content workspace's git (serialised by the store's own lock, which is what sizes
-  the budget's fixed term) and the Cloud API relay (a bounded read of its own) take no
+  The Cloud API relay (a bounded read of its own) takes no
   slot and no reservation; the forge refresh takes no slot and reserves only when it
   will run its helper, which a coalesced refresh does not.
   A request that waits more than 60 seconds for admission is answered
@@ -948,7 +968,7 @@ Consequences:
   since statvfs on an emptyDir reads the node, not the cap) on the memory sampler's 30 s
   tick. From the soft watermark
   (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
-  run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
+  run one at a time and the first tick reclaims orphaned vcs
   scratch, collects and trims the allocator. From the hard watermark
   (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
   caller is answered at once, before it queues, with
@@ -957,17 +977,17 @@ Consequences:
   slot stays open to the session role, which is the one interactive class, up to a ceiling
   of 92% memory or 90% disk, past which it is refused too. A level is left only once the
   readings clear three points under the watermark it was entered at, so a reading that
-  hovers at a watermark is one episode: one transition line, one relief. A workspace write
-  refused this way has its body drained before the 429, as a vcs verb's refusal does, so a
-  commit still sending its files reads the refusal rather than a reset. Under the clamp that reserve is a
+  hovers at a watermark is one episode: one transition line, one relief. A vcs verb
+  refused this way has its body drained before the 429, so a
+  publish still sending its bundle reads the refusal rather than a reset. Under the clamp that reserve is a
   slot in the executor as well, one above the background commands running (those admitted
   before the clamp arrived keep their slots) and bounded by the configured cap alone, not by
   the interactive class cap of `designs/credential-broker-exec-tier.md` §4.2, which the
   shell's sweep can hold when the clamp arrives: a session's command runs beside them, and
   passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
   `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
-  and the content workspace's `open`, `commit` and `push` take the hard check alone, and a
-  watch and the workspace reads pass. A missing or `max` `memory.max` turns the
+  takes the hard check alone, and a
+  watch passes. A missing or `max` `memory.max` turns the
   memory half off. The refusal counts under `bound="pressure"`, and
   `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,

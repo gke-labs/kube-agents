@@ -2,9 +2,9 @@
 # FIXTURE_NOT_READY (#2513), in no roster file under hack/eval/ until an
 # evaluation install sets INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and the pool
 # GitOps repositories declare eval-pr-reminder-workload. Run it by hand against
-# such an install, with INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 and shorter
-# than the pull request takes to open (150 holds; the stack does not wait out a
-# longer window), and with no agent pull request left open on the workload's
+# such an install, with INCIDENT_WORKLOAD_DEDUP_SECONDS (on by default at an
+# hour) set shorter than the pull request takes to open (150 holds; the stack
+# does not wait out a longer window), and with no agent pull request left open on the workload's
 # manifest by an earlier run: that one would hold this run's first incident.
 #
 # Before a roster takes it, the case has to request its pull request the way

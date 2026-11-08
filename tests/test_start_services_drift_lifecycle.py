@@ -525,13 +525,15 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 "than RUNTIME_DRAIN_SECONDS",
             )
 
-    def test_the_broker_role_waits_on_its_own_longer_budget(self) -> None:
-        """The standalone broker drains its requests in flight on SIGTERM, so its
-        runtime gets BROKER_RUNTIME_DRAIN_SECONDS; the sidecar roles keep
-        RUNTIME_DRAIN_SECONDS, which their pods' grace periods hold.
+    def test_the_broker_and_exec_roles_wait_on_their_own_longer_budget(self) -> None:
+        """The standalone broker and the exec tier's pods drain their requests in
+        flight on SIGTERM, so their runtime gets BROKER_RUNTIME_DRAIN_SECONDS; the
+        sidecar roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods
+        hold.
         """
         for role, floor, ceiling in (
             ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
+            ("exec", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
             ("combined", 0, _BROKER_RUNTIME_DRAIN_SECONDS - 1),
         ):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
@@ -1401,8 +1403,19 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),
-            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD"},
+            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD", "WATCHER_ALERT_EXCLUDE"},
             "a WATCHER_* value reaches the watcher without a normaliser",
+        )
+
+    def test_the_alert_exclude_list_reaches_the_watcher_as_it_is(self) -> None:
+        """A JSON list, so the watcher parses it, and fails open on a bad one.
+
+        Quoted whole: the list carries spaces and double quotes.
+        """
+        self.assertIn('WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"', self.text)
+        self.assertIn(
+            '--alert-exclude="${WATCHER_ALERT_EXCLUDE}"',
+            self.lift("start_event_watcher"),
         )
 
 

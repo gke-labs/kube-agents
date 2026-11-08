@@ -6061,7 +6061,7 @@ summarize_existing_cluster_mutations() {
 
   # 5. gVisor pool
   if [ "$is_autopilot" != "True" ] && is_truthy "$enable_gvisor"; then
-    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (1 e2-standard-4 per zone; new billable capacity)"
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (shape from sizing_profile and the gvisor_* inputs, small unless install.env sets their TF_VAR_ lines, see terraform/modules/gke-cluster/README.md; new billable capacity)"
   else
     echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} None (not requested or native on Autopilot)"
   fi
@@ -7331,7 +7331,7 @@ main() {
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
-    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
   }
@@ -7346,7 +7346,16 @@ main() {
     # after_summary is true for the repeat at the end of main(), where the
     # component summary has already printed the web console command.
     local after_summary="${1:-false}"
+    # The resolved PlatformAgent mode: after the apply as the closing summary
+    # reads it, and at the chat step (before main() has resolved its own
+    # copy) from the flag or the fallback the mode check settled. Under next
+    # the CR carries the NoChatPlatform condition, which says where the
+    # agent's findings go.
+    local mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${platform_agent_mode:-${PARAM_PLATFORM_AGENT_MODE:-${PLATFORM_AGENT_MODE_FALLBACK:-}}}}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+    if [ "$mode" = "next" ]; then
+      print_info "The PlatformAgent carries the NoChatPlatform condition, which says where the agent's findings go instead of chat."
+    fi
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
     # endpoint, so print the resolved flag rather than a literal one. Resolved

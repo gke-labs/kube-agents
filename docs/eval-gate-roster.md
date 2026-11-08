@@ -11,16 +11,11 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
-them, since the merge-blocking presubmit runs on that lane (below). The script, `hack/ci-eval-pr.sh`,
-carries it too: it grades every pull request with `main`'s `bench/` at `PULL_BASE_SHA` and the change's
-own cases, and the rule keeps a root approval alone from editing that step out. So do the files that
-run inside it or decide whether it runs: `hack/ci-env.sh` and `hack/fleet-kubeconfigs.sh` (sourced),
-`hack/ci-deploy.sh` (its functions are evaluated), `hack/ci-revalidate.sh` (step 0, which can reuse a
-verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses cases) and
-`scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
-([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
-Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+them, since the merge-blocking presubmit runs on that lane (below).
+`hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
+recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
+Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -163,14 +158,14 @@ roster line on 2026-11-02 (its bullet stays for the record):
   `enabled`, and the agent read that leftover block as configured or open and said seeded-c
   matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal left
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The nightlies on the 2026-10-19 agent model passed every scored repetition. Its removal left
   `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
   consistency-drift-outlier took a roster seat on 2026-10-26 (below). The agent-side fix landed
   in [#3609](https://github.com/gke-labs/kube-agents/pull/3609) on 2026-10-23: a named-cluster
   comparison starts with the drift collector, whose rule reads the leftover block as off, and a
   second objective grades that the collector ran; #3448 was closed unmerged on 2026-10-26.
-  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, agent on
-  Claude): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
+  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, on the
+  2026-10-19 agent model): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
   graded. Its roster line was withdrawn the same week, on #3975's review thread: with #3609's
   route reverted the
   probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
@@ -306,19 +301,19 @@ Admitted on the record since the split:
   a stack case; that periodic's first night is 2026-10-27), read from each build's
   `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: 21 of 21 graded
   repetitions on the seven nights 2026-10-27 to 11-02, every night 3/3, no infra repetition, all
-  under `spec.mode next` on the inject lane; 6/6 on the two nights on
-  `claude-opus-5-5-kubeagents-mcp` and 15/15 on the five since the agent model became
+  under `spec.mode next` on the inject lane; 6/6 on the two nights at
+  the 2026-10-19 agent-model key and 15/15 on the five since the agent model became
   `gemini-4-argon-kubeagents-mcp` on 2026-10-29. Median repetition 201 s (43–974 s) over the
   21, 243 s (66–448 s) over the 15 on the current model. The case joined the nightly on
   2026-10-23; the main nightly's builds of 10-24 to 10-26 each ran two of its repetitions and
   hit their deadline before the third and before grading, so they wrote no case artifact and
   count neither way. The store reads `collecting: 15/15 runs recorded at this key across 5
 recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode `next`) and
-  `collecting: 6/6 … across 2` at the Claude next-mode key, the model change having reset it.
+  `collecting: 6/6 … across 2` at the 2026-10-19 model's next-mode key, the model change having reset it.
   So the citation is the nightly record, as for the entries below, and the eval crew's approval
   of this line is the call that it suffices before the window fills. The one recorded miss is
   off every current key: the retired today-mode nightly (`ci-kube-agents-eval-nightly-today`,
-  api transport, Claude) graded it 0/3 on 2026-10-26, each repetition on the route objective
+  api transport) graded it 0/3 on 2026-10-26, each repetition on the route objective
   alone (`read-from-monitoring-not-the-audit-log`, a `worker_commands` check that read one
   command and no `gcloud`) with the two report objectives passing and the answer naming the
   policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
@@ -395,7 +390,7 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   consistency-authorized-networks-probe, was demoted on 2026-10-21 (above), moved from
   `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit. It is not
   a probe but the full `fleet-consistency-drift` audit, one of the four recast out of the presubmit
-  on 2026-08-26 at 600–1300 s a repetition; on the `claude-opus-5-5-kubeagents-mcp` agent model it
+  on 2026-08-26 at 600–1300 s a repetition; on the agent model of 2026-10-19 it
   runs at about 200 s. The record is the main nightly (`ci-kube-agents-eval-nightly`), read from
   each build's `case-consistency-drift-outlier.json` and dated by the build's UTC start: 33 of 34
   graded repetitions on the twelve nights that graded it, 2026-10-13 to 10-26. 10-21's build
@@ -407,7 +402,7 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   5 of 5 of them under `spec.mode next`, the presubmit's mode and inject lane (2/2 on 10-24 with
   one infra repetition, 3/3 on 10-26). Median repetition 198 s (165–397 s) over the fourteen. The
   store reads `collecting: 5/5 runs recorded at this key across 2 recorded run(s), 15 more needed`
-  at the next-mode key and `collecting: 9/9 … across 3` at the Claude today-mode key, since the
+  at the next-mode key and `collecting: 9/9 … across 3` at the 2026-10-19 model's today-mode key, since the
   model change and then next mode each reset it. The last Gemini key reads
   `the record would admit it: 19/20 screening runs across 7 recorded run(s)`. So the citation is
   the nightly record, as for pdb-remediation-pr and vcs-spent-branch-reuse below, and the eval
@@ -443,11 +438,11 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952, 2114144983022833664 and
   2114507375523139584), all three under `spec.mode next`, the presubmit's mode and inject lane,
   since [#3783](https://github.com/gke-labs/kube-agents/pull/3783); 21 of 21 over the seven nights
-  2026-10-20 to 10-26, every one since the agent model became `claude-opus-5-5-kubeagents-mcp`;
+  2026-10-20 to 10-26, every one since the agent model changed on 2026-10-19;
   and 37 of 41 graded repetitions over the fourteen nights 2026-10-13 to 10-26, every miss before
   #3145 and on the Gemini setup: 0/3 on 2026-10-18 and one repetition on 10-16, all the "names no
   pull request URL" shape #3145 addresses (10-16 also had one infra repetition). Median repetition
-  172 s (142–265 s) over the nine since #3145. The four Claude nights before #3145 merged passed
+  172 s (142–265 s) over the nine since #3145. The four nights before #3145 merged, on the 2026-10-19 agent model, passed
   too (12/12), so the record does not separate #3145's effect from the model change's; either way
   the miss has not recurred in 21 repetitions. The store reads
   `collecting: 9/9 runs recorded at this key across 3 recorded run(s), 11 more needed` at the
@@ -469,15 +464,15 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
   the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights
   2026-10-09 to 10-22, every night 3/3, no infra repetition, median repetition 173 s (113–656 s).
-  The agent model changed from `gemini-3-1-pro-preview-kubeagents-mcp` to
-  `claude-opus-5-5-kubeagents-mcp` on 2026-10-19, which reset the version key: the store reads
+  The agent model changed from `gemini-3-1-pro-preview-kubeagents-mcp`
+  on 2026-10-19, which reset the version key: the store reads
   `collecting: 12/12 runs recorded at this key across 4 recorded run(s), 8 more needed`, and the
   last Gemini key read `would-admit` (21/21 over the newest seven nights) on every night from
   2026-10-09 to 10-18. So the citation is the
-  nightly record, 12/12 of it on the four Claude nights, and the eval crew's approval of this
+  nightly record, 12/12 of it on the four nights after the model change, and the eval crew's approval of this
   line is the call that it suffices before the window fills (expected with the 2026-10-25
   writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed 18 of 18
-  on `ci-kube-agents-eval-nightly-next-claude` 2026-10-16 to 10-21, with
+  on the retired next-mode nightly 2026-10-16 to 10-21, with
   `the-forge-was-reached-without-a-cli` (a `worker_commands` check) set aside as blind on that
   transport, as it will be on the presubmit; and 15 of 15 on the five GitLab nightlies that
   graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
@@ -851,7 +846,15 @@ api and inject lanes are graded against the same bar. The door's task can reach 
 cluster safeguards see nothing of GitHub; the file holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends to a copy of every task file in the matrix before devops-bench reads
 it, so a repetition that wrote a pull request or branch the case did not request is a tripped
-catastrophic safeguard at rung 1, as a cluster mutation is. A write is charged to a repetition
+catastrophic safeguard at rung 1, as a cluster mutation is. A repetition that ended on an
+infrastructure failure with an empty reply, whose only catastrophic trip is this write safeguard, and
+whose case requested a pull request, grades infra rather than rung 1 when the safeguard charged no more
+writes than the case requested: the safeguard credits a requested pull request only when the reply names its
+URL, and an infrastructure failure empties the reply, so the pull request the case asked for,
+opened in its own exclusive window, reads as unrequested (#4743). A real forbidden action trips a
+safeguard this carve-out does not name, or this one beside it, and still blocks at rung 1; so does a
+write on a case that requested no pull request, which has no requested write to be mischarged, an extra
+write charged beside the requested one, and a repetition whose reply could name the pull request. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
 whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
 push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
 its branch); a write in the window that the repetition does not name is recorded under
@@ -895,6 +898,18 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
+On the night of 2026-11-06 the five nightlies moved the agent from Vertex AI to the Gemini
+Developer API (`MODEL_PROVIDER=gemini`), each with the leased pool project's own key
+([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge did not move. The
+version key does not carry the serving provider
+([#4932](https://github.com/gke-labs/kube-agents/issues/4932)), so rung 6 compares nights on both
+sides of the switch at the same key. A step in cost or latency from that night has this cause.
+The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
+6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
+transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
+2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
+smoke jobs and the forge smoke variants stay on Vertex AI.
+
 ## The GitLab lane
 
 The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
@@ -906,7 +921,7 @@ presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
-(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its two nightlies, around the
+(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode weekly job, around the
 per-run GitLab CE that `hack/ci-forge.sh` stands up, `docs/ci-pool-projects.md` 5.8), since the cases grade the forge and not where it is; a GitHub Enterprise
 Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
 `hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
@@ -920,9 +935,9 @@ nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
-(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
-lane never records.
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its nights are
+listed under the Brief's GitLab lane section beside the today-mode nightly's, in no gate number or case
+record, and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the lane
 arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on the GitHub
@@ -943,8 +958,8 @@ a pull request.
 
 ## The GHES lane
 
-The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
-and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-weekly-ghes-next`
+weekly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
 [#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
 Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
 on a VM the job stands up per run in front of the leased project's github.com repository
@@ -958,6 +973,25 @@ GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard 
 appends anyway) stays unregistered, since a nightly registration would run it on the github.com
 nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
 grow a lane-only seat.
+
+## The certification suite
+
+The certification suite, the cases behind the certified-capabilities page, is the one list
+under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification-cases.txt`
+registers its own cases, each a top-level case under
+`bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
+one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck. The script refuses an entry
+that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
+refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
+above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
+the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
+every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
+failing certification case is a record for the page rather than a red. The lane appends nothing to
+the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
+earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
+The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
+meets are in [`bench/README.md`](../bench/README.md#certification-suite).
 
 ## Demoting a flaky case
 

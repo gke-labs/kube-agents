@@ -552,6 +552,10 @@ class SendTest(unittest.TestCase):
         result, _ = self._send(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN)
         self.assertTrue(result.success)
 
+    def test_kept_by_the_gateway_is_not_a_failure(self):
+        result, _ = self._send(kanban_chat_notify.NOTIFY_KEPT, err=b"kept for the digest")
+        self.assertTrue(result.success)
+
     def test_route_unavailable_fails_and_marks_the_route_down(self):
         adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.GOOGLE_CHAT, _Runner())
 
@@ -692,6 +696,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.A2A_CLI, chat_notify.A2A_CLI)
         self.assertEqual(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN, chat_notify.NOTIFY_OUTCOME_UNKNOWN)
         self.assertEqual(kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, chat_notify.NOTIFY_ROUTE_UNAVAILABLE)
+        self.assertEqual(kanban_chat_notify.NOTIFY_KEPT, chat_notify.NOTIFY_KEPT)
         self.assertEqual(kanban_chat_notify.NOTIFY_WAIT_SECONDS, chat_notify.NOTIFY_WAIT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_CONNECT_SECONDS, chat_notify.NOTIFY_CONNECT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_MARGIN_SECONDS, chat_notify.NOTIFY_MARGIN_SECONDS)

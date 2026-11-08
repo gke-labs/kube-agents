@@ -53,6 +53,7 @@ that ships.
 
 import json
 import pathlib
+import tempfile
 import re
 import shlex
 import subprocess
@@ -73,6 +74,8 @@ _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
+_A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
+_A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _BRIDGE_MAIN = _REPO_ROOT / "a2a" / "cmd" / "hermes-bridge" / "main.go"
@@ -89,15 +92,17 @@ _A2A_SUBSTITUTIONS = (
     "_A2A_VERIFIER_URI",
     "_A2A_CONSOLE_URI",
     "_A2A_BRIDGE_URI",
+    "_A2A_DISPATCHER_URI",
 )
-_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge")
-_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console")
+_A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "a2a-console", "hermes-bridge", "a2a-dispatcher")
+_A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console", "dispatcher")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
-# nightly's three parts and the GitLab and GHES next nightlies; the today-mode
-# GitLab nightly and a made-up job stand for every other Prow run.
+# nightly's three parts, the forge lanes' next-mode nightlies and weekly
+# jobs, and the certification lane's first slice; the today-mode GitLab nightly and a
+# made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
@@ -106,6 +111,9 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
     "ci-kube-agents-eval-nightly-gitlab-ce-next",
+    "ci-kube-agents-eval-weekly-ghes-next",
+    "ci-kube-agents-eval-weekly-gitlab-ce-next",
+    "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
 )
@@ -411,6 +419,17 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[8].value=true",
         ]
+        # The gateway's election, off for installs and on for the lane, under
+        # the name the operator reads it by, which opens it only on "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[9].name={go_constant(_A2A_GATEWAY_LEASE, 'a2aGatewayElectionEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[9].value=true",
+        ]
+        # Nothing turns the AgentProfile dispatcher on: it is off by default,
+        # and the lane installs what a default install does.
+        self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -563,6 +582,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
+        # The gateway's election, on for the lane on this path too.
+        self.assertEqual(values[9], "operator.extraEnv[9].value=true")
+        self.assertEqual(len(values), 10, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -1796,19 +1818,20 @@ class BridgeImageBuildTest(unittest.TestCase):
             ("a2a-authcallout", "A2A_CALLOUT_IMAGE"),
             ("a2a-verifier", "A2A_VERIFIER_IMAGE"),
             ("a2a-console", "A2A_CONSOLE_IMAGE"),
+            ("a2a-dispatcher", "A2A_DISPATCHER_IMAGE"),
             ("hermes-bridge", "A2A_BRIDGE_IMAGE"),
         ):
             self.assertEqual(by_name[name]["override"], override)
             self.assertEqual(by_name[name]["tagPolicy"], "release")
 
-    def test_the_a2a_step_starts_at_once_and_builds_the_five_in_order(self) -> None:
-        """The five A2A images do not depend on the platform image, so their
+    def test_the_a2a_step_starts_at_once_and_builds_the_six_in_order(self) -> None:
+        """The six A2A images do not depend on the platform image, so their
         step must not queue behind it; only the bridge does."""
         self.assertEqual(build_step("a2a")["waitFor"], ["-"])
         result = run_build_step("a2a", next_stack_substitutions(), 'docker() { echo "docker $*"; }')
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = []
-        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, _A2A_IMAGES[:5], strict=True):
+        for suffix, image in zip(_A2A_DOCKERFILE_SUFFIXES, (*_A2A_IMAGES[:5], "a2a-dispatcher"), strict=True):
             uri = f"{_AR_REPO}/{image}:{_TAG}"
             # The worker's Dockerfile copies the credential broker's shim client
             # from agents/platform/scripts, so it builds from the repository
@@ -1846,6 +1869,42 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("built FROM this run's platform image", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+
+class CrStatusReportTest(unittest.TestCase):
+    """report_cr_status: the agent's full status, which names the model the
+    install serves, goes to the job's artifacts; the job log, which Prow
+    streams to anyone while a run is in progress, gets the phase and the
+    Ready condition only."""
+
+    def test_the_log_line_names_no_model_and_the_artifact_holds_the_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                "\n".join(
+                    [
+                        f'export ARTIFACTS="{tmp}/artifacts"',
+                        'export NAMESPACE="kubeagents-system"',
+                        'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                        "kubectl() {",
+                        '  case "$*" in',
+                        '    *"-o yaml"*) printf "status:\\n  phase: Running\\n  inference:\\n    model: secret-model-name\\n    provider: vertex_ai\\n" ;;',
+                        '    *jsonpath*) printf "Running\\tAgentReady: the agent is up" ;;',
+                        "  esac",
+                        "}",
+                        lifted_block("readonly DEPLOY_ARTIFACT_DIR=", "readonly CR_PHASE_READY_JSONPATH", "the artifact dir and status constants"),
+                        shell_function("report_cr_status"),
+                        'report_cr_status "probe"',
+                    ]
+                )
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("secret-model-name", result.stdout + result.stderr)
+            self.assertIn("Running", result.stdout)
+            self.assertIn("AgentReady", result.stdout)
+            artifact = pathlib.Path(tmp) / "artifacts" / "platformagent-status-probe.yaml"
+            self.assertTrue(artifact.exists(), result.stdout)
+            self.assertIn("secret-model-name", artifact.read_text())
 
 
 if __name__ == "__main__":

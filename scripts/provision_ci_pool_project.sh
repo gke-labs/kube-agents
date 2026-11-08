@@ -389,6 +389,9 @@ gcloud services enable \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
+  apikeys.googleapis.com \
+  secretmanager.googleapis.com \
+  generativelanguage.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -698,6 +701,12 @@ if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_
 fi
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
+
+# ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
+echo -e "\n==> [Step 1.6] Minting the project's Gemini Developer API key..."
+# Per project so each leased project gets its own quota window; the same script repairs an already-registered project, which must not be re-provisioned.
+# Step 1 already enabled its three APIs (REQUIRED_APIS); the script enables them again, which is a no-op.
+"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

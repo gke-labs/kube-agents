@@ -13,7 +13,10 @@ install without the interview.
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
   by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  (with an optional gVisor node pool; `sizing_profile = "fleet"` or the
+  `standard_*` and `gvisor_*` inputs resize both pools, per the module's
+  [sizing section](../../modules/gke-cluster/README.md#sizing-the-node-pools))
+  — with Workload Identity, Cloud KMS
   database encryption (CMEK), the Backup for GKE agent enabled, and the
   `kube-agents-host=true` discovery label applied. Setting
   `create_cluster = false` instead makes the module read an existing cluster:
@@ -244,7 +247,11 @@ release namespace (`NAMESPACE` in `install.env`) has the same guard,
 so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
 `guard_kms_identity`): on a cluster this state created, a renamed key would be
 destroyed and recreated, which schedules the live key's versions for destruction.
-A key is rotated in Cloud KMS, not by renaming it here.
+A key is rotated in Cloud KMS, not by renaming it here. On a Standard cluster
+`standard_node_count` is the cluster's own `initial_node_count`, ForceNew on the
+cluster itself, and a `TF_VAR_standard_node_count` line in `install.env` reaches
+it: `guard_standard_node_count` refuses a count other than the one the cluster
+was created with, because the plan would be the cluster's destroy-and-recreate.
 And a distinct GSA name un-collides creation, not identity: the Workload
 Identity principal names a namespace and KSA project-wide, no cluster, so two
 installs that share the namespace and the default KSA name bind the same
@@ -266,6 +273,23 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The Standard pools' sizing inputs (`sizing_profile`, `standard_*`, `gvisor_*`)
+travel the same way, as `TF_VAR_` lines the generator never writes, and the
+lines have to be present on every later `install.sh` and `upgrade.sh` run: a
+lost one resolves the `small` profile, and the apply would recreate every node
+of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
+sizing input asks for the change: the pool's own input, set to any value, or,
+for an attribute no explicit input decided at the last apply, a profile other
+than the one that apply recorded. Two root outputs carry what the last apply
+decided them with: `sizing_profile`, and `node_pool_shape_inputs`, the
+explicit inputs that were set. A profile kept beside a lost explicit line asks
+for nothing, and a changed profile asks nothing about an attribute an explicit
+line set, so both of those applies are refused until the line is back or the
+pool's input names the shape. An install applied before the two outputs
+existed plans them once, `+ sizing_profile = "<profile>"` and
+`+ node_pool_shape_inputs = "<names>"` under `Changes to Outputs` and nothing
+else, which `-detailed-exitcode` reports as 2 and `./upgrade.sh --plan` as
+drift, until the next apply records them.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and

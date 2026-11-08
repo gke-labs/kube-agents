@@ -17,6 +17,11 @@
 # holds the pods the A2A gateway creates to the session pod shape, and sets
 # A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
 #
+# It also installs templates/web-console-cr-admission-policy.yaml where the web
+# console and its environment page are on: the console's ServiceAccount may
+# change only its own annotations and spec.integration.forges, repositories and
+# github on the PlatformAgent.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -150,6 +155,18 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The MCP server (<agent>-a2a-mcp), a Model Context Protocol endpoint that lets
+  # an external coding agent or IDE talk to a platformAgent.mode: next install
+  # over its message bus. true sets A2A_MCP_DOOR=true on the controller manager,
+  # which then renders the server's Deployment, Service, deny-all ingress
+  # NetworkPolicy and bearer-token Secret beside every next-mode PlatformAgent it
+  # manages; the quota preflight counts its pod. Under "today" the operator
+  # renders nothing for it. Setting this back to false removes all of it, the
+  # token included. An A2A_MCP_DOOR entry in extraEnv wins: the chart then
+  # renders only that entry. What it renders and how to connect: the site's
+  # "MCP server" reference page.
+  mcpServer:
+    enabled: false
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -237,23 +254,28 @@ operator:
   # manager sets its Go soft memory limit to nine tenths of whatever limit is
   # rendered, so raising this is the one change for a larger cluster.
   #
-  # requests.cpu is 50m rather than the 10m the manager needs because GKE
-  # Autopilot admits a pod unchanged only at 50m or more per pod and between
-  # 1 and 6.5 GiB of memory per vCPU on the requests pair, and raises the
-  # smaller request into that band: 10m beside 128Mi is 12.5 GiB per vCPU,
-  # so Autopilot wrote 50m onto the pod and the quota preflight, which sums
-  # this line, had counted 10m. Declared on the floor, the manifest is the
-  # pod the cluster admits on Standard and on Autopilot with bursting.
-  # Autopilot without bursting raises the pod to its per-pod minimums
-  # (250m CPU, 512 MiB) and sets the limits equal to the requests, so the
-  # manager runs under at least 512Mi there and reads that limit.
+  # The requests are sized to be livable as the limits: GKE Autopilot
+  # without Pod bursting (a cluster or compute class with bursting off) sets
+  # each limit equal to its request, so the request is what the manager then
+  # runs under, and 128Mi, right for the measurement above, left no room for
+  # the cache to grow with the cluster before the manager was OOM-killed.
+  # 256Mi holds a cluster several times the measured one, and the manager
+  # reads whichever limit was admitted. requests.cpu is 100m rather than the
+  # 10m the manager needs because Autopilot admits a pod unchanged only at
+  # 50m or more per pod and between 1 and 6.5 GiB of memory per vCPU on the
+  # requests pair, and raises the smaller request into that band: 100m beside
+  # 256Mi is 2.5 GiB per vCPU, inside it, so the manifest is the pod the
+  # cluster admits, and the quota preflight, which sums this line, counts
+  # what runs. Where Autopilot raises a pod to its per-pod minimums (250m
+  # CPU, 512 MiB) the admitted pod is still larger than this; where it does
+  # not, this is the pod it admits.
   resources:
     limits:
       cpu: 500m
       memory: 512Mi
     requests:
-      cpu: 50m
-      memory: 128Mi
+      cpu: 100m
+      memory: 256Mi
 
 telemetry:
   # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,
@@ -645,11 +667,65 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # The shadow-mode inference replay proxy, an eval fixture
+  # (hack/replay-proxy/README.md): it takes the inference-gateway Service, logs
+  # what a replay cache would have keyed on for every request, and forwards
+  # each one unchanged to LiteLLM through the inference-gateway-upstream
+  # Service. It never serves a saved answer. Off on every install;
+  # hack/ci-deploy.sh turns it on for Prow eval runs (EVAL_REPLAY_SHADOW=false keeps it off).
+  # On, the LiteLLM pods also carry kubeagents.x-k8s.io/inference-role: litellm,
+  # and the proxy pods keep app: litellm, so the LiteLLM PodDisruptionBudget,
+  # PodMonitoring and the operator's litellm-policy select them too. Turned on
+  # in an upgrade rather than at install, inference-gateway moves to the proxy
+  # at once while LiteLLM still has to roll to gain the label, so model calls
+  # fail until it has; CI turns it on at install.
+  replayShadow:
+    enabled: false
+    # The image hack/ci-deploy.sh builds from hack/replay-proxy/Dockerfile into
+    # the eval project's registry. Nothing publishes it, so there is no
+    # default, and the reference is used as given: global.imageRegistry and
+    # global.thirdPartyImageRegistry do not rewrite it.
+    image:
+      repository: ""
+      tag: ""
+      pullPolicy: IfNotPresent
+    # Two, so a proxy restart or a node drain leaves one serving; there is no
+    # fallback to LiteLLM, which would split the traffic and lose its lines.
+    replicaCount: 2
+    # Surge first: the proxy is the only path to the model while it is on,
+    # so a rollout never drops below the running count. An eval namespace with
+    # a full ResourceQuota stalls this rollout (litellm.rollingUpdate above says
+    # why); set maxUnavailable: 1 there.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
+    # nightly-untrusted or presubmit (hack/ci-env.sh, resolve_replay_shadow),
+    # and is required when the proxy is on: an untagged line counts in no
+    # estimate.
+    job:
+      kind: ""
+      project: ""
+      build: ""
+      pr: ""
+    # Ephemeral storage covers the 2Gi data volume (templates/litellm.yaml)
+    # plus 256Mi of container log. The proxy is one Python process: its
+    # analysis runs on one thread, and memory holds up to 1024 queued request
+    # bodies and a million first-seen message timestamps.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+        ephemeral-storage: 2304Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 2304Mi
 
 # The Hindsight memory store: the API the agents call for long-term memory,
-# the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
-# the database's deliberate lack of a password, and a PodMonitoring. Mirrors
-# k8s-operator/config/integrations/hindsight.
+# the Postgres/pgvector StatefulSet behind it, NetworkPolicies isolating the
+# API pod and standing in for the database's deliberate lack of a password,
+# and a PodMonitoring. Mirrors k8s-operator/config/integrations/hindsight.
 hindsight:
   # Tri-state. true/false is an answer; null (the default) follows
   # platformAgent.harness.memory.provider, so the providers that need the
@@ -679,21 +755,25 @@ hindsight:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # The request covers steady state: at rest the API sits near 9m of CPU,
-    # and the request is what the scheduler places, what Autopilot bills and
-    # what a ResourceQuota counts, so it stays small. The limit is the ceiling
-    # recall may burst to on the in-process cross-encoder reranker; CPU above
-    # the request is best-effort, so on a node shared with other CPU-heavy
-    # tenants the request is the number to raise. An Autopilot cluster without
-    # Pod bursting resets the limit to the request, so raise the request there
-    # too if recall is slow. Raising the limit buys nothing: more CPU has been
-    # measured to change no recall latency on e2-standard-4, and a request of
-    # 4 CPUs never schedules there (docs/designs/memory.md, "What a recall
-    # costs"; k8s-operator/config/integrations/hindsight/api.yaml is canonical).
+    # The memory request is sized to be livable as the limit: an Autopilot
+    # cluster without Pod bursting sets each limit equal to its request, and
+    # the API loads 1.4 GB of embedding and reranking model weights in
+    # process, which a 1Gi request clamped to 1Gi could not hold. 2Gi holds
+    # them with room to serve. The CPU request is above steady state (at rest
+    # the API sits near 9m) for the same clamp, so recall keeps half a core
+    # there; the request is what the scheduler places, what Autopilot bills
+    # and what a ResourceQuota counts, so it stays under one core. The limits
+    # are the ceiling recall may burst to on the in-process cross-encoder
+    # reranker where bursting is on; CPU above the request is best-effort, so
+    # on a node shared with other CPU-heavy tenants the request is the number
+    # to raise. Raising the limit buys nothing: more CPU has been measured to
+    # change no recall latency on e2-standard-4, and a request of 4 CPUs
+    # never schedules there (docs/designs/memory.md, "What a recall costs";
+    # k8s-operator/config/integrations/hindsight/api.yaml is canonical).
     resources:
       requests:
-        cpu: 250m
-        memory: 1Gi
+        cpu: 500m
+        memory: 2Gi
       limits:
         cpu: "4"
         memory: 4Gi
@@ -720,6 +800,9 @@ hindsight:
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
+  # When litellm.enabled=false, hindsight-api's NetworkPolicy renders as
+  # Ingress-only (because its gateway egress rule selects app: litellm /
+  # app: standalone-replay pods in the release namespace).
   networkPolicy: true
   podMonitoring: true
   podDisruptionBudget:
@@ -858,14 +941,17 @@ platformAgent:
     size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Three of them the chart also derives from
+  # "PlatformAgent annotations"). Four of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
   # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
   # kubeagents.x-k8s.io/otlp-collector-namespace, and
   # litellm.modelProvider=openai_compatible stamps
   # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
-  # (unless the endpoint is public on port 443). When the chart stamps a key,
+  # (unless the endpoint is public on port 443), and every render stamps
+  # kubeagents.x-k8s.io/a2a-quota-chart-pods with the chart's pods and their
+  # rollout surges.
+  # When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
@@ -999,6 +1085,26 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The k8s event watcher. alertExclude lists events that open no incident:
+    # no alert, no triage card, no share of the daily alert ceiling. Their
+    # clusters stay in scope, so the agent still reads them when asked. A rule
+    # sets one or more of cluster ({projectId, location, clusterName}, only
+    # clusterName required), namespace, reason, kind and name (a trailing *
+    # is a prefix), and matches when every part it sets matches; an event is
+    # excluded when any rule matches. At most 64 rules. Empty omits the block.
+    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
+    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
+    # removes the CR's whole eventWatcher block, so an enabled: false set there
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
+    eventWatcher:
+      alertExclude: []
+        # - namespace: payments
+        # - reason: FailedScheduling
+        #   cluster: { clusterName: batch }
+        # - namespace: shop
+        #   kind: Pod
+        #   name: inventory-api-*
     # The controller stall watch, the stall-watch cron job that alerts on
     # controllers that stopped making progress. Empty omits the block and
     # keeps the watch's defaults. A change rolls the agent pod. The
@@ -1203,6 +1309,56 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The most triage pull requests open or being opened at once, when
+    # INCIDENT_TRIAGE_OPEN_PULL_REQUEST is "true" in env above. A triage whose
+    # pull request would pass the limit still runs, but its report asks for a
+    # reply, and a note in the alert's thread says that the limit held its pull
+    # request back. Rendered as INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+    # spec.deployment.env when above 0. 0 is no limit. An entry with the same
+    # name in env above wins, and a valueFrom entry for it fails the render
+    # while this key is above 0. The site's chatops page, "Limiting the open
+    # triage pull requests", has the rules.
+    incidentMaxOpenPullRequests: 0
+    # The event watcher's tuning settings. Each key that you set becomes one
+    # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
+    # the agent-api-auth container, which runs the watcher. A key that you do
+    # not set keeps the watcher's default (in brackets below). An entry with the
+    # same name in env above wins over the key, a valueFrom entry included.
+    #
+    #   eventWatcher:
+    #     dedupWindow: 24h                # WATCHER_DEDUP_WINDOW [24h]
+    #     backoffMinCount: 3              # WATCHER_BACKOFF_MIN_COUNT [3]
+    #     imagePullTransientMinCount: 3   # WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT [3]
+    #     failedSchedulingMinCount: 5     # WATCHER_FAILEDSCHEDULING_MIN_COUNT [5]
+    #     failedSchedulingMinSpan: 2m     # WATCHER_FAILEDSCHEDULING_MIN_SPAN [2m]
+    #     scaleUpHold: 15m                # WATCHER_SCALEUP_HOLD [15m]
+    #     settle: 2m                      # WATCHER_SETTLE [2m]
+    #     quietAfter: 15m                 # WATCHER_QUIET_AFTER [15m]
+    #     autopilotScaleToZeroHold: true  # WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD [true]
+    #
+    # A duration is a Go duration such as 90s, 2m or 1h30m, up to 1000000h.
+    # "0" turns off failedSchedulingMinSpan, settle and quietAfter.
+    # dedupWindow and scaleUpHold must be above zero, and a count at least 1.
+    # A count of 1 fires on the first event only with its gate off:
+    # failedSchedulingMinSpan "0" for failedSchedulingMinCount, and settle "0"
+    # for backoffMinCount. The watcher README
+    # (k8s-operator/cmd/k8s-event-watcher/README.md, the flag table) says what
+    # each setting does. A duration that the watcher cannot read keeps its
+    # default, and the container log names it. A change rolls the agent pod
+    # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
+    eventWatcher: {}
+    # Seconds an alert holds its workload's incident open: within the window a
+    # later Warning event for the same workload (a Deployment's other replicas,
+    # a replacement pod, another reason in the cascade), or a later Critical
+    # after a Critical alert, posts nothing, starts no triage turn and spends
+    # no alert budget. Rendered as INCIDENT_WORKLOAD_DEDUP_SECONDS in
+    # spec.deployment.env. 0 turns folding off; the most is 86400, a day. null
+    # renders no entry and leaves the default the operator renders into the
+    # agent container, the same hour. An entry with the same name in env above wins, and a valueFrom
+    # entry for it fails the render while this key is set. The site's chatops
+    # page, "One incident per workload", has the rules.
+    incidentWorkloadDedupSeconds: 3600
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests, or 2 CPU
@@ -1217,7 +1373,8 @@ platformAgent:
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
     # when the proxy is OOM-killed under a large fleet. The quota preflight
-    # counts the override, and on Autopilot the Autopilot requests. A cpu or
+    # counts the override, at the sizing profile's row when the operator would
+    # refuse it against that row, and on Autopilot the Autopilot requests. A cpu or
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
@@ -1243,6 +1400,14 @@ platformAgent:
     # does).
     credentialProxy:
       resources: {}
+      # The exec tier: stateless broker replicas beside the stateful broker that
+      # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
+      # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
+      # none. Each replica requests and is limited to 2 CPU and 2Gi. On an
+      # existing install the chart fails the upgrade when the installed CRD
+      # predates the field; apply crds/ first (upgrade.sh does).
+      exec:
+        replicas: 0
     # The agent-api-auth sidecar's requests and limits, forwarded to the CR as
     # spec.deployment.agentAPIAuth.resources when any key is set. Each key merges
     # over the operator's defaults (150m CPU and 384Mi requests; 1 CPU, 2Gi memory
@@ -1271,6 +1436,23 @@ platformAgent:
     # apply crds/ first (upgrade.sh does).
     agentAPIAuth:
       resources: {}
+    # The preset the credential proxy, the agent-api-auth sidecar and the shell
+    # container start from, forwarded to the CR as spec.deployment.sizingProfile
+    # when set: small (the operator's defaults, and what an unset value means),
+    # medium, fleet, or auto, which steps the tier up as the fleet the operator
+    # counts grows, from the tier the CR's status last recorded (a count that
+    # falls never lowers it), holding a step the namespace's ResourceQuota has
+    # no room for or a LimitRange bound refuses, stepping back one tier when
+    # admission refuses the pod a step recreated, and saying so in the CR's
+    # SizingCappedByQuota condition. The three
+    # resources overrides above and in harness.experimental.shellSandbox are
+    # applied per key over the preset, so an explicit key always wins. The
+    # quota preflight counts medium and fleet at their rows and auto at the
+    # small row it starts from; a later promotion is the operator's check. The
+    # CRD reference's spec.deployment section has each row's figures. On an
+    # existing install the chart fails the upgrade when the installed CRD
+    # predates the field; apply crds/ first (upgrade.sh does).
+    sizingProfile: ""
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,
   # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace
@@ -1580,6 +1762,10 @@ platformAgent:
       homeChannel: ""
       # "default" (quiet) or "debug" (full verbosity).
       mode: default
+      # Under spec.mode next, Google Chat's 👍/👎 buttons under each final answer;
+      # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
+      # false hides the buttons and keeps nothing.
+      answerFeedback: true
     slack:
       # Bot/app tokens are read from credentials.secretName under the
       # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
@@ -1721,13 +1907,22 @@ webConsole:
     gcpServiceAccount: ""
     # Project-level IAM roles granted to that service account.
     roles: []
+  # Sized for GKE Autopilot without Pod bursting, which sets each limit equal
+  # to its request: the request is what the console then runs under, so it
+  # has to hold the page, its session polling and the LiteLLM counters it
+  # reads from every replica, and the limit is the room it gets where
+  # bursting is on. The requests pair sits in the 1 to 6.5 GiB per vCPU band
+  # Autopilot admits unchanged. The console reads limits.memory through the
+  # Downward API (templates/web-console.yaml) and sets its Go soft memory
+  # limit to nine tenths of it, so it follows the admitted limit, a clamp
+  # included, and raising this is the one change for a busier console.
   resources:
     limits:
-      cpu: 200m
-      memory: 128Mi
+      cpu: 500m
+      memory: 256Mi
     requests:
-      cpu: 50m
-      memory: 32Mi
+      cpu: 100m
+      memory: 128Mi
   securityContext:
     runAsNonRoot: true
     runAsUser: 65532

@@ -89,9 +89,47 @@ MUTATIONS: list[Mutation] = [
         "agents/platform/scripts/credential_proxy.py",
         ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
          '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
-        "test_A3_the_profile_role_reaches_the_exec_route_alone",
+        "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
         "let a profile worker read a proposal the way the MCP pod does -- a "
         "forge read no task target confines",
+    ),
+    Mutation(
+        "A3-profile-reaches-gke-mcp",
+        "agents/platform/scripts/mcp_policy.py",
+        ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
+         '    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n'
+         '    "gke": GKE_READ_TOOLS,\n}'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a profile worker call the gke MCP server, whose tools name any "
+        "project and cluster in their arguments, so a task confined to one "
+        "cluster could read every other",
+    ),
+    Mutation(
+        "A3-profile-mcp-without-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if principal.task is None:\n        return (\n",
+         "    if False:\n        return (\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a warm profile pod between tasks read through the MCP relay "
+        "with no task credential",
+    ),
+    Mutation(
+        "A3-profile-mcp-uses-the-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return mcp_policy.evaluate_for_profile(server_name, message), offered\n",
+         "    return mcp_policy.evaluate(server_name, message), offered\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "decide a profile worker's call on the relay's whole table, so every "
+        "gke read and answer_query reach it",
+    ),
+    Mutation(
+        "A3-profile-mcp-full-offer",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())\n',
+         '    offered = None\n'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "offer a profile worker the table's whole tool list, answer_query "
+        "and every gke read among it",
     ),
     Mutation(
         "A3-inject-auth",
@@ -526,8 +564,8 @@ Mutation(
     Mutation(
         "B1-mcp-relay-opened-to-the-sandbox",
         "agents/platform/scripts/credential_proxy.py",
-        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
-         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE, CALLER_ROLE_SHELL)),\n"),
         "test_B1_only_the_gateway_reaches_the_mcp_relay",
         "let the shell sandbox call MCP tools too, for a skill script -- every "
         "model-authored command then has a GKE read path it never had",
@@ -758,6 +796,43 @@ Mutation(
         "older watcher -- the one item then comes back as the whole object, spec "
         "and status beside the ObjectMeta the metadata Accept already relays, on "
         "the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n',
+         '        if accept and not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "let a named Pod read through when the caller sends no Accept at all -- the "
+        "Pod then comes back whole, spec, env and status, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:\n',
+         '    if match.groupdict().get("ns") and match.group("resource") == POD_RESOURCE:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "drop the core-group guard on the named Pod rule, so any API group's "
+        "resource called pods (metrics.k8s.io's PodMetrics, a CRD's plural) is "
+        "relayed on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-unprojected-labels",
+        "agents/platform/scripts/watcher_policy.py",
+        ('                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}\n',
+         '                projected["labels"] = dict(labels)\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay every label of a named Pod instead of the owner lookup's one, "
+        "widening what the watcher token reads of any Pod in the fleet",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-controller-kind",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):\n',
+         '        if kind != POD_METADATA_HASH_OWNER_KIND or has_hash:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay a named Pod's controller whatever its kind (a static Pod's Node, a "
+        "custom controller), which the owner lookup never folds on",
     ),
     Mutation(
         "C1-watcher-count-list-widened-to-secrets",
@@ -2296,7 +2371,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:               true,\n", ""),
+        ("\ta2aBusUserEnv:                 true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",

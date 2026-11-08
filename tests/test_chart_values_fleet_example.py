@@ -69,6 +69,11 @@ _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]
 # of the names the operator itself sets or lists as sensitive, so a name the
 # operator source never spells as a string reaches those two containers.
 _LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
+# The env names the CR template renders from a chart key (incidentWorkloadDedupSeconds,
+# alertDailyLimits.<bucket>). The template skips the key whenever env carries the name,
+# so an example entry for one would win over the key, its 0 included.
+_CHART_KEY_ENV_NAME_RE = re.compile(r'\$dedupName\s*:=\s*"(?P<name>[A-Z0-9_]+)"')
+_ALERT_LIMIT_ENV_NAME_RE = re.compile(r'printf\s+"(?P<prefix>ALERT_DAILY_LIMIT_)%s"')
 
 # The page's declared column, derived from the two files the page cites.
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
@@ -77,6 +82,7 @@ _PAGE_TABLE_HEADING = "## What each pod needs"
 _PAGE_ROW_PROXY = "Credential proxy"
 _PAGE_ROW_GATEWAY = "Gateway pod"
 _PAGE_ROW_SANDBOX = "Shell sandbox"
+_PAGE_ROW_KUBE_PROXY = "Kubernetes API proxy"
 _PAGE_ROW_OPERATOR = "Operator"
 _PAGE_ROW_LITELLM = "LiteLLM"
 _PAGE_ROW_MINTER = "GitHub token minter"
@@ -226,7 +232,7 @@ class ExampleShapeTest(unittest.TestCase):
         env = self.values["platformAgent"]["deployment"]["env"]
         self.assertEqual(
             [entry["name"] for entry in env],
-            ["INCIDENT_WORKLOAD_DEDUP_SECONDS", "KUBEAGENTS_AUDIT_AUTO_PROMOTE"],
+            ["KUBEAGENTS_AUDIT_AUTO_PROMOTE"],
         )
         for entry in env:
             with self.subTest(name=entry["name"]):
@@ -235,6 +241,19 @@ class ExampleShapeTest(unittest.TestCase):
                 # value is a string: a bare 3600 or false would fail at apply.
                 self.assertIsInstance(entry["value"], str)
                 self.assertNotIn("valueFrom", entry)
+
+    def test_no_env_entry_shadows_a_chart_key(self):
+        """The CR template skips a key's entry when `env` already carries the name, so an
+        example entry for one would win over the key's off switch."""
+        template = (_CHART / _CR_TEMPLATE).read_text()
+        dedup = _CHART_KEY_ENV_NAME_RE.search(template)
+        self.assertIsNotNone(dedup, "the CR template no longer names the fold window's env entry")
+        prefixes = set(_ALERT_LIMIT_ENV_NAME_RE.findall(template))
+        self.assertTrue(prefixes, "the CR template no longer renders alertDailyLimits as env entries")
+        for entry in self.values["platformAgent"]["deployment"]["env"]:
+            with self.subTest(name=entry["name"]):
+                self.assertNotEqual(entry["name"], dedup.group("name"), "incidentWorkloadDedupSeconds is the route")
+                self.assertFalse(entry["name"].startswith(tuple(prefixes)), "alertDailyLimits is the route")
 
     def test_the_names_the_maintainers_left_out_stay_out(self):
         """The page says the two names reach the proxy pod and not the agent container."""
@@ -332,10 +351,14 @@ class DeclaredColumnTest(unittest.TestCase):
         dashboard = _footprint_block(agent["dashboard"])
         gateway = tuple(b + d for b, d in zip(base, dashboard))
         data_claim_gi = self.footprint["storage"]["dataClaimBytesRequest"] / (1024 ** 3)
+        # The footprint sums the kube-proxy's replicas; the row reads per replica, "each".
+        kube_proxy = self.footprint["kubeProxy"]
+        kube_proxy_each = tuple(part / kube_proxy["pods"] for part in _footprint_block(kube_proxy))
         return {
             _PAGE_ROW_PROXY: (_footprint_block(self.footprint["credentialProxy"]), 1, 0),
             _PAGE_ROW_GATEWAY: (gateway, 1, data_claim_gi + 1),
             _PAGE_ROW_SANDBOX: (_footprint_block(self.footprint["shellSandbox"]), 1, data_claim_gi + 1),
+            _PAGE_ROW_KUBE_PROXY: (kube_proxy_each, kube_proxy["pods"], 0),
             _PAGE_ROW_OPERATOR: (_values_block(self.values["operator"]["resources"]), self.values["operator"]["replicaCount"], 0),
             _PAGE_ROW_LITELLM: (_values_block(self.values["litellm"]["resources"]), self.values["litellm"]["replicaCount"], 0),
             _PAGE_ROW_MINTER: (_values_block(self.values["githubMinter"]["resources"]), self.values["githubMinter"]["replicaCount"], 0),
@@ -356,7 +379,7 @@ class DeclaredColumnTest(unittest.TestCase):
         self.assertTrue(self._row(_PAGE_ROW_PROXY)[5].startswith(f"{_gib(proxy)} GiB"))
         self.assertTrue(self._row(_PAGE_ROW_GATEWAY)[5].startswith(f"{_gib(gateway)} GiB"))
         self.assertEqual(self._row(_PAGE_ROW_LITELLM)[5], f"{_gib(litellm)} GiB each")
-        for label in (_PAGE_ROW_SANDBOX, _PAGE_ROW_OPERATOR, _PAGE_ROW_MINTER):
+        for label in (_PAGE_ROW_SANDBOX, _PAGE_ROW_KUBE_PROXY, _PAGE_ROW_OPERATOR, _PAGE_ROW_MINTER):
             with self.subTest(row=label):
                 self.assertEqual(declared[label][0][4], 0)
                 self.assertEqual(self._row(label)[5], "none declared")

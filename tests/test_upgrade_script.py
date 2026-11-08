@@ -3877,7 +3877,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         self.assertIn("SLACK_HOME_CHANNEL is empty", out)
         self.assertLess(out.index("SLACK_HOME_CHANNEL is empty"), out.index("PLANNED"))
         tail = [l for l in proc.stdout.splitlines() if l.strip()][-2:]
-        self.assertIn("No home channel: proactive posts are dropped.", tail[0], proc.stdout)
+        self.assertIn("No home channel: proactive posts are not delivered there yet.", tail[0], proc.stdout)
         self.assertIn("Set SLACK_HOME_CHANNEL", tail[1], proc.stdout)
         quiet = self._plan({**self._NO_HOME, "SLACK_HOME_CHANNEL": "C0123ABCD"})
         self.assertEqual(quiet.returncode, 0, quiet.stdout + quiet.stderr)
@@ -3983,6 +3983,7 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, out)
         self.assertIn(f"{self._short('bang')} feat(operator)!: drop the old field", out)
         self.assertIn("--allow-breaking-downgrade", out)
+        self.assertIn("https://gke-labs.github.io/kube-agents/deploy/rollback/", out)
         self.assertNotIn("CONTINUED", out)
 
     def test_a_breaking_change_footer_is_refused_and_named(self):

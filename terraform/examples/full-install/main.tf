@@ -450,6 +450,16 @@ module "gke_cluster" {
   enable_backup_agent        = var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
+  sizing_profile             = var.sizing_profile
+  standard_machine_type      = var.standard_machine_type
+  standard_node_count        = var.standard_node_count
+  standard_disk_size_gb      = var.standard_disk_size_gb
+  standard_disk_type         = var.standard_disk_type
+  gvisor_machine_type        = var.gvisor_machine_type
+  gvisor_min_node_count      = var.gvisor_min_node_count
+  gvisor_max_node_count      = var.gvisor_max_node_count
+  gvisor_disk_size_gb        = var.gvisor_disk_size_gb
+  gvisor_disk_type           = var.gvisor_disk_type
 
   resource_labels = {
     "kube-agents-host" = "true"
@@ -747,7 +757,12 @@ module "github_minter" {
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster for the reason module.kube_agents_iam's depends_on
+  # states in full: the module's workload_identity binding names the pool as
+  # an interpolated string, so Terraform sees no edge to the cluster whose
+  # creation brings the pool into existence, and on a first install into a new
+  # project the binding fails with "Identity Pool does not exist".
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
