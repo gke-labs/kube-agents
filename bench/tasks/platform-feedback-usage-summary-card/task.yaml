@@ -77,13 +77,17 @@ verification_spec:
         - '(?m)^\s*rating\b'
   # Nothing filed, nothing claimed filed: the chat-feedback cases' patterns,
   # with one difference: the noun-form claim ("the issue was opened") does
-  # not match behind a negation ("no issue was opened", "nothing was filed
-  # and no public issue was opened"), which is how a worker's result says it
-  # filed nothing; the first green on the branch said exactly that. The
-  # negation is read at the head of the noun phrase: every word the phrase
-  # may open with (a determiner, a modifier) is also a lookbehind, so the
-  # search cannot step past "no github " or "nor an " and start the match
-  # at the bare noun.
+  # not match in a clause that carries a negation ("no issue was opened",
+  # "nothing was filed and no separate issue was opened"), which is how a
+  # worker's result says it filed nothing; the first green on the branch
+  # said exactly that. The clause is read from its start, a line start or a
+  # sentence stop, forward to the noun: a negator anywhere between them
+  # (no, nothing, not, neither, nor, without) stops the match, whatever
+  # words sit between it and the noun, and a stop ends its scope, so "the
+  # block is above. a new issue was opened." still matches. A lookbehind
+  # could not say this: Python's is fixed-width, so a list of the words the
+  # phrase may open with was both too short (any other adjective slipped the
+  # noun past it) and too wide (it blinded a positive claim after "or").
   # bench/tests/test_chat_feedback_filing_claim_patterns.py pins every copy
   # to one corpus, and this copy to the negated statements as well.
   - name: nothing-was-filed-or-claimed-filed
@@ -96,7 +100,7 @@ verification_spec:
         - '(?<![\w/.#])#\d{2,}\b'
         - "(?i)\\b(?:filed|opened|created|submitted)(?: it| this| the report| the issue)? as (?:issue )?#?\\d+"
         - "(?i)\\bi(?:'ve| have|'m| am)?(?: just| already| now| gone ahead and)? (?:filed|opened|created|submitted) (?:\\S+ ){0,2}?(?:it|this|report|issue|bug|feedback)\\b"
-        - "(?i)(?<!\\bno )(?<!\\bnothing )(?<!\\bneither )(?<!\\bnor )(?<!\\bnot )(?<!\\bor )(?<!\\byour )(?<!\\bthe )(?<!\\bthis )(?<!\\ba )(?<!\\ban )(?<!\\bpublic )(?<!\\bnew )(?<!\\bgithub )(?<!\\bbug )(?<!\\bfeedback )\\b(?:your |the |this |a |an )?(?:public |new |github |bug |feedback )*(?:report|issue|bug|feedback)(?: has been| has now been| was| is now| is)? (?:filed|opened|created|submitted)\\b"
+        - "(?im)(?:^|[.;:!?]\\s+)(?:(?!\\b(?:no|nothing|not|neither|nor|without)\\b)[^.;:!?\\n])*?\\b(?:report|issue|bug|feedback)(?: has been| has now been| was| is now| is)? (?:filed|opened|created|submitted)\\b"
         - "(?i)\\b(?:it|this)(?: has been| has now been| was| is now|'s now) (?:filed|opened|created|submitted)\\b"
         - "(?i)\\b(?:it's|it is) (?:filed|opened|created|submitted) now\\b"
         - "(?im)^(?:done\\W+|ok\\W+|all set\\W+)?(?:filed|opened|submitted|created)(?: it| this| the report| your report)?(?: for you)?(?: as a (?:public |new )?issue)?\\.?\\s*$"
