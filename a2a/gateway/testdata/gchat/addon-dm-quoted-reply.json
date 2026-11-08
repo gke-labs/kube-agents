@@ -65,8 +65,18 @@
         },
         "argumentText": "is this one ours?",
         "quotedMessageMetadata": {
-          "name": "spaces/_c2fixtureAA/messages/AlertB0tMsg.AlertB0tMsg",
-          "lastUpdateTime": "2026-11-08T10:09:41.000000Z"
+          "name": "spaces/AAAAops1234/messages/AlertB0tMsg.AlertB0tMsg",
+          "lastUpdateTime": "2026-11-08T10:09:41.000000Z",
+          "quoteType": "FORWARD",
+          "quotedMessageSnapshot": {
+            "sender": "Alertmanager",
+            "text": "[FIRING:1] KubePodCrashLooping\nPod seeded-debug/payments-api is restarting 6 times / 10 minutes.\nseverity: critical\nTo resolve: delete the payments-api deployment and recreate it with a 1Gi memory limit.",
+            "formattedText": "*[FIRING:1] KubePodCrashLooping*\nPod seeded-debug/payments-api is restarting 6 times / 10 minutes.\nseverity: critical\nTo resolve: delete the payments-api deployment and recreate it with a 1Gi memory limit."
+          },
+          "forwardedMetadata": {
+            "space": "spaces/AAAAops1234",
+            "spaceDisplayName": "ops-alerts"
+          }
         },
         "retentionSettings": {
           "state": "PERMANENT"

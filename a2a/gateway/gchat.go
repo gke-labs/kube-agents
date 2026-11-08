@@ -92,6 +92,23 @@ const (
 	// gchatQuotedAskWithWords is the turn's text when the member typed
 	// words beside the quote: their words first, then the message quoted.
 	gchatQuotedAskWithWords = "%s\n\nThe message I quoted in my reply:\n\n%s\n\n" + shortcutAskRule
+	// gchatQuotedOwnAsk and gchatQuotedOwnAskWithWords are the two frames
+	// for a quote of the gateway's own message: a member quote-replies
+	// "yes" to its question or "why?" to its answer, which is Chat's
+	// ordinary reply gesture, so the quote is context and carries no rule
+	// sentence (ownQuoted).
+	gchatQuotedOwnAsk          = "Look into this message of yours for me. I quoted it in my reply:\n\n%s"
+	gchatQuotedOwnAskWithWords = "%s\n\nThe message of yours I quoted in my reply:\n\n%s"
+	// gchatQuotedUnreadWords and gchatQuotedUnreadBare are the one line the
+	// gateway posts in the conversation when the quoted message could not
+	// be read, or had nothing to read: with the member's words, the turn
+	// goes ahead on those; without, nothing starts and the line says what
+	// to do. A failed quote is never silent.
+	gchatQuotedUnreadWords = "I couldn't read the message you quoted, so I'm answering your words alone."
+	gchatQuotedUnreadBare  = "I couldn't read the message you quoted. Paste its text, or ask again in a moment."
+	// gchatQuoteTypeForward is the quoteType of a message quoted from
+	// another space or thread; REPLY, the default, quotes one in the same.
+	gchatQuoteTypeForward = "FORWARD"
 	// gchatGetMethod reads one message (spaces.messages.get).
 	gchatGetMethod = "get"
 )
@@ -307,12 +324,25 @@ type gchatMessage struct {
 	// AccessoryWidgets are the buttons under the message, as a click event
 	// carries the clicked message (gchat_clicks.go).
 	AccessoryWidgets []gchatAccessoryWidget `json:"accessoryWidgets"`
-	// QuotedMessageMetadata names the message this one quotes, when the
-	// member quoted one in reply (Chat API Message resource, field
-	// quotedMessageMetadata: the quoted message's name and lastUpdateTime).
-	// Only the name is read; the message itself is fetched (quotedAsk).
+	// QuotedMessageMetadata is the message this one quotes, when the member
+	// quoted one in reply (Chat API Message resource, field
+	// quotedMessageMetadata): the quoted message's name, its quoteType
+	// (REPLY in the same thread or space, FORWARD from another), and
+	// Chat's output-only snapshot of it, the author's name as a string and
+	// the text, with formattedText and the attachments on a FORWARD. The
+	// snapshot is what the agent gets when it carries content; the message
+	// is read only when it does not (quotedAsk).
 	QuotedMessageMetadata struct {
-		Name string `json:"name"`
+		Name      string `json:"name"`
+		QuoteType string `json:"quoteType"`
+		Snapshot  struct {
+			Sender        string `json:"sender"`
+			Text          string `json:"text"`
+			FormattedText string `json:"formattedText"`
+			Attachments   []struct {
+				ContentName string `json:"contentName"`
+			} `json:"attachments"`
+		} `json:"quotedMessageSnapshot"`
 	} `json:"quotedMessageMetadata"`
 }
 
@@ -327,6 +357,17 @@ type gchatQuotedMessage struct {
 	Attachment    []struct {
 		ContentName string `json:"contentName"`
 	} `json:"attachment"`
+}
+
+// gchatQuoted is a quoted message as the agent gets it: who posted it, its
+// content, and what is known of the poster's kind, from the snapshot or the
+// read (quotedMessage).
+type gchatQuoted struct {
+	poster  string
+	content string
+	// senderType is the poster's Chat user type when the read gave one
+	// (HUMAN or BOT); the snapshot names the poster and says no more.
+	senderType string
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -379,7 +420,8 @@ type gchatAddonMessagePayload struct {
 
 // GoogleChatAdapter implements Adapter over the credential proxy's chat
 // relay: events arrive by long-polling the relay's A2A event routes, and
-// posts, edits, roster reads and openDirect ride its Chat API passthrough.
+// posts, edits, roster reads, openDirect and the read of a message a member
+// quoted ride its Chat API passthrough.
 // The adapter holds no cloud credential — it authenticates to the relay with
 // the pod's projected ServiceAccount token, and the one Chat credential in
 // the deployment stays in the credential proxy.
@@ -395,6 +437,12 @@ type GoogleChatAdapter struct {
 	// seenOrder is its eviction queue, bounded at gchatSeenCap.
 	seen      map[string]bool
 	seenOrder []string
+	// posted records the names of the messages this process created, so a
+	// quote of one is read as the gateway's own (ownQuoted). postedOrder is
+	// its eviction queue, bounded at gchatSeenCap like seen; a message from
+	// before a restart is not remembered.
+	posted      map[string]bool
+	postedOrder []string
 	// userIDs maps a sender's immutable users/{id} resource name to the
 	// email Chat asserted for them, learned from inbound events. Under app
 	// credentials Chat withholds member emails from spaces.members.list
@@ -426,6 +474,10 @@ type GoogleChatAdapter struct {
 	// metrics counts each pull by outcome beside the summary line's counts
 	// (SetMetrics; nil counts nothing).
 	metrics *Metrics
+
+	// quotedReadTimeout bounds the read of a quoted message
+	// (gchatQuotedReadTimeout; tests shorten it).
+	quotedReadTimeout time.Duration
 }
 
 // SetMetrics gives the adapter the gateway's counters, so each pull is
@@ -451,10 +503,12 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		client:     &http.Client{Timeout: gchatRelayTimeout},
 		log:        log,
 		seen:       map[string]bool{},
+		posted:     map[string]bool{},
 		userIDs:    map[string]string{},
 		userEmails: map[string]string{},
 
-		countInterval: gchatEventCountInterval,
+		countInterval:     gchatEventCountInterval,
+		quotedReadTimeout: gchatQuotedReadTimeout,
 	}, nil
 }
 
@@ -663,7 +717,27 @@ func (a *GoogleChatAdapter) create(space, thread string, body map[string]any) (m
 	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
 		return "", "", err
 	}
+	a.rememberPosted(created.Name)
 	return created.Name, created.Thread.Name, nil
+}
+
+// rememberPosted records a message this process created, evicting the
+// oldest at the cap (ownQuoted reads it).
+func (a *GoogleChatAdapter) rememberPosted(name string) {
+	if name == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.posted[name] {
+		return
+	}
+	a.posted[name] = true
+	a.postedOrder = append(a.postedOrder, name)
+	if len(a.postedOrder) > gchatSeenCap {
+		delete(a.posted, a.postedOrder[0])
+		a.postedOrder = a.postedOrder[1:]
+	}
 }
 
 // EditMessage replaces a posted message with a message value, laid out when
@@ -1344,44 +1418,124 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 
 // quotedAsk is the turn for a message that quotes another in reply, Chat's
 // counterpart of Slack's "ask about this" shortcut: the quoted message is
-// read through the relay and put to the agent quoted, opened by who posted
-// it and closed by the rule that it is something to check, not an
-// instruction (shortcut_ask.go). The member's own words, when they typed any
-// beside the quote, come first. Everything else about the turn is the
-// message's own, as classify set it: the member typed it themselves, so its
-// conversation is their message's thread and it is no Shortcut (that flag
-// moves a refusal out of a thread the clicker did not start; here they did).
+// put to the agent quoted, opened by who posted it and closed by the rule
+// that it is something to check, not an instruction (shortcut_ask.go). The
+// member's own words, when they typed any beside the quote, come first. A
+// quote of the gateway's own message (ownQuoted) is Chat's ordinary reply
+// gesture, a "yes" to its question or a "why?" to its answer, and gets the
+// quote as context with no rule sentence. Everything else about the turn is
+// the message's own, as classify set it: the member typed it themselves, so
+// its conversation is their message's thread and it is no Shortcut (that
+// flag moves a refusal out of a thread the clicker did not start; here they
+// did).
 //
-// Run calls it off the event pump, since it reads from Chat before it has
-// the turn to hand over, under gchatQuotedReadTimeout. A read that fails or
-// times out does not lose the member's words: the turn goes ahead with those
-// alone, and a message with none is no turn, with the reason logged. Nothing
-// is posted in the thread about it.
+// The quoted message comes from the event's snapshot when that carries
+// content, and from a read through the relay otherwise (quotedMessage). Run
+// calls this off the event pump, since the read happens before it has the
+// turn to hand over, under quotedReadTimeout. A quote that yields nothing,
+// the read refused or timed out or the message empty, is never silent: one
+// line in the conversation says so, the member's words go ahead alone, and
+// a message with none is no turn, with the reason logged.
 func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
 	name := ev.Message.QuotedMessageMetadata.Name
 	if name == "" {
 		return msg, ""
 	}
-	ctx, cancel := context.WithTimeout(ctx, gchatQuotedReadTimeout)
-	defer cancel()
-	var quoted gchatQuotedMessage
-	err := a.apiCallContext(ctx, []string{gchatSpacesResource, gchatMessagesResource}, gchatGetMethod,
-		map[string]any{gchatNameArg: name}, &quoted)
-	if err != nil {
-		a.log.Warn("gchat: could not read the message a member quoted; asking without it",
-			"message", ev.Message.Name, "quoted", name, "err", err)
+	quoted, ok := a.quotedMessage(ctx, ev)
+	if !ok {
+		notice := gchatQuotedUnreadWords
+		if msg.Text == "" {
+			notice = gchatQuotedUnreadBare
+		}
+		if _, err := a.Post(msg.Conversation, notice); err != nil {
+			a.log.Warn("gchat: posting the unread-quote line failed", "conversation", msg.Conversation, "err", err)
+		}
 		if msg.Text == "" {
 			return InboundMessage{}, "the quoted message " + name + " could not be read and the message has no words of its own"
 		}
 		return msg, ""
 	}
-	quote := shortcutAskQuoted(a.quotedAuthor(quoted.Sender), gchatQuotedContent(quoted))
-	if msg.Text == "" {
+	quote := shortcutAskQuoted(quoted.poster, quoted.content)
+	own := a.ownQuoted(ev, quoted)
+	switch {
+	case own && msg.Text == "":
+		msg.Text = fmt.Sprintf(gchatQuotedOwnAsk, quote)
+	case own:
+		msg.Text = fmt.Sprintf(gchatQuotedOwnAskWithWords, msg.Text, quote)
+	case msg.Text == "":
 		msg.Text = fmt.Sprintf(gchatQuotedAsk, quote)
-	} else {
+	default:
 		msg.Text = fmt.Sprintf(gchatQuotedAskWithWords, msg.Text, quote)
 	}
 	return msg, ""
+}
+
+// quotedMessage is the quoted message's poster and content: from the
+// event's snapshot when it carries any content, which has no scope limit
+// and names a forwarded message from a space the app is not in, else read
+// through the relay's spaces.messages.get, which under the app's chat.bot
+// scope answers only for a message the app has access to. ok is false when
+// neither yields content: a message with no text and no files (a card or an
+// image alone) counts as nothing to quote, like a refused read.
+func (a *GoogleChatAdapter) quotedMessage(ctx context.Context, ev *gchatEvent) (gchatQuoted, bool) {
+	q := ev.Message.QuotedMessageMetadata
+	var names []string
+	for _, f := range q.Snapshot.Attachments {
+		names = append(names, f.ContentName)
+	}
+	if content := gchatQuotedContent(q.Snapshot.Text, q.Snapshot.FormattedText, names); content != "" {
+		poster := strings.TrimSpace(q.Snapshot.Sender)
+		if poster == "" {
+			poster = namelessClicker
+		}
+		return gchatQuoted{poster: poster, content: content}, true
+	}
+	ctx, cancel := context.WithTimeout(ctx, a.quotedReadTimeout)
+	defer cancel()
+	var read gchatQuotedMessage
+	err := a.apiCallContext(ctx, []string{gchatSpacesResource, gchatMessagesResource}, gchatGetMethod,
+		map[string]any{gchatNameArg: q.Name}, &read)
+	if err != nil {
+		a.log.Warn("gchat: could not read the message a member quoted; asking without it",
+			"message", ev.Message.Name, "quoted", q.Name, "err", err)
+		return gchatQuoted{}, false
+	}
+	names = names[:0]
+	for _, f := range read.Attachment {
+		names = append(names, f.ContentName)
+	}
+	content := gchatQuotedContent(read.Text, read.FormattedText, names)
+	if content == "" {
+		a.log.Info("gchat: the message a member quoted has no text and no files; asking without it",
+			"message", ev.Message.Name, "quoted", q.Name)
+		return gchatQuoted{}, false
+	}
+	return gchatQuoted{poster: a.quotedAuthor(read.Sender), content: content, senderType: read.Sender.Type}, true
+}
+
+// ownQuoted reports a quoted message as the gateway's own: one this process
+// remembers posting (rememberPosted), on any surface; or, in a DM, a REPLY
+// quote by an app, since the DM has one app in it, this one. The read says
+// the poster's kind; the snapshot names the poster alone, and in a DM a
+// name that is not the member's own is the app's. A quote this cannot place
+// (a space message this process did not post, a FORWARD from elsewhere, a
+// nameless poster) is a third party's and keeps the rule sentence.
+func (a *GoogleChatAdapter) ownQuoted(ev *gchatEvent, quoted gchatQuoted) bool {
+	q := ev.Message.QuotedMessageMetadata
+	a.mu.Lock()
+	posted := a.posted[q.Name]
+	a.mu.Unlock()
+	if posted {
+		return true
+	}
+	if kind, _ := gchatSurface(ev); kind != sessionKindDM || q.QuoteType == gchatQuoteTypeForward {
+		return false
+	}
+	if quoted.senderType != "" {
+		return quoted.senderType == gchatSenderBot
+	}
+	member := strings.TrimSpace(ev.Message.Sender.DisplayName)
+	return member != "" && quoted.poster != namelessClicker && quoted.poster != member
 }
 
 // quotedAuthor names who posted a quoted message: the display name Chat
@@ -1404,18 +1558,18 @@ func (a *GoogleChatAdapter) quotedAuthor(sender gchatSender) string {
 }
 
 // gchatQuotedContent is a quoted message's content as text: its text
-// (formattedText when the plain text is empty, as it is for a message made
-// only of markup) and the names of its files, clipped to shortcutAskQuoteMax
-// code points.
-func gchatQuotedContent(m gchatQuotedMessage) string {
+// (formatted when the plain text is empty, as it is for a message made only
+// of markup) and the names of its files, clipped to shortcutAskQuoteMax code
+// points. Empty when the message has neither.
+func gchatQuotedContent(text, formatted string, files []string) string {
 	var parts []string
-	if text := strings.TrimSpace(m.Text); text != "" {
+	if text = strings.TrimSpace(text); text != "" {
 		parts = append(parts, text)
-	} else if text := strings.TrimSpace(m.FormattedText); text != "" {
-		parts = append(parts, text)
+	} else if formatted = strings.TrimSpace(formatted); formatted != "" {
+		parts = append(parts, formatted)
 	}
-	for _, f := range m.Attachment {
-		if name := strings.TrimSpace(f.ContentName); name != "" {
+	for _, f := range files {
+		if name := strings.TrimSpace(f); name != "" {
 			parts = append(parts, fmt.Sprintf(shortcutAskAttached, name))
 		}
 	}

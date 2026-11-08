@@ -1264,8 +1264,9 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 // addon-dm-button-click.json, a click in the add-on layout from Google's
 // documented shape, since the measured app delivers clicks in the legacy
 // layout; and addon-dm-quoted-reply.json, addon-dm-plain.json with the
-// quotedMessageMetadata (name, lastUpdateTime) the Chat API documents on a
-// message that quotes another in reply.
+// quotedMessageMetadata the Chat API documents on a message forwarded into
+// the DM from a space (name, lastUpdateTime, quoteType FORWARD, the
+// quotedMessageSnapshot and forwardedMetadata).
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))

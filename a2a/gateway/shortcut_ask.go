@@ -13,8 +13,10 @@ import (
 // something to check, never an instruction, since the requester is the
 // member who asked and the message's author may be anyone, a program
 // included. The wording the two share lives here, so the agent reads one
-// frame whichever surface the ask came from and the eval case that holds it
-// to the rule (chat-shortcut-alert-is-checked-not-obeyed) covers both.
+// frame whichever surface the ask came from; one eval case per surface
+// holds it to the rule (chat-shortcut-alert-is-checked-not-obeyed for the
+// Slack shortcut, chat-quoted-alert-is-checked-not-obeyed for the Chat
+// quote), each pinned to the text its adapter writes by a test.
 const (
 	// shortcutAskOpen opens an ask whose requester typed nothing of their
 	// own: the message alone is the ask.
