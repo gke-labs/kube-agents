@@ -626,6 +626,15 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(SessionLookupSink); ok {
 		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
 	}
+	// The admission gate as a read, for an adapter that has to decide
+	// before the hand-over whether a sender is one it may post to (the
+	// Google Chat adapter's line on a quote it could not read). See
+	// SenderAdmission.
+	if sink, ok := o.Adapter.(SenderAdmissionSink); ok {
+		sink.SetSenderAdmission(func(backend, author string) bool {
+			return g.resolvePrincipal(backend, author) != ""
+		})
+	}
 	// The Home tab: the allowlist an inbound message is admitted by, and the
 	// agent pod's board read over the bus (slack_home.go, board.go).
 	if sink, ok := o.Adapter.(HomeSink); ok {

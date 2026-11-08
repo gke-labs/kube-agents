@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 const (
@@ -478,6 +480,30 @@ type GoogleChatAdapter struct {
 	// quotedReadTimeout bounds the read of a quoted message
 	// (gchatQuotedReadTimeout; tests shorten it).
 	quotedReadTimeout time.Duration
+	// admits is the gateway's admission gate (SetSenderAdmission), read
+	// before the line on a quote that could not be read is posted: the
+	// adapter posts nothing in a sender's conversation ahead of the gateway
+	// for a sender it would refuse. Nil admits nobody.
+	admits SenderAdmission
+}
+
+var _ SenderAdmissionSink = (*GoogleChatAdapter)(nil)
+
+// SetSenderAdmission receives the gateway's admission gate
+// (SenderAdmissionSink).
+func (a *GoogleChatAdapter) SetSenderAdmission(admits SenderAdmission) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.admits = admits
+}
+
+// admitted reports whether the gateway would take a turn from the sender of
+// msg, or false when it has not said how it decides.
+func (a *GoogleChatAdapter) admitted(msg InboundMessage) bool {
+	a.mu.Lock()
+	admits := a.admits
+	a.mu.Unlock()
+	return admits != nil && admits(gchatBackend, msg.AuthorID)
 }
 
 // SetMetrics gives the adapter the gateway's counters, so each pull is
@@ -1048,7 +1074,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "reason", reason)
 			continue
 		}
-		if ev.Message.QuotedMessageMetadata.Name == "" {
+		if !quotedAskNeeded(ev, msg) {
 			handler(msg)
 			continue
 		}
@@ -1416,6 +1442,16 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	return msg, ""
 }
 
+// quotedAskNeeded reports a message whose turn is composed from the message
+// it quotes (quotedAsk): one that quotes a message and whose own words are
+// not a command. A command sent as a quote-reply to one of the bot's posts,
+// a stop, a status question, /session, /feedback or a delegate, is the
+// command, which routeTurn matches on the words alone; the quote is where
+// the member typed it, not what they asked.
+func quotedAskNeeded(ev *gchatEvent, msg InboundMessage) bool {
+	return ev.Message.QuotedMessageMetadata.Name != "" && !chattext.IsCommand(msg.Text)
+}
+
 // quotedAsk is the turn for a message that quotes another in reply, Chat's
 // counterpart of Slack's "ask about this" shortcut: the quoted message is
 // put to the agent quoted, opened by who posted it and closed by the rule
@@ -1433,16 +1469,26 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // content, and from a read through the relay otherwise (quotedMessage). Run
 // calls this off the event pump, since the read happens before it has the
 // turn to hand over, under quotedReadTimeout. A quote that yields nothing,
-// the read refused or timed out or the message empty, is never silent: one
-// line in the conversation says so, the member's words go ahead alone, and
-// a message with none is no turn, with the reason logged.
+// the read refused or timed out or the message empty, is never silent for a
+// sender the gateway admits: one line in the conversation says so, the
+// member's words go ahead alone, and a message with none is no turn, with
+// the reason logged. A sender it would refuse gets no line, since the
+// adapter posts nothing in their conversation ahead of the gateway: their
+// words go ahead unchanged, to the refusal verifySender gives any message,
+// and their bare quote is dropped.
 func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
 	name := ev.Message.QuotedMessageMetadata.Name
-	if name == "" {
+	if !quotedAskNeeded(ev, msg) {
 		return msg, ""
 	}
 	quoted, ok := a.quotedMessage(ctx, ev)
 	if !ok {
+		if !a.admitted(msg) {
+			if msg.Text == "" {
+				return InboundMessage{}, "the quoted message " + name + " could not be read, the message has no words of its own, and its sender is not admitted, so no line is posted"
+			}
+			return msg, ""
+		}
 		notice := gchatQuotedUnreadWords
 		if msg.Text == "" {
 			notice = gchatQuotedUnreadBare

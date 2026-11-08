@@ -78,6 +78,12 @@ func humanSender(name string) map[string]any {
 	return map[string]any{"name": "users/42", "displayName": name, "type": "HUMAN"}
 }
 
+// admitAll gives the adapter a gateway gate that admits every sender, as a
+// test of an admitted member's path needs.
+func admitAll(a *GoogleChatAdapter) {
+	a.SetSenderAdmission(func(backend, author string) bool { return backend == gchatBackend && author != "" })
+}
+
 // postedTexts is the text of every message the fake relay was asked to
 // create.
 func postedTexts(f *fakeChatRelay) []string {
@@ -281,6 +287,7 @@ func TestGchatQuotedReadFailureFallsBackToTheTypedWords(t *testing.T) {
 	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/N1"}
 	var logs bytes.Buffer
 	a := newTestGchatAdapterWithRelay(t, f)
+	admitAll(a)
 	a.log = slog.New(slog.NewTextHandler(&logs, nil))
 
 	ev := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot is this one ours?", "is this one ours?", gchatQuotedName)
@@ -308,6 +315,7 @@ func TestGchatBareQuoteWhoseReadFailsIsDroppedWithTheReason(t *testing.T) {
 	f := newFakeChatRelay(t)
 	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/N1"}
 	a := newTestGchatAdapterWithRelay(t, f)
+	admitAll(a)
 	_, reason := quotedTurn(a, gchatBareQuotedMsg(gchatQuotedName))
 	if !strings.Contains(reason, gchatQuotedName) || !strings.Contains(reason, "no words of its own") {
 		t.Errorf("reason = %q, want it to name the quoted message and that nothing was typed", reason)
@@ -327,6 +335,7 @@ func TestGchatEmptyQuoteIsAFailedQuote(t *testing.T) {
 				"cardsV2": []map[string]any{{"cardId": "c1"}}}
 			f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/N1"}
 			a := newTestGchatAdapterWithRelay(t, f)
+			admitAll(a)
 			ev := gchatBareQuotedMsg(gchatQuotedName)
 			if words != "" {
 				ev.Message.ArgumentText = &words
@@ -435,6 +444,7 @@ func TestGchatQuotedReadTimesOutToTheTypedWords(t *testing.T) {
 		}
 	}
 	a := newTestGchatAdapterWithRelay(t, f)
+	admitAll(a)
 	a.quotedReadTimeout = 50 * time.Millisecond
 
 	ev := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot is this one ours?", "is this one ours?", gchatQuotedName)
@@ -597,5 +607,99 @@ func TestGchatQuotedReplyFixtureThroughRun(t *testing.T) {
 				t.Errorf("turn = %+v", msg)
 			}
 		})
+	}
+}
+
+// A sender the gateway would refuse gets no line from the adapter ahead of
+// the gateway: a failed quote with words is handed over as the words, to the
+// refusal verifySender gives any message, and a bare one is dropped. With no
+// gate set the adapter admits nobody.
+func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(a *GoogleChatAdapter)
+	}{
+		{"gate refuses", func(a *GoogleChatAdapter) { a.SetSenderAdmission(func(string, string) bool { return false }) }},
+		{"no gate", func(*GoogleChatAdapter) {}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChatRelay(t)
+			f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/N1"}
+			a := newTestGchatAdapterWithRelay(t, f)
+			c.set(a)
+			words := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot is this one ours?", "is this one ours?", gchatQuotedName)
+			msg, reason := quotedTurn(a, words)
+			if reason != "" || msg.Text != "is this one ours?" || msg.AuthorID != "u1@example.com" {
+				t.Errorf("words: turn = %+v (%q), want the words handed over unchanged", msg, reason)
+			}
+			bare := gchatBareQuotedMsg(gchatQuotedName)
+			bare.Message.Name = "spaces/S1/messages/M2"
+			_, reason = quotedTurn(a, bare)
+			if !strings.Contains(reason, gchatQuotedName) || !strings.Contains(reason, "not admitted") {
+				t.Errorf("bare: reason = %q, want the drop to name the quoted message and the sender's standing", reason)
+			}
+			if got := postedTexts(f); len(got) != 0 {
+				t.Errorf("posted = %q, want nothing in an unadmitted sender's conversation", got)
+			}
+		})
+	}
+}
+
+// A command sent as a quote-reply to one of the bot's posts is the command:
+// the words go over unchanged, with no read and no frame, so routeTurn's
+// matchers see them. Ordinary words beside a quote are still framed.
+func TestGchatQuoteReplyCommandStaysTheCommand(t *testing.T) {
+	for _, words := range []string{"stop", "/session off", "status", "/feedback", "delegate check node-3"} {
+		t.Run(words, func(t *testing.T) {
+			f := newFakeChatRelay(t)
+			f.responses["spaces.messages/get"] = quotedResponse(humanSender("Alex"), gchatQuotedAlert)
+			a := newTestGchatAdapterWithRelay(t, f)
+			ev := withSnapshot(gchatQuotedMsg("spaces/D1", "DIRECT_MESSAGE", "spaces/D1/threads/T1", "spaces/D1/messages/M1", words, "", "spaces/D1/messages/Q1"),
+				"REPLY", "kube-agents", "Scale it to 3 replicas?")
+			msg, reason := a.classify(ev)
+			if reason != "" {
+				t.Fatalf("dropped: %s", reason)
+			}
+			if quotedAskNeeded(ev, msg) {
+				t.Error("Run must hand a command over inline, not through the quote path")
+			}
+			if msg, reason = a.quotedAsk(context.Background(), ev, msg); reason != "" || msg.Text != words {
+				t.Errorf("turn = %+v (%q), want the command unchanged", msg, reason)
+			}
+			if len(f.calls) != 0 {
+				t.Errorf("relay calls = %+v, want none", f.calls)
+			}
+		})
+	}
+	f := newFakeChatRelay(t)
+	a := newTestGchatAdapterWithRelay(t, f)
+	ev := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M2", "@bot stop the bleeding, what is this?", "stop the bleeding, what is this?", gchatQuotedName),
+		"REPLY", "Alex", gchatQuotedAlert)
+	msg, _ := quotedTurn(a, ev)
+	if !quotedAskNeeded(ev, msg) || !strings.HasSuffix(msg.Text, shortcutAskRule) {
+		t.Errorf("ordinary words = %q, want the frame", msg.Text)
+	}
+}
+
+// The gateway's admission gate reaches the Chat adapter behind the console
+// mux and the side door, as the session lookup does.
+func TestGchatSenderAdmissionReachesTheAdapterThroughMuxAndDoor(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	mux, err := NewMultiAdapter(gchatBackend, consoleBackend, map[string]Adapter{gchatBackend: a, consoleBackend: newFakeAdapter()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	door, err := NewInjectAdapter("127.0.0.1:0", "side-door-test-token", time.Minute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	composite := WithSideDoor(mux, door, nil)
+	sink, ok := composite.(SenderAdmissionSink)
+	if !ok {
+		t.Fatal("the composite must implement SenderAdmissionSink")
+	}
+	sink.SetSenderAdmission(func(backend, author string) bool { return backend == gchatBackend && author == "u1@example.com" })
+	if !a.admitted(InboundMessage{AuthorID: "u1@example.com"}) || a.admitted(InboundMessage{AuthorID: "nobody@example.com"}) {
+		t.Error("SetSenderAdmission did not reach the Chat adapter")
 	}
 }

@@ -421,6 +421,15 @@ func (s *sideDoorAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Du
 	}
 }
 
+// SetSenderAdmission hands the gateway's admission gate to the primary, the
+// chat half that posts in a sender's conversation; the door's callers are
+// programs the door itself admits.
+func (s *sideDoorAdapter) SetSenderAdmission(admits SenderAdmission) {
+	if sink, ok := s.primary.(SenderAdmissionSink); ok {
+		sink.SetSenderAdmission(admits)
+	}
+}
+
 // SetFeedbackRecorder hands the answer-feedback recorder to the primary, the
 // chat half that draws rating controls; a door's callers are programs.
 func (s *sideDoorAdapter) SetFeedbackRecorder(r FeedbackRecorder) {

@@ -2028,12 +2028,17 @@ or a "why?" to its answer, so it gets the quote as context and no rule sentence.
 message this process remembers posting, on any surface, or in a DM a `REPLY` quote by an app,
 since the DM has one app in it: the read says the poster's kind, and the snapshot names the
 poster, who in a DM is the app when not the member. A quote this cannot place keeps the rule.
-The read runs off the event pump under a ten-second budget, after the dedupe. A quote that
-yields nothing, the read refused or timed out or the message empty (a card or an image alone),
-is never silent: one line posts in the conversation, `I couldn't read the message you quoted,
-so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't read
-the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with the
-reason.
+A command sent as a quote-reply to one of the bot's posts (a stop, a status question,
+`/session`, `/feedback`, a delegate: `chattext.IsCommand`) is the command: the words go over
+unchanged, with no read and no frame, so `routeTurn`'s matchers see them. The read runs off the
+event pump under a ten-second budget, after the dedupe. A quote that yields nothing, the read
+refused or timed out or the message empty (a card or an image alone), is never silent for a
+sender the gateway admits: one line posts in the conversation, `I couldn't read the message you
+quoted, so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't
+read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
+the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
+the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
+words go over unchanged to the refusal any message gets, and their bare quote is dropped.
 
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
