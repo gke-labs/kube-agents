@@ -23639,7 +23639,10 @@ def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], 
     answers none of; one already answered holds nothing, since the markers
     are permanent and the comment is never edited, and a non-writer's is
     refused the same on either path. A ledger that is not an issue (no
-    forge, or a forge with no issue tracker) carries no requests. The
+    forge, or a forge with no issue tracker) carries no requests. A
+    repository `start` could not reach (`LedgerDecision.unreachable`) keeps
+    its ledger in the store too, but its issue could not be read at all, so
+    its requests are unknown and the reason is the probe's. The
     conversation is read, not fetched: `read_comments` answers None for one
     it could not read whole (a refusal, a truncated thread, an identity or a
     standing it could not get), and that is unknown, as any other lookup
@@ -23651,6 +23654,8 @@ def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], 
         return [], None
     try:
         decision = finish_target(audit_id, store_repo)
+        if decision.unreachable is not None:
+            return [], decision.unreachable[1]
         if decision.ledger != LEDGER_FORGE:
             return [], None
         refresh_credentials(store_repo)

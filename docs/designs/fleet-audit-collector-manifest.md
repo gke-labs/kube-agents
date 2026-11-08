@@ -588,8 +588,10 @@ scheme, the run the record's `envelope_finished_at` names, a `document` with a f
 there, and the open ledger issue
 carries no `/remediate` request still owed an answer (`pending_ledger_requests`: a writer's
 request, `all` included, that no acked or refused marker has answered, read with
-`unanswered_remediate_comments`; a conversation `read_comments` could not read whole, or any other
-lookup failure, counts as pending, and a lost broker is raised as from any command), `precheck`
+`unanswered_remediate_comments`; a conversation `read_comments` could not read whole, a repository
+`start` found unreachable (the diverted decision keeps its ledger in the store like a forge with no
+issue tracker, but its issue could not be read at all), or any other lookup failure, counts as
+pending, and a lost broker is raised as from any command), `precheck`
 writes that document to `findings_path` and runs `finish --scheduled` on it with this run's
 manifest. The request rule is there because the stored document answers no request: `finish`
 opens a fix only for a `manifest` remediation, so a request on a `manual` finding would otherwise

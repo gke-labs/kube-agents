@@ -310,8 +310,9 @@ again), with a findings document `finish` can run again (no remediation
 that names a file or carries a note `finish` wrote, no withheld postures, every `declared[]` entry
 filed again by this run's `start`, and this run's own search covering every repository the step
 names), and the ledger carries no `/remediate` request still owed an answer (a writer's, `all`
-included, with no acked or refused marker; a conversation that cannot be read whole counts as
-one, and a lost broker is the `BROKER UNAVAILABLE` exit 2 as from any command), it writes that
+included, with no acked or refused marker; a conversation that cannot be read whole, or a
+repository `start` found unreachable, counts as one, and a lost broker is the
+`BROKER UNAVAILABLE` exit 2 as from any command), it writes that
 document to `findings_path`, with each remediation's note as the worker wrote it before the route
 notes, without the previous run's search record and with each `declared[]` entry's declaration as
 this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,

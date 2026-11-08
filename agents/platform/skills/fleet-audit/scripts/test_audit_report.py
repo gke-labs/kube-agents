@@ -36375,6 +36375,41 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertEqual(pending, [])
         self.assertIn("the forge timed out", unread)
 
+    def test_a_repository_start_found_unreachable_means_a_full_run(self):
+        """A ledger `start` could not reach is one that could not be read, not one with no requests.
+
+        `start`'s record carries the no-forge decision with the reason, and
+        `finish_target` follows it; the diverted decision keeps its ledger in
+        the store like a forge with no issue tracker, but its requests are
+        unknown, so the run goes on in full with the reason instead of a close
+        that `_finish` would divert.
+        """
+        candidate, _, stored = self.day_one()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.real_claim_in_flight(AUDIT)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+        audit_report.write_run_record(
+            AUDIT,
+            "acme/fleet",
+            [],
+            searched=["acme/fleet@abc123"],
+            decision=audit_report.no_forge_decision(("acme/fleet", "REPOSITORY_NOT_MANAGED: acme/fleet")),
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        calls_before = len(self.harness.calls)
+
+        rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn(
+            audit_report.PRECHECK_LEDGER_UNREAD_REASON.format(error="REPOSITORY_NOT_MANAGED: acme/fleet"), out["reason"]
+        )
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+        self.assertEqual(len(self.harness.calls), calls_before)
+        self.assertTrue(Path(audit_report.inflight_path_for(AUDIT)).is_file())
+
     def day_one(self):
         """A scheduled day-1 `finish` of one finding on the forge path.
 
