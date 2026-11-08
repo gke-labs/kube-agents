@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestSteerNoticeRoundTrips(t *testing.T) {
@@ -268,5 +269,69 @@ func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
 	two, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "prod-1"}})
 	if _, ok, err := TaskParametersOf([]Part{one, two}); !ok || err == nil {
 		t.Fatalf("ok=%v err=%v, want found and refused", ok, err)
+	}
+}
+
+func TestDelegateTargetsRoundTrip(t *testing.T) {
+	want := DelegateTargets{Targets: []DelegateTarget{
+		{Name: "platform", Description: "the platform agent"},
+		{Name: "e2e5", Description: "reads one cluster's workloads"},
+	}}
+	part, err := DelegateTargetsPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := Part{Kind: "text", Text: "use e2e5"}
+	got, ok, err := DelegateTargetsOf([]Part{text, part})
+	if err != nil || !ok {
+		t.Fatalf("DelegateTargetsOf = %v %v", ok, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	if _, ok, err := DelegateTargetsOf([]Part{text}); ok || err != nil {
+		t.Fatalf("no part: ok=%v err=%v, want absent", ok, err)
+	}
+}
+
+func TestDelegateTargetsRefuseWhatIsNotAnAddresseeOrOneLine(t *testing.T) {
+	for name, tgt := range map[string]DelegateTarget{
+		"a dotted name":         {Name: "a.b"},
+		"a wildcard":            {Name: "*"},
+		"no name":               {Name: ""},
+		"a two-line blurb":      {Name: "p", Description: "first\nsecond"},
+		"a blurb over the cap":  {Name: "p", Description: strings.Repeat("x", DelegateTargetDescriptionMax+1)},
+		"a blurb with a tab":    {Name: "p", Description: "a\tb"},
+		"a blurb padded by two": {Name: "p", Description: "a  b"},
+	} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{tgt}}); err == nil {
+			t.Errorf("%s: built, want refused", name)
+		}
+		raw, _ := json.Marshal(map[string]DelegateTargets{"delegateTargets": {Targets: []DelegateTarget{tgt}}})
+		if _, ok, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+			t.Errorf("%s: read ok=%v err=%v, want an error", name, ok, err)
+		}
+	}
+	over := make([]DelegateTarget, DelegateTargetsMax+1)
+	for i := range over {
+		over[i] = DelegateTarget{Name: fmt.Sprintf("p%d", i)}
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: over}); err == nil {
+		t.Error("more than the cap: built, want refused")
+	}
+	raw := []byte(`{"delegateTargets":{}}`)
+	if _, ok, err := DelegateTargetsOf([]Part{{Kind: "data", Data: raw}}); !ok || err == nil {
+		t.Errorf("no targets list: ok=%v err=%v, want an error", ok, err)
+	}
+}
+
+func TestDelegateTargetDescriptionFoldsToOneLineUnderTheCap(t *testing.T) {
+	if got := DelegateTargetDescription("  reads\none\tcluster\x00  "); got != "reads one cluster" {
+		t.Fatalf("got %q", got)
+	}
+	long := strings.Repeat("é", DelegateTargetDescriptionMax) // two bytes a rune
+	got := DelegateTargetDescription(long)
+	if len(got) > DelegateTargetDescriptionMax || !utf8.ValidString(got) {
+		t.Fatalf("cut to %d bytes, valid=%v", len(got), utf8.ValidString(got))
 	}
 }

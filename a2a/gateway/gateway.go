@@ -2939,7 +2939,18 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		capRef = nil
 	}
 
-	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route)
+	// A turn for the conversation's own session pod carries the agents its
+	// requester may delegate to, which the pod's delegate tool names. Per
+	// turn, so a reused pod sees profiles as they come and go.
+	var extra []lib.Part
+	if ts.Route == nil && rec.AddressedToOwnSession() {
+		if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, g.profiles)); err != nil {
+			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
+		} else {
+			extra = append(extra, part)
+		}
+	}
+	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
 		return "", false

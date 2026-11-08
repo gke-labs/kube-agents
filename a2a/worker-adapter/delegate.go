@@ -162,6 +162,34 @@ func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string
 		env = os.Environ()
 	}
 	outEnv = append(slices.Clone(env), EnvDelegateSocket+"="+socket)
+	out, rewrote = withDelegateServerEnv(argv, EnvDelegateSocket, socket)
+	return out, outEnv, rewrote
+}
+
+// withDelegateTargets hands one turn's delegateTargets part to the delegate
+// MCP server, as JSON in its env inside --mcp-config. A submission with no
+// part, or one that doesn't parse, leaves argv as it is, and the server names
+// platform only. It reports whether the server's entry was found.
+func withDelegateTargets(argv []string, origin *lib.Envelope) ([]string, bool) {
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		return argv, false
+	}
+	targets, ok, err := lib.DelegateTargetsOf(m.Parts)
+	if !ok || err != nil {
+		return argv, false
+	}
+	raw, err := json.Marshal(targets)
+	if err != nil {
+		return argv, false
+	}
+	return withDelegateServerEnv(argv, EnvDelegateTargets, string(raw))
+}
+
+// withDelegateServerEnv sets key to value in the delegate MCP server's env
+// inside the --mcp-config argument, reporting whether the server's entry was
+// found. argv is not modified.
+func withDelegateServerEnv(argv []string, key, value string) (out []string, rewrote bool) {
 	out = slices.Clone(argv)
 	for i := 1; i < len(out); i++ {
 		if out[i-1] != MCPConfigFlag {
@@ -179,12 +207,12 @@ func withDelegateSocket(argv, env []string, socket string) (out, outEnv []string
 		if srvEnv == nil {
 			srvEnv = map[string]any{}
 		}
-		srvEnv[EnvDelegateSocket] = socket
+		srvEnv[key] = value
 		srv[MCPEnvKey] = srvEnv
 		if b, err := json.Marshal(cfg); err == nil {
 			out[i] = string(b)
 			rewrote = true
 		}
 	}
-	return out, outEnv, rewrote
+	return out, rewrote
 }

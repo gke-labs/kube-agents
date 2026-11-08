@@ -34,6 +34,11 @@ it when the ask:
 Answer yourself when what you have is enough: a concept, output the user pasted, or a
 diagnosis you can make with the cluster view.
 
+The `delegate` tool's addressee field lists every agent you may hand a task to. Besides
+`platform` it can name agent profiles, each with a line on what it does. When the person
+asks for one of them by name ("use e2e5", "have the triage profile look"), delegate to it
+under that name, even when you could answer yourself.
+
 You can delegate only when the `delegate` tool is available. If it isn't, answer from
 what you have and say plainly what you couldn't check.
 

@@ -7,6 +7,8 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // TaskState is the A2A task state machine, plus rejected. auth-required is
@@ -296,6 +298,117 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 	}
 	if found == nil {
 		return TaskParameters{}, false, nil
+	}
+	return *found, true, nil
+}
+
+// DelegateTargets is the delegateTargets data part on a session turn's
+// submission: the agents the turn's requester may delegate to, as the gateway
+// resolved them when it submitted the turn (platform, then each AgentProfile
+// whose card admits them). The session pod's delegate tool names them in its
+// addressee description, so the model is told what it can address rather than
+// a fixed name. It's a hint for the model, not a grant: the gateway checks a
+// delegation against the same rules when it arrives, so a stale list costs at
+// most a refused delegation.
+type DelegateTargets struct {
+	Targets []DelegateTarget `json:"targets"`
+}
+
+// DelegateTarget is one agent a session may delegate to: its addressee, and
+// its card's routing blurb, which the delegate tool shows the model.
+type DelegateTarget struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// The bounds a delegateTargets part is held to. A name is a subject token (an
+// addressee); a description is one line of at most DelegateTargetDescriptionMax
+// bytes, cut by the gateway (DelegateTargetDescription).
+const (
+	DelegateTargetsMax           = 64
+	DelegateTargetDescriptionMax = 280
+)
+
+const delegateTargetsKey = "delegateTargets"
+
+// DelegateTargetDescription is a card's description as a delegate target
+// carries it: control characters and line breaks folded to spaces, runs of
+// space collapsed, and cut to DelegateTargetDescriptionMax bytes on a rune
+// boundary.
+func DelegateTargetDescription(s string) string {
+	s = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)), " ")
+	if len(s) <= DelegateTargetDescriptionMax {
+		return s
+	}
+	cut := DelegateTargetDescriptionMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
+func validateDelegateTargets(t DelegateTargets) error {
+	if len(t.Targets) > DelegateTargetsMax {
+		return fmt.Errorf("delegate targets: %d, at most %d", len(t.Targets), DelegateTargetsMax)
+	}
+	for _, d := range t.Targets {
+		if !ValidSubjectToken(d.Name) {
+			return fmt.Errorf("delegate target %q is not an addressee", d.Name)
+		}
+		if d.Description != DelegateTargetDescription(d.Description) {
+			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
+		}
+	}
+	return nil
+}
+
+// DelegateTargetsPart is t as a data part, refused when t breaks the bounds.
+func DelegateTargetsPart(t DelegateTargets) (Part, error) {
+	if err := validateDelegateTargets(t); err != nil {
+		return Part{}, err
+	}
+	if t.Targets == nil {
+		t.Targets = []DelegateTarget{}
+	}
+	data, err := json.Marshal(map[string]DelegateTargets{delegateTargetsKey: t})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// DelegateTargetsOf finds the delegateTargets part among parts. A part that
+// breaks the bounds, or a second one, is an error, and the reader falls back
+// to what it would show with none.
+func DelegateTargetsOf(parts []Part) (DelegateTargets, bool, error) {
+	var found *DelegateTargets
+	for _, p := range parts {
+		raw, ok := wrappedData(p, delegateTargetsKey)
+		if !ok {
+			continue
+		}
+		if found != nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: more than one delegateTargets part")
+		}
+		var t DelegateTargets
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return DelegateTargets{}, true, fmt.Errorf("delegate targets: %w", err)
+		}
+		if t.Targets == nil {
+			return DelegateTargets{}, true, errors.New("delegate targets: the part carries no targets list")
+		}
+		if err := validateDelegateTargets(t); err != nil {
+			return DelegateTargets{}, true, err
+		}
+		found = &t
+	}
+	if found == nil {
+		return DelegateTargets{}, false, nil
 	}
 	return *found, true, nil
 }

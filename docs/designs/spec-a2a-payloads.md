@@ -769,6 +769,17 @@ chat session's turn ends when it delegates, so a session parent keeps the chatop
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
 finished turn's `…in`.
 
+**Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
+`{"delegateTargets": {"targets": [{"name", "description"?}, …]}}`: the agents that turn's requester
+may delegate to, `platform` first and then each AgentProfile whose card admits them, by the same
+checks a delegation meets (the target's list for the requester's backend, the A2A door's own-list
+rule, and the card's tiers). The session's delegate tool names them in its addressee description,
+so the model is told what it can address. The part is a hint, not a grant: the gateway checks the
+delegation again when it arrives. It rides every turn, so a reused pod keeps up with profiles added
+and removed. A name is an addressee (a subject token), a description is one line of at most 280
+bytes, and a list has at most 64 targets (`lib.DelegateTargetsOf`). A part that breaks the bounds
+is ignored, and the tool falls back to naming `platform`.
+
 ### Card work after the task ends
 
 **A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
