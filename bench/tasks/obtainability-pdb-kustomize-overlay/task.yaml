@@ -1,8 +1,9 @@
-# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
-# FIXTURE_NOT_READY (#2686), in no roster file under hack/eval/ until its
-# stack has run on the pool. Red on main and green on the branch that adds
-# `degrade_unlisted_kustomize_additions` to `audit_report.py finish`, on a dev
-# install that carries the fixture below.
+# NIGHTLY-TIER: registered in hack/eval/nightly-cases.txt (#2686). It has no
+# pool fixture: its stack plants the fixture for each run, so its first
+# nightly run is the proof that the plant and the teardown work on the pool.
+# The case was red before `degrade_unlisted_kustomize_additions` landed in
+# `audit_report.py finish`, and green after it, on a dev install that carries
+# the fixture below.
 #
 # WHAT THIS GRADES. Kustomize renders only the files its kustomization lists.
 # A remediation carries one file, so a pull request that adds a new
@@ -13,25 +14,28 @@
 # ledger row names the kustomization and the `resources:` line a person must
 # add.
 #
-# WHY IT IS RED ON MAIN. The prompt asks for the budget as a file: a
-# `kind: manifest` remediation, a new pdb.yaml beside checkout-gateway's
-# declaration, as the obtainability SOP's rule for a new object beside the
-# declaration of the workload it protects says. So the red does not depend
-# on the worker's own choice between `manifest` and `manual` (on main
-# 1e7845bb, with no such instruction, the worker chose `manual` and the case
-# could not tell main from the branch). The finding is `major` on `no-pdb`,
-# which is in MAJOR_SWEEP_CHECKS, and the collector's candidate vouches for
-# it, so on main the sweep opens a pull request that adds only pdb.yaml,
-# unasked: the-sweep-opened-no-pull-request goes red. On the branch the
-# guard sees a new file that the overlay's kustomization does not list, and
-# makes the fix `manual`: no pull request, green.
+# WHAT MAKES IT RED WITHOUT THE GUARD. The prompt asks for the budget as a
+# file: a `kind: manifest` remediation, a new pdb.yaml beside
+# checkout-gateway's declaration, as the obtainability SOP's rule for a new
+# object beside the declaration of the workload it protects says. So the red
+# does not depend on the worker's own choice between `manifest` and `manual`
+# (on main 1e7845bb, before the guard, with no such instruction, the worker
+# chose `manual` and the case could not tell the code without the guard from
+# the code with it). The
+# finding is `major` on `no-pdb`, which is in MAJOR_SWEEP_CHECKS, and the
+# collector's candidate vouches for it, so without the guard the sweep opens
+# a pull request that adds only pdb.yaml, unasked:
+# the-sweep-opened-no-pull-request goes red. With the guard,
+# `degrade_unlisted_kustomize_additions` sees a new file that the overlay's
+# kustomization does not list, and makes the fix `manual`: no pull request,
+# green.
 #
 # WHAT DECIDES. Three objectives: a finding id names checkout-gateway (the
 # finding was filed); a worker wrote seeded-reliability/pdb.yaml (so a green
 # is the guard's work, not a worker that declined to write the file); and no
-# pull request was opened (`none` over github_writes). Red on main is a pull
+# pull request was opened (`none` over github_writes). Red is a pull
 # request that adds only pdb.yaml; green is the file written and no pull
-# request. The branch's SOP says that a fix in a Kustomize root is `manual`;
+# request. The SOP says that a fix in a Kustomize root is `manual`;
 # if a worker follows that over the prompt and writes no file,
 # the-worker-wrote-the-budget-file goes red, which is the honest result. The
 # ledger body is not graded, because it renders only part of a seeded
@@ -163,7 +167,7 @@ verification_spec:
   # No objective reads the ledger body for the kustomization or the
   # `resources:` line. On the seeded fleet the obtainability ledger carries
   # about 105 findings and its body renders about 20 of them, so the
-  # checkout-gateway row is often omitted, on main and on the branch alike.
+  # checkout-gateway row is often omitted, with the guard and without it.
   # Read the row by hand when it renders: it names
   # seeded-reliability/kustomization.yaml and the `resources:` line.
   # The worker wrote the file the prompt asks for, through the file tool or
@@ -199,8 +203,8 @@ verification_spec:
             [
               '(?s)(?=.*(>|\btee\b|\bcp\b|\bmv\b|\binstall\b|write_text|\.write\(|open\()).*clusters/[^/\s''"]*seeded-a/seeded-reliability/pdb\.yaml',
             ]
-  # The red on main: `finish` opens a pull request that adds only the new
-  # file. github_writes passes on a write, so it sits under `none`. The case
+  # The red without the guard: `finish` opens a pull request that adds only
+  # the new file. github_writes passes on a write, so it sits under `none`. The case
   # requests no pull request, so any write in its window is the defect.
   - name: the-sweep-opened-no-pull-request
     role: objective

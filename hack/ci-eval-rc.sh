@@ -132,7 +132,7 @@ set -euo pipefail
 # minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
 # consistency-drift-outlier (roster since 2026-10-26) adds three units in the
 # first phase, beside the other cases and serialized on its task lock: a ~10
-# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~30 at
+# minute chain at its 198 s median on the nightlies after the 2026-10-19 model change, ~30 at
 # its 600 s hint. monitoring-alert-policy-read (roster since 2026-11-02) adds
 # three more first-phase units, serialized on its task lock and on
 # lock-infra, which no other case in this matrix takes; its stack is a few

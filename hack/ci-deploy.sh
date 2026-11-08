@@ -132,6 +132,16 @@ readonly EVAL_DRIFT_READY_CONTAINER="agent-api-auth"
 # a cold start rather than tight against it.
 readonly EVAL_DRIFT_READY_ATTEMPTS=60
 readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
+# Where the job's artifacts land (Prow sets ARTIFACTS; hack/ci-eval-pr.sh uses
+# the same default). The agent's full status names the model the install
+# serves, and Deck streams this script's output to anyone while a run is in
+# progress, so report_cr_status writes the status there and prints the phase
+# and the Ready condition only.
+readonly DEPLOY_ARTIFACT_DIR="${ARTIFACTS:-/tmp/artifacts}"
+readonly CR_STATUS_ARTIFACT_PREFIX="platformagent-status"
+# The selector cr_phase_and_ready_condition (section 6b) spells out itself:
+# tests lift that function alone, so it carries no constant.
+readonly CR_PHASE_READY_JSONPATH='{.status.phase}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.reason}{": "}{.message}{end}'
 
 # Deliberately not --log-dropped here, though the detector takes it and
 # deploy/shared/start-services.sh will pass it on any install that sets
@@ -455,8 +465,8 @@ readonly A2A_INJECT_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-inject"
 readonly A2A_INJECT_TOKEN_KEY="token"
 readonly A2A_INJECT_BACKEND_ENV_VAR="A2A_INJECT_BACKEND"
 readonly A2A_INJECT_BACKEND_ON="true"
-# The gateway's election: the operator renders its Lease, the grant on it and
-# the gateway's election env only with this set.
+# The gateway's election, on by default; the lane sets it anyway so its runs
+# don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
@@ -1747,8 +1757,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "operator.extraEnv[8].name=${A2A_CARD_STOP_ENV_VAR}"
     --set-string "operator.extraEnv[8].value=${A2A_CARD_STOP_ON}"
     # The gateway's election (k8s-operator platformagent_a2a_gateway_lease.go):
-    # off by default for installs, on here so the next lane runs the gateway
-    # the way it will run with replicas.
+    # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
     # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
@@ -2186,6 +2195,16 @@ fi
 # for that would red the whole matrix over a gap only a drift case cares
 # about. Section 3 of docs/ci-pool-projects.md says which projects those are;
 # it is not every older one, and the set is not re-checked between leases.
+# The CR's phase and Ready condition on one log line; its full status in the
+# artifacts under platformagent-status-<label>.yaml (see DEPLOY_ARTIFACT_DIR).
+report_cr_status() {
+  local label="$1" out
+  out="${DEPLOY_ARTIFACT_DIR}/${CR_STATUS_ARTIFACT_PREFIX}-${label}.yaml"
+  mkdir -p "${DEPLOY_ARTIFACT_DIR}" 2>/dev/null || true
+  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml > "${out}" 2>/dev/null || true
+  echo "platformagent ${PLATFORM_AGENT_CR_NAME}: $(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true) (full status: ${out##*/} in the artifacts)"
+}
+
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying drift-detector startup ==="
 drift_detector_started=false
 # `grep -F ... >/dev/null` rather than `grep -qF`, and the difference is the
@@ -2209,7 +2228,7 @@ done
 if [[ "${drift_detector_started}" != "true" ]]; then
   echo "ERROR: drift-detector never reached its pull loop on this install"
   echo "       (no '${EVAL_DRIFT_READY_MARKER}' in the ${EVAL_DRIFT_READY_CONTAINER} container)"
-  kubectl get platformagent -n "${NAMESPACE}" -o yaml || true
+  report_cr_status "drift-detector"
   kubectl logs -n "${NAMESPACE}" deployment/platform-agent-gateway \
     -c "${EVAL_DRIFT_READY_CONTAINER}" --tail=100 || true
   exit 1
@@ -2277,7 +2296,7 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # limits (#1700), so a namespace ResourceQuota on limits.cpu admits them;
 # nothing this deploy or the chart renders carries such a quota either way.
 dump_mode_next_state() {
-  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+  report_cr_status "mode-next-failure"
   kubectl get pods,jobs,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
   kubectl get events -n "${NAMESPACE}" --sort-by=.lastTimestamp | tail -"${MODE_NEXT_DIAG_EVENT_LINES}" || true
   kubectl logs -n "${NAMESPACE}" "deployment/${OPERATOR_DEPLOYMENT_NAME}" --tail="${MODE_NEXT_DIAG_LOG_LINES}" || true
@@ -2704,7 +2723,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's
   # account of the A2A skill overlay landing (or not) in the agent pod.
-  kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o yaml | sed -n '/^status:/,$p' || true
+  report_cr_status "mode-next-ready"
   kubectl get statefulsets,deployments,jobs,pods,networkpolicies,pvc -n "${NAMESPACE}" -l "${A2A_PART_OF_SELECTOR}" || true
   echo "--- A2A gateway (reported, not gated; see the comment above this step) ---"
   kubectl get "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-gateway" -n "${NAMESPACE}" || true

@@ -79,10 +79,12 @@ exit 0
 #: can be asserted after a delete that failed inside the trap.
 _RM_STUB = '#!/bin/bash\necho "rm $*" >> "$CALLS"\nexec /bin/rm "$@"\n'
 
-#: The signal test's waits: for the plant to reach the manifest create, and for
-#: the script to finish once signalled (bash runs the trap after the foreground
-#: command returns, so the stub's sleep bounds the second wait).
-_SIGNAL_SETTLE_SECONDS = 1.0
+#: The signal test's waits: for the plant to reach the manifest create (read
+#: off the stub's call log, not a fixed sleep, which loses on a loaded shard),
+#: and for the script to finish once signalled (bash runs the trap after the
+#: foreground command returns, so the stub's sleep bounds the second wait).
+_SIGNAL_REACH_DEADLINE_SECONDS = 20.0
+_SIGNAL_POLL_SECONDS = 0.05
 _SIGNAL_STUB_SLEEP_SECONDS = 3
 _SIGNAL_EXIT = 143
 
@@ -205,7 +207,18 @@ class NamespacedPlantTest(unittest.TestCase):
         env["CALLS"] = str(self._calls)
         env["MANIFEST_CREATE_SLEEP"] = str(_SIGNAL_STUB_SLEEP_SECONDS)
         proc = subprocess.Popen(["bash", str(_SCRIPT), "plant"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(_SIGNAL_SETTLE_SECONDS)
+        # Signal inside the manifest create (the second `create -f -`, which the
+        # stub holds open for _SIGNAL_STUB_SLEEP_SECONDS), never before the
+        # Namespace create: the call log says when the plant got there.
+        deadline = time.monotonic() + _SIGNAL_REACH_DEADLINE_SECONDS
+        while time.monotonic() < deadline:
+            calls = self._calls.read_text().splitlines() if self._calls.exists() else []
+            if len(self._creates(calls)) >= 2:
+                break
+            time.sleep(_SIGNAL_POLL_SECONDS)
+        else:
+            proc.kill()
+            self.fail("the plant did not reach the manifest create within the deadline")
         proc.send_signal(signal.SIGTERM)
         _, stderr = proc.communicate(timeout=_SIGNAL_STUB_SLEEP_SECONDS * 10)
         calls = self._calls.read_text().splitlines() if self._calls.exists() else []

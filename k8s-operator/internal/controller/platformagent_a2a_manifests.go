@@ -4084,11 +4084,18 @@ const (
 	// pods (the callouts and verifiers roll together on the new operator's
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
-	// after its TTL), one scope publisher Job pod (started every
-	// scopePublishInterval, never while another is active; it renders in next
-	// mode, the only mode this quota renders in), and three for the gateway's
-	// count-then-create overshoot (a2a/gateway/spawn.go, refuseAtSessionCap).
-	a2aQuotaTransientMargin = 2 + 1 + 1 + 3
+	// after its TTL), the scope publisher's Job pods, and three for the
+	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// refuseAtSessionCap).
+	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
+	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
+	// started every scopePublishInterval and never while another is active
+	// (decideScopePublish). The margin counts it in next mode, the only mode
+	// this quota renders in, whether or not a scope gives the Job anything to
+	// resolve. The chart's quota preflight counts the same pod only when one
+	// does (files/transient-pods.yaml), so this may not count fewer:
+	// TestTheChartCountsTheScopePublishersJobPod.
+	a2aScopePublisherJobPods = 1
 )
 
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
@@ -4172,6 +4179,9 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
 	n += a2aFlaggedStandingPods(agent)
+	// The gateway's standbys and its rollout's surge pod, under the election
+	// (the builder above renders the one replica it runs before then).
+	n += a2aGatewayStandbyPods(agent)
 	return n
 }
 
@@ -5516,17 +5526,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(1)),
-			// Recreate, as the credential proxy is, rather than the
-			// RollingUpdate default: at one replica that default resolves
-			// maxUnavailable to 0, so a roll needs a surge Pod and stalls
-			// for good under a namespace ResourceQuota with no headroom
-			// (#977, #1267). maxUnavailable: 1 is not the fix here --
-			// gateway.FromEnv refuses a second backend because two gateways
-			// on one relay durable split event deliveries, so two instances
-			// overlapping during a roll is the wrong shape. Recreate stops
-			// the old one before the new one starts; the gap is the one
-			// the single-backend rule already implies.
+			// One replica and Recreate until the operator knows the image
+			// runs the election (scaleOutA2AGateway): an unelected gateway
+			// beside another would split the relay durable's deliveries, so
+			// two must never overlap. Recreate stops the old one before the
+			// new one starts. Elected replicas take turns on the Lease, and
+			// scaleOutA2AGateway rolls them with a surge pod instead.
+			Replicas:                ptr.To(int32(1)),
 			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			ProgressDeadlineSeconds: ptr.To(a2aGatewayProgressDeadlineSeconds),
 			Selector:                &metav1.LabelSelector{MatchLabels: selector},
@@ -5538,6 +5544,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					// exactly that grant, nothing ambient.
 					ServiceAccountName:           a2aGatewayName(agent),
 					AutomountServiceAccountToken: ptr.To(true),
+					// Over zones, so a zone outage leaves a standby.
+					TopologySpreadConstraints: a2aGatewayTopologySpread(agent),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(int64(1000)),
@@ -5563,12 +5571,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
-						// Not ready until the event relay binds: the adapters and
-						// doors start only after it, and it waits for TASKS rather
-						// than exiting. Recreate (above) already stops the old
-						// pod before this one starts, so the probe opens no gap
-						// in a roll; it shows the existing one, with the reason
-						// in the probe's failure message.
+						// The replica holding the Lease is not ready until its
+						// event relay binds: the adapters and doors start only
+						// after it, and it waits for TASKS rather than exiting. A
+						// standby is ready once connected with the Lease read
+						// (gateway.ElectedReadiness), so a rolling update's surge
+						// pod reads Ready before an old pod stops. At one replica,
+						// Recreate stops the old pod first and the probe shows
+						// that gap, with the reason in its failure message.
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{Path: a2aGatewayReadyzPath, Port: intstr.FromString(a2aGatewayMetricsPortName)},
@@ -5660,6 +5670,11 @@ type a2aProvisionState struct {
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
+	// gatewayElected is the image the pod holding the gateway's Lease runs,
+	// as this pass read it, or nil when it couldn't tell
+	// (observeA2AGatewayElection). The status writers carry it as the
+	// GatewayElected condition (gatewayElectedImage).
+	gatewayElected *string
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -6244,6 +6259,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.leaseRequeue = leaseWait
+		state.gatewayElected = r.observeA2AGatewayElection(ctx, agent)
 	}
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
@@ -6333,6 +6349,19 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 	}
 	gatewayExists := getErr == nil
+	// More than one replica only once a gateway that runs the election on
+	// this image has taken the Lease (scaleOutA2AGateway,
+	// a2aGatewayScaleOutAllowed).
+	elected := gatewayElectedImage(agent, state.gatewayElected)
+	if !a2aGatewayScaleOutAllowed(state.gatewayElected, elected, liveGateway, gatewayExists) {
+		elected = ""
+	}
+	scaleOutA2AGateway(dep, agent, elected)
+	if elected == "" && a2aGatewayElectionEnabled() && a2aGatewayReplicas(agent) > 1 {
+		// Nothing wakes the pass that sees the election: Lease updates are
+		// filtered out and pods aren't watched.
+		state.leaseRequeue = minPositive(state.leaseRequeue, a2aGatewayElectionRecheck)
+	}
 	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {
 		state.gatewayWaking = true
 	}
@@ -6397,6 +6426,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
+	}
+	// Its budget, after the Deployment it selects, so a drain takes one
+	// replica at a time; only while more than one is rendered and Ready. At
+	// one replica a budget protects nothing, and one applied while the
+	// standby hasn't come up (or can't: no room, a failed pull) would pin
+	// the one pod that runs. The ready count is the one read above, so the
+	// budget lands a pass after the standby is Ready.
+	scaledOut := ptr.Deref(dep.Spec.Replicas, 1) > 1 && gatewayExists && liveGateway.Status.ReadyReplicas > 1
+	if err := r.reconcileA2AGatewayPDB(ctx, agent, scaledOut); err != nil {
+		return state, err
 	}
 
 	// And the removal AFTER it, the other half of the same ordering
@@ -6995,6 +7034,8 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// Its budget, after the Deployment, as the callout's is.
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The election's Lease, after the gateway that held it.
 		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
