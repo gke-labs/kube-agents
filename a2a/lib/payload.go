@@ -310,23 +310,35 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 // a fixed name. It's a hint for the model, not a grant: the gateway checks a
 // delegation against the same rules when it arrives, so a stale list costs at
 // most a refused delegation.
+//
+// The part's presence is the marker: a turn that carries one has exactly the
+// agents listed (an empty list is none), and a turn with none reads as
+// platform only. Truncated says the gateway left agents out to stay inside
+// the bounds below.
 type DelegateTargets struct {
-	Targets []DelegateTarget `json:"targets"`
+	Targets   []DelegateTarget `json:"targets"`
+	Truncated bool             `json:"truncated,omitempty"`
 }
 
-// DelegateTarget is one agent a session may delegate to: its addressee, and
-// its card's routing blurb, which the delegate tool shows the model.
+// DelegateTarget is one agent a session may delegate to: its addressee, its
+// card's routing blurb, and the parameters its card declares (a pinned
+// profile's cluster, say), which a delegation may pass.
 type DelegateTarget struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	Name        string             `json:"name"`
+	Description string             `json:"description,omitempty"`
+	Parameters  []ProfileParameter `json:"parameters,omitempty"`
 }
 
 // The bounds a delegateTargets part is held to. A name is a subject token (an
 // addressee); a description is one line of at most DelegateTargetDescriptionMax
-// bytes, cut by the gateway (DelegateTargetDescription).
+// bytes, cut by the gateway (DelegateTargetDescription); a parameter is named
+// by TaskParameterNameRE, at most TaskParametersMax a target. The encoded part
+// is at most DelegateTargetsMaxBytes, so the session pod can hand it to its
+// tool server in one environment variable.
 const (
-	DelegateTargetsMax           = 64
-	DelegateTargetDescriptionMax = 280
+	DelegateTargetsMax           = 32
+	DelegateTargetDescriptionMax = 200
+	DelegateTargetsMaxBytes      = 16 * 1024
 )
 
 const delegateTargetsKey = "delegateTargets"
@@ -363,6 +375,17 @@ func validateDelegateTargets(t DelegateTargets) error {
 		if d.Description != DelegateTargetDescription(d.Description) {
 			return fmt.Errorf("delegate target %s: the description is not one line of at most %d bytes", d.Name, DelegateTargetDescriptionMax)
 		}
+		if len(d.Parameters) > TaskParametersMax {
+			return fmt.Errorf("delegate target %s: %d parameters, at most %d", d.Name, len(d.Parameters), TaskParametersMax)
+		}
+		for _, p := range d.Parameters {
+			if !TaskParameterNameRE.MatchString(p.Name) {
+				return fmt.Errorf("delegate target %s: parameter %q is not a lower-case identifier", d.Name, p.Name)
+			}
+		}
+	}
+	if raw, err := json.Marshal(t); err != nil || len(raw) > DelegateTargetsMaxBytes {
+		return fmt.Errorf("delegate targets: encoded past %d bytes", DelegateTargetsMaxBytes)
 	}
 	return nil
 }

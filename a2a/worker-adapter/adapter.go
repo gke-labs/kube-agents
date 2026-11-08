@@ -815,13 +815,6 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		}
 	}
 
-	if delegate {
-		// The agents this turn's requester may delegate to, as the gateway
-		// listed them on the submission: per turn, so a reused pod's tool
-		// keeps up with profiles added and removed.
-		argv, _ = withDelegateTargets(argv, origin)
-	}
-
 	if cfg.SessionReuse {
 		if err := removeUserSettings(cfg.HarnessUserSettings); err != nil {
 			state := lib.StateFailed

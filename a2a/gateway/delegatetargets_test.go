@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -79,8 +81,8 @@ func TestDelegateTargetsSkipBadNamesAndStopAtTheCap(t *testing.T) {
 		d.put(name, &lib.AgentCard{Name: name})
 	}
 	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
-	if len(got.Targets) != lib.DelegateTargetsMax {
-		t.Fatalf("%d targets, want the cap %d", len(got.Targets), lib.DelegateTargetsMax)
+	if len(got.Targets) != lib.DelegateTargetsMax || !got.Truncated {
+		t.Fatalf("%d targets, truncated=%v; want the cap %d, truncated", len(got.Targets), got.Truncated, lib.DelegateTargetsMax)
 	}
 	for i, d := range got.Targets {
 		if d.Name == "a.b" || (d.Name == "platform" && (i != 0 || d.Description != platformTargetDescription)) {
@@ -115,5 +117,40 @@ func TestAPlatformTurnCarriesNoDelegateTargets(t *testing.T) {
 	origin := r.awaitTask(t, "platform")
 	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, origin)); found {
 		t.Fatal("a platform turn carried delegate targets")
+	}
+}
+
+// A card's declared parameters ride with it; a card whose parameters break the
+// part's rules is skipped without cutting the list short; and a list that would
+// pass the byte bound stops early and says so.
+func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
+	d := newProfileDirectory()
+	d.put("a-cluster", &lib.AgentCard{Name: "a-cluster", Parameters: clusterParams})
+	d.put("b-bad", &lib.AgentCard{Name: "b-bad", Parameters: []lib.ProfileParameter{{Name: "Not-An-Identifier"}}})
+	d.put("c-open", &lib.AgentCard{Name: "c-open"})
+	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, d)
+	if want := []string{"platform", "a-cluster", "c-open"}; !reflect.DeepEqual(targetNames(got), want) || got.Truncated {
+		t.Fatalf("targets = %v truncated=%v, want %v untruncated", targetNames(got), got.Truncated, want)
+	}
+	if !reflect.DeepEqual(got.Targets[1].Parameters, clusterParams) {
+		t.Fatalf("a-cluster's parameters = %+v, want %+v", got.Targets[1].Parameters, clusterParams)
+	}
+
+	big := newProfileDirectory()
+	blurb := strings.Repeat("x", lib.DelegateTargetDescriptionMax)
+	for i := 0; i < lib.DelegateTargetsMax-1; i++ {
+		name := fmt.Sprintf("p%02d", i)
+		var params []lib.ProfileParameter
+		for j := 0; j < lib.TaskParametersMax; j++ {
+			params = append(params, lib.ProfileParameter{Name: fmt.Sprintf("parameter_number_%02d", j), Required: true})
+		}
+		big.put(name, &lib.AgentCard{Name: name, Description: blurb, Parameters: params})
+	}
+	got = (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, big)
+	if !got.Truncated || len(got.Targets) >= lib.DelegateTargetsMax {
+		t.Fatalf("%d targets, truncated=%v; want fewer than the cap, truncated by bytes", len(got.Targets), got.Truncated)
+	}
+	if _, err := lib.DelegateTargetsPart(got); err != nil {
+		t.Fatalf("the truncated list doesn't build a part: %v", err)
 	}
 }

@@ -335,3 +335,36 @@ func TestDelegateTargetDescriptionFoldsToOneLineUnderTheCap(t *testing.T) {
 		t.Fatalf("cut to %d bytes, valid=%v", len(got), utf8.ValidString(got))
 	}
 }
+
+func TestDelegateTargetsHoldParametersAndTheByteBound(t *testing.T) {
+	ok := DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: []ProfileParameter{{Name: "cluster", Required: true}}}}, Truncated: true}
+	part, err := DelegateTargetsPart(ok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := DelegateTargetsOf([]Part{part}); err != nil || !reflect.DeepEqual(got, ok) {
+		t.Fatalf("round trip = %+v %v", got, err)
+	}
+	bad := DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: []ProfileParameter{{Name: "Cluster"}}}}}
+	if _, err := DelegateTargetsPart(bad); err == nil {
+		t.Error("a parameter that isn't an identifier: built, want refused")
+	}
+	var many []ProfileParameter
+	for i := 0; i <= TaskParametersMax; i++ {
+		many = append(many, ProfileParameter{Name: fmt.Sprintf("p%d", i)})
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "c", Parameters: many}}}); err == nil {
+		t.Error("more parameters than the cap: built, want refused")
+	}
+	var huge []DelegateTarget
+	for i := 0; i < DelegateTargetsMax; i++ {
+		var ps []ProfileParameter
+		for j := 0; j < TaskParametersMax; j++ {
+			ps = append(ps, ProfileParameter{Name: fmt.Sprintf("parameter_number_%02d", j)})
+		}
+		huge = append(huge, DelegateTarget{Name: fmt.Sprintf("p%d", i), Description: strings.Repeat("x", DelegateTargetDescriptionMax), Parameters: ps})
+	}
+	if _, err := DelegateTargetsPart(DelegateTargets{Targets: huge}); err == nil {
+		t.Errorf("a list past %d bytes: built, want refused", DelegateTargetsMaxBytes)
+	}
+}

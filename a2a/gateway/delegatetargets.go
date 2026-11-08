@@ -40,9 +40,11 @@ func (d *profileDirectory) sortedCards() []lib.AgentCard {
 // name order. It applies the checks a delegation meets when it arrives
 // (handleDelegateRequest): the door's own-list rule and the target's list for
 // r's backend, and for a profile the tier r would run at against the card's
-// tiers. It stops at DelegateTargetsMax, so an install with more profiles than
-// that shows the first ones by name. Resolving a target (a pinned profile's
-// cluster, an ambiguous name) is the delegation's step, not the list's.
+// tiers. It stops at DelegateTargetsMax, or before the part would pass
+// DelegateTargetsMaxBytes, and says so (Truncated), so an install with more
+// profiles than that shows the first ones by name. Resolving a target (a
+// pinned profile's cluster, an ambiguous name) is the delegation's step, not
+// the list's.
 func (g *Gateway) delegateTargets(r TaskRequester, profiles profileLister) lib.DelegateTargets {
 	allowed := func(target string) bool {
 		return !g.doorUnlisted(target, r.Backend) && g.targetAllows(target, r.Backend, r.Subject)
@@ -58,16 +60,32 @@ func (g *Gateway) delegateTargets(r TaskRequester, profiles profileLister) lib.D
 		return out
 	}
 	for _, c := range profiles.sortedCards() {
-		if len(out.Targets) == lib.DelegateTargetsMax {
-			break
-		}
 		if c.Name == targetPlatform || !lib.ValidSubjectToken(c.Name) || !allowed(c.Name) {
 			continue
 		}
 		if len(c.Tiers) > 0 && !slices.Contains(c.Tiers, string(tier)) {
 			continue
 		}
-		out.Targets = append(out.Targets, lib.DelegateTarget{Name: c.Name, Description: lib.DelegateTargetDescription(c.Description)})
+		next := lib.DelegateTarget{Name: c.Name, Description: lib.DelegateTargetDescription(c.Description), Parameters: c.Parameters}
+		if !fits(lib.DelegateTargets{}, next) {
+			// A card whose parameters break the part's rules isn't offered;
+			// the delegation would refuse its parameters anyway.
+			continue
+		}
+		if len(out.Targets) == lib.DelegateTargetsMax || !fits(out, next) {
+			out.Truncated = true
+			break
+		}
+		out.Targets = append(out.Targets, next)
 	}
 	return out
+}
+
+// fits reports whether t with next added is still a valid part: inside the
+// byte bound, and with next's parameters well formed (a card the operator
+// wrote is held to the part's rules rather than trusted).
+func fits(t lib.DelegateTargets, next lib.DelegateTarget) bool {
+	t.Targets = append(slices.Clone(t.Targets), next)
+	_, err := lib.DelegateTargetsPart(t)
+	return err == nil
 }
