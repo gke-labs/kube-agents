@@ -794,3 +794,55 @@ func TestGchatCapturedLegacyQuotedReplyThroughRun(t *testing.T) {
 		t.Errorf("turn = %+v", msg)
 	}
 }
+
+// A quoted ask cut short by shutdown makes no turn and posts nothing: the
+// member must not be promised an answer the pump will not hand over, and
+// Run's wait must not sit behind a post made after its context ended.
+func TestGchatQuotedAskCutShortByShutdownPostsNothing(t *testing.T) {
+	for _, words := range []string{"what is this?", ""} {
+		t.Run(fmt.Sprintf("words=%q", words), func(t *testing.T) {
+			f := newFakeChatRelay(t)
+			f.responses["spaces.messages/get"] = quotedResponse(humanSender("Alex"), gchatQuotedAlert)
+			f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/N1"}
+			ctx, cancel := context.WithCancel(context.Background())
+			release := make(chan struct{})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			// Shutdown lands while the read is in flight: the relay has the
+			// request, and the gateway's context ends before it answers.
+			f.beforeCall = func(key string) {
+				if key == "spaces.messages/get" {
+					cancel()
+					<-release
+				}
+			}
+			a := newTestGchatAdapterWithRelay(t, f)
+			admitAll(a)
+			ev := gchatBareQuotedMsg(gchatQuotedName)
+			if words != "" {
+				ev.Message.ArgumentText = &words
+			}
+			msg, reason := a.classify(ev)
+			if reason != "" {
+				t.Fatalf("dropped: %s", reason)
+			}
+			done := make(chan struct{})
+			go func() {
+				msg, reason = a.quotedAsk(ctx, ev, msg)
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("quotedAsk did not return after its context ended")
+			}
+			once.Do(func() { close(release) })
+			if reason != gchatShuttingDownReason || msg != (InboundMessage{}) {
+				t.Errorf("turn = %+v (%q), want no turn with the shutdown reason", msg, reason)
+			}
+			if got := postedTexts(f); len(got) != 0 {
+				t.Errorf("posted = %q, want nothing", got)
+			}
+		})
+	}
+}

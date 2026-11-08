@@ -113,6 +113,9 @@ const (
 	gchatQuoteTypeForward = "FORWARD"
 	// gchatGetMethod reads one message (spaces.messages.get).
 	gchatGetMethod = "get"
+	// gchatShuttingDownReason is the drop reason for a turn composed after
+	// Run's context ended: the pump hands nothing over then.
+	gchatShuttingDownReason = "the gateway is shutting down"
 )
 
 const (
@@ -1087,7 +1090,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			defer wg.Done()
 			msg, reason := a.quotedAsk(ctx, ev, msg)
 			if reason == "" && ctx.Err() != nil {
-				reason = "the gateway is shutting down"
+				reason = gchatShuttingDownReason
 			}
 			if reason != "" {
 				a.log.Info("gchat event is not a turn; acked", "pubsubMessageId", id, "reason", reason)
@@ -1508,8 +1511,17 @@ func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg I
 	if !quotedAskNeeded(ev, msg) {
 		return msg, ""
 	}
+	if ctx.Err() != nil {
+		return InboundMessage{}, gchatShuttingDownReason
+	}
 	quoted, ok := a.quotedMessage(ctx, ev)
 	if !ok {
+		if ctx.Err() != nil {
+			// Shutdown cut the read short: no line, since the pump hands
+			// nothing over now and the line would promise an answer that
+			// never comes, and no post for Run's wait to sit behind.
+			return InboundMessage{}, gchatShuttingDownReason
+		}
 		if !a.admitted(msg) {
 			if msg.Text == "" {
 				return InboundMessage{}, "the quoted message " + name + " could not be read, the message has no words of its own, and its sender is not admitted, so no line is posted"
@@ -1563,12 +1575,17 @@ func (a *GoogleChatAdapter) quotedMessage(ctx context.Context, ev *gchatEvent) (
 		}
 		return gchatQuoted{poster: poster, content: content}, true
 	}
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, a.quotedReadTimeout)
 	defer cancel()
 	var read gchatQuotedMessage
 	err := a.apiCallContext(ctx, []string{gchatSpacesResource, gchatMessagesResource}, gchatGetMethod,
 		map[string]any{gchatNameArg: q.Name}, &read)
 	if err != nil {
+		if parent.Err() != nil {
+			// Cut short by shutdown, not refused: nothing to warn about.
+			return gchatQuoted{}, false
+		}
 		a.log.Warn("gchat: could not read the message a member quoted; asking without it",
 			"message", ev.Message.Name, "quoted", q.Name, "err", err)
 		return gchatQuoted{}, false
