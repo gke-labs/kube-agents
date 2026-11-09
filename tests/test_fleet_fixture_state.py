@@ -1602,6 +1602,17 @@ class ProjectScopedRoleTest(_Harness):
         assert 'instance/startup-fail-* serial_contains "Script \\"startup-script\\" failed with error"' in body, body
         assert "not in the serial port 1 output of startup-fail-seeded (us-central1-a," in body, body
 
+    def test_a_rotated_console_does_not_hold_the_wait(self):
+        """Only a reboot puts the line back, so a wait would be spent for
+        nothing: one pass, then drift."""
+        world = _healthy_world()
+        world["serial"]["startup-fail-seeded"] = _WRAPPED_SERIAL
+        started = datetime.now(timezone.utc)
+        done = self.run_script(world, "--wait", "60", "--interval", "1")
+        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
+        assert self.log.read_text().count("get-serial-port-output startup-fail-seeded") == 1, done.stderr
+        assert set(self.drift_files()) == {"startup-fail-vm"}, done.stderr
+
     def test_a_refused_serial_read_is_not_checked_and_leaves_no_drift_file(self):
         world = _healthy_world()
         world["serial"]["startup-fail-seeded"] = "UNREACHABLE"

@@ -1683,6 +1683,9 @@ NOTE_TEXT_FIELD = "note"
 # entry for one of them (`refuse_resolved_over_notes`), because the run did
 # not see the finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"
+# The key a held entry carries when it is held because a note names its
+# object, not because the collector still flags it (`collector_held_entries`).
+NOTED_HELD_KEY = "noted"
 MAX_CELL_CHARS = 120
 # `cluster`, `namespace` and `object` are Kubernetes identifiers, and the API
 # bounds every one of them: a namespace is a 63-character DNS label, a resource
@@ -2799,11 +2802,38 @@ STORE_LOST_MEMORY_UNGUARDED_GAP = (
     "shows whether the findings it carries were fixed; no remediation fix is "
     "closed until a run that reports findings stores the ledger again"
 )
+# Why a noted object (`noted_ids`) is held, and when it is released. It is
+# not flagged: the collector could not see the result, so the run cannot see
+# the finding go away.
+NOTED_HOLD_CAUSE = (
+    "the collector ran its check on the object but could not see the result (for "
+    "a GCE instance, the serial console no longer shows the startup-script run), "
+    "so this run cannot see the finding go away"
+)
+NOTED_HOLD_END = (
+    "it stays until the collector can see the object again (for a GCE instance, "
+    "until the console shows a startup-script run again)"
+)
+# The lost-memory gaps when every still-flagged id the document does not carry
+# is a noted object: nothing is flagged, but the run cannot see those go away.
+LOST_MEMORY_NOTED_GAP = (
+    "the report store holds no trusted record of the open ledger (none, or one "
+    "that no longer matches the ledger's findings), so the findings it "
+    f"carries are unknown, and on an object a target's notes name {NOTED_HOLD_CAUSE}; "
+    "the ledger stays open over it"
+)
+STORE_LOST_MEMORY_NOTED_GAP = (
+    "the report store holds no trusted record of the stored ledger, so the "
+    f"findings it carries are unknown, and on an object a target's notes name "
+    f"{NOTED_HOLD_CAUSE}; no remediation fix is closed over it"
+)
 LOST_MEMORY_GAPS = (
     LOST_MEMORY_GAP,
     LOST_MEMORY_UNGUARDED_GAP,
+    LOST_MEMORY_NOTED_GAP,
     STORE_LOST_MEMORY_GAP,
     STORE_LOST_MEMORY_UNGUARDED_GAP,
+    STORE_LOST_MEMORY_NOTED_GAP,
 )
 # What a clean run says about a lost memory where a coverage gap would say
 # "did not see the whole fleet": the fleet may have been seen whole, and the
@@ -7667,6 +7697,19 @@ def noted_ids(manifest: dict | None) -> set[str]:
     return {published_id(identity) for _entry, identity in _noted_objects(manifest)}
 
 
+def lost_memory_gap(unexplained: set[str], noted: set[str], *, store: bool = False) -> str:
+    """The lost-memory gap for the still-flagged ids the document does not carry.
+
+    `unexplained` is that set; `noted` is `noted_ids`. The noted variant when
+    every id in the set is a noted object, because nothing is flagged then.
+    """
+    if unexplained - noted:
+        return STORE_LOST_MEMORY_GAP if store else LOST_MEMORY_GAP
+    if unexplained:
+        return STORE_LOST_MEMORY_NOTED_GAP if store else LOST_MEMORY_NOTED_GAP
+    return STORE_LOST_MEMORY_UNGUARDED_GAP if store else LOST_MEMORY_UNGUARDED_GAP
+
+
 def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
     """Refuse a `resolved_because` entry for an object a target's note names.
 
@@ -8094,7 +8137,11 @@ def collector_held_entries(
         ]
         by_ledger_id.setdefault(
             published_id(identity),
-            {**identity, "commands": [(commands[0] if commands else "").strip() or COLLECTOR_COMMAND_UNRECORDED]},
+            {
+                **identity,
+                "commands": [(commands[0] if commands else "").strip() or COLLECTOR_COMMAND_UNRECORDED],
+                NOTED_HELD_KEY: True,
+            },
         )
     held: list[dict] = []
     for fid in held_ids:
@@ -10951,6 +10998,21 @@ def collector_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str
     )
 
 
+def noted_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
+    """Why a `/remediate` on a finding held over a noted object is neither refused nor acted on.
+
+    The sibling of `collector_hold_reason` for an id a target's notes name
+    (`noted_ids`): the collector does not flag it, but it could not see the
+    result either.
+    """
+    return (
+        f"`{target}` is not in this run's document, and the ledger keeps it: "
+        f"{NOTED_HOLD_CAUSE}, and {NOTED_HOLD_END}. There is no finding in the "
+        f"document to open a {noun} from. The request stands: the first run "
+        "whose document carries the finding acts on it"
+    )
+
+
 def unread_hold_reason(target: str, noun: str = DEFAULT_PROPOSAL_NOUN) -> str:
     """Why a `/remediate` on a finding held over an unchecked target is neither refused nor acted on.
 
@@ -11046,6 +11108,7 @@ def parse_remediate_commands(
     collector_flagged: set[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
     unread_held: set[str] | None = None,
+    collector_noted: set[str] | None = None,
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
@@ -11097,6 +11160,8 @@ def parse_remediate_commands(
     covered = declared_by_id(declared)
     held_ids = set(collector_held or ())
     flagged_ids = set(collector_flagged or ()) - held_ids
+    # A noted id is held or still-flagged too; it gets its own reason.
+    noted_held = set(collector_noted or ()) & (held_ids | flagged_ids)
     # The collector's word first, as on the clean branch: an id the
     # collector still flags gets the collector's reason.
     unread_ids = set(unread_held or ()) - held_ids - flagged_ids
@@ -11197,6 +11262,9 @@ def parse_remediate_commands(
             target = raw.strip().strip("`")
             if target in withheld_ids:
                 deferred.append(deferral_reason(target))
+                continue
+            if target in noted_held:
+                deferred.append(noted_hold_reason(target, noun))
                 continue
             if target in held_ids:
                 deferred.append(collector_hold_reason(target, noun))
@@ -13114,11 +13182,28 @@ def _render_flagged_held(
             "over these; a `/remediate <finding-id>` on one is held, not refused, "
             "until a document carries the finding again."
         )
+    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
+    if noted and not carried:
+        # A noted object is held on other grounds: nothing flags it, but the
+        # run cannot see it go away (`noted_ids`).
+        out[-1] += (
+            f" {noted} of them the collector does not flag: {NOTED_HOLD_CAUSE}. "
+            f"For each of these, {NOTED_HOLD_END}."
+        )
     for index, entry in enumerate(held):
         fid = str(entry.get("id", ""))
         out.append("")
         out += _held_identity_lines(entry)
         if not detail or index >= MAX_HELD_DETAIL_ROWS:
+            continue
+        if entry.get(NOTED_HELD_KEY) and not carried:
+            commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
+            out.append(
+                f"- **Check:** `{_ident(str(entry.get('check', '')))}` — the collector ran "
+                f"`{_code_span(commands[0]) if commands else COLLECTOR_COMMAND_UNRECORDED}` "
+                "there this run but could not see the result; the target's notes say why."
+            )
+            out.append(f"- **Finding id:** `{fid}`")
             continue
         commands = [c for c in entry.get("commands") or [] if c != COLLECTOR_COMMAND_UNRECORDED]
         if carried:
@@ -13209,6 +13294,12 @@ def _render_held_note(
             "block below, which is what the next run reads them back from, and each "
             "stays held until the collector stops emitting it or a `declared` entry "
             "covers it."
+        )
+    noted = sum(1 for entry in held if entry.get(NOTED_HELD_KEY))
+    if noted and not carried:
+        opening += (
+            f" {noted} of them the collector does not flag: {NOTED_HOLD_CAUSE}. "
+            f"For each of these, {NOTED_HOLD_END}."
         )
     return [
         "",
@@ -14166,7 +14257,10 @@ def render_held_comment(
     held and the shortfall listed under it, rather than the coverage comment
     going out alone and naming no finding.
     """
-    collector_held = set(collector or [])
+    # A noted object is held, but the collector does not flag it: it gets its
+    # own sentence and mark (`noted_ids`).
+    noted_held = {str(entry.get("id", "")) for entry in held if entry.get(NOTED_HELD_KEY)}
+    collector_held = set(collector or []) - noted_held
     # `carried`: held from a previous run's manifest by a run that passed none
     # and so cannot release them — said apart from `collector`, whose sentence
     # claims this run's manifest carries the candidate.
@@ -14215,6 +14309,13 @@ def render_held_comment(
             "owner's choice.",
             "",
         ]
+    if noted_held:
+        out += [
+            f"{len(noted_held)} of these the collector does not flag: {NOTED_HOLD_CAUSE}. "
+            f"For each of these, {NOTED_HOLD_END}. A `resolved_because` entry for one "
+            "is refused; report it again from the previous finding.",
+            "",
+        ]
     for entry in held[:MAX_DELTA_ROWS]:
         namespace = str(entry.get("namespace", ""))
         place = f"`{_cell(str(entry.get('cluster', '')))}`"
@@ -14231,6 +14332,8 @@ def render_held_comment(
             line += f" _(and {others} more)_"
         if str(entry.get("id", "")) in collector_held:
             line += " — _still flagged by the collector_"
+        if str(entry.get("id", "")) in noted_held:
+            line += " — _not visible to the collector_"
         if str(entry.get("id", "")) in carried_held:
             line += " — _held from a previous manifest run_"
         out.append(line)
@@ -22200,6 +22303,15 @@ def handle_remediate(args: argparse.Namespace) -> None:
 
     by_id = {str(f.get("id", "")): f for f in findings}
     still_flagged = still_flagged_ids(manifest, data) if manifest is not None else set()
+    noted = noted_ids(manifest)
+    collector_noted = [fid for fid in args.finding if fid not in by_id and fid in still_flagged and fid in noted]
+    if collector_noted:
+        raise ValidationError(
+            f"--finding: {', '.join(collector_noted)} not in {args.findings_file}: "
+            f"{NOTED_HOLD_CAUSE}, so finish does not resolve it, and {NOTED_HOLD_END}. "
+            "There is no finding here to open a pull request from: report it in the "
+            "document from the previous finding and run finish, then ask again"
+        )
     collector_held = [fid for fid in args.finding if fid not in by_id and fid in still_flagged]
     if collector_held:
         # This command reads no ledger body, so it cannot say whether the
@@ -22761,6 +22873,7 @@ def render_no_forge_summary(
     prs: dict | None = None,
     unaccounted: Iterable[str] = (),
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    noted: Iterable[str] = (),
 ) -> str:
     """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
@@ -22784,8 +22897,16 @@ def render_no_forge_summary(
     opened, found waiting and closed, and the refusal of their listing
     (`REMEDIATION_REFUSED_KEY`), and `unaccounted`, the previous findings that
     keep its ledger open. `noun` is the forge's word for them.
+
+    `noted` is `noted_ids`: a held id in it gets its own line, because the
+    collector does not flag it. The targets' notes (`scope_notes`) come
+    before the coverage gaps, because the worker sends this text verbatim
+    and it is the only place they reach the operator.
     """
     findings = list(data.get("findings") or [])
+    noted = set(noted)
+    noted_held = [fid for fid in held if fid in noted]
+    held = [fid for fid in held if fid not in noted]
     lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
     ordered = sort_findings(findings)
     shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
@@ -22809,6 +22930,14 @@ def render_no_forge_summary(
             "Still flagged by the collector but not in this run's document: "
             + shown_held
             + (SUMMARY_HELD_MORE.format(count=more_held) if more_held > 0 else "")
+        )
+    if noted_held:
+        shown_noted = ", ".join(noted_held[:NO_FORGE_SUMMARY_FINDINGS])
+        more_noted = len(noted_held) - NO_FORGE_SUMMARY_FINDINGS
+        lines.append(
+            f"Kept, because {NOTED_HOLD_CAUSE}; {NOTED_HOLD_END}: "
+            + shown_noted
+            + (SUMMARY_HELD_MORE.format(count=more_noted) if more_noted > 0 else "")
         )
     if unread:
         shown = ", ".join(unread[:NO_FORGE_SUMMARY_FINDINGS])
@@ -22844,6 +22973,9 @@ def render_no_forge_summary(
             "Not accounted for, so the ledger keeps them and no fix was closed: "
             + ", ".join(unaccounted)
         )
+    notes = scope_notes(data)
+    if notes:
+        lines.append("Read but not visible, which is not a coverage gap: " + "; ".join(notes))
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
     lines.append(note)
@@ -23104,6 +23236,7 @@ def _finish_without_forge(
         since_scheduled=since_scheduled_line(payload, delta_known),
         unread=unread,
         stored=stored,
+        noted=noted_ids(manifest),
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -23427,11 +23560,7 @@ def _finish_store_ledger(
     # Over a lost memory a clean run cannot tell what the stored ledger
     # carried, so it closes no fix, as the forge path's lost-memory gap says.
     if not delta_known and not findings:
-        gap = (
-            STORE_LOST_MEMORY_GAP
-            if (still_flagged - held_exclude)
-            else STORE_LOST_MEMORY_UNGUARDED_GAP
-        )
+        gap = lost_memory_gap(still_flagged - held_exclude, noted_ids(manifest), store=True)
         gaps = [*gaps, gap]
         log(f"COVERAGE GAP: {gap}")
     # A scheduled run compares with the last scheduled run's gaps, because the
@@ -23813,6 +23942,7 @@ def _finish_store_ledger(
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,
+        noted=noted_ids(manifest),
     )
     append_chat_report(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -24874,12 +25004,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # its `silent_ok` is false on a lost memory (see the payload). For the same
     # reason the gap joins `gaps` only: `collector_gaps` feeds the findings
     # branch's delta comment, which this branch never posts.
-    if memory_lost and not findings and (still_flagged - held_exclude):
-        gaps.append(LOST_MEMORY_GAP)
-        log(f"COVERAGE GAP: {LOST_MEMORY_GAP}")
-    elif memory_lost and not findings:
-        gaps.append(LOST_MEMORY_UNGUARDED_GAP)
-        log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
+    if memory_lost and not findings:
+        lost_gap = lost_memory_gap(still_flagged - held_exclude, noted_ids(manifest))
+        gaps.append(lost_gap)
+        log(f"COVERAGE GAP: {lost_gap}")
     # Whether the coverage gaps changed since the stored run. Both silence
     # verdicts below use it instead of the gaps themselves: a gap that did
     # not change is not news on its fourteenth run (`coverage_changed`).
@@ -25050,6 +25178,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         collector_held = held_entries if existing_issue else []
         collector_held_ids = [entry["id"] for entry in collector_held]
         already_held = {entry["id"] for entry in unaccounted}
+        # The held comment marks a noted object as one: keep the mark on an
+        # entry the document's own check also left unaccounted.
+        noted_held = {e["id"] for e in collector_held if e.get(NOTED_HELD_KEY)}
+        unaccounted = [
+            {**entry, NOTED_HELD_KEY: True} if entry["id"] in noted_held else entry
+            for entry in unaccounted
+        ]
         unaccounted = sorted(
             unaccounted + [e for e in collector_held if e["id"] not in already_held],
             key=lambda entry: entry["id"],
@@ -25163,7 +25298,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                                 "author": request.get("author", "someone"),
                                 "reasons": [deferral_reason(t) for t in held]
                                 + [
-                                    collector_hold_reason(t, noun)
+                                    noted_hold_reason(t, noun)
+                                    if t in noted_ids(manifest)
+                                    else collector_hold_reason(t, noun)
                                     if t in held_ids
                                     else collector_candidate_reason(t, noun)
                                     for t in flagged
@@ -25633,6 +25770,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         collector_flagged=candidate_only,
         noun=noun,
         unread_held=unchecked_ids,
+        collector_noted=noted_ids(manifest),
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:

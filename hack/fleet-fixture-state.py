@@ -188,8 +188,6 @@ OP_NOT_AHEAD = "not_ahead_of_channel"
 # out of every cohort (agents/platform/governance/fleet_consistency_drift_sop.md
 # §1), so a replaced seeded cluster silences the drift finding for a day.
 OP_AGE_HOURS_GE = "age_hours_ge"
-# Ops a `--wait` cannot see converge: only the clock clears them, in hours.
-OPS_ONLY_TIME_CLEARS = frozenset({OP_AGE_HOURS_GE})
 # `node_cpu_spare_ge` reads the matched nodes whole plus the pods bound to each
 # (one all-namespaces pod read per role per pass) and wants every node to keep
 # at least `value` millicores of allocatable CPU unrequested, counting a pod
@@ -207,6 +205,10 @@ OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
 # buffer of about 1 MiB, so a line the guest prints at boot only is there
 # until later output pushes it out.
 OP_SERIAL_CONTAINS = "serial_contains"
+# Ops a `--wait` cannot see converge, so their drift does not hold the pass:
+# the clock clears an age, in hours, and only a reboot of the VM (the next
+# reconcile's reset) puts a rotated line back on a serial console.
+OPS_A_WAIT_CANNOT_CLEAR = frozenset({OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
 OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
 # Ops whose `value` must be a number; anything else is a catalog bug.
 OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
@@ -1009,7 +1011,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
             continue
         if problem:
             drift.append(problem + (f" (why: {entry['why']})" if entry["why"] else ""))
-            settling = settling or entry["op"] not in OPS_ONLY_TIME_CLEARS
+            settling = settling or entry["op"] not in OPS_A_WAIT_CANNOT_CLEAR
     return drift, unreadable, settling
 
 

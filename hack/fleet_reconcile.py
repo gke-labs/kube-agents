@@ -33,7 +33,7 @@ summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 (scripts/eval_dashboard/periodics.py); each applied project also gets
 `applied.json` in its state bucket, the record of which commit it is at.
 
-After a project's fleet is at the tree, the run resets the planted
+After each project whose state it read, the run resets the planted
 startup-fail VM (bench/tf/fleet/main.tf `google_compute_instance.startup_fail`)
 so that the guest prints the startup-script failure line again: it prints it
 at boot only, and the serial buffer the GCE audit reads rotates it out within
@@ -876,7 +876,8 @@ class Run:
         self.build = build
         self.job = job
         self.publish = publish
-        # Reset the startup-fail VM after each at-tree project (reset_startup_fail).
+        # Reset the startup-fail VM after each project whose state it read
+        # (reset_startup_fail).
         self.refresh_fixtures = refresh_fixtures
         self.extras = {}
         self.lock = threading.Lock()
@@ -1411,7 +1412,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
     parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under %s: %s, %s) differs from the checkout's (the jobs pass origin/main)" % (FLEET_SUBDIR, ", ".join("*" + s for s in FLEET_INPUT_SUFFIXES), ", ".join(FLEET_INPUT_NAMES)))
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
-    parser.add_argument("--no-fixture-refresh", action="store_true", help="do not reset the startup-fail VM after a project's fleet is at the tree")
+    parser.add_argument("--no-fixture-refresh", action="store_true", help="do not reset the startup-fail VM after each project whose state it read")
     parser.add_argument(
         "--report",
         default=os.path.join(os.environ[ARTIFACTS_ENV], REPORT_FILE) if os.environ.get(ARTIFACTS_ENV) else None,

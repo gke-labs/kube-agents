@@ -18,9 +18,9 @@
 #
 # The failure line is on the serial console only after a boot. The guest
 # prints it once per boot, and the VM's serial buffer (about 1 MiB) rotates
-# it out about three weeks later; on 2026-11-08 and 2026-11-09 the line was
-# gone and the case went 0 of 3. hack/fleet_reconcile.py resets the VM
-# after each reconcile, and the fixture-state scan asserts the line on the
+# it out about three weeks later. Without the line the case has no finding to
+# grade. hack/fleet_reconcile.py resets the VM after each project whose
+# state it reads, and the fixture-state scan asserts the line on the
 # console (`serial_contains`), so a rotated buffer is fixture drift. The case
 # is recorded as infrastructure, not run, once the hourly scan has held the
 # role drifted on its last two scans and the lease-time scan sees it drifted
