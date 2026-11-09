@@ -404,8 +404,10 @@ Layout:
   invites squaring the render against prose. Two consequences of the split the render does
   not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
   (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
-  static render cannot express - so it reaches every profile's supervisor subject too, and
-  a profile task's `…supervisor` must not be modelled as unreachable. Second, the class
+  static render cannot express. The render subtracts each bound or draining profile by name
+  (`a2a.tasks.<profile>.*.supervisor` on the gateway's publish deny), so the gateway cannot
+  publish directly to a profile's supervisor subject. The deny covers direct publishes
+  only, so a profile task's `…supervisor` must still not be modelled as unreachable. Second, the class
   that is not yet single-writer is `…events`, and the holder is the static `worker`
   credential the Hermes bridge authenticates with: its `a2a.tasks.*.*.events` wildcards the
   addressee token, so it reaches session and profile subjects alike until that credential
