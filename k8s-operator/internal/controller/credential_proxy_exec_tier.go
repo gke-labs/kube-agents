@@ -85,6 +85,11 @@ const (
 	// credential words, which gosec's G101 reads as a hardcoded credential.
 	brokerMinterVolume       = "credential-proxy-ksa-token"
 	execTierDroppedMinterEnv = "KSA_TOKEN_FILE"
+	// The callers' address for the tier (§12): the sandbox and the session
+	// pods read CREDENTIAL_PROXY_EXEC_URL; the A2A gateway reads its own
+	// name and passes the URL to the session pods it spawns.
+	credentialProxyExecURLEnv    = "CREDENTIAL_PROXY_EXEC_URL"     // #nosec G101 -- Environment variable name, not a credential
+	a2aCredentialProxyExecURLEnv = "A2A_CREDENTIAL_PROXY_EXEC_URL" // #nosec G101 -- Environment variable name, not a credential
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
@@ -135,6 +140,26 @@ func ValidateCredentialProxyExec(agent *agentv1alpha1.PlatformAgent, path *field
 	}
 	return field.ErrorList{field.Invalid(path, agent.Name, fmt.Sprintf(credentialProxyExecTierNameRefusalFmt,
 		agent.Name, len(agent.Name), credentialProxyExecTierMaxAgentName, credentialProxyExecTierSuffix))}
+}
+
+// credentialProxyExecTierEnabled reports whether the tier renders, and with it
+// whether callers get its URL and an egress peer to it: a positive count, and
+// an agent name the tier's objects fit.
+func credentialProxyExecTierEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return credentialProxyExecTierReplicas(agent) > 0 && len(ValidateCredentialProxyExec(agent, nil)) == 0
+}
+
+// credentialProxyExecTierURL is the exec Service's address, for the callers'
+// CREDENTIAL_PROXY_EXEC_URL.
+func credentialProxyExecTierURL(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d",
+		credentialProxyExecTierName(agent), agent.Namespace, credentialProxyPort)
+}
+
+// credentialProxyExecTierPodPeer selects the tier's pods in the agent's
+// namespace, for a caller's egress rule in that namespace.
+func credentialProxyExecTierPodPeer(agent *agentv1alpha1.PlatformAgent) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxyExecTierSelector(agent)}}
 }
 
 // credentialProxyExecTierResources is the broker container's resources with
