@@ -1241,7 +1241,8 @@ def test_settle_records_none_when_the_read_did_not_run(no_cluster_exec: list[str
     harness.KubeAgentsHarness._settle(result, [], [FRONT])
     assert result.metadata["worker_trajectory"] is None
     assert result.tokens["workers"] is None
-    assert result.trajectory == []
+    # devops-bench drops metadata, so the gap is on the trajectory too.
+    assert result.trajectory == [worker_trajectory.gap_entry([worker_trajectory.UNREAD_CAPTURE_GAP])]
     assert any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
 
 

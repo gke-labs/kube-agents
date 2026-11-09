@@ -2618,7 +2618,8 @@ def test_a_marker_that_reports_a_loss_does_not_retire_the_rule(measured_spec, in
 def test_a_worker_check_stays_set_aside_when_the_door_shows_the_trace(write_task, inject_run):
     """The trace carries the delegating turn's calls and nothing of the
     workers: no results, so no card ids to read logs by, and no tagged
-    entries. A ``worker_commands`` entry that errored on a record carrying
+    entries. On a record with no tagged worker entry (#5236), a
+    ``worker_commands`` entry that errored on a record carrying
     the marker is still set aside -- otherwise the marker would turn an
     absent capture into a rung-2 block -- while a router-scope
     ``tool_called`` beside it grades. The same holds for ``worker_agents``

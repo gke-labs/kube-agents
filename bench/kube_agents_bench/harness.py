@@ -4347,9 +4347,14 @@ class KubeAgentsHarness(AgentHarness):
             floor=self._pod_floor,
         )
         if not shown and len(result.trajectory) > before:
-            withheld = result.trajectory[before:]
-            del result.trajectory[before:]
-            result.trajectory.append(worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP]))
+            # _settle's own gap entry stays, with its reasons; only what it
+            # added besides is withheld.
+            added = result.trajectory[before:]
+            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            withheld = [e for e in added if e not in kept]
+            result.trajectory[before:] = kept
+            if withheld:
+                result.trajectory.append(worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP]))
             result.metadata["worker_entries_withheld"] = len(withheld)
         return True
 
@@ -4732,6 +4737,12 @@ class KubeAgentsHarness(AgentHarness):
             # that did delegate and whose pod could not be read.
             if awaited:
                 result.tokens["workers"] = None
+                # And the gap goes on the trajectory, where the scorer reads
+                # it: a record that merges this turn with one whose workers
+                # were read would otherwise read as a complete capture.
+                result.trajectory.append(
+                    worker_trajectory.gap_entry([worker_trajectory.UNREAD_CAPTURE_GAP])
+                )
         else:
             result.trajectory.extend(captured.entries)
             # devops-bench drops ``metadata``, so a gap goes on the trajectory

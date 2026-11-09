@@ -195,6 +195,9 @@ GAP_ENTRY = "harness_worker_capture_gaps"
 # entries off the trajectory (``harness.KubeAgentsHarness`` withholds them on
 # a turn whose door showed no trace).
 WITHHELD_ENTRIES_GAP = "the workers' entries were withheld: the door showed no trace"
+# What ``_settle`` records under it when the turn delegated and the read
+# itself did not complete (``capture`` returned ``None``).
+UNREAD_CAPTURE_GAP = "the worker read did not complete"
 # What the in-pod script puts in place of every result and argument when the
 # redactor will not load (a store without the shared rules module reads no
 # session at all). Named here too so a verifier can tell an unreadable capture

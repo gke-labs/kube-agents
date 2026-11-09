@@ -3622,6 +3622,40 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
     assert result.tokens["workers"] is not None
 
 
+@pytest.mark.parametrize("entries", [1, 0], ids=["entries-and-gap", "gap-only"])
+def test_a_withheld_turn_keeps_the_captures_own_gap_entry(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: int,
+) -> None:
+    """On a door that showed no trace, only the workers' entries are withheld:
+    the capture's own gap entry stays with its reasons, the count is the
+    entries alone, and the withheld gap entry is added only when an entry
+    was withheld."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    unread = "session store for platform: locked"
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(
+            entries=[dict(WORKER_ENTRY)] * entries,
+            summary={"cards": {CARD_A: {"sessions": ["s1"]}}, "unread": [unread]},
+        )
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    gaps = [e for e in result.trajectory if e.get("name") == worker_trajectory.GAP_ENTRY]
+    withheld_gap = worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+    assert worker_trajectory.gap_entry([unread]) in gaps
+    assert (withheld_gap in gaps) == bool(entries)
+    assert result.metadata["worker_entries_withheld"] == entries
+    assert scoring._inject_blind(result.trajectory)
+
+
 def _failing_first(shell: Any, failures: int) -> Any:
     """``shell`` with its first ``failures`` session-cards reads failing."""
     seen = []

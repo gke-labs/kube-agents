@@ -1998,7 +1998,8 @@ def test_delegated_work_is_awaited_before_the_result_is_returned(
     # done. A fourth would mean the loop failed to notice the terminal state.
     assert len(stub_agent.requests) == 3
     # The polls are the harness's own, so they are not charged to the agent.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
 
 
@@ -2183,7 +2184,8 @@ def test_a_running_card_is_watched_on_the_board_without_a_model_turn(
     assert len(stub_agent.requests) == 2
     # The four polls, then settle's read of the cards' end state (#4998).
     assert len(reads) == 5
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
 
 
 def test_a_ceiling_hit_on_a_readable_board_costs_no_status_turn(
@@ -3245,7 +3247,8 @@ def test_status_turns_the_endpoint_answered_still_grade_the_partial_record(
     assert _TASK_ID in result.errors[0]
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     # The delegation turn survived.
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.output == f"I've started this as task {_TASK_ID}."
     # An endpoint that answers is not a tunnel problem: no reset.
     assert recorded_pf_resets == []
@@ -3381,7 +3384,8 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert not result.has_errors()
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.metadata["tools"] == {"kanban_create": 1}
     # Usage is reported per turn even when the output items are replayed, so
     # each turn's envelope is its own spend and the buckets add up: 110 for the
@@ -3424,7 +3428,8 @@ def test_an_additive_turn_is_still_concatenated(
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert [entry["name"] for entry in result.trajectory] == ["kanban_create"]
+    # The pod read did not complete here, so _settle records the gap.
+    assert [entry["name"] for entry in result.trajectory] == ["kanban_create", harness.worker_trajectory.GAP_ENTRY]
     assert result.tokens["total"] == 330
 
 
@@ -5739,6 +5744,23 @@ def test_settle_records_a_capture_gap_on_the_trajectory(
         assert res.trajectory[-2]["agent"] == "cluster-a"
     assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
+def test_settle_records_a_read_that_did_not_complete(awaited: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A turn that delegated and whose read returned nothing leaves the gap
+    entry, so a record that merges it with a turn whose workers were read
+    does not read as complete. A turn that filed no card has nothing to read
+    and leaves none."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: None)
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], awaited)
+
+    gap = harness.worker_trajectory.gap_entry([harness.worker_trajectory.UNREAD_CAPTURE_GAP])
+    assert (gap in res.trajectory) == bool(awaited)
 
 
 def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(

@@ -785,8 +785,9 @@ no worker's entries and no results. The delegation wait now reads the cards and 
 when the turn ran under the bridge's `api` executor and puts the workers' calls on the record, so the
 scorer grades `worker_commands`, `worker_agents`, `worker_budget` and a `tool_called` in the
 `workers` scope on an inject record that carries those entries with no capture gap. It still
-treats them as blind on any other inject record, and treats `report_times_in_window` and a
-router-scope `tool_called` with a `result` or `arguments` pattern as blind on every inject record.
+treats them as blind on any other inject record, and treats `report_times_in_window`, a
+router-scope `tool_called` with a `result` pattern, and one with an `arguments` pattern in an entry
+that also reads the workers as blind on every inject record.
 A door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
