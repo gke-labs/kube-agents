@@ -98,7 +98,7 @@ Only once that policy is in place does the operator admit the namespace on the b
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It's off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image.
+The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the one writer of a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. So binding or removing a profile, or one finishing its drain, changes that config and restarts the bus pod. Turns in flight ride out the restart. It's off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image.
 
 With the dispatcher on, each admitted profile also gets a warm pool for each of its interactive tiers: a Deployment `agentprofile-<profile>-<tier>` in the profile namespace, running `warmReplicas` worker pods plus one surge pod during a rollout. The profile quota budgets those pods. The pods hold the profile's bus and broker tokens, and the operator copies the bus CA bundle beside them. A worker empties its writable directories after every task, so nothing one task leaves reaches the next. Turning the dispatcher off, or removing or refusing the profile, removes its pools.
 
