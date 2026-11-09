@@ -516,8 +516,9 @@ it would get answers from the old setup. To stop that, the key also includes Lit
 fingerprint (the chart already keeps one, in the `checksum/config` annotation), the LiteLLM image
 version, and the normalizer's version hash. The config includes the provider route, so moving a
 model between the Gemini Developer API and Vertex AI counts as a model change. The nightly and
-presubmit eval jobs each read their provider from a Secret, so if the two ever diverge, their replay
-keys stop matching: that is safe, but replay then serves nothing across the lanes.
+presubmit eval jobs each set their provider in their own Prow job config, kept equal by hand, so if
+the two ever diverge, their replay keys stop matching: that is safe, but replay then serves nothing
+across the lanes.
 
 **Backup-model answers are never saved.** LiteLLM can be set up with a backup it uses when the main
 model fails. The backup is the same model with less thinking, so the model name in the reply looks
