@@ -4176,6 +4176,30 @@ print("\t".join(found.get(t, "") for t in want))
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
+# The install a minter key's owner labels name, as <cluster>/<namespace>
+# (lifecycle.sh's MINTER_OWNER_*_LABEL; set by the composition's owner_labels),
+# or nothing for a key with no owner labels. Returns 1 when the key can't be
+# described (absent, or not readable by this identity: lifecycle.sh's own check
+# decides then), 2 when it exists and its labels can't be read.
+minter_key_owner() {
+  local ring=$1 key=$2 location=$3 project=$4 labels pair cluster="" namespace=""
+  (trap - ERR; gcloud kms keys describe "$key" --keyring "$ring" --location "$location" \
+    --project "$project" --format='value(name)' >/dev/null 2>&1) || return 1
+  labels="$(trap - ERR; gcloud kms keys describe "$key" --keyring "$ring" --location "$location" \
+    --project "$project" --format='value(labels)' 2>/dev/null)" || return 2
+  local IFS=';'
+  for pair in $labels; do
+    case "$pair" in
+      kube-agents-cluster=*)   cluster="${pair#*=}" ;;
+      kube-agents-namespace=*) namespace="${pair#*=}" ;;
+    esac
+  done
+  unset IFS
+  if [ -n "${cluster}${namespace}" ]; then
+    printf '%s/%s\n' "${cluster:-?}" "${namespace:-?}"
+  fi
+}
+
 # This install's default minter names, tab-separated: key ring, key, GSA. An
 # install with a minter in its state gets the names it holds (a field the
 # state lacks falls back to the project-wide default it was created under). An

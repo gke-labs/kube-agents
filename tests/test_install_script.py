@@ -154,6 +154,55 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         proc = self._apply_minter_names(env={"KMS_KEYRING": "my-ring"})
         self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
 
+    # confirm_minter_key_owner (#3504), with the state read and the owner read stubbed.
+    def _confirm_owner(self, owner, owner_rc=0, state_names="", env=None, answer=None):
+        script = (
+            f"tf_state_minter_names() {{ printf '{state_names}'; }}; "
+            f"minter_key_owner() {{ printf '%s' '{owner}'; return {owner_rc}; }}; "
+            + ("has_controlling_tty() { return 0; }; PARAM_NON_INTERACTIVE=false; "
+               f"prompt_read() {{ printf -v \"$2\" '%s' '{answer}'; }}; " if answer is not None else
+               "PARAM_NON_INTERACTIVE=true; ")
+            # In an `if`, as the call site's `|| exit 1` is: install.sh's ERR trap
+            # would otherwise abort the shell on the refusal's return 1.
+            + 'if confirm_minter_key_owner ring key us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            + 'echo "rc=$rc shared=${MINTER_SHARED_KEY:-}"'
+        )
+        return self._run_install_func(script, env=env)
+
+    def test_this_installs_own_key_needs_no_question(self):
+        proc = self._confirm_owner("cluster-b/kubeagents-system")
+        self.assertIn("rc=0 shared=", proc.stdout, proc.stderr)
+
+    def test_another_installs_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stdout + proc.stderr)
+
+    def test_an_unlabelled_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("carries no owner labels", proc.stdout + proc.stderr)
+
+    def test_a_yes_at_the_terminal_shares_exactly_that_key(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", answer="y")
+        self.assertIn("rc=0 shared=ring/key", proc.stdout, proc.stderr)
+
+    def test_a_no_at_the_terminal_stops_the_install(self):
+        proc = self._confirm_owner("", answer="n")
+        self.assertIn("rc=1 shared=", proc.stdout, proc.stderr)
+
+    def test_a_key_already_in_this_state_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring\\tkey\\tgsa")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_a_key_already_named_as_shared_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"MINTER_SHARED_KEY": "ring/key"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_absent_or_undescribable_key_is_left_to_the_apply(self):
+        proc = self._confirm_owner("", owner_rc=1)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):

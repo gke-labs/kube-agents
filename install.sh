@@ -3364,6 +3364,48 @@ apply_minter_name_defaults() {
   fi
 }
 
+# Says whose minter key the interview's key ring and key name, when it exists,
+# isn't in this install's state and isn't this install's own (#3504), and asks
+# before adopting it: a yes records MINTER_SHARED_KEY for that one key, which
+# lifecycle.sh's adoption step honours. Without a terminal to ask at, refuses
+# here, before anything is provisioned, rather than at the apply. A key that is
+# absent or can't be described is left to lifecycle.sh's own check.
+confirm_minter_key_owner() {
+  local ring=$1 key=$2 location=$3 project=$4 cluster=$5
+  local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}" names state_ring="" state_key="" owner rc=0 answer=""
+  [ "${MINTER_SHARED_KEY:-}" = "${ring}/${key}" ] && return 0
+  names="$(tf_state_minter_names "$project" "$cluster" 2>/dev/null)" || names=""
+  IFS=$'\t' read -r state_ring state_key _ <<<"$names"
+  [ "${state_ring}/${state_key}" = "${ring}/${key}" ] && return 0
+  owner="$(minter_key_owner "$ring" "$key" "$location" "$project")" || rc=$?
+  case "$rc" in
+    1) return 0 ;;
+    2) print_warning "Could not read the owner labels of Cloud KMS key ${ring}/${key}; the apply checks again before adopting it."
+       return 0 ;;
+  esac
+  [ "$owner" = "${cluster}/${namespace}" ] && return 0
+  if [ -n "$owner" ]; then
+    print_warning "Cloud KMS key ${ring}/${key} belongs to install ${owner} (its owner labels), not this one (${cluster}/${namespace})."
+  else
+    print_warning "Cloud KMS key ${ring}/${key} exists and carries no owner labels, so it may be another install's."
+  fi
+  print_info "Adopting it would put that install's App key in this install's state, where a destroy here schedules its versions for destruction."
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    print_error "Set KMS_KEYRING and KMS_KEY to names of this install's own, or set MINTER_SHARED_KEY=${ring}/${key} to share this key on purpose."
+    return 1
+  fi
+  prompt_read "Share this key on purpose? (y/N)" answer "n"
+  case "$answer" in
+    [yY]*)
+      export MINTER_SHARED_KEY="${ring}/${key}"
+      print_info "Sharing ${ring}/${key} on purpose; recorded as MINTER_SHARED_KEY."
+      return 0 ;;
+    *)
+      print_error "Choose other key ring and key names (KMS_KEYRING, KMS_KEY, or --kms-keyring and --kms-key) and re-run."
+      return 1 ;;
+  esac
+}
+
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
   resolve_platform_agent_mode_fallback
@@ -7851,6 +7893,7 @@ main() {
 
         local kms_loc existing_kms_ver=""
         kms_loc="$(derive_kms_location "$region")"
+        confirm_minter_key_owner "$kms_keyring" "$kms_key" "$kms_loc" "$project_id" "$cluster_name" || exit 1
         existing_kms_ver="$(kms_key_enabled_version "$kms_key" "$kms_keyring" "$kms_loc" "$project_id" 2>/dev/null || echo "")"
         if [ -n "$existing_kms_ver" ]; then
           print_success "Cloud KMS key ${kms_keyring}/${kms_key} already has an ENABLED version (${existing_kms_ver}); skipping PEM prompt."

@@ -3076,6 +3076,27 @@ class InstallerCommonTest(unittest.TestCase):
                          ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
         self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
 
+    def _key_owner(self, describe_rc=0, labels="", labels_rc=0):
+        stub = (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then '
+            f'echo "{labels}"; exit {labels_rc}; fi; '
+            f'if [[ "$*" == *"kms keys describe"* ]]; then exit {describe_rc}; fi'
+        )
+        return self._run('owner="$(minter_key_owner ring key us-central1 p)"; echo "owner=$owner rc=$?"',
+                         gcloud_extra_cases=f'  *"kms keys describe"*) {stub} ;;\n')
+
+    def test_minter_key_owner_reads_the_owner_labels(self):
+        proc = self._key_owner(labels="kube-agents-cluster=cluster-a;kube-agents-namespace=team-one")
+        self.assertIn("owner=cluster-a/team-one rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_is_empty_for_an_unlabelled_key(self):
+        proc = self._key_owner(labels="")
+        self.assertIn("owner= rc=0", proc.stdout, proc.stderr)
+
+    def test_minter_key_owner_returns_1_for_a_key_it_cannot_describe(self):
+        proc = self._key_owner(describe_rc=1)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
     def test_minter_deferred_without_an_enabled_key_version(self):
         # A minter whose KMS key holds no ENABLED version never passes
         # readiness, and the apply waits on it — the generator defers.
