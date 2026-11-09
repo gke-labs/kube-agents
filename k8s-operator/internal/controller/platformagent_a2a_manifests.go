@@ -4049,9 +4049,10 @@ const defaultA2AMaxSessions = 10
 //     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
 //     and the web console, plus the surge pods each one's rollout can add,
 //     since a chart bump rolls several in one upgrade), which only the chart
-//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
-//     The CR is in the namespace those pods run in, and the chart renders it
-//     whether or not it renders the operator;
+//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation,
+//     and renders them in the a2aChartPodsConfigMapName ConfigMap, which the
+//     operator reads in its own namespace for a CR without the annotation
+//     (a2aQuotaAgent);
 //   - a2aQuotaTransientMargin for what this operator starts beside the
 //     standing pods, and the gateway's overshoot.
 const (
@@ -4059,13 +4060,21 @@ const (
 	// plus their surges (charts/kube-agents/templates/platform-agent-cr.yaml,
 	// from kube-agents.chartQuotaPods).
 	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
-	// a2aDefaultChartPods stands in when that annotation is absent (a
-	// PlatformAgent the chart did not render) or unreadable: the chart's
-	// default release, the operator and two LiteLLM replicas, and a surge pod
-	// for each of the two Deployments. It errs high for a CR in a namespace
-	// with no chart pods, which only loosens the bound, and low for a
-	// hand-written CR beside a chart release that runs more than the default
-	// (platformAgent.enabled=false), which must carry the annotation itself
+	// a2aChartPodsConfigMapName is the ConfigMap the chart renders in its
+	// release namespace with the same count, under a2aChartPodsConfigMapKey
+	// (charts/kube-agents/templates/a2a-quota-chart-pods.yaml). The operator
+	// reads it when the CR carries no annotation: a PlatformAgent written by
+	// hand in a release with platformAgent.enabled=false (#4883).
+	a2aChartPodsConfigMapName = "a2a-quota-chart-pods"
+	a2aChartPodsConfigMapKey  = "pods"
+	// a2aDefaultChartPods stands in when neither that annotation nor the
+	// chart's ConfigMap gives a usable count (a PlatformAgent in a namespace
+	// with no chart release, or an unreadable value): the chart's default
+	// release, the operator and two LiteLLM replicas, and a surge pod for each
+	// of the two Deployments. It errs high for a CR in a namespace with no
+	// chart pods, which only loosens the bound. A hand-written CR beside a
+	// chart release that runs the operator (platformAgent.enabled=false) gets
+	// the release's count from the ConfigMap in the operator's namespace
 	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
@@ -4074,10 +4083,11 @@ const (
 	// chart's own count is a handful of pods, so a figure past this is not one
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
-	// a2aChartPodsDiscardedReason is the Warning event a CR carrying an
-	// annotation the operator will not use gets, once per spec generation and
-	// annotation value (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
-	// can sit below what the namespace runs.
+	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
+	// operator does not use a chart-pods count it finds, from the annotation or
+	// the ConfigMap, once per spec generation and reason (a2aQuotaAgent): the
+	// quota then counts a2aDefaultChartPods, which can sit below what the
+	// namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
 	// a2aQuotaTransientMargin is room for pods this operator starts beside the
 	// standing ones, at their worst moment, a helm upgrade: two rollout surge
@@ -4105,33 +4115,97 @@ func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
 }
 
 // a2aChartPodsWarning is what a2aChartPodsWarned last reported for a CR: the
-// spec generation and the discarded annotation value.
+// spec generation and the Warning itself.
 type a2aChartPodsWarning struct {
 	generation int64
-	value      string
+	value      string // the Warning's message: its source and the value, truncated
 }
 
 // a2aChartPodsCount reads the CR's chart-pods annotation once (#4893): the
 // chart's pods in agent's namespace, surges included, that the session quota
 // counts, and why the annotation was discarded, "" when it was used or is
 // absent. An absent one is a CR written without the chart, which the default
-// is for. A present one the operator discards is a figure the chart did not
-// write (the chart refuses to render one past the cap) or one it cannot read,
-// and the default may then sit below what the namespace runs, so the reason
-// is reported rather than silent.
+// is for (or one the chart's ConfigMap stands in for: a2aQuotaAgent). A
+// present one the operator discards is a figure the chart did not write (the
+// chart refuses to render one past the cap) or one it cannot read, and the
+// default may then sit below what the namespace runs, so the reason is
+// reported rather than silent.
 func a2aChartPodsCount(agent *agentv1alpha1.PlatformAgent) (int64, string) {
 	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
+	return a2aParseChartPods(raw, present, "annotation "+a2aChartPodsAnnotation)
+}
+
+// a2aParseChartPods is the one parse of a chart-pods count, wherever it was
+// read: the count, and why it was discarded, naming source.
+func a2aParseChartPods(raw string, present bool, source string) (int64, string) {
 	if !present {
 		return a2aDefaultChartPods, ""
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	switch {
 	case err != nil:
-		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is not a number; the session quota counts the default of %d chart pods instead", source, raw, a2aDefaultChartPods)
 	case v < 0 || v > a2aMaxChartPods:
-		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", source, raw, a2aMaxChartPods, a2aDefaultChartPods)
 	}
 	return v, ""
+}
+
+// a2aQuotaAgent is the agent the session quota is sized for: agent itself
+// when it carries the chart-pods annotation, or when no chart ConfigMap can
+// be used; otherwise a copy carrying the ConfigMap's count as the annotation,
+// so every sizing function reads one figure (#4883). The second result is
+// why a count was not used, "" when it was, naming its source.
+//
+// The operator reads the chart's ConfigMap from its own namespace only
+// (r.OperatorNamespace, from POD_NAMESPACE through the downward API): the
+// release that runs the operator and its chart pods there, with a
+// PlatformAgent written by hand beside them. A chart ConfigMap in any other
+// namespace is not read, and the quota counts the default. It is read
+// uncached (a2aReader), like the rest of this path's bookkeeping, and goes
+// through the annotation's parse, cap and Warning.
+func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
+	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
+		_, why := a2aChartPodsCount(agent)
+		return agent, why, nil
+	}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}
+	cm := &corev1.ConfigMap{}
+	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
+		// Outside the operator's namespace the count is not read. The lookup
+		// only decides whether to say so, so no answer from it can fail the
+		// reconcile.
+		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
+			return agent, "", nil
+		}
+		if r.OperatorNamespace == "" {
+			return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator's own namespace is unknown (%s is unset or not a namespace name), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, OperatorNamespaceEnv, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+		}
+		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%s), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+	}
+	err := r.a2aReader().Get(ctx, key, cm)
+	if errors.IsNotFound(err) {
+		return agent, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read the chart's pod count from ConfigMap %s: %w", a2aChartPodsConfigMapName, err)
+	}
+	source := fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation)
+	raw, present := cm.Data[a2aChartPodsConfigMapKey]
+	if !present {
+		// The chart always writes the key, so a ConfigMap of this name without
+		// it is not the chart's: say so rather than count the default silently.
+		return agent, fmt.Sprintf("%s is missing; the session quota counts the default of %d chart pods instead", source, a2aDefaultChartPods), nil
+	}
+	_, why := a2aParseChartPods(raw, present, source)
+	sized := agent.DeepCopy()
+	annotations := sized.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[a2aChartPodsAnnotation] = raw
+	sized.SetAnnotations(annotations)
+	return sized, why, nil
 }
 
 // a2aChartPods is the count a2aChartPodsCount reads.
@@ -5504,6 +5578,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// name, so the render and the spawner must agree
 		// or every session is refused at connect.
 		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+		// The install's rendered spec.scope, which a profile
+		// task's target is checked against
+		// (a2aGatewayScopeVolume). Rendered at the gateway's
+		// default, so a reader of the live Deployment sees where
+		// the file comes from.
+		{Name: a2aGatewayScopeFileEnv, Value: scopeDir + "/" + scopeFileName},
+		// The install's own project, which the target check
+		// admits whatever spec.scope lists, as the reconcile
+		// does. Empty on an install with no harness block.
+		{Name: a2aGatewayManagementProjectEnv, Value: a2aManagementProject(agent)},
 		// Rendered explicitly at the gateway's default, like
 		// A2A_GCHAT_TOKEN_PATH: the path and the projected
 		// volume below are one fact, and a reader of the live
@@ -5587,10 +5671,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
 				},
 			},
 		},
@@ -5640,6 +5724,10 @@ type a2aProvisionState struct {
 	// such a rollout, and the status writers carry it as
 	// a2aCalloutStalledConditionType so the wedged rollout is visible.
 	calloutStalled string
+	// calloutMap is what the callout pods' /status said about the identity
+	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
+	// that did not get as far as rendering one.
+	calloutMap *calloutMapState
 	// busHeld reports that a running bus was left on its current config
 	// this pass because a callout replica is not yet on the current spec
 	// (a2aBusWaitsForCallout). It shares the reconcile's requeue with
@@ -5670,11 +5758,22 @@ type a2aProvisionState struct {
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
+	// busPodRequeue is how long until a bus pod stuck on an old revision is
+	// due for replacement (replaceStuckA2ANATSPod); zero when none waits.
+	busPodRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
 	// GatewayElected condition (gatewayElectedImage).
 	gatewayElected *string
+}
+
+// wantsRequeue reports whether a pass should come back at a2aPendingRequeue
+// rather than wait for an event: the stack is still converging, the gateway
+// or the bus is held, or the callouts haven't settled on the map (a map
+// taken changes nothing the operator watches).
+func (s a2aProvisionState) wantsRequeue() bool {
+	return !s.done || s.gatewayHeld || s.gatewayWaking || s.busHeld || s.calloutMap.unsettled()
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5892,6 +5991,15 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to prune stale A2A identity map shards: %w", err)
 	}
 	state.AuthMapVersion = authMapVersion
+	// Whether the callouts took that map, or refused it and serve the one
+	// they had. An unreadable answer hides a refusal, so turning unreadable
+	// is a Warning, once per transition.
+	mapState := r.readCalloutMapState(ctx, agent, authMapVersion)
+	if prev := meta.FindStatusCondition(agent.Status.Conditions, a2aIdentityMapAppliedConditionType); mapState.reason == a2aIdentityMapStatusUnreadable &&
+		(prev == nil || prev.Reason != a2aIdentityMapStatusUnreadable) {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aIdentityMapStatusUnreadable, mapState.message)
+	}
+	state.calloutMap = &mapState
 
 	// The auth callout, before the bus's config and before anything that
 	// dials the bus. nats.conf names it as the authority for every
@@ -5938,6 +6046,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		if err := r.applyManaged(ctx, agent, sts); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+		}
+		// A pod that never became Ready on an earlier template blocks the
+		// rolling update this apply starts (replaceStuckA2ANATSPod).
+		if state.busPodRequeue, err = r.replaceStuckA2ANATSPod(ctx, agent, sts, time.Now()); err != nil {
+			return state, err
 		}
 	}
 
@@ -6021,12 +6134,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
 	// why both exist and why the quota sits above the cap).
-	quota := buildA2ASessionQuota(agent)
-	if why := a2aChartPodsDiscard(agent); why != "" {
+	quotaAgent, why, err := r.a2aQuotaAgent(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	quota := buildA2ASessionQuota(quotaAgent)
+	if why != "" {
 		key := client.ObjectKeyFromObject(agent)
-		// An annotation edit does not bump the generation, so the value is
-		// part of what was reported: a second bad value warns too.
-		seen := a2aChartPodsWarning{generation: agent.Generation, value: agent.Annotations[a2aChartPodsAnnotation]}
+		// An annotation or ConfigMap edit does not bump the generation, so what
+		// was reported is part of the key: a second bad value, or the same one
+		// from another source, warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: why}
 		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
 			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
 			r.a2aChartPodsWarned.Store(key, seen)
@@ -7614,4 +7732,52 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
+}
+
+// a2aGatewayScopeFileEnv names the gateway's scope file (A2A_SCOPE_FILE in
+// a2a/gateway/config.go).
+const a2aGatewayScopeFileEnv = "A2A_SCOPE_FILE"
+
+// a2aGatewayManagementProjectEnv names the gateway's management project
+// (A2A_MANAGEMENT_PROJECT in a2a/gateway/config.go).
+const a2aGatewayManagementProjectEnv = "A2A_MANAGEMENT_PROJECT"
+
+// a2aManagementProject is spec.harness.projectId, the project the agent
+// container gets as GKE_PROJECT_ID and the reconcile treats as always in
+// scope.
+func a2aManagementProject(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil {
+		return ""
+	}
+	return agent.Spec.Harness.ProjectID
+}
+
+// a2aGatewayScopeVolumeName projects the install's rendered spec.scope into
+// the gateway pod.
+const a2aGatewayScopeVolumeName = "a2a-gateway-scope"
+
+// a2aGatewayScopeVolume is the agent's scope.json, from the config ConfigMap
+// the platform agent mounts it from (scopeConfigKey), so the gateway checks a
+// profile task's target against the declaration the agent reads. Optional,
+// like the agent's: a ConfigMap from an operator predating the key mounts an
+// empty directory, and the gateway then refuses every profile target rather
+// than holding the pod in ContainerCreating.
+func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aGatewayScopeVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-config"},
+				Items:                []corev1.KeyToPath{{Key: scopeConfigKey, Path: scopeFileName}},
+				Optional:             ptr.To(true),
+				DefaultMode:          ptr.To(int32(0444)),
+			},
+		},
+	}
+}
+
+// a2aGatewayScopeMount is a directory mount, so a CR edit reaches the file
+// without a restart; the gateway reads it per routed task.
+func a2aGatewayScopeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
 }

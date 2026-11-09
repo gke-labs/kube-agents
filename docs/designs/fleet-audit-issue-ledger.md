@@ -461,7 +461,9 @@ practice groups are almost always singletons.
 
 ## 6. Script surface
 
-`agents/platform/skills/fleet-audit/scripts/audit_report.py` — three subcommands.
+`agents/platform/skills/fleet-audit/scripts/audit_report.py` — the subcommands below, plus
+`draft`, the content-mode reads and `precheck`; `precheck` and the `precheck` key it adds to the
+`finish` line are in [`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7.
 
 ### `start --audit <id>`
 
@@ -522,7 +524,15 @@ completely (every note under the searched paths arrived and was read) under `sea
 record, and `finish` unions that list into the document and moves each covered finding to
 `declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
 severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
-stays a finding.
+stays a finding. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
+last day it stands: `start` files the date and `finish` holds it to the day the run started, from
+`start`'s record, whatever day the join or a later `remediate` happens to run on, so a lapsed item
+moves nothing, declares no collector candidate and shields no sibling, and the finding
+it covered publishes with a _Declared intent expired_ line naming the note and the date — the
+renewal is an edit to the note, never one the harness makes. A standing item for the same posture
+wins over a lapsed one. The Declared intent row of an item with a date says what day it stands
+until, and a hand-written `declared[].declaration.expires` is held to the format always and to the
+same run-start day by `finish`, so one run gives a date one answer whichever route filed it.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -1491,7 +1501,10 @@ section says so. The one limit: an on-demand run that goes through `hermes cron 
 the cron prompt, so it counts as a scheduled run and can be silent.
 
 The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
-`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`, and, on a
+stream whose SOP runs `precheck` after its collector, to `precheck` too; a run `precheck` closes
+from the stored document is decided by this rule unchanged, since the close is `finish --scheduled`
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). The SOPs do
 not, because a scheduled run and an on-demand run read the same SOP, and an SOP that passed the
 flag would make every on-demand run of its stream able to go silent. A scheduled worker that
 forgets the flag reports a run that could have been silent. That is noise in the channel, and it

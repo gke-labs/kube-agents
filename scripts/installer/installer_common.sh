@@ -1664,7 +1664,7 @@ PLATFORM_AGENT_MODE_AFTER_APPLY=""
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
-# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh and upgrade.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
   # Read by install.sh's -y refusal.
@@ -2388,7 +2388,7 @@ retry_kms_create() {
       [ -n "$output" ] && printf '%s\n' "$output"
       return 0
     fi
-    if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$output"; then
       if [ "$attempt" -ge "$max_attempts" ]; then
         if type print_warning >/dev/null 2>&1; then
           print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
@@ -3875,11 +3875,11 @@ sys.exit(granted if sys.argv[1] in held else denied)
       # cloud-platform scope (the remedy is the token's scope, not a grant),
       # and the Resource Manager API being off in the credential's quota
       # project (the apply enables that API before it binds).
-      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
+      if grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN" <<<"$body"; then
         printf '%s' "$SCOPE_PROBE_TOKEN_SCOPE_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
-      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
+      if grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN" <<<"$body"; then
         printf '%s' "$SCOPE_PROBE_API_OFF_REASON"
         return "$SCOPE_PROBE_UNDECIDED"
       fi
@@ -3954,7 +3954,7 @@ tf_state_read() {
   if ! state="$(gcloud storage cat "$object" 2>"$err_file")"; then
     err="$(cat "$err_file" 2>/dev/null)"
     rm -f "$err_file"
-    if printf '%s' "$err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+    if grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$err"; then
       return 1
     fi
     # >&2 because the front doors' print_warning writes to stdout, and this
@@ -4163,7 +4163,7 @@ check_service_account_ownership() {
   fi
   for line in "${candidates[@]}"; do
     IFS=$'\t' read -r label key account_id <<<"$line"
-    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+    if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
     email="${account_id}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -4188,7 +4188,7 @@ check_service_account_ownership() {
   while IFS= read -r email; do
     [ -n "$email" ] || continue
     account_id="${email%%@*}"
-    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+    if grep -Fxq "$account_id" <<<"$in_state"; then
       continue
     fi
     # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
@@ -4597,7 +4597,7 @@ live_hindsight_state() {
     out="$({ trap - ERR; kubectl get "$kind" "$name" -n "$namespace" --context "$expected_ctx" \
       --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" --ignore-not-found -o name; } 2>&1)" || rc=$?
     if [ "$rc" -eq 0 ]; then
-      if printf '%s\n' "$out" | grep -qE "(^|/)${name}\$"; then
+      if grep -qE "(^|/)${name}\$" <<<"$out"; then
         LIVE_HINDSIGHT_STATE="present"
         return 0
       fi
@@ -4608,7 +4608,7 @@ live_hindsight_state() {
     # function is entitled to believe -- it can only come from a server that
     # answered -- and it still arrives on older kubectl builds, and for a
     # namespace that does not exist, where --ignore-not-found does not apply.
-    if printf '%s' "$out" | grep -qF 'Error from server (NotFound)'; then
+    if grep -qF 'Error from server (NotFound)' <<<"$out"; then
       absent=$((absent + 1))
       continue
     fi
@@ -4710,7 +4710,7 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
 # says the cluster does not exist. The tfvars generator and install.sh's mode
 # settle both ask this, so they cannot disagree about what absence is.
 gke_describe_error_is_not_found() {
-  printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
+  grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN" <<<"${1:-}"
 }
 
 is_existing_cluster_network_policy_satisfied() {

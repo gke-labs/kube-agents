@@ -423,20 +423,41 @@ def _capped_board(profiles: list[str]) -> dict[str, Any]:
     return {"sweep": CAPPED_SWEEP, "tasks": tasks, "task_links": [], "kanban_worker_children": []}
 
 
-def _audit(profile: str) -> dict[str, Any]:
+def _audit(profile: str, workloads: int = 1, findings: int = 1) -> dict[str, Any]:
+    """One audit's metadata as the SOP shapes it; by default one workload and one finding, the
+    least that shows an audit read the cluster (the capped check requires one of the two)."""
     ident = CAPPED_ROSTER[profile]
-    return {**ident, "workloads": [], "findings": [], "topology": {}}
+    return {
+        **ident,
+        "workloads": [
+            {"namespace": "shop", "name": f"web-{i}", "kind": "Deployment", "replicas": "1/1",
+             "probes": {"startup": False}, "telemetry": "none",
+             "security_context": {"read_only_root_fs": False, "added_capabilities": []}}
+            for i in range(workloads)
+        ],
+        "findings": [
+            {"check": "probes-startup", "severity": "medium", "area": "reliability", "namespace": "shop",
+             "workload": f"web-{i}", "issue": f"web-{i} has no startupProbe", "recommendation": "add one"}
+            for i in range(findings)
+        ],
+        "topology": {},
+    }
 
 
-def _compose(carded: list[str], swept: list[str], fleet: list[str] | None = None) -> str:
+def _compose(
+    carded: list[str], swept: list[str], fleet: list[str] | None = None,
+    swept_audits: dict[str, dict[str, Any]] | None = None,
+) -> str:
     """INVENTORY.raw.md as the hand-off itself writes it: a done card for each of
-    ``carded``, and the sweep's own audits of ``swept`` with ``fleet`` listed."""
+    ``carded``, and the sweep's own audits of ``swept`` with ``fleet`` listed;
+    ``swept_audits`` replaces the default audit of a swept profile."""
     fleet = sorted(CAPPED_ROSTER) if fleet is None else fleet
+    swept_audits = swept_audits or {}
     state = {
         "sweep": {
             "id": CAPPED_SWEEP, "status": "done", "created_at": CAPPED_SWEEP_AT, "block_reason": "",
             "metadata": {
-                "clusters": [_audit(p) for p in swept],
+                "clusters": [swept_audits.get(p, _audit(p)) for p in swept],
                 "fleet": [dict(CAPPED_ROSTER[p], status="RUNNING") for p in fleet],
             },
         },
@@ -610,6 +631,142 @@ def test_a_past_cap_cluster_with_no_row_and_no_gap_line_fails(capped) -> None:
     result = _verify_capped("past_cap_clusters_sweep_audited")
     assert result.status == "fail", result.reason
     assert f"{PAST[0]} (c2 in proj) has no Coverage row" in result.reason
+
+
+def test_a_past_cap_row_with_no_workload_and_no_finding_line_fails(capped) -> None:
+    # Green 1 of #4115: the worker relayed the collector's object with its lists
+    # collapsed, the row said "0 workloads" under the sweep's card, and the
+    # check passed on the row alone. One workload or one finding line is the
+    # proof that the audit reached the report.
+    empty = {PAST[0]: _audit(PAST[0], workloads=0, findings=0)}
+    capped(FIRST, _compose(FIRST, PAST, swept_audits=empty))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{PAST[0]} (c2 in proj) is in the report as the sweep's with 0 workloads audited and no finding line" in result.reason
+    assert PAST[1] not in result.reason
+
+
+def test_a_workload_list_of_booleans_counts_no_workload(capped) -> None:
+    # The incident's boolean class one level down: `workloads: [false, false, false]`
+    # must not read as three workloads audited.
+    audit = _audit(PAST[0], workloads=0, findings=0)
+    audit["workloads"] = [False, False, False]
+    capped(FIRST, _compose(FIRST, PAST, swept_audits={PAST[0]: audit}))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{PAST[0]} (c2 in proj) is in the report as the sweep's with 0 workloads audited and no finding line" in result.reason
+
+
+def test_a_read_cut_before_the_findings_fence_is_an_error(capped, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _compose(FIRST, PAST)
+    cut = raw[: raw.index("## Gaps")]
+    monkeypatch.setattr(onboarding, "MAX_RAW_BYTES", len(cut.encode()) - 1)
+    capped(FIRST, cut)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "error", result.reason
+    assert "findings block" in result.reason
+
+
+def test_a_findings_block_with_no_closing_fence_is_an_error(capped) -> None:
+    raw = _compose(FIRST, PAST)
+    capped(FIRST, raw[: raw.rindex("```")])
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "error", result.reason
+    assert "findings block" in result.reason
+
+
+@pytest.mark.parametrize("workloads,findings", [(0, 1), (1, 0), (3, 2)])
+def test_a_past_cap_row_with_a_workload_or_a_finding_line_passes(capped, workloads: int, findings: int) -> None:
+    # seeded-c on the eval fleet lists no workload and carries findings, so the
+    # finding-line leg is load-bearing.
+    audits = {p: _audit(p, workloads=workloads, findings=findings) for p in PAST}
+    capped(FIRST, _compose(FIRST, PAST, swept_audits=audits))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "pass", result.reason
+
+
+def test_a_finding_line_counts_only_on_a_row_scanned_in_full(capped) -> None:
+    # A cluster whose kubectl reads failed still carries describe-level findings
+    # and a row saying "no, see Gaps"; that is not proof the audit read it.
+    audit = _audit(PAST[0], workloads=0, findings=1)
+    audit["gaps"] = ["Step 3: kubectl get deployments failed (rc=1): Forbidden"]
+    capped(FIRST, _compose(FIRST, PAST, swept_audits={PAST[0]: audit}))
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{PAST[0]} (c2 in proj) is in the report as the sweep's with 0 workloads audited and no finding line on a row scanned in full" in result.reason
+
+
+TWIN = "cluster-proj-c2-europe-west1"  # c2 again, in another location of the same project
+TWIN_IDENT = {"project": "proj", "cluster": "c2", "location": "europe-west1"}
+
+
+def _with_twin(capped, monkeypatch: pytest.MonkeyPatch, workloads: int, findings: int) -> None:
+    monkeypatch.setitem(CAPPED_ROSTER, TWIN, TWIN_IDENT)
+    first = _audit(PAST[0], workloads=46, findings=1)
+    twin_audit = _audit(TWIN, workloads=workloads, findings=findings)
+    capped(FIRST, _compose(FIRST, [*PAST, TWIN], swept_audits={PAST[0]: first, TWIN: twin_audit}), roster=dict(CAPPED_ROSTER))
+
+
+def test_a_same_named_clusters_workloads_do_not_vouch_for_its_twin(capped, monkeypatch) -> None:
+    # Round 2 of #4115: c2 in us-east4 audited in full with 46 workloads, c2 in
+    # europe-west1 relayed empty. The twin's row and finding lines are its own.
+    _with_twin(capped, monkeypatch, workloads=0, findings=0)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert f"{TWIN} (c2 in proj) is in the report as the sweep's with 0 workloads audited" in result.reason
+    assert PAST[0] not in result.reason
+
+
+def test_a_same_named_clusters_finding_line_counts_for_the_twin_it_names(capped, monkeypatch) -> None:
+    # The finding line carries the location, so a twin with no workload and one
+    # finding on a row scanned in full passes on its own line, not its twin's.
+    _with_twin(capped, monkeypatch, workloads=0, findings=1)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "pass", result.reason
+    assert "all 4 cluster(s) past the cap of 2" in result.reason
+
+
+def test_the_identity_triple_is_the_hand_offs() -> None:
+    sys.path.insert(0, str(HANDOFF_DIR))
+    try:
+        import bootstrap_handoff
+    finally:
+        sys.path.remove(str(HANDOFF_DIR))
+    assert onboarding.IDENTITY_FIELDS == bootstrap_handoff.IDENTITY_FIELDS == ("project", "location", "cluster")
+    assert onboarding.cluster_identity(TWIN_IDENT) == bootstrap_handoff.cluster_identity(TWIN_IDENT)
+
+
+def test_the_raw_read_keeps_two_same_named_clusters_apart(monkeypatch) -> None:
+    # The parse behind the leg: rows, Gaps lines and finding lines of c2 in two
+    # locations come back as two triples each, never summed into one pair.
+    monkeypatch.setitem(CAPPED_ROSTER, TWIN, TWIN_IDENT)
+    monkeypatch.setitem(CAPPED_ROSTER, "cluster-proj-c2-asia-east1", {"project": "proj", "cluster": "c2", "location": "asia-east1"})
+    raw = _compose(FIRST, [*PAST, TWIN], swept_audits={PAST[0]: _audit(PAST[0], findings=2), TWIN: _audit(TWIN, findings=1)})
+    read = onboarding.parse_raw_coverage(raw)
+    rows = {onboarding.cluster_identity(r) for r in read["rows"] if r["cluster"] == "c2"}
+    assert rows == {("proj", "us-east4", "c2"), ("proj", "europe-west1", "c2")}
+    assert ["proj", "us-east4", "c2"] in read["sweep_audited"] and ["proj", "europe-west1", "c2"] in read["sweep_audited"]
+    assert read["unreported"] == [["proj", "asia-east1", "c2"]]
+    counts = {tuple(e[:-1]): e[-1] for e in read["finding_counts"]}
+    assert counts[("proj", "us-east4", "c2")] == 2 and counts[("proj", "europe-west1", "c2")] == 1
+
+
+def test_a_coverage_table_without_the_workloads_column_fails(capped) -> None:
+    raw = _compose(FIRST, PAST).replace("| Workloads audited ", "| Pods ")
+    capped(FIRST, raw)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "fail", result.reason
+    assert "Workloads audited" in result.reason
+
+
+def test_a_findings_block_the_read_cut_is_an_error(capped, monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _compose(FIRST, PAST)
+    cut = raw[: raw.index("```findings") + len("```findings") + 1]
+    monkeypatch.setattr(onboarding, "MAX_RAW_BYTES", len(cut.encode()) - 1)
+    capped(FIRST, cut)
+    result = _verify_capped("past_cap_clusters_sweep_audited")
+    assert result.status == "error", result.reason
+    assert "findings block" in result.reason
 
 
 def test_no_raw_report_fails(capped) -> None:

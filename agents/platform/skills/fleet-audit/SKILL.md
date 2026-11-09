@@ -86,9 +86,13 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    succeeded in this session, do not run it again. Every field: `references/lifecycle.md`.
 
 2. **Read the SOP at `sop` in full, then run its checks**, read-only, against every cluster in
-   scope. Where the SOP runs a collector, run it the way the SOP says. Append each check's slug and
+   scope. Where the SOP runs a collector, run it the way the SOP says, then `precheck` on its
+   manifest the way the SOP says: on a scheduled run whose collector found the fleet as the last
+   scheduled run left it, `precheck` closes the run itself from that run's stored document, its
+   JSON line is `finish`'s plus `precheck: unchanged`, and steps 3 and 4 are done; any other line
+   means the SOP continues. Append each check's slug and
    the exact command you issued to that cluster's `checks_run` as the check completes. Content-mode
-   reads (`grep`, `list`, `fetch`) and `draft`: `references/lifecycle.md`.
+   reads (`grep`, `list`, `fetch`), `draft` and `precheck`: `references/lifecycle.md`.
 3. **Write the findings document at `findings_path`.** On a stream whose SOP runs a collector,
    start it from the manifest with
    `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit <audit-id> --manifest-file <manifest>`:
@@ -106,8 +110,8 @@ Run every script by its full path. A kanban worker starts in its card's workspac
      [--decline-fix <finding-id> "<why>" ...] [--no-promote] [--scheduled]
    ```
 
-   Pass `--scheduled` only when the cron prompt tells you to; never on a run a person asked for
-   (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
+   Pass `--scheduled` to `precheck` and to `finish` only when the cron prompt tells you to; never on
+   a run a person asked for (`references/finish.md`). Pass `--no-promote` when the card says not to open a pull request: the
    ledger still publishes, no automatic remediation pull request opens on that run.
 
    Exit 0 published. Exit 2 (`FINDINGS REJECTED`) published nothing and kept the run yours: fix
@@ -116,7 +120,7 @@ Run every script by its full path. A kanban worker starts in its card's workspac
    fields, exit codes, partial coverage and no forge: `references/finish.md`.
 
 5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
-   `[SILENT]`. Otherwise report `issue_url` in full and every URL in `prs_opened` and
+   `[SILENT]`; a run `precheck` closed is reported from its line the same way. Otherwise report `issue_url` in full and every URL in `prs_opened` and
    `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
    An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 

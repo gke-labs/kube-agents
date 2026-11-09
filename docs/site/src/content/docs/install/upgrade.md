@@ -482,6 +482,9 @@ has the rules for the key, and
 what a switch changes inside the install. This section covers what a switch does to chat: Google Chat first, then
 Slack, in order.
 
+With Google Chat or Slack on, a full run prints the chat setup checklist for the mode it applied
+after "Upgrade Complete!", so the app steps that mode needs are on the screen after the switch.
+
 ### Google Chat
 
 With Google Chat enabled, Google Chat takes the A2A gateway under `next`. Each top-level
