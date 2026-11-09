@@ -703,10 +703,11 @@ addressed to platform or a session gets none. The stream and the dispatcher's re
 built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
 queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
-`DIRECTORY` is forgotten. The delegate tool
-the worker adapter serves still offers no `parameters`, so a session can delegate to a pinned
-profile or one that takes no target; offering the field is text the model reads and lands with
-its own eval case.
+`DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
+requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
+cards, for the delegate tool the worker adapter serves to name in its addressee description.
+The tool still offers no `parameters`, so a session can delegate to a pinned profile or one that
+takes no target; offering the field is text the model reads and lands with its own eval case.
 
 ## Session lifecycle
 
