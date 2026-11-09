@@ -1282,6 +1282,18 @@ func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
+	// The site documents CRON_CATCH_UP_STAGGER_MINUTES as a spec.deployment.env
+	// entry, and `0` is how an install that wants every catch-up on resume
+	// turns the policy off; it reaches the ticker only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_CATCH_UP_STAGGER_MINUTES", Value: "0"},
+	})
+	if len(got) != 1 || got[0].Name != "CRON_CATCH_UP_STAGGER_MINUTES" || got[0].Value != "0" {
+		t.Fatalf("expected CRON_CATCH_UP_STAGGER_MINUTES to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
