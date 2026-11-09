@@ -3974,11 +3974,11 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
 
-	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a", nil)
+	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a")
 	if len(hashA) != a2aConfigHashLength {
 		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
 	}
-	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a", nil); hashA != hashB {
+	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a"); hashA != hashB {
 		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
 	}
 
@@ -3986,14 +3986,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// Update on the same Secret, so the UID does not move and the
 	// resourceVersion is the only thing that says a credential changed.
 	rotated := a2aFullCreds("b", "4712")
-	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a", nil); hashA == hashRotated {
+	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a"); hashA == hashRotated {
 		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
 	}
 
 	// A config change: the agent's name is rendered into server_name.
 	other := a2aTestAgent()
 	other.Name = "other-agent"
-	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a", nil); hashA == hashOther {
+	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a"); hashA == hashOther {
 		t.Error("a config change does not roll the bus: the hash ignores the render")
 	}
 
@@ -4002,14 +4002,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// what the new callout signs. If this does not move the hash, the
 	// StatefulSet is never rolled and the bus rejects every authorization.
 	rotatedKeys := a2aTestCalloutKeys(t)
-	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a", nil); hashA == hashKeys {
+	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a"); hashA == hashKeys {
 		t.Error("a callout keypair rotation does not roll the bus: the hash ignores the public keys")
 	}
 
 	// A serving-certificate renewal: the kubelet updates the mounted files in
 	// place, but nats-server reads its certificate at boot, so the bus has to
 	// roll or it keeps serving the old one until it expires.
-	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b", nil); hashA == hashRenewed {
+	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b"); hashA == hashRenewed {
 		t.Error("a serving-certificate renewal does not roll the bus: the hash ignores the fingerprint")
 	}
 }

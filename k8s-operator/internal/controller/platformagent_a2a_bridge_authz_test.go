@@ -156,6 +156,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 	opts.Websocket.Port = 0
 	opts.StoreDir = store
 	opts.NoSigs = true
+	// The rendered pid_file is the pod's path.
+	opts.PidFile = filepath.Join(t.TempDir(), "nats.pid")
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("nats-server refused the rendered config: %v", err)

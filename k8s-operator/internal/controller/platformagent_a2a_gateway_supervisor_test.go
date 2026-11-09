@@ -2,11 +2,16 @@ package controller
 
 import (
 	"context"
+	natsserver "github.com/nats-io/nats-server/v2/server"
+	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -28,9 +33,8 @@ func TestGatewayProfileSupervisorDenyNamesEachProfile(t *testing.T) {
 	}
 }
 
-// The profiles reach the gateway's block and no other, and they move the
-// config hash, so binding or unbinding a profile rolls the bus.
-func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAndTheHash(t *testing.T) {
+// The profiles reach the gateway's block and no other.
+func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAlone(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("a", "1")
 	keys := a2aTestCalloutKeys(t)
@@ -48,11 +52,6 @@ func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAndTheHash(t *testing.T) {
 	}
 	if strings.Count(conf, "a2a.tasks.tse.*.supervisor") != 1 {
 		t.Fatalf("the deny appears %d times in nats.conf, want once (the gateway's)", strings.Count(conf, "a2a.tasks.tse.*.supervisor"))
-	}
-	without := a2aConfigRolloutHash(agent, creds, keys, "fp", nil)
-	with := a2aConfigRolloutHash(agent, creds, keys, "fp", []string{"tse"})
-	if without == with {
-		t.Fatal("a bound profile doesn't move the config hash, so the bus wouldn't pick up its deny")
 	}
 }
 
@@ -144,12 +143,11 @@ func TestADrainingProfileKeepsTheGatewaysDeny(t *testing.T) {
 	}
 }
 
-// Binding a profile moves the bus's config hash, which is what rolls the bus
-// onto a config carrying the new deny: the pass that sees the profile finds
-// the desired hash apart from the live one (and holds the bus for the callout
-// rolling the new identity map, a2aBusWaitsForCallout, which it does only
-// when the two differ).
-func TestBindingAProfileRollsTheBus(t *testing.T) {
+// Binding a profile changes the config Secret but not the pod template, so
+// the bus isn't rolled. The pass records a pending reload on the Secret; a
+// config_load_time that moves clears it, and one that doesn't move within the
+// bound gets the bus pod restarted.
+func TestBindingAProfileReloadsTheBusInsteadOfRollingIt(t *testing.T) {
 	agent := a2aTestAgent()
 	cl := fake.NewClientBuilder().
 		WithScheme(setupScheme()).
@@ -157,7 +155,9 @@ func TestBindingAProfileRollsTheBus(t *testing.T) {
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	loaded := "2026-11-09T22:00:00Z"
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(),
+		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return loaded, nil }}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	pass := func() a2aProvisionState {
@@ -168,16 +168,53 @@ func TestBindingAProfileRollsTheBus(t *testing.T) {
 		}
 		return st
 	}
-	pass()
-	if st := pass(); st.busHeld {
-		t.Fatal("with nothing changed the bus's desired config hash moved")
+	read := func() (*corev1.Secret, string) {
+		t.Helper()
+		var secret corev1.Secret
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, &secret); err != nil {
+			t.Fatal(err)
+		}
+		var sts appsv1.StatefulSet
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &sts); err != nil {
+			t.Fatal(err)
+		}
+		return &secret, sts.Spec.Template.Annotations[a2aConfigHashAnnotation]
 	}
+	pass()
+	pass()
+	_, hashBefore := read()
 	profile := testAgentProfile(agent.Namespace, "tse")
 	if err := cl.Create(ctx, &profile); err != nil {
 		t.Fatal(err)
 	}
-	if st := pass(); !st.busHeld {
-		t.Fatal("a bound profile left the bus's desired config hash where it was, so the bus wouldn't roll onto its deny")
+	st := pass()
+	if st.busHeld {
+		t.Fatal("a bound profile held the bus for a roll")
+	}
+	secret, hashAfter := read()
+	if hashAfter != hashBefore {
+		t.Fatal("a bound profile moved the pod template's hash, so the bus would roll")
+	}
+	if !strings.Contains(string(secret.Data["nats.conf"]), "a2a.tasks.tse.*.supervisor") {
+		t.Fatal("the config Secret carries no deny for the bound profile")
+	}
+	if secret.Annotations[a2aBusReloadBaselineAnnotation] != loaded || secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+		t.Fatalf("no pending reload recorded on the Secret: %v", secret.Annotations)
+	}
+	if st.busReloadRequeue <= 0 {
+		t.Fatal("a pending reload asked for no recheck")
+	}
+	// Not landed yet: still pending.
+	pass()
+	if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+		t.Fatal("the pending reload was dropped before config_load_time moved")
+	}
+	loaded = "2026-11-09T22:00:41Z"
+	if st := pass(); st.busReloadRequeue != 0 {
+		t.Fatal("a landed reload still asks for a recheck")
+	}
+	if secret, _ := read(); secret.Annotations[a2aBusReloadRequestedAnnotation] != "" {
+		t.Fatalf("a landed reload left its pending record: %v", secret.Annotations)
 	}
 }
 
@@ -229,5 +266,87 @@ func TestARefusedProfileLeavesTheSupervisorGrantsAlone(t *testing.T) {
 	}
 	if !reflect.DeepEqual(supervisorLines(with), supervisorLines(without)) {
 		t.Fatalf("a refused profile changed the bus's supervisor grants:\n%v\nvs\n%v", supervisorLines(with), supervisorLines(without))
+	}
+}
+
+// On a real nats-server, a profile's deny delivered by a config reload, with
+// no restart, refuses the gateway on a connection it opened before the
+// reload, and config_load_time moves.
+func TestAReloadedDenyRefusesTheGatewayWithoutARestart(t *testing.T) {
+	agent := a2aTestAgent()
+	creds := a2aFullCreds("a", "1")
+	keys := a2aTestCalloutKeys(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nats.conf")
+	// The test-only overrides a2aStartRenderedServerAt makes, held here so
+	// the reload can make the same ones: nats-server refuses a reload that
+	// moves the port, the store or the file it was started from.
+	load := func(profiles []string) *natsserver.Options {
+		t.Helper()
+		conf := string(buildA2ANATSConfigSecret(agent, creds, keys, profiles).Data["nats.conf"])
+		if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		opts, err := natsserver.ProcessConfigFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opts.Host = "127.0.0.1"
+		opts.HTTPPort = 0
+		opts.Websocket.Port = 0
+		opts.StoreDir = filepath.Join(dir, "store")
+		opts.NoSigs = true
+		opts.PidFile = filepath.Join(dir, "nats.pid")
+		return opts
+	}
+	opts := load(nil)
+	opts.Port = -1
+	s, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := &a2aServerLog{}
+	s.SetLoggerV2(log, false, false, false)
+	go s.Start()
+	t.Cleanup(func() {
+		s.Shutdown()
+		s.WaitForShutdown()
+	})
+	if !s.ReadyForConnections(10 * time.Second) {
+		t.Fatal("embedded nats-server did not come up")
+	}
+	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
+	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", string(creds.Data["gateway-password"]))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const profileSupervisor = "a2a.tasks.tse.task-1.supervisor"
+	if _, err := gw.Publish(ctx, profileSupervisor, []byte(`{"kind":"status-update"}`)); err != nil {
+		t.Fatalf("before the profile, gateway publish on %s: %v, want it stored", profileSupervisor, err)
+	}
+	varz, err := s.Varz(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := varz.ConfigLoadTime
+
+	reloaded := load([]string{"tse"})
+	reloaded.Port = s.Addr().(*net.TCPAddr).Port
+	time.Sleep(10 * time.Millisecond)
+	if err := s.ReloadOptions(reloaded); err != nil {
+		t.Fatalf("nats-server refused to reload the config with the profile's deny: %v", err)
+	}
+	if varz, err = s.Varz(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !varz.ConfigLoadTime.After(before) {
+		t.Fatalf("config_load_time %s didn't move off %s after the reload", varz.ConfigLoadTime, before)
+	}
+	pubCtx, pubCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer pubCancel()
+	if _, err := gw.Publish(pubCtx, profileSupervisor, []byte(`{"kind":"status-update"}`)); err == nil {
+		t.Fatalf("after the reload, gateway publish on %s stored, want refused", profileSupervisor)
+	}
+	if !log.refusedPublish("gateway", profileSupervisor) {
+		t.Fatalf("no publish violation for gateway on %s after the reload; server log: %q", profileSupervisor, log.publishViolations("gateway"))
 	}
 }
