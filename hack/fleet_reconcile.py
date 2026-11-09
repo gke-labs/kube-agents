@@ -32,6 +32,14 @@ fleet-reconcile.json (mode, commit, tree, per-project outcomes with times, a
 summary), under $ARTIFACTS when Prow sets it, for the CI health bot
 (scripts/eval_dashboard/periodics.py); each applied project also gets
 `applied.json` in its state bucket, the record of which commit it is at.
+
+After a project's fleet is at the tree, the run resets the planted
+startup-fail VM (bench/tf/fleet/main.tf `google_compute_instance.startup_fail`)
+so that the guest prints the startup-script failure line again: it prints it
+at boot only, and the serial buffer the GCE audit reads rotates it out within
+about three weeks. Only the one instance the project's state records at that
+address is reset; a reset that fails is a warning on the project's outcome,
+never a failure of it. `--no-fixture-refresh` skips the reset.
 """
 
 import argparse
@@ -245,6 +253,21 @@ REASON_RUN_ERROR = "the run hit an error at this project: %s"
 REASON_VISITED_NONE = "visited no project of the %d asked for: every one was busy for the whole budget, is not registered in Boskos under its mapped name, or the budget ran out polling them"
 REASON_RESTAMP = "re-stamp of seeded-b's maintenance exclusion only"
 WARNING_MARKER = "applied.json not written: %s"
+# The startup-fail fixture's refresh: the one resource address it reads from
+# the project's state, and the shapes its name and zone must have before
+# either goes on a gcloud command line.
+STARTUP_FAIL_ADDRESS = "google_compute_instance.startup_fail"
+STARTUP_FAIL_NAME_RE = re.compile(r"^startup-fail-[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+ZONE_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-[a-z]$")
+# A reset waits for its zone operation, which takes seconds; the ceiling is
+# generous so a slow API is a warning, not a kill mid-call.
+RESET_TIMEOUT_SECONDS = 180
+REPORT_KEY_REFRESH = "startup_fail_reset"
+REFRESH_RESET = "reset"
+REFRESH_FAILED = "failed"
+REFRESH_SKIPPED = "skipped"
+WARNING_REFRESH = "startup-fail VM not reset: %s"
+REASON_REFRESH_NOT_IN_STATE = "the state records no %s" % STARTUP_FAIL_ADDRESS
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -616,9 +639,34 @@ def unused_allowlist(allow, changes):
     needed = {c.address for c in changes if c.actions == [ACTION_DELETE] or c.actions in REPLACE_ACTIONS}
     return sorted(entry.address for entry in allow or () if not entry.standing and not any(_listed(address, {entry.address}) for address in needed))
 
-def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJECT_TIMEOUT_SECONDS, allow=None, extras=None):
+def startup_fail_instance(state_json):
+    """(name, zone) of the startup-fail VM in `tofu show -json` state output,
+    None when the state records none. ReconcileError on a document or a value
+    this script will not act on; the message never carries the state, which
+    holds the stack's secrets."""
+    try:
+        doc = json.loads(state_json)
+    except ValueError as exc:
+        raise ReconcileError("tofu show -json printed no JSON document (%s)" % type(exc).__name__)
+    root = ((doc.get("values") or {}).get("root_module") or {}) if isinstance(doc, dict) else {}
+    resources = root.get("resources") or [] if isinstance(root, dict) else []
+    for resource in resources:
+        if not isinstance(resource, dict) or resource.get("address") != STARTUP_FAIL_ADDRESS or resource.get("mode") != "managed":
+            continue
+        values = resource.get("values") or {}
+        name, zone = str(values.get("name") or ""), str(values.get("zone") or "")
+        if not STARTUP_FAIL_NAME_RE.match(name) or not ZONE_RE.match(zone):
+            raise ReconcileError("%s has a name or zone outside the expected shape" % STARTUP_FAIL_ADDRESS)
+        return name, zone
+    return None
+
+
+def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJECT_TIMEOUT_SECONDS, allow=None, extras=None, refresh=False):
     """init, plan, inspect, apply, under one deadline. Returns (outcome, detail);
-    with `extras`, records the allowlist entries the plan did not need."""
+    with `extras`, records the allowlist entries the plan did not need. With
+    `refresh`, reads the startup-fail VM from the state before the plan, into
+    `extras` for the caller's reset: before, so a termination in the read
+    lands where nothing has changed yet."""
     deadline = clock() + timeout
     # No allowlist given means the committed one; a caller that means "nothing" passes [].
     allow = load_allowlist(ALLOWLIST_FILE) if allow is None else allow
@@ -646,6 +694,12 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
                     deadline,
                     env=env,
                 )
+            if refresh and extras is not None and not dry_run:
+                try:
+                    state = _tofu(["show", "-json", "-no-color"], runner, deadline, env=env)
+                    extras["startup_fail_instance"] = startup_fail_instance(state.stdout)
+                except ReconcileError as exc:
+                    extras["startup_fail_lookup_error"] = str(exc)
             planned = _tofu(
                 [
                     "plan",
@@ -797,7 +851,7 @@ class Run:
     and the allowlist entries the plan did not need, for the report.
     """
 
-    def __init__(self, budget_seconds=None, ceiling_seconds=PROJECT_TIMEOUT_SECONDS, main_ref=None, allow=None, workers=DEFAULT_WORKERS, commit=None, fleet_tree=None, build=None, job=None, publish=False):
+    def __init__(self, budget_seconds=None, ceiling_seconds=PROJECT_TIMEOUT_SECONDS, main_ref=None, allow=None, workers=DEFAULT_WORKERS, commit=None, fleet_tree=None, build=None, job=None, publish=False, refresh_fixtures=False):
         # The budget clock starts at the first project, not here: the main
         # fetch and the Boskos reset before the walk are not charged to it,
         # so a budget of exactly one ceiling still starts one project.
@@ -812,6 +866,8 @@ class Run:
         self.build = build
         self.job = job
         self.publish = publish
+        # Reset the startup-fail VM after each at-tree project (reset_startup_fail).
+        self.refresh_fixtures = refresh_fixtures
         self.extras = {}
         self.lock = threading.Lock()
         # The last failure of the main-moved check, for the report: a run
@@ -945,6 +1001,29 @@ def publish_applied(project, outcome, run):
     return None
 
 
+def reset_startup_fail(project, extras):
+    """Reset the startup-fail VM `extras` names. Returns (report field, warning
+    or None). Only the one instance the state recorded, by name and zone."""
+    if "startup_fail_lookup_error" in extras:
+        why = extras["startup_fail_lookup_error"]
+        return {"result": REFRESH_FAILED, "detail": why}, WARNING_REFRESH % why
+    instance = extras.get("startup_fail_instance")
+    if not instance:
+        return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_NOT_IN_STATE}, None
+    name, zone = instance
+    field = {"instance": name, "zone": zone}
+    argv = ["gcloud", "compute", "instances", "reset", name, "--zone=%s" % zone, "--project=%s" % project, "--quiet"]
+    try:
+        result = gcloud_runner(argv, capture_output=True, text=True, timeout=RESET_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as exc:
+        why = "%s: %s" % (type(exc).__name__, exc)
+    else:
+        if result.returncode == 0:
+            return dict(field, result=REFRESH_RESET), None
+        why = _tail(result.stderr or result.stdout)
+    return dict(field, result=REFRESH_FAILED, detail=why), WARNING_REFRESH % why
+
+
 def _line(project, outcome):
     """One project's result, printed as it happens: a run that is terminated
     or loses Boskos mid-walk has still named every project it reached."""
@@ -957,7 +1036,7 @@ def _record(project, outcomes, runner, dry_run, run=None):
     extras = {}
     run.mark(project, started_at=_iso(time.time()))
     try:
-        outcome = reconcile_project(project, runner=runner, dry_run=dry_run, timeout=run.ceiling, allow=run.allow, extras=extras)
+        outcome = reconcile_project(project, runner=runner, dry_run=dry_run, timeout=run.ceiling, allow=run.allow, extras=extras, refresh=run.refresh_fixtures)
     except TerminatedBeforeTofu as exc:
         outcomes[project] = (OUTCOME_INTERRUPTED, REASON_INTERRUPTED_BEFORE % (exc, exc.step))
         run.mark(project, finished_at=_iso(time.time()))
@@ -986,6 +1065,19 @@ def _record(project, outcomes, runner, dry_run, run=None):
             raise
         if warning:
             outcomes[project] = (outcome[0], "%s; %s" % (outcome[1], warning))
+    if outcome[0] in AT_TREE_OUTCOMES and not dry_run and run.refresh_fixtures:
+        # After the marker: the reset is a fixture's refresh, not part of
+        # being at the tree, so it neither gates the marker nor the outcome.
+        try:
+            field, warning = reset_startup_fail(project, extras)
+        except boskos_pool.Terminated:
+            run.mark(project, **{REPORT_KEY_REFRESH: {"result": REFRESH_FAILED, "detail": "terminated during the reset"}})
+            outcomes[project] = (outcomes[project][0], "%s; %s" % (outcomes[project][1], WARNING_REFRESH % "terminated during the reset"))
+            _line(project, outcomes[project])
+            raise
+        run.mark(project, **{REPORT_KEY_REFRESH: field})
+        if warning:
+            outcomes[project] = (outcomes[project][0], "%s; %s" % (outcomes[project][1], warning))
     _line(project, outcomes[project])
 
 def report(outcomes):
@@ -1303,6 +1395,7 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="projects reconciled at once, each under its own lease (default: %(default)s)")
     parser.add_argument("--stop-when-moved", metavar="REMOTE/BRANCH", help="stop, with the rest not reached, once this ref's fleet tree (a hash of the stack's files under %s: %s, %s) differs from the checkout's (the jobs pass origin/main)" % (FLEET_SUBDIR, ", ".join("*" + s for s in FLEET_INPUT_SUFFIXES), ", ".join(FLEET_INPUT_NAMES)))
     parser.add_argument("--no-publish", action="store_true", help="do not write applied.json to the project's state bucket")
+    parser.add_argument("--no-fixture-refresh", action="store_true", help="do not reset the startup-fail VM after a project's fleet is at the tree")
     parser.add_argument(
         "--report",
         default=os.path.join(os.environ[ARTIFACTS_ENV], REPORT_FILE) if os.environ.get(ARTIFACTS_ENV) else None,
@@ -1403,6 +1496,7 @@ def _start(args, error):
         build=os.environ.get(BUILD_ID_ENV),
         job=os.environ.get(JOB_NAME_ENV),
         publish=not args.no_publish,
+        refresh_fixtures=not args.no_fixture_refresh,
     )
     try:
         run.require_main_readable()

@@ -107,8 +107,10 @@ TREE_B = _fleet_hash(**{**FLEET_INPUTS, "main.tf": "bbb1"})
 class _Tofu:
     """A stand-in for `tofu`: plays back one plan per project and records the calls."""
 
-    def __init__(self, plans=None, plan_exit=None, fail=None):
+    def __init__(self, plans=None, plan_exit=None, fail=None, states=None):
         self.plans = plans or {}
+        # `tofu show -json -no-color` with no plan file: the project's state.
+        self.states = states or {}
         self.plan_exit = plan_exit or {}
         self.fail = fail or {}
         self.calls = []
@@ -128,6 +130,11 @@ class _Tofu:
             return subprocess.CompletedProcess(argv, 1, "", failure)
         if verb == "plan":
             return subprocess.CompletedProcess(argv, self.plan_exit.get(self.project, reconcile.PLAN_HAS_CHANGES), "", "")
+        if verb == "show" and "-no-color" in argv:
+            state = self.states.get(self.project, json.dumps({"values": {"root_module": {"resources": []}}}))
+            if isinstance(state, Exception):
+                raise state
+            return subprocess.CompletedProcess(argv, 0, state, "")
         if verb == "show":
             return subprocess.CompletedProcess(argv, 0, self.plans[self.project], "")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -612,8 +619,9 @@ class MainTest(unittest.TestCase):
         rc, _ = self._main(["--drifted"], boskos, tofu, scan=scan)
         self.assertEqual(rc, reconcile.EXIT_OK)
         self.assertEqual(boskos.acquired, [P8])
-        self.assertEqual(tofu.verbs(), ["init", "plan", "show", "apply"], "the drifted project is applied, not only planned")
-        self.assertIn("-var=project_id=%s" % P8, tofu.calls[1])
+        # The first show reads the state for the startup-fail VM's reset.
+        self.assertEqual(tofu.verbs(), ["init", "show", "plan", "show", "apply"], "the drifted project is applied, not only planned")
+        self.assertIn("-var=project_id=%s" % P8, tofu.calls[2])
         self.assertEqual(boskos.resets[0]["state"], reconcile.HOLD_STATE)
         self.assertEqual(boskos.resets[0]["expire"], reconcile.STRANDED_AFTER)
 
@@ -2047,6 +2055,148 @@ class ReportFieldsTest(unittest.TestCase):
             self.assertEqual(outcomes[P7][0], expected)
         self.assertEqual(len(copies), 2, copies)
         self.assertTrue(all(any(str(arg).endswith("/applied.json") for arg in argv) for argv in copies), copies)
+
+
+def _state(*resources):
+    """`tofu show -json` state output holding these (address, values) pairs."""
+    return json.dumps({"values": {"root_module": {"resources": [
+        {"address": address, "mode": "managed", "type": address.split(".")[0], "name": address.split(".")[1], "values": values}
+        for address, values in resources
+    ]}}})
+
+
+STARTUP_FAIL_STATE = _state(
+    ("google_compute_instance.world_open", {"name": "world-open-seeded", "zone": "us-central1-a"}),
+    ("google_compute_instance.startup_fail", {"name": "startup-fail-seeded", "zone": "us-central1-a"}),
+)
+
+
+class FixtureRefreshTest(unittest.TestCase):
+    """After a project is at the tree, the run resets the startup-fail VM so the
+    guest prints its failure line again; the serial buffer the GCE audit reads
+    rotates the line out within weeks. Only the one instance the state records
+    at that address is reset, and a failed reset never fails the project."""
+
+    def _reconcile(self, tofu, gcloud, dry_run=False, refresh=True):
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(commit="c", fleet_tree="t", refresh_fixtures=refresh)
+        with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            outcomes = reconcile.reconcile_pool(BOSKOS, OWNER, runner=tofu, known={P7}, dry_run=dry_run, run=run)
+        return outcomes, run
+
+    def _gcloud(self, calls, rc=0, stderr=""):
+        def gcloud(argv, **kw):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, rc, "", stderr)
+        return gcloud
+
+    def test_each_at_tree_outcome_resets_exactly_the_startup_fail_vm(self):
+        for tofu, expected in (
+            (_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), reconcile.OUTCOME_APPLIED),
+            (_Tofu({P7: RESTAMP_ONLY}, states={P7: STARTUP_FAIL_STATE}), reconcile.OUTCOME_CONVERGED),
+            (_Tofu({}, plan_exit={P7: reconcile.PLAN_NO_CHANGES}, states={P7: STARTUP_FAIL_STATE}), reconcile.OUTCOME_UNCHANGED),
+        ):
+            with self.subTest(expected):
+                calls = []
+                outcomes, run = self._reconcile(tofu, self._gcloud(calls))
+                self.assertEqual(outcomes[P7][0], expected)
+                self.assertEqual(calls, [["gcloud", "compute", "instances", "reset", "startup-fail-seeded", "--zone=us-central1-a", "--project=%s" % P7, "--quiet"]])
+                self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH], {"instance": "startup-fail-seeded", "zone": "us-central1-a", "result": "reset"})
+                self.assertNotIn("not reset", outcomes[P7][1])
+                self.assertEqual(tofu.verbs()[:3], ["init", "show", "plan"], "the state is read before the plan")
+
+    def test_a_failed_reset_is_a_warning_not_a_failure(self):
+        calls = []
+        outcomes, run = self._reconcile(_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), self._gcloud(calls, rc=1, stderr="ERROR: Required 'compute.instances.reset' permission"))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+        self.assertIn("compute.instances.reset", outcomes[P7][1])
+        self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH]["result"], "failed")
+        self.assertEqual(reconcile.report(outcomes), [], "the reset does not red the job")
+
+    def test_a_state_without_the_vm_skips_the_reset(self):
+        calls = []
+        outcomes, run = self._reconcile(_Tofu({P7: UPDATE_ONLY}), self._gcloud(calls))
+        self.assertEqual(calls, [])
+        self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH]["result"], "skipped")
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+
+    def test_a_failed_state_read_is_a_warning_and_the_apply_still_runs(self):
+        calls = []
+        tofu = _Tofu({P7: UPDATE_ONLY}, states={P7: "not json"})
+        outcomes, run = self._reconcile(tofu, self._gcloud(calls))
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertIn("apply", tofu.verbs())
+        self.assertEqual(calls, [])
+        self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+        self.assertNotIn("not json", outcomes[P7][1])
+
+    def test_a_name_or_zone_outside_the_shape_is_never_put_on_a_command_line(self):
+        for values in (
+            {"name": "seeded-a", "zone": "us-central1-a"},
+            {"name": "startup-fail-seeded --project=other", "zone": "us-central1-a"},
+            {"name": "startup-fail-seeded", "zone": "--zone=x"},
+        ):
+            with self.subTest(values):
+                calls = []
+                outcomes, _ = self._reconcile(_Tofu({P7: UPDATE_ONLY}, states={P7: _state(("google_compute_instance.startup_fail", values))}), self._gcloud(calls))
+                self.assertEqual(calls, [])
+                self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+
+    def test_no_reset_on_a_dry_run_a_refusal_a_failure_or_with_refresh_off(self):
+        for tofu, dry, refresh in (
+            (_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), True, True),
+            (_Tofu({P7: REPLACE}, states={P7: STARTUP_FAIL_STATE}), False, True),
+            (_Tofu({P7: UPDATE_ONLY}, fail={"apply": "boom"}, states={P7: STARTUP_FAIL_STATE}), False, True),
+            (_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), False, False),
+        ):
+            with self.subTest(dry=dry, refresh=refresh):
+                calls = []
+                _, run = self._reconcile(tofu, self._gcloud(calls), dry_run=dry, refresh=refresh)
+                self.assertEqual(calls, [])
+                self.assertNotIn(reconcile.REPORT_KEY_REFRESH, run.extras.get(P7, {}))
+        # A dry run and refresh off do not read the state either.
+        tofu = _Tofu({P7: UPDATE_ONLY})
+        self._reconcile(tofu, self._gcloud([]), dry_run=True)
+        self.assertEqual(tofu.verbs(), ["init", "plan", "show"])
+
+    def test_a_termination_during_the_reset_keeps_the_applied_project_on_the_record(self):
+        def gcloud(argv, **kw):
+            raise boskos_pool.Terminated("signal 15")
+
+        boskos = _Boskos(free=[P7])
+        run = reconcile.Run(commit="c", fleet_tree="t", refresh_fixtures=True)
+        outcomes = {}
+        with mock.patch.object(reconcile, "gcloud_runner", gcloud), mock.patch.object(boskos_pool.urllib.request, "urlopen", boskos), mock.patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(boskos_pool.Terminated):
+                reconcile.reconcile_pool(BOSKOS, OWNER, runner=_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), known={P7}, run=run, outcomes=outcomes)
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+        self.assertIn("terminated during the reset", outcomes[P7][1])
+        self.assertEqual(boskos.released, [P7])
+
+    def test_main_refreshes_by_default_and_the_flag_turns_it_off(self):
+        captured = []
+        real_run = reconcile.Run
+
+        def spy(*args, **kwargs):
+            run = real_run(*args, **kwargs)
+            captured.append(run.refresh_fixtures)
+            return run
+
+        for argv, expected in ((["--project", P7, "--no-lease", "--dry-run"], True), (["--project", P7, "--no-lease", "--dry-run", "--no-fixture-refresh"], False)):
+            with mock.patch.object(reconcile, "Run", spy), mock.patch.object(reconcile, "_provenance", lambda: ("c", "t")), mock.patch.object(
+                reconcile, "tofu_runner", _Tofu({P7: UPDATE_ONLY})
+            ), mock.patch.object(reconcile.signal, "signal"), mock.patch.object(reconcile, "pool_projects", lambda *a, **k: set(KNOWN)), mock.patch(
+                "sys.stdout", io.StringIO()
+            ), mock.patch("sys.stderr", io.StringIO()):
+                reconcile.main(argv + ["--boskos-server", BOSKOS])
+            self.assertEqual(captured[-1], expected)
+
+    def test_the_state_is_never_quoted_in_an_error(self):
+        secret = "PRIVATE-KEY-MATERIAL"
+        with self.assertRaises(reconcile.ReconcileError) as caught:
+            reconcile.startup_fail_instance('{"values": "' + secret)
+        self.assertNotIn(secret, str(caught.exception))
 
 
 class WorkersTest(unittest.TestCase):
