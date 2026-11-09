@@ -104,6 +104,10 @@ func serveDelegateConn(c net.Conn, ch chan<- delegateAsk, done <-chan struct{}, 
 	_ = enc.Encode(<-ask.reply)
 }
 
+// delegatePlatform is the platform agent's addressee, the one that takes no
+// parameters (the gateway's targetPlatform).
+const delegatePlatform = "platform"
+
 // validateDelegate is the adapter's share of the check; the gateway's is the
 // one that matters (allowlist, target, depth, and the parameters the target
 // profile declares), this one keeps junk off the bus.
@@ -115,6 +119,10 @@ func validateDelegate(req lib.DelegateRequest) string {
 		return "text is required"
 	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
+	case strings.TrimSpace(req.Addressee) == delegatePlatform && len(req.Parameters) > 0:
+		// The platform agent takes its target from the text; parameters
+		// sent to it would be dropped, so the turn hears why instead.
+		return "platform takes no parameters; put the target in text"
 	}
 	// Parameters are held to the bounds every reader holds them to; which
 	// names the target takes is the gateway's to say, from the profile's

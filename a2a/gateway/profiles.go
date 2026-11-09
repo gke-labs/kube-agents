@@ -57,6 +57,8 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// noticePlatformTakesNoParameters: platform takes its target from the text.
+	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.

@@ -380,3 +380,17 @@ func TestValidateDelegatePassesParametersWithinTheBounds(t *testing.T) {
 		}
 	}
 }
+
+// platform takes its target from the text and the gateway carries parameters
+// only on a profile route, so a set sent to platform is refused in the turn
+// rather than dropped.
+func TestValidateDelegateRefusesParametersForPlatform(t *testing.T) {
+	req := lib.DelegateRequest{Addressee: "platform", Text: "check web-1", Parameters: map[string]string{"cluster": "web-1"}}
+	if got := validateDelegate(req); !strings.Contains(got, "platform takes no parameters") {
+		t.Fatalf("parameters for platform: %q, want a refusal naming why", got)
+	}
+	req.Parameters = nil
+	if got := validateDelegate(req); got != "" {
+		t.Fatalf("a plain platform delegation was refused: %s", got)
+	}
+}
