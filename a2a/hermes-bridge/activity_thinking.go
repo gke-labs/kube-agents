@@ -1743,10 +1743,11 @@ func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 }
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
-// names a credential key: in a row whose first cell is one, the second
-// cell, unless the table's headers show a listing whose first column is
-// resources' names (| Namespace | Status | Age |) or a description of each
-// key (tableHeadersShowAListing); under
+// names a credential key: in a row whose first cell is one, the cell in
+// the value column (a header tableValueHeaderWords names, else the second),
+// unless the table has a header with no value column whose second column's
+// header shows a listing of resources or checks (| Namespace | Status |
+// Age |) or a description of each key (tableHeaderIsListing); under
 // a header cell that is one, that column's cells in every row below the
 // delimiter row. A cell is read with its markdown normalised away
 // and redacted where it stands. Only a key whose class is strong counts
@@ -1764,7 +1765,7 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 			return
 		}
 		cols := map[int]secretKeyClass{}
-		start, firstCellKeys := 0, true
+		start, firstCellKeys, valueCol := 0, true, 1
 		if len(block) >= 2 && markdownDelimiterRow(s, block[1].cells) {
 			for c, cell := range block[0].cells {
 				if class, ok := tableSecretKeyClass(s[cell[0]:cell[1]]); ok {
@@ -1772,7 +1773,11 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 				}
 			}
 			if h := block[0].cells; len(h) >= 2 {
-				firstCellKeys = !tableHeadersShowAListing(s, h)
+				if c := tableValueColumn(s, h); c > 0 {
+					valueCol = c
+				} else {
+					firstCellKeys = !tableHeaderIsListing(s, h[1])
+				}
 			}
 			start = 2
 		}
@@ -1780,9 +1785,9 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 			if markdownDelimiterRow(s, r.cells) {
 				continue
 			}
-			if len(r.cells) >= 2 && firstCellKeys {
+			if len(r.cells) > valueCol && firstCellKeys {
 				if class, ok := tableSecretKeyClass(s[r.cells[0][0]:r.cells[0][1]]); ok {
-					spans = append(spans, tableCellSpans(s, r.cells[1], class, tableKeyNamed(s, r.cells[0]), sink)...)
+					spans = append(spans, tableCellSpans(s, r.cells[valueCol], class, tableKeyNamed(s, r.cells[0]), sink)...)
 				}
 			}
 			for c, class := range cols {
@@ -1860,6 +1865,12 @@ func markdownDelimiterRow(s string, cells [][2]int) bool {
 }
 
 var (
+	// tableValueHeaderWords name a column of values: a table with one is a
+	// key/value table whatever its other headers say.
+	tableValueHeaderWords = map[string]bool{
+		"value": true, "values": true, "decoded": true, "content": true, "contents": true,
+		"plaintext": true, "secret": true, "password": true, "credential": true,
+	}
 	// tableListingHeaderWords are header words of a listing whose first
 	// column names resources or checks, not keys (| Namespace | Status |
 	// Age |, | Check | Status | Detail |), and of a table whose second
@@ -1887,16 +1898,33 @@ var (
 	}
 )
 
-// tableHeadersShowAListing says whether any word of a table's header
-// cells is one of tableListingHeaderWords, read with the markdown
-// normalised away and in lower case.
-func tableHeadersShowAListing(s string, header [][2]int) bool {
-	for _, cell := range header {
-		n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
-		for _, w := range strings.FieldsFunc(strings.ToLower(n), func(r rune) bool { return !(r >= 'a' && r <= 'z') }) {
-			if tableListingHeaderWords[w] {
-				return true
+// tableHeaderWords is a header cell's words, the markdown normalised away,
+// in lower case.
+func tableHeaderWords(s string, cell [2]int) []string {
+	n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
+	return strings.FieldsFunc(strings.ToLower(n), func(r rune) bool { return !(r >= 'a' && r <= 'z') })
+}
+
+// tableValueColumn is the first column after the first whose header names
+// a value column (tableValueHeaderWords), or -1: in a table with one, a
+// row's first cell is its key and that column holds its value.
+func tableValueColumn(s string, header [][2]int) int {
+	for c := 1; c < len(header); c++ {
+		for _, w := range tableHeaderWords(s, header[c]) {
+			if tableValueHeaderWords[w] {
+				return c
 			}
+		}
+	}
+	return -1
+}
+
+// tableHeaderIsListing says whether the second column's header shows a
+// listing or a description (tableListingHeaderWords).
+func tableHeaderIsListing(s string, cell [2]int) bool {
+	for _, w := range tableHeaderWords(s, cell) {
+		if tableListingHeaderWords[w] {
+			return true
 		}
 	}
 	return false
@@ -2026,7 +2054,10 @@ var (
 	// ("Password (decoded):", "**password** (prod):"), emphasis or a code
 	// span allowed between. normalizeMarkdown keeps one only in the
 	// non-secret shapes markdownParenKept names.
-	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\(([^()\r\n:]{1,40})\))[*_\x60 \t]*:[*_\x60 \t]*([A-Za-z/]*)`)
+	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\(([^()\r\n:]{1,40})\))[*_\x60 \t]*:[*_\x60 \t]*([A-Za-z/]*)([^A-Za-z0-9_-]|$)`)
+	// markdownDecodedParenPattern is a parenthetical that says how the
+	// value is written: never kept.
+	markdownDecodedParenPattern = regexp.MustCompile(`(?i)\b(?:decoded|encoded|plain[ -]?text|base64|b64|raw|literal)\b`)
 	// markdownTallyPattern is a parenthetical that counts ("5 major, 25
 	// minor").
 	markdownTallyPattern = regexp.MustCompile(`^[0-9]+ [A-Za-z]+(?:, ?[0-9]+ [A-Za-z]+)*$`)
@@ -2049,9 +2080,15 @@ var statusWords = map[string]bool{
 
 // markdownParenKept says whether a parenthetical before a colon stays when
 // normalizeMarkdown reads the text: its content (marks taken off) is a
-// status word or a tally, or the first word after the colon is a status
-// word. Any other is dropped, so the label reads as the key.
+// status word or a tally, or the whole value after the colon is a status
+// word (markdownKeyParenPattern ends the word at the value's end, a space
+// or punctuation). A parenthetical saying how the value is written
+// (decoded, base64, plaintext) is never kept. Any other is dropped, so the
+// label reads as the key.
 func markdownParenKept(content, after string) bool {
+	if markdownDecodedParenPattern.MatchString(content) {
+		return false
+	}
 	c := strings.ToLower(strings.TrimSpace(strings.Trim(strings.TrimSpace(content), "*_`")))
 	c = strings.ReplaceAll(strings.ReplaceAll(c, "`", ""), "*", "")
 	return statusWords[c] || markdownTallyPattern.MatchString(c) || statusWords[strings.ToLower(after)]

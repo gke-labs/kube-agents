@@ -388,3 +388,22 @@ func TestScrubInlineSecretsMarkdownExclusionsStayNarrow(t *testing.T) {
 		}
 	}
 }
+
+// A key/value table with a status or notes column still redacts its rows'
+// values, and a decode parenthetical before a value that merely opens with
+// a status word is read past. Synthetic values.
+func TestScrubInlineSecretsValueColumnsAndDecodeParens(t *testing.T) {
+	positives := []struct{ in, want string }{
+		{"| Name | Value | Notes |\n|---|---|---|\n| password | quietpasture | rotated monthly |",
+			"| Name | Value | Notes |\n|---|---|---|\n| password | [redacted] | rotated monthly |"},
+		{"| Key | Status | Value |\n|---|---|---|\n| api_key | set | quietpasture |",
+			"| Key | Status | Value |\n|---|---|---|\n| api_key | set | [redacted] |"},
+		{"Password (decoded): ready2go-synthetic", "Password (decoded): [redacted]"},
+		{"Password (prod): readyvalue123", "Password (prod): [redacted]"},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
