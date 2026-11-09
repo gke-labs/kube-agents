@@ -20,6 +20,45 @@ type profileLister interface {
 	sortedCards() []lib.AgentCard
 }
 
+// delegateAuthors is everyone a delegation from this turn will be checked
+// for, as far as the list can know it when the turn is submitted: the
+// session's author set as it will stand once this turn's requester joins it,
+// unknown if that would pass sessionAuthorCap. The set is recorded after the
+// submission is built, and a pod about to be spawned is seeded only then
+// with the authors of the earlier turns its primer replays (ensureSessionPod).
+// So for an incarnation whose set isn't started (a fresh or rehydrated pod),
+// it is every requester and steer author still on the conversation's record,
+// a superset of what the primer keeps: the list may leave out a profile the
+// delegation would allow, never offer one it would refuse for these people.
+func delegateAuthors(rec *SessionRecord, r TaskRequester) ([]TaskRequester, bool) {
+	var out []TaskRequester
+	unknown := false
+	add := func(a TaskRequester) {
+		if !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	if authors, u, _ := rec.sessionAuthorsOf(); rec.BusSession != "" && rec.SessionAuthorsFor == rec.BusSession {
+		unknown = u
+		for _, a := range authors {
+			add(a)
+		}
+	} else {
+		for _, ref := range rec.Tasks {
+			if ref.Requester == nil {
+				continue
+			}
+			add(*ref.Requester)
+			for _, a := range ref.SteerAuthors {
+				add(a)
+			}
+			unknown = unknown || ref.SteerAuthorsOverflow
+		}
+	}
+	add(r)
+	return out, unknown || len(out) > sessionAuthorCap
+}
+
 // sortedCards is every card the directory holds, in name order.
 func (d *profileDirectory) sortedCards() []lib.AgentCard {
 	if d == nil {
@@ -99,6 +138,8 @@ func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, auth
 // wrote is held to the part's rules rather than trusted).
 func fits(t lib.DelegateTargets, next lib.DelegateTarget) bool {
 	t.Targets = append(slices.Clone(t.Targets), next)
+	// Measured as it would go out if this is the last that fits.
+	t.Truncated = true
 	_, err := lib.DelegateTargetsPart(t)
 	return err == nil
 }
