@@ -319,7 +319,9 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
   worker's trajectory. That objective and the `no-monitoring-write` safeguard were set aside on
   the inject lane until #5236, so the merge-blocking presubmit and the main nightly graded neither, and the
-  seat blocks there on the two report objectives. The today lane ([below](#the-inject-lane))
+  seat blocked there on the two report objectives alone. Since #5236 both grade on an inject record
+  that carries the workers' entries, so the seat blocks on all four: on the 381 inject presubmit
+  repetitions of 2026-11-07 to 11-09 both passed on every record. The today lane ([below](#the-inject-lane))
   runs the presubmit matrix over the api transport, where both are graded: this seat puts the
   case on that matrix with the route objective live and its one api-transport record at 0/3,
   so a collapse there reds `ci-kube-agents-eval-today` (a periodic on `main`, not a merge
@@ -474,7 +476,9 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed 18 of 18
   on the retired next-mode nightly 2026-10-16 to 10-21, with
   `the-forge-was-reached-without-a-cli` (a `worker_commands` check) set aside as blind on that
-  transport, as it will be on the presubmit; and 15 of 15 on the five GitLab nightlies that
+  transport, as it was on the presubmit until #5236. Since #5236 it grades on an inject record that
+  carries the workers' entries: it passed on 322 of the 323 inject presubmit repetitions of
+  2026-11-07 to 11-09, and was set aside on the other; and 15 of 15 on the five GitLab nightlies that
   graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
   run, so it reads no seeded cluster and no fixture: none of the fleet-drift exposure that
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
