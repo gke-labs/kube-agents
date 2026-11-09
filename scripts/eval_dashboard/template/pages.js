@@ -1022,9 +1022,10 @@ function releasesHtml() {
 /* ---- the forge lanes (SCHEMA.md: brief.json's lanes block) ---- */
 // A forge lane's runs are nobody's gate verdict: their tier (tiers.py,
 // FORGE_TIERS) keeps them out of every count above, so each lane's section
-// is the only place they show. Each row links the build where it lives (log_url for a night,
-// gcs_base for a run that records it), else Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+// is the only place they show. Each row links the build where it lives (the Console for a run
+// that records its gcs_base, whose Spyglass log_url is dead; a night's log_url otherwise), else
+// Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run, withForge, withJob) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);

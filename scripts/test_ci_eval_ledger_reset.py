@@ -658,7 +658,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(unit.count('"${lock_deadline}"'), 1)
         self.assertIn('"$(stream_lock_deadline "${name}" "${s}" "${streams}")"', unit)
         self.assertIn(
-            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))',
+            'echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))',
             lifted("stream_lock_deadline"),
         )
         self.assertLess(unit.index('lock_deadline="$(stream_lock_deadline'), task_lock)

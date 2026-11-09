@@ -1282,6 +1282,18 @@ func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronCatchUpStep(t *testing.T) {
+	// The site documents CRON_CATCH_UP_STAGGER_MINUTES as a spec.deployment.env
+	// entry, and `0` is how an install that wants every catch-up on resume
+	// turns the policy off; it reaches the ticker only through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_CATCH_UP_STAGGER_MINUTES", Value: "0"},
+	})
+	if len(got) != 1 || got[0].Name != "CRON_CATCH_UP_STAGGER_MINUTES" || got[0].Value != "0" {
+		t.Fatalf("expected CRON_CATCH_UP_STAGGER_MINUTES to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env
@@ -1609,7 +1621,7 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	// whatever the builder renders, so a request that drifted back down would
 	// otherwise pass every test. This is the Standard render: 500m lets a mint
 	// finish inside its timeouts while an evicted pod's replacement warms up,
-	// 1Gi is above the budget's 672Mi floor, and the 2 CPU limit is the load
+	// 1Gi is above the budget's 544Mi floor, and the 2 CPU limit is the load
 	// measurement's figure (#4106), which the broker bursts to.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
@@ -1764,19 +1776,19 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The child term (docs/designs/credential-proxy-child-memory-budget.md
 	// §2.5), in the broker's own arithmetic: the limit, less the broker's
-	// two fixed reserves, has to admit at least two requests at once, each
+	// resident reserve, has to admit at least two requests at once, each
 	// with its child reserve and its output allowance, or a listing phase
 	// cannot parallelise at all. The slot cap above is an upper bound on the
-	// count and enters this rule only as that. The four figures and the
+	// count and enters this rule only as that. The three figures and the
 	// floor are declared in credential_proxy_manifests.go as copies of the
 	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
-	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
-	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// REQUEST_CHILD_MEMORY_RESERVE_BYTES, OUTPUT_COPIES_PER_COMMAND,
+	// BUDGET_MINIMUM_ADMITTED_REQUESTS), and
 	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
 	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
 	if admitted < credentialProxyMinimumAdmittedRequests {
-		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
-			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyWorkspaceReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
+		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident reserve, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",
+			limit, admitted, credentialProxyResidentReserveBytes>>20, credentialProxyRequestReserveBytes>>20, credentialProxyOutputCopiesPerCommand, capBytes, credentialProxyMinimumAdmittedRequests)
 	}
 	if minimum := credentialProxyMinimumMemoryLimitBytes(int64(capBytes)); minimum > limit {
 		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
