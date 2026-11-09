@@ -125,6 +125,24 @@ func TestSeenSecrets_AShapeCaughtValueIsTracked(t *testing.T) {
 	}
 }
 
+// A plain word a shape rule caught in a result (a constant's value under a
+// *_KEY name in a source file) is not tracked, so the answer keeps the word
+// everywhere else; a Secret's data value is tracked whatever its shape.
+func TestSeenSecrets_AShapeCaughtPlainWordIsNotTracked(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "32|NODE_LOCATIONS_KEY = \"locations\"\n33|ZONE_KEY = \"zone\""))
+	if s.has("locations") {
+		t.Error("a plain word a shape rule caught is tracked")
+	}
+	if got := scrubAnswerText("| Cluster | Location (`locations`) |", &s); got != "| Cluster | Location (`locations`) |" {
+		t.Errorf("answer = %q, want it unchanged", got)
+	}
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"word": "quietpasture"})))
+	if !s.has("quietpasture") {
+		t.Error("a Secret's plain-word data value is not tracked")
+	}
+}
+
 // The longest value wins where two overlap, so no fragment is left over.
 func TestSeenSecrets_TheLongestValueWins(t *testing.T) {
 	var s seenSecrets

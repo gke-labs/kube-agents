@@ -23,6 +23,10 @@ import (
 //   - the shape rules (scrubInlineSecrets), for a secret written in a form
 //     that says what it is.
 //
+// The set takes every Secret data and stringData value of eight bytes or
+// more, and every value a shape rule catches in a result's text that is
+// not one plain word (shapeCaught).
+//
 // The bridge sees a tool's result only through the activity door: hermes's
 // post_tool_call delivery carries the tool's whole result (extra.result).
 // Under the cli executor that is the bridge's own child; under the api
@@ -282,7 +286,20 @@ func (c *toolResultCollector) text(t string, depth int) {
 		scan = capBytes(scan, c.budget)
 	}
 	c.budget -= len(scan)
-	scrubInlineSecretsTo(scan, c.set.add)
+	scrubInlineSecretsTo(scan, c.shapeCaught)
+}
+
+// shapeCaught tracks a value a shape rule redacted in a result's text,
+// unless it is one plain word. The shape rules fail closed after a
+// credential key, which costs one word where it stands, but the set
+// redacts its values everywhere in the answer, so a plain word a rule
+// caught (a constant's value under a *_KEY name in a source file the agent
+// read) would come out of every sentence that uses it.
+func (c *toolResultCollector) shapeCaught(v string) {
+	if isPlainWord(trimValueEdges(v)) {
+		return
+	}
+	c.set.add(v)
 }
 
 // truncatedJSONSecrets reads Secret data blocks out of JSON text cut short.
