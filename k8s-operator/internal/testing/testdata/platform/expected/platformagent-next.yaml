@@ -801,10 +801,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -3478,7 +3478,8 @@ stringData:
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
-          # no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the
+          # no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list
+          # and a direct get on the card subjects, and nothing at all on the
           # topic streams or the runtime-state, cap and PROFILE_LEASES buckets.
           {
             user: gateway
@@ -3488,6 +3489,8 @@ stringData:
                 allow = [
                   "a2a.tasks.*.*.in",
                   "a2a.tasks.*.*.supervisor",
+                  "a2a.submit.*.*.*.*",
+                  "a2a.stop.*.*",
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
@@ -3511,6 +3514,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
                   "$JS.FC.>",
                   "_INBOX.gateway.>"
@@ -4657,7 +4662,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "34"
+    pods: "36"
 status: {}
 ---
 apiVersion: v1
@@ -4734,6 +4739,15 @@ rules:
       - get
       - patch
   - apiGroups:
+      - coordination.k8s.io
+    resourceNames:
+      - platformagent-a2a-gateway
+    resources:
+      - leases
+    verbs:
+      - get
+      - update
+  - apiGroups:
       - ""
     resourceNames:
       - platformagent-resolved-scope
@@ -4808,6 +4822,27 @@ metadata:
       kind: PlatformAgent
       name: platformagent
       uid: ""
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+    kubeagents.x-k8s.io/a2a-gateway-lease: "true"
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec: {}
 ---
 apiVersion: batch/v1
 kind: Job
@@ -5427,6 +5462,10 @@ spec:
               value: platformagent-a2a-gateway
             - name: A2A_SESSION_SERVICE_ACCOUNT
               value: platformagent-a2a-session
+            - name: A2A_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: A2A_MANAGEMENT_PROJECT
+              value: example-project
             - name: A2A_PRINCIPAL_MAP
               value: /etc/a2a/principal-map
             - name: A2A_GCHAT_RELAY_URL
@@ -5440,6 +5479,13 @@ spec:
               value: /var/run/secrets/a2a-chat-relay/token
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
+            - name: A2A_GATEWAY_LEASE
+              value: platformagent-a2a-gateway
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:
@@ -5470,6 +5516,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/kube-agents
+              name: a2a-gateway-scope
+              readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
               readOnly: true
@@ -5480,6 +5529,15 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: platformagent-a2a-gateway
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - configMap:
             name: principal-map
@@ -5488,6 +5546,14 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: a2a-gateway-scope
         - name: a2a-chat-relay-token
           projected:
             defaultMode: 256

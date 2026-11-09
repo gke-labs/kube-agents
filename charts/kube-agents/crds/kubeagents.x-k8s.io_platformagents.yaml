@@ -144,6 +144,25 @@ spec:
                         Availability configures high availability and scheduling
                         settings for the agent pod.
                       properties:
+                        a2aGateway:
+                          description:
+                            A2AGateway is the A2A gateway's availability,
+                            under mode next.
+                          properties:
+                            replicas:
+                              description: |-
+                                Replicas is how many A2A gateway pods run. One holds the gateway's Lease
+                                and does the work, and the others stand by to take over. Defaults to 2.
+                                Set 1 where the namespace's quota has no room for the extra pod a
+                                rolling update starts. The operator renders more than one replica only
+                                once a gateway on the image it renders has taken the Lease (the
+                                GatewayElected condition), and one replica until then. At most 5: only
+                                one replica works at a time, and the count feeds the namespace pod quota.
+                              format: int32
+                              maximum: 5
+                              minimum: 1
+                              type: integer
+                          type: object
                         affinity:
                           description: Affinity specifies affinity scheduling rules
                           properties:
@@ -5453,9 +5472,10 @@ spec:
                           type: object
                       type: object
                     scaleToZero:
-                      description:
-                        ScaleToZero scales the deployment replicas to 0 when
-                        true (useful for saving costs during idle periods).
+                      description: |-
+                        ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+                        While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+                        condition False with reason ScaledToZero; clearing it restores the normal phases.
                       type: boolean
                     sidecarVolumes:
                       description: |-
@@ -9885,17 +9905,21 @@ spec:
                         kinds:
                           description: |-
                             Kinds replaces the watch's default list of resources to scan (Deployments,
-                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
-                            cert-manager Certificates). Each item is a kubectl resource name such as
-                            `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
-                            scans every namespaced kind the cluster serves, one read per kind per
-                            namespace, which is slow on a large fleet. Absent or empty keeps the
-                            default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes,
+                            cert-manager Certificates, and `*.cnrm.cloud.google.com`, every Config
+                            Connector kind the cluster serves). Each item is a kubectl resource name
+                            such as `deployments` or `gateways.gateway.networking.k8s.io`, or a group
+                            wildcard `*.<suffix>` for every namespaced kind whose API group ends in
+                            the suffix; the watch reads a wildcard's kinds only in the namespaces
+                            where it found their objects. The single item `all` scans every
+                            namespaced kind the cluster serves, one read per kind per namespace,
+                            which is slow on a large fleet. Absent or empty keeps the default list.
+                            Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
                             ControllerRevisions and Leases are refused: the scan reports nothing from
                             them, and a Secret listing would carry every body.
                           items:
                             maxLength: 253
-                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\*(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$
                             type: string
                           maxItems: 20
                           type: array
@@ -9950,10 +9974,11 @@ spec:
                             maxTurns:
                               description: |-
                                 MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-                                a run that does cannot even produce a closing summary. Repository exploration is
-                                the main consumer, so size this against how much the agent has to read, not
-                                against how complex the request is.
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+                                kanban worker that does ends with its closing summary saved on its card for the
+                                retry, not with the result it was asked for. Repository exploration is the main
+                                consumer, so size this against how much the agent has to read, not against how
+                                complex the request is.
                               maximum: 1000
                               minimum: 1
                               type: integer
@@ -9975,10 +10000,11 @@ spec:
                             maxTurns:
                               description: |-
                                 MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-                                a run that does cannot even produce a closing summary. Repository exploration is
-                                the main consumer, so size this against how much the agent has to read, not
-                                against how complex the request is.
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+                                kanban worker that does ends with its closing summary saved on its card for the
+                                retry, not with the result it was asked for. Repository exploration is the main
+                                consumer, so size this against how much the agent has to read, not against how
+                                complex the request is.
                               maximum: 1000
                               minimum: 1
                               type: integer
@@ -10133,10 +10159,11 @@ spec:
                             maxTurns:
                               description: |-
                                 MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-                                defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-                                a run that does cannot even produce a closing summary. Repository exploration is
-                                the main consumer, so size this against how much the agent has to read, not
-                                against how complex the request is.
+                                defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+                                kanban worker that does ends with its closing summary saved on its card for the
+                                retry, not with the result it was asked for. Repository exploration is the main
+                                consumer, so size this against how much the agent has to read, not against how
+                                complex the request is.
                               maximum: 1000
                               minimum: 1
                               type: integer
@@ -12117,9 +12144,10 @@ spec:
                   format: int64
                   type: integer
                 phase:
-                  description:
-                    Phase is the overall state (Pending, Provisioning, Ready,
-                    Degraded, Failed).
+                  description: |-
+                    Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+                    Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+                    Ready condition then reads False with reason ScaledToZero.
                   type: string
                 profileSubmitMaxAgeSeconds:
                   description: |-
@@ -12470,8 +12498,10 @@ spec:
                         the nine origin fields usually sum to at most RemediationsProposedTotal.
                         A reading, not an accumulation: the ledger survives a restart and the
                         plugin reads it whole; a read that fails after the plugin's first success
-                        keeps serving the last counts, so a stale count reads as current until
-                        the plugin restarts. A 0 is a reading. Absent until the first
+                        keeps serving the last counts, and the poller reads a read age past two
+                        poll intervals as no reading, so a stale count clears two polls after
+                        that, about twenty minutes after the ledger stops answering. A 0 is a
+                        reading. Absent until the first
                         reading, after two polls in a row without one, and while the served CRD
                         predates the field. Moves neither LastActiveTime nor
                         LastHumanActiveTime.

@@ -2,6 +2,8 @@ module github.com/gke-labs/kube-agents/k8s-operator
 
 go 1.27.0
 
+toolchain go1.27.3
+
 require (
 	cloud.google.com/go/compute/metadata v0.10.0
 	github.com/go-logr/logr v1.4.4

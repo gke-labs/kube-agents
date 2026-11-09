@@ -48,8 +48,9 @@ const (
 // policy's forge checks in a real API server. The console may carry a forge
 // over, add one with no credential, change a forge's namespace when it has no
 // credential, and remove one; it may not move a forge's credential to another
-// destination, add a forge with a credential, or move the install's GitHub
-// host, where the broker spends the GitHub App token.
+// destination, change the account it acts as (identity), add a forge with a
+// credential, or move the install's GitHub host, where the broker spends the
+// GitHub App token.
 func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	cfg, scheme := startEnvtestConfig(t)
 	admin, err := client.New(cfg, client.Options{Scheme: scheme})
@@ -198,7 +199,31 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	}
 
 	// Cases that start from their own declaration, set by the admin.
+	const forgeBitbucket = `{"name":"bb","provider":"bitbucket","namespace":"acme",` +
+		`"credentialsRef":{"name":"bb-token"},"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"}`
+	bitbucketWith := func(old, new string) string {
+		return integration(forgeGitHub+","+strings.Replace(forgeBitbucket, old, new, 1), `[]`)
+	}
 	for _, tc := range []struct{ name, setup, body, rule string }{
+		{
+			name:  "a Bitbucket forge's identity changed",
+			setup: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			body:  bitbucketWith(`0f3b2c1d-aaaa`, `99999999-aaaa`),
+			rule:  destinationRule,
+		},
+		{
+			name:  "a Bitbucket forge's identity removed",
+			setup: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			body:  bitbucketWith(`,"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"`, ``),
+			rule:  destinationRule,
+		},
+		{
+			name: "an identity added to a Bitbucket forge with none",
+			setup: integration(forgeGitHub+","+
+				strings.Replace(forgeBitbucket, `,"identity":"{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}"`, ``, 1), `[]`),
+			body: integration(forgeGitHub+","+forgeBitbucket, `[]`),
+			rule: destinationRule,
+		},
 		{
 			// The operator refuses a GitHub forge at a reserved domain and falls
 			// back to the first usable one, so a new forge must not become it.
@@ -226,6 +251,15 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 			t.Errorf("%s: refused with %q, want the rule %q", tc.name, err, tc.rule)
 		}
 	}
+	// The page's write carries a Bitbucket forge's identity over unchanged.
+	if err := patch(admin, integration(forgeGitHub+","+forgeBitbucket, `[]`)); err != nil {
+		t.Fatalf("setting the Bitbucket forge: %v", err)
+	}
+	if err := patch(console, integration(forgeGitHub+","+forgeBitbucket,
+		`[{"forge":"bb","repository":"acme/infra","role":"context"}]`)); err != nil {
+		t.Errorf("the Bitbucket forge carried over, a repository added: refused, want admitted: %v", err)
+	}
+
 	// The deprecated alias moved to forges, with github.com spelled another
 	// way: the GitHub host does not change, so the console may write it.
 	if err := patch(admin, `{"spec":{"integration":{"forges":null,"repositories":null,"github":{"org":"gke-labs","gitRepo":"kube-agents"}}}}`); err != nil {

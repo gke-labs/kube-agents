@@ -409,6 +409,14 @@ func (s *sideDoorAdapter) SetBoardActor(actor BoardActor) {
 	}
 }
 
+// SetBoardAdmits hands the rule a board tap is admitted by to the primary,
+// as SetBoardActor hands the route.
+func (s *sideDoorAdapter) SetBoardAdmits(admits BoardAdmits) {
+	if sink, ok := s.primary.(BoardAdmitSink); ok {
+		sink.SetBoardAdmits(admits)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation

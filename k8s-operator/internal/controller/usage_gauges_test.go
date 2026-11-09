@@ -396,7 +396,7 @@ func samplesOfAgent(t *testing.T, vec *prometheus.GaugeVec, namespace string) in
 // PlatformAgent writer constant is in usagePhases. A literal returned or
 // compared elsewhere is outside it.
 func TestUsageGauges_PhasesAreConstantsTheVocabularyCarries(t *testing.T) {
-	for _, p := range []string{provisioningPhase, readyPhase, degradedPhase} {
+	for _, p := range []string{provisioningPhase, readyPhase, pausedPhase, degradedPhase} {
 		if !slices.Contains(usagePhases, p) {
 			t.Errorf("usagePhases lacks the writer constant %q", p)
 		}
