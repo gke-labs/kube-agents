@@ -23,11 +23,14 @@ import (
 //   - the shape rules (scrubInlineSecrets), for a secret written in a form
 //     that says what it is.
 //
-// The set takes only the data and stringData values of objects whose kind
-// is Secret, eight bytes or more, under any key but the connection
-// settings seenSecretSkippedKeys names. It never takes what a shape rule
-// catches in a result's text: a Secret's name, a byte count, an image
-// digest or a phrase would then be redacted everywhere in the answer.
+// The set takes the data and stringData values of objects whose kind is
+// Secret, under any key but the connection settings seenSecretSkippedKeys
+// names, and the values a shape rule catches in a result's text where the
+// key, flag or prose noun in front names a credential outright, or the
+// rule's own shape is a credential's (secretSink), one word with no space.
+// Values under eight bytes are not tracked. A Secret's name, a byte count,
+// an image digest or a phrase is never tracked: the set redacts its values
+// everywhere in the answer.
 //
 // The bridge sees a tool's result only through the activity door: hermes's
 // post_tool_call delivery carries the tool's whole result (extra.result).
@@ -52,10 +55,13 @@ const (
 	// keeps the most recent ones.
 	seenSecretMaxEntries = 512
 	seenSecretMaxBytes   = 1 << 20
-	// toolResultScanCap bounds how much of one result's text the text
-	// readers (YAML, JSON cut short) scan for a Secret; JSON that parses
-	// whole is not bounded by it.
+	// toolResultScanCap bounds how much of one result's text the regex
+	// readers (the shape rules, the YAML reader) scan.
 	toolResultScanCap = 1 << 20
+	// toolResultParseCap bounds the text the JSON readers (a whole parse,
+	// the scan of JSON cut short) read: the door's own body cap, so a
+	// Secret list of any size the door accepts is read whole.
+	toolResultParseCap = activityBodyCap
 	// toolResultNestDepth bounds how deep JSON text inside a result's
 	// strings is parsed (a terminal result is JSON whose output is
 	// kubectl's JSON).
@@ -221,25 +227,20 @@ var (
 	yamlListItemPattern      = regexp.MustCompile(`^([ \t]*)-[ \t]+\S`)
 	yamlTopBlockPattern      = regexp.MustCompile(`^(data|stringData)[ \t]*:[ \t]*(?:#.*)?$`)
 	yamlDataEntryPattern     = regexp.MustCompile(`^[ \t]+["']?([-A-Za-z0-9_./]+)["']?[ \t]*:[ \t]*(.*?)[ \t]*$`)
-	// jsonSecretBlockOpenPattern and jsonStringPairPattern read a Secret's
-	// data out of JSON text that does not parse whole (a truncated result),
-	// a block cut short included, up to its last complete pair.
-	jsonSecretBlockOpenPattern = regexp.MustCompile(`"(data|stringData)"\s*:\s*\{`)
-	jsonStringPairPattern      = regexp.MustCompile(`"((?:[^"\\]|\\.)*)"\s*:\s*"((?:[^"\\]|\\.)*)"`)
-	jsonKindPattern            = regexp.MustCompile(`"kind"\s*:\s*"([^"\\]*)"`)
-	jsonSATokenTypePattern     = regexp.MustCompile(`"type"\s*:\s*"kubernetes\.io/service-account-token"`)
 )
 
-// collectToolResult adds the Secret values one tool result carries: every
+// collectToolResult adds the secret values one tool result carries: every
 // value of a Kubernetes Secret's data (base64, decoded too) and stringData,
 // whether the result holds the object as JSON (at any depth, in JSON text
 // inside a string included, or cut short) or as YAML (a document, or an
-// item of a list). Nothing else in the result is tracked.
+// item of a list), and the values secretSink describes: a string under a
+// JSON key that names a credential outright, and what the shape rules hand
+// on from the result's text.
 func (s *seenSecrets) collectToolResult(raw json.RawMessage) {
 	if s == nil || len(raw) == 0 {
 		return
 	}
-	c := toolResultCollector{set: s}
+	c := toolResultCollector{set: s, budget: toolResultScanCap}
 	var v any
 	if json.Unmarshal(raw, &v) != nil {
 		c.text(string(raw), 0)
@@ -249,7 +250,8 @@ func (s *seenSecrets) collectToolResult(raw json.RawMessage) {
 }
 
 type toolResultCollector struct {
-	set *seenSecrets
+	set    *seenSecrets
+	budget int // bytes of text the shape rules may still read
 }
 
 func (c *toolResultCollector) value(v any, depth int) {
@@ -260,7 +262,10 @@ func (c *toolResultCollector) value(v any, depth int) {
 		if kind, _ := t["kind"].(string); kind == "Secret" {
 			c.secretObject(t)
 		}
-		for _, x := range t {
+		for k, x := range t {
+			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) {
+				c.shapeCaught(sv)
+			}
 			c.value(x, depth)
 		}
 	case []any:
@@ -290,66 +295,184 @@ func (c *toolResultCollector) secretObject(m map[string]any) {
 	}
 }
 
+// text reads one string of a result: as JSON when it is JSON text (read
+// whole, or scanned when cut short), as YAML when it holds a kind: Secret
+// line, and through the shape rules within the scan budget. JSON that
+// parses is read as a structure only, so the shape rules see its strings
+// unescaped.
 func (c *toolResultCollector) text(t string, depth int) {
-	if t == "" || !strings.Contains(t, "Secret") {
+	if t == "" {
 		return
 	}
-	t = capBytes(t, toolResultScanCap)
-	if trimmed := strings.TrimSpace(t); depth < toolResultNestDepth && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
+	if trimmed := strings.TrimSpace(capBytes(t, toolResultParseCap)); depth < toolResultNestDepth && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
 		var v any
 		if json.Unmarshal([]byte(trimmed), &v) == nil {
 			c.value(v, depth+1)
 			return
 		}
-		c.truncatedJSONSecrets(t)
-	}
-	if yamlAnySecretKindPattern.MatchString(t) {
-		c.yamlSecrets(t)
-	}
-}
-
-// truncatedJSONSecrets reads the data and stringData blocks out of JSON
-// text that does not parse whole (cut short), each up to its closing brace
-// or its last complete pair. A block is read only when the text names kind
-// Secret and no kind but Secret and List: in kubectl's output a block
-// comes before its own object's kind, so a text holding other kinds could
-// hand it a ConfigMap's data. A single Secret cut inside its data, before
-// its kind is printed, names no kind and is not read.
-func (c *toolResultCollector) truncatedJSONSecrets(t string) {
-	sawSecret := false
-	for _, k := range jsonKindPattern.FindAllStringSubmatch(t, -1) {
-		switch k[1] {
-		case "Secret":
-			sawSecret = true
-		case "List", "SecretList":
-		default:
-			return
+		if strings.Contains(trimmed, "Secret") {
+			c.jsonSecretScan(trimmed)
 		}
 	}
-	if !sawSecret {
+	scan := capBytes(t, toolResultScanCap)
+	if strings.Contains(scan, "Secret") && yamlAnySecretKindPattern.MatchString(scan) {
+		c.yamlSecrets(scan)
+	}
+	if c.budget <= 0 {
 		return
 	}
-	saToken := jsonSATokenTypePattern.MatchString(t)
-	for _, m := range jsonSecretBlockOpenPattern.FindAllStringSubmatchIndex(t, -1) {
-		block := t[m[1]:]
-		if end := strings.IndexByte(block, '}'); end >= 0 {
-			block = block[:end]
+	if len(scan) > c.budget {
+		scan = capBytes(scan, c.budget)
+	}
+	c.budget -= len(scan)
+	scrubInlineSecretsTo(scan, c.shapeCaught)
+}
+
+// shapeCaught tracks a value secretSink hands on, its quotes and trailing
+// punctuation taken off, unless it holds a space: a phrase ("14 bytes",
+// "denied for user ...") is not a credential to match everywhere.
+func (c *toolResultCollector) shapeCaught(v string) {
+	v = trimValueEdges(v)
+	if strings.ContainsAny(v, " \t\r\n") {
+		return
+	}
+	c.set.add(v)
+}
+
+// jsonSecretScan reads Secret data out of JSON text that does not parse
+// whole (cut short): a scan that tracks each object's own kind, type and
+// data and stringData blocks, so a block is read for the object it belongs
+// to, whatever other kinds the text holds (an ownerReference, another item
+// of a list). An object's pairs are taken when it closes, or at the cut
+// when its kind was read before it; a pair cut short is not taken. In
+// kubectl's output a block comes before its own object's kind, so an item
+// cut inside its data is taken as a Secret when every item of its list
+// read before it was one (kubectl get secrets -o json, cut short); a
+// single Secret cut there, with no kind read at all, is not read.
+func (c *toolResultCollector) jsonSecretScan(t string) {
+	type pair struct {
+		key, value string
+		stringData bool
+	}
+	type frame struct {
+		object     bool
+		key        string
+		haveKey    bool
+		kind       string
+		saToken    bool
+		owner      *frame // a data block's object
+		parent     *frame
+		stringData bool
+		pairs      []pair
+		// an array's items read whole so far: Secrets, and anything else
+		secretItems, otherItems int
+	}
+	var stack []*frame
+	settle := func(f *frame, cut bool) {
+		if !f.object || f.owner != nil {
+			return
 		}
-		stringData := t[m[2]:m[3]] == "stringData"
-		for _, kv := range jsonStringPairPattern.FindAllStringSubmatch(block, -1) {
-			var k, v string
-			if json.Unmarshal([]byte(`"`+kv[1]+`"`), &k) != nil || json.Unmarshal([]byte(`"`+kv[2]+`"`), &v) != nil {
-				continue
-			}
-			if seenSecretKeySkipped(k, saToken) {
-				continue
-			}
-			if stringData {
-				c.set.add(v)
+		if p := f.parent; !cut && p != nil && !p.object {
+			if f.kind == "Secret" {
+				p.secretItems++
 			} else {
-				c.set.addEncoded(v)
+				p.otherItems++
 			}
 		}
+		kind := f.kind
+		if p := f.parent; cut && kind == "" && p != nil && !p.object && p.secretItems > 0 && p.otherItems == 0 {
+			kind = "Secret"
+		}
+		if kind != "Secret" {
+			return
+		}
+		for _, p := range f.pairs {
+			switch {
+			case seenSecretKeySkipped(p.key, f.saToken):
+			case p.stringData:
+				c.set.add(p.value)
+			default:
+				c.set.addEncoded(p.value)
+			}
+		}
+	}
+	valueDone := func() {
+		if n := len(stack); n > 0 {
+			stack[n-1].haveKey = false
+		}
+	}
+	for i := 0; i < len(t); {
+		ch := t[i]
+		switch ch {
+		case '{', '[':
+			f := &frame{object: ch == '{'}
+			if n := len(stack); n > 0 {
+				f.parent = stack[n-1]
+			}
+			if n := len(stack); n > 0 && ch == '{' {
+				if p := stack[n-1]; p.object && p.haveKey && p.owner == nil && (p.key == "data" || p.key == "stringData") {
+					f.owner, f.stringData = p, p.key == "stringData"
+				}
+			}
+			stack = append(stack, f)
+			i++
+		case '}', ']':
+			if n := len(stack); n > 0 {
+				settle(stack[n-1], false)
+				stack = stack[:n-1]
+			}
+			valueDone()
+			i++
+		case '"':
+			end := i + 1
+			for end < len(t) && t[end] != '"' {
+				if t[end] == '\\' {
+					end++
+				}
+				end++
+			}
+			if end >= len(t) {
+				i = len(t) // a string cut short: nothing after it is read
+				break
+			}
+			var str string
+			ok := json.Unmarshal([]byte(t[i:end+1]), &str) == nil
+			i = end + 1
+			n := len(stack)
+			if n == 0 || !stack[n-1].object {
+				break
+			}
+			top := stack[n-1]
+			if !top.haveKey {
+				j := i
+				for j < len(t) && (t[j] == ' ' || t[j] == '\t' || t[j] == '\r' || t[j] == '\n') {
+					j++
+				}
+				if j < len(t) && t[j] == ':' {
+					top.key, top.haveKey, i = str, true, j+1
+				}
+				break
+			}
+			if ok {
+				switch {
+				case top.owner != nil:
+					top.owner.pairs = append(top.owner.pairs, pair{top.key, str, top.stringData})
+				case top.key == "kind":
+					top.kind = str
+				case top.key == "type" && str == "kubernetes.io/service-account-token":
+					top.saToken = true
+				}
+			}
+			top.haveKey = false
+		case ',':
+			valueDone()
+			i++
+		default:
+			i++
+		}
+	}
+	for k := len(stack) - 1; k >= 0; k-- {
+		settle(stack[k], true)
 	}
 }
 

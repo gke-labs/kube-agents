@@ -117,20 +117,19 @@ func TestSeenSecrets_AServiceAccountTokensNamespaceIsNotTracked(t *testing.T) {
 	}
 }
 
-// Only a Secret object's data is tracked: what a shape rule catches in a
-// result's text (a password in an env dump), a Secret's name (the pull
-// secret and token Secret a service account lists, a Helm existingSecret
-// reference, a TLS secretName), describe secret's byte counts and an image
-// digest are not, so the answer keeps every one of them where it names
-// them.
-func TestSeenSecrets_OnlySecretObjectDataIsTracked(t *testing.T) {
+// A Secret's name (the pull secret and token Secret a service account
+// lists, a Helm existingSecret reference, a TLS secretName), describe
+// secret's byte counts, an image digest, a phrase after a credential key,
+// and a word under a weak or ambiguous key are not tracked, so the answer
+// keeps every one of them where it names them.
+func TestSeenSecrets_NamesSizesDigestsAndPhrasesAreNotTracked(t *testing.T) {
 	results := []string{
-		"export DB_PASSWORD=" + synthSecretPlain + "\nok",
 		"Name:                default\nNamespace:           shop\nImage pull secrets:  regcred-missing\nMountable secrets:   default-token-x7k2p\nTokens:              <none>\n",
 		"Name:         db-creds\nType:  Opaque\n\nData\n====\npassword:  14 bytes\nusername:  5 bytes\n",
-		"auth:\n  existingSecret: postgres-creds\nspec:\n  tls:\n  - hosts: [a]\n    secretName: shop-tls-cert\n",
+		"auth:\n  existingSecret: postgres-creds\n  imagePullSecret: regcred-missing\nspec:\n  tls:\n  - hosts: [a]\n    secretName: shop-tls-cert\n    secret: shop-tls-cert\n",
 		"docker pull nginx\nDigest: sha256:4f1c9a0b2e3d4c5f6a7b8c9d0e1f2a3b4c5d6e7f\nStatus: Downloaded\n",
 		"The secret is referenced by the deployment; the pull secret is regcred-missing.",
+		"Authorization: denied for user alice-operator\nauth: oidc-provider-x\n",
 		"32|NODE_LOCATIONS_KEY = \"locations\"\n33|ZONE_KEY = \"zone\"",
 	}
 	var s seenSecrets
@@ -138,13 +137,48 @@ func TestSeenSecrets_OnlySecretObjectDataIsTracked(t *testing.T) {
 		s.collectToolResult(terminalResult(t, r))
 	}
 	if n := s.size(); n != 0 {
-		t.Fatalf("set holds %d values from results with no Secret object: %q", n, s.order)
+		t.Fatalf("set holds %d values from results with no credential in them: %q", n, s.order)
 	}
 	answer := "Pull secret regcred-missing is absent; default-token-x7k2p is mounted. password (14 bytes). " +
-		"Postgres uses postgres-creds and TLS uses shop-tls-cert, image sha256:4f1c9a0b2e3d4c5f6a7b8c9d0e1f2a3b4c5d6e7f. Location (`locations`)."
+		"Postgres uses postgres-creds and TLS uses shop-tls-cert, image sha256:4f1c9a0b2e3d4c5f6a7b8c9d0e1f2a3b4c5d6e7f. " +
+		"alice-operator was denied; oidc-provider-x is the issuer. Location (`locations`)."
 	if got := scrubAnswerText(answer, &s); got != answer {
 		t.Errorf("answer = %q, want it unchanged", got)
 	}
+}
+
+// A credential a shape rule catches in a tool result that is not a Secret
+// object (an env dump, a config file, a connection string, a password
+// flag), under a key, flag or noun that names it outright, is tracked, so
+// its echo in the answer is redacted where it has no shape of its own.
+func TestSeenSecrets_AStrongKeyCredentialInAnyResultIsTracked(t *testing.T) {
+	const (
+		envWord = "quietpasture"
+		cfgTok  = "meadowlark-synthetic-12"
+		urlPass = "lanternfield-synthetic"
+		flagVal = "harborstone-synthetic"
+	)
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "export DB_PASSWORD="+envWord+"\nok"))
+	s.collectToolResult(terminalResult(t, `{"client": {"token": "`+cfgTok+`"}}`))
+	s.collectToolResult(json.RawMessage(mustJSONString(t, "DATABASE_URL=postgres://app:"+urlPass+"@db.internal:5432/orders")))
+	s.collectToolResult(terminalResult(t, "app --db-password "+flagVal+" --port 5432"))
+	answer := "Use " + envWord + ", then " + cfgTok + "; the URL carries " + urlPass + " and the flag " + flagVal + "."
+	got := scrubAnswerText(answer, &s)
+	for _, v := range []string{envWord, cfgTok, urlPass, flagVal} {
+		if strings.Contains(got, v) {
+			t.Errorf("answer leaked %q: %q", v, got)
+		}
+	}
+}
+
+func mustJSONString(t *testing.T, v string) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // A Secret's value under a credential-named key is tracked whatever its
@@ -206,8 +240,9 @@ func TestSeenSecrets_YAMLSecretListItemsAreReadEachInItsOwnScope(t *testing.T) {
 }
 
 // JSON cut inside a data block: every pair read whole is tracked, the cut
-// one is not, and a cut text that names a kind other than Secret or List
-// is not read at all (a block precedes its own kind in kubectl's output).
+// one is not. Each block is read for its own object's kind: a ConfigMap
+// item is not read, a Secret item beside it is, and an item cut before its
+// kind is printed counts as a Secret only when every item before it was.
 func TestSeenSecrets_JSONCutInsideDataTracksWhatWasReadWhole(t *testing.T) {
 	const (
 		whole   = "synthetic-whole-0009"
@@ -224,11 +259,44 @@ func TestSeenSecrets_JSONCutInsideDataTracksWhatWasReadWhole(t *testing.T) {
 	if s.size() != 4 {
 		t.Errorf("size = %d, want 4 (two values, each as given and decoded): the cut pair was tracked", s.size())
 	}
-	mixed := `{"items":[{"data":{"a":"` + b64(whole) + `"},"kind":"ConfigMap"},{"data":{"b":"` + b64(inBlock) + `"},"kind":"Secret"},{"data":{"c":"x`
+	mixed := `{"items":[{"data":{"a":"` + b64(whole) + `"},"kind":"ConfigMap"},{"data":{"b":"` + b64(inBlock) + `"},"kind":"Secret"},{"data":{"c":"` + b64(cutOff) + `"`
 	var m seenSecrets
 	m.collectToolResult(terminalResult(t, mixed))
-	if m.size() != 0 {
-		t.Errorf("a cut text holding a ConfigMap was read: %d values", m.size())
+	if m.has(whole) || m.has(cutOff) || !m.has(inBlock) {
+		t.Errorf("mixed list: ConfigMap read %v, unknown cut item read %v, Secret item read %v; want false, false, true",
+			m.has(whole), m.has(cutOff), m.has(inBlock))
+	}
+}
+
+// A Secret cut short after its kind, whose metadata names another kind (an
+// owner reference), is still read for its own data.
+func TestSeenSecrets_ACutSecretWithAnOwnerReferenceIsRead(t *testing.T) {
+	const value = "synthetic-owned-0012"
+	cut := `{"apiVersion":"v1","data":{"password":"` + b64(value) + `"},"kind":"Secret","metadata":{"name":"app-db",` +
+		`"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"web","uid":"1"}],"resourceVersion":"12`
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, cut))
+	if !s.has(value) {
+		t.Error("a cut Secret with an owner reference of another kind was not read")
+	}
+}
+
+// A Secret list larger than the shape rules' scan cap is parsed whole, so
+// a value past the cap is tracked.
+func TestSeenSecrets_ASecretListOverTheScanCapIsReadWhole(t *testing.T) {
+	const value = "synthetic-past-cap-0013"
+	filler := strings.Repeat("A", toolResultScanCap+1024)
+	list, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "List", "items": []any{
+		map[string]any{"kind": "Secret", "data": map[string]string{"bundle": filler}},
+		map[string]any{"kind": "Secret", "data": map[string]string{"password": b64(value)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, string(list)))
+	if !s.has(value) {
+		t.Error("a Secret value past the scan cap was not tracked")
 	}
 }
 

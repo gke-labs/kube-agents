@@ -1235,34 +1235,74 @@ func isAllDigits(s string) bool {
 	return s != ""
 }
 
+// secretSink receives a value a shape rule redacts when the text in front
+// of it names a credential outright (keyClearlyNamesSecret, a password,
+// passphrase, token or api key noun) or the rule's own shape is a
+// credential's (a token prefix, a URL's password, a password flag, an
+// Authorization header pair), so the seen-values set can track what a
+// tool's result held; nil drops them. The other rules hand it nothing: a
+// value caught after an auth scheme word, a pgpass line, a YAML data block
+// or a weak or ambiguous key may be an ordinary word, which the set would
+// redact everywhere in the answer.
+type secretSink func(value string)
+
+func (sink secretSink) emit(v string) {
+	if sink != nil && v != "" && !strings.Contains(v, redactedValue) {
+		sink(v)
+	}
+}
+
+var (
+	clearSecretKeyEndPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:password|passwd|passphrase|secret|token|api[_-]?key|apikey)$`)
+	clearSecretCamelEndPattern = regexp.MustCompile(`[A-Za-z0-9](?:Password|Passwd|Passphrase|Secret|Token|Api[_-]?Key|APIKey)$`)
+	clearSecretUpperEndPattern = regexp.MustCompile(`[A-Z0-9](?:PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN)$`)
+	// secretReferenceKeyPattern is a key that names a Secret object, not a
+	// credential: existingSecret, imagePullSecret, tls_secret.
+	secretReferenceKeyPattern = regexp.MustCompile(`(?i)(?:existing|external|pull|tls|ref|reference|source|target|mountable|default)[_.-]?secret$`)
+	clearSecretNounPattern    = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|token|api[ _-]?key)\b`)
+)
+
+// keyClearlyNamesSecret says whether a key's last component is password,
+// passwd, passphrase, secret, token or api key, singular: the value under
+// it is a credential whatever it looks like. A *_KEY or *_ID name, a key
+// carrying the word elsewhere, the ambiguous pass, pwd and auth, a plural
+// (Mountable secrets, Tokens), the bare word secret and a key naming a
+// Secret object (existingSecret) do not.
+func keyClearlyNamesSecret(k string) bool {
+	if strings.EqualFold(k, "secret") || secretReferenceKeyPattern.MatchString(k) {
+		return false
+	}
+	return clearSecretKeyEndPattern.MatchString(k) || clearSecretCamelEndPattern.MatchString(k) || clearSecretUpperEndPattern.MatchString(k)
+}
+
 // inlineScrubRule is one step of scrubInlineSecrets, in order.
 type inlineScrubRule struct {
 	name string
-	fn   func(s string) string
+	fn   func(s string, sink secretSink) string
 }
 
 // inlineScrubRules are scrubInlineSecrets's steps, in the order they run.
 // The names are for tests and the evidence tooling, which attribute a
 // redaction to the step that made it.
 var inlineScrubRules = []inlineScrubRule{
-	{"pem-private-key", func(s string) string {
+	{"pem-private-key", func(s string, _ secretSink) string {
 		s = redactSubmatch(pemPrivateKeyBlockPattern, s, 0, nil)
 		return redactSubmatch(pemPrivateKeyOpenPattern, s, 0, nil)
 	}},
-	{"yaml-secret-block", scrubYAMLSecretBlocks},
-	{"token-prefix", func(s string) string {
-		return redactSubmatch(inlineTokenValuePattern, s, 0, nil)
+	{"yaml-secret-block", func(s string, _ secretSink) string { return scrubYAMLSecretBlocks(s) }},
+	{"token-prefix", func(s string, sink secretSink) string {
+		return redactSubmatchTo(inlineTokenValuePattern, s, 0, nil, sink)
 	}},
-	{"auth-header-pair", func(s string) string {
-		return redactSubmatch(authHeaderPairPattern, s, 1, nil)
+	{"auth-header-pair", func(s string, sink secretSink) string {
+		return redactSubmatchTo(authHeaderPairPattern, s, 1, nil, sink)
 	}},
-	{"auth-scheme", func(s string) string {
+	{"auth-scheme", func(s string, _ secretSink) string {
 		return redactSubmatch(authSchemeCredentialPattern, s, 2, authSchemeCredentialRedacted)
 	}},
-	{"url-userinfo", func(s string) string {
-		return redactSubmatch(inlineURLCredPattern, s, 2, nil)
+	{"url-userinfo", func(s string, sink secretSink) string {
+		return redactSubmatchTo(inlineURLCredPattern, s, 2, nil, sink)
 	}},
-	{"pgpass-entry", func(s string) string {
+	{"pgpass-entry", func(s string, _ secretSink) string {
 		return redactSubmatch(pgpassEntryPattern, s, 4, pgpassEntryRedacted)
 	}},
 	{"cli-flag", scrubCLISecretFlags},
@@ -1282,8 +1322,17 @@ func scrubInlineSecrets(s string) string {
 	if s == "" || s == redactedValue {
 		return s
 	}
+	return scrubInlineSecretsTo(s, nil)
+}
+
+// scrubInlineSecretsTo is scrubInlineSecrets, handing the values it
+// redacts to sink as secretSink says.
+func scrubInlineSecretsTo(s string, sink secretSink) string {
+	if s == "" || s == redactedValue {
+		return s
+	}
 	for _, r := range inlineScrubRules {
-		s = r.fn(s)
+		s = r.fn(s, sink)
 	}
 	return s
 }
@@ -1291,6 +1340,19 @@ func scrubInlineSecrets(s string) string {
 // redactSubmatch replaces group of each match of re in s with the marker,
 // where keep (nil for always) says so.
 func redactSubmatch(re *regexp.Regexp, s string, group int, keep func(s string, m []int) bool) string {
+	return redactSubmatchTo(re, s, group, keep, nil)
+}
+
+// redactSubmatchTo is redactSubmatch, handing each value it redacts to
+// sink.
+func redactSubmatchTo(re *regexp.Regexp, s string, group int, keep func(s string, m []int) bool, sink secretSink) string {
+	return redactNamedSubmatch(re, s, group, -1, keep, sink)
+}
+
+// redactNamedSubmatch is redactSubmatchTo handing a value to sink only
+// where the key in keyGroup names a credential outright
+// (keyClearlyNamesSecret); keyGroup -1 hands every value.
+func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep func(s string, m []int) bool, sink secretSink) string {
 	ms := re.FindAllStringSubmatchIndex(s, -1)
 	if ms == nil {
 		return s
@@ -1304,6 +1366,9 @@ func redactSubmatch(re *regexp.Regexp, s string, group int, keep func(s string, 
 		}
 		sb.WriteString(s[last:lo])
 		sb.WriteString(redactedValue)
+		if keyGroup < 0 || keyClearlyNamesSecret(s[m[2*keyGroup]:m[2*keyGroup+1]]) {
+			sink.emit(s[lo:hi])
+		}
 		last = hi
 	}
 	if last == 0 {
@@ -1370,26 +1435,28 @@ func pgpassEntryRedacted(s string, m []int) bool {
 	return false
 }
 
-func scrubCLISecretFlags(s string) string {
+func scrubCLISecretFlags(s string, sink secretSink) string {
 	notAFlag := func(group int) func(s string, m []int) bool {
 		return func(s string, m []int) bool { return !strings.HasPrefix(s[m[2*group]:m[2*group+1]], "-") }
 	}
-	s = redactSubmatch(cliUserPassPattern, s, 4, nil)
-	s = redactSubmatch(cliSpacedPassPattern, s, 2, notAFlag(2))
-	s = redactSubmatch(cliAttachedPassPattern, s, 2, nil)
-	s = redactSubmatch(cliLDAPPassPattern, s, 2, notAFlag(2))
-	s = redactSubmatch(cliPassphraseArgPattern, s, 2, nil)
+	s = redactSubmatchTo(cliUserPassPattern, s, 4, nil, sink)
+	s = redactSubmatchTo(cliSpacedPassPattern, s, 2, notAFlag(2), sink)
+	s = redactSubmatchTo(cliAttachedPassPattern, s, 2, nil, sink)
+	s = redactSubmatchTo(cliLDAPPassPattern, s, 2, notAFlag(2), sink)
+	s = redactSubmatchTo(cliPassphraseArgPattern, s, 2, nil, sink)
 	// A flag whose name is a credential key (flagValueRedacted).
 	flagValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
 	}
-	s = redactSubmatch(cliLongSecretFlagPattern, s, 4, flagValue)
-	s = redactSubmatch(cliSingleDashSecretFlagPattern, s, 4, flagValue)
+	// A flag's value is handed to sink only under a name that names a
+	// credential outright.
+	s = redactNamedSubmatch(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink)
+	s = redactNamedSubmatch(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink)
 	argListValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
 	}
-	s = redactSubmatch(cliArgListJSONPattern, s, 2, argListValue)
-	return redactSubmatch(cliArgListYAMLPattern, s, 2, argListValue)
+	s = redactNamedSubmatch(cliArgListJSONPattern, s, 2, 1, argListValue, sink)
+	return redactNamedSubmatch(cliArgListYAMLPattern, s, 2, 1, argListValue, sink)
 }
 
 // flagValueRedacted says whether a flag's value is redacted: the flag's
@@ -1453,11 +1520,11 @@ func scrubYAMLSecretBlocks(s string) string {
 // (proseSecretPattern), as proseValueRedacted says, matched with the
 // markdown around the noun and the value normalised away ("the
 // **password** is `x`").
-func scrubProseSecrets(s string) string {
-	return scrubNormalized(s, func(n string, rec func(lo, hi int)) {
+func scrubProseSecrets(s string, sink secretSink) string {
+	return scrubNormalized(s, sink, func(n string, rec func(lo, hi int, named bool)) {
 		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
 			if n[m[4]:m[5]] != redactedValue && proseValueRedacted(n[m[4]:m[5]]) {
-				rec(m[4], m[5])
+				rec(m[4], m[5], clearSecretNounPattern.MatchString(n[m[2]:m[3]]))
 			}
 		}
 	})
@@ -1471,13 +1538,13 @@ func scrubProseSecrets(s string) string {
 // value where it stands in s. A bare lower-case key used as a label in the
 // middle of a sentence ("rotate the token: run ...") keeps a value that is
 // one plain word.
-func scrubInlineKVSecrets(s string) string {
-	return scrubNormalized(s, kvSecretSpans)
+func scrubInlineKVSecrets(s string, sink secretSink) string {
+	return scrubNormalized(s, sink, kvSecretSpans)
 }
 
 // kvSecretSpans reports, through rec, the span of each value
 // scrubInlineKVSecrets redacts in s.
-func kvSecretSpans(s string, rec func(lo, hi int)) {
+func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 	pos := 0
 	for pos < len(s) {
 		loc := inlineKVSecretPattern.FindStringSubmatchIndex(s[pos:])
@@ -1510,6 +1577,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 		}
 		lineLeading := isLineLeadingKVKey(s, matchStart)
 		class := secretKeyClassOf(key)
+		named := keyClearlyNamesSecret(key)
 		redacts := func(v, after string) bool {
 			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
 		}
@@ -1522,7 +1590,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 			}
 			if closeIdx >= 0 {
 				if redacts(rest[:closeIdx], "") {
-					rec(matchEnd, matchEnd+closeIdx)
+					rec(matchEnd, matchEnd+closeIdx, named)
 					pos = matchEnd + closeIdx
 				}
 				continue
@@ -1546,7 +1614,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 			if !redacts(afterOpen[:end], "") {
 				continue
 			}
-			rec(matchEnd+2, matchEnd+2+end)
+			rec(matchEnd+2, matchEnd+2+end, named)
 			pos = matchEnd + 2 + end
 			if closeIdx >= 0 {
 				pos += 2
@@ -1567,7 +1635,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 			if !redacts(val[schemeEnd:], "") {
 				continue
 			}
-			rec(matchEnd+1+schemeEnd, matchEnd+1+end)
+			rec(matchEnd+1+schemeEnd, matchEnd+1+end, named)
 			pos = matchEnd + 1 + end
 			if closeIdx >= 0 {
 				pos++
@@ -1579,7 +1647,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 				lineRest := strings.TrimRight(rest[:lineEndIn(rest)], " \t")
 				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
 					if redacts(lineRest, "") {
-						rec(matchEnd, matchEnd+len(lineRest))
+						rec(matchEnd, matchEnd+len(lineRest), named)
 						pos = matchEnd + len(lineRest)
 					}
 					continue
@@ -1602,7 +1670,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 			if valLen == 0 || !redacts(rest[:valLen], rest[valLen:]) {
 				continue
 			}
-			rec(matchEnd, matchEnd+valLen)
+			rec(matchEnd, matchEnd+valLen, named)
 			pos = matchEnd + valLen
 		}
 	}
@@ -1615,7 +1683,7 @@ func kvSecretSpans(s string, rec func(lo, hi int)) {
 // and redacted where it stands. Only a key whose class is strong counts
 // (tableSecretKeyClass); a bare credential noun heads a column of names as
 // often as of values, so under one a value must be token-shaped.
-func scrubMarkdownTables(s string) string {
+func scrubMarkdownTables(s string, sink secretSink) string {
 	if !strings.Contains(s, "|") {
 		return s
 	}
@@ -1646,12 +1714,12 @@ func scrubMarkdownTables(s string) string {
 			}
 			if len(r.cells) >= 2 && firstCellKeys {
 				if class, ok := tableSecretKeyClass(s[r.cells[0][0]:r.cells[0][1]]); ok {
-					spans = append(spans, tableCellSpans(s, r.cells[1], class)...)
+					spans = append(spans, tableCellSpans(s, r.cells[1], class, tableKeyNamed(s, r.cells[0]), sink)...)
 				}
 			}
 			for c, class := range cols {
 				if c < len(r.cells) {
-					spans = append(spans, tableCellSpans(s, r.cells[c], class)...)
+					spans = append(spans, tableCellSpans(s, r.cells[c], class, tableKeyNamed(s, block[0].cells[c]), sink)...)
 				}
 			}
 		}
@@ -1761,7 +1829,7 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 
 // tableCellSpans is the span to redact in one value cell, its markdown
 // normalised away for the test and kept around the marker, or none.
-func tableCellSpans(s string, cell [2]int, class secretKeyClass) [][2]int {
+func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sink secretSink) [][2]int {
 	text := s[cell[0]:cell[1]]
 	n, idx := normalizeMarkdown(text)
 	lo := len(n) - len(strings.TrimLeft(n, " \t"))
@@ -1772,7 +1840,17 @@ func tableCellSpans(s string, cell [2]int, class secretKeyClass) [][2]int {
 	if idx != nil {
 		lo, hi = idx[lo], idx[hi-1]+1
 	}
+	if named {
+		sink.emit(text[lo:hi])
+	}
 	return [][2]int{{cell[0] + lo, cell[0] + hi}}
+}
+
+// tableKeyNamed says whether a table's key cell names a credential
+// outright (keyClearlyNamesSecret), its words read as one key.
+func tableKeyNamed(s string, cell [2]int) bool {
+	n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
+	return keyClearlyNamesSecret(strings.ReplaceAll(strings.TrimSpace(strings.TrimRight(strings.TrimSpace(n), ":")), " ", "_"))
 }
 
 // normalizeMarkdown is s with the markdown that wraps a key or a value in
@@ -1893,10 +1971,10 @@ func isWordByte(c byte) bool {
 // scrubNormalized runs find over s with its markdown normalised away
 // (normalizeMarkdown) and redacts each span find reports in s itself, so
 // the markdown around a redacted value stays.
-func scrubNormalized(s string, find func(n string, rec func(lo, hi int))) string {
+func scrubNormalized(s string, sink secretSink, find func(n string, rec func(lo, hi int, named bool))) string {
 	n, idx := normalizeMarkdown(s)
 	var spans [][2]int
-	find(n, func(lo, hi int) {
+	find(n, func(lo, hi int, named bool) {
 		if hi <= lo {
 			return
 		}
@@ -1904,6 +1982,9 @@ func scrubNormalized(s string, find func(n string, rec func(lo, hi int))) string
 			lo, hi = idx[lo], idx[hi-1]+1
 		}
 		spans = append(spans, [2]int{lo, hi})
+		if named {
+			sink.emit(s[lo:hi])
+		}
 	})
 	return redactSpans(s, spans)
 }
