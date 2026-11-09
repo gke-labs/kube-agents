@@ -410,8 +410,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
-	// Only a console or MCP turn waits on its cards in turn (#5170); every
-	// other turn ends at its acknowledgement, as before the in-turn wait.
+	// Only a console, MCP or A2A door turn waits on its cards in turn
+	// (#5170, #5180); every other turn ends at its acknowledgement, as
+	// before the in-turn wait.
 	waitKanbanInTurn := waitsForCardsInTurn(run.origin)
 	if waitKanbanInTurn {
 		b.rememberConsoleSession(sessionID, run.origin)
