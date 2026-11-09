@@ -2129,7 +2129,12 @@ quoted, so I'm answering your words alone.` and the turn goes ahead on the words
 read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
 the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
 the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
-words go over unchanged to the refusal any message gets, and their bare quote is dropped.
+words go over unchanged to the refusal any message gets, and their bare quote is dropped. A read
+cut short by the gateway's shutdown posts no line and makes no turn: `quotedAsk` returns the
+shutdown reason when its context is cancelled on entry or when the cancel cut its read short, and
+`Run` drops a turn `quotedAsk` composed before the cancel with the same reason, so nothing is
+promised in the thread for a turn the restart drops, the adapter's at-most-once choice for an acked
+event.
 
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
