@@ -152,7 +152,7 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     # every kind of breakage -- a bad kubeconfig, an API server mid-upgrade, a
     # renamed namespace -- into a green run that applied nothing. Only a lease
     # somebody genuinely holds is a deferral; anything else is a failure.
-    if ! printf '%s' "${holder}" | grep -q '"state": "held"'; then
+    if ! grep -q '"state": "held"' <<<"${holder}"; then
       echo "::error title=Live-test lease could not be read::Could not determine whether '${ENV_NAME}' is in use, so this reconcile stopped rather than assuming either answer. ${holder}"
       summary "### Reconcile failed — \`${ENV_NAME}\`"
       summary ""

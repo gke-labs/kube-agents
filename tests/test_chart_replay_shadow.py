@@ -70,13 +70,10 @@ def _helm():
     return "helm"
 
 
-def _render(sets=(), chart=_CHART, show_only=None, typed_sets=()):
-    """Render the chart; `sets` go in as strings bar true/false, `typed_sets` as Helm parses them."""
+def _render(sets=(), chart=_CHART, show_only=None):
     args = [_helm(), "template", "test-release", str(chart)]
     for value in (*_REQUIRED, *sets):
         args += ["--set-string" if "=" in value and not value.endswith(("=true", "=false")) else "--set", value]
-    for value in typed_sets:
-        args += ["--set", value]
     if show_only:
         args += ["--show-only", show_only]
     return subprocess.run(args, capture_output=True, text=True, timeout=_HELM_TIMEOUT_SECONDS)
@@ -99,9 +96,6 @@ def _selects(selector, labels):
 
 class TemplateTextTest(unittest.TestCase):
     """What the template says, without rendering it."""
-
-    def test_callbacks_are_registered_only_through_their_classified_names(self):
-        self.assertNotRegex(_TEMPLATE.read_text(), r"proxy_handler_instance|\"otel\"|\"prometheus\"")
 
     def test_proxy_container_is_never_the_name_the_litellm_log_collector_reads(self):
         text = _TEMPLATE.read_text()
@@ -201,7 +195,8 @@ class EnabledTest(unittest.TestCase):
         self.assertEqual(self.container["image"], f"{_IMAGE_REPOSITORY}:{_IMAGE_TAG}")
 
     def test_fingerprint_inputs_are_what_litellm_runs(self):
-        self.assertRegex(self.env["REPLAY_MODEL_BEHAVIOUR_CHECKSUM"], r"^[0-9a-f]{64}$")
+        annotation = self.litellm["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+        self.assertEqual(self.env["REPLAY_LITELLM_CONFIG_CHECKSUM"], annotation)
         litellm_container = next(c for c in self.litellm["spec"]["template"]["spec"]["containers"]
                                  if c["name"] == _LITELLM_CONTAINER)
         self.assertEqual(self.env["REPLAY_LITELLM_IMAGE"], litellm_container["image"])
@@ -244,163 +239,6 @@ class EnabledTest(unittest.TestCase):
         self.assertEqual(litellm["ports"], [{"port": 8080, "protocol": "TCP"}])
         [peer] = litellm["to"]
         self.assertEqual(peer, {"podSelector": {"matchLabels": {"app": "litellm", _ROLE: "litellm"}}})
-
-
-# The two model routes hack/ci-deploy.sh renders: presubmits on Vertex AI, the
-# nightlies on the Gemini Developer API, the rest of its LiteLLM flags alike.
-_EVAL_MODEL = "gemini-4-argon"
-_EVAL_LITELLM = (
-    f"litellm.modelDefaultName={_EVAL_MODEL}",
-    "litellm.vertex.serviceAccountAnnotations.iam\\.gke\\.io/gcp-service-account=litellm@pool.iam.gserviceaccount.com",
-    "litellm.vertex.sessionAffinity.enabled=true",
-)
-_EVAL_LITELLM_TYPED = (
-    "litellm.fallback.numRetries=2",
-    "litellm.fallback.retryAfterSeconds=20",
-    "litellm.vertex.sessionAffinity.slots=1",
-)
-_VERTEX = ("litellm.modelProvider=vertex_ai", *_EVAL_LITELLM)
-_GEMINI_API = ("litellm.modelProvider=gemini", *_EVAL_LITELLM)
-# Not a Gemini thinking model, so the gemini render carries no thinking key and
-# only the route tells it from an openai_compatible one.
-_PLAIN_MODEL = "litellm.modelDefaultName=gemma-3-27b"
-_SERVER_A = "litellm.openaiCompatible.apiBase=https://llm-a.example.com/v1"
-_SERVER_B = "litellm.openaiCompatible.apiBase=https://llm-b.example.com/v1"
-
-_CALLBACKS_PROBE = """
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: probe-callbacks
-data:
-  callbacks: |
-    {{ include "kube-agents.litellmCallbacks" . }}
-"""
-# Every provider and flag combination that turns a callback on.
-_CALLBACK_RENDERS = (
-    (),
-    ("litellm.otel=true",),
-    ("litellm.modelProvider=anthropic",),
-    ("litellm.modelProvider=vertex_ai", "litellm.modelDefaultName=claude-opus-5"),
-    ("litellm.modelProvider=vertex_ai", f"litellm.modelDefaultName={_EVAL_MODEL}",
-     "litellm.vertex.sessionAffinity.enabled=true"),
-    ("litellm.redaction.enabled=true",),
-    ("litellm.traceLogEnabled=true",),
-    ("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A, "litellm.envFromSecret=ai-gateway-oauth"),
-    ("litellm.modelProvider=vertex_ai", f"litellm.modelDefaultName={_EVAL_MODEL}", "litellm.otel=true",
-     "litellm.vertex.sessionAffinity.enabled=true", "litellm.redaction.enabled=true", "litellm.traceLogEnabled=true"),
-)
-
-
-class ReplayKeyTest(unittest.TestCase):
-    """REPLAY_MODEL_BEHAVIOUR_CHECKSUM covers what decides the answer, not the route to the model."""
-
-    def render(self, sets, chart=_CHART, typed_sets=()):
-        res = _render((*_ON, *sets), chart=chart, show_only="templates/litellm.yaml",
-                      typed_sets=(*_EVAL_LITELLM_TYPED, *typed_sets))
-        self.assertEqual(res.returncode, 0, res.stderr)
-        docs = _docs(res.stdout)
-        container = _find(docs, "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
-        env = {e["name"]: e.get("value") for e in container["env"]}
-        rollout = _find(docs, "Deployment", "litellm")["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
-        return env["REPLAY_MODEL_BEHAVIOUR_CHECKSUM"], rollout
-
-    def test_vertex_and_gemini_api_routes_to_one_model_share_the_key(self):
-        vertex_key, _ = self.render(_VERTEX)
-        gemini_key, _ = self.render(_GEMINI_API)
-        self.assertEqual(vertex_key, gemini_key)
-
-    def test_the_pods_still_roll_when_the_route_changes(self):
-        _, vertex_rollout = self.render(_VERTEX)
-        _, gemini_rollout = self.render(_GEMINI_API)
-        self.assertNotEqual(vertex_rollout, gemini_rollout)
-
-    def test_openai_compatible_and_gemini_api_serving_one_model_name_keep_apart(self):
-        gemini_key, _ = self.render(("litellm.modelProvider=gemini", _PLAIN_MODEL))
-        server_key, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A))
-        self.assertNotEqual(gemini_key, server_key)
-
-    def test_two_openai_compatible_servers_keep_apart(self):
-        server_a, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_A))
-        server_b, _ = self.render(("litellm.modelProvider=openai_compatible", _PLAIN_MODEL, _SERVER_B))
-        self.assertNotEqual(server_a, server_b)
-
-    def test_retry_settings_leave_the_key_alone(self):
-        base, _ = self.render(_VERTEX)
-        retried, _ = self.render(_VERTEX, typed_sets=("litellm.fallback.numRetries=1",
-                                                      "litellm.fallback.retryAfterSeconds=30"))
-        self.assertEqual(base, retried)
-
-    def test_what_changes_the_answer_changes_the_key(self):
-        base, _ = self.render(_VERTEX)
-        for name, extra, typed in (
-            ("model", ("litellm.modelDefaultName=gemini-3.5-flash",), ()),
-            ("max tokens", (), ("litellm.maxTokens=4096",)),
-            ("thinking", ("litellm.reasoningEffort=high",), ()),
-            ("fallback alias", ("litellm.fallback.reasoningEffort=low",), ()),
-            ("redaction", ("litellm.redaction.enabled=true",), ()),
-        ):
-            with self.subTest(name):
-                changed, _ = self.render((*_VERTEX, *extra), typed_sets=typed)
-                self.assertNotEqual(base, changed)
-
-    def test_an_edit_to_a_request_rewriting_hook_changes_the_key(self):
-        base, _ = self.render(_VERTEX)
-        with tempfile.TemporaryDirectory() as tmp:
-            chart = pathlib.Path(tmp) / "kube-agents"
-            shutil.copytree(_CHART, chart)
-            hook = chart / "files" / "litellm_thinking_replay_callback.py"
-            hook.write_text(hook.read_text() + "\n# edited\n")
-            changed, _ = self.render(_VERTEX, chart=chart)
-        self.assertNotEqual(base, changed)
-
-    def test_an_edit_to_the_replica_routing_hook_leaves_the_key_alone(self):
-        base, _ = self.render(_VERTEX)
-        with tempfile.TemporaryDirectory() as tmp:
-            chart = pathlib.Path(tmp) / "kube-agents"
-            shutil.copytree(_CHART, chart)
-            hook = chart / "files" / "litellm_session_affinity_callback.py"
-            hook.write_text(hook.read_text() + "\n# edited\n")
-            changed, _ = self.render(_VERTEX, chart=chart)
-        self.assertEqual(base, changed)
-
-
-class CallbackClassesTest(unittest.TestCase):
-    """Every rendered callback is classified as in the replay key or out of it."""
-
-    @classmethod
-    def setUpClass(cls):
-        _helm()
-        cls.tmp = tempfile.mkdtemp()
-        cls.chart = pathlib.Path(cls.tmp) / "kube-agents"
-        shutil.copytree(_CHART, cls.chart)
-        (cls.chart / "templates" / "zz-probe.yaml").write_text(_CALLBACKS_PROBE)
-        res = _render(chart=cls.chart, show_only="templates/zz-probe.yaml")
-        if res.returncode != 0:
-            raise AssertionError(res.stderr)
-        classes = json.loads(_docs(res.stdout)[0]["data"]["callbacks"])
-        cls.keyed = set(classes["replayKeyed"].values())
-        cls.unkeyed = set(classes["replayUnkeyed"].values())
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, ignore_errors=True)
-
-    def test_no_callback_is_in_both_sets(self):
-        self.assertEqual(self.keyed & self.unkeyed, set())
-
-    def test_every_rendered_callback_is_classified(self):
-        seen = set()
-        for sets in _CALLBACK_RENDERS:
-            with self.subTest(sets=sets):
-                res = _render(sets, chart=self.chart, show_only="templates/litellm.yaml")
-                self.assertEqual(res.returncode, 0, res.stderr)
-                config = yaml.safe_load(_find(_docs(res.stdout), "ConfigMap", "litellm-config")["data"]["config.yaml"])
-                callbacks = config["litellm_settings"]["callbacks"]
-                self.assertEqual(set(callbacks) - self.keyed - self.unkeyed, set())
-                seen.update(callbacks)
-        # The renders above reach every classified callback, so none is a dead name.
-        self.assertEqual(seen, self.keyed | self.unkeyed)
 
 
 class PdbTest(unittest.TestCase):

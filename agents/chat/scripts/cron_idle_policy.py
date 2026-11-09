@@ -164,6 +164,11 @@ CRONITER_MODULE = "croniter"
 # How many characters of an error reach the ticker's output line.
 ERROR_EXCERPT_CHARS = 160
 
+# How many wall-clock steps a slot search takes before it gives up on finding
+# an instant after the horizon: the first step, and one more for the hour the
+# clocks skip in spring, which has no instant at all. Hermes takes the same two.
+WALL_CLOCK_STEPS = 2
+
 
 class SignalUnknown(RuntimeError):
     """The CR was read and says no reading can be given: the field is absent
@@ -407,15 +412,30 @@ def next_occurrence(
     The inclusive form reads ``horizon`` to the minute, the lattice a
     five-field expression lives on: a hold computed thirty seconds into the
     due minute still lands on tomorrow's slot rather than the day after's.
-    The expression is walked in ``zone``, the clock Hermes reads it by.
+    The expression is walked in ``zone``, the clock Hermes reads it by, and
+    on the naive wall clock, as Hermes' ``compute_next_run`` walks it:
+    croniter keeps the offset its start carried, so a zone-aware start walked
+    across a DST change lands an hour off the lattice Hermes writes, and
+    Hermes then re-anchors the stamp as an expression edit without firing.
+    The zone is put back on the wall-clock result, and on the day the clocks
+    go back the earlier of the two readings that is after the horizon wins.
     """
     from croniter import croniter
 
     base = horizon.astimezone(zone)
     if inclusive:
         base = base.replace(second=0, microsecond=0) - timedelta(seconds=1)
+    base_ts = base.timestamp()
     try:
-        return croniter(expr, base).get_next(datetime).astimezone(timezone.utc)
+        steps = croniter(expr, base.replace(tzinfo=None))
+        next_wall = steps.get_next(datetime)
+        for _ in range(WALL_CLOCK_STEPS):
+            for fold in (0, 1):
+                candidate = next_wall.replace(tzinfo=zone, fold=fold)
+                if candidate.timestamp() > base_ts:
+                    return candidate.astimezone(timezone.utc)
+            next_wall = steps.get_next(datetime)
+        return next_wall.replace(tzinfo=zone).astimezone(timezone.utc)
     except Exception:
         return None
 

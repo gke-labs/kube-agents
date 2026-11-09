@@ -3962,6 +3962,41 @@ class SnapshotTest(unittest.TestCase):
         self.assertGreater(by_path["zeros"], 1 << 20)
         self.assertLess(by_path["manifests"], 1 << 20)
 
+    def test_files_past_max_bytes_are_refused_with_the_entries(self):
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 64 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 1 << 20})
+        fields = caught.exception.fields
+        self.assertEqual(("SNAPSHOT_TOO_LARGE", 64 << 20), (fields["code"], fields["ceiling"]))
+        self.assertIn("zeros", [entry["path"] for entry in fields["entries"]])
+        self.assertIn("the caller unpacks at most", str(caught.exception))
+
+    def test_max_bytes_bounds_the_files_not_the_tar(self):
+        # Many small files: the tar's headers and padding pass the bound, the
+        # files do not, so the caller would have taken it and still does.
+        self.push_tree({f"small/{index}.txt": b"x" * 10 for index in range(50)})
+        self.broker.max_snapshot_bytes = 64 << 20
+        listing = self._listing_for([])
+        self.assertGreater(vcs_broker._tar_bytes(listing), 8192)
+        self.assertLess(vcs_broker._unpacked_bytes(listing), 8192)
+        answer = self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 8192})
+        self.assertTrue(answer["archiveBase64"])
+
+    def test_max_bytes_above_the_ceiling_changes_nothing(self):
+        self.push_tree({f"zeros/{index}.bin": b"\0" * (1 << 20) for index in range(4)})
+        self.broker.max_snapshot_bytes = 1 << 20
+        with self.assertRaises(WorkspaceError) as caught:
+            self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": 64 << 20})
+        self.assertEqual(1 << 20, caught.exception.fields["ceiling"])
+        self.assertIn("1048576-byte ceiling", str(caught.exception))
+
+    def test_max_bytes_that_is_not_a_whole_number_is_refused(self):
+        for raw in (-1, "1024", True, 1.5):
+            with self.subTest(raw=raw), self.assertRaises(WorkspaceError) as caught:
+                self.broker.snapshot({"repository": self.REPOSITORY, "maxBytes": raw})
+            self.assertIn("maxBytes", str(caught.exception))
+
     def test_with_paths_the_entries_are_the_children_of_each_asked_path(self):
         self.push_tree({
             **{f"deep/zeros/{index}.bin": b"\0" * (1 << 20) for index in range(2)},

@@ -331,8 +331,8 @@ types are added by PR as needs arise. Layout mirrors OKF: `knowledge/{index.md, 
 links form the knowledge graph; optional `log.md` for history. Agents **read** OKF for context and
 **propose** updates via PR (curate-as-code); humans approve. OKF holds durable knowledge only —
 **not** session state. An entry of any type may carry `declares:`, a list of
-`{check, namespace, object}` items (plus `cluster` for a one-cluster choice) that an audit reads as a
-declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from.
+`{check, namespace, object}` items (plus `cluster` for a one-cluster choice and `expires`, a `YYYY-MM-DD`
+UTC date, for one that lapses unless renewed) that an audit reads as a declared posture; `.kube-agents/intent.yaml` at the repository root names the paths it reads them from.
 
 ## 6. Session-state contract (mem0 deferred post-v1)
 

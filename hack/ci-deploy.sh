@@ -229,7 +229,7 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # The broker admits a request only while its child memory reservation fits the
 # budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
 # docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
-# admits nine, so the slot cap of eight is the binding bound. The operator's
+# admits ten, so the slot cap of eight is the binding bound. The operator's
 # default limit is 2Gi as well, and so is its default memory request on GKE
 # Autopilot, so today this override changes nothing. It stays as a pin: if the
 # operator default moves, the eval install keeps the budget its cases were
@@ -244,7 +244,8 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # the broker's 60s refusal: Cluster Agents' commands timed out and the judge
 # graded the answers as regressions on pull requests that never touched the
 # path. #2455's live test ran this figure: the broker's startup line read
-# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# "admits 9 requests at once beside the slot cap of 8", before the 128 MiB
+# workspace term left the budget (it reads 10 now). Set on this install
 # only, through spec.deployment.credentialProxy.resources. A string, because
 # the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a
@@ -1315,7 +1316,7 @@ if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
   fi
   # A CA, not any certificate: the grader verifies strictly, so a leaf or a
   # CA without CA:TRUE fails after the build. hack/ghes-proxy/make-certs.sh sets it.
-  if ! openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null | grep -q 'CA:TRUE'; then
+  if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CA_FILE}" 2>/dev/null)"; then
     echo "ERROR: ${FORGE_CA_FILE} is not a CA certificate (it does not parse, or its basicConstraints lack CA:TRUE); make it with hack/ghes-proxy/make-certs.sh on Linux (kube-agents#3682)." >&2
     exit 1
   fi
@@ -1403,7 +1404,7 @@ if [ "${GITOPS_REPO}" = "none" ]; then
   GITOPS_REPO=""
 elif [ -z "${GITOPS_REPO}" ] && [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   : # resolved above: no GitHub repository under the gitlab kind
-elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+elif ! grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' <<<"${GITOPS_REPO}"; then
   echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
   echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2
   echo "       shorthand is what CI passes — not a URL." >&2

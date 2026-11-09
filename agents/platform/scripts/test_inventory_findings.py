@@ -57,6 +57,10 @@ class ParseBlockTests(unittest.TestCase):
         text = raw_file(item_line(object="api")) + "\n```findings\n" + item_line(object="web") + "\n```\n"
         self.assertEqual([i["object"] for i in inv.parse_block(text)], ["api", "web"])
 
+    def test_a_line_may_name_the_clusters_location(self):
+        [item] = inv.parse_block(raw_file(item_line(location="us-east4")))
+        self.assertEqual(item["location"], "us-east4")
+
     def test_longer_fence_and_trailing_space_are_accepted(self):
         text = f"````findings  \n{item_line()}\n````\n"
         self.assertEqual(len(inv.parse_block(text)), 1)

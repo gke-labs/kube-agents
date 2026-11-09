@@ -413,7 +413,10 @@ Layout:
   callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
   consumer rule that rests on all of this and enumerates what is not yet decision-grade -
   including a redirection route onto `…supervisor` that no assertion pins. Read that
-  section before treating any class as closed.
+  section before treating any class as closed. A profile task's submission has a subject of its own,
+  `a2a.submit.<profile>.<tier>.<kind>.<task>` on the `PROFILE_SUBMITS` stream, and the gateway is its one writer: the
+  dispatcher reads it through its durables, and no executor's grant reaches it
+  (`test_A3_the_submit_subject_has_exactly_one_writer`).
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is
@@ -924,7 +927,7 @@ on a new config, every client reconnects, and whichever callout replica answers 
 places it by the map that replica holds. A connection placed by the previous map stays in
 that map's account until it next reconnects. So a running bus moves to a new config only
 once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
-(`a2aBusWaitsForCallout`). Readiness does not hold it: a current replica that is not ready places
+(`a2aBusWaitsForCallout`). Readiness alone does not hold it: a current replica that is not ready places
 nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
 reconciled ahead of both. A fresh install is not held, since there is no running bus. The
 wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
@@ -933,6 +936,11 @@ key change. The release records a Warning event, and the `A2ACalloutRolloutStall
 stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
 Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
 terminating one only until its deletion deadline.
+A bus that is down does not wait either: when its pod has not been Ready for two minutes and no
+callout replica is Ready, the bus admits no new connection and the hold can only end at the
+progress deadline, since a callout replica is not Ready without the bus. The release records an
+`A2ABusHoldSkipped` Warning event. Once the bus is back, a pod of an older ReplicaSet can answer a
+reconnect until the callout's rollout finishes, the same window the stall release opens.
 While the bus waits, a reconnect is placed by the current map, which can name an account the
 running config does not have yet. That connection is refused until the bus moves, which
 fails closed.

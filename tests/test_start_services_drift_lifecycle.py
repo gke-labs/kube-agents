@@ -1167,8 +1167,9 @@ class NormalizeBooleanResolvesWhatTheWatcherIsHandedAsAFlag(_ScriptCase):
 
 
 # The eight tunables the script hands the watcher as duration or count flags,
-# and which normaliser each goes through. The positive flag marks the one whose
-# validate() also refuses zero.
+# and which normaliser each goes through. The positive flag marks the ones that
+# also refuse zero: validate() rejects a zero window, and the watcher replaces
+# a zero hold or count with its default without a log line.
 _WATCHER_DURATION_KNOBS = {
     "WATCHER_DEDUP_WINDOW": "--dedup-window",
     "WATCHER_FAILEDSCHEDULING_MIN_SPAN": "--failedscheduling-min-span",
@@ -1176,7 +1177,13 @@ _WATCHER_DURATION_KNOBS = {
     "WATCHER_SETTLE": "--settle",
     "WATCHER_QUIET_AFTER": "--quiet-after",
 }
-_WATCHER_POSITIVE_DURATION_KNOBS = ("WATCHER_DEDUP_WINDOW",)
+_WATCHER_POSITIVE_KNOBS = (
+    "WATCHER_DEDUP_WINDOW",
+    "WATCHER_SCALEUP_HOLD",
+    "WATCHER_BACKOFF_MIN_COUNT",
+    "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT",
+    "WATCHER_FAILEDSCHEDULING_MIN_COUNT",
+)
 _WATCHER_COUNT_KNOBS = {
     "WATCHER_BACKOFF_MIN_COUNT": "--backoff-min-count",
     "WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT": "--imagepull-transient-min-count",
@@ -1291,6 +1298,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             with self.subTest(value=value):
                 result = self._resolve("normalize_duration", value, "24h", "positive")
                 self.assertIn("resolved=24h", result.stdout)
+                self.assertIn("SETTING=", result.stderr)
                 self.assertIn("above zero", result.stderr)
         for value in ("30m", "1ns", "1.5ns", "0.001us", "0.5s"):
             with self.subTest(value=value):
@@ -1304,6 +1312,22 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 result = self._resolve("normalize_count", value, _FALLBACK_COUNT)
                 self.assertIn(f"resolved={want}", result.stdout)
                 self.assertEqual("", result.stderr)
+
+    def test_the_positive_count_form_refuses_zero(self) -> None:
+        for value in ("0", "00", " 0 "):
+            with self.subTest(value=repr(value)):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT, "positive")
+                self.assertIn(f"resolved={_FALLBACK_COUNT}", result.stdout)
+                self.assertIn("SETTING=", result.stderr)
+                self.assertIn("above zero", result.stderr)
+        for value, want in (("1", "1"), ("08", "8"), ("10", "10")):
+            with self.subTest(value=value):
+                result = self._resolve("normalize_count", value, _FALLBACK_COUNT, "positive")
+                self.assertIn(f"resolved={want}", result.stdout)
+                self.assertEqual("", result.stderr)
+        result = self._resolve("normalize_count", "abc", _FALLBACK_COUNT, "positive")
+        self.assertIn(f"resolved={_FALLBACK_COUNT}", result.stdout)
+        self.assertIn("is not a usable count", result.stderr)
 
     def test_a_count_the_watcher_would_reject_lands_on_the_default_and_says_so(self) -> None:
         # Nineteen digits can overflow the int64 the flag package parses into.
@@ -1391,7 +1415,7 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
                 with self.subTest(name=name):
                     lift_constant(f"{name}_DEFAULT", self.text, _SCRIPT)
                     self.assertIn(f'{name}="${{{name}:-${{{name}_DEFAULT}}}}"', self.text)
-                    suffix = " positive" if name in _WATCHER_POSITIVE_DURATION_KNOBS else ""
+                    suffix = " positive" if name in _WATCHER_POSITIVE_KNOBS else ""
                     self.assertRegex(
                         self.text,
                         rf'(?m)^{helper} {name} "\$\{{{name}_DEFAULT\}}"{suffix}$',
