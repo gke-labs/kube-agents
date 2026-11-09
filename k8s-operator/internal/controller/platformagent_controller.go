@@ -179,13 +179,29 @@ const (
 
 	// readyConditionType and degradedPhase are the condition and the phase
 	// getDeploymentStatusDetails reads back off the CR when a pod read failed.
-	// The three phases this controller writes are these constants and never
+	// The four phases this controller writes are these constants and never
 	// a literal: usagePhases (usage_gauges.go) exports them, and a test holds
 	// the package to it.
 	readyConditionType = "Ready"
 	provisioningPhase  = "Provisioning"
 	readyPhase         = "Ready"
 	degradedPhase      = "Degraded"
+	// pausedPhase is the phase of an install whose gateway runs zero replicas
+	// because spec.deployment.scaleToZero asked for it, from the pass that sees
+	// the scale-down converged until the field is cleared. Without it a paused
+	// install read Provisioning with the start-up message, the same words as a
+	// rollout that never finishes, and nothing on the CR told the two apart.
+	pausedPhase = "Paused"
+	// reasonScaledToZero and scaledToZeroMessage are the Ready condition under
+	// pausedPhase. Ready stays False: a paused agent answers nothing.
+	// scaledToZeroNotReadyMsgFmt is the message when a workload that is not
+	// scaled with the gateway (the shell sandbox, the broker, the A2A stack)
+	// has no ready replica either: the pause is still the phase, but the
+	// message may not claim "not failing" over a workload the pod scan found
+	// no fault in and that is nonetheless not up. %s is the not-ready list.
+	reasonScaledToZero         = "ScaledToZero"
+	scaledToZeroMessage        = "Gateway runs zero replicas because spec.deployment.scaleToZero is true; the install is paused, not failing. Set scaleToZero to false to resume"
+	scaledToZeroNotReadyMsgFmt = "Gateway runs zero replicas because spec.deployment.scaleToZero is true; the install is paused, and it is also waiting for %s to become ready. Set scaleToZero to false to resume"
 	// podScanMessagePrefixContainer and podScanMessagePrefixPod open every
 	// message getDeploymentStatusDetails writes, and nothing else that writes
 	// the Ready condition opens with either: the refusals in Reconcile name a
@@ -4596,6 +4612,22 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
+		} else if scaleToZeroRequested(agent.Spec.Deployment) && newDeploymentStatusReadyReplicas == 0 {
+			// A gateway at zero because the spec asked for it. After the pod
+			// scan, so a fault in the workloads that keep running (the shell
+			// sandbox, the broker, the A2A stack) still reads Degraded; before
+			// the start-up wait, which is what this install is not. Only once
+			// the scale-down converged: a replica still serving is still Ready,
+			// and the first arm has said so.
+			newPhase = pausedPhase
+			condReason = reasonScaledToZero
+			condMsg = scaledToZeroMessage
+			if len(notReady) > 0 {
+				// The arm below never reaches a paused install (it needs a
+				// gateway replica), so the not-ready list is named here, as
+				// it would be there, rather than hidden behind the pause.
+				condMsg = fmt.Sprintf(scaledToZeroNotReadyMsgFmt, strings.Join(notReady, " and "))
+			}
 		} else if newDeploymentStatusReadyReplicas > 0 && len(notReady) > 0 {
 			// The gateway is up and the pod scan found no fault to name, so the
 			// generic "waiting for replicas" message would point at the one
