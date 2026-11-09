@@ -1980,7 +1980,7 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # What that message says about the harm: the days the periodic
         # breached on, the longest wait among them (the window's when none
         # is a day's), and how many runs are queued right now.
-        "breached_days": [d for d in (trend.get("breached_days") or []) if isinstance(d, str)],
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
         "worst_s": _worst_breached_s(trend),
         "waiting": _count(_section(artifact, "queue").get("waiting")),
     }

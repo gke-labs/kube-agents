@@ -1878,6 +1878,12 @@ class PoolNote(unittest.TestCase):
             if row.get("breached"):
                 row["worst_minutes"] = True
         self.assertEqual(health.pool_note(bad, T0, None)["worst_s"], 300 * 60)
+        # A `breached_days` that is not a list is no days, not a crashed tick
+        # and not a day per character.
+        for wrong in (True, 1, "2026-09-06", {"2026-09-06": 1}):
+            with self.subTest(breached_days=wrong):
+                bad["trend"]["breached_days"] = wrong
+                self.assertEqual(health.pool_note(bad, T0, None)["breached_days"], [])
 
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet
