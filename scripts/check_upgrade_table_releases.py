@@ -7,7 +7,8 @@ The "Breaking changes in recent releases" table labels each row with the release
 first meets the change in. A pull request writes that label when it merges, naming the release
 its author expects next, and a release cut from an earlier commit leaves the label wrong. Once a
 release is tagged, this check finds the commit that added each row labelled with it (the oldest
-commit whose diff adds a table cell holding the row's change text) and requires the tag to contain
+commit whose diff adds a table row with the change text in its change cell, after the last commit
+that removed such a row) and requires the tag to contain
 that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
 to the release branch). A row whose release has no tag yet is not checked. Nor is a row for a
 release tagged before the table itself was added: those rows were written afterwards, about
@@ -33,16 +34,21 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 UPGRADE_PAGE = "docs/site/src/content/docs/install/upgrade.md"
 TABLE_HEADING = "### Breaking changes in recent releases"
 # A table row: `| <release> | <change> | ...`. The change cell is the row's stable name.
 ROW = re.compile(r"^\| (?P<release>\d+\.\d+\.\d+)\s*\| (?P<change>[^|]+?)\s*\|", re.MULTILINE)
-# A line a diff adds to the table starts with this; a commit counts as adding a row only when one of
-# its added lines is a table row holding the change text, so a mention of the same words in prose
-# does not stand in for the row, and a row whose cell later lost a prefix still traces to its start.
-ADDED_TABLE_LINE = "+|"
+# A table line in a diff: `git log -G` lists the commits that add or remove one. A commit counts as
+# adding a row only when one of its added lines holds the change text in its second (change) cell, so
+# the same words in prose or in another cell do not stand in for the row; the first cell may still say
+# `pending`, and a row whose cell later lost a prefix still traces to its start.
+DIFF_TABLE_LINE = r"^\| "
+TABLE_LINE = re.compile(r"^\| [^|]*\| (?P<change>[^|]+?)\s*\|")
+ADDED = "+"
+REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -93,13 +99,31 @@ def oldest_adding(text: str) -> str | None:
     return commits[0] if commits else None
 
 
+@cache
+def row_commits() -> list[str]:
+    """The commits in HEAD's history whose diff of the page adds or removes a table line, oldest first."""
+    return git("log", "--format=%H", "--reverse", "-G", DIFF_TABLE_LINE, "HEAD", "--", UPGRADE_PAGE).split()
+
+
+@cache
+def page_diff(commit: str) -> list[str]:
+    return git("show", "--format=", commit, "--", UPGRADE_PAGE).splitlines()
+
+
+def holds(diff: list[str], sign: str, change: str) -> bool:
+    return any(line.startswith(sign) and (m := TABLE_LINE.match(line[1:])) and change in m["change"] for line in diff)
+
+
 def row_commit(change: str) -> str | None:
-    """The oldest commit whose diff of the page adds a table row holding `change`."""
-    for commit in commits_adding(change):
-        diff = git("show", "--format=", commit, "--", UPGRADE_PAGE).splitlines()
-        if any(line.startswith(ADDED_TABLE_LINE) and change in line for line in diff):
-            return commit
-    return None
+    """The oldest commit that adds a table row holding `change` since the last commit that removed it."""
+    origin = None
+    for commit in row_commits():
+        diff = page_diff(commit)
+        if holds(diff, ADDED, change):
+            origin = origin or commit
+        elif holds(diff, REMOVED, change):
+            origin = None
+    return origin
 
 
 def commit_time(commit: str) -> int:

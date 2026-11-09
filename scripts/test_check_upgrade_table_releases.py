@@ -169,6 +169,41 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('"change k"', err)
 
+    def test_an_earlier_mention_in_another_rows_cell_does_not_stand_in_for_the_row(self):
+        self.repo.commit("feat: m", row="| 0.9.0 | change m | change k comes later |\n")
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: k", row=row("1.0.0", "change k"))
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('"change k"', err)
+
+    def test_a_row_moved_from_prose_in_one_commit_traces_to_that_commit(self):
+        self.repo.prose = "Later releases: change k is coming.\n\n"
+        self.repo.write_page()
+        self.repo.commit("docs: mention change k")
+        self.repo.prose = ""
+        self.repo.commit("feat: k", row=row("1.0.0", "change k"))
+        self.repo.tag("1.0.0")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_row_added_as_pending_and_labelled_after_the_cut_traces_to_its_first_commit(self):
+        self.repo.commit("feat: p", row=row("pending", "change p"))
+        self.repo.tag("1.0.0")
+        self.repo.relabel("change p", "1.0.0")
+        self.repo.commit("docs: label the 1.0.0 rows", code=False)
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_a_row_reverted_before_the_cut_and_relanded_after_it_fails(self):
+        self.repo.commit("feat: b", row=row("1.0.0", "change b"))
+        self.repo.rows.remove(row("1.0.0", "change b"))
+        self.repo.write_page()
+        self.repo.commit("revert: b")
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b again", row=row("1.0.0", "change b"))
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('"change b"', err)
+
     def test_a_row_whose_cell_later_lost_a_prefix_traces_to_its_first_commit(self):
         self.repo.commit("feat: j", row=row("1.0.0", "#12: change j"))
         self.repo.tag("1.0.0")
