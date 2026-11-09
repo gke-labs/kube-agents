@@ -309,7 +309,7 @@ identifier appears, add its source here.
 | Chat platforms an install posts to, the order, and the fallback | `agents/platform/scripts/chat_platforms.py` |
 | Which deliverables a Google Chat thread gets pasted inline, the size ceiling, and the per-message budget | `agents/platform/scripts/google_chat_relay_patch.py` |
 | Staging a sandbox-written artifact out for delivery: the per-file, per-card and total ceilings, the deadline, and the denied prefixes | `agents/platform/scripts/sandbox_artifact_patch.py` |
-| fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
+| fleet-audit finding-id pattern, rendering caps, and the declaration `expires` format and expired-line text | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | fleet-audit report store: root, `FLEET_AUDIT_REPORTS_DIR`, ring size, stamp format, and the in-flight TTL | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`report_status.py` beside it copies the root and the TTL, and `kcc_health.py` copies the in-flight note path and the TTL) |
 | fleet-audit precheck: the digest record's path, the refresh age, the verdict names, the volatile manifest, command and candidate keys, the settled outcomes, and the `precheck` envelope key | `DIGEST_FILE_TEMPLATE`, `DEFAULT_MAX_SILENT_AGE_SECONDS`, `VERDICT_*`, `VOLATILE_*_KEYS` and `SETTLED_OUTCOMES` in `agents/platform/skills/fleet-audit/scripts/manifest_delta.py`; `PRECHECK_KEY` in `audit_report.py` beside it |
 | fleet-audit route-note caps: the longest path or reconciler a route note shows | `ROUTE_PATH_MAX_CHARS` and `ROUTE_RECONCILER_MAX_CHARS` in `agents/platform/skills/fleet-audit/scripts/audit_report.py` |

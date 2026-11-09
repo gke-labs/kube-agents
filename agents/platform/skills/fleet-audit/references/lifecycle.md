@@ -203,7 +203,8 @@ file names a path with nothing behind it, is copied whole under those caps. `sta
 at `declarations_path` and lists each repository it read completely — every note under the
 searched paths arrived and was read; one the broker withheld or the harness could not decode costs
 the repository its entry, a symlink there being no note in either mode — as `owner/name@sha`. `finish` unions that list into the document's and
-moves every finding a filed declaration covers to `declared` itself. A slug in `declared_intent_repos` missing
+moves every finding a filed, still-standing declaration covers to `declared` itself; a filed item
+whose `expires` has passed moves nothing (`findings-document.md`, `declared`). A slug in `declared_intent_repos` missing
 from `declared_intent_searched` is one the harness could not read; `declared_intent_unsearched`
 lists each as `{repo, ref}`, stderr says why, and the SOP says what the worker does about it — its
 own copy at that `ref`. An entry whose `ref` failed the branch-name check carries the value under
