@@ -14,6 +14,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().with_name("check_upgrade_table_releases.py")
 PAGE = "docs/site/src/content/docs/install/upgrade.md"
+HEADING = "### Breaking changes in recent releases\n\n"
 HEADER = "| Release | Change | What an existing install meets |\n| --- | --- | --- |\n"
 
 
@@ -24,6 +25,7 @@ class Repo:
         self.root = root
         self.clock = 1_700_000_000
         self.rows: list[str] = []
+        self.prose = ""
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.email", "test@example.com")
         self.git("config", "user.name", "Test")
@@ -43,7 +45,7 @@ class Repo:
     def write_page(self) -> None:
         page = self.root / PAGE
         page.parent.mkdir(parents=True, exist_ok=True)
-        page.write_text("# Upgrade\n\n" + HEADER + "".join(self.rows), encoding="utf-8")
+        page.write_text("# Upgrade\n\n" + self.prose + HEADING + HEADER + "".join(self.rows), encoding="utf-8")
 
     def commit(self, message: str, *, row: str | None = None, code: bool = True) -> str:
         if row is not None:
@@ -59,6 +61,10 @@ class Repo:
 
     def tag(self, name: str, commit: str = "HEAD") -> None:
         self.git("tag", "-a", name, "-m", name, commit, at=self.tick())
+
+    def reword(self, old: str, new: str) -> None:
+        self.rows = [r.replace(f"| {old} |", f"| {new} |") for r in self.rows]
+        self.write_page()
 
     def relabel(self, change: str, release: str) -> None:
         self.rows = [f"| {release} | {change} | x |\n" if f"| {change} |" in r else r for r in self.rows]
@@ -117,10 +123,37 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.git("checkout", "-q", "main")
         self.assertEqual(self.repo.check(), (0, ""))
 
-    def test_a_documentation_only_row_written_after_its_release_is_a_record(self):
-        self.repo.commit("feat: e")
+    def test_a_row_for_a_release_tagged_before_the_table_existed_is_not_checked(self):
+        root = Path(self.tmp.name) / "older"
+        root.mkdir()
+        repo = Repo(root)
+        repo.commit("feat: before the table")
+        repo.tag("0.5.0")
+        repo.commit("docs: start the table, listing 0.5.0", row=row("0.5.0", "change e"), code=False)
+        self.assertEqual(repo.check(), (0, ""))
+
+    def test_a_documentation_only_row_naming_a_release_cut_before_it_fails(self):
         self.repo.tag("1.0.0")
-        self.repo.commit("docs: list what 1.0.0 changed", row=row("1.0.0", "change e"), code=False)
+        self.repo.commit("docs: label the change 1.0.0", row=row("1.0.0", "change e"), code=False)
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('"change e"', err)
+
+    def test_an_earlier_mention_in_prose_does_not_stand_in_for_the_row(self):
+        self.repo.prose = "Later releases: change k is coming.\n\n"
+        self.repo.write_page()
+        self.repo.commit("docs: mention change k")
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: k", row=row("1.0.0", "change k"))
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('"change k"', err)
+
+    def test_a_row_whose_cell_later_lost_a_prefix_traces_to_its_first_commit(self):
+        self.repo.commit("feat: j", row=row("1.0.0", "#12: change j"))
+        self.repo.tag("1.0.0")
+        self.repo.reword("#12: change j", "change j")
+        self.repo.commit("docs: drop the pull-request prefixes", code=False)
         self.assertEqual(self.repo.check(), (0, ""))
 
     def test_a_documentation_only_row_written_before_the_cut_and_left_out_fails(self):
