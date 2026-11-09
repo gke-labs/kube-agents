@@ -458,6 +458,17 @@ for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for an `api
 exhaustion that ends with no response — and retrying re-runs into the same wall, so read that text
 and the upstream error rate before suspecting the worker.
 
+A `maxTurns` exhaustion keeps what the run found. At the cap the runtime asks the model for a
+closing summary and discards any tool call in the answer, and the worker saves the summary as the
+run's hand-off. `hermes kanban show <id>` prints it as the card's latest summary, the card carries
+it as a comment that names the budget used, and the next attempt reads it in its prompt under the
+prior attempt. The card's own `result` stays empty, as for every run that does not complete.
+
+The text is the model's, cut on a word at 4000 characters. When the summary call fails, the
+worker's last written answer is saved instead, and the comment says so. A summary that names a
+GitHub pull request URL is saved on the run only, with no comment: the dispatcher holds a card whose
+recent comments name one, and the retry is what the hand-off is for.
+
 One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on provider rate
 limits (429s), the worker blocks its own card instead, kind `transient`, with the provider's error
 text as the reason; `kanban_unblock` it once the quota window has passed. A second rate-limit block

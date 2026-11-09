@@ -1118,10 +1118,11 @@ type AgentLimits struct {
 	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
 
 	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-	// a run that does cannot even produce a closing summary. Repository exploration is
-	// the main consumer, so size this against how much the agent has to read, not
-	// against how complex the request is.
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+	// kanban worker that does ends with its closing summary saved on its card for the
+	// retry, not with the result it was asked for. Repository exploration is the main
+	// consumer, so size this against how much the agent has to read, not against how
+	// complex the request is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
