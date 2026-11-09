@@ -1666,6 +1666,11 @@ MAX_COMMAND_CHARS = 2000
 MAX_TITLE_CHARS = 300
 MAX_TEXT_CHARS = 1500
 MAX_NOTE_CHARS = 2000
+# A target's `notes`: what the collector read but could not show, written for
+# the reader and never counted as a coverage gap (`scope_notes`). The GCE
+# collector's rotated serial consoles are the one producer
+# (docs/designs/fleet-audit-collector-manifest.md).
+SCOPE_NOTES_KEY = "notes"
 MAX_CELL_CHARS = 120
 # `cluster`, `namespace` and `object` are Kubernetes identifiers, and the API
 # bounds every one of them: a namespace is a 63-character DNS label, a resource
@@ -5714,6 +5719,8 @@ def _validate_findings_document(data: object, audit_id: str, expiry_day: date | 
             f"scope.clusters[{i}].limitations",
             allow_empty=False,
         )
+        if SCOPE_NOTES_KEY in cluster:
+            _require_str_ok(cluster.get(SCOPE_NOTES_KEY), f"scope.clusters[{i}].{SCOPE_NOTES_KEY}")
         if CLUSTERS_LISTED_KEY in cluster:
             listed = cluster[CLUSTERS_LISTED_KEY]
             if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
@@ -7534,6 +7541,51 @@ def _candidates(manifest: dict | None):
         for candidate in entry.get("candidates") or []:
             if isinstance(candidate, dict):
                 yield entry, candidate
+
+
+def adopt_collector_notes(data: dict, manifest: dict | None) -> list[str]:
+    """Copy each collected target's `notes` from the manifest onto the
+    document's target of the same name. Returns the names changed.
+
+    A note is the collector's own sentence about what it read but could not
+    show, so it is taken from the collector, as the evidence is, rather than
+    left to the model to copy. It is information, not a gap: `coverage_gaps`
+    never reads it.
+    """
+    if not isinstance(manifest, dict):
+        return []
+    by_name = {
+        str(entry.get("name")): str(entry.get(SCOPE_NOTES_KEY) or "").strip()
+        for entry in manifest.get("clusters") or []
+        if isinstance(entry, dict) and entry.get("outcome") == MANIFEST_OUTCOME_COLLECTED
+    }
+    changed = []
+    for cluster in (data.get("scope") or {}).get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        note = by_name.get(str(cluster.get("name")))
+        if note:
+            cluster[SCOPE_NOTES_KEY] = note[:MAX_NOTE_CHARS]
+            changed.append(str(cluster.get("name")))
+    return changed
+
+
+def scope_notes(data: dict) -> list[str]:
+    """`<target>: <note>` for every audited target that carries `notes`.
+
+    Rendered on the ledger (the scope table and the clean comment) so a run
+    never reads as having cleared what it could not see; never a coverage gap,
+    because what it describes is the ordinary state of a healthy fleet.
+    """
+    out = []
+    for cluster in (data.get("scope") or {}).get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        note = publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).strip()
+        if note:
+            name = str(cluster.get("name", "")).strip() or "(unnamed)"
+            out.append(f"{name}: {note[:MAX_NOTE_CHARS]}")
+    return out
 
 
 def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
@@ -12422,6 +12474,7 @@ def _render_scope(
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     show_limitations = any(str(c.get("limitations", "")).strip() for c in clusters)
+    show_notes = any(str(c.get(SCOPE_NOTES_KEY, "")).strip() for c in clusters)
     roster = audit_checks(audit_id)
 
     out = ["", "## Scope", "", f"Audited {scope_phrase(audit_id, clusters)} on {stamp}."]
@@ -12433,6 +12486,9 @@ def _render_scope(
     if show_limitations:
         header += " Limitations |"
         rule += " ----------- |"
+    if show_notes:
+        header += " Notes |"
+        rule += " ----- |"
     out += ["", header, rule]
     for cluster in clusters[:MAX_SCOPE_ROWS]:
         row = (
@@ -12458,10 +12514,14 @@ def _render_scope(
             row += f"| {complete}/{applicable}{note}{flag} "
         if show_limitations:
             row += f"| {_cell(cluster.get('limitations', '')) or '—'} "
+        if show_notes:
+            # Not a gap, so not in the Limitations column: the row's checks
+            # ran, and this says what one of them could not see.
+            row += f"| {_cell(cluster.get(SCOPE_NOTES_KEY, ''), limit=MAX_NOTE_CHARS) or '—'} "
         out.append(row + "|")
     if len(clusters) > MAX_SCOPE_ROWS:
         remaining = len(clusters) - MAX_SCOPE_ROWS
-        columns = 3 + bool(roster) + bool(show_limitations)
+        columns = 3 + bool(roster) + bool(show_limitations) + bool(show_notes)
         out.append(f"| _…and {remaining} more_ " + "|  " * (columns - 1) + "|")
 
     if skipped:
@@ -13856,6 +13916,16 @@ def render_clean_comment(
         out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+
+    # What the run read but could not see, which is not a gap: a clean
+    # comment is the one place a clean run says so, because it does not
+    # rewrite the body's scope table.
+    notes = scope_notes(data)
+    if notes:
+        out += ["", f"Read but not visible, which is not a coverage gap ({len(notes)}):", ""]
+        out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
+        if len(notes) > MAX_SCOPE_ROWS:
+            out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
 
     # The postures held back for want of a declared-intent search, one per
     # line. A clean run over a withheld posture is a clean run only because
@@ -21357,6 +21427,9 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
         limitations = "; ".join(part for part in (entry_limitations, unevaluated_note) if part)
         if limitations:
             cluster["limitations"] = limitations
+        note = str(entry.get(SCOPE_NOTES_KEY) or "").strip()
+        if note:
+            cluster[SCOPE_NOTES_KEY] = note
         clusters.append(cluster)
         for candidate in entry.get("candidates") or []:
             if not isinstance(candidate, dict):
@@ -24152,6 +24225,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # Before anything reads `evidence` — the dry-run preview and the ledger
         # body both do — so what renders is what the collector observed.
         adopted = adopt_collector_evidence(data["findings"], manifest)
+        adopt_collector_notes(data, manifest)
         if adopted:
             shown = ", ".join(adopted[:MANIFEST_LOG_IDS])
             if len(adopted) > MANIFEST_LOG_IDS:

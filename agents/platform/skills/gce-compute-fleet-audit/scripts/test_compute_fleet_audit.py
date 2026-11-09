@@ -1105,10 +1105,11 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
         self.assertNotIn(cf.STARTUP_SLUG, {e["check"] for e in entry["checks_not_applicable"]})
 
-    def test_a_rotated_console_is_unevaluated_not_clean(self):
-        """The planted VM after three weeks: its console was read, the boot
-        that ran the script is gone from it, and the project used to come
-        back with no candidate and the check in `checks_run`."""
+    def test_a_rotated_console_is_a_note_not_a_clean_pass_or_a_gap(self):
+        """The planted VM after three weeks: its console was read, and the boot
+        that ran the script is gone from it. The check ran and the run claims
+        nothing about that VM: no candidate, no limitation, no unevaluated
+        slug, and a note that names it."""
         entry = cf.collect_project(
             "proj-1",
             run=self.fake_run(self.clean(**{
@@ -1118,10 +1119,11 @@ class CollectProjectTest(unittest.TestCase):
         )
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual(entry["candidates"], [])
-        self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
-        self.assertIn("rotated past the boot", unevaluated(entry)[cf.STARTUP_SLUG])
-        self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
-        self.assertIn("passed over these instances rather than cleared them: startup-fail-seeded (us-central1-a)", entry["limitations"])
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertNotIn("limitations", entry)
+        self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+        self.assertIn("is not visible", entry["notes"])
+        self.assertIn("startup-fail-seeded (us-central1-a)", entry["notes"])
 
     def test_a_fresh_console_is_still_a_finding(self):
         entry = cf.collect_project(
@@ -1132,10 +1134,19 @@ class CollectProjectTest(unittest.TestCase):
             })),
         )
         self.assertEqual([c["excerpt"] for c in entry["candidates"]], [RECORDED_FAILURE_LINE])
-        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
         self.assertNotIn("limitations", entry)
+        self.assertNotIn("notes", entry)
 
-    def test_one_rotated_console_beside_a_read_one_is_a_partial_read(self):
+    def test_a_fresh_console_with_a_clean_run_reads_clean(self):
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{"get-serial-port-output": run_of(0, FRESH_CLEAN_SERIAL)})),
+        )
+        self.assertEqual(entry["candidates"], [])
+        self.assertNotIn("limitations", entry)
+        self.assertNotIn("notes", entry)
+
+    def test_a_refused_console_beside_a_rotated_one_is_the_only_gap(self):
         instances = (
             '[{"name": "vm-1", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}, '
             '{"name": "vm-2", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}]'
@@ -1145,36 +1156,17 @@ class CollectProjectTest(unittest.TestCase):
             # Ahead of `clean()`'s catch-all serial stub: first match wins.
             run=self.fake_run({
                 "get-serial-port-output vm-1": run_of(0, WRAPPED_SERIAL),
-                "get-serial-port-output vm-2": run_of(0, FRESH_FAILED_SERIAL),
-                **self.clean(**{"instances list": run_of(0, instances)}),
-            }),
-        )
-        self.assertEqual([c["object"] for c in entry["candidates"]], ["ComputeInstance/z1/vm-2"])
-        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
-        self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
-        self.assertIn("1 of the 2 RUNNING instance(s)", entry["limitations"])
-        self.assertIn("vm-1 (z1)", entry["limitations"])
-
-    def test_rotated_and_refused_consoles_together_are_unevaluated(self):
-        instances = (
-            '[{"name": "vm-1", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}, '
-            '{"name": "vm-2", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}]'
-        )
-        entry = cf.collect_project(
-            "proj-1",
-            run=self.fake_run({
-                "get-serial-port-output vm-1": run_of(0, WRAPPED_SERIAL),
                 "get-serial-port-output vm-2": run_of(1, "", "instance not ready"),
                 **self.clean(**{"instances list": run_of(0, instances)}),
             }),
         )
-        reason = unevaluated(entry)[cf.STARTUP_SLUG]
-        self.assertIn("1 console(s) had rotated", reason)
-        self.assertIn("1 refused", reason)
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
         self.assertIn("read serial console output from 1 of the 2", entry["limitations"])
-        self.assertIn("passed over these instances rather than cleared them: vm-1 (z1)", entry["limitations"])
+        self.assertIn("vm-2 (z1)", entry["limitations"])
+        self.assertNotIn("vm-1", entry["limitations"])
+        self.assertIn("vm-1 (z1)", entry["notes"])
 
-    def test_a_project_wide_script_makes_a_rotated_console_unevaluated(self):
+    def test_a_project_wide_script_notes_a_rotated_console_without_its_own_key(self):
         """The common metadata sets the script, so it runs on an instance
         whose own metadata sets none, and that console owes a run marker."""
         entry = cf.collect_project(
@@ -1187,7 +1179,45 @@ class CollectProjectTest(unittest.TestCase):
                 "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
             })),
         )
-        self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertIn("vm-1 (us-central1-a)", entry["notes"])
+        self.assertNotIn("limitations", entry)
+
+    def test_gke_nodes_are_never_noted(self):
+        """§2.1's universe excludes GKE nodes, and a project-wide script puts
+        them in the read; their rotated consoles stay out of the note."""
+        instances = (
+            '[{"name": "gke-seeded-a-default-pool-1", "status": "RUNNING", "zone": "https://x/zones/z1"}, '
+            '{"name": "gk3-auto-pool-2", "status": "RUNNING", "zone": "https://x/zones/z1"}]'
+        )
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, instances),
+                "project-info describe": run_of(
+                    0, '{"commonInstanceMetadata": {"items": [{"key": "startup-script"}]}}'
+                ),
+                "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
+            })),
+        )
+        self.assertNotIn("notes", entry)
+        self.assertNotIn("limitations", entry)
+
+    def test_the_note_names_at_most_ten_instances(self):
+        items = ", ".join(
+            f'{{"name": "vm-{i:02d}", "status": "RUNNING", "zone": "https://x/zones/z1", {STARTUP_META}}}'
+            for i in range(13)
+        )
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, f"[{items}]"),
+                "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
+            })),
+        )
+        self.assertIn("status of 13 RUNNING", entry["notes"])
+        self.assertIn("vm-09 (z1)", entry["notes"])
+        self.assertNotIn("vm-10", entry["notes"])
+        self.assertIn("and 3 more", entry["notes"])
 
     def test_the_failed_project_info_fallback_does_not_demand_a_run_marker(self):
         """After a failed `project-info` read every RUNNING instance is read,
@@ -1495,17 +1525,56 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             [],
         )
 
-    def test_a_rotated_console_makes_the_run_partial(self):
-        """What `finish` does with the rotated console: a coverage gap on the
-        project, so the ledger stays open instead of retiring as clean."""
+    def test_a_rotated_console_renders_as_a_note_on_the_ledger(self):
+        """`finish` takes the note from the manifest and shows it in the scope
+        table and the clean comment, and the run stays complete."""
         import audit_report
 
         manifest = self.fleet(**{"get-serial-port-output": run_of(0, WRAPPED_SERIAL)})
         data = self._document(manifest)
         audit_report.cross_check_manifest(data, manifest)
-        gaps = [g for g in audit_report.coverage_gaps(data) if cf.UNENUMERATED_PROJECTS_TARGET not in g]
-        self.assertEqual(len(gaps), 1, gaps)
-        self.assertIn(cf.STARTUP_SLUG, gaps[0])
+        self.assertEqual(audit_report.adopt_collector_notes(data, manifest), ["project/proj-1"])
+        self.assertEqual(
+            [g for g in audit_report.coverage_gaps(data) if cf.UNENUMERATED_PROJECTS_TARGET not in g],
+            [],
+        )
+        stamp = datetime.datetime(2026, 11, 9, tzinfo=datetime.timezone.utc)
+        body = "\n".join(audit_report._render_scope(data["scope"]["clusters"], [], stamp, self.AUDIT))
+        self.assertIn("| Notes |", body)
+        self.assertIn("is not visible", body)
+        clean = audit_report.render_clean_comment(self.AUDIT, data, stamp, gaps=[])
+        self.assertIn("Read but not visible, which is not a coverage gap (1)", clean)
+        self.assertIn("vm-1 (us-central1-a)", clean)
+
+    def test_a_long_lived_scripted_vm_leaves_no_gap_and_carries_a_note(self):
+        """The review's repro: the current guest agent prints the MWLID line
+        every ten minutes, so about eight weeks of it fill the buffer of any VM
+        whose metadata sets a startup script. That is an ordinary production VM,
+        and a coverage gap on it would hold every GCE finding open until someone
+        reboots it. The run reports no gap and says, in a note, that the VM's
+        startup-script status was not visible."""
+        import audit_report
+
+        mwlid = "".join(
+            f"2026-09-{1 + i // 144:02d}T00:00:00+00:00 web-1 mwlid_extension[723]: "
+            "MWLID credential refresh is not enabled, skipping run\n"
+            for i in range(8000)
+        )
+        manifest = self.fleet(**{
+            "instances list": run_of(0, one_running_instance("web-1")),
+            "get-serial-port-output": run_of(0, mwlid),
+        })
+        data = self._document(manifest)
+        audit_report.cross_check_manifest(data, manifest)
+        audit_report.adopt_collector_notes(data, manifest)
+        self.assertEqual(
+            [g for g in audit_report.coverage_gaps(data) if cf.UNENUMERATED_PROJECTS_TARGET not in g],
+            [],
+        )
+        notes = audit_report.scope_notes(data)
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("web-1 (us-central1-a)", notes[0])
+        self.assertIn("not visible", notes[0])
 
     def test_the_collectors_evidence_is_adopted_onto_the_model_finding(self):
         """The whole point of the conversion: the excerpt that ships is the

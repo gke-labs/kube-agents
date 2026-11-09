@@ -66,9 +66,10 @@ Field contracts assumed of `gcloud ... --format=json` output:
   in `checks_unevaluated` rather than reporting a clean fleet. The body is
   what is left in a ring buffer of about 1 MiB, and the guest prints its
   startup-script lines once per boot, so a console that holds no line opening
-  a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script counts
-  against coverage the same way: named in `limitations`, and the slug
-  unevaluated when no instance's run could be read.
+  a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script is not
+  a clean result. It is not a coverage gap either, because every VM that runs
+  for some weeks reaches that state: the target's `notes` names it
+  (`ROTATED_SERIAL_NOTE`), which `finish` shows and does not count as a gap.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
@@ -468,24 +469,21 @@ UNREAD_SERIAL_LIMITATION = (
 
 # A console was read, but it holds no line that opens a startup-script run
 # (`STARTUP_RUN_PATTERN`) and no failure line: the boot that ran the script
-# has rotated out of the ring buffer (`startup_run_visible`). The check passed
-# over these instances rather than cleared them.
-ROTATED_SERIAL_LIMITATION = (
-    "gce-startup-script-status read the serial console of {count} of the "
-    "{total} RUNNING instance(s) on this project that run a startup script, "
-    "but the console no longer holds the boot that ran the script: the serial "
-    "buffer keeps about 1 MiB, and later guest output has pushed the "
-    "startup-script lines out. The check passed over these instances rather "
-    "than cleared them: {names}."
+# has rotated out of the ring buffer (`startup_run_visible`). That is the
+# ordinary state of any VM that has run for some weeks, so it is neither a
+# limitation nor an unevaluated check: either would be a coverage gap that
+# holds every GCE finding open until someone reboots the VM. It is a note,
+# which `finish` shows on the target and does not count as a gap, so the run
+# never claims these instances were cleared. At most ROTATED_NOTE_NAMES names.
+ROTATED_SERIAL_NOTE = (
+    "gce-startup-script-status: the startup-script status of {count} RUNNING "
+    "instance(s) that run a startup script is not visible. Their serial "
+    "console was read, but the boot that ran the script has rotated out of "
+    "the serial buffer (about 1 MiB), so neither a failure nor a clean run "
+    "could be seen: {names}."
 )
-# Every target was either refused or rotated, at least one of them rotated,
-# so the check reached no verdict on this project.
-UNSEEN_RUN_REASON = (
-    "No RUNNING instance whose console §2.1 reads on this project showed its "
-    "last startup-script run: {rotated} console(s) had rotated past the boot "
-    "that ran the script and {unread} refused `compute instances "
-    "get-serial-port-output`, so §2.1's markers had no run to match against."
-)
+ROTATED_NOTE_NAMES = 10
+ROTATED_NOTE_MORE = ", and {more} more"
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
 # apply, and §2.5's is a legal-hold exclusion it cannot see. `needs_triage` is
@@ -498,6 +496,9 @@ TRIAGE_RETENTION_HOLD = "retention-hold"
 
 # Both GKE node-pool MIG spellings: `gke-` for Standard, `gk3-` for Autopilot.
 GKE_MIG_PREFIXES = ("gke-", "gk3-")
+# A GKE node instance carries its node pool's MIG prefix. §2.1's universe
+# excludes GKE nodes, so a rotated console on one is not noted.
+GKE_INSTANCE_PREFIXES = GKE_MIG_PREFIXES
 
 REDACTED = "[REDACTED]"
 # Serial console output is untrusted text from inside the guest, and §2.1's
@@ -1227,6 +1228,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     not_applicable: list[dict] = []
     unevaluated: list[dict] = []
     limitations: list[str] = []
+    # Information for the reader that is not a coverage gap
+    # (ROTATED_SERIAL_NOTE); the manifest's `notes`.
+    notes: list[str] = []
 
     def gated(argv: list[str], slug: str) -> list:
         parsed, result = run_and_gate(argv, run=run)
@@ -1310,11 +1314,14 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
                 candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
-            elif (common_script or (instance_name, zone) in scripted) and not startup_run_visible(
-                result.stdout
+            elif (
+                (common_script or (instance_name, zone) in scripted)
+                and not instance_name.startswith(GKE_INSTANCE_PREFIXES)
+                and not startup_run_visible(result.stdout)
             ):
                 # The console was read, but the boot that ran the script is
-                # no longer in it. No failure line here proves nothing.
+                # no longer in it. No failure line here proves nothing, so the
+                # note below says so; GKE nodes are outside §2.1's universe.
                 rotated.append(f"{instance_name} ({zone})")
 
         if not instances:
@@ -1346,35 +1353,20 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             # this listing exists to refuse.
             unevaluated.append({"check": STARTUP_SLUG, "reason": UNREAD_SERIAL_REASON})
             limitations.append(UNREAD_SERIAL_LIMITATION.format(total=len(targets)))
-        else:
-            if len(unread) + len(rotated) == len(targets):
-                # Every console was refused or had lost its last boot, so the
-                # check decided nothing on this project: unevaluated, which
-                # keeps an open finding open instead of retiring it as clean.
-                unevaluated.append(
-                    {
-                        "check": STARTUP_SLUG,
-                        "reason": UNSEEN_RUN_REASON.format(
-                            rotated=len(rotated), unread=len(unread)
-                        ),
-                    }
+        elif unread:
+            limitations.append(
+                PARTIAL_SERIAL_LIMITATION.format(
+                    read=len(targets) - len(unread),
+                    total=len(targets),
+                    names=", ".join(sorted(unread)),
                 )
-            if unread:
-                limitations.append(
-                    PARTIAL_SERIAL_LIMITATION.format(
-                        read=len(targets) - len(unread),
-                        total=len(targets),
-                        names=", ".join(sorted(unread)),
-                    )
-                )
-            if rotated:
-                limitations.append(
-                    ROTATED_SERIAL_LIMITATION.format(
-                        count=len(rotated),
-                        total=len(targets),
-                        names=", ".join(sorted(rotated)),
-                    )
-                )
+            )
+        if rotated:
+            shown = sorted(rotated)[:ROTATED_NOTE_NAMES]
+            names = ", ".join(shown)
+            if len(rotated) > len(shown):
+                names += ROTATED_NOTE_MORE.format(more=len(rotated) - len(shown))
+            notes.append(ROTATED_SERIAL_NOTE.format(count=len(rotated), names=names))
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(
@@ -1522,6 +1514,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         entry["checks_unevaluated"] = unevaluated
     if limitations:
         entry["limitations"] = "; ".join(limitations)
+    if notes:
+        entry["notes"] = "; ".join(notes)
     return entry
 
 

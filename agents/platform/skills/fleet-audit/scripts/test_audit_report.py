@@ -14819,6 +14819,51 @@ class TestCoverageGaps(unittest.TestCase):
     def test_a_complete_run_has_no_gaps(self):
         self.assertEqual(audit_report.coverage_gaps(make_doc()), [])
 
+    def test_a_note_is_never_a_gap(self):
+        """`notes` says what a check read but could not see on a target whose
+        checks all ran: the GCE collector's rotated serial consoles, the state
+        of every VM that has run for some weeks. Counted as a gap, it would
+        hold a healthy stream's ledger open for good."""
+        doc = make_doc(
+            clusters=[
+                {
+                    "name": "prod-us-east",
+                    "location": "us-east1",
+                    "project": "acme-prod",
+                    "notes": "startup-script status of 1 instance(s) is not visible: web-1",
+                }
+            ]
+        )
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+        self.assertEqual(
+            audit_report.scope_notes(doc),
+            ["prod-us-east: startup-script status of 1 instance(s) is not visible: web-1"],
+        )
+
+    def test_a_note_must_be_a_string(self):
+        doc = make_doc(clusters=[{"name": "prod-us-east", "location": "us-east1", "project": "acme-prod", "notes": ["x"]}])
+        with self.assertRaisesRegex(audit_report.ValidationError, "notes"):
+            audit_report.validate_findings(doc, AUDIT)
+
+    def test_notes_are_adopted_from_collected_manifest_targets_only(self):
+        doc = make_doc(
+            clusters=[
+                {"name": "a", "location": "l", "project": "p", "notes": "the model's draft"},
+                {"name": "b", "location": "l", "project": "p"},
+            ]
+        )
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED, "notes": "the collector's note"},
+                {"name": "b", "outcome": "gate-failed", "notes": "not adopted"},
+            ]
+        }
+        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
+        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
+        self.assertEqual(clusters["a"]["notes"], "the collector's note")
+        self.assertNotIn("notes", clusters["b"])
+        self.assertEqual(audit_report.adopt_collector_notes(doc, None), [])
+
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
         gaps = audit_report.coverage_gaps(
