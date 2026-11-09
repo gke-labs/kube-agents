@@ -682,8 +682,10 @@ answer. There are two passes:
    base64 as given, and the decoded value when it is text) and every `stringData` value. These are
    read from JSON at any depth, including JSON text inside a result's strings (a terminal result is
    JSON whose output is kubectl's JSON), from JSON cut short, and from YAML. It also holds every
-   value a shape rule catches in a result's text, up to the first 1 MiB of it, unless the value
-   is one plain word: the set redacts everywhere in the answer, not just where the value stood. A service account
+   value a shape rule catches in a result's text, up to the first 1 MiB of it. A value that is one
+   plain word is held only when the key, flag or prose noun in front of it is password,
+   passphrase, secret, token or api key, because the set redacts everywhere in the answer, not
+   just where the value stood. A plain word under a weak or ambiguous key is left out. A service account
    token Secret's `namespace` is not tracked, and neither is a value under 8 bytes. The set holds
    at most 512 entries and 1 MiB, and past either cap the oldest entry is evicted first. It is
    cleared when the task finalizes, and none of it is logged or published.
