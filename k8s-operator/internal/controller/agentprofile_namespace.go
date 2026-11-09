@@ -445,7 +445,7 @@ func (r *PlatformAgentReconciler) removeProfileQuotaOnDeletion(ctx context.Conte
 	}
 	logf.FromContext(ctx).Error(err, "profile namespace: releasing with the quota left", "namespace", ns, "quota", name)
 	r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileQuotaLeft,
-		fmt.Sprintf("profile namespace %s: left ResourceQuota %s, whose delete was refused for %s: %v. A later PlatformAgent in %s removes it.",
+		fmt.Sprintf("profile namespace %s: left ResourceQuota %s, whose delete was still refused %s after the deletion: %v. A later PlatformAgent in %s removes it.",
 			ns, name, profileQuotaReleaseAfter, err, agent.Namespace))
 	return 0
 }
@@ -479,7 +479,12 @@ func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context
 			}
 			continue
 		}
-		if err := r.Delete(ctx, q); client.IgnoreNotFound(err) != nil {
+		// Preconditioned on what was read, so a PlatformAgent of the old name
+		// created since, which applies over the same quota, keeps it.
+		switch err := r.Delete(ctx, q, client.Preconditions{UID: &q.UID, ResourceVersion: &q.ResourceVersion}); {
+		case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+			continue
+		case err != nil:
 			r.profileNamespaceFailure(ctx, agent, "remove the leftover quota "+q.Name, err)
 			continue
 		}

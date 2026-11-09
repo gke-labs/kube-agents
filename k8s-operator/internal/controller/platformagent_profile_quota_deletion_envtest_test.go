@@ -8,6 +8,7 @@ import (
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -117,10 +118,16 @@ func TestADeletedAgentsRefusedProfileQuotaIsRetriedThenLeftForASuccessor(t *test
 		t.Fatal(err)
 	}
 	quotaKey := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileQuotaName(agent)}
+	// The dispatcher's pod-read Role there, which deletion removes whether or
+	// not the quota's delete is refused.
+	podRead := &rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: profileNamespaceName(agent), Labels: a2aLabels(agent, "dispatcher")}}
+	if err := c.Create(ctx, podRead); err != nil {
+		t.Fatal(err)
+	}
 
 	allow := refuseQuotaDeletes(ctx, t, c, profileNamespaceName(agent))
 	defer func(was time.Duration) { profileQuotaReleaseAfter = was }(profileQuotaReleaseAfter)
-	profileQuotaReleaseAfter = 3 * time.Second
+	profileQuotaReleaseAfter = time.Hour
 
 	if err := c.Delete(ctx, agent); err != nil {
 		t.Fatal(err)
@@ -136,8 +143,12 @@ func TestADeletedAgentsRefusedProfileQuotaIsRetriedThenLeftForASuccessor(t *test
 	if err := c.Get(ctx, client.ObjectKeyFromObject(agent), deleting); err != nil || len(deleting.Finalizers) == 0 {
 		t.Fatalf("inside the bound the finalizer was released: %v %v", deleting.Finalizers, err)
 	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(podRead), &rbacv1.Role{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the dispatcher's pod-read Role while the quota holds the finalizer: %v, want it already gone", err)
+	}
 
-	time.Sleep(time.Until(deleting.DeletionTimestamp.Add(profileQuotaReleaseAfter)) + time.Second)
+	// Past the bound: shortened rather than slept through.
+	profileQuotaReleaseAfter = 0
 	if res, err := r.handleDeletion(ctx, deleting); err != nil || res.RequeueAfter != 0 {
 		t.Fatalf("past the bound: %+v %v, want the release", res, err)
 	}
@@ -217,5 +228,42 @@ func TestAdoptionTakesOnlyALeftoverOfADeletedAgent(t *testing.T) {
 		if err := c.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: name}, &corev1.ResourceQuota{}); err != nil {
 			t.Errorf("%s: %v, want it left", name, err)
 		}
+	}
+}
+
+// With nothing refusing it, the quota goes and the finalizer releases on the
+// same pass.
+func TestADeletedAgentsProfileQuotaGoesWithIt(t *testing.T) {
+	c, scheme := startEnvtest(t)
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	agent.Finalizers = []string{platformAgentFinalizer}
+	for _, obj := range []client.Object{&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}, chartProfileNamespace(agent), agent} {
+		if err := c.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	if err := r.applyManaged(ctx, agent, buildProfileQuota(agent, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	deleting := &agentv1alpha1.PlatformAgent{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(agent), deleting); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := r.handleDeletion(ctx, deleting); err != nil || res.RequeueAfter != 0 {
+		t.Fatalf("handleDeletion = %+v %v, want the release", res, err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileQuotaName(agent)}, &corev1.ResourceQuota{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the quota: %v, want it gone", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(agent), &agentv1alpha1.PlatformAgent{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the PlatformAgent: %v, want it gone", err)
 	}
 }

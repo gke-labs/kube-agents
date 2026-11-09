@@ -1498,15 +1498,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
-		// The profile namespace's quota carries no owner reference
-		// (agentprofile_namespace.go), and left behind it caps a successor's
-		// profile pods: it is removed here, a refused delete retried for a
-		// bounded time and then left with a Warning for a successor to adopt
-		// (removeProfileQuotaOnDeletion). Its fence stays until the chart's
-		// uninstall deletes the namespace.
-		if wait := r.removeProfileQuotaOnDeletion(ctx, agent, time.Now()); wait > 0 {
-			return ctrl.Result{RequeueAfter: wait}, nil
-		}
+		// The profile namespace's quota and fence carry no owner reference
+		// (agentprofile_namespace.go). The quota is removed last, below; the
+		// fence stays until the chart's uninstall deletes the namespace.
+		//
 		// The dispatcher's warm pools there go, with their CA bundle copy
 		// (their pods hold bus and broker tokens), and so does its pod-read
 		// binding, for the ClusterRoleBinding's reason above: left behind,
@@ -1550,6 +1545,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		case client.IgnoreNotFound(err) != nil:
 			return ctrl.Result{}, err
+		}
+
+		// The profile namespace's quota, left behind, caps a successor's
+		// profile pods. Last, so a refused delete held for its bounded retry
+		// (removeProfileQuotaOnDeletion) holds back nothing else, and the
+		// quota still caps the warm pools until they're gone; every step
+		// above is idempotent across the retries.
+		if wait := r.removeProfileQuotaOnDeletion(ctx, agent, time.Now()); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
