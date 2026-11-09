@@ -313,12 +313,11 @@ Run records (`manifest.json`, `results.json`, `rows.json`) are kept under
 own evidence; `rows.json` is the artifact the devops-bench leaderboard ingests. Only the
 isolated campaign runs (gke-labs/kube-agents#1773: one repository per run, the agent's state
 reset before each task-run) are kept there, each with its `campaign.json` version stamp,
-`audit.json` isolation counts, integrity sweep and adjudication: b-0011 on `claude-opus-5`
-(`run_20260918_181403_840299`) and on `gemini-3.7-flash` (`run_20260918_210713_821053`),
-b-0022b on `claude-opus-5` (`run_20260918_185657_889776`). The b-0022b cell on
-`gemini-3.7-flash` has no record: its one campaign attempt (2026-09-18) ended in the
-harness's status-turn transport failure with an empty trajectory and a null row, and is
-not kept. `b-0022b-gitops-pinned-base` (task_version 2) keeps its red run against `main` on
+`audit.json` isolation counts, integrity sweep and adjudication: b-0011 on
+`gemini-3.7-flash` (`run_20260918_210713_821053`). The campaign runs on a third-party
+model are not kept in the repository, which is public. The b-0022b cell on `gemini-3.7-flash` has no record: its one
+campaign attempt (2026-09-18) ended in the harness's status-turn transport failure with an
+empty trajectory and a null row, and is not kept. `b-0022b-gitops-pinned-base` (task_version 2) keeps its red run against `main` on
 `gemini-3.7-flash` (`run_20261005_215541_763063`, a per-run repository and a reset agent,
 without the integrity sweep): both search-api objectives failed and the agent's one pull
 request went onto `main`. Its addresses were mapped to documentation ranges for the fixture

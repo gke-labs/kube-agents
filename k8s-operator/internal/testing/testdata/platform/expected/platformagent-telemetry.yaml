@@ -771,10 +771,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1387,8 +1387,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1664,6 +1662,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:

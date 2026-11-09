@@ -106,6 +106,10 @@ PROXY_LOAD_RATE = "proxy_load_per_second"
 PROXY_LOAD_P50 = "proxy_load_p50_seconds"
 PROXY_LOAD_P95 = "proxy_load_p95_seconds"
 PROXY_LOAD_MAX = "proxy_load_max_seconds"
+PROXY_SLOT_CAP = "proxy_slot_cap"
+PROXY_SLOTS_PEAK = "proxy_slots_in_use_peak"
+CPU_THROTTLED_SECONDS = "cpu_throttled_seconds"
+CPU_THROTTLED_SHARE = "cpu_throttled_period_share"
 WATCHER_SEEN = "watcher_events_seen"
 WATCHER_SEEN_RATE = "watcher_events_seen_per_minute"
 WATCHER_CREATES = "watcher_session_creates"
@@ -339,6 +343,10 @@ METRICS = MappingProxyType(
         PROXY_LOAD_P50: MetricSpec("Proxy load: command time, median", "s"),
         PROXY_LOAD_P95: MetricSpec("Proxy load: command time, 95th percentile", "s"),
         PROXY_LOAD_MAX: MetricSpec("Proxy load: command time, maximum", "s"),
+        PROXY_SLOT_CAP: MetricSpec("Credential proxy slot cap"),
+        PROXY_SLOTS_PEAK: MetricSpec("Credential proxy slots in use, peak"),
+        CPU_THROTTLED_SECONDS: MetricSpec("CPU throttled time", "s"),
+        CPU_THROTTLED_SHARE: MetricSpec("CPU periods throttled, share"),
         WATCHER_SEEN: MetricSpec("Watcher events seen"),
         WATCHER_SEEN_RATE: MetricSpec("Watcher events seen per minute"),
         WATCHER_CREATES: MetricSpec("Watcher session creates"),
@@ -2191,6 +2199,8 @@ class ProxyLevel:
     shell_cpu_cores: float | None = None
     # The broker's largest median admission wait: near zero while its slots are free.
     wait_p50_seconds: float | None = None
+    # The load operation: a plan can load one tool per operation (`proxy_load_gcloud`).
+    operation: str = PROXY_LOAD_OPERATION
 
 
 @dataclass(frozen=True)
@@ -2287,14 +2297,17 @@ def _cpu_reading(record: Record, metric: str, container: str) -> float | None:
 
 
 def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
-    """The proxy load runs, one row per worker count, in rising order; a run that shared the broker is left out."""
-    groups: dict[float, list[Record]] = {}
+    """The proxy load runs, one row per operation and worker count, in rising order; a run that shared the broker is left out.
+
+    Each load operation keeps its own rows: one tool's throughput is no measure of another's.
+    """
+    groups: dict[tuple[str, float], list[Record]] = {}
     for record in records:
         workers = factor_value(record, PROXY_CONCURRENCY)
         if record.value(PROXY_LOAD_RATE) is not None and workers is not None and not record.excluded(PROXY_LOAD_RATE):
-            groups.setdefault(workers, []).append(record)
+            groups.setdefault((record.operation, workers), []).append(record)
     levels = []
-    for workers, runs in sorted(groups.items()):
+    for (operation, workers), runs in sorted(groups.items()):
         peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, PROXY_CONTAINER)) is not None]
         shell = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, SHELL_CONTAINER)) is not None]
         waits = [value for run in runs if not run.excluded(PROXY_WAIT_P50) and (value := run.value(PROXY_WAIT_P50)) is not None]
@@ -2309,6 +2322,7 @@ def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
                 max(peaks) if peaks else None,
                 max(shell) if shell else None,
                 max(waits) if waits else None,
+                operation,
             )
         )
     return levels
@@ -2322,7 +2336,9 @@ def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
     """
     groups: dict[tuple[str, str, float], list[Record]] = {}
     for record in records:
-        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None:
+        # A load run is known by what only a load run writes, its rate, as `proxy_levels` knows
+        # it: an operation's name says nothing about its kind.
+        if record.value(PROXY_LOAD_RATE) is not None or record.value(PROXY_COMMANDS) is None:
             continue
         if record.excluded(PROXY_COMMANDS) or record.excluded(PROXY_COMMAND_SECONDS):
             continue

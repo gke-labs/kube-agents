@@ -42,7 +42,7 @@
 # "checkout-gateway" in namespace "seeded-reliability" on the seeded fleet,
 # with no PodDisruptionBudget -- exactly the shape the obtainability SOP's
 # step 3.3 flags: multi-replica but nothing bounding voluntary disruption,
-# so a drain or upgrade can still take both replicas at once. We chose both
+# so back-to-back drains in an upgrade can take both replicas. We chose both
 # names, so the exact match is fair (we planted the noun).
 # Isolation class: cluster-read-only, GitOps-repo write. NOT read-only, and
 # the earlier claim that it was is the correction this line carries: step 0 of

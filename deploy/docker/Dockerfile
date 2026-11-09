@@ -139,9 +139,10 @@ RUN set -eu; \
         arm64) triple=aarch64-unknown-linux-gnu; sum="${TIRITH_SHA256_ARM64}" ;; \
         *) echo "no tirith build pinned for ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    for attempt in 1 2 3 4 5; do \
+    delay=1; \
+    for attempt in 1 2 3 4 5 6 7 8 9; do \
         wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz" && break; \
-        [ "$attempt" -lt 5 ] || exit 1; sleep "$attempt"; \
+        [ "$attempt" -lt 9 ] || exit 1; sleep "$delay"; delay=$((delay * 2)); \
     done; \
     echo "${sum}  /tmp/tirith.tar.gz" | sha256sum -c -; \
     mkdir /tmp/tirith; tar -xzf /tmp/tirith.tar.gz -C /tmp/tirith tirith; \
@@ -2942,7 +2943,7 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
       google-cloud-cli-gke-gcloud-auth-plugin \
       kubectl && \
     ARCH=$(dpkg --print-architecture) && \
-    curl -fL --retry 5 --retry-all-errors -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" && \
+    curl -fL --retry 8 --retry-all-errors -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" && \
     dpkg -i /tmp/gh.deb && \
     rm -f /tmp/gh.deb && \
     rm -rf /var/lib/apt/lists/* && \

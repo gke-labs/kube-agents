@@ -22,9 +22,10 @@ import (
 // busy is the dispatcher's business (its holdings and the lease bucket),
 // not the pool's.
 type PodPool struct {
-	store cache.Store
-	run   func(stop <-chan struct{})
-	ready func() bool
+	namespace string
+	store     cache.Store
+	run       func(stop <-chan struct{})
+	ready     func() bool
 }
 
 // NewPodPool builds the watch on namespace. Run starts it.
@@ -51,7 +52,7 @@ func NewPodPool(ctx context.Context, client kubernetes.Interface, namespace stri
 			},
 		},
 	})
-	return &PodPool{store: store, run: informer.Run, ready: informer.HasSynced}
+	return &PodPool{namespace: namespace, store: store, run: informer.Run, ready: informer.HasSynced}
 }
 
 // Run watches until ctx ends.
@@ -68,12 +69,43 @@ func (p *PodPool) Pods(profile, tier string) []string {
 		if !ok || pod.Labels[lib.ProfileNameLabel] != profile || pod.Labels[lib.ProfileTierLabel] != tier {
 			continue
 		}
-		if pod.DeletionTimestamp == nil && podReady(pod) && lib.ValidSubjectToken(pod.Name) {
+		if pod.DeletionTimestamp == nil && podReady(pod) && lib.ValidSubjectToken(pod.Name) && !jobPod(pod) {
 			out = append(out, pod.Name)
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// PodUID implements Pool: the UID of the watched pod of that name, if it is
+// one of the (profile, tier)'s pods and isn't being deleted. A pod deleted
+// and re-created under the same name has a new UID, which is the point: a
+// task credential names the UID the pod had when it was offered the task.
+func (p *PodPool) PodUID(profile, tier, pod string) string {
+	obj, ok, err := p.store.GetByKey(p.namespace + "/" + pod)
+	if err != nil || !ok {
+		return ""
+	}
+	po, ok := obj.(*corev1.Pod)
+	if !ok || po.Labels[lib.ProfileNameLabel] != profile || po.Labels[lib.ProfileTierLabel] != tier || po.DeletionTimestamp != nil {
+		return ""
+	}
+	return string(po.UID)
+}
+
+// jobPod reports whether p is a Job's pod. A dispatcher Job's pod carries
+// the warm pool's labels, but it is one task's, offered only by runJob: the
+// pool never offers it another, even once Job mode is revoked under it.
+func jobPod(p *corev1.Pod) bool {
+	if _, ok := p.Labels[jobNameLabel]; ok {
+		return true
+	}
+	for _, o := range p.OwnerReferences {
+		if o.Kind == "Job" {
+			return true
+		}
+	}
+	return false
 }
 
 func podReady(p *corev1.Pod) bool {

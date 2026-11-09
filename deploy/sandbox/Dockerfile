@@ -106,7 +106,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
       *) echo "no kubectl checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    curl -sSLf --retry 8 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     install -d -m 0755 /usr/local/libexec && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
@@ -142,16 +142,16 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Pinned and checked against the release's SHA256SUMS, per architecture; a
 # version bump moves the hashes and the `leeway version` check in
 # deploy/sandbox/smoke-test.sh with it.
-ARG LEEWAY_VERSION=0.1.3
-ARG LEEWAY_SHA256_AMD64=26380a054ae1e5291f915f3965705c5d4198aeec611c42db843fd0ddbea06854
-ARG LEEWAY_SHA256_ARM64=850d8b9cd8d745898f41d139c1284db0aa88c6b9a42a5a95e758f59b58a8bb5b
+ARG LEEWAY_VERSION=0.1.5
+ARG LEEWAY_SHA256_AMD64=f241671cf5a6e6b642fda5238b31ea3283e8dcb7aa6b9782358f268515e71d8a
+ARG LEEWAY_SHA256_ARM64=6282ea89eeb9af23a50ac4f9f06bcf135206ff93f3beda9efa96cf94144ccc5c
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
       arm64) LEEWAY_SHA256="${LEEWAY_SHA256_ARM64}" ;; \
       *) echo "no leeway checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/leeway.tar.gz \
       "https://github.com/go-steer/leeway/releases/download/v${LEEWAY_VERSION}/leeway_v${LEEWAY_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${LEEWAY_SHA256}  /tmp/leeway.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/leeway.tar.gz --no-same-owner -C /usr/local/bin leeway && \
@@ -178,7 +178,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) TOFU_SHA256="${OPENTOFU_SHA256_ARM64}" ;; \
       *) echo "no OpenTofu checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/tofu.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/tofu.tar.gz \
       "https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${TOFU_SHA256}  /tmp/tofu.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/tofu.tar.gz --no-same-owner -C /usr/local/bin tofu && \
@@ -639,6 +639,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          for Cluster Agent domain audits (#3285)
 #   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and GKE
 #                          ManagedCertificate collector (#3285)
+#   workload_triage.py     the Cluster Agent's workload-triage-scan reader: one
+#                          pass over pods, controllers and Warning events; reads
+#                          current-context locally via credential_proxy_client,
+#                          its kubectl reads go through the same wrapper, and it
+#                          is here for the same reason as stall_report.py
+#   kcc_fleet_audit.py     batched parallel Config Connector (KCC) CRD and custom
+#                          resource auditor for Cluster Agent KCC audits (#3142)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -688,6 +695,8 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/audit_storage.py \
      agents/platform/scripts/audit_networking.py \
      agents/platform/scripts/audit_certificates.py \
+     agents/platform/scripts/workload_triage.py \
+     agents/platform/scripts/kcc_fleet_audit.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \

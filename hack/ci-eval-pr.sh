@@ -128,6 +128,9 @@ readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
 readonly EVAL_TIMING_FILE="timing.json"
+# The delivered reply's shape beside results.json, where
+# bench/kube_agents_bench/scoring.py (_SHAPE_FILE) reads it. Reported, never scored.
+readonly EVAL_SHAPE_FILE="shape.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
 # Where each unit writes a repetition's log (run_one_unit) and grading reads it
@@ -872,12 +875,16 @@ report_partial_verdict() {
 profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
+  # First, so the shadow proxy collector's last pass runs alongside the
+  # captures below; waited for after them (hack/ci-env.sh). No-ops without one.
+  signal_replay_shadow_collector
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
   collect_litellm_log
   collect_credential_proxy_evidence
+  wait_replay_shadow_collector
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
@@ -1147,6 +1154,9 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
+# to the private bucket from here on, while the eval runs (hack/ci-env.sh).
+start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -2757,6 +2767,18 @@ export JUDGE_PROVIDER="google"
 # JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
 # touching the agent line.
 export JUDGE_MODEL="${JUDGE_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
+# A pull request's run leaves out the ToolInvocation and Checklist judge
+# scores (bench/kube_agents_bench/harness.py, SKIP_REPORT_ONLY_JUDGES_ENV).
+# Nothing in its verdict reads them, and a pull request never records a
+# baseline. PULL_NUMBER is the key the baseline recorder uses, so every run
+# that records keeps both scores. A job whose EVAL_JUDGED_METRICS has rung 6
+# compare ToolInvocation, ChecklistScore or OutcomeScore (which falls back to
+# ChecklistScore) keeps both too, or rung 6 would compare nothing for it. The
+# harness that reads this is the pinned grader's (GRADER_BENCH_DIR), so it
+# prints to each unit log whether the switch took effect.
+if [ -n "${PULL_NUMBER:-}" ] && ! grep -qwE 'ToolInvocation|ChecklistScore|OutcomeScore' <<< "${EVAL_JUDGED_METRICS:-}"; then
+  export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
+fi
 export AGENT_PROVIDER="google"
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 
@@ -2935,8 +2957,13 @@ while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
 check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+# A here-string, not `printf | grep -q`: grep exits on its first match, a
+# producer still writing dies of SIGPIPE, and under pipefail the duplicate
+# reads as absent. printf hands the pipe a few KiB per write, so on today's
+# rosters that is a rare race (the flake this replaced); past a pipe buffer
+# it is every run.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
-  if printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+  if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
     echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
     exit 1
   fi
@@ -2988,8 +3015,12 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # which check_case_entries has already proven to be a case path with a
   # directory behind it; the lane picks from the catalogue, it does not
   # register.
+  # A here-string, not `printf | grep -q`: grep exits on its first match, a
+  # producer still writing dies of SIGPIPE, and under pipefail a registered
+  # entry reads as unregistered. A rare race on today's rosters, every run
+  # past a pipe buffer; the certification check above says why.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
-    if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+    if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
       exit 1
     fi
@@ -4152,8 +4183,8 @@ unit_cost_hint() {
     # 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster) echo 900 ;;
-    # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
-    # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
+    # On the blocking roster since 2026-10-26. Measured on the main nightlies
+    # 2026-10-20 to 10-26: median 198s, 165-397s over 14
     # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
     # audit-band test allows, rather than 900: the hint still launches it
     # early, and the presubmit wall estimate in
@@ -4177,8 +4208,18 @@ unit_cost_hint() {
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
     # then the same full drift audit as consistency-drift-outlier. Unmeasured.
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
+    # The sibling's plant plus a real scheduled drift run the stack fires and
+    # waits out: a full audit on an image without the gate, a collector and a
+    # precheck with it. Unmeasured; priced at the band plus the plant.
+    fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
+    # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
+    # dispatch, a delegated worker that sweeps the fleet, a ledger write. The
+    # kustomize case runs in the second phase (writes_alone), so its hint
+    # orders it only among that phase's units.
+    gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
+    obtainability-pdb-kustomize-overlay) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
@@ -4211,6 +4252,10 @@ unit_cost_hint() {
     # A general fleet health question that runs the health sweep (#3302): one
     # card and a sweep of seconds; the drift chat route's band.
     health-chat-request-runs-collector) echo 400 ;;
+    # A plain chat request that runs the GCE compute collector (#2386): it
+    # reads the serial console of every instance with a startup script; the
+    # audit band, without the ledger write.
+    gce-chat-request-runs-collector) echo 900 ;;
     # On the blocking roster since 2026-11-02 (#2013 step 4); presubmit held
     # out 2026-09-29 to then (#2013 step 2); nightly-only 2026-09-22 to
     # 2026-09-29 (#1023; held out on #1171, closed 2026-09-08). The canary
@@ -4370,7 +4415,7 @@ unit_cost_hint() {
 # The harness's delegation ceiling for one unit, in seconds: how long
 # devops-bench keeps polling the Platform Agent for a delegated worker before
 # it grades whatever the parent has said so far. Every unit inherits the
-# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the eight
+# global AGENT_DELEGATION_TIMEOUT exported in section 3 (2700s); the
 # full-audit units -- SOP dispatch, a delegated worker sweeping the fleet,
 # a ledger write, one closing line -- get 3000s.
 #
@@ -4408,6 +4453,8 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
+    obtainability-pdb-kustomize-overlay) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
     # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
     fleet-audit-as-many-excluded-as-managed) echo 3000 ;;
@@ -5100,6 +5147,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # lease is never copied in for this repetition.
   local timing="${STATE_DIR}/${name}.rep${rep}.${EVAL_TIMING_FILE}"
   rm -f "${timing}"
+  # The same for the delivered reply's shape (harness.py, KUBE_AGENTS_SHAPE_FILE).
+  local shape="${STATE_DIR}/${name}.rep${rep}.${EVAL_SHAPE_FILE}"
+  rm -f "${shape}"
   # A stack that writes to the leased GitOps repository gets its own write
   # token, minted here, after the waits, as the grading token is above, and
   # renewed until devops-bench returns, which is after the stack's destroy
@@ -5124,7 +5174,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   local token_file="${STATE_DIR}/${name}.rep${rep}.ledger-token"
   start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"
   start="$(_now_ms)"
-  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
+  (cd "${BENCH_DIR}" && KUBE_AGENTS_TIMING_FILE="${timing}" KUBE_AGENTS_SHAPE_FILE="${shape}" uv run devops-bench "${run_task}" --agent-type kubeagents 2>&1 | _ts_lines > "${log}") || true
   end="$(_now_ms)"
   stop_ledger_token_renewal "${token_file}"
   if [ -n "${gitops_writer}" ]; then
@@ -5140,6 +5190,9 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # missing timing never fails the repetition.
   if [ -n "${dir}" ] && [ -f "${timing}" ]; then
     cp "${timing}" "${dir}/${EVAL_TIMING_FILE}" 2>/dev/null || true
+  fi
+  if [ -n "${dir}" ] && [ -f "${shape}" ]; then
+    cp "${shape}" "${dir}/${EVAL_SHAPE_FILE}" 2>/dev/null || true
   fi
   # A gated judged score the judge failed to return is asked for once more
   # from the saved answer (kube_agents_bench/rejudge.py), before the .dir

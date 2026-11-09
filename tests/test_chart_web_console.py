@@ -39,6 +39,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+from tests._autopilot import gib_per_vcpu, gib_per_vcpu_in_band
 from tests.testing.release import parse_required_release_images
 CHART_DIR = REPO_ROOT / "charts" / "kube-agents"
 TEMPLATE = CHART_DIR / "templates" / "web-console.yaml"
@@ -226,10 +227,32 @@ class WebConsoleChartTest(unittest.TestCase):
         self.assertNotIn("replicaCount", values["webConsole"])
         self.assertRegex(self.docs["Deployment"], r"(?m)^\s+replicas: 1$")
 
+    def test_resources_are_sized_for_an_autopilot_clamp(self) -> None:
+        """GKE Autopilot without Pod bursting sets each limit to its request, so the
+        request is what the console runs under. The pinned pair, both limits declared, the
+        requests inside the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged, and the
+        memory limit handed to the binary from the container's own limits.memory."""
+        resources = yaml.safe_load(VALUES.read_text())["webConsole"]["resources"]
+        self.assertEqual(
+            resources,
+            {
+                "requests": {"cpu": "100m", "memory": "128Mi"},
+                "limits": {"cpu": "500m", "memory": "256Mi"},
+            },
+        )
+        ratio = gib_per_vcpu(resources["requests"]["cpu"], resources["requests"]["memory"])
+        self.assertTrue(gib_per_vcpu_in_band(ratio), ratio)
+        self.assertRegex(
+            self.docs["Deployment"],
+            r"(?m)^\s+- name: WEB_CONSOLE_MEMORY_LIMIT_BYTES\n\s+valueFrom:\n\s+resourceFieldRef:\n\s+resource: limits\.memory$",
+        )
+
     def test_quota_preflight_counts_the_console(self) -> None:
         self.assertRegex(
             HELPERS.read_text(),
-            r'(?s)if \.Values\.webConsole\.enabled -\}\}(?:(?!\{\{- end).)*append \$chartWorkloads \(dict "values" \.Values\.webConsole ',
+            # kube-agents.chartWorkloads, which the preflight and the operator's chart-pods
+            # count both read (#4893).
+            r'(?s)if \.Values\.webConsole\.enabled -\}\}(?:(?!\{\{- end).)*append \$w \(dict "name" "web-console" "standing" true "values" \.Values\.webConsole ',
         )
 
     def test_off_by_default(self) -> None:
@@ -327,6 +350,17 @@ class WebConsoleRenderTest(unittest.TestCase):
     def _console_env(self, docs: list[dict]) -> dict[str, str]:
         deployment = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "t-web-console")
         return {e["name"]: e.get("value") for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+    def test_memory_limit_reaches_the_console_from_its_own_limit(self) -> None:
+        docs = self._render("--set", "webConsole.enabled=true")
+        deployment = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "t-web-console")
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        env = {e["name"]: e for e in container["env"]}
+        self.assertEqual(
+            env["WEB_CONSOLE_MEMORY_LIMIT_BYTES"]["valueFrom"],
+            {"resourceFieldRef": {"resource": "limits.memory"}},
+        )
+        self.assertEqual(container["resources"]["limits"]["memory"], "256Mi")
 
     def test_headless_service_only_with_both_toggles(self) -> None:
         self.assertEqual(self._headless(self._render()), [])

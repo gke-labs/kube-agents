@@ -24,7 +24,9 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"maps"
 	"net"
+	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +36,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	sigsyaml "sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -48,6 +52,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"k8s.io/client-go/tools/record"
 )
 
 func a2aTestAgent() *agentv1alpha1.PlatformAgent {
@@ -843,6 +848,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -1558,24 +1565,135 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if !ok {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
-	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 27 {
-		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
+	// The gateway's cap plus the derived headroom (#3848): what the operator
+	// renders for the agent, the chart's pods (the default for a CR the chart
+	// did not stamp), and the transient margin.
+	standing := a2aStandingPods(agent)
+	want := 10 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin
+	if pods.Value() != want {
+		t.Fatalf("default quota = %d, want %d (cap 10 + standing %d + chart default %d + margin %d)",
+			pods.Value(), want, standing, a2aDefaultChartPods, a2aQuotaTransientMargin)
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 19 {
-		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
+	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
+		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
 
 	// The MCP server is one more standing pod, only while its flag is on (#3869).
+	without := pods.Value()
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 20 {
-		t.Fatalf("tuned quota with the MCP server = %d, want 20 (cap 2 + headroom 17 + 1)", pods.Value())
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
+		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
 	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	}
+}
+
+// The chart's standing pods come from the annotation the chart stamps on the
+// CR; a CR without one, or with an unreadable one, gets the chart's default.
+func TestA2AQuotaCountsTheChartsPods(t *testing.T) {
+	base := a2aTestAgent()
+	quotaBase := int64(resolveA2AMaxSessions(base)) + a2aStandingPods(base) + a2aQuotaTransientMargin
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int64
+	}{
+		{"the chart's count", ptr.To("7"), quotaBase + 7},
+		{"zero, for a chart that renders none here", ptr.To("0"), quotaBase},
+		{"trimmed", ptr.To(" 4 "), quotaBase + 4},
+		{"the default without the annotation", nil, quotaBase + a2aDefaultChartPods},
+		{"the default for an unreadable count", ptr.To("seven"), quotaBase + a2aDefaultChartPods},
+		{"the default for a negative count", ptr.To("-3"), quotaBase + a2aDefaultChartPods},
+		{"the cap itself", ptr.To(strconv.Itoa(a2aMaxChartPods)), quotaBase + a2aMaxChartPods},
+		{"the default past the cap", ptr.To(strconv.Itoa(a2aMaxChartPods + 1)), quotaBase + a2aDefaultChartPods},
+		{"the default for a figure that would wrap the quota", ptr.To("9223372036854775807"), quotaBase + a2aDefaultChartPods},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			pods := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+			if pods.Value() != tc.want {
+				t.Fatalf("quota = %d, want %d", pods.Value(), tc.want)
+			}
+		})
+	}
+}
+
+// An agent scaled to zero runs no agent pod, so it holds no slot of the
+// headroom; the rest of the stack still stands.
+func TestA2AStandingPodsDropTheAgentPodAtScaleToZero(t *testing.T) {
+	agent := a2aTestAgent()
+	running := a2aStandingPods(agent)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{ScaleToZero: ptr.To(true)}
+	if got := a2aStandingPods(agent); got != running-1 {
+		t.Fatalf("a2aStandingPods at scaleToZero = %d, want %d", got, running-1)
+	}
+}
+
+// a2aStandingPods has to name every standing workload the operator renders in
+// next mode. The next-mode golden is the operator's own steady-state render of
+// the example CR, so a Deployment or StatefulSet added there and not here fails
+// this rather than quietly eating the session headroom (#3848).
+func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
+	dir := filepath.Join("..", "testing", "testdata", "platform")
+	input, err := os.ReadFile(filepath.Join(dir, "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := sigsyaml.Unmarshal(input, agent); err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile(filepath.Join(dir, "expected", "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered int64
+	var names []string
+	for _, doc := range strings.Split(string(golden), "\n---\n") {
+		var w struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+		}
+		if err := sigsyaml.Unmarshal([]byte(doc), &w); err != nil {
+			t.Fatal(err)
+		}
+		if w.Kind != "Deployment" && w.Kind != "StatefulSet" {
+			continue
+		}
+		rendered += int64(ptr.Deref(w.Spec.Replicas, 1))
+		names = append(names, w.Kind+"/"+w.Metadata.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
+	}
+	// The golden runs the gateway at the one replica it starts with: no pod
+	// holds the election's Lease there, so the scale-out to its standby (and a
+	// rollout's surge pod) never renders, and a2aGatewayStandbyPods counts them.
+	standby := a2aGatewayStandbyPods(agent)
+	if standby == 0 {
+		t.Fatal("the next-mode golden's CR runs no gateway standby, so this proves nothing about it")
+	}
+	if got := a2aStandingPods(agent); got != rendered+standby {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v, plus %d for the gateway's standby",
+			got, rendered, names, standby)
+	}
+
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:
@@ -2172,13 +2290,16 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	t.Setenv(a2aGatewayElectionEnvVar, "true")
+	// And Job mode, so its objects in the profile namespace are rendered too.
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	failRole := true
+	jobPolicy, jobBinding := shippedDispatcherJobPolicy(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, chartProfileNamespace(agent)).
+		WithObjects(agent, chartProfileNamespace(agent), jobPolicy, jobBinding).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2211,12 +2332,45 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
+	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.
 	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
 		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
 			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
 		}
+	}
+	// And Job mode's half: the Jobs Role and binding, the policy's index
+	// param, and a Job the dispatcher made (the fake runs no dispatcher).
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher-jobs", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's Jobs %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
+	}
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: dispatchJobLabels(agent),
+	}}); err != nil {
+		t.Fatalf("precondition: create a dispatcher Job: %v", err)
+	}
+	// A Job with the marker but not this agent's labels isn't the
+	// dispatcher's, and stays.
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "someone-elses", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+	}}); err != nil {
+		t.Fatalf("precondition: create a foreign Job: %v", err)
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2280,6 +2434,25 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
+	}
+	// Job mode's half, likewise unowned.
+	for _, tc := range []struct {
+		obj  client.Object
+		name string
+	}{
+		{&rbacv1.Role{}, "test-agent-a2a-dispatcher-jobs"},
+		{&rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher-jobs"},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobIndexName},
+		{&batchv1.Job{}, "dispatch-1"},
+	} {
+		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns-profiles"}, tc.obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("Job mode's %T %s in the profile namespace survived the cleanup (err=%v)", tc.obj, tc.name, err)
+		}
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "someone-elses", Namespace: "test-ns-profiles"}, &batchv1.Job{}); err != nil {
+		t.Errorf("a Job without this agent's labels was deleted: %v", err)
 	}
 
 	// A third pass on the now-empty tree is the exit doing its job.
@@ -5166,6 +5339,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A profile task's submission; the gateway is its one writer.
+		"a2a.submit.*.*.*.*",
+		// A profile task's stop record; the gateway is its one writer too.
+		"a2a.stop.*.*",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
@@ -5179,6 +5356,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read: the directory's subject list and a
+	// direct get per card subject, and no consumer.
+	want = append(want, "$JS.API.STREAM.INFO.DIRECTORY", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*")
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
@@ -5236,11 +5416,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
 	// Streams the gateway has no business on at all: not a read, not a
-	// consumer, not a direct get. The directory is the identity plane and
-	// the gateway reads it by subscribing to the cards; the topic streams
-	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the bridge's and the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+	// consumer, not a direct get. The topic streams are the blackboard,
+	// which nothing in a2a/gateway touches; the other two buckets are the
+	// bridge's and the capability envelope's.
+	for _, s := range []string{"TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5252,6 +5431,21 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 			"$JS.API.DIRECT.GET."+s,
 		)
 	}
+	// The directory, the identity plane. The gateway follows the cards by
+	// subscribing, but subscribing alone misses cards published before it
+	// started, so it also reads them: the subject list, then DIRECT.GET on
+	// card subjects only. No consumer on it, and no direct get past the card
+	// subjects.
+	forbidden = append(forbidden,
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x.a2a.agents.platform",
+		"$JS.API.CONSUMER.DURABLE.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.x",
+		"$JS.API.CONSUMER.DELETE.DIRECTORY.x",
+		"$JS.API.DIRECT.GET.DIRECTORY",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform.x",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.tasks.platform.task-0001.in",
+	)
 	forbidden = append(forbidden,
 		// A session pod's three consumers, and the bridge's durable: the
 		// gateway may create consumers on TASKS, and create-as-update
@@ -5361,6 +5555,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway answer feedback, over the feedback bucket.
 		{"startFeedback js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aFeedbackBucket},
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
+		// gateway.readDirectory, the profile cards' start-up read.
+		{"readDirectory js.Stream / stream.Info", "$JS.API.STREAM.INFO." + a2aDirectoryStream},
+		{"readDirectory GetLastMsgForSubject", "$JS.API.DIRECT.GET." + a2aDirectoryStream + ".a2a.agents.cluster"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		// gateway people count, over the people bucket.
@@ -5886,6 +6083,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: map[string][]string{
 				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The profile cards' start-up read: the subject list and a
+				// direct get per card, no consumer (readDirectory).
+				a2aDirectoryStream: {"STREAM.INFO", "DIRECT.GET"},
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
@@ -8377,5 +8577,269 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	noIntegration := a2aTestAgent()
 	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
 		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
+	}
+}
+
+// Each workload the operator renders only on a condition is counted when it
+// runs, in agent.Namespace: the credential proxy's exec tier (a CR field), the
+// MCP door and the dispatcher (operator flags). The golden tie cannot see
+// these, so each has a row here, and a new conditional workload needs one.
+func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
+	base := a2aStandingPods(a2aTestAgent())
+	t.Run("the exec tier, at its replicas", func(t *testing.T) {
+		agent := a2aTestAgent()
+		if agent.Spec.Deployment == nil {
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+		}
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(3))}}
+		if got := a2aStandingPods(agent); got != base+3 {
+			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
+		}
+	})
+	t.Run("the MCP door", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+		}
+	})
+	t.Run("the dispatcher", func(t *testing.T) {
+		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+		}
+	})
+}
+
+// One parse decides both the count and the discard (#4893): a value is used
+// exactly when no reason is given, an absent annotation takes the default
+// without one, and every discarded value takes the default with one.
+func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
+	absent := a2aTestAgent()
+	if n, why := a2aChartPodsCount(absent); n != a2aDefaultChartPods || why != "" {
+		t.Fatalf("absent: (%d, %q), want the default and no reason", n, why)
+	}
+	for _, c := range []struct {
+		raw  string
+		want int64
+		used bool
+	}{
+		{"0", 0, true},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{fmt.Sprint(a2aMaxChartPods), a2aMaxChartPods, true},
+		{fmt.Sprint(a2aMaxChartPods + 1), a2aDefaultChartPods, false},
+		{"-1", a2aDefaultChartPods, false},
+		{"", a2aDefaultChartPods, false},
+		{"seven", a2aDefaultChartPods, false},
+		{"99999999999999999999", a2aDefaultChartPods, false},
+	} {
+		agent := a2aTestAgent()
+		agent.SetAnnotations(map[string]string{a2aChartPodsAnnotation: c.raw})
+		n, why := a2aChartPodsCount(agent)
+		if n != c.want || (why == "") != c.used {
+			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
+		}
+		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
+			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		}
+	}
+}
+
+// A PlatformAgent without the chart-pods annotation takes the chart's count
+// from the a2a-quota-chart-pods ConfigMap in its namespace (#4883): an
+// operator-only release still runs chart pods there. The annotation wins, a
+// missing ConfigMap leaves the default, a value past the cap is discarded and
+// named as the ConfigMap's, and the CR itself is not changed.
+func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
+	cm := func(v string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: "test-ns"},
+			Data:       map[string]string{a2aChartPodsConfigMapKey: v},
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		configMap  *corev1.ConfigMap
+		operatorNS string
+		want       int64
+		why        string
+	}{
+		{"the ConfigMap, without an annotation", nil, cm("11"), "test-ns", 11, ""},
+		{"the annotation wins over the ConfigMap", ptr.To("7"), cm("11"), "test-ns", 7, ""},
+		{"neither: the default", nil, nil, "test-ns", a2aDefaultChartPods, ""},
+		{"a ConfigMap past the cap: the default, named", nil, cm("70"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		// The operator reads the ConfigMap from its own namespace only.
+		{"a ConfigMap outside the operator's namespace: the default, said", nil, cm("11"), "kubeagents-system", a2aDefaultChartPods, "only from its own namespace"},
+		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "own namespace is unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			objs := []client.Object{agent}
+			if tc.configMap != nil {
+				objs = append(objs, tc.configMap)
+			}
+			cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			r := &PlatformAgentReconciler{Client: cl, OperatorNamespace: tc.operatorNS}
+			sized, why, err := r.a2aQuotaAgent(context.Background(), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := a2aChartPods(sized); got != tc.want {
+				t.Errorf("chart pods = %d, want %d", got, tc.want)
+			}
+			if (why == "") != (tc.why == "") || !strings.Contains(why, tc.why) {
+				t.Errorf("why = %q, want it to name %q", why, tc.why)
+			}
+			if tc.annotation == nil && len(agent.Annotations) != 0 {
+				t.Errorf("the CR itself gained annotations %v", agent.Annotations)
+			}
+		})
+	}
+}
+
+// The reconcile sizes the applied session quota from the ConfigMap's count
+// when the CR has no annotation and the ConfigMap is in the operator's own
+// namespace, and warns, naming the ConfigMap, when it discards one or does
+// not read one from another namespace (#4883).
+func TestA2ASessionQuotaFollowsTheChartConfigMap(t *testing.T) {
+	for _, tc := range []struct {
+		value      string
+		operatorNS string
+		pods       int64
+		warns      bool
+	}{
+		{"11", "test-ns", 11, false},
+		{"70", "test-ns", a2aDefaultChartPods, true},
+		{"11", "kubeagents-system", a2aDefaultChartPods, true},
+	} {
+		t.Run(tc.value+"/"+tc.operatorNS, func(t *testing.T) {
+			agent := a2aTestAgent()
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: agent.Namespace},
+				Data:       map[string]string{a2aChartPodsConfigMapKey: tc.value},
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent), cm).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: tc.operatorNS}
+			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			quota := &corev1.ResourceQuota{}
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: a2aSessionQuotaName(agent)}, quota); err != nil {
+				t.Fatal(err)
+			}
+			want := int64(resolveA2AMaxSessions(agent)) + a2aStandingPods(agent) + tc.pods + a2aQuotaTransientMargin
+			if got := quota.Spec.Hard[corev1.ResourcePods]; got.Value() != want {
+				t.Errorf("quota pods = %d, want %d (chart pods %d)", got.Value(), want, tc.pods)
+			}
+			warned := false
+			for done := false; !done; {
+				select {
+				case e := <-rec.Events:
+					if strings.Contains(e, a2aChartPodsDiscardedReason) && strings.Contains(e, "ConfigMap "+a2aChartPodsConfigMapName) {
+						warned = true
+					}
+				default:
+					done = true
+				}
+			}
+			if warned != tc.warns {
+				t.Errorf("warned naming the ConfigMap = %v, want %v", warned, tc.warns)
+			}
+		})
+	}
+}
+
+// A chart-pods annotation the operator discards is reported, once per spec
+// generation, as a Warning event; an absent one (a CR written without the
+// chart) and a usable one are not.
+func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
+	warnings := func(rec *record.FakeRecorder) int {
+		n := 0
+		for {
+			select {
+			case e := <-rec.Events:
+				if strings.Contains(e, a2aChartPodsDiscardedReason) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int
+	}{
+		{"past the cap", ptr.To("70"), 1},
+		{"unreadable", ptr.To("seven"), 1},
+		{"negative", ptr.To("-3"), 1},
+		{"usable", ptr.To("5"), 0},
+		{"absent", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			if why := a2aChartPodsDiscard(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsDiscard = %q", why)
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+			ctx := context.Background()
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events over two passes of one generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			agent.Generation++
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events after a new generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			// An annotation edit leaves the generation alone; a new bad value
+			// still warns, once.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events after a new bad value at the same generation, want 1", got, a2aChartPodsDiscardedReason)
+			}
+			// A usable value in between re-arms it: the same bad value again
+			// warns once more.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "5"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events for a bad value back after a usable one, want 1", got, a2aChartPodsDiscardedReason)
+			}
+		})
 	}
 }

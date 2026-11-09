@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -127,10 +128,12 @@ func TestDeferredStopGivesUnsettledDeliveriesBack(t *testing.T) {
 	// The durable's AckWait is the server default, 30s; a give-back that
 	// didn't happen would only arrive after it.
 	waitUntil(t, "the two unsettled deliveries on the second subscriber", 5*time.Second, func() bool { return len(c2.snapshot()) == 2 })
-	for i, want := range []string{"t2", "t3"} {
-		if got := c2.snapshot()[i].Envelope().TaskID; got != want {
-			t.Fatalf("second subscriber's delivery %d is %s, want %s", i, got, want)
-		}
+	// In either order: this subscriber binds after the stop, so the give-back
+	// can fall due before it is bound, and deferred.go promises the order
+	// only to a subscriber bound by then.
+	ids := taskIDs(c2.snapshot())
+	if got := slices.Sorted(slices.Values(ids)); !slices.Equal(got, []string{"t2", "t3"}) {
+		t.Fatalf("second subscriber got %v, want t2 and t3", ids)
 	}
 }
 
@@ -170,9 +173,9 @@ func consumerInfo(t *testing.T, h *heldHarness) *jetstream.ConsumerInfo {
 }
 
 // Deliveries that reach the client while a stop is draining are held for the
-// give-back, not nak'd ahead of it, so the next subscriber gets every
-// delivery back in stream order: the one the handler had and the ones still
-// buffered behind it.
+// give-back, not nak'd ahead of it, so a subscriber bound when the give-back
+// falls due gets every delivery back in stream order: the one the handler had
+// and the ones still buffered behind it.
 func TestDeferredDeliveriesArrivingDuringTheDrainComeBackInOrder(t *testing.T) {
 	h, first := newHeldHarness(t, "relay")
 	release := make(chan struct{})
@@ -190,12 +193,17 @@ func TestDeferredDeliveriesArrivingDuringTheDrainComeBackInOrder(t *testing.T) {
 		h.submit(id)
 	}
 	waitUntil(t, "the first delivery in the handler", 5*time.Second, func() bool { return len(c1.snapshot()) == 1 })
-	stopped := make(chan struct{})
-	go func() { sub1.Stop(); close(stopped) }()
-	time.Sleep(200 * time.Millisecond) // the stop is draining, behind the handler
-	close(release)
-	<-stopped
+	// The order covers only the deliveries the stopping subscriber holds: one
+	// the server hadn't sent it yet would reach the second subscriber as new.
+	waitUntil(t, "all three sent to the first subscriber", 5*time.Second, func() bool {
+		info := consumerInfo(t, h)
+		return info.NumPending == 0 && info.NumAckPending == 3
+	})
 
+	// And only a subscriber bound when the give-back falls due gets them in
+	// order (deferred.go), so the second binds before the stop, and the first
+	// stops only once the server holds the second's pull request.
+	waiting := consumerInfo(t, h).NumWaiting
 	second, err := Connect(h.ctx, h.url, WithName("second"))
 	if err != nil {
 		t.Fatal(err)
@@ -207,6 +215,13 @@ func TestDeferredDeliveriesArrivingDuringTheDrainComeBackInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(sub2.Stop)
+	waitUntil(t, "the second subscriber's pull request on the server", 5*time.Second, func() bool { return consumerInfo(t, h).NumWaiting > waiting })
+
+	stopped := make(chan struct{})
+	go func() { sub1.Stop(); close(stopped) }()
+	time.Sleep(200 * time.Millisecond) // the stop is draining, behind the handler
+	close(release)
+	<-stopped
 	waitUntil(t, "all three back on the second subscriber", 5*time.Second, func() bool { return len(c2.snapshot()) == 3 })
 	for i, want := range []string{"t1", "t2", "t3"} {
 		if got := c2.snapshot()[i].Envelope().TaskID; got != want {

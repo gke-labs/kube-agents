@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -21,7 +22,17 @@ func TestALostAcceptIsAbandonedBeforeTheReoffer(t *testing.T) {
 	lost := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
 	lost.dropAccept = true
 	good := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
-	b.runDispatcher(testConfig(), oneProfile("tse", 2, "tse-0", "tse-1"), &fakeVerifier{})
+	// The order the dispatcher sends in: two workers on two connections can
+	// receive back-to-back publishes in either order.
+	var sentMu sync.Mutex
+	var sent []string
+	b.runPrepared(b.connect("dispatcher"), testConfig(), oneProfile("tse", 2, "tse-0", "tse-1"), &fakeVerifier{}, func(d *Dispatcher) {
+		d.onSend = func(subject string, m lib.DispatchMessage) {
+			sentMu.Lock()
+			defer sentMu.Unlock()
+			sent = append(sent, subject+" "+string(m.Type)+" "+m.TaskID)
+		}
+	})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	if ts := b.waitTerminal("task-1", 15*time.Second); ts.state != lib.StateCompleted || ts.from != "tse-1" {
@@ -37,12 +48,28 @@ func TestALostAcceptIsAbandonedBeforeTheReoffer(t *testing.T) {
 	if good.confirmCount() != 1 || good.startedCount() != 1 {
 		t.Errorf("tse-1: %d confirms, %d starts; want one each", good.confirmCount(), good.startedCount())
 	}
-	// The abandon reached tse-0 before tse-1 was offered the task.
 	lost.mu.Lock()
 	abandon := lost.abandons[0]
 	lost.mu.Unlock()
 	if abandon.TaskID != "task-1" || abandon.Reason != abandonTimedOut {
 		t.Errorf("tse-0's abandon %+v", abandon)
+	}
+	// The abandon went to tse-0 before tse-1 was offered the task.
+	sentMu.Lock()
+	order := append([]string(nil), sent...)
+	sentMu.Unlock()
+	at := func(event string) int {
+		for i, e := range order {
+			if e == event {
+				return i
+			}
+		}
+		return -1
+	}
+	abandoned := at(lib.DispatchSubject("tse", "read", "tse-0") + " " + string(lib.DispatchAbandon) + " task-1")
+	reoffered := at(lib.DispatchSubject("tse", "read", "tse-1") + " " + string(lib.DispatchOffer) + " task-1")
+	if abandoned < 0 || reoffered < 0 || abandoned > reoffered {
+		t.Errorf("send order %v: want tse-0's abandon before tse-1's offer", order)
 	}
 }
 

@@ -289,7 +289,7 @@ class TestEnsureWorkspace(WorkspaceTestCase):
 class TestEnsureScratchWorkspace(WorkspaceTestCase):
     """The same lease, with no clone in it.
 
-    What the content-passing path hands the agent. Two things have to hold at
+    What the broker paths hand the agent. Two things have to hold at
     once and they pull in opposite directions: there must be no `.git` here,
     and the lease bookkeeping — the path, the marker, the reaper — has to be
     the same as the clone path's, because `start` and `finish` find each other

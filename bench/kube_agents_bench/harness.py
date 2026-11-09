@@ -67,6 +67,16 @@ Environment:
         presubmit sets it per repetition), on either transport: under
         ``inject`` the opening task from the door accepting it to its
         terminal. Unset, nothing is written.
+    KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES: ``1`` turns off devops-bench's
+        ``ToolInvocation`` and ``Checklist`` judge scores for the process the
+        harness is built in (:func:`_skip_report_only_judges`). The presubmit
+        sets it on a pull request; unset, every score runs.
+    KUBE_AGENTS_SHAPE_FILE: When set, the shape of the reply the run
+        delivered is written there (best effort; the presubmit sets it per
+        repetition): whether it opens on its answer, whether it apologizes,
+        how many messages the thread received, and its word counts
+        (:mod:`kube_agents_bench.chat_shape`). Reported, never scored. Unset,
+        or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -147,6 +157,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -160,11 +171,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from devops_bench.agents import AgentHarness, AgentResult
+from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -192,12 +203,23 @@ SERVICE_API_PORT = 8642
 # Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
 # recorded a condition under which no answer can be graded: transport exhausted,
 # the server reporting a provider rate limit or billing stop on the opening turn,
-# or a delegated worker encountering quota exhaustion before acting.
+# or a delegated worker's card blocked by its rate-limit guardrail with no
+# completion or block call of the worker's own and no artifact (#4998),
+# whether or not the worker acted first.
 # ``scoring.py`` matches this string on a record's error and classifies the repetition
 # as infrastructure rather than grading it. The literal is duplicated there (importing
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# Set to ``1`` by the presubmit on a pull request (hack/ci-eval-pr.sh). The two
+# judge scores it turns off gate nothing: the verdict reads the deterministic
+# Verification* scores and OutcomeValidity, ``RepetitionRecord.judged`` keeps
+# ToolInvocation "for reporting only", and ChecklistScore only feeds
+# OutcomeScore when a record has no VerificationCorrectness. A pull request
+# never records a baseline, so the nightly, which keeps both, is where their
+# trend lives.
+SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
 # The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
@@ -218,6 +240,20 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
+# The block kind the worker's rate-limit guardrail files
+# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
+# test_harness.py holds the two equal) and the status it leaves the card in.
+_GUARDRAIL_BLOCK_KIND = "transient"
+_GUARDRAIL_BLOCK_STATUS = "blocked"
+# The one failure reason the guardrail blocks on (its RATE_LIMIT_FAILURE_REASONS;
+# a billing stop is not blocked transient, so a billing reason is not its write).
+_GUARDRAIL_FAILURE_REASON = "rate_limit"
+# The verbs by which a worker closes or blocks its own card. The guardrail
+# blocks from the exit path with no tool call, so a card whose worker made
+# one of these calls was closed by the model, whatever text it carries.
+_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
+
+
 def _is_substantive_worker_action(name: str | None) -> bool:
     """Whether a tool entry recorded for a delegated worker constitutes substantive action.
 
@@ -231,7 +267,7 @@ def _is_substantive_worker_action(name: str | None) -> bool:
     if not name:
         return False
     # Worker terminal verbs that complete or block cards
-    if name in {"kanban_complete", "kanban_block"}:
+    if name in _WORKER_CARD_VERBS:
         return True
     # Terminal, shell, and direct command execution
     if name in {"terminal", "bash", "sh", "exec", "shell", "kubectl", "gcloud"}:
@@ -474,6 +510,9 @@ _ARTIFACTS_ENV = "ARTIFACTS"
 _TIMING_FILE_ENV = "KUBE_AGENTS_TIMING_FILE"
 _TIMING_TURN1_KEY = "turn1_s"
 _TIMING_DECIMALS = 3
+# Where the delivered reply's shape goes (chat_shape.measure), for the eval
+# dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
+_SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -962,6 +1001,60 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _guardrail_blocked_cards(
+    awaited: Sequence[str],
+    on_board: dict[str, board.BoardCard] | None,
+    captured: worker_trajectory.WorkerCapture | None,
+    with_artifact: set[str],
+    front_trajectory: Sequence[Any] = (),
+) -> list[str]:
+    """The awaited cards when EVERY one is the rate-limit guardrail's block, else ``[]``.
+
+    A card counts when the board holds it blocked with the guardrail's kind
+    and its newest run summary opens on the guardrail's prefix with a
+    rate-limit or billing reason, no artifact was produced for it, and the
+    captured worker trajectory (present, or nothing counts) holds no
+    ``kanban_block`` or ``kanban_complete`` call for it, nor a wrapper call
+    that could hide one, from its own worker, another card's worker (the
+    call's ``task_id``) or the front door (``front_trajectory``). One card
+    that reads otherwise is a delivery, and the run is graded on it.
+    """
+    if not awaited or on_board is None or captured is None:
+        return []
+    # A ``tool_call`` wrapper whose arguments cannot be read (not a dict, a
+    # clipped ``raw`` string, no names) may hold the worker's own close, as
+    # #3988 counts it as acted; it is read as a close here too, fail closed.
+    closed: set[str] = set()
+    for e in [*captured.entries, *front_trajectory]:
+        if not isinstance(e, dict):
+            continue
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        names = {e.get("name")} | worker_trajectory.wrapped_tool_names(e)
+        unreadable_wrapper = e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER and (
+            not isinstance(e.get("args"), dict)
+            or isinstance(args.get("raw"), str)
+            or not worker_trajectory.wrapped_tool_names(e)
+        )
+        if names & _WORKER_CARD_VERBS or unreadable_wrapper:
+            closed.add(str(e.get("task")))
+            if args.get("task_id"):
+                closed.add(str(args["task_id"]))
+    blocked: list[str] = []
+    for tid in awaited:
+        card = on_board.get(tid)
+        if (
+            card is None
+            or card.status != _GUARDRAIL_BLOCK_STATUS
+            or card.block_kind != _GUARDRAIL_BLOCK_KIND
+            or _extract_infra_failure_reason(card.summary or "") != _GUARDRAIL_FAILURE_REASON
+            or tid in with_artifact
+            or tid in closed
+        ):
+            return []
+        blocked.append(tid)
+    return blocked
+
+
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
@@ -1147,8 +1240,9 @@ def _artifact_paths(task_ids: list[str], timeout: float) -> list[str]:
     return paths[:_MAX_ARTIFACTS]
 
 
-def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> None:
+def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> set[str]:
     """Append the files the delegated cards produced to the graded answer.
+    Returns the ids of the cards that produced one.
 
     On a task whose deliverable is a written report, the worker's card result is
     a summary *of* the report and the report is a file the judge never sees --
@@ -1156,17 +1250,20 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     work is done and correct. Reading it back makes the deliverable part of the
     answer, the same way :func:`_append_delivered` does for the card result.
     """
+    produced: set[str] = set()
     if not task_ids:
-        return
+        return produced
     sections = []
     for path in _artifact_paths(task_ids, timeout):
         text = _agent_shell(f"head -c {_MAX_ARTIFACT_BYTES} {_shell_quote(path)}", timeout)
         if text.strip():
             tid, _, name = path[len(_ATTACHMENTS_DIR) + 1 :].partition("/")
             sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
+            produced.add(tid)
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
     _append_final(result, sections)
+    return produced
 
 
 _LOG_PRESENT = "__WORKER_LOG__"
@@ -2336,13 +2433,41 @@ def _connection_dropped(exc: BaseException) -> bool:
 
 
 def _write_turn_timing(turn1_s: float) -> None:
-    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``.
+    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``."""
+    _write_sidecar(
+        _TIMING_FILE_ENV, {_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, "turn timing"
+    )
+
+
+def _write_chat_shape(result: AgentResult) -> None:
+    """Write the delivered reply's shape to ``KUBE_AGENTS_SHAPE_FILE``.
+
+    Nothing is written for a run whose reply the thread never showed: none
+    at all, a silence marker the gateway swallows, or an inject answer
+    adopted from the stream because the relay posted nothing. The inject
+    transport counts the posts it saw; the api transport leaves the count to
+    the final message's delivered sections.
+    """
+    final_message = str(result.metadata.get("final_message") or "")
+    if is_intentional_silence_response(final_message) or result.metadata.get("outcome") == inject.OUTCOME_STREAM_TERMINAL:
+        return
+    posts = result.metadata.get("window_posts")
+    shape = chat_shape.measure(
+        final_message,
+        posts if isinstance(posts, int) and not isinstance(posts, bool) else None,
+    )
+    if shape is not None:
+        _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
+
+
+def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
+    """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
     Best effort, like the worker logs: a file that will not write is logged
     and never changes the run. The temp file and ``os.replace`` make sure a
     reader never sees half a file.
     """
-    path = os.environ.get(_TIMING_FILE_ENV)
+    path = os.environ.get(env)
     if not path:
         return
     target = Path(path)
@@ -2350,10 +2475,10 @@ def _write_turn_timing(turn1_s: float) -> None:
     try:
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, handle)
+            json.dump(payload, handle)
         os.replace(tmp, target)
     except OSError as exc:
-        _log.warning("could not write the turn timing to %s: %s", target, exc)
+        _log.warning("could not write the %s to %s: %s", what, target, exc)
         if tmp is not None:
             try:
                 os.unlink(tmp)
@@ -2553,6 +2678,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "reason_token": fold.reason_token or None,
             "executor_states": list(fold.executor_states),
             "posts": len(fold.posts),
+            # The messages this task posted (its window), which the reply
+            # shape counts.
+            "window_posts": len(fold.window_posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
             # The marker's arguments (calls written, calls dropped), or None
@@ -2582,6 +2710,34 @@ class _DelegationTransportExhausted(Exception):
     """
 
 
+def _never_applies(self: object, ctx: object) -> bool:
+    return False
+
+
+def _skip_report_only_judges() -> None:
+    """Turn off devops-bench's ToolInvocation and Checklist evaluators in this process.
+
+    devops-bench scores a run in the process that built its harness, after the
+    run, from every evaluator in its metrics registry whose ``applies`` is true.
+    It has no switch for leaving one out, so the two classes' ``applies`` is
+    replaced: they stay registered and are skipped on every record, as a
+    checklist with no bullets already is. Importing the classes here does not
+    register them twice; the scoring pass imports the same modules.
+    """
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        evaluator.applies = _never_applies  # type: ignore[method-assign]
+    # stderr, not ``_log``: nothing configures a handler that shows INFO here
+    # (devops-bench attaches only a NullHandler), and the unit log the
+    # presubmit keeps (eval_<case>_rep<n>.log) captures stderr.
+    print(
+        f"{SKIP_REPORT_ONLY_JUDGES_ENV}=1: ToolInvocation and Checklist judge scores are off for this run",
+        file=sys.stderr,
+    )
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -2589,6 +2745,11 @@ class KubeAgentsHarness(AgentHarness):
     return an ``AgentResult`` with ``errors`` populated; the base class's safety
     net covers anything unexpected.
     """
+
+    def __init__(self, config: AgentConfig | None = None) -> None:
+        super().__init__(config)
+        if os.environ.get(SKIP_REPORT_ONLY_JUDGES_ENV) == "1":
+            _skip_report_only_judges()
 
     # The purge's floor (:func:`_pod_start`), set by :meth:`run`; ``None`` for
     # a run that could not read it, or an ``_execute`` called without ``run``.
@@ -2636,6 +2797,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
         )
+        _write_chat_shape(result)
         return result
 
     def _execute(
@@ -4549,7 +4711,10 @@ class KubeAgentsHarness(AgentHarness):
         buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
-        _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        with_artifact = _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        # The cards as the board holds them, read before the purge below
+        # deletes them: the guardrail block's key is their status and kind.
+        on_board = board.read_board_cards(_agent_shell, awaited, _EXEC_TIMEOUT) if awaited else None
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
@@ -4674,6 +4839,37 @@ class KubeAgentsHarness(AgentHarness):
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+            )
+            return
+
+        # The guardrail's own block, whether or not the worker acted first
+        # (#4998). A worker that spent its model-call retries on 429s is
+        # blocked by kanban_guardrail_exit from the exit path: status blocked,
+        # kind transient, the provider's text as the newest run summary, and
+        # no kanban_block or kanban_complete call of its own, which is the one
+        # board-visible difference from a model that typed the same words and
+        # blocked its card itself. Every awaited card has to read so, with no
+        # artifact, for the run to hold no answer; a worker that acted and then
+        # died is still set aside, because the answer it never gave is not
+        # evidence of the agent under test, and rung 1 grades what it did
+        # before that above this mark. On the inject lane the scorer sets the
+        # worker-blind safeguards aside on every record, died or completed,
+        # so keeping an acting worker's death graded there would protect
+        # nothing the lane has; the mark reads the same on both transports.
+        # The front door is another matter: one that acted after the card
+        # died (a command of its own, an answer it made up) produced
+        # something the judge must see, so it stays graded, as on the path
+        # above. A capture with a gap may have dropped the worker's own
+        # close, so it stays graded too.
+        guardrail_blocked = _guardrail_blocked_cards(
+            awaited, on_board, captured, with_artifact, result.trajectory
+        )
+        if guardrail_blocked and trajectory_clean and logs_clean and not front_door_acted:
+            _mark_result_infra_failure(
+                result,
+                "delegated worker hit infrastructure failure (rate_limit): the rate-limit "
+                f"guardrail blocked {', '.join(guardrail_blocked)} with no completion or block "
+                "call of the worker's own and no artifact, so the run holds no answer",
             )
 
     @staticmethod

@@ -728,14 +728,14 @@ if [ "${BENCH_NO_TEARDOWN:-false}" != "true" ]; then
   [ "${default_branch}" = "${REPO_DEFAULT_BRANCH}" ] || echo "WARN leak: default branch of ${repo_slug} is '${default_branch}', not ${REPO_DEFAULT_BRANCH}" >&2
   if ! agent_base_lines="$(agent_bases 2>/dev/null)"; then
     echo "WARN leak: whether a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH} is unknown (it could not be read); check it by hand" >&2
-  elif cut -f3 <<<"${agent_base_lines}" | grep -qxF "${RUN_BRANCH}"; then
+  elif grep -qxF "${RUN_BRANCH}" <<<"$(cut -f3 <<<"${agent_base_lines}")"; then
     echo "WARN leak: a PlatformAgent spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}" >&2
   fi
-  if gcloud container clusters list --project "${GCP_PROJECT_ID}" --filter="name=${CLUSTER_NAME}" --format="value(name)" 2>/dev/null | grep -q .; then
+  if grep -q . <<<"$(gcloud container clusters list --project "${GCP_PROJECT_ID}" --filter="name=${CLUSTER_NAME}" --format="value(name)" 2>/dev/null)"; then
     echo "WARN leak: task cluster ${CLUSTER_NAME} still exists" >&2
   fi
 elif [ "${case_pin}" = "true" ] \
-  && { agent_bases 2>/dev/null || true; } | cut -f3 | grep -qxF "${RUN_BRANCH}"; then
+  && grep -qxF "${RUN_BRANCH}" <<<"$({ agent_bases 2>/dev/null || true; } | cut -f3)"; then
   echo "WARN BENCH_NO_TEARDOWN=true: the PlatformAgent's spec.integration.repositories[].baseBranch still names ${RUN_BRANCH}, so every proposal onto ${slug} from this install targets it until the stack's destroy is run by hand" >&2
 fi
 exit "${rc}"

@@ -18,13 +18,13 @@ You need four things:
 
 ## Turn on the MCP server
 
-The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`; any other value leaves it off. Set the variable in the chart's `operator.extraEnv` list, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
+The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
 
 ```bash
-TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_MCP_DOOR",value="true"}]}}'
+TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
 ```
 
-The variable applies to every `PlatformAgent` the operator manages. If the line already carries other `extraEnv` entries, add this one to the same list, since there is one such line. On a bare Helm install, add the entry to `operator.extraEnv` in your values file.
+The setting applies to every `PlatformAgent` the operator manages. If the line already sets other values, add `mcpServer={enabled=true}` inside its `operator` object, since there is one such line. On a bare Helm install, pass `--set operator.mcpServer.enabled=true` or set it in your values file. An install that turned the server on with an `A2A_MCP_DOOR` entry in `operator.extraEnv` keeps working, and that entry wins over the value.
 
 Once the operator has restarted and reconciled, the install's namespace holds four objects named after the `PlatformAgent` (`platform-agent` on a default install): the server's Deployment and Service, its token Secret, and a NetworkPolicy that limits who can reach it:
 
@@ -162,7 +162,7 @@ The answer names the conversation and its token, quotes any gateway notices, and
 
 The other tools are `read_topics` (the install's standing topics and agent cards) and `manage_session` (named conversations and `/session` workers). There is also `discover_deployments`, which rescans your kubeconfig, and `connect_deployment`, which connects to a named install. `inspect_pr` fetches a pull request the agent filed and writes its diff to local files. The [MCP server reference](/kube-agents/reference/a2a-mcp/#the-tools) describes what each one does in the cluster.
 
-Card reports that arrive after a `send_message` call returns are not shown by this bridge, which does not offer the server's `poll_events` tool. A question the install hands to a card, which is common for anything that reads a cluster, then comes back as a short acknowledgement such as "checking namespaces on the host cluster." A later `status` message on the same conversation lists the cards and whether each is done, but not what they found.
+A question the install hands to a card, which is common for anything that reads a cluster, can come back first as a short acknowledgement such as "checking namespaces on the host cluster." The card's report arrives after `send_message` has returned. The answer ends with the `conversation_token` and `since` cursor to read it with: call `poll_events` with those two, and it returns the reports posted since that cursor. Set `wait_seconds` (60 at most) to have it wait for a report when none has arrived yet, and pass the cursor it returns on the next call. A `status` message on the same conversation lists the cards and whether each is done, but not what they found.
 
 ## Troubleshooting
 

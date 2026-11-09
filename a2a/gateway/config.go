@@ -35,6 +35,11 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultScopeFile is where the operator projects the install's rendered
+// spec.scope into the gateway pod: the same scope.json, at the same path, the
+// platform agent reads.
+const defaultScopeFile = "/etc/kube-agents/scope.json"
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -71,10 +76,14 @@ const (
 	envPodName      = "POD_NAME"
 )
 
-// envSlackAnswerFeedback turns answer feedback off when "false"
-// (feedback.go); the operator renders it only from
-// slack.answerFeedback=false.
-const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+// envSlackAnswerFeedback and envGchatAnswerFeedback turn answer feedback
+// off when "false" (feedback.go); the operator renders each only from its
+// backend's answerFeedback=false. The gateway holds one chat backend, so
+// either name turns off the one switch.
+const (
+	envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+	envGchatAnswerFeedback = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+)
 
 // envPeopleSeen turns the people bucket's records off when "false"
 // (people.go); the operator renders it only from
@@ -222,9 +231,9 @@ type Config struct {
 	// PodName is its identity there. Empty runs the gateway unelected.
 	GatewayLease string
 	PodName      string
-	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
-	// rating controls are drawn and nothing is kept, whatever the feedback
-	// bucket holds.
+	// AnswerFeedbackOff is the install's slack.answerFeedback=false or
+	// googleChat.answerFeedback=false: no rating controls are drawn and
+	// nothing is kept, whatever the feedback bucket holds.
 	AnswerFeedbackOff bool
 	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
 	// gateway records no one it sees in the people bucket.
@@ -337,7 +346,7 @@ type Config struct {
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
-	// MetricsPath and nothing else. It may not be either door's port: a door
+	// MetricsPath and ReadyzPath and nothing else. It may not be either door's port: a door
 	// that lost its port to this listener would fail to bind, and a door
 	// that won it would be what the collector's NetworkPolicy rule admits.
 	MetricsPort int
@@ -605,6 +614,19 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// ScopeFile is the rendered spec.scope a profile task's target is
+	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
+	// routed task, so an edit reaches the gateway without a restart. A
+	// missing or unreadable file refuses every target.
+	ScopeFile string
+
+	// ManagementProject is the install's own project
+	// (A2A_MANAGEMENT_PROJECT, spec.harness.projectId). checkTargetScope
+	// admits it whatever the scope lists, and ignores an exclude.projects
+	// entry that matches it, as the reconcile does. Empty admits nothing
+	// extra.
+	ManagementProject string
+
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
@@ -696,6 +718,8 @@ func FromEnv() (*Config, error) {
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:    capability.OptionalFromEnv(),
+		ScopeFile:             envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:     os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -718,7 +742,8 @@ func FromEnv() (*Config, error) {
 		// would campaign as the same holder.
 		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
 	}
-	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false) ||
+		strings.TrimSpace(os.Getenv(envGchatAnswerFeedback)) == strconv.FormatBool(false)
 	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}

@@ -344,11 +344,6 @@ FIXTURE_NOT_READY = {
         "re-apply); no pool project has a backend service draining longer than the 600 s "
         "GKE waits per node"
     ),
-    "networking-world-open-ingress": (
-        "#2682: bench/tf/fleet's world_open firewall rule and VM are applied; the "
-        "un-park cites a fixture-state scan that reads the world-open-ingress role "
-        "healthy on every pool project"
-    ),
     "b-0011-gitops": (
         "#1307: the GitOps fix-cycle pilot; needs a leaderboard GitOps repository "
         "and its credentials in the pool projects (the case takes the repository, "
@@ -433,22 +428,6 @@ FIXTURE_NOT_READY = {
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
     ),
-    "gce-startup-script-failure": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied; the un-park cites a "
-        "fixture-state scan that reads the startup-fail-vm role healthy on every "
-        "pool project"
-    ),
-    "gce-chat-request-runs-collector": (
-        "#2483: bench/tf/fleet's startup_fail VM is applied, as for "
-        "gce-startup-script-failure; the un-park cites a fixture-state scan that "
-        "reads the startup-fail-vm role healthy on every pool project"
-    ),
-    "obtainability-pdb-kustomize-overlay": (
-        "#2686: bench/tf/prebuilt/kustomize-overlay-declaration plants the "
-        "Kustomize root for each run with the write token hack/ci-eval-pr.sh "
-        "mints for a stack that declares bench_gitops_write_token_file; the "
-        "un-park cites one pool run that shows the plant and the teardown work"
-    ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
@@ -467,9 +446,11 @@ FIXTURE_NOT_READY = {
         "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
     "incident-triage-open-pr-reminder": (
-        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and "
-        "INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 in spec.deployment.env and a GitOps repository "
-        "declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env, "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS set shorter than the fix pull request takes to open (150, "
+        "as hack/ci-deploy.sh sets it; on the hour default the stack's recurrence lands inside the "
+        "window and folds with no pull request on its row, which the objective check fails) and a "
+        "GitOps repository declaring eval-pr-reminder-workload; every CI eval install leaves "
         "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
         "tier can run it; run it by hand against such an install"
     ),
@@ -609,9 +590,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the paragraphs the onboarding report
     # opens with, and the verdicts it must not write.
     "bootstrap_report_posture": ("posture",),
-    # This repository, sandbox-reading. No field, like pull_request_opened:
-    # the diff against the image is the assertion. It reads the agent's own
-    # shell sandbox pod, not a seeded-fleet fixture, so it is not in
+    # This repository, sandbox- or agent-pod-reading. No field, like
+    # pull_request_opened: the diff against the image is the assertion, and
+    # `target` only picks which pod's copy is read. It reads the agent's own
+    # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
@@ -663,6 +645,12 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 #: The property checks whose `value` the upstream verifier compares raw, so
 #: a quoted boolean never equals the API's boolean.
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+# `ledger_issue_contains` under `scope: finding` reads the findings of the
+# check(s) `finding_check` names; the verifier's model refuses one without the
+# other, which in the lane is after the cluster lease.
+LEDGER_CHECK_TYPE = "ledger_issue_contains"
+LEDGER_FINDING_SCOPE = "finding"
+LEDGER_FINDING_CHECK_FIELD = "finding_check"
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
@@ -1104,6 +1092,28 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
         )
+
+    # The same two rules the verifier's model applies after the cluster lease:
+    # the scope needs its check, a name or a list of names; the field is
+    # refused, blank or not, under any other scope.
+    if node_type == LEDGER_CHECK_TYPE:
+        scoped = node.get("scope") == LEDGER_FINDING_SCOPE
+        check_names = node.get(LEDGER_FINDING_CHECK_FIELD)
+        names = check_names if isinstance(check_names, list) else [check_names]
+        named = check_names is not None and all(isinstance(n, str) for n in names) and any(
+            n.strip() for n in names if isinstance(n, str)
+        )
+        if scoped and not named:
+            problems.append(
+                f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}' (a check name, or a list of them), "
+                "the check whose findings it reads"
+            )
+        elif check_names is not None and not scoped:
+            problems.append(
+                f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
+                f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
+            )
 
     # A quoted boolean against a boolean field never compares equal: the
     # verifier compares the value raw and the API holds a bool, so the check

@@ -235,7 +235,7 @@ resource "null_resource" "drift" {
       managers="$(kubectl get deployment "${local.workload}" -n "${local.ns}" \
         -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}')"
       for expected in "${var.gitops_field_manager}" "${var.drift_field_manager}"; do
-        if ! printf '%s\n' "$managers" | grep -qxF "$expected"; then
+        if ! grep -qxF "$expected" <<<"$managers"; then
           echo "ERROR: ${local.workload} does not record field manager '$expected' after the plant, so the ownership the drift record claims is not on the live object. Managers found:" >&2
           printf '%s\n' "$managers" >&2
           exit 1

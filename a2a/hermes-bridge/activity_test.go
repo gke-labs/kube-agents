@@ -721,6 +721,9 @@ func TestActivity_NoArgumentTextReachesTheBus(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}, "project": "p"}, "call_1")
+call("read_file", {"path": "/etc/secret-path.yaml"}, "call_2")
+call("mcp__gke__list_clusters", {"cluster": "secret-cluster-name"}, "call_3")
+call("terminal", {"command": "kubectl get pods --cluster secret-cluster"}, "call_4")
 print("the answer")
 `), nil)
 	c := gatewayClient(t, url)
@@ -730,8 +733,13 @@ print("the answer")
 		t.Fatalf("state = %s, want completed", task.State)
 	}
 	entries := activityEntries(t, task)
-	if len(entries) != 1 {
-		t.Fatalf("activity entries = %d, want 1: %+v", len(entries), entries)
+	if len(entries) != 4 {
+		t.Fatalf("activity entries = %d, want 4: %+v", len(entries), entries)
+	}
+	for i, e := range entries {
+		if e.Title != "" {
+			t.Fatalf("entry %d in cli mode populated Title = %q, want empty", i, e.Title)
+		}
 	}
 	var input map[string]any
 	if err := json.Unmarshal(entries[0].Input, &input); err != nil {
@@ -745,8 +753,10 @@ print("the answer")
 	}
 	for _, art := range task.Artifacts {
 		for _, p := range art.Parts {
-			if strings.Contains(string(p.Data), "get pods") || strings.Contains(string(p.Data), "hunter2") || strings.Contains(p.Text, "hunter2") {
-				t.Fatalf("raw argument text on the bus under %s: %s %s", art.Name, p.Data, p.Text)
+			for _, secret := range []string{"get pods", "hunter2", "/etc/secret-path.yaml", "secret-path.yaml", "secret-cluster-name", "secret-cluster"} {
+				if strings.Contains(string(p.Data), secret) || strings.Contains(p.Text, secret) {
+					t.Fatalf("raw argument text %q on the bus under %s: %s %s", secret, art.Name, p.Data, p.Text)
+				}
 			}
 		}
 	}
