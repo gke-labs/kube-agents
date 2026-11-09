@@ -192,7 +192,7 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume, Dispatcher: reading.Dispatcher}
 	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	if slices.Contains(kinds, usageReadingTopTools) {
 		out.ToolPairs = reading.ToolPairs
@@ -322,6 +322,16 @@ func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) 
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
+// setDispatcher gives addr's reading the chat plugin's failing boards (none
+// for an idle dispatcher), which set leaves in place.
+func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Dispatcher = &usageDispatcherReading{Failing: failing}
 	s.readings[addr] = reading
 }
 

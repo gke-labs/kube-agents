@@ -573,6 +573,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				// DataVolume rides with Clusters: both come from the
 				// watcher's body alone.
 				DataVolume: reading.DataVolume,
+				Dispatcher: reading.Dispatcher,
 				ToolPairs:  reading.ToolPairs,
 			})
 		}
@@ -589,6 +590,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
+	dispatcher := usageDispatcherForPoll(scraped)
 	misses := p.noteReadings(cached, scraped)
 	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
 	topTools, topToolsKnown := usageTopToolsForPoll(scraped, misses[usageReadingTopTools])
@@ -643,7 +645,10 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if err := p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown, topTools, topToolsKnown); err != nil {
 		return err
 	}
-	return p.projectDataVolume(ctx, agent, volume, volumeKnown)
+	if err := p.projectDataVolume(ctx, agent, volume, volumeKnown); err != nil {
+		return err
+	}
+	return p.projectKanbanDispatcher(ctx, agent, dispatcher)
 }
 
 // usageClusterGaugesForPoll is the fleet reading this poll projects, and
