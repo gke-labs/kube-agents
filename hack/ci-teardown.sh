@@ -245,8 +245,8 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Uninstalling the kube-agent
 # greets the project's next lease as `UPGRADE FAILED: "kube-agents" has no
 # deployed releases` at ci-deploy.sh's `helm upgrade --install` — and the
 # poisoned run's own teardown cannot remove it either, so the state is
-# self-sustaining until something drops the record. The sweeps in Steps 3 and
-# 4 already handle the objects the release owned, so this strands nothing a
+# self-sustaining until something drops the record. The sweeps in Steps 4 and
+# 5 already handle the objects the release owned, so this strands nothing a
 # failed uninstall was not going to strand anyway.
 #
 # The deployed-revision gate is what makes the fallback safe on a *healthy*

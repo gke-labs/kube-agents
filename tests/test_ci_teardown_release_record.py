@@ -178,7 +178,7 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
                 + f"  exit {kubectl_exit}\n"
                 "fi\n"
                 # The CRD delete answers separately so a test can reach Step
-                # 2's timed-out branch, which needs a readable probe (else the
+                # 3's timed-out branch, which needs a readable probe (else the
                 # keep branch fires first) and a red delete.
                 'if [[ "$1" == "delete" && "$2" == "-f" ]]; then\n'
                 f"  exit {crd_delete_exit}\n"

@@ -302,7 +302,7 @@ class CiTeardownSweepTest(unittest.TestCase):
         survives is Step 2's decision (#1180), not this sweep's.
 
         Run with a red helm deliberately. That is the only path on which Step
-        1's fallback issues its own `kubectl delete secret -l owner=helm,...`,
+        2's fallback issues its own `kubectl delete secret -l owner=helm,...`,
         so it is the only run where both selectors are in flight and the
         assertion has two things to tell apart. An earlier version of this test
         ran the green path and filtered on `"secrets" in call.split()`, which
