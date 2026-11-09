@@ -43,9 +43,9 @@ import (
 // Chat), a kanban card's completion goes back to the conversation
 // asynchronously through the gateway's chat.notify route, using the route
 // this executor records before a task's first turn (route.go). On console
-// and unrouted A2A/MCP turns, runTaskAPI waits in-turn for the session's
-// kanban cards to settle and synthesizes their findings into the task's
-// answer (kanban.go). Both are named in a2a/docs/hermes-bridge.md.
+// and MCP turns only (waitsForCardsInTurn), runTaskAPI waits in-turn for the
+// session's kanban cards to settle and synthesizes their findings into the
+// task's answer (kanban.go); every other turn ends at its acknowledgement. Both are named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -410,7 +410,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
-	waitKanbanInTurn := !run.routeRecorded.Load() || isConsoleOrigin(run.origin)
+	// Only a console or MCP turn waits on its cards in turn (#5170); every
+	// other turn ends at its acknowledgement, as before the in-turn wait.
+	waitKanbanInTurn := waitsForCardsInTurn(run.origin)
 	if waitKanbanInTurn {
 		b.rememberConsoleSession(sessionID, run.origin)
 	}

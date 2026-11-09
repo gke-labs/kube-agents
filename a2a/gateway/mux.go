@@ -332,6 +332,14 @@ func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
 	}
 }
 
+func (m *MultiAdapter) SetBoardAdmits(admits BoardAdmits) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardAdmitSink); ok {
+			sink.SetBoardAdmits(admits)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {

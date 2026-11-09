@@ -837,10 +837,10 @@ func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
 	series := make(chan prometheus.Metric, 16)
 	m.answerFeedback.Collect(series)
 	close(series)
-	if got := len(series); got != 4 {
-		t.Errorf("answer_feedback_total series = %d, want 4", got)
+	if got := len(series); got != 8 {
+		t.Errorf("answer_feedback_total series = %d, want 8 (2 backends x 2 ratings x 2 answers)", got)
 	}
-	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp)); got != 0 {
-		t.Errorf("answer_feedback_total{googlechat,up} = %v, want 0", got)
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp, answerReply)); got != 0 {
+		t.Errorf("answer_feedback_total{googlechat,up,reply} = %v, want 0", got)
 	}
 }

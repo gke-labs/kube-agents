@@ -127,6 +127,33 @@ const (
 	a2aPeopleWindowLabel = "window"
 	a2aPeopleWindowShort = "7d"
 	a2aPeopleWindowLong  = "30d"
+	// proposalsOpenedSeries is the chat plugin's count of the pull requests
+	// the agent opened, by the origin of the work and, for chat, its platform:
+	// a gauge it reads from the pod's proposals ledger at scrape time, served
+	// with a row for every origin once its first ledger read succeeds and as
+	// no family before. The origins reading (usageReadingOrigins) maps each
+	// origin, summed over the platform label, to status.usage.
+	proposalsOpenedSeries = "kubeagents_proposals_opened"
+	// proposalsOpenedReadAgeSeries is the plugin's label-less gauge of the
+	// seconds since its last successful ledger read, served only beside
+	// proposalsOpenedSeries: 0 after a good read, growing while failed reads
+	// keep the last counts.
+	proposalsOpenedReadAgeSeries = "kubeagents_proposals_opened_read_age_seconds"
+	// proposalsReadAgeLimit is the oldest ledger read the origins reading
+	// accepts: two poll intervals, so a ledger that has not answered for two
+	// polls reads as a miss and the two-miss rule clears the nine fields.
+	proposalsReadAgeLimit = 2 * usageCountersPollInterval
+	proposalsOriginLabel  = "origin"
+	// The nine origins the ledger counts, in the chat plugin's ORIGINS order.
+	proposalOriginChat      = "chat"
+	proposalOriginConsole   = "console"
+	proposalOriginAPI       = "api"
+	proposalOriginEvent     = "event"
+	proposalOriginDrift     = "drift"
+	proposalOriginAudit     = "audit"
+	proposalOriginScheduled = "scheduled"
+	proposalOriginIssue     = "issue"
+	proposalOriginOther     = "other"
 	// The broker's proposal readings (vcs_readings.py), gauges its readings
 	// sweep sets from what the forge reports now: the install's proposals by
 	// state; the closed ones by who closed them; the touches by anyone but
@@ -262,12 +289,11 @@ var (
 		},
 		"git": {
 			"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-			"check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
-			"describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
-			"ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
-			"reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
-			"sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
-			"tag", "update-ref", "version", "worktree",
+			"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
+			"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
+			"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
+			"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
+			"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
 		},
 		"gh": {
 			"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -363,7 +389,8 @@ func usageSiblingsFor(counter string) []usageSibling {
 // the broker's top tools: its tool counter by tool and subcommand, which
 // every broker body carries (a broker that has run nothing carries an empty
 // one), read beside the counters the same series feeds and projected, not
-// folded, as status.usage.topTools.
+// folded, as status.usage.topTools. The fifth is the chat plugin's origins
+// reading, the pull requests the agent opened by the origin of the work.
 type usageReadingKind string
 
 const (
@@ -371,6 +398,7 @@ const (
 	usageReadingDetails  usageReadingKind = "details"
 	usageReadingPeople   usageReadingKind = "people"
 	usageReadingTopTools usageReadingKind = "topTools"
+	usageReadingOrigins  usageReadingKind = "origins"
 )
 
 // usageToolPair is one tool and subcommand the broker's tool counter labels.
@@ -408,10 +436,19 @@ var usageReadingSpecs = []usageReadingSpec{
 	{field: usageExportProposalsMergedUntouched, family: vcsTouchesPerProposalSeries, filter: usageLabelFilter{vcsReadingsOutcomeLabel: {vcsOutcomeMerged: true}, vcsReadingsLeLabel: {vcsLeUntouched: true}}, reading: usageReadingDetails},
 	{field: usageExportPeopleSeen7d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowShort: true}}, reading: usageReadingPeople},
 	{field: usageExportPeopleSeen30d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowLong: true}}, reading: usageReadingPeople},
+	{field: usageExportProposalsFromChat, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginChat: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromConsole, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginConsole: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromApi, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginAPI: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromEvent, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginEvent: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromDrift, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginDrift: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromAudit, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginAudit: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromScheduled, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginScheduled: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromIssue, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginIssue: true}}, reading: usageReadingOrigins, sum: true},
+	{field: usageExportProposalsFromOther, family: proposalsOpenedSeries, filter: usageLabelFilter{proposalsOriginLabel: {proposalOriginOther: true}}, reading: usageReadingOrigins, sum: true},
 }
 
 // usageReadingKinds is every reading, in a fixed order.
-var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople, usageReadingTopTools}
+var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople, usageReadingTopTools, usageReadingOrigins}
 
 // usageReadingKindsOf is the entries of specs whose reading is one of kinds,
 // in their order.
@@ -437,7 +474,16 @@ func usageReadingAged(kind usageReadingKind) bool {
 // since the broker serves only the label sets it has seen. The people
 // reading is present when both its windows resolved, with no age series:
 // the gateway serves both windows together or neither, so one alone is no
-// reading.
+// reading. The origins reading is present when all nine origins resolved,
+// each on at least one sample, sum fields though they are, and the body
+// carried no proposalsOpenedReadAgeSeries above proposalsReadAgeLimit: the
+// chat plugin serves a row for every origin, zero included, from its first
+// ledger read on, and keeps serving the last counts while later reads fail,
+// so only the age tells fresh counts from stale ones. A body with the counts
+// and no age series, a plugin from before the age, keeps the old rule and is
+// present: an agent image can be pinned apart from the operator, and nine
+// fields absent with no cause would be worse than counts the plugin still
+// vouches for.
 func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
 	if kind == usageReadingTopTools {
 		// The tool counter is the broker's own, served from its first request
@@ -458,6 +504,9 @@ func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool 
 		}
 	}
 	return func(f *usageReadingFold) bool {
+		if kind == usageReadingOrigins && f.originsAgeSeen && f.originsAge > proposalsReadAgeLimit.Seconds() {
+			return false
+		}
 		for i, spec := range f.specs {
 			if spec.reading == kind && !f.resolved[i] {
 				return false
@@ -677,9 +726,6 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	if len(kinds) > 0 {
 		readings = newUsageReadingFold(kinds)
 		families := readings.families()
-		if slices.ContainsFunc(kinds, usageReadingAged) {
-			families = append([]string{vcsReadingsAgeSeries}, families...)
-		}
 		if slices.Contains(kinds, usageReadingTopTools) {
 			pairs = map[usageToolPair]map[string]float64{}
 			families = append(families, toolInvocationsSeries)
@@ -736,6 +782,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				}
 				for _, metric := range mf.GetMetric() {
 					value, ok := usageSampleValue(metric)
+					// A wanted family's sample that is not a finite non-negative number
+					// fails the scrape; the plugin's read age is clamped at zero on a
+					// monotonic clock and printed finite, so it cannot trip this.
 					if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 						return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 					}
@@ -869,13 +918,18 @@ func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
 
 // usageReadingFold is the reading slot's state through one body: the kinds
 // asked for, their specs, and per spec its running sum and whether a sample
-// resolved it.
+// resolved it; the broker readings whose age series the body carried; and,
+// for the origins reading, the age value the body carried.
 type usageReadingFold struct {
 	kinds    []usageReadingKind
 	specs    []usageReadingSpec
 	sums     []float64
 	resolved []bool
 	aged     map[usageReadingKind]bool
+	// originsAge is the plugin's read age when the body carried it, the
+	// largest of any repeated sample; originsAgeSeen says whether it did.
+	originsAge     float64
+	originsAgeSeen bool
 }
 
 func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
@@ -889,9 +943,16 @@ func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
 	}
 }
 
-// families is every family a field of the fold's readings is read from.
+// families is every family a field of the fold's readings is read from, and
+// the age series of the readings whose presence needs one.
 func (f *usageReadingFold) families() []string {
 	var families []string
+	if slices.ContainsFunc(f.kinds, usageReadingAged) {
+		families = append(families, vcsReadingsAgeSeries)
+	}
+	if slices.Contains(f.kinds, usageReadingOrigins) {
+		families = append(families, proposalsOpenedReadAgeSeries)
+	}
 	for _, spec := range f.specs {
 		if !slices.Contains(families, spec.family) {
 			families = append(families, spec.family)
@@ -900,13 +961,23 @@ func (f *usageReadingFold) families() []string {
 	return families
 }
 
-// fold takes one sample of family name into the reading fields it feeds, or
-// marks a reading aged, and reports whether name is a readings family.
+// fold takes one sample of family name into the reading fields it feeds,
+// marks a reading aged, or records the origins reading's age, and reports
+// whether name is a readings family.
 func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) bool {
 	if name == vcsReadingsAgeSeries && slices.ContainsFunc(f.kinds, usageReadingAged) {
 		kind := usageReadingKind(usageLabelValue(metric, vcsReadingsReadingLabel))
 		if slices.Contains(f.kinds, kind) && usageReadingAged(kind) {
 			f.aged[kind] = true
+		}
+		return true
+	}
+	if name == proposalsOpenedReadAgeSeries && slices.Contains(f.kinds, usageReadingOrigins) {
+		// The plugin renders one sample; a body that repeats it is judged by
+		// the oldest, so a stale ledger cannot pass on a fresh duplicate.
+		if !f.originsAgeSeen || value > f.originsAge {
+			f.originsAge = value
+			f.originsAgeSeen = true
 		}
 		return true
 	}

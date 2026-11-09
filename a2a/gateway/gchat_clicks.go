@@ -204,6 +204,19 @@ type gchatUX struct {
 	// its layout to patching it (lockRewrite), by message name, held only
 	// while a rewrite holds or waits on it, so it needs no ring.
 	rewriting map[string]*gchatRewriteLock
+	// board is the layout each message whose rows carry Retry and Drop was
+	// last sent with, by message name; boardTaps the rows being tapped or
+	// settled, by message and row, each holding the tap that claimed it;
+	// and boardMoved the messages laid out again without such rows while
+	// they were remembered, which a tap in flight must not draw on
+	// (gchat_board.go). boardOrder, boardTapsOrder and boardMovedOrder are
+	// their rings.
+	board           map[string]gchatChatLayout
+	boardOrder      []string
+	boardTaps       map[string]string
+	boardTapsOrder  []string
+	boardMoved      map[string]bool
+	boardMovedOrder []string
 }
 
 // gchatRewriteLock orders the patches of one message: a rating tap, an
@@ -221,7 +234,8 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
 			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
-			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{}}
+			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{},
+			board: map[string]gchatChatLayout{}, boardTaps: map[string]string{}, boardMoved: map[string]bool{}}
 	}
 	return a.ux
 }
@@ -347,12 +361,17 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		return InboundMessage{}, "a click event with no click"
 	}
 	switch click.Function {
+	case gchatStopFunction:
+		return a.classifyStop(ev)
 	case gchatFeedbackFunction:
 		// A rating tap is never a turn (gchat_feedback.go).
 		return InboundMessage{}, a.feedbackClick(ev)
 	case gchatFeedbackNoteFunction:
 		// Nor is a click on the note card a 👎 asks for.
 		return InboundMessage{}, a.feedbackNoteClick(ev)
+	case gchatBoardFunction:
+		// Nor is a board-health row's Retry or Drop (gchat_board.go).
+		return InboundMessage{}, a.boardClick(ev)
 	case gchatChatFunction:
 	default:
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"
@@ -445,6 +464,13 @@ func gchatClickID(message, eventTime string) string {
 		return message
 	}
 	return message + gchatClickIDSep + eventTime
+}
+
+// gchatClickMessage is the message a click id names (gchatClickID): the
+// message a stale Stop press is answered on (chatStopStale).
+func gchatClickMessage(id string) string {
+	message, _, _ := strings.Cut(id, gchatClickIDSep)
+	return message
 }
 
 // gchatMessageButtons reads a clicked message's own buttons, told apart by
@@ -604,7 +630,10 @@ func gchatAnsweredLayout(layout gchatChatLayout, links []chatmsg.Link, rating gc
 	if text != "" {
 		text += gchatChatSectionGap
 	}
-	return gchatChatLayout{Text: text + line, Widgets: gchatWithRating(gchatChatWidgets(nil, links), rating)}
+	answered := layout
+	answered.Text = text + line
+	answered.Widgets = gchatWithRating(gchatChatWidgets(nil, links), rating)
+	return answered
 }
 
 // answeredLayout keeps an answered question's line through a later edit of

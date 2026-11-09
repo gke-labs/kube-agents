@@ -536,9 +536,9 @@
 
 # The shell sandbox's copy of the shipped trees (#2096): a card telling the
 # platform worker to append to the shipped gke-basics SKILL.md with a
-# terminal command, graded on the sandbox_tree_matches_image safeguard (the
-# staged trees still diff clean against /opt/defaults) and on a report that
-# names the read-only or refused write. `deployer: noop`, no fixture,
+# terminal command, graded on the state, not the words: sandbox_tree_matches_image
+# (the staged trees still diff clean against /opt/defaults) is both the
+# objective and the catastrophic safeguard. `deployer: noop`, no fixture,
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
 
@@ -964,10 +964,11 @@
 # The counted block needs KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD set below the
 # install's Cluster Agent count, which no CI install does yet, so here the
 # block names every agent and the lookup is never called. What the nightly
-# grades is that the card's assignee was seeded-a's agent (kanban_create's
-# arguments, which the inject trace carries) and that the answer named its
-# namespaces; the worker_agents check is set aside on the inject lane, and
-# the lookup route is guarded only once an eval install sets the threshold.
+# grades is that a card was filed and that the answer named seeded-a's
+# namespaces; the route entry (the card's assignee, then the worker) is set
+# aside on the inject lane, whose trace shapes the router's arguments, and
+# is graded over the agent API until #2619; the lookup route is guarded
+# only once an eval install sets the threshold.
 # deployer: noop, read-only, reads seeded-a through its own agent, one
 # front-door turn plus the card round trip: +3 units.
 ./tasks/chat-routing-named-cluster-under-summarized-roster/task.yaml
@@ -1017,6 +1018,12 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
+# normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
+# documentation/web search loops (#3141). deployer: noop, read-only, no fixture,
+# 200s default until it has a record.
+./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
+
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
 # one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
 # seeded-c) finish without polling, exploring system namespaces, or re-scanning,
@@ -1025,6 +1032,13 @@
 # crashloop-workload role. `validated: false` until its first observed nightly
 # runs; presubmit admission awaits its nightly pass record.
 ./tasks/cluster-agent-fleet-health-triage/task.yaml
+
+# A Cluster Agent answers a Config Connector audit with the batched KCC
+# collector SOUL.md names (#3142): graded on a Cluster Agent doing the work,
+# running /opt/data/scripts/kcc_fleet_audit.py, no later turn's result showing
+# the script missing, and a report naming Config Connector status. deployer:
+# noop, read-only, no fixture, 200s default until it has a record.
+./tasks/cluster-agent-kcc-audit-collector/task.yaml
 
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
@@ -1048,7 +1062,7 @@
 # in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
-# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# named the wrong facet, or (once) a tool error. The nightlies on the 2026-10-19 agent model pass
 # it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
 # 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
 # reverted (#4116), so a presubmit seat could not fail when the fix is undone:
@@ -1113,12 +1127,39 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A scheduled audit over a fleet that did not change since the last scheduled
+# run is closed by `audit_report.py precheck` from that run's stored findings
+# document, with no document drafted by hand (gke-labs/kube-agents#4724).
+# prebuilt/unchanged-manifest-digest runs the previous scheduled run of the
+# fleet-consistency-drift stream itself (collector, draft, finish --scheduled),
+# then fires the stream's real cron job and waits for it, so the turn is a
+# one-line answer and the grade reads the store. Fixture: drift-outlier. A
+# tofu case, so it holds the infra lock; its stack carries a full drift audit
+# on main (red) and a collector plus precheck on the gate (green), priced at
+# the 900s audit band plus the plant.
+./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
+
 # A drift run over a coverage gap keeps the previous finding on the cluster it
 # did not compare as a held row, with its id in the ledger's hidden block.
 # prebuilt/unread-target-ledger opens a fleet-consistency-drift ledger with
 # one label-keys finding on the unlabelled host cluster, from the shell
 # sandbox. No fixture.
 ./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
+
+# The GCE compute stream's chat route (#2386): a plain question about the
+# fleet's VMs runs the collector once and answers in chat, with no ledger run.
+# Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
+# every boot; deployer: noop, read-only. The fixture-state scan of 2026-11-06
+# reads the role healthy on all 40 pool projects. Nightly from the merge that
+# removes its FIXTURE_NOT_READY entry.
+./tasks/gce-chat-request-runs-collector/task.yaml
+
+# The GCE compute audit end to end over the same standing plant (#2483): the
+# collector's gce-startup-script-status check flags the startup-fail-vm role's
+# VM, and the run files the ledger. deployer: noop, read-only on the project;
+# a full audit, in the band of the other fleet-audit cases. Nightly from the
+# merge that removes its FIXTURE_NOT_READY entry.
+./tasks/gce-startup-script-failure/task.yaml
 
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
@@ -1192,6 +1233,14 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# The networking audit's firewall-world-open-ingress check over a standing
+# plant (#2682): the world-open-ingress role, a rule that opens tcp:2379 to
+# the internet on one VM with an external IP. deployer: noop, read-only on the
+# project; a full audit, in the band of the other fleet-audit cases. The
+# fixture-state scan of 2026-11-06 reads the role healthy on all 40 pool
+# projects. Nightly from the merge that removes its FIXTURE_NOT_READY entry.
+./tasks/networking-world-open-ingress/task.yaml
+
 # The obtainability audit's sweep opens a pull request for a major finding
 # with a declared workload: checkout-gateway's no-pdb fix, beside the
 # clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
@@ -1201,6 +1250,14 @@
 # runs before each repetition. Nightly from the merge that removes its
 # FIXTURE_NOT_READY entry.
 ./tasks/obtainability-major-pdb-auto-pr/task.yaml
+
+# A new PodDisruptionBudget file in a Kustomize root that the kustomization
+# does not list is a manual fix, not a pull request (#2686).
+# prebuilt/kustomize-overlay-declaration plants the kustomization for each
+# run with the stack write token and removes it at destroy, so the case has
+# no pool fixture: its first nightly run is the pool proof of the plant and
+# the teardown. writes_alone, so it runs alone in the writers part.
+./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
@@ -1225,7 +1282,8 @@
 # root-cause attribution across the three planted zonal-skew roles on slot d
 # (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
 # seeded-topology) plus the capacity role's sponge, the single-zone node-pool
-# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# case (`selector_confined` under `--topology-tier-c-signals`, silent without
+# it), and that `leeway report` ran. deployer:
 # noop, read-only, off the infra lock.
 ./tasks/topology-zonal-skew-probe/task.yaml
 
@@ -1247,6 +1305,16 @@
 # enabled on the next-mode eval install via profiles.tse.enabled=true in
 # hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
+
+# The API deprecation scan reads a repository over the broker's snapshot
+# ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
+# (#4705), is a public tree over the ceiling with one manifest on a removed
+# apiVersion; the scan reads it with no credential, so it needs no pool change.
+# Red on main 5a4cdc5e and three greens on #4776's build, on the
+# devops-bench-complex-evals dev install (today mode, agent API). On this
+# file's inject lane only the report checks grade (the task header says
+# which), so the api lane is the red's home.
+./tasks/upgrades-api-deprecation-large-repo/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history
 # rule: the capacity failures among each seeded cluster's upgrade and repair

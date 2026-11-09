@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -258,8 +259,9 @@ func (s *stubUsageSource) setSample(addr, counter string, sample int64) {
 }
 
 // setReadings gives addr's reading its readings, the broker's proposal readings
-// or, at a2aAddr(), the people reading: values by status field and the readings
-// present, as foldUsageBody would hand them out.
+// or, at a2aAddr(), the people reading, or, at chatAddr(), the origins
+// reading: values by status field and the readings present, as foldUsageBody
+// would hand them out.
 // A value of a reading not named present is dropped, as the scrape drops it.
 func (s *stubUsageSource) setReadings(addr string, values map[string]int64, present ...usageReadingKind) {
 	s.mu.Lock()
@@ -387,6 +389,9 @@ const usageTestReadingsNulls = `"remediationsMergedTotal":null,"remediationsOpen
 // usageTestPeopleNulls is the two people readings as merge-patch deletions.
 const usageTestPeopleNulls = `"peopleSeen7d":null,"peopleSeen30d":null`
 
+// usageTestOriginsNulls is the nine origin readings as merge-patch deletions.
+const usageTestOriginsNulls = `"proposalsFromChat":null,"proposalsFromConsole":null,"proposalsFromApi":null,"proposalsFromEvent":null,"proposalsFromDrift":null,"proposalsFromAudit":null,"proposalsFromScheduled":null,"proposalsFromIssue":null,"proposalsFromOther":null`
+
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
 type usageHarness struct {
@@ -434,6 +439,8 @@ type usageHarness struct {
 	pruningPeople bool
 	// pruningTopTools is a CRD serving all but topTools.
 	pruningTopTools bool
+	// pruningOrigins is a CRD serving all but the nine origin readings.
+	pruningOrigins bool
 	// pruningStorage makes the fake behave like a served CRD from before
 	// status.storageStatus carried its byte fields.
 	pruningStorage bool
@@ -450,8 +457,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople || h.pruningTopTools || h.pruningOrigins) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,"topTools":null,` + usageTestPeopleNulls + `,` + usageTestOriginsNulls + `}}}`
 				if h.pruningReadings {
 					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
@@ -484,6 +491,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningTopTools {
 					strip = `{"status":{"usage":{"topTools":null}}}`
+				}
+				if h.pruningOrigins {
+					strip = `{"status":{"usage":{` + usageTestOriginsNulls + `}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -536,6 +546,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningTopTools) {
 				pa.Status.Usage.TopTools = nil
+			}
+			if isAgent && (h.pruningGauges || h.pruningOrigins) {
+				for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOrigins) {
+					*usageReadingStatusField(&pa.Status.Usage, spec.field) = nil
+				}
 			}
 			if err == nil && isAgent && h.pruningStorage {
 				stored := pa.DeepCopy()
@@ -4000,7 +4015,7 @@ func TestUsagePoller_ARequestedHAInstallReadsItsOnePodsChatListener(t *testing.T
 
 // Each target asks for the readings its listener serves: the A2A gateway the
 // people reading, the broker its two proposal readings, the gateway pod's
-// watcher and chat listeners none.
+// chat listener the origins reading, its watcher listener none.
 func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usagePeopleTestAgent(created, false)
@@ -4011,7 +4026,7 @@ func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 	}
 	want := map[string][]usageReadingKind{
 		gatewayAddr(): nil,
-		chatAddr():    nil,
+		chatAddr():    {usageReadingOrigins},
 		a2aAddr():     {usageReadingPeople},
 		brokerAddr():  {usageReadingOutcomes, usageReadingDetails, usageReadingTopTools},
 	}
@@ -4419,4 +4434,184 @@ func TestUsagePoller_TopToolsHaveTheirOwnPruningRecord(t *testing.T) {
 	if h.p.newerFieldPruned(agent, usageNewerFieldTopTools) {
 		t.Fatal("the echo that carried topTools did not clear its record")
 	}
+}
+
+// usageTestOrigins is the chat listener's nine origin readings, the api
+// origin at zero so the zero is shown to land as a reading.
+func usageTestOrigins(chat int64) map[string]int64 {
+	return map[string]int64{
+		usageExportProposalsFromChat:      chat,
+		usageExportProposalsFromConsole:   1,
+		usageExportProposalsFromApi:       0,
+		usageExportProposalsFromEvent:     5,
+		usageExportProposalsFromDrift:     2,
+		usageExportProposalsFromAudit:     6,
+		usageExportProposalsFromScheduled: 8,
+		usageExportProposalsFromIssue:     9,
+		usageExportProposalsFromOther:     10,
+	}
+}
+
+// usageCheckOrigins asserts the nine origin fields hold want, or are all
+// absent for a nil want.
+func usageCheckOrigins(t *testing.T, status agentv1alpha1.AgentUsageStatus, want map[string]int64, context string) {
+	t.Helper()
+	specs := usageReadingKindsOf(usageReadingSpecs, usageReadingOrigins)
+	if len(specs) != 9 {
+		t.Fatalf("%d origin specs, want 9", len(specs))
+	}
+	for _, spec := range specs {
+		expected := int64(-1)
+		if want != nil {
+			expected = want[spec.field]
+		}
+		if got := usageReadingValue(status, spec.field); got != expected {
+			t.Errorf("%s: %s = %d, want %d (-1 is absent)", context, spec.field, got, expected)
+		}
+	}
+}
+
+// The chat listener's origin readings land as the nine pointer fields, a zero
+// as a zero; neither a first reading nor a changed one moves lastActiveTime
+// or lastHumanActiveTime.
+func TestUsagePoller_TheOriginReadingsLandAsPointersAndMoveNeitherTime(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setReadings(chatAddr(), usageTestOrigins(7), usageReadingOrigins)
+	h.poll(5)
+	status := h.status()
+	usageCheckOrigins(t, status, usageTestOrigins(7), "first reading")
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("the origin readings moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	h.stub.setReadings(chatAddr(), usageTestOrigins(12), usageReadingOrigins)
+	h.poll(10)
+	status = h.status()
+	usageCheckOrigins(t, status, usageTestOrigins(12), "changed reading")
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("a changed origin reading moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+}
+
+func TestUsagePoller_OriginReadingsClearAfterTwoPollsWithoutASample(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setReadings(chatAddr(), usageTestOrigins(7), usageReadingOrigins)
+	h.poll(5)
+	h.stub.setReadings(chatAddr(), nil)
+	h.poll(10)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "one poll without a sample")
+	h.poll(15)
+	usageCheckOrigins(t, h.status(), nil, "two polls without a sample")
+	h.stub.setReadings(chatAddr(), usageTestOrigins(8), usageReadingOrigins)
+	h.poll(20)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(8), "the sample back")
+}
+
+func TestUsagePoller_TheOriginReadingsHaveTheirOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, false)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	h.pruningOrigins = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setReadings(chatAddr(), usageTestOrigins(7), usageReadingOrigins)
+	h.poll(5)
+	status := h.status()
+	usageCheckOrigins(t, status, nil, "under a CRD without them")
+	if !h.p.newerFieldPruned(agent, usageNewerFieldOrigins) || h.p.newerFieldPruned(agent, usageNewerFieldReadings) || h.p.newerFieldPruned(agent, usageNewerFieldPeople) {
+		t.Fatal("the absence of the origin readings was not recorded against their own record alone")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of the origin readings was recorded as the counters' pruning")
+	}
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d under a CRD without the origin readings, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status = h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(4)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d under a CRD without the origin readings, want %d", spec.field, got, want)
+		}
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the origin readings alone behind re-patched the status while their record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOrigins) {
+		if !held[spec.field] {
+			t.Errorf("held fields %v, want %s held", held, spec.field)
+		}
+	}
+	if held[usageExportRemediationsMerged] || held[usageExportPeopleSeen7d] {
+		t.Fatalf("held fields %v, want remediationsMergedTotal and peopleSeen7d published", held)
+	}
+}
+
+// usageBodySource folds a held text body for addr through the real parser and
+// hands every other address to the stub, so a poller test can drive one
+// listener with an exposition.
+type usageBodySource struct {
+	stub   *stubUsageSource
+	addr   string
+	mu     sync.Mutex
+	body   string
+	served bool
+}
+
+func (s *usageBodySource) serve(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.body, s.served = body, true
+}
+
+func (s *usageBodySource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+	s.mu.Lock()
+	body, served := s.body, s.served
+	s.mu.Unlock()
+	if addr != s.addr || !served {
+		return s.stub.Scrape(ctx, addr, counters, kinds)
+	}
+	return foldUsageBody(strings.NewReader(body), counters, kinds)
+}
+
+// A ledger whose read age passes proposalsReadAgeLimit is a miss, though the
+// plugin still serves its last counts: one such poll holds the nine fields,
+// the second clears them, and a fresh read brings them back.
+func TestUsagePoller_StaleOriginReadingsClearAfterTwoPolls(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	source := &usageBodySource{stub: h.stub, addr: chatAddr()}
+	h.p.source = source
+	stale := strconv.FormatFloat(proposalsReadAgeLimit.Seconds()+1, 'f', 3, 64)
+	source.serve(usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	h.poll(5)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "a fresh read")
+	source.serve(usageOriginsBody(append(slices.Clone(usageOriginsRows), usageOriginsAge(stale)...)...))
+	h.poll(10)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "one poll past the age limit")
+	h.poll(15)
+	usageCheckOrigins(t, h.status(), nil, "two polls past the age limit")
+	source.serve(usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	h.poll(20)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "a fresh read again")
 }

@@ -277,7 +277,7 @@ def clone_content(args) -> int:
 
 
 def clone_directory(args) -> int:
-    """The pre-content-passing path: a leased checkout on the shared volume."""
+    """The leased-checkout path: a checkout on the shared volume."""
     repo = args.repo
     lease = gitops_workspace.lease_id(args.lease)
     workspace = gitops_workspace.ensure_workspace(

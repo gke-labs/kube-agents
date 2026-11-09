@@ -9,6 +9,7 @@ tested in test_eval_dashboard_nightly_digest.py (LatencyBlockTest).
 
 import unittest
 
+from eval_dashboard import nightly
 from eval_dashboard import nightly_latency as nl
 
 
@@ -136,6 +137,93 @@ class SlowCasesTest(unittest.TestCase):
     def test_slow_text(self):
         entry = {"case": "a", "value": 428.0, "typical": 18.0, "ratio": 428.0 / 18.0, "sustained": 3}
         self.assertEqual(nl.slow_text(entry, "Observability", "@owner"), "Observability: a 18 s → 428 s (23.8×), sustained 3 nights · @owner")
+
+
+def dated(nights, first_day=28, hour=2):
+    """``nights`` (newest first) with a ``started`` stamp a date apart, the
+    newest on 2026-10-``first_day``."""
+    return [{**n, "started": f"2026-10-{first_day - i:02d}T{hour:02d}:00:00+00:00"} for i, n in enumerate(nights)]
+
+
+def rerun(n, day, hour):
+    """``n`` as a run started on 2026-10-``day`` at ``hour``."""
+    return {**n, "started": f"2026-10-{day:02d}T{hour:02d}:00:00+00:00"}
+
+
+def nightly_run(build, started, agent):
+    """A nightly main-job run of case-a, every rep at ``agent`` seconds."""
+    reps = [{"n": i, "result": "pass", "agent_s": agent, "turn1_s": 10.0} for i in (1, 2, 3)]
+    return {"build_id": build, "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None,
+            "head_sha": build[-7:], "started": started, "finished": started.replace("T00", "T06").replace("T09", "T15"),
+            "result": "SUCCESS", "duration_s": 21600, "tasks": [{"name": "case-a", "result": "pass", "reps": reps}]}
+
+
+def nightly_data(runs, generated_at):
+    return {"schema_version": 1, "generated_at": generated_at,
+            "cases": [{"name": "case-a", "domain": "cost", "active": True, "nightly_active": True}], "runs": runs}
+
+
+class OneRunPerDateTest(unittest.TestCase):
+    """A same-date re-run of the main nightly job is a night of its own in
+    ``night_reports``; the latency block counts its date once, by the newest
+    run, as ``nightly_bugs.graded_nights`` does."""
+
+    def test_the_newest_run_of_a_date_is_kept(self):
+        older, newer = rerun(night(p50=1.0), 27, 2), rerun(night(p50=2.0), 27, 9)
+        undated = night(p50=3.0)
+        self.assertEqual(nightly.one_per_date([newer, older, undated]), [newer, undated])
+
+    def test_a_same_date_re_run_is_not_a_second_sustained_night(self):
+        names = ("a", "b", "c", "d")
+        slow = night([case(n, 400.0 if n == "a" else 100.0) for n in names])
+        nights = [rerun(slow, 28, 9), rerun(slow, 28, 2)] + dated(steady(7, names=names), first_day=27)
+        slow_entries, _ = nl.slow_cases(nights)
+        self.assertEqual([(s["case"], s["sustained"]) for s in slow_entries], [("a", 1)])
+
+    def test_a_case_typical_spans_seven_dates(self):
+        # Seven earlier dates: 27 run twice at 100 s, 26 and 25 at 100 s,
+        # 24 to 21 at 1000 s. Counted per date the typical is 1000 s; counted
+        # per run, 27's re-run pushes 21 out and the typical reads 100 s.
+        earlier = [rerun(night([case("a", 100.0)]), 27, 9), rerun(night([case("a", 100.0)]), 27, 2)]
+        earlier += dated([night([case("a", 100.0)])] * 2, first_day=26)
+        earlier += dated([night([case("a", 1000.0)])] * 4, first_day=24)
+        slow, _ = nl.slow_cases([rerun(night([case("a", 2500.0)]), 28, 2)] + earlier)
+        self.assertEqual([(s["case"], s["typical"]) for s in slow], [("a", 1000.0)])
+
+    def test_the_night_typical_counts_a_date_once(self):
+        # The same shape for the night line: counted per run, 27's two whole
+        # runs give a typical turn 1 p50 of 10 s; per date, 40 s.
+        earlier = [rerun(night([case("a", 100.0)], 10.0, 20.0), 27, 9), rerun(night([case("a", 100.0)], 10.0, 20.0), 27, 2)]
+        earlier += dated([night([case("a", 100.0)], 10.0, 20.0)] * 2, first_day=26)
+        earlier += dated([night([case("a", 100.0)], 40.0, 20.0)] * 4, first_day=24)
+        line = nl.night_line([rerun(night([case("a", 100.0)], 10.0, 20.0), 28, 2)] + earlier)
+        self.assertIn("typical 40.0 s, 20.0 s", line)
+
+    def test_a_re_run_through_night_reports(self):
+        """The real path: runs, then ``night_reports``, then the block. A cron
+        run and a 09:00 re-run of the main job on 10-05 both time case-a slow."""
+        runs = [nightly_run(f"300000000000000000{d}", f"2026-10-0{d}T00:00:00+00:00", 100.0) for d in (1, 2, 3, 4)]
+        runs += [nightly_run("3000000000000000005", "2026-10-05T00:00:00+00:00", 400.0),
+                 nightly_run("3000000000000000006", "2026-10-05T09:00:00+00:00", 400.0)]
+        data = nightly_data(runs, "2026-10-05T16:00:00+00:00")
+        nights = nightly.night_reports(data)
+        self.assertEqual([n["build"] for n in nights[:2]], ["3000000000000000006", "3000000000000000005"], "the re-run is a night of its own")
+        slow, _ = nl.slow_cases(nights)
+        self.assertEqual([(s["case"], s["sustained"], s["typical"]) for s in slow], [("case-a", 1, 100.0)])
+
+    def test_re_runs_do_not_push_a_date_out_of_the_window(self):
+        """``night_dates`` takes the window in dates. A cron run on 10-01 to
+        10-08 and a 09:00 re-run on 10-02 to 10-08 are 15 runs: the newest 14
+        runs reach back to 10-02 only, six earlier dates, and case-a's typical
+        reads 550 s; the newest 14 dates give seven, 1000 s."""
+        agent = {1: 1000.0, 2: 1000.0, 3: 1000.0, 4: 1000.0, 5: 100.0, 6: 100.0, 7: 100.0, 8: 2500.0}
+        runs = [nightly_run(f"30000000000000000{d}0", f"2026-10-0{d}T00:00:00+00:00", agent[d]) for d in agent]
+        runs += [nightly_run(f"30000000000000000{d}9", f"2026-10-0{d}T09:00:00+00:00", agent[d]) for d in agent if d > 1]
+        data = nightly_data(runs, "2026-10-08T16:00:00+00:00")
+        by_runs, _ = nl.slow_cases(nightly.night_reports(data))
+        self.assertEqual([(s["case"], s["typical"]) for s in by_runs], [("case-a", 550.0)], "the window in runs, as before")
+        slow, _ = nl.slow_cases(nightly.night_dates(data))
+        self.assertEqual([(s["case"], s["typical"]) for s in slow], [("case-a", 1000.0)])
 
 
 if __name__ == "__main__":

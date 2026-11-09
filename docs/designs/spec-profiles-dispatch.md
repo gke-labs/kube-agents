@@ -340,9 +340,11 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (its submission aged off the stream). A record
-  nobody can read counts as a running one: its task is treated as started, and the sweep
-  waits as long from the record's last write. Answers a pod
+  long expired that no held submission has (its submission aged off the stream), reading the
+  bucket in one pass and logging a pass cut short. A record nobody can read (or of another
+  shape) has one meaning for every reader: a started task, last seen alive at the entry's
+  write, so it expires a lease after that like any record. A renewal from the pod its key
+  names has the dispatcher, the bucket's one writer, write it back readable. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
 - **Task credentials.** With a task-signing key (a cluster seed, read from the file
   `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
@@ -382,12 +384,14 @@ leave open:
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
   once it is older than the stream's retention plus an hour. The retention is the dispatch
-  config's `submitRetentionSeconds`, which the operator renders from the constant it creates
-  the stream with, and never less than `lib.ProfileSubmitRetention` (72h). Both are compiled
-  values, not the live stream's max age, and the operator never edits an existing stream: a
-  release that raises the max age and a later one that lowers it leave the streams created
-  in between longer than the retention, so the constant isn't lowered below any max age a
-  release has shipped (#4948).
+  config's `submitRetentionSeconds`, never less than `lib.ProfileSubmitRetention` (72h). The
+  operator renders the longer of the constant it creates the stream with and the live stream's
+  max age, which the provision Job reads back and reports when it is longer
+  (`status.profileSubmitMaxAgeSeconds`). The operator never edits an existing stream, so a
+  stream an older release created longer, or one edited by hand, is covered this way, once the
+  Job's next run (at most a day) has read it. The retention is capped at a year
+  (`lib.MaxSubmitRetention`): a stream with no age limit, or a longer one, keeps tombstones that
+  long (#4948).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.
@@ -398,6 +402,19 @@ leave open:
   had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
   amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
   from the bus's side.
+- **A profile that leaves.** A profile removed from the install, or one whose identity stops
+  rendering, drains (#5074). The operator keeps it in the dispatch config with no durables and
+  `drainingUntil` set to the longest deadline any task can carry (six hours, the ceiling on
+  `maxTaskDeadlineSeconds`) plus fifteen minutes past the moment it left, so nothing new is
+  dispatched for it. A task keeps the deadline it was confirmed with, so a lower limit set since
+  doesn't shorten the window. The dispatcher's identity keeps its `.supervisor` and
+  stop-record grants and drops its durable grants, so the terminals of the tasks it still holds
+  reach their requesters. The applied dispatch config is the state: a profile it lists that the
+  render no longer has starts draining, and one already draining keeps its time until that
+  passes, when it leaves the config and the identity together. The set is read once a pass for
+  both, and only an entry the render could itself produce (subject-token name and tiers) is
+  carried forward, since its name becomes a grant. A held task whose submission goes back to the
+  stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
   identity for one.
@@ -408,10 +425,16 @@ leave open:
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
-  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
-  admission, and `lease-expired` and `deadline-exceeded` while it holds.
+  `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
+  `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
+  and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
+  profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
+  so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
+  task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
+  an error (#5074).
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
-  (profile, tier), default 3, opens its breaker. While it is open, for
+  (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
+  is open, for
   `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
   cap, never refused: a refusal would let one input that keeps killing workers fail every
   other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
@@ -426,6 +449,18 @@ leave open:
   always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
   task isn't told it is held yet (#4362).
+- **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
+  the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
+  Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
+  worker. The Job's pod is the warm worker's pod in one-shot mode (`PROFILE_WORKER_ONE_SHOT`):
+  it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
+  is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
+  deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
+  re-adopts the task.
+  Without a Job runner or a Job template, an unattended task has no worker (the operator builds
+  warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
+  for unattended on this install: Job mode is off"), rather than leave it queued until its
+  queue timeout. A pool that serves the tier, were there one, would take the task instead.
 
 ### Execution
 
@@ -451,7 +486,11 @@ leave open:
 - A top-level task's results and progress go back through the gateway relay to the asking
   conversation, whichever door it came in on. A child's terminal goes to its parent task.
 - Stop on a conversation cancels its task tree through the supervisor path: the dispatcher
-  tells warm workers to abandon the task (and resets them) or deletes the Job.
+  tells warm workers to abandon the task (and resets them) or deletes the Job. It learns of the
+  stop from a stop record the gateway writes beside each profile task's cancel
+  (`a2a.stop.<profile>.<task>` on `DISPATCH_STOPS`), so a task it still holds queued is dropped
+  rather than admitted later. The gateway writes the record today, and the stream and the
+  dispatcher's reader are still to be built.
 
 ### What this spec leaves to the build
 

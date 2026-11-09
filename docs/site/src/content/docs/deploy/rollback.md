@@ -78,6 +78,35 @@ Slack back to the credential broker, and the Slack app back to its `today` setti
 that section gives, instead of leaving you to find the app without its slash commands after the
 rollback.
 
+### A bus left down by a rollback under `next`
+
+Since the release that separates the bus's accounts, the bus keeps its stored streams under a
+`TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
+past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
+the A2A gateway and the agent's bridge fail behind it.
+
+Upgrade forward to the release you came from. That renders the right configuration, but the
+StatefulSet does not replace a pod that never became Ready, and the forward run then waits for the
+agent, which cannot start while the bus is down. While it waits, run the checks below, and delete
+the pod once its `controller-revision-hash` label differs from the StatefulSet's
+`status.updateRevision` (the default agent name is `platform-agent`). The operator can hold the bus
+on its earlier template for up to ten minutes, the auth callouts' rollout deadline, which is well
+inside the run's wait; a pod deleted before then comes back on that template. Once the pod is
+replaced, the run completes:
+
+```bash
+kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
+  -o jsonpath='{.status.updateRevision}{"\n"}'
+kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}{"\n"}'
+kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
+```
+
+Then roll back as this page says: switch to `today` first, and move the bus's store back as the
+bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says before you return to `next`.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:

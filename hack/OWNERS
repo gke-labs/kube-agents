@@ -30,5 +30,10 @@ filters:
   '^replay-proxy/':
     approvers:
     - eval-crew
+  # A flaky security or conformance test is fixed, not skipped, unless a
+  # security approver lists it here (scripts/check_quarantine.py).
+  '^quarantine-approved\.txt$':
+    approvers:
+    - security-approvers
 options:
   no_parent_owners: true

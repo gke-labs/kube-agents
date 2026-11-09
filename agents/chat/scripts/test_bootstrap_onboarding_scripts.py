@@ -2037,6 +2037,10 @@ class ScanGateTest(unittest.TestCase):
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        # The hand-off predicts a past-cap cluster's collector file from this.
+        for agent in agents.values():
+            self.assertEqual(sorted(agent["identity"]), ["cluster", "location", "project"])
+            self.assertIn(agent["identity"]["cluster"], agent["cluster_label"])
         self.assertEqual(sorted(agents), sorted([short, hashed]))
         self.assertEqual(agents[short]["key"], f"{prefix}{short}")
         self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
@@ -2505,6 +2509,26 @@ class ScanGateTest(unittest.TestCase):
         # table's K8s version, node pool and Workload Identity columns unsourced on
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
+
+    def test_step_3_names_the_collector_once_per_cluster(self):
+        # Three by-hand SOP walks do not fit the platform worker's turn budget
+        # (#4115): the sweep completed with one past-cap cluster recorded, or ran
+        # past the hand-off's wait. Step 3 is one command per cluster, and the
+        # by-hand walk is the fallback for a cluster the script cannot reach.
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH, body)
+        self.assertIn("--project <project> --location <location> --cluster <cluster>", body)
+        self.assertIn(bootstrap_scan_gate.SWEEP_DIR + "/<project>__<location>__<cluster>.json", body)
+        self.assertIn("Do not copy the object anywhere: the gate takes it from the file", body)
+        self.assertIn("one `{project, location, cluster, gaps}` entry per cluster Step 3 audited", body)
+        self.assertIn("only where the script itself cannot run", body)
+        # The constant is the sandbox path of a file this repository ships: the
+        # staged root /opt/data/profiles/platform/ maps onto agents/platform/.
+        staged_root = "/opt/data/profiles/platform/"
+        self.assertTrue(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH.startswith(staged_root))
+        relative = bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH[len(staged_root):]
+        self.assertTrue((Path(__file__).resolve().parents[2] / "platform" / relative).is_file(), relative)
+        self.assertIn("`timeout` set to 600", body)
 
     def test_cluster_cards_are_keyed_by_profile_name(self):
         # The gate re-files a missing card every tick until the hand-off; the
