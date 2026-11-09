@@ -753,7 +753,8 @@ standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
 drops a dressed marker with the Slack sender's predicate, and upstream's, on an
 install without the relay, carries no such guard; no roster job uses `"all"`.
 
-The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`
+(and, where the SOP runs the gate, to `precheck`).
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier
 ([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 

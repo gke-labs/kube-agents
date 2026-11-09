@@ -8453,14 +8453,16 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
-    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
-    findings in its ``document`` (this run's own, never ids it only carried),
-    or the ``error`` that kept it unread. The rest stays in the pod.
+    the envelope's ``status``, ``repo`` and ``finished_at``, each further top-level
+    key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
+    and the ids of the findings in its ``document`` (this run's own, never ids it
+    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
     """
+    wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
 import glob, json, os
 out = []
@@ -8468,7 +8470,7 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
     try:
         with open(path, encoding="utf-8") as handle:
             envelope = json.load(handle)
-        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        entry = {{key: envelope.get(key) for key in {wanted!r}}}
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
         out.append(entry)
@@ -8479,11 +8481,28 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
+    """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
+
+    Missing file, not JSON, no ``fired_at``, or one that is not an aware
+    ISO-8601 stamp all read as None: the stack did not fire the run.
+    """
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+        fired = datetime.fromisoformat(str(state["fired_at"]))
+    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if fired.tzinfo is None:
+        return None
+    return fired
+
+
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit), timeout)
+    reply = shell(report_store_command(audit, keys), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -8502,10 +8521,15 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     store, in the shell sandbox first and then in the agent container: the
     store is on whichever pod ran the audit's shell. Passes when one envelope
     finished at or after the run started (``TranscriptSnapshot.started_at``
-    less ``max_clock_skew_sec``), has ``status`` when the check names one, and
-    has, for each ``required_finding_phrases`` entry, a finding in its
-    ``document`` whose id contains it. ``current_ids`` is not read: it also
-    carries ids a run held without finding them.
+    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
+    ``fired_at`` a case's stack recorded in that file in the agent container,
+    for a scheduled run the stack fired and waited out before the turn), has
+    ``status`` when the check names one, has
+    each ``required_envelope`` key equal to the value given (a top-level key of
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
+    and fails), and has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -8516,6 +8540,13 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
+    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
@@ -8529,10 +8560,16 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        if self.since_state_file:
+            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same pod.
+            since = fired
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout)
+            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -8546,11 +8583,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 continue
             if finished.tzinfo is not None and finished >= since:
                 fresh.append(envelope)
-        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at")} for e in envelopes]}
+        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at", *self.required_envelope)} for e in envelopes]}
         if not fresh:
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since the run started "
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since "
+                f"{'the stack fired the audit' if self.since_state_file else 'the run started'} "
                 f"({len(envelopes)} older or unreadable)",
                 raw,
             )
@@ -8558,8 +8596,14 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
+                )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
             else:
