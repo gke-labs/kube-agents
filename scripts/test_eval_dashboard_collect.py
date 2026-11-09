@@ -985,6 +985,7 @@ class TestIndexDiscovery(_MergeBase):
         """gcs_base turns a build's links into Console links, which need a
         sign-in; a run in a bucket Spyglass still renders must not get it."""
         self.assertTrue(collect.records_location("gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
+        self.assertTrue(collect.records_location("gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/2/"), "the nightly's bucket is private too")
         self.assertFalse(collect.records_location("gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
         self.assertFalse(collect.records_location(FAKE_BUCKET + "pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/2/"))
         self.assertFalse(collect.records_location("/tmp/not-a-bucket/2/"))

@@ -821,18 +821,22 @@ type StallWatchSpec struct {
 	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
 
 	// Kinds replaces the watch's default list of resources to scan (Deployments,
-	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
-	// cert-manager Certificates). Each item is a kubectl resource name such as
-	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
-	// scans every namespaced kind the cluster serves, one read per kind per
-	// namespace, which is slow on a large fleet. Absent or empty keeps the
-	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes,
+	// cert-manager Certificates, and `*.cnrm.cloud.google.com`, every Config
+	// Connector kind the cluster serves). Each item is a kubectl resource name
+	// such as `deployments` or `gateways.gateway.networking.k8s.io`, or a group
+	// wildcard `*.<suffix>` for every namespaced kind whose API group ends in
+	// the suffix; the watch reads a wildcard's kinds only in the namespaces
+	// where it found their objects. The single item `all` scans every
+	// namespaced kind the cluster serves, one read per kind per namespace,
+	// which is slow on a large fleet. Absent or empty keeps the default list.
+	// Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
 	// ControllerRevisions and Leases are refused: the scan reports nothing from
 	// them, and a Secret listing would carry every body.
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=20
 	// +kubebuilder:validation:items:MaxLength=253
-	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\*(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$`
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
 	// +optional
@@ -902,7 +906,7 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
 	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
 	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
@@ -914,9 +918,9 @@ type TuningSpec struct {
 	// slot cap binds, and no CR field moves it, so raising the memory limit in
 	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
 	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
-	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
-	// memory binds, note the related failure mode: workers that exhaust their retry
+	// more, since below it the memory budget (176 MiB per command after the 192 MiB
+	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
+	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
 	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
 	// as a "protocol violation" rather than as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
@@ -1121,10 +1125,11 @@ type AgentLimits struct {
 	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
 
 	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-	// a run that does cannot even produce a closing summary. Repository exploration is
-	// the main consumer, so size this against how much the agent has to read, not
-	// against how complex the request is.
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+	// kanban worker that does ends with its closing summary saved on its card for the
+	// retry, not with the result it was asked for. Repository exploration is the main
+	// consumer, so size this against how much the agent has to read, not against how
+	// complex the request is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -1294,6 +1299,8 @@ type DeploymentSpec struct {
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+	// condition False with reason ScaledToZero; clearing it restores the normal phases.
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 
@@ -1395,9 +1402,9 @@ type CredentialProxySpec struct {
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
 	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
-	// and Envoy, 128Mi for the content workspace); the broker's child peak and
-	// memory high-water series give the figure.
+	// at the slot cap) plus the 192Mi resident reserve for the broker and
+	// Envoy; the broker's child peak and memory high-water series give the
+	// figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request
@@ -2568,7 +2575,9 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+	// Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+	// Ready condition then reads False with reason ScaledToZero.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -2871,23 +2880,34 @@ type AgentUsageStatus struct {
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
 	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
-	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
-	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
-	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
-	// not, whose reactor is not the bot and whose message is the bot's, once
-	// per reactor and message within one gateway process (a thumbs-down taken
-	// off and put back is one; after a restart the same one counts again, and
-	// a reaction before the first inbound message after a start is not
-	// counted), into the
-	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
-	// read every five minutes and kept monotonic the same way as
-	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
-	// delivers no reaction events, and the A2A gateway's Slack adapter does not
-	// subscribe to them, so on a next-mode install with Slack through A2A this
-	// stays at 0. Does not move LastActiveTime: the message the person
-	// reacted to already did.
+	// NegativeFeedbackTotal is the cumulative count of thumbs-downs people
+	// gave the bot's answers. On the Hermes gateway the
+	// chat_feedback_reactions hook counts a -1 or thumbsdown reaction on one
+	// of the bot's Slack messages, skin tone or not, whose reactor is not the
+	// bot, once per reactor and message within one gateway process (a
+	// thumbs-down taken off and put back is one; after a restart the same one
+	// counts again, and a reaction before the first inbound message after a
+	// start is not counted), into the chat_metrics plugin's
+	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
+	// reaction events. On a next-mode install the A2A gateway's
+	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
+	// it: one count each time a verified sender's rating of one of its
+	// answers becomes Bad answer, so a repeated tap adds nothing. Read every
+	// five minutes and kept monotonic the same way as ToolExecutionsTotal.
+	// Does not move
+	// LastActiveTime: the message the person rated already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// PositiveFeedbackTotal is the cumulative count of times a verified
+	// sender's rating of one of the A2A gateway's answers became Good answer,
+	// so a repeated tap adds nothing:
+	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
+	// over its other labels; read every five minutes and kept monotonic the
+	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
+	// install this stays at 0. Does not move LastActiveTime: the message the
+	// person rated already did.
+	// +optional
+	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -2953,8 +2973,10 @@ type AgentUsageStatus struct {
 	// the nine origin fields usually sum to at most RemediationsProposedTotal.
 	// A reading, not an accumulation: the ledger survives a restart and the
 	// plugin reads it whole; a read that fails after the plugin's first success
-	// keeps serving the last counts, so a stale count reads as current until
-	// the plugin restarts. A 0 is a reading. Absent until the first
+	// keeps serving the last counts, and the poller reads a read age past two
+	// poll intervals as no reading, so a stale count clears two polls after
+	// that, about twenty minutes after the ledger stops answering. A 0 is a
+	// reading. Absent until the first
 	// reading, after two polls in a row without one, and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
@@ -3067,9 +3089,9 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
-	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
-	// and NegativeFeedbackTotal alone leave it where it was, and the six
-	// proposal readings never move it.
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
+	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
+	// was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

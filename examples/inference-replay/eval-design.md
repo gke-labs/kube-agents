@@ -5,7 +5,7 @@
 > to 2026-11-02, and the replay lane's modes on 2026-11-04 and 05 (see "Replay lane trials").
 > [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the proxy with its shadow, record
 > and replay modes, its fingerprint log, the scrubbed request store, the hit-rate script, the lane's
-> report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
+> report, the baseline report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
 > `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh` deploy it in shadow mode on every Prow presubmit and
 > nightly and copy its output to a private bucket in `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false`
 > turns it off); nothing deploys record or replay mode yet. The join with run verdicts and the
@@ -748,6 +748,15 @@ before stage 3 of the rollout (turning replay on):
    results, or a swap hid something that looks like real state, that's a collision. A reviewed
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
+
+   Two weeks of shadow data also freeze the baseline that replay is measured against: tokens,
+   cache hits, estimated cost, model time, 429s, retries and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. The window starts on the first full
+   UTC day after the proxy began logging LiteLLM's cost, retries, model name and reasoning and
+   cache-write tokens, so that nightlies and presubmits log every field the report compares from
+   its first line; days before that would show those figures as missing. Replay is not switched on
+   anywhere until that report is saved, and every report after it comes from the same script with
+   `--compare`, so before and after are measured the same way.
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a

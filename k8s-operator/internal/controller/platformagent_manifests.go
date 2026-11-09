@@ -1241,7 +1241,7 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
 // measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
 // gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
-// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// resident without holding a slot. The credential proxy's 2Gi default admits ten
 // brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
 // eight, shared with the listing pools).
 // TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
