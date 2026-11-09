@@ -82,7 +82,7 @@ names `gvisor`; the gateway pod's class is the separate `availability.runtimeCla
 the installer sets.
 
 `maxInProgress` counts kanban workers, not the memory of one command. A single
-`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 10 GiB.
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 14 GiB.
 
 The sandbox's memory guard acts at its limit less the larger of 256 MiB and an eighth of the limit
 (at most a quarter). It stops the largest commands of at least 64 MiB, as many as bring it back

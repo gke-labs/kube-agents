@@ -1316,7 +1316,8 @@ platformAgent:
     # off switch, not the way to point at one.
     #
     # KUBEAGENTS_AUDIT_AUTO_PROMOTE: "false" stops the fleet audits from
-    # opening remediation pull requests on their own; a `/remediate` on a    # ledger still opens one. The operator forwards it to the shell sandbox,
+    # opening remediation pull requests on their own; a `/remediate` on a
+    # ledger still opens one. The operator forwards it to the shell sandbox,
     # where the audits run.
     #
     # KUBEAGENTS_KUBECTL_COST_TIER: the column of the shell's kubectl cost table

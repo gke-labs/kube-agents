@@ -65,7 +65,6 @@ CLUSTER_SCOPE = "cluster"
 NAMESPACE_SCOPE = "namespace"
 OBJECT_SCOPE = "object"
 MIB = 1024 * 1024
-KIB = 1024
 # Memory the shell keeps for everything that is not an admitted read: sshd, terminals,
 # scripts. One read may take at most the guard's watermark less this.
 SHELL_FLOOR_BYTES = 256 * MIB

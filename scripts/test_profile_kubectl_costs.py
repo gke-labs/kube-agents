@@ -3,7 +3,6 @@
 import importlib.util
 import json
 import os
-import stat
 import sys
 import tempfile
 import unittest
@@ -21,15 +20,12 @@ class ProfileTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             table = Path(tmp) / "costs.json"
             table.write_text(json.dumps({"about": "x", "tiers": {"fleet": {"commands": {}, "other": {"peak_mib": 9}}}}))
-            fake = Path(tmp) / "kubectl"
-            # Fails for `get pv`, as a cluster that serves no such kind would.
-            fake.write_text("#!/bin/sh\ncase \"$*\" in *' pv '*) exit 1 ;; esac\nexit 0\n")
-            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
             peaks = iter(range(1, 1000))
+            # `get pv` exits 1, as on a cluster that serves no such kind.
             with mock.patch.object(profile, "measure_alone",
                                    side_effect=lambda k, args: (next(peaks) * profile.MIB, 0.1, 1 if "pv" in args else 0)), \
                     mock.patch.object(profile, "kubectl_version", return_value="v1.35.10"):
-                profile.main(["--tier", "default", "--reference", "a test cluster", "--kubectl", str(fake),
+                profile.main(["--tier", "default", "--reference", "a test cluster", "--kubectl", "kubectl",
                               "--table", str(table)])
             written = json.loads(table.read_text())
         self.assertEqual(written["tiers"]["fleet"]["other"], {"peak_mib": 9})  # the other tier is untouched

@@ -61,8 +61,9 @@ The table is written only by `scripts/dev/profile_kubectl_costs.py`, never by ha
      tier. To lower figures (a new `kubectl` version, a new reference cluster), delete the tier's
      column first and say why in the pull request.
 3. **Read the log.** The profiler prints one line per command, with peak, time and exit code.
-   A command that fails (exit code not 0) is left out, because the reference cluster does not
-   serve that kind; check that this is the reason. To add a command the admission logged as
+   A command that fails (exit code not 0) gets no new figure, because the reference cluster does
+   not serve that kind; check that this is the reason. `--keep-higher` keeps its figure from the
+   previous column, if it had one. To add a command the admission logged as
    `other`, add it to `COMMANDS` in `scripts/dev/profile_kubectl_costs.py` and re-run.
 4. **Check:**
    - Every listed key's `example` must key back to it (`test_the_shipped_table`).

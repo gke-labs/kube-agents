@@ -994,7 +994,7 @@ moving again, and should be argued for here the way this one is.
 #### A memory guard beside sshd
 
 A memory limit alone does not keep the container up: every session's commands share it, and one
-`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 10 GiB. That one read OOMKilled
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 14 GiB. That one read OOMKilled
 the shell, ended every session in it, and the agents sent it again after the restart. The entrypoint
 starts [`shell-memory-guard`](../../deploy/sandbox/shell-memory-guard.py) as root before `sshd`, in
 a loop that restarts it every 5 s if it exits. Every 100 ms the guard reads what the kernel cannot
@@ -1068,7 +1068,8 @@ larger than a single read may take (the watermark less 256 MiB) fails at once wi
 refusals print a `capacity:` reason with the alternatives: a count from one item (`kubectl get --raw
 '<collection>?limit=1'` and its `metadata.remainingItemCount`), one namespace at a time, a selector
 when it matches few objects, or a batch of at most 10 clusters. A read with a selector narrows by an
-amount no table knows, so it is never refused; it books what is free, up to its charge. A read the
+amount no table knows, so it is never refused for its size; it books what is free, up to its charge,
+and waits, then fails with exit 75, only while nothing is free. A read the
 guard stops prints the same reason.
 
 Every kubectl command also takes a slot, a pid-named file beside the reservations, for as long as it

@@ -4,7 +4,7 @@
 Every agent's terminal, script and `kubectl` runs in this one container. When it
 reaches its memory limit the kernel OOMKills it, every session in it ends, and the
 agents send the same work again. One `kubectl get ... -A -o json` of a cluster of
-100,000 Pods holds about 10 GiB, five times the default limit, so a single fleet
+100,000 Pods holds about 14 GiB, seven times the default limit, so a single fleet
 read is enough.
 
 This process runs as root beside sshd, started by the entrypoint. Every
