@@ -2290,13 +2290,16 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
 	t.Setenv(a2aGatewayElectionEnvVar, "true")
+	// And Job mode, so its objects in the profile namespace are rendered too.
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
 	failRole := true
+	jobPolicy, jobBinding := shippedDispatcherJobPolicy(t)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, chartProfileNamespace(agent)).
+		WithObjects(agent, chartProfileNamespace(agent), jobPolicy, jobBinding).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
@@ -2346,6 +2349,28 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher", Namespace: "test-ns-profiles"}, obj); err != nil {
 			t.Fatalf("precondition: the dispatcher's pod-read %T in the profile namespace wasn't rendered: %v", obj, err)
 		}
+	}
+	// And Job mode's half: the Jobs Role and binding, the policy's index
+	// param, and a Job the dispatcher made (the fake runs no dispatcher).
+	for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+		if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-dispatcher-jobs", Namespace: "test-ns-profiles"}, obj); err != nil {
+			t.Fatalf("precondition: the dispatcher's Jobs %T in the profile namespace wasn't rendered: %v", obj, err)
+		}
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: dispatchJobIndexName, Namespace: "test-ns-profiles"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Fatalf("precondition: the Job policy's index param wasn't rendered: %v", err)
+	}
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "dispatch-1", Namespace: "test-ns-profiles", Labels: dispatchJobLabels(agent),
+	}}); err != nil {
+		t.Fatalf("precondition: create a dispatcher Job: %v", err)
+	}
+	// A Job with the marker but not this agent's labels isn't the
+	// dispatcher's, and stays.
+	if err := cl.Create(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: "someone-elses", Namespace: "test-ns-profiles", Labels: map[string]string{dispatchJobLabel: "true"},
+	}}); err != nil {
+		t.Fatalf("precondition: create a foreign Job: %v", err)
 	}
 
 	// The render has to have produced what the cleanup is asked to remove.
@@ -2409,6 +2434,25 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 		if !errors.IsNotFound(err) {
 			t.Errorf("the dispatcher's pod-read %T in the profile namespace survived the cleanup (err=%v)", obj, err)
 		}
+	}
+	// Job mode's half, likewise unowned.
+	for _, tc := range []struct {
+		obj  client.Object
+		name string
+	}{
+		{&rbacv1.Role{}, "test-agent-a2a-dispatcher-jobs"},
+		{&rbacv1.RoleBinding{}, "test-agent-a2a-dispatcher-jobs"},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobIndexName},
+		{&batchv1.Job{}, "dispatch-1"},
+	} {
+		err := cl.Get(ctx, types.NamespacedName{Name: tc.name, Namespace: "test-ns-profiles"}, tc.obj)
+		if !errors.IsNotFound(err) {
+			t.Errorf("Job mode's %T %s in the profile namespace survived the cleanup (err=%v)", tc.obj, tc.name, err)
+		}
+	}
+
+	if err := cl.Get(ctx, types.NamespacedName{Name: "someone-elses", Namespace: "test-ns-profiles"}, &batchv1.Job{}); err != nil {
+		t.Errorf("a Job without this agent's labels was deleted: %v", err)
 	}
 
 	// A third pass on the now-empty tree is the exit doing its job.
@@ -5295,6 +5339,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A profile task's submission; the gateway is its one writer.
+		"a2a.submit.*.*.*.*",
+		// A profile task's stop record; the gateway is its one writer too.
+		"a2a.stop.*.*",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
@@ -5308,6 +5356,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read: the directory's subject list and a
+	// direct get per card subject, and no consumer.
+	want = append(want, "$JS.API.STREAM.INFO.DIRECTORY", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*")
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
@@ -5365,11 +5416,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
 	// Streams the gateway has no business on at all: not a read, not a
-	// consumer, not a direct get. The directory is the identity plane and
-	// the gateway reads it by subscribing to the cards; the topic streams
-	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the bridge's and the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+	// consumer, not a direct get. The topic streams are the blackboard,
+	// which nothing in a2a/gateway touches; the other two buckets are the
+	// bridge's and the capability envelope's.
+	for _, s := range []string{"TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5381,6 +5431,21 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 			"$JS.API.DIRECT.GET."+s,
 		)
 	}
+	// The directory, the identity plane. The gateway follows the cards by
+	// subscribing, but subscribing alone misses cards published before it
+	// started, so it also reads them: the subject list, then DIRECT.GET on
+	// card subjects only. No consumer on it, and no direct get past the card
+	// subjects.
+	forbidden = append(forbidden,
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x.a2a.agents.platform",
+		"$JS.API.CONSUMER.DURABLE.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.x",
+		"$JS.API.CONSUMER.DELETE.DIRECTORY.x",
+		"$JS.API.DIRECT.GET.DIRECTORY",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform.x",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.tasks.platform.task-0001.in",
+	)
 	forbidden = append(forbidden,
 		// A session pod's three consumers, and the bridge's durable: the
 		// gateway may create consumers on TASKS, and create-as-update
@@ -5490,6 +5555,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway answer feedback, over the feedback bucket.
 		{"startFeedback js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aFeedbackBucket},
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
+		// gateway.readDirectory, the profile cards' start-up read.
+		{"readDirectory js.Stream / stream.Info", "$JS.API.STREAM.INFO." + a2aDirectoryStream},
+		{"readDirectory GetLastMsgForSubject", "$JS.API.DIRECT.GET." + a2aDirectoryStream + ".a2a.agents.cluster"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		// gateway people count, over the people bucket.
@@ -6015,6 +6083,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: map[string][]string{
 				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The profile cards' start-up read: the subject list and a
+				// direct get per card, no consumer (readDirectory).
+				a2aDirectoryStream: {"STREAM.INFO", "DIRECT.GET"},
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
@@ -8568,8 +8639,8 @@ func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
 		if n != c.want || (why == "") != c.used {
 			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
 		}
-		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
-			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		if a2aChartPods(agent) != n {
+			t.Errorf("%q: a2aChartPods disagrees with a2aChartPodsCount", c.raw)
 		}
 	}
 }
@@ -8720,8 +8791,8 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			if tc.annotation != nil {
 				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
 			}
-			if why := a2aChartPodsDiscard(agent); (why != "") != (tc.want > 0) {
-				t.Fatalf("a2aChartPodsDiscard = %q", why)
+			if _, why := a2aChartPodsCount(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsCount's reason = %q", why)
 			}
 			scheme := setupScheme()
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).

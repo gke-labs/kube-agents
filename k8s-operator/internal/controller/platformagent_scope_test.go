@@ -220,3 +220,15 @@ func TestScopeFileReachesTheAgentWhetherOrNotScopeIsDeclared(t *testing.T) {
 		t.Errorf("agent container does not mount %s", scopeVolumeName)
 	}
 }
+
+func TestTheGatewayGetsTheManagementProject(t *testing.T) {
+	agent := scopeTestAgent(nil)
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-proj"}
+	if got := a2aManagementProject(agent); got != "mgmt-proj" {
+		t.Errorf("a2aManagementProject = %q, want the harness project", got)
+	}
+	agent.Spec.Harness = nil
+	if got := a2aManagementProject(agent); got != "" {
+		t.Errorf("a2aManagementProject with no harness = %q, want empty", got)
+	}
+}
