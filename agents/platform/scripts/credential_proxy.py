@@ -641,14 +641,22 @@ SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 SHUTDOWN_ERROR = "credential proxy shutting down"
 # The drain thread's name, for a reader of a thread dump mid-stop.
 SHUTDOWN_THREAD_NAME = "shutdown"
-# In the broker and exec roles the stop is a drain (install_shutdown_handler):
-# new requests are refused with the `draining` bound, and the requests already
-# in flight get this long to finish before the commands still running are ended.
+# In the broker role the stop is a drain (install_shutdown_handler): new
+# requests are refused with the `draining` bound, and the requests already in
+# flight get this long to finish before the commands still running are ended.
 # The pod's terminationGracePeriodSeconds (45 s, the operator's
 # credentialProxyTerminationGraceSeconds) holds this, SHUTDOWN_END_WAIT_SECONDS,
 # the hand-back and the entrypoint's kill of Envoy after it; the entrypoint
 # waits BROKER_RUNTIME_DRAIN_SECONDS (40 s) for the runtime to exit.
 SHUTDOWN_DRAIN_SECONDS = 30
+# The exec role drains for as long as the longest command it admits, because
+# another replica serves while its pod rolls: the default --timeout-seconds
+# (300 s) plus COMMAND_SLOT_WAIT_SECONDS (60 s), since a request still waiting
+# for a slot at SIGTERM can be admitted. A literal, not the parsed timeout: the
+# entrypoint's EXEC_RUNTIME_DRAIN_SECONDS (370 s) and the operator's
+# credentialProxyExecTierTerminationGraceSeconds (380 s) are literals too, and a
+# drain that followed a longer timeout would outlast them.
+EXEC_SHUTDOWN_DRAIN_SECONDS = 360
 # After the drain, how long the stop waits for the requests whose commands it
 # ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
 # the process group, the poll that notices the stop, and the write. A request
@@ -866,7 +874,8 @@ ADMISSION_PATH = "/v1/exec/admission"
 # file is held to it.
 EXEC_REPLICAS_MAX = 32
 EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
-# Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
+# Requests that keep serving while the broker or an exec pod drains
+# (SHUTDOWN_DRAIN_SECONDS, EXEC_SHUTDOWN_DRAIN_SECONDS),
 # by method and path: the health probe; a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
 # and Teams' queues are in-process and already acknowledged upstream, so every
@@ -16293,7 +16302,8 @@ def install_shutdown_handler(
     gateway on a next install reads Slack itself. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
-    With drain_seconds (the broker and exec roles, SHUTDOWN_DRAIN_SECONDS), the
+    With drain_seconds (the broker role's SHUTDOWN_DRAIN_SECONDS, the exec role's
+    EXEC_SHUTDOWN_DRAIN_SECONDS), the
     stop is a drain as well: every new request outside DRAIN_OPEN_ROUTES is
     refused 503 with the `draining` bound, the Slack relay stops taking events
     from Slack, and the requests already in flight get up to drain_seconds from
@@ -16647,11 +16657,16 @@ def serve(args: argparse.Namespace) -> None:
         ],
         executor=executor,
         # The standalone broker pod and the exec tier's pods drain: the operator
-        # gives each the grace period for one
-        # (credentialProxyTerminationGraceSeconds), and an exec pod that stops
-        # mid-rollout must finish the commands it
-        # admitted. The sidecar roles' pods keep the short stop.
-        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role in (ROLE_BROKER, EXEC_ROLE) else 0,
+        # gives each the grace period for its drain
+        # (credentialProxyTerminationGraceSeconds,
+        # credentialProxyExecTierTerminationGraceSeconds), and an exec pod that
+        # stops mid-rollout must finish the commands it admitted. The sidecar
+        # roles' pods keep the short stop.
+        drain_seconds=(
+            SHUTDOWN_DRAIN_SECONDS if role == ROLE_BROKER
+            else EXEC_SHUTDOWN_DRAIN_SECONDS if role == EXEC_ROLE
+            else 0
+        ),
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

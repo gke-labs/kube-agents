@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	"k8s.io/utils/ptr"
 )
 
 // kubernetesDefaultTerminationGraceSeconds is what the kubelet waits between
@@ -46,5 +47,28 @@ func TestTheBrokerPodHoldsItsDrain(t *testing.T) {
 	}
 	if got := dep.Spec.Strategy.Type; got != appsv1.RecreateDeploymentStrategyType {
 		t.Errorf("strategy = %q, want Recreate: the bounded drain is sized for a pod no other broker serves beside", got)
+	}
+}
+
+// TestTheExecTierHoldsItsLongestCommand pins the exec pods' own grace period:
+// RollingUpdate keeps another replica serving while one rolls, so the exec
+// role drains for as long as the longest command it admits, and the broker's
+// bounded 45s would cut a command still running at the SIGKILL.
+// tests/test_credential_proxy_drain_budget.py holds the drain's own terms
+// under this value.
+func TestTheExecTierHoldsItsLongestCommand(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	broker := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+	dep := buildCredentialProxyExecTierDeployment(agent, broker)
+
+	grace := dep.Spec.Template.Spec.TerminationGracePeriodSeconds
+	if grace == nil {
+		t.Fatalf("the exec pod sets no terminationGracePeriodSeconds; the kubelet's %ds default cuts the drain", kubernetesDefaultTerminationGraceSeconds)
+	}
+	if *grace != credentialProxyExecTierTerminationGraceSeconds {
+		t.Errorf("exec terminationGracePeriodSeconds = %d, want credentialProxyExecTierTerminationGraceSeconds (%d)", *grace, credentialProxyExecTierTerminationGraceSeconds)
+	}
+	if got := broker.Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != credentialProxyTerminationGraceSeconds {
+		t.Errorf("broker terminationGracePeriodSeconds = %v, want credentialProxyTerminationGraceSeconds (%d) left as it was", got, credentialProxyTerminationGraceSeconds)
 	}
 }

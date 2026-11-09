@@ -419,9 +419,10 @@ readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # window plus margin, inside a 30s default grace with the Envoy kill after it.
 # In the api-proxy role the runtime installs no handler and exits on the
 # signal, so the wait there is one poll. The broker and exec roles drain longer
-# and wait BROKER_RUNTIME_DRAIN_SECONDS instead (below).
+# and wait BROKER_RUNTIME_DRAIN_SECONDS or EXEC_RUNTIME_DRAIN_SECONDS instead
+# (below).
 readonly RUNTIME_DRAIN_SECONDS=10
-# The standalone broker pod's runtime, and an exec pod's, drains longer: it
+# The standalone broker pod's runtime drains longer: it
 # refuses new requests and gives those in flight up to credential_proxy.py's own
 # SHUTDOWN_DRAIN_SECONDS (30s from the signal, the 3s settle inside it), then
 # ends the commands still running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for
@@ -431,6 +432,14 @@ readonly RUNTIME_DRAIN_SECONDS=10
 # inside the 45s terminationGracePeriodSeconds the operator gives the broker pod
 # (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
 readonly BROKER_RUNTIME_DRAIN_SECONDS=40
+# An exec pod's runtime drains for as long as the longest command it admits:
+# credential_proxy.py's EXEC_SHUTDOWN_DRAIN_SECONDS (360s from the signal), then
+# its SHUTDOWN_END_WAIT_SECONDS (5s); the exec role starts no Chat relay, so
+# nothing is handed back. 370s holds those 365s and one poll
+# (tests/test_credential_proxy_drain_budget.py), inside the 380s
+# terminationGracePeriodSeconds the operator gives an exec pod
+# (credentialProxyExecTierTerminationGraceSeconds), Envoy's kill after it.
+readonly EXEC_RUNTIME_DRAIN_SECONDS=370
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -694,10 +703,11 @@ wait_for_exit() {
 # that sweeps the pid's children first, and the runtime's children are the
 # brokered commands in flight (kubectl, git, gh, gcloud, each in its own
 # session), which the runtime lets finish: in the broker and exec roles it
-# drains them for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an
-# answer; in the other roles its exec route stays open for the settle window,
-# and one still running when the runtime exits dies with the pod. A sweep would
-# end them at the first instant of the stop.
+# drains them for up to SHUTDOWN_DRAIN_SECONDS or EXEC_SHUTDOWN_DRAIN_SECONDS
+# and ends the rest itself, with an answer; in the other roles its exec route
+# stays open for the settle window, and one still running when the runtime
+# exits dies with the pod. A sweep would end them at the first instant of the
+# stop.
 drain_runtime() {
   local budget="$1"
   local pid="$2"
@@ -719,7 +729,8 @@ terminate() {
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
   local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
   case "${CREDENTIAL_PROXY_ROLE}" in
-    broker | exec) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+    broker) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+    exec) runtime_budget="${EXEC_RUNTIME_DRAIN_SECONDS}" ;;
   esac
   [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true

@@ -106,6 +106,12 @@ _LONG_DRAIN_SECONDS = 20
 # two apart, and inside _DRAIN_CEILING_SECONDS.
 _BROKER_RUNTIME_DRAIN_SECONDS = 5
 
+# The exec role's runtime budget in the same test: longer than the broker's by
+# more than a poll, so the clock tells the two apart, and inside _run_bash's
+# timeout. Its ceiling allows the same slack past the budget as the others'.
+_EXEC_RUNTIME_DRAIN_SECONDS = 8
+_EXEC_DRAIN_CEILING_SECONDS = 11.0
+
 # How long to give bash to reap a supervisor the drain has just killed. The wait
 # is what makes the check deterministic: SIGKILL is delivered synchronously but
 # the reap that makes `kill -0` fail is a SIGCHLD the shell handles when it next
@@ -259,6 +265,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         runtime_drain: int = _SHORT_DRAIN_SECONDS,
         role: str = "combined",
         broker_runtime_drain: int = _LONG_DRAIN_SECONDS,
+        exec_runtime_drain: int = _LONG_DRAIN_SECONDS,
     ) -> str:
         """The shipped drain functions, wired to a fake supervisor.
 
@@ -271,6 +278,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
         readonly RUNTIME_DRAIN_SECONDS={runtime_drain}
         readonly BROKER_RUNTIME_DRAIN_SECONDS={broker_runtime_drain}
+        readonly EXEC_RUNTIME_DRAIN_SECONDS={exec_runtime_drain}
         CREDENTIAL_PROXY_ROLE={role}
         {self.lift("drain_supervised")}
         {self.lift("wait_for_exit")}
@@ -525,15 +533,15 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 "than RUNTIME_DRAIN_SECONDS",
             )
 
-    def test_the_broker_and_exec_roles_wait_on_their_own_longer_budget(self) -> None:
+    def test_the_broker_and_exec_roles_wait_on_their_own_longer_budgets(self) -> None:
         """The standalone broker and the exec tier's pods drain their requests in
-        flight on SIGTERM, so their runtime gets BROKER_RUNTIME_DRAIN_SECONDS; the
-        sidecar roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods
-        hold.
+        flight on SIGTERM, so their runtime gets BROKER_RUNTIME_DRAIN_SECONDS or,
+        for the exec role's longer drain, EXEC_RUNTIME_DRAIN_SECONDS; the sidecar
+        roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods hold.
         """
         for role, floor, ceiling in (
-            ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
-            ("exec", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
+            ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _EXEC_RUNTIME_DRAIN_SECONDS - 1),
+            ("exec", _EXEC_RUNTIME_DRAIN_SECONDS - 1, _EXEC_DRAIN_CEILING_SECONDS),
             ("combined", 0, _BROKER_RUNTIME_DRAIN_SECONDS - 1),
         ):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
@@ -554,6 +562,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                     result = _run_bash(self._harness(
                         body, runtime_drain=_SHORT_DRAIN_SECONDS, role=role,
                         broker_runtime_drain=_BROKER_RUNTIME_DRAIN_SECONDS,
+                        exec_runtime_drain=_EXEC_RUNTIME_DRAIN_SECONDS,
                     ))
                     elapsed = time.monotonic() - started
                 finally:
