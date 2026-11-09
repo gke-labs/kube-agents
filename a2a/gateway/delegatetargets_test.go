@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -200,5 +201,98 @@ func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
 	})
 	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, wake)); found {
 		t.Fatal("a wake carried delegate targets")
+	}
+}
+
+// The people the list is checked for are the people the delegation will be
+// checked for: the incarnation's set with this turn's requester added, or,
+// for an incarnation whose set isn't started yet (a pod the primer will
+// seed), everyone still on the conversation's record.
+func TestDelegateAuthorsAreWhomTheDelegationWillCheck(t *testing.T) {
+	u1 := TaskRequester{Backend: "discord", Subject: "u1"}
+	u2 := TaskRequester{Backend: "discord", Subject: "u2"}
+	u3 := TaskRequester{Backend: "discord", Subject: "u3"}
+
+	// A fresh incarnation: the record's earlier requester and steer author
+	// count, though the set the primer seeds isn't written yet.
+	fresh := &SessionRecord{BusSession: "chat-new", SessionAuthorsFor: "chat-old",
+		Tasks: []TaskRef{{ID: "t1", Requester: &u2, SteerAuthors: []TaskRequester{u3}}, {ID: "t0"}}}
+	got, unknown := delegateAuthors(fresh, u1)
+	if unknown || !slices.Contains(got, u2) || !slices.Contains(got, u3) || !slices.Contains(got, u1) {
+		t.Fatalf("fresh incarnation: %v unknown=%v, want u1, u2 and u3", got, unknown)
+	}
+	fresh.Tasks[0].SteerAuthorsOverflow = true
+	if _, unknown := delegateAuthors(fresh, u1); !unknown {
+		t.Fatal("fresh incarnation with an overflowed steer set: known, want unknown")
+	}
+
+	// A running incarnation: its set, plus this turn's requester.
+	live := &SessionRecord{BusSession: "chat-a", SessionAuthorsFor: "chat-a", SessionAuthors: []TaskRequester{u2},
+		Tasks: []TaskRef{{ID: "t1", Requester: &u3}}}
+	if got, unknown := delegateAuthors(live, u1); unknown || !reflect.DeepEqual(got, []TaskRequester{u2, u1}) {
+		t.Fatalf("running incarnation: %v unknown=%v, want [u2 u1] (u3's turn was another incarnation's)", got, unknown)
+	}
+
+	// At the cap, a new requester makes the set unknown, as recording the
+	// turn will; one already in it doesn't.
+	full := &SessionRecord{BusSession: "chat-a", SessionAuthorsFor: "chat-a"}
+	for i := 0; i < sessionAuthorCap; i++ {
+		full.SessionAuthors = append(full.SessionAuthors, TaskRequester{Backend: "discord", Subject: fmt.Sprintf("p%d", i)})
+	}
+	if _, unknown := delegateAuthors(full, u1); !unknown {
+		t.Fatal("a new requester past the cap: known, want unknown")
+	}
+	if _, unknown := delegateAuthors(full, full.SessionAuthors[0]); unknown {
+		t.Fatal("a requester already in a full set: unknown, want known")
+	}
+}
+
+// Whatever the cards, the list the gateway builds is a part it can send: a
+// list cut short by the byte bound still fits once it says it was cut.
+func TestEveryDelegateTargetsListBuildsAPart(t *testing.T) {
+	var params []lib.ProfileParameter
+	for j := 0; j < lib.TaskParametersMax; j++ {
+		params = append(params, lib.ProfileParameter{Name: fmt.Sprintf("parameter_number_%02d", j), Required: true})
+	}
+	for blurb := 1; blurb <= lib.DelegateTargetDescriptionMax; blurb++ {
+		d := newProfileDirectory()
+		for i := 0; i < lib.DelegateTargetsMax; i++ {
+			name := fmt.Sprintf("p%02d", i)
+			d.put(name, &lib.AgentCard{Name: name, Description: strings.Repeat("x", blurb), Parameters: params})
+		}
+		got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+		if _, err := lib.DelegateTargetsPart(got); err != nil {
+			t.Fatalf("blurb of %d bytes: %d targets, truncated=%v, and no part: %v", blurb, len(got.Targets), got.Truncated, err)
+		}
+	}
+}
+
+// A turn that starts a fresh incarnation is checked for the people on the
+// conversation's record, whose turns the new pod's primer replays, though the
+// set isn't seeded until the pod spawns.
+func TestAFreshIncarnationsListCountsTheRecordsPeople(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	me := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")}
+	offList := TaskRequester{Backend: "discord", Subject: "someone-else"}
+	r.g.profiles.put("listed", &lib.AgentCard{Name: "listed"})
+	r.g.profiles.put("open", &lib.AgentCard{Name: "open"})
+	r.g.targetAllowed = map[string]map[string]map[string]bool{"listed": {"discord": {me.Subject: true}}}
+	conv := "discord:g1/t-fresh"
+	// The earlier incarnation is gone (reaped): no bus session or pod, its
+	// turn still on record.
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-fresh", Kind: "group", Addressee: "platform",
+		Tasks: []TaskRef{{ID: "task-earlier", Addressee: "chat-old-1", Requester: &offList, Request: "an earlier ask"}}}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "fr-1", Text: "use listed"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	got, found, err := lib.DelegateTargetsOf(messageParts(t, origin))
+	if err != nil || !found {
+		t.Fatalf("delegateTargets part: found=%v err=%v", found, err)
+	}
+	if slices.Contains(targetNames(got), "listed") {
+		t.Fatalf("targets = %v: listed offered though someone off its list spoke in a turn the pod replays", targetNames(got))
 	}
 }

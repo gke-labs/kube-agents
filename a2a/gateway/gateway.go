@@ -2950,7 +2950,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A wake runs without the tool, so it carries none.
 	var extra []lib.Part
 	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
-		authors, unknown, _ := rec.sessionAuthorsOf()
+		authors, unknown := delegateAuthors(rec, ts.Requester)
 		if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
 			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
 		} else {
