@@ -95,6 +95,12 @@ RUN_ID_SUFFIX = "_run_id"
 EVENTS_KEY = "events"
 EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
+# `queued` is the dispatcher noting that the card waited for a free worker
+# ("Queued: the system is busy", with how many were running): whether a card
+# has one depends on what else was running at that moment. Dropped like a
+# heartbeat. A dropped event's values that cannot be put back in an answer (an
+# epoch `created_at`, a date) still count against one (Normalizer.dropped_guards).
+DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, "queued")
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
 # came before its JSON in one run and after it in the next. Only that shape is
@@ -293,10 +299,47 @@ IPV4_OCTET_MAX = 255
 # Kubernetes' random-suffix alphabet (k8s.io/apimachinery rand.SafeEncodeString).
 K8S_SAFE = "bcdfghjklmnpqrstvwxz2456789"
 
+# The eval pool's GCP projects (docs/ci-pool-projects.md): `kube-agents-evals`,
+# then `kube-agents-evals-2` up. Every Prow build leases its own, and the name
+# is in the Cluster Agent's profile (`cluster-kube-agents-evals-31-seeded-a-…`),
+# the front door's specialist list, the GitOps repository
+# (`gke-agentic/kube-agents-evals-31-infra`) and tool results, so it is an
+# identifier. A numbered name is one wherever it starts and no letter or digit
+# follows its number. The bare name is also the start of names that belong to
+# no project and are the same in every run (`kube-agents-evals-token-minter`,
+# `kube-agents-evals-large-gitops`), so it counts only on its own or before a
+# part that pool projects add to their own names.
+EVAL_POOL_PROJECT = "kube-agents-evals"
+EVAL_POOL_NAME_PARTS = ("infra", "seeded", "platform", "us")
+EVAL_POOL_PROJECT_RE = re.compile(
+    r"(?<![A-Za-z0-9])" + re.escape(EVAL_POOL_PROJECT)
+    + r"(?:-\d+(?![A-Za-z0-9])|(?![A-Za-z0-9-])|(?=-(?:" + "|".join(EVAL_POOL_NAME_PARTS) + r")(?![A-Za-z0-9])))"
+)
+EVAL_POOL_CLASS = "EVALPROJECT"
+# A repository's commit as `owner/repo@<sha>` (`gke-agentic/kube-agents-evals-31-infra@c99b1ab`): each
+# pool project's repository has its own history. The owner and repository may
+# already be placeholders when the pattern runs over a normalized answer.
+COMMIT_CLASS = "COMMIT"
+COMMIT_MIN_HEX = 7
+COMMIT_MAX_HEX = 40
+COMMIT_RE = re.compile(
+    r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
+)
+# A run of hex an answer may abbreviate a bound commit to (Mapping.identifier_left_literal).
+HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
+
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
 # rest of the match stays literal (a pod keeps its workload name).
 ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
+    # GKE operation: operation-<epoch ms>-<uuid>. Before UID, which would take the uuid alone.
+    ("GKEOP", re.compile(
+        r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
+    (COMMIT_CLASS, COMMIT_RE, 1),
+    (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
+    # The fleet audit's declared-intent clone directory, a Python tempfile name:
+    # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
+    ("TMPNAME", re.compile(r"(?<![A-Za-z0-9])declared-intent-([a-z0-9_]{8})(?![A-Za-z0-9_-])"), 1),
     ("UID", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b"), 0),
     # Hermes session id: 20261102_002640_791a68.
     ("SESSION", re.compile(r"\b\d{8}_\d{6}_[0-9a-f]{4,}\b"), 0),
@@ -325,11 +368,18 @@ TIMESTAMP_PATTERNS = (ISO_TS_RE, RFC1123_RE, OPENSSL_TS_RE, LS_DATE_RE)
 # Hermes appends `## Recent work by @<assignee>` (the assignee's last runs on
 # other cards, one `- ` line each, then a blank line) to every card view. It
 # differs between otherwise identical runs, so it is dropped from the key
-# (#1730). Matched with real and JSON-escaped newlines.
-RECENT_WORK_RE = re.compile(r"(?m)^## Recent work by @[^\n]*\n(?:- [^\n]*(?:\n|$))*")
-RECENT_WORK_ESCAPED_RE = re.compile(r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*")
-RECENT_WORK_STRIPPED = "## Recent work [stripped]\n"
-RECENT_WORK_ESCAPED_STRIPPED = "## Recent work [stripped]"
+# (#1730). Whether a card view has one at all depends on whether the assignee
+# happened to finish another card first, so the header goes too, with the blank
+# line that separates it from the section before (Hermes joins sections with
+# one): a view with the digest keys as the same view without it. A digest with
+# no blank line before it takes the line breaks after it instead. Matched with
+# real and JSON-escaped newlines.
+RECENT_WORK_SECTION = r"## Recent work by @[^\n]*(?:\n- [^\n]*)*"
+RECENT_WORK_RE = re.compile(r"\n\n" + RECENT_WORK_SECTION + r"(?=\n|\Z)|(?m:^)" + RECENT_WORK_SECTION + r"(?:\n\n?)?")
+RECENT_WORK_ESCAPED_SECTION = r"## Recent work by @(?:(?!\\n).)*(?:\\n- (?:(?!\\n).)*)*"
+RECENT_WORK_ESCAPED_RE = re.compile(
+    r"\\n\\n" + RECENT_WORK_ESCAPED_SECTION + r"(?=\\n|\Z|\")|" + RECENT_WORK_ESCAPED_SECTION + r"(?:\\n(?:\\n)?)?"
+)
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["
@@ -344,7 +394,7 @@ TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
 # Classes whose value is the tail of a longer name (`web-` + the pod's hash
 # suffix, `gke-…-` + the node's): in an answer that tail follows a `-` or `_`,
 # so those may border it on the left.
-SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT")
+SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT", "TMPNAME", "GKEOP")
 SUFFIX_TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=])"
 # A bare number is a token when no word character, `.` or `-` precedes it and
 # no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
@@ -502,8 +552,8 @@ def key_timed(key: Any) -> bool:
 
 def strip_recent_work(text: str) -> str:
     """Drop the `## Recent work` digest, which the key leaves out (RECENT_WORK_RE)."""
-    text = RECENT_WORK_RE.sub(RECENT_WORK_STRIPPED, text)
-    return RECENT_WORK_ESCAPED_RE.sub(RECENT_WORK_ESCAPED_STRIPPED, text)
+    text = RECENT_WORK_RE.sub("", text)
+    return RECENT_WORK_ESCAPED_RE.sub("", text)
 
 
 @dataclass
@@ -652,11 +702,21 @@ class Mapping:
 
         A backstop for apply_to_answer: such an answer would be served with the
         recording's value. IPs count only where no digit or `.`+digit borders
-        them, so 10.1.2.3 is not found in 10.1.2.30.
+        them, so 10.1.2.3 is not found in 10.1.2.30. A commit counts also as
+        any run of 7 or more hex digits that starts it, or that it starts: an
+        answer may shorten `…@c99b1ab1fee8…` to `c99b1ab`, and no pattern binds that.
         """
+        hex_runs = None
         for key, token in self.to_placeholder.items():
             cls, value = key.split(MAPPING_KEY_SEPARATOR, 1)
-            if cls or token_class(token) not in IDENTIFIER_CLASSES or value not in text:
+            if cls or token_class(token) not in IDENTIFIER_CLASSES:
+                continue
+            if token_class(token) == COMMIT_CLASS:
+                if hex_runs is None:
+                    hex_runs = HEX_RUN_RE.findall(text)
+                if any(run.startswith(value) or value.startswith(run) for run in hex_runs):
+                    return True
+            if value not in text:
                 continue
             if token_class(token) != IP_CLASS or re.search(IP_LITERAL_BEFORE + re.escape(value) + IP_LITERAL_AFTER, text):
                 return True
@@ -758,6 +818,7 @@ class Normalizer:
             return self.text(obj)
         if isinstance(obj, (list, dict)):
             items = self.kept_items(obj, key, is_tool_call)
+            self.dropped_guards(obj, key)
             beside = self.siblings_timed(items)
             walked = [self.beside(flag, lambda item=item: self.walk(*item)) for item, flag in zip(items, beside)]
             if isinstance(obj, dict):
@@ -781,13 +842,37 @@ class Normalizer:
     def kept_items(obj: Any, key: Optional[str], is_tool_call: bool) -> List[Tuple[Any, Optional[str], bool, bool]]:
         """The children `walk` keeps, as its arguments: (value, key or None, in_tool_call, is_tool_call).
 
-        A dict's keys come sorted; a kanban card's heartbeat events are dropped.
+        A dict's keys come sorted; a kanban card's heartbeat and queued events are dropped.
         """
         if isinstance(obj, dict):
             return [(obj[k], k, is_tool_call, False) for k in sorted(obj)]
         if key == EVENTS_KEY:
-            obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
+            obj = [v for v in obj if not Normalizer.dropped_event(v)]
         return [(v, None, False, key == TOOL_CALLS_KEY and isinstance(v, dict)) for v in obj]
+
+    @staticmethod
+    def dropped_event(value: Any) -> bool:
+        return isinstance(value, dict) and value.get(EVENT_KIND_KEY) in DROPPED_EVENT_KINDS
+
+    def dropped_guards(self, obj: Any, key: Optional[str]) -> None:
+        """Note what an answer must not repeat from the events kept_items drops, without keying them.
+
+        Each is walked by a throwaway normalizer, so no placeholder is numbered
+        for it; its unrestorable values (an epoch `created_at`, a keyed number,
+        an age, a day-counted date) join this request's. An identifier only a
+        dropped event holds is unbound, which has_identifier already refuses.
+        """
+        if key != EVENTS_KEY or not isinstance(obj, list):
+            return
+        for event in obj:
+            if not self.dropped_event(event):
+                continue
+            scratch = Normalizer(self.now, self.keep_ips)
+            scratch.walk(event)
+            self.mapping.bare_numbers |= scratch.mapping.bare_numbers
+            self.mapping.ages |= scratch.mapping.ages
+            self.mapping.dates |= scratch.mapping.dates
+            self.mapping.today_dates |= scratch.mapping.today_dates
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.

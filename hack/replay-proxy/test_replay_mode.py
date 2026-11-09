@@ -402,6 +402,79 @@ class BoundValueTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], [])
 
 
+class RunNameTest(AnalyzeCase):
+    """The eval pool project, a repository commit, a clone directory and a GKE operation are bound like ids."""
+
+    CASES = (
+        # (what the request shows, recorded value, replayed value, the answer naming it)
+        ("You are cluster-{}-seeded-a-us-central1-a.", "kube-agents-evals-31", "kube-agents-evals-29",
+         "gcloud container clusters describe seeded-a --project={} --zone us-central1-a"),
+        # The nightly's project has no number; the presubmit's does.
+        ("project {}", "kube-agents-evals", "kube-agents-evals-7",
+         "I opened a PR on gke-agentic/{}-infra for cluster-{}-seeded-a-us-central1-a."),
+        ("searched gke-agentic/kube-agents-evals-3-infra@{} (whole tree)", "c99b1ab", "4f1e414",
+         "git -C repo checkout {}"),
+        ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q",
+         "ls /opt/data/scratch/declared-intent-{}/"),
+        ("newest operation operation-{} (UPGRADE_NODES)", "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3",
+         "1792900340178-5482a62f-d7e3-4c54-bb09-236983a9dfb7", "gcloud container operations describe operation-{}"),
+    )
+
+    @staticmethod
+    def body(shown):
+        return {"model": "m", "messages": [{"role": "user", "content": shown}]}
+
+    def test_the_answer_is_served_with_this_runs_value(self):
+        for shown, recorded, replayed, said in self.CASES:
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(shown.format(recorded)),
+                                     {"role": "assistant", "content": said.format(recorded, recorded)})
+                self.assertEqual(line["unstorable"], [])
+                hit, _ = self.proxy().lookup(self.body(shown.format(replayed)), time.time())
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[0]["content"], said.format(replayed, replayed))
+
+    def test_the_project_in_tool_arguments_is_served_with_this_runs_value(self):
+        def answer(project):
+            return {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "terminal", "arguments": json.dumps({"command": f"gcloud projects describe {project}"})}}]}
+
+        def shown(project):
+            return json.dumps({"output": f"project: {project}"})
+
+        self.assertEqual(self.recorded(self.body(shown("kube-agents-evals-31")),
+                                       answer("kube-agents-evals-31"))["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown("kube-agents-evals-12")), time.time())
+        self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]),
+                         {"command": "gcloud projects describe kube-agents-evals-12"})
+
+    def test_a_pool_project_the_request_never_named_is_not_stored(self):
+        line = self.recorded(self.body("list the clusters"),
+                             {"role": "assistant", "content": "gcloud container clusters list --project=kube-agents-evals-31"})
+        self.assertEqual(line["unstorable"], ["unbound_identifier"])
+
+    def test_a_shortened_commit_is_not_stored(self):
+        # The request holds the full commit; the answer abbreviates it, which no pattern binds.
+        full = "c99b1ab1fee849df074d039fe5d4d4ad4301d1c9"
+        line = self.recorded(self.body(f"searched gke-agentic/kube-agents-evals-3-infra@{full}"),
+                             {"role": "assistant", "content": "the repository is at c99b1ab"})
+        self.assertEqual(line["unstorable"], ["bound_value_left_literal"])
+
+    def test_names_that_are_no_pool_project_are_served_as_recorded(self):
+        said = "Opened by kube-agents-evals-token-minter[bot] against gke-agentic/kube-agents-evals-large-gitops."
+        self.assertEqual(self.recorded(self.body("project kube-agents-evals-31"),
+                                       {"role": "assistant", "content": said})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body("project kube-agents-evals-29"), time.time())
+        self.assertEqual(hit[0]["content"], said)
+
+    def test_an_answer_repeating_a_dropped_queued_events_time_is_not_stored(self):
+        card = json.dumps({"task": {"id": "t_bbbbbbbb"}, "events": [
+            {"kind": "queued", "created_at": 1793700100, "payload": {"note": "Queued: the system is busy."}}]})
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "It waited from 1793700100."})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+
 class ReasoningTest(AnalyzeCase):
     """An answer's reasoning is checked for credentials, and never stored."""
 
