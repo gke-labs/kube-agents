@@ -21,8 +21,11 @@ import (
 // under each row, so the renderer numbers the rows when any carries buttons
 // ("1. ", "2. ", in the bullet's place) and labels each row's buttons with
 // its number ("Retry 1", "Drop 1"); the number is the renderer's own, as
-// the bullet is. The button's parameters carry the action, the row's number
-// and the row's ids.
+// the bullet is. The button's parameters carry the action, the row's number,
+// the row's ids and the row's line in the text, as the Stop button carries
+// its task (gchat_stop.go): a tap edits by the line on every path, whether
+// or not the adapter remembers the message's layout, so a numbered list in
+// the detail or the fold is never taken for the rows.
 //
 // A tap is no turn. It is admitted by the gateway's rule for the backend
 // (BoardAdmits, the allowlist an inbound message is admitted by; Chat has
@@ -41,15 +44,25 @@ import (
 // copy of it, text and buttons.
 const (
 	// gchatBoardFunction is the onClick action a Retry or Drop sends, and
-	// gchatBoardParamAction, gchatBoardParamRow and gchatBoardParamTasks its
-	// parameters: the action (chatmsg.RowActionRetry or RowActionDrop), the
-	// row's number as drawn, and the row's ids joined by
-	// gchatBoardTaskSeparator.
+	// gchatBoardParamAction, gchatBoardParamRow, gchatBoardParamTasks and
+	// gchatBoardParamLine its parameters: the action (chatmsg.RowActionRetry
+	// or RowActionDrop), the row's number as drawn, the row's ids joined by
+	// gchatBoardTaskSeparator, and the index of the row's line in the
+	// message's text. The line is the row's place when the message was laid
+	// out, and holds while edits keep the line count, which the adapter's
+	// own do (a tap's line goes on the row's line; an answer's line goes
+	// after the text), so a tap checks that its line still starts with the
+	// row's marker before it acts.
 	gchatBoardFunction      = "kage.board"
 	gchatBoardParamAction   = "action"
 	gchatBoardParamRow      = "row"
 	gchatBoardParamTasks    = "tasks"
+	gchatBoardParamLine     = "line"
 	gchatBoardTaskSeparator = ","
+	// gchatBoardNoLine is the line of a button that carries none: one
+	// drawn before gchatBoardParamLine existed, whose row the text's rows
+	// block finds (gchatBoardRowsBlock).
+	gchatBoardNoLine = -1
 	// gchatBoardRowMarker leads each row of a message whose rows carry
 	// buttons, in the bullet's place, and gchatBoardLabel is a button's
 	// text: the action's label, then the row's number.
@@ -149,9 +162,11 @@ func (a *GoogleChatAdapter) SetBoardAdmits(admits BoardAdmits) {
 // gchatBoardButtons is the buttons of every row that asks for them, in row
 // order, each labelled with the action and the row's number as drawn: its
 // place among the rows gchatChatRows draws, so a row that draws nothing
-// (gchatChatRowText) takes no number and gets no buttons. nil when no row
-// asks for any.
-func gchatBoardButtons(rows []chatmsg.Row) []map[string]any {
+// (gchatChatRowText) takes no number and gets no buttons, and each carrying
+// its row's line, counted from rowsStart, the line the first drawn row is
+// on (gchatChatRows draws one line per drawn row). nil when no row asks for
+// any.
+func gchatBoardButtons(rows []chatmsg.Row, rowsStart int) []map[string]any {
 	var buttons []map[string]any
 	n := 0
 	for _, r := range rows {
@@ -175,6 +190,7 @@ func gchatBoardButtons(rows []chatmsg.Row) []map[string]any {
 					{gchatParamKey: gchatBoardParamAction, gchatParamValue: action},
 					{gchatParamKey: gchatBoardParamRow, gchatParamValue: strconv.Itoa(n)},
 					{gchatParamKey: gchatBoardParamTasks, gchatParamValue: tasks},
+					{gchatParamKey: gchatBoardParamLine, gchatParamValue: strconv.Itoa(rowsStart + n - 1)},
 				},
 			}}
 			buttons = append(buttons, b)
@@ -209,14 +225,16 @@ func gchatButtonParam(b map[string]any, key string) string {
 
 // boardClick takes one tap on a row's Retry or Drop. It is never a turn: it
 // always returns the reason the pull loop logs. A tap with no row, card,
-// action, presser or message, a redelivery, one with no board route or
-// admission rule wired, one from a presser the gateway would not answer,
-// and one on a row already being tapped change nothing. Otherwise the tap
-// is acted on off the pull loop (runBoardTap).
+// action, presser or message, or a line that is no index, a redelivery,
+// one with no board route or admission rule wired, one from a presser the
+// gateway would not answer, one on a row already being tapped, and one
+// whose line is not its row's change nothing. Otherwise the tap is acted
+// on off the pull loop (runBoardTap).
 func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	click := ev.click
 	verb := click.Parameters[gchatBoardParamAction]
 	n, err := strconv.Atoi(click.Parameters[gchatBoardParamRow])
+	line, lineOK := gchatBoardLineOf(click.Parameters[gchatBoardParamLine])
 	var tasks []string
 	for _, task := range strings.Split(click.Parameters[gchatBoardParamTasks], gchatBoardTaskSeparator) {
 		if task != "" {
@@ -224,7 +242,7 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 		}
 	}
 	switch {
-	case slackBoardLabels[verb] == "" || err != nil || n < 1 || len(tasks) == 0:
+	case slackBoardLabels[verb] == "" || err != nil || n < 1 || len(tasks) == 0 || !lineOK:
 		return gchatBoardNoRow
 	case click.User.Email == "":
 		return gchatBoardNoEmail
@@ -255,15 +273,16 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 		return gchatBoardBusy
 	}
 	// A message laid out again since the client drew its buttons: the row
-	// the tap names is not the row n the message shows now, or the message
-	// shows no rows at all. A message with no record (posted before a
-	// restart) is edited from the click's own copy, so that copy must still
-	// draw the row, or the tap would act on cards it cannot report on.
+	// the tap names is not the row n the message shows now, its line is
+	// not where the button says, or the message shows no rows at all. A
+	// message with no record (posted before a restart) is edited from the
+	// click's own copy, so that copy must still draw the row, or the tap
+	// would act on cards it cannot report on.
 	layout, remembered := ux.board[message]
 	if !remembered {
 		layout = gchatEventLayout(ev.Message)
 	}
-	if ux.boardMoved[message] || !gchatBoardRowHolds(layout, n, tasks) {
+	if ux.boardMoved[message] || !gchatBoardRowHolds(layout, n, tasks) || !gchatBoardRowShown(layout, n, line) {
 		a.mu.Unlock()
 		return gchatBoardStale
 	}
@@ -280,9 +299,26 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
 		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)}}
 	a.goRewrite(func() {
-		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner}, verb, n, tasks, name, actor)
+		a.runBoardTap(snapshot, gchatBoardClaim{key: key, owner: owner}, verb, gchatBoardRow{n: n, line: line}, tasks, name, actor)
 	})
 	return gchatBoardTaken + verb
+}
+
+// gchatBoardLineOf is the line a tap's line parameter names, and whether
+// it is one: gchatBoardNoLine for a button that carries none, an index
+// otherwise.
+func gchatBoardLineOf(raw string) (line int, ok bool) {
+	if raw == "" {
+		return gchatBoardNoLine, true
+	}
+	line, err := strconv.Atoi(raw)
+	return line, err == nil && line >= 0
+}
+
+// gchatBoardRow is the row a tap names: its number as drawn, and its line
+// in the text as the button carries it (gchatBoardNoLine for none).
+type gchatBoardRow struct {
+	n, line int
 }
 
 // gchatBoardClaim is a tap's hold on its row: the claim's key and the tap's
@@ -297,8 +333,8 @@ type gchatBoardClaim struct {
 // again. The release comes after the edit, under the message's rewrite lock,
 // so a second tap cannot edit the row before the first has drawn its line
 // and then have that line drawn over it.
-func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, n int, tasks []string, name string, actor BoardActor) {
-	message := ev.Message.Name
+func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, row gchatBoardRow, tasks []string, name string, actor BoardActor) {
+	message, n := ev.Message.Name, row.n
 	ctx, cancel := context.WithTimeout(context.Background(), slackBoardTimeout)
 	defer cancel()
 	res, err := actor(ctx, lib.BoardAction{Action: verb, Tasks: tasks, By: name})
@@ -315,11 +351,11 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	// again in it (trackBoard frees the claims and replaces or drops the
 	// record): the outcome belongs to the row the tap named, not to
 	// whatever is row n now, so it is drawn only where that row, with those
-	// cards, still is. A message marked as laid out without rows is such a
-	// message, and the tap's own copy of it (the click's) is stale. A
-	// message with no record, never remembered (posted before a restart) or
-	// forgotten since the tap was taken (an edit that failed, below), is
-	// read from that copy.
+	// cards, still is, on the line the tap's button named. A message marked
+	// as laid out without rows is such a message, and the tap's own copy of
+	// it (the click's) is stale. A message with no record, never remembered
+	// (posted before a restart) or forgotten since the tap was taken (an
+	// edit that failed, below), is read from that copy.
 	if moved {
 		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
@@ -333,7 +369,12 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
 		return
 	}
-	layout, err := gchatBoardRowLayout(base, n, line, settled)
+	layout, err := gchatBoardRowLayout(base, row, line, settled)
+	if errors.Is(err, errGchatBoardRowGone) {
+		a.releaseBoardTap(claim)
+		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
+		return
+	}
 	if err == nil {
 		err = a.patchLayout(message, layout)
 	}
@@ -401,30 +442,53 @@ func gchatBoardLine(verb, outcome, name string, now time.Time) string {
 	return fmt.Sprintf(gchatBoardSettledLine, note, defangGchatControls(name), now.UTC().Format(gchatBoardTime))
 }
 
-// gchatBoardRowLayout is layout with row n's line put in: after the row's
-// text on its line, in place of the line an earlier tap left, and the row's
-// buttons gone when settled. The row is the nth line of the rows block: the
-// one the renderer recorded (RowsStart, RowsCount) for a layout the adapter
-// sent, or, for a layout read back from a click's copy of the message, the
-// one gchatBoardRowsBlock finds.
-func gchatBoardRowLayout(layout gchatChatLayout, n int, line string, settled bool) (gchatChatLayout, error) {
+// gchatBoardRowLayout is layout with the row's line put in: after the row's
+// text on its line (gchatBoardRowIndex), in place of the line an earlier
+// tap left, and the row's buttons gone when settled. errGchatBoardRowGone
+// when the text no longer shows the row where the tap's button put it.
+func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string, settled bool) (gchatChatLayout, error) {
 	lines := strings.Split(layout.Text, "\n")
-	start, count := layout.RowsStart, layout.RowsCount
-	if count == 0 {
-		start, count = gchatBoardRowsBlock(lines)
-	}
-	if n > count || start+n > len(lines) {
+	i, ok := gchatBoardRowIndex(lines, row)
+	if !ok {
 		return gchatChatLayout{}, errGchatBoardRowGone
 	}
-	i := start + n - 1
 	lines[i] = gchatBoardRowText(lines[i]) + gchatBoardNoteSep + line
 	widgets := layout.Widgets
 	if settled {
 		widgets = gchatWithoutButtons(widgets, func(b map[string]any) bool {
-			return gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == strconv.Itoa(n)
+			return gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == strconv.Itoa(row.n)
 		})
 	}
-	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets, RowsStart: start, RowsCount: count}, nil
+	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}, nil
+}
+
+// gchatBoardRowShown reports whether layout's text shows the row where the
+// tap's button put it (gchatBoardRowIndex).
+func gchatBoardRowShown(layout gchatChatLayout, n, line int) bool {
+	_, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), gchatBoardRow{n: n, line: line})
+	return ok
+}
+
+// gchatBoardRowIndex is the index in lines of the row's line: the one its
+// button carries, or, for a button that carries none, the nth line of the
+// rows block gchatBoardRowsBlock finds. Either way the line must start with
+// the row's marker ("n. "): the index is the row's place when the message
+// was laid out, and a line that no longer starts with the marker is a
+// message laid out again since the button was drawn, whose row n, if it
+// has one, is elsewhere.
+func gchatBoardRowIndex(lines []string, row gchatBoardRow) (int, bool) {
+	i := row.line
+	if i == gchatBoardNoLine {
+		start, count := gchatBoardRowsBlock(lines)
+		if row.n > count {
+			return 0, false
+		}
+		i = start + row.n - 1
+	}
+	if i < 0 || i >= len(lines) || !strings.HasPrefix(lines[i], fmt.Sprintf(gchatBoardRowMarker, row.n)) {
+		return 0, false
+	}
+	return i, true
 }
 
 // gchatBoardRowHolds reports whether layout still draws row n's buttons for
@@ -446,12 +510,17 @@ func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) bool {
 	return false
 }
 
-// gchatBoardRowsBlock finds the rows in a laid-out text: the longest run of
-// lines numbered in order from "1. " (the renderer's markers,
-// gchatChatRows), the last such run when two are as long, since the rows
-// come after the detail and the fold's text is the one section after them
-// that may hold a list. It returns the run's first line and its length, 0
-// for none.
+// gchatBoardRowsBlock finds the rows in a laid-out text for a button that
+// carries no line (gchatBoardNoLine): the longest run of lines numbered in
+// order from "1. " (the renderer's markers, gchatChatRows), the last such
+// run when two are as long, since the rows come after the detail and the
+// fold's text is the one section after them that may hold a list. It
+// returns the run's first line and its length, 0 for none.
+//
+// This is the path for cards posted before gchatBoardParamLine existed,
+// whose buttons name no line; a daily card lives up to a day, so a deploy
+// in the middle of one would otherwise leave its buttons dead. Remove it,
+// and gchatBoardNoLine, one release after the parameter shipped.
 func gchatBoardRowsBlock(lines []string) (start, count int) {
 	first := fmt.Sprintf(gchatBoardRowMarker, 1)
 	for i := range lines {
