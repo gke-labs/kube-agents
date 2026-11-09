@@ -425,14 +425,16 @@ leave open:
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
-  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
-  admission, and `lease-expired` and `deadline-exceeded` while it holds. A terminal is retried
-  until it lands, except for a profile that has left the install config: its `.supervisor`
-  grant goes at the next reconnect, so after `DroppedTerminalGiveUp` (fifteen minutes, well past
-  a brief drop from the config) the task is settled without one: its slot is freed, the
-  terminal is lost, and the loss is logged as an error (#5074).
+  `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
+  `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
+  and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
+  profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
+  so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the
+  task is settled without one: its slot is freed, the terminal is lost, and the loss is logged as
+  an error (#5074).
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
-  (profile, tier), default 3, opens its breaker. While it is open, for
+  (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
+  is open, for
   `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
   cap, never refused: a refusal would let one input that keeps killing workers fail every
   other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
@@ -447,6 +449,18 @@ leave open:
   always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
   task isn't told it is held yet (#4362).
+- **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
+  the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
+  Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
+  worker. The Job's pod is the warm worker's pod in one-shot mode (`PROFILE_WORKER_ONE_SHOT`):
+  it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
+  is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
+  deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
+  re-adopts the task.
+  Without a Job runner or a Job template, an unattended task has no worker (the operator builds
+  warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
+  for unattended on this install: Job mode is off"), rather than leave it queued until its
+  queue timeout. A pool that serves the tier, were there one, would take the task instead.
 
 ### Execution
 
