@@ -102,13 +102,13 @@ roster line on 2026-11-02 (its bullet stays for the record):
 
 - **cluster-agent-healthy-workload-no-finding** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): the delegation receipt is
-  graded as the answer (51 of 156 recorded repetitions).
+  graded as the answer (the record is on the domain scorecard).
   [#1100](https://github.com/gke-labs/kube-agents/issues/1100) held this seat until its own
   sweep closed it — the agent invents nothing here, so the false-positive premise is gone
   but the reason for the hold is not. Still main's own trait, so a collapse would tax an
   innocent PR. #1010's fix ([#1174](https://github.com/gke-labs/kube-agents/pull/1174))
-  merged 2026-09-03, but this case's record after it was never re-derived (566 of 674 graded
-  presubmit repetitions 2026-09-15 to 09-22). Nightly since 2026-09-22; enters when a
+  merged 2026-09-03, but this case's record after it was never re-derived (under the bar on
+  the presubmit 2026-09-15 to 09-22). Nightly since 2026-09-22; enters when a
   re-derived record clears the bar above.
 - **compliance-rbac-overgrant** —
   [#1171](https://github.com/gke-labs/kube-agents/issues/1171): demoted 2026-09-02 after
@@ -116,7 +116,7 @@ roster line on 2026-11-02 (its bullet stays for the record):
   fleet-audit delegation chain is degraded: audits go partial on what the agent reports as
   "access limitations", skipping check 2.4 (the cluster-admin-binding check this case
   grades), and some runs publish no ledger at all — so the collapse is the environment's,
-  not the diff's. 413 of 677 graded presubmit repetitions 2026-09-15 to 09-22. Nightly
+  not the diff's. Well under the bar on the presubmit 2026-09-15 to 09-22. Nightly
   2026-09-22 to 2026-09-29; since 2026-09-29 seated held out in `presubmit-cases.txt`
   ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) step 2) after the eval install's
   kanban cap (#2022, for the dispatcher-stall residual #2032) and the credential-proxy
@@ -135,8 +135,8 @@ roster line on 2026-11-02 (its bullet stays for the record):
   delegation chain, so it integrates over every environment fault in its window: the
   #1097 429 storms, the #1144 proxy EACCES (fix #1183), and #1184's gap (infra-blocked
   repetitions graded rather than classified) turn one dirty window into a correlated
-  collapse. Its own record was 12/13 clean before the storms; 434 of 681 graded presubmit
-  repetitions 2026-09-15 to 09-22. Since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
+  collapse. Its own record was clean but for one miss before the storms; well under the bar
+  on the presubmit 2026-09-15 to 09-22. Since [#1780](https://github.com/gke-labs/kube-agents/pull/1780)
   (merged 2026-09-21) it is graded by `pull_request_opened`, which rejects a pull request last
   written before the run started; since #2260 the job empties the `*-infra` repository before
   every repetition ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2). Nightly since
@@ -147,29 +147,30 @@ roster line on 2026-11-02 (its bullet stays for the record):
   when #1189's re-admission bar holds.
 - **consistency-authorized-networks-probe** —
   [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
-  failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
+  missed, on the agent model of the day, on unrelated pull requests (#2997,
   #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
-  2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
-  `would-demote`. 15 of the 37 were Vertex 429s
+  2026-10-20, across 42 runs, the store's record at `would-demote`. Part of the misses were
+  provider 429s
   ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), a fix proposed in
-  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
+  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The rest were the agent
   being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
   still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
   `enabled`, and the agent read that leftover block as configured or open and said seeded-c
   matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
   encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
-  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The nightlies on the 2026-10-19 agent model passed every scored repetition. Its removal left
+  list). The rung-4 collapses include #2997; `main`'s red was rung 6. The nightlies since the
+  agent model change of 2026-10-19 passed every scored repetition. Its removal left
   `consistency` with no presubmit case, so the domain was on the `domains.yaml` allowlist until
   consistency-drift-outlier took a roster seat on 2026-10-26 (below). The agent-side fix landed
   in [#3609](https://github.com/gke-labs/kube-agents/pull/3609) on 2026-10-23: a named-cluster
   comparison starts with the drift collector, whose rule reads the leftover block as off, and a
   second objective grades that the collector ran; #3448 was closed unmerged on 2026-10-26.
-  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26, on the
-  2026-10-19 agent model): 9/9 scored on the inject lane and 10/10 on the api lane with the route objective
+  Measured on [#3975](https://github.com/gke-labs/kube-agents/pull/3975) (2026-10-26): green on
+  the inject lane and on the api lane with the route objective
   graded. Its roster line was withdrawn the same week, on #3975's review thread: with #3609's
   route reverted the
-  probe still passed 10/10 on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
-  2026-10-28, agent on gemini-4-argon), because that lane sets the route check aside and the
+  probe still passed on the inject lane ([#4116](https://github.com/gke-labs/kube-agents/pull/4116),
+  2026-10-28), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
   the fix it guards is undone. It stays a nightly case; the domain's seat is
   consistency-drift-outlier's. No CI lane grades its route check today: the nightly's main shards run
@@ -178,13 +179,14 @@ roster line on 2026-11-02 (its bullet stays for the record):
   nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
   today-lane measuring run did. Enters again only once a CI lane grades that route check (an
   api-lane job that runs the nightly file, or the case on a list such a job reads) and the record
-  under it holds; #3598 stays open as that tracker, its Gemini-nightly bar retired with the lane.
+  under it holds; #3598 stays open as that tracker, its bar on the retired today-mode nightly
+  retired with the lane.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
 record via the nightly tier ([#1175](https://github.com/gke-labs/kube-agents/pull/1175)).
 Its original hold-out rationale stands —
-[#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
+[#1101](https://github.com/gke-labs/kube-agents/issues/1101): no pass on
 record. It enters the roster when the lettered-options bar is settled and it has a clean
 record.
 
@@ -195,7 +197,7 @@ remediation domain's second writer, was on the roster from 2026-10-14
 nightly on 2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), and is on
 it again since 2026-10-26 (the first entry under that heading). How it got there, kept for
 the measurements it cites: it held no presubmit seat before 2026-09-28. Its record —
-12/12 on the four graded nights 2026-09-16 to 09-20 (420–1153 s a repetition), after 11/15
+clean on the four graded nights 2026-09-16 to 09-20 (420–1153 s a repetition), after misses
 across #1079's five presubmit runs (the misses traced to
 [#1097](https://github.com/gke-labs/kube-agents/issues/1097) and
 [#1590](https://github.com/gke-labs/kube-agents/issues/1590)) — is what a 2026-09-22
@@ -208,17 +210,17 @@ started; until the pool sweep (`hack/ci_sweep_agent_pulls.py`,
 the `*-infra` leftovers between runs
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 2), so a correct but
 byte-identical resubmission graded as a miss, the shape rca-remediation-pr showed on #1780's
-own head (0/3 on a leftover), and the sweep runs between leases, not between one job's three
+own head (a collapse on a leftover), and the sweep runs between leases, not between one job's three
 repetitions; and no graded run under the new check existed (the 09-22 nightly
 died at the Prow deadline before grading). A seat on that record would have armed rung 4 on
 a grader the record never saw. The record under `pull_request_opened` since: no pass on any
 graded night, none of the misses the case's own. On 2026-09-24 (build 2103273400171499520) it
-was 0/2 graded plus one infra repetition: the three failed on the context-less `kubectl` after
+collapsed, one repetition infra: the three failed on the context-less `kubectl` after
 `get-credentials` ([#1968](https://github.com/gke-labs/kube-agents/issues/1968), fix #1977,
 merged), the credential-proxy workspace leak
 ([#2011](https://github.com/gke-labs/kube-agents/issues/2011)) and the delegation-ceiling
 residual, in that order, the last an infra class the harness excludes; the nights after (09-25
-to 09-27, 0/3 each) failed on "no pull request URL", the #2011 shape, whose fix
+to 09-27, a collapse each) failed on "no pull request URL", the #2011 shape, whose fix
 [#2069](https://github.com/gke-labs/kube-agents/pull/2069) merged 2026-09-28, except one 09-25
 repetition that linked a 2026-09-17 leftover, `kube-agents-evals-6-infra#38`, the shape the
 sweep closes between leases. Its held-out seat in `presubmit-cases.txt` opened 2026-09-28
@@ -229,7 +231,7 @@ The Cases page read it as held out, undated, until the roster line. The bar step
 clean days at ≥ 90 % of graded repetitions under `pull_request_opened` with no all-reps
 collapse, infra classes the harness excludes not counted, read on the Cases page on either
 tier it shows; the eval crew took the roster line on the writers nightlies of 2026-10-12 to
-10-14 with the presubmit at 90.2 % in aggregate, and the dominant remaining miss (the worker
+10-14 with the presubmit above the bar in aggregate, and the dominant remaining miss (the worker
 declining to open a pull request into a repository that holds no manifest for the workload) as
 a known cost rather than a reason to wait. One miss shape the seat showed before #2260 was graded and counted against the case: a
 job's three repetitions shared the leased repository, the sweep closed leftovers between leases
@@ -237,14 +239,14 @@ and not between them, and submit-suggestion derives its branch from the change, 
 and 3 met repetition 1's open pull request. A repetition that pushed its own commit onto that pull
 request passed (#1832 grades the head commit, which must be no older than the repetition's
 start); one that only linked the sibling's pull request failed, and that miss was the case's own,
-not infra. On the old record's two best nights three of six repetitions linked a pull request
+not infra. On the old record's two best nights repetitions linked a pull request
 they did not open (09-20: `evals-23-infra` #34 twice, then leftover #4; 09-19: `evals-6-infra`
-#43, #46, then leftover #12), so a reading in the 50–67 % band is the isolation design
+#43, #46, then leftover #12), so a reading under the bar there is the isolation design
 ([#1755](https://github.com/gke-labs/kube-agents/issues/1755) item 3, closed undecided) before
 it is agent regression. Step 3's choice was the third of counting it, grading repetition 1 only,
 or sweeping between repetitions: since [#2260](https://github.com/gke-labs/kube-agents/issues/2260)
 the job empties the repository before every repetition of a case that requests a pull request,
-so the shape no longer arises and a reading in that band is regression.
+so the shape no longer arises and a reading under the bar is regression.
 `pull_request_opened`'s `accepts_stream_pull_request` is not a
 fourth answer here: it widens only a fleet audit's stream, and this case has no ledger and
 opens submit-suggestion branches. The roster edit of 2026-10-14 (step 4) took `remediation` off
@@ -273,8 +275,9 @@ obtainability activations from
 [#1049](https://github.com/gke-labs/kube-agents/issues/1049)
 (**obtainability-pdb-semantics**, **obtainability-fleet-exposure-sweep**,
 **obtainability-healthy-namespace-silence**). Their presubmit records to the move (graded
-repetitions 2026-09-15 to 09-22): 680/688, 600/685, 491/679 and 69/684 — the silence case
-fails on a correct agent today, and the nightly record is what will show a fix landing.
+2026-09-15 to 09-22) are on the domain scorecard: the first above the bar, the next two under
+it, and the silence case failing most runs — it fails on a correct agent today, and the
+nightly record is what will show a fix landing.
 
 Three re-admissions on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
@@ -300,21 +303,20 @@ Admitted on the record since the split:
   the main nightly's `-main-b` half as it then was (`ci-kube-agents-eval-nightly-main-b`, where the case
   ran as a stack case; that periodic's first night is 2026-10-27; since the main part runs as five
   shards the case is in main-e, `hack/eval/nightly-main-e.txt`), read from each build's
-  `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: 21 of 21 graded
-  repetitions on the seven nights 2026-10-27 to 11-02, every night 3/3, no infra repetition, all
-  under `spec.mode next` on the inject lane; 6/6 on the two nights at
-  the 2026-10-19 agent-model key and 15/15 on the five since the agent model became
-  `gemini-4-argon-kubeagents-mcp` on 2026-10-29. Median repetition 201 s (43–974 s) over the
-  21, 243 s (66–448 s) over the 15 on the current model. The case joined the nightly on
+  `case-monitoring-alert-policy-read.json` and dated by the build's UTC start: clean on the
+  seven nights 2026-10-27 to 11-02, no infra repetition, all under `spec.mode next` on the
+  inject lane, on both sides of the agent model change of 2026-10-29; the record is on the
+  domain scorecard. Median repetition 201 s (43–974 s) over the seven nights, 243 s (66–448 s)
+  since the change. The case joined the nightly on
   2026-10-23; the main nightly's builds of 10-24 to 10-26 each ran two of its repetitions and
   hit their deadline before the third and before grading, so they wrote no case artifact and
-  count neither way. The store reads `collecting: 15/15 runs recorded at this key across 5
-recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode `next`) and
-  `collecting: 6/6 … across 2` at the 2026-10-19 model's next-mode key, the model change having reset it.
+  count neither way. The store reads `collecting`, short of a window, at the presubmit's key
+  (the current next-mode version key) and at the key before the change, the model change
+  having reset it.
   So the citation is the nightly record, as for the entries below, and the eval crew's approval
   of this line is the call that it suffices before the window fills. The one recorded miss is
   off every current key: the retired today-mode nightly (`ci-kube-agents-eval-nightly-today`,
-  api transport) graded it 0/3 on 2026-10-26, each repetition on the route objective
+  api transport) collapsed it on 2026-10-26, each repetition on the route objective
   alone (`read-from-monitoring-not-the-audit-log`, a `worker_commands` check that read one
   command and no `gcloud`) with the two report objectives passing and the answer naming the
   policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
@@ -324,7 +326,7 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   that carries the workers' entries, so the seat blocks on all four: on the 381 inject presubmit
   repetitions of 2026-11-07 to 11-09 both passed on every record. The today lane ([below](#the-inject-lane))
   runs the presubmit matrix over the api transport, where both are graded: this seat puts the
-  case on that matrix with the route objective live and its one api-transport record at 0/3,
+  case on that matrix with the route objective live and its one api-transport record a collapse,
   so a collapse there reds `ci-kube-agents-eval-today` (a periodic on `main`, not a merge
   block) until the api transport's `worker_commands` read of a platform card is fixed or the
   objective is reworded; the eval crew's approval of this line takes that exposure with the
@@ -352,37 +354,36 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   `compliance-audit` stream over the seeded `debug-binding` over-grant, graded on the ledger it
   publishes (`ledger_issue_contains`: the binding in the prose and in the finding ids, and a
   `cluster-admin-binding` or `wildcard-rbac` finding id). The record, read on 2026-11-02 from the
-  dashboard's `data.json` (generated 18:25 UTC) and the evidence store: 36 of 36 graded
-  repetitions on the twelve main nightlies that graded it, 2026-10-20 to 11-02, every night
-  3/3 (10-21 and 10-25 did not grade it; 10-24 and 10-26 graded it in runs that ended with no
-  job verdict, so the coverage bot's ten-night reading is 30 of 30); 15 of 15 at the
-  presubmit's own key, `gemini-4-argon-kubeagents-mcp` under `spec.mode next`, over the five
-  nightlies 10-29 to 11-02, the store reading `collecting: 15/15 runs recorded at this key
-across 5 recorded run(s), 5 more needed before this case can collapse`; and, because the seat
-  ran on every pull request, the presubmit itself: 1068 of 1117 graded repetitions (95.6 %)
-  over the 399 builds of 2026-10-27 to 11-02, 78 more set aside as infra, and no build in
-  which every graded repetition failed. The last such build was 2026-10-22 (build
+  dashboard's `data.json` (generated 18:25 UTC) and the evidence store: clean on the twelve
+  main nightlies that graded it, 2026-10-20 to 11-02 (10-21 and 10-25 did not grade it; 10-24
+  and 10-26 graded it in runs that ended with no job verdict, so the coverage bot reads ten
+  nights); clean at the presubmit's own key, the current next-mode version key, over the five
+  nightlies 10-29 to 11-02, the store reading `collecting`, short of a window; and, because the
+  seat ran on every pull request, the presubmit itself: above the bar over the 399 builds of
+  2026-10-27 to 11-02, infra repetitions set aside, and no collapse. The last collapse was
+  2026-10-22 (build
   2113373630183247872), the day before the fleet audits got their own turn budget (#3602) and
   the open-ledger lookup fix (#3910) merged; from 2026-10-23 to 11-02, 678 builds carried the
-  case with no collapse. So the citation is the nightly record plus the presubmit's own, and
+  case with no collapse. The numbers are on the domain scorecard. So the citation is the
+  nightly record plus the presubmit's own, and
   the eval crew's approval of this line is the call that it suffices before the window fills,
-  as for the three entries below. The 49 presubmit misses of the week fell in 46 builds, three
-  of them with two misses and none with three, and read: 31 "the run's report names no
-  github.com issue URL" (the worker published no ledger,
+  as for the three entries below. The week's presubmit misses fell one or two to a build, never
+  three, and read, most to fewest: the run's report naming no
+  github.com issue URL (the worker published no ledger,
   [#2856](https://github.com/gke-labs/kube-agents/issues/2856), the residual the canary
-  carries at about 3 % of repetitions; 10-31 was the worst day, 18 misses in 35 builds); 10
-  "the report names 2 issues that each claim to be the compliance-audit ledger" and 2 a ledger
-  without the planted binding, two shapes with no issue yet; 5 a ledger the harness's own ledger
-  reset closed before the verifier read it; 1 an erroring safeguard (rung 2, which blocked
-  already). Rung 6 is armed by the same line but cannot fire at this key: main's
-  OutcomeValidity mean there is 0.30–0.50, so the 0.5 margin puts the threshold below zero.
+  carries; 10-31 was the worst day); a report naming two issues that each claim to be the
+  compliance-audit ledger, and a ledger
+  without the planted binding, two shapes with no issue yet; a ledger the harness's own ledger
+  reset closed before the verifier read it; one erroring safeguard (rung 2, which blocked
+  already). Rung 6 is armed by the same line but cannot fire at this key: on `main`'s judged
+  record there the 0.5 margin puts the threshold below zero.
   It reads seeded-a's `rbac-overgrant` role, whose two catalog `state` assertions (the binding's
   `roleRef.name` is `cluster-admin`, its ServiceAccount subject is in `seeded-security`) the
   hourly seeded-fleet scan runs, so rule (c) holds without an exemption; rule (d) holds on the
   three objectives above. What it costs: nothing new, since the seat already ran; it requests
   no pull request, so it runs in the first phase, its three repetitions one after another on
   its task lock, hinted at 1000 s in `unit_cost_hint` against a measured 732 s median and
-  1450 s p90 over the week's 1068 passing repetitions (2990 s at the slowest, under the 3000 s
+  1450 s p90 over the week's passing repetitions (2990 s at the slowest, under the 3000 s
   delegation ceiling). Taking the line took `fleet-audits` off the `docs/designs/domains.yaml`
   allowlist and made the compliance stream blocking (below). The same line arms rung 4 for the
   case on every lane that reads the roster: the release-candidate lane (`hack/ci-eval-rc.sh`)
@@ -393,21 +394,21 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   consistency-authorized-networks-probe, was demoted on 2026-10-21 (above), moved from
   `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit. It is not
   a probe but the full `fleet-consistency-drift` audit, one of the four recast out of the presubmit
-  on 2026-08-26 at 600–1300 s a repetition; on the agent model of 2026-10-19 it
+  on 2026-08-26 at 600–1300 s a repetition; since the agent model change of 2026-10-19 it
   runs at about 200 s. The record is the main nightly (`ci-kube-agents-eval-nightly`), read from
-  each build's `case-consistency-drift-outlier.json` and dated by the build's UTC start: 33 of 34
-  graded repetitions on the twelve nights that graded it, 2026-10-13 to 10-26. 10-21's build
+  each build's `case-consistency-drift-outlier.json` and dated by the build's UTC start: one
+  miss on the twelve nights that graded it, 2026-10-13 to 10-26; the record is on the domain
+  scorecard. 10-21's build
   uploaded nothing (#3616) and 10-25's hit its deadline before grading, so neither counts. The one
-  miss, on 2026-10-16 on the Gemini setup, was the Platform Agent fanning the audit out to cluster
-  agents: one of them filed the right ledger (seeded-c, authorized networks), but the main task
-  blocked and its answer carried no ledger URL, so the verifier found no ledger (10-16 also had one
-  infra repetition). Since the model change on 2026-10-19: 14 of 14 over the five graded nights,
-  5 of 5 of them under `spec.mode next`, the presubmit's mode and inject lane (2/2 on 10-24 with
-  one infra repetition, 3/3 on 10-26). Median repetition 198 s (165–397 s) over the fourteen. The
-  store reads `collecting: 5/5 runs recorded at this key across 2 recorded run(s), 15 more needed`
-  at the next-mode key and `collecting: 9/9 … across 3` at the 2026-10-19 model's today-mode key, since the
-  model change and then next mode each reset it. The last Gemini key reads
-  `the record would admit it: 19/20 screening runs across 7 recorded run(s)`. So the citation is
+  miss, on 2026-10-16 before the model change, was the Platform Agent fanning the audit out to
+  cluster agents: one of them filed the right ledger (seeded-c, authorized networks), but the main
+  task blocked and its answer carried no ledger URL, so the verifier found no ledger (10-16 also
+  had one infra repetition). Since the model change on 2026-10-19: clean over the five graded
+  nights, the ones under `spec.mode next`, the presubmit's mode and inject lane, included (10-24
+  with one infra repetition, 10-26). Median repetition 198 s (165–397 s) over the five nights.
+  The store reads `collecting`, short of a window, at the next-mode key and at the today-mode
+  key since the change, since the model change and then next mode each reset it. The key
+  before the change reads `would-admit`. So the citation is
   the nightly record, as for pdb-remediation-pr and vcs-spent-branch-reuse below, and the eval
   crew's approval of this line is the call that it suffices before the window fills. The probe's
   failure does not carry over. This case is graded on the ledger's finding ids
@@ -438,23 +439,23 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   (`ci-kube-agents-eval-nightly-writers`, where the case runs because it opens a pull request; its
   writers-a third since the part runs in thirds),
   read from each build's `case-pdb-remediation-pr.json` and dated, as the dashboard's Nightly page
-  dates it, by the build's UTC start (8 PM ET the evening before): 3/3 on each of the three nights
-  since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952, 2114144983022833664 and
-  2114507375523139584), all three under `spec.mode next`, the presubmit's mode and inject lane,
-  since [#3783](https://github.com/gke-labs/kube-agents/pull/3783); 21 of 21 over the seven nights
-  2026-10-20 to 10-26, every one since the agent model changed on 2026-10-19;
-  and 37 of 41 graded repetitions over the fourteen nights 2026-10-13 to 10-26, every miss before
-  #3145 and on the Gemini setup: 0/3 on 2026-10-18 and one repetition on 10-16, all the "names no
-  pull request URL" shape #3145 addresses (10-16 also had one infra repetition). Median repetition
-  172 s (142–265 s) over the nine since #3145. The four nights before #3145 merged, on the 2026-10-19 agent model, passed
-  too (12/12), so the record does not separate #3145's effect from the model change's; either way
-  the miss has not recurred in 21 repetitions. The store reads
-  `collecting: 9/9 runs recorded at this key across 3 recorded run(s), 11 more needed` at the
-  next-mode key, which the model change
-  and then the move to next mode each reset (the last Gemini key reads `would-demote`, 16/20, on
+  dates it, by the build's UTC start (8 PM ET the evening before): green on each of the three
+  nights since #3145, 2026-10-24, 10-25 and 10-26 (builds 2113782591684349952,
+  2114144983022833664 and 2114507375523139584), all three under `spec.mode next`, the
+  presubmit's mode and inject lane, since
+  [#3783](https://github.com/gke-labs/kube-agents/pull/3783); clean over the seven nights
+  2026-10-20 to 10-26, every one since the agent model change of 2026-10-19; and above the bar
+  over the fourteen nights 2026-10-13 to 10-26, every miss before #3145 and before the model
+  change: a collapse on 2026-10-18 and a miss on 10-16, all the "names no pull request URL"
+  shape #3145 addresses (10-16 also had one infra repetition); the record is on the domain
+  scorecard. Median repetition 172 s (142–265 s) over the three nights since #3145. The four
+  nights after the model change and before #3145 merged passed too, so the record does not
+  separate #3145's effect from the model change's; either way the miss has not recurred since.
+  The store reads `collecting`, short of a window, at the next-mode key, which the model change
+  and then the move to next mode each reset (the key before the change reads `would-demote` on
   the pre-fix misses). So the citation is the nightly record, as for vcs-spent-branch-reuse below,
   and the eval crew's approval of this line is the call that it suffices before the window fills.
-  The GitLab nightly passed it 21 of 21 on the seven nights that graded it, 2026-10-19 to 10-26.
+  The GitLab nightly passed it clean on the seven nights that graded it, 2026-10-19 to 10-26.
   What it costs: like vcs-spent-branch-reuse it requests a pull request, so its three repetitions
   join that case's in the fan-out's second phase, one at a time after every other unit, each after
   the repository reset and on the inject lane the 30-second GitHub-write settle ([The inject
@@ -462,25 +463,24 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   172 s)), plus three more resets. The two cases' units alternate there, so a late write from one
   would be charged to the other by the lane's write safeguard; the writers nightly has run them
   interleaved that way on the inject lane, with six other requesting cases, on all three next-mode
-  nights, and neither tripped it (every repetition's catastrophic score 1.0). Taking the line took
+  nights, and neither tripped it. Taking the line took
   `remediation` off the `docs/designs/domains.yaml` allowlist.
 - **vcs-spent-branch-reuse**, 2026-10-23, the source-control domain's first roster seat, moved
   from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
-  the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights
-  2026-10-09 to 10-22, every night 3/3, no infra repetition, median repetition 173 s (113–656 s).
-  The agent model changed from `gemini-3-1-pro-preview-kubeagents-mcp`
-  on 2026-10-19, which reset the version key: the store reads
-  `collecting: 12/12 runs recorded at this key across 4 recorded run(s), 8 more needed`, and the
-  last Gemini key read `would-admit` (21/21 over the newest seven nights) on every night from
+  the record the writers nightly built: clean over the fourteen nights
+  2026-10-09 to 10-22, no infra repetition, median repetition 173 s (113–656 s); the record is
+  on the domain scorecard. The agent model changed on 2026-10-19, which reset the version key:
+  the store reads `collecting`, short of a window, and the key before the change read
+  `would-admit` on every night from
   2026-10-09 to 10-18. So the citation is the
-  nightly record, 12/12 of it on the four nights after the model change, and the eval crew's approval of this
-  line is the call that it suffices before the window fills (expected with the 2026-10-25
-  writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed 18 of 18
+  nightly record, the four nights since the change included, and the eval crew's approval of
+  this line is the call that it suffices before the window fills (expected with the 2026-10-25
+  writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed clean
   on the retired next-mode nightly 2026-10-16 to 10-21, with
   `the-forge-was-reached-without-a-cli` (a `worker_commands` check) set aside as blind on that
   transport, as it was on the presubmit until #5236. Since #5236 it grades on an inject record that
-  carries the workers' entries: it passed on 322 of the 323 inject presubmit repetitions of
-  2026-11-07 to 11-09, and was set aside on the other; and 15 of 15 on the five GitLab nightlies that
+  carries the workers' entries: clean on the inject presubmit repetitions of 2026-11-07 to 11-09,
+  one set aside as infra; and clean on the five GitLab nightlies that
   graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
   run, so it reads no seeded cluster and no fixture: none of the fleet-drift exposure that
   demoted the upgrades and consistency probes. What it costs: it was the presubmit's one case
@@ -496,13 +496,13 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   planted on every pool; the prompt asked for "what its release channel offers", and during the
   1.36 roll-out REGULAR's `upgradeTargetVersion` (1.35.8-gke.1439001) sat below the planted
   version while `defaultVersion` (1.36.4) sat above it, so an agent reading the target called the
-  lagging cluster current: 66 of 141 presubmit repetitions passed on 2026-10-16 (34 of the 75
-  misses read the target; the rest were other wrong verdicts, wording the check lacks, and rate
-  limits), then nightlies of 2/3, 2/3 and 0/3 on 10-17 to 10-19.
+  lagging cluster current: under the bar on the presubmit on 2026-10-16 (most misses read the
+  target; the rest were other wrong verdicts, wording the check lacks, and rate
+  limits), then a miss, a miss and a collapse on the nightlies of 10-17 to 10-19.
   [#3338](https://github.com/gke-labs/kube-agents/pull/3338) (merged 2026-10-19) makes the
   prompt name the channel's default version. The three clean nights the bar asks for are
   `ci-kube-agents-eval-nightly` 2026-10-20 (build 2112333062724390912, kube-agents-evals-28),
-  10-22 (2113057845506215936, evals-10) and 10-23 (2113420200605913088, evals-16), 3/3 each,
+  10-22 (2113057845506215936, evals-10) and 10-23 (2113420200605913088, evals-16), green each,
   every repetition comparing against `defaultVersion`; 10-21's build (2112695452917829632)
   uploaded nothing when the build cluster's GKE upgrade replaced its node (#3616) and counts
   neither way. The demotion's exit condition named an agent-side fix; the eval crew's approval of
@@ -513,23 +513,23 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   and the inject lane became the blocking one on 2026-10-21 (#3156), after the demotion. So under
   the #3338 prompt the case's inject-lane record is this line's own pull request,
   [#3899](https://github.com/gke-labs/kube-agents/pull/3899): `pull-kube-agents-smoke-test` build
-  2113733214391504896 (2026-10-23, kube-agents-evals-10), 3/3, each repetition reading
-  `defaultVersion`, in a GREEN run at 100 % admitted-case pass rate; its pre-fix record on the
-  optional `-next` job was mixed (2/3 on 2026-10-15, build 2110588743994839040). Taking the line
+  2113733214391504896 (2026-10-23, kube-agents-evals-10), green, each repetition reading
+  `defaultVersion`, in a GREEN run; its pre-fix record on the
+  optional `-next` job was mixed (a miss on 2026-10-15, build 2110588743994839040). Taking the line
   took `upgrades` off the `domains.yaml` allowlist.
 - **pdb-remediation-pr**, 2026-10-14
   ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4), from the held-out
   seat it took on 2026-09-28. The three clean days the bar asks for are the writers nightlies
-  of 2026-10-12, 10-13 and 10-14, 3/3 each (16 of 18 over the six nights before that), and the
-  evidence store's newest-20 window stood at 19/21, reported as `would-admit` since 2026-10-13.
+  of 2026-10-12, 10-13 and 10-14, green each (misses over the six nights before that), and the
+  evidence store's newest-20 window read `would-admit` since 2026-10-13.
   The presubmit record behind it, since
   [#2263](https://github.com/gke-labs/kube-agents/pull/2263) landed, which empties the leased
-  repository before each repetition: 1,882 of 2,086 graded repetitions passed (90.2 %); by UTC
-  day, 10-09 298/322, 10-10 69/75, 10-11 12/15 with one all-reps collapse, 10-12 53/60,
-  10-13 245/270, 10-14 101/106 to 14:53Z. Read on the presubmit alone the days do not run three
-  clean in a row, 10-11 and 10-12 being under on 15 and 60 repetitions, and the eval crew's
+  repository before each repetition: above the bar in aggregate, on the domain scorecard by UTC
+  day, 10-09 to 10-14 at 14:53Z, with one all-reps collapse on 10-11. Read on the presubmit
+  alone the days do not run three
+  clean in a row, 10-11 and 10-12 being under on few repetitions, and the eval crew's
   approval of this line is the call that the nightly reading and the aggregate suffice. Named
-  so a reader can reproduce it, the cut: presubmit tier, UTC days, runs started at or after #2263's merge, 2026-10-03 02:32Z, `data.json` generated 2026-10-14 14:53Z, the 13 `MISSING` repetitions of the 2026-10-07 GitHub outage left out, which read 89.6 % with them in. What
+  so a reader can reproduce it, the cut: presubmit tier, UTC days, runs started at or after #2263's merge, 2026-10-03 02:32Z, `data.json` generated 2026-10-14 14:53Z, the `MISSING` repetitions of the 2026-10-07 GitHub outage left out, which put it under the bar with them in. What
   the remaining misses are: the worker finding checkout-gateway and declining to open a pull
   request because the `*-infra` repository holds no manifest for it; a 429 on the model; the
   worker citing an earlier repetition's pull request; two all-reps collapses in the window
@@ -546,15 +546,15 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   while its ceiling check redded correct answers on wording
   ([#1626](https://github.com/gke-labs/kube-agents/pull/1626), merged 2026-09-15 10:44 PM
   ET). Presubmit record from that merge to 2026-09-22 (`data.json`, presubmit tier): 196
-  runs on 104 pull requests, 570 graded repetitions, 529 passed (92.8%), 41 failed, 18
-  infra-excluded, 147 runs at 3/3 and no run with every graded repetition failed. Per UTC
-  day: 09-16 105/111, 09-17 164/177, 09-18 95/104, 09-19 33/36, 09-20 8/9, 09-21 118/127,
-  09-22 6/6. Nightly: 3/3, 2/3, 2/3, 3/3 on the four graded nights 09-16 to 09-20. What the
-  41 misses are: 31 carry an excerpt and every one is the delegation acknowledgement or a
+  runs on 104 pull requests, above the bar, infra repetitions set aside, and no run with every
+  graded repetition failed; by UTC day, 09-16 to 09-22, on the domain scorecard. Nightly:
+  green, a miss, a miss, green on the four graded nights 09-16 to 09-20. What the
+  misses are: most carry an excerpt and every one of those is the delegation acknowledgement
+  or a
   blocked delegation delivered as the answer
   ([#1840](https://github.com/gke-labs/kube-agents/issues/1840),
-  [#1874](https://github.com/gke-labs/kube-agents/issues/1874)); 30 of the 41 miss both the
-  planted-pool name and the ceiling, 10 only the ceiling, 1 only the pool. The residual is
+  [#1874](https://github.com/gke-labs/kube-agents/issues/1874)); most miss both the
+  planted-pool name and the ceiling, the rest only the ceiling or only the pool. The residual is
   mostly the platform's shape, not the case's own regression; the roster's operative metric
   is the collapse, and there were none in 196 runs.
 - **incident-triage-oom-event-probe**, 2026-09-22
@@ -562,8 +562,9 @@ across 5 recorded run(s), 5 more needed before this case can collapse`; and, bec
   domain's presubmit-eligible probe
   ([#1625](https://github.com/gke-labs/kube-agents/pull/1625)), moved from
   `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
-  the record the nightly built: 10/12 on the four graded nights 2026-09-16 to 09-20 (2/3, 3/3,
-  2/3, 3/3; 529–2808 s a repetition at the nightly's parallelism 6), after 3/3 in its measured
+  the record the nightly built: above the bar on the four graded nights 2026-09-16 to 09-20 (a
+  miss, green, a miss, green; 529–2808 s a repetition at the nightly's parallelism 6), after a
+  green in its measured
   presubmit run (build 2099969322708373504, 737/599/1357 s). Both misses are platform bugs the
   case surfaced, not the case: on the first night the worker blocked on
   `cluster_agent_profile.py` in the sandbox
@@ -715,7 +716,7 @@ never falls back. The verdict prints it on every
 run:
 
 ```
-Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)
+Admitted-case pass rate: <rate> (main: <main rate>, margin 10.0%)
 ```
 
 The margin is `EVAL_AGGREGATE_MARGIN`, default 0.10, measured on 2026-09-29 against 94 green
@@ -751,23 +752,23 @@ and `eval-verdict.md` opens:
 ```
 **RED**
 
-Admitted-case pass rate: 80.6% (main: 92.4%, margin 10.0%)
+Admitted-case pass rate: <rate> (main: <main rate>, margin 10.0%)
 
 ### Why it is red
 
-- suite pass rate 0.806 is below main's 0.924 by more than the 0.100 margin (over 36 scored repetitions)
+- suite pass rate <rate> is below main's <main rate> by more than the 0.100 margin (over <n> scored repetitions)
 ```
 
-followed by the per-case table, where the failed repetitions sit under `Passes` as `2/3` on
-several rows and each failing repetition's reason and the agent's report are quoted below it.
-Because the sample said seven failed repetitions of 36 is beyond what an unchanged pull request
-produces, the first move is the same as for any red: read the quoted reasons. If they are the
+followed by the per-case table, where the failed repetitions sit under `Passes` as
+`<passes>/<reps>` on several rows; the reasons are on the run page behind the link.
+Because a rate that far under `main`'s is beyond what an unchanged pull request
+produces, the first move is the same as for any red: read the reasons there. If they are the
 familiar phrase-match misses spread over unrelated probes, rerun once; a second red at the same
 rate is a finding against the change. `main`'s side of the line is the same number the eval
 dashboard's Trend page draws from the store (`docs/ci-health.md`), so a rate that looks wrong can
 be checked there, and a `main` window that has itself slipped is a nightly problem to fix on
 `main`, not a reason to widen the margin. A case that is dragging both sides down (on
-2026-09-29 `upgrades-lagging-master-probe` was 52 of the sample's 116 failed repetitions) is
+2026-09-29 `upgrades-lagging-master-probe` was the bulk of the sample's failed repetitions) is
 handled under [Demoting a flaky case](#demoting-a-flaky-case), which raises `main`'s rate and
 tightens this rule at the same time.
 
@@ -1055,7 +1056,7 @@ graded collapse is the agent no longer reading the policy: check that the broker
 `agents/platform/scripts/command_policy.py`) before reading it as the case's flake. A red on
 the today lane alone, on the route objective `read-from-monitoring-not-the-audit-log` with
 the two report objectives passing, is the api transport's `worker_commands` read of a platform
-card (0/3 that way on 2026-10-26), not the case and not the agent.
+card (a collapse that way on 2026-10-26), not the case and not the agent.
 
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
@@ -1136,8 +1137,8 @@ to have shown all of the following first, and the decision is still a team one a
    16/20); at 0.90 it demotes 4, and the two that flip are the ones one miss short of the
    old bar. This item is not "holds" yet: one reading, and the four that remain below the
    bar are not one story — the two crashloop cases miss this week only, capacity misses in
-   both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25 with
-   12 of 12 since.
+   both weeks, and upgrades-lagging-master-probe's misses are all from 09-20 to 09-25, clean
+   since.
 
 Switching before 2 holds leaves a listed case with no full window with the list (the list
 is the fallback in `record` mode) but hands every full-window case to the record the same
