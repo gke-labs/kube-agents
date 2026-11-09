@@ -192,6 +192,11 @@ func TestPodPoolOffersOnlyReadyWorkersOfThePool(t *testing.T) {
 	noWatchList(t)
 	notWorker := workerPod("tse-sa-ish", "tse", "read", true)
 	notWorker.Labels[lib.ProfileComponentLabel] = "something-else"
+	// A dispatcher Job's pod has the pool's labels; it is never the pool's.
+	jobLabelled := workerPod("dispatch-0a1b-x7k2p", "tse", "read", true)
+	jobLabelled.Labels[jobNameLabel] = "dispatch-0a1b"
+	jobOwned := workerPod("dispatch-2c3d-q9z8w", "tse", "read", true)
+	jobOwned.OwnerReferences = []metav1.OwnerReference{{APIVersion: "batch/v1", Kind: "Job", Name: "dispatch-2c3d", UID: "u"}}
 	client := fake.NewSimpleClientset(
 		workerPod("tse-read-b", "tse", "read", true),
 		workerPod("tse-read-a", "tse", "read", true),
@@ -199,6 +204,8 @@ func TestPodPoolOffersOnlyReadyWorkersOfThePool(t *testing.T) {
 		workerPod("tse-unattended-a", "tse", "unattended", true),
 		workerPod("chat-read-a", "chat", "read", true),
 		notWorker,
+		jobLabelled,
+		jobOwned,
 	)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

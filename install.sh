@@ -4076,13 +4076,13 @@ ensure_existing_cluster_cmek() {
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
   local kr_err="" k_err=""
   kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id")" || true
-  if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+  if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kr_err"; then
     print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
     return 1
   fi
   k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
     --purpose="encryption" --project="$project_id")" || true
-  if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+  if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$k_err"; then
     print_error "Cloud KMS key create failed after propagation retries: $k_err"
     return 1
   fi
@@ -6160,7 +6160,7 @@ import_github_pem() {
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+  if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kms_ring_err"; then
     kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
   else
     kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
@@ -6173,8 +6173,8 @@ import_github_pem() {
   # wrong above, the import cannot work without this key, and saying so here names
   # the cause instead of leaving a confusing failure two steps later.
   local kms_describe_failed=0
-  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN" || \
-     printf '%s\n' "$kms_key_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+  if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kms_ring_err" || \
+     grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kms_key_err"; then
     kms_describe_failed=1
   elif ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
     --project="$project_id" >/dev/null; then

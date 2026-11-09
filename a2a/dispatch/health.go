@@ -31,7 +31,8 @@ type Health struct {
 	NoWorker map[string]int
 	// Breaker is the part of Waiting a breaker holds, open or half open,
 	// by durable, and HandOffFailed the part whose hand-off errored (a
-	// lease that couldn't be written), retried each delay.
+	// lease that couldn't be written, or an unattended task's Job that
+	// couldn't be launched or read), retried each delay.
 	Breaker       map[string]int
 	HandOffFailed map[string]int
 	// OldestWait is the longest a waiting submission has been queued, by
@@ -54,6 +55,9 @@ type Health struct {
 	// StopStream is why the dispatcher can't read the stop stream, or ""
 	// (stop.go): while it is set, a stop counts only if heard live.
 	StopStream string
+	// JobAdmission is the last refusal of a Job by the dispatcher Job
+	// admission policy, or "" (job.go).
+	JobAdmission string
 }
 
 func (d *Dispatcher) noteWaiting(hk holdKey, queued time.Time, why string) {
@@ -136,6 +140,7 @@ func (d *Dispatcher) Health() Health {
 	sort.Strings(h.Stalled)
 	h.OpenBreakers, h.HalfOpenBreakers = d.breakers.open(now)
 	h.StopStream = d.stopStreamErr
+	h.JobAdmission = d.jobAdmissionErr
 	return h
 }
 
@@ -143,6 +148,9 @@ func (d *Dispatcher) logHealth() {
 	h := d.Health()
 	d.log.Info("dispatcher health", "running", h.Running, "offering", h.Offering, "waiting", h.Waiting, "noWorker", h.NoWorker,
 		"oldestWait", h.OldestWait, "droppedAnswers", h.DroppedAnswers)
+	if h.JobAdmission != "" {
+		d.log.Warn(jobRefusedHint, "err", h.JobAdmission)
+	}
 	if h.StopStream != "" {
 		d.log.Warn("the stop stream can't be read; a stop counts only if heard live", "err", h.StopStream)
 	}
@@ -168,7 +176,7 @@ func (d *Dispatcher) logHealth() {
 			"durables", noWorker, "stallAfter", d.cfg.StallAfter)
 	}
 	if len(failing) > 0 {
-		d.log.Warn("admission stalled: every waiting submission's hand-off keeps failing (the lease can't be written); check the bus and the lease bucket",
+		d.log.Warn("admission stalled: every waiting submission's hand-off keeps failing (the lease can't be written, or an unattended task's Job can't be launched or read); check the bus and the lease bucket, or the Job (quota, RBAC, admission policy)",
 			"durables", failing, "stallAfter", d.cfg.StallAfter)
 	}
 	if len(held) > 0 {
