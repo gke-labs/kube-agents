@@ -168,6 +168,12 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 			forbidden: []string{"SynThEtIcToKeNvAlUe"},
 			wantSub:   []string{"sent Bearer [redacted] to the API"},
 		},
+		{
+			name:      "fail closed: a token-like value ending in a state word",
+			in:        "The password is Synth3tic-expired. The token was synth-9f3c2a-valid, the secret is SynthPass-mounted and api_key=synth-0001-set",
+			forbidden: []string{"Synth3tic-expired", "synth-9f3c2a-valid", "SynthPass-mounted", "synth-0001-set"},
+			wantSub:   []string{"The password is [redacted].", "The token was [redacted],", "the secret is [redacted]", "api_key=[redacted]"},
+		},
 	}
 	for _, tc := range positives {
 		t.Run(tc.name, func(t *testing.T) {
@@ -207,6 +213,7 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"The node fe80:0:0:0:200:f8ff:fe21:67cf answered at 10:15:30:123:456 UTC.",
 		"See http://localhost:8080/healthz and https://example.test/docs/page.",
 		"Enable Basic Authentication on the ingress; the token is valid and the password is unchanged.",
+		"The secret is now-expired, the token is not-set and the credential is still-mounted.",
 		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
 		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
 	}

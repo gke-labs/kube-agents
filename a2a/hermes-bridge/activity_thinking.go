@@ -1040,6 +1040,9 @@ var credentialStateWords = map[string]bool{
 	"stale": true, "used": true, "unused": true, "needed": true, "not": true, "a": true, "an": true,
 	"the": true, "managed": true, "generated": true, "provided": true, "injected": true,
 	"exposed": true, "leaked": true, "compromised": true, "only": true, "same": true, "different": true,
+	// Whole values only, never matched as a phrase's last word.
+	"base64": true, "base64-encoded": true, "plaintext": true, "read-only": true, "write-only": true,
+	"not-set": true,
 }
 
 // trimValueEdges strips what wraps a value in text and is not part of it:
@@ -1056,9 +1059,9 @@ func trimValueEdges(v string) string {
 
 // valueNotASecret says a value after an explicit credential word is plainly
 // not a value: no letter or digit in it (a line continuation, "{",
-// markdown), a marker already placed, a placeholder, a state word (or a
-// compound ending in one: base64-encoded, read-only), or a short number
-// (max_tokens: 4096).
+// markdown), a marker already placed, a placeholder, a state word, a plain
+// hyphenated phrase ending in one (plainHyphenatedStatePhrase), or a short
+// number (max_tokens: 4096).
 func valueNotASecret(v string) bool {
 	if !hasAlnum(v) || strings.Contains(v, redactedValue) || secretPlaceholderPattern.MatchString(v) {
 		return true
@@ -1067,10 +1070,30 @@ func valueNotASecret(v string) bool {
 	if credentialStateWords[lower] {
 		return true
 	}
-	if i := strings.LastIndexByte(lower, '-'); i > 0 && credentialStateWords[lower[i+1:]] {
+	if plainHyphenatedStatePhrase(v) {
 		return true
 	}
 	return len(v) <= 5 && isAllDigits(v)
+}
+
+// plainHyphenatedStatePhrase says whether v is words joined by hyphens, each
+// lower-case letters only, whose last word is a state word of four letters
+// or more (now-expired, still-mounted): a phrase, not a token. A value with
+// a digit, a capital or a symbol in it, or one ending in a short function
+// word (-on, -set, -not), is not one, so a secret ending in a state word
+// stays redacted.
+func plainHyphenatedStatePhrase(v string) bool {
+	parts := strings.Split(v, "-")
+	if len(parts) < 2 {
+		return false
+	}
+	for _, p := range parts {
+		if !isLowerWord(p) {
+			return false
+		}
+	}
+	last := parts[len(parts)-1]
+	return len(last) > 3 && credentialStateWords[last] && !valueTokenShaped(v)
 }
 
 // keyedValueRedacted says whether the value under a key inlineSecretKey
