@@ -25,6 +25,7 @@ the audit line names a rule the same way for every door.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,6 +96,19 @@ GKE_READ_TOOLS = frozenset(
         "list_node_pools",
         "list_operations",
     }
+)
+
+# The gke tools that reach a cluster's Kubernetes API rather than the GKE
+# control plane: the ones spec.scope.exclude.clusters holds the broker to
+# (`k8s_tool_clusters`). The others read the project's clusters, node pools and
+# operations, which an exclusion leaves readable.
+GKE_K8S_TOOLS = frozenset(tool for tool in GKE_READ_TOOLS if "_k8s_" in tool)
+
+# A cluster's resource name, as the gke server's in-cluster tools take it in
+# `parent` (or `name`). A `-` location is every location, not one cluster.
+CLUSTER_RESOURCE = re.compile(
+    r"projects/(?P<project>[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
+    r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
 )
 
 # The Developer Knowledge server's tools: all three are annotated
@@ -184,6 +198,35 @@ def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise _DuplicateKey(key)
         seen[key] = value
     return seen
+
+
+def k8s_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[tuple[str, str, str]] | None:
+    """The clusters a gke in-cluster tool call names, or None when it isn't one.
+
+    Each string argument is searched for a cluster resource name. An empty list
+    is a call this broker can't tie to a cluster: no resource name it can read,
+    or one under the `-` location. The caller decides what that means.
+    """
+    if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict) or params.get("name") not in GKE_K8S_TOOLS:
+        return None
+    arguments = params.get("arguments")
+    values = list(arguments.values()) if isinstance(arguments, dict) else []
+    clusters = []
+    while values:
+        value = values.pop()
+        if isinstance(value, dict):
+            values.extend(value.values())
+        elif isinstance(value, list):
+            values.extend(value)
+        elif isinstance(value, str):
+            for match in CLUSTER_RESOURCE.finditer(value):
+                if match["location"] == "-":
+                    return []
+                clusters.append((match["project"], match["location"], match["cluster"]))
+    return clusters
 
 
 def server(name: str) -> McpServer | None:

@@ -1627,11 +1627,8 @@ platformAgent:
   #         - projectId: payments-staging
   #           location: us-central1
   #           clusterName: scratch-cluster
-  # An excluded cluster is left out of what the agents look at, but that is not
-  # yet enforced: the agent's read roles still reach it, so a worker that
-  # fetches its credentials itself can read it. Only a project where the agent
-  # holds no roles, bound there or through a folder or organization, keeps it
-  # off a cluster; the management project always holds them.
+  # The credential broker refuses every route to an excluded cluster's
+  # Kubernetes API; reads of the project's cluster list stay allowed.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the

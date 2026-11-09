@@ -54,6 +54,7 @@ import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
+import scope_exclude
 import scope_policy
 import scoped_sa_pool
 import task_confinement
@@ -8925,8 +8926,14 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
+        exclusions: "scope_exclude.Exclusions | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
+        # spec.scope.exclude.clusters, from the scope.json the operator mounts
+        # (scope_exclude). Checked wherever a target cluster is known before its
+        # Kubernetes API is reached: `_kubeconfig_for`, the no-pool ambient
+        # kubectl, and both ends of `_execute_get_credentials`.
+        self.exclusions = exclusions if exclusions is not None else scope_exclude.Exclusions()
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
         # Where admission waits are observed; None in a test that wants none.
         self.metrics = metrics
@@ -9997,6 +10004,13 @@ class CommandExecutor:
             # Splitting the two identities is the change that closes that.
             kubeconfig_path = self._default_kubeconfig()
         else:
+            if executable == "kubectl":
+                # No pool and no cluster named: kubectl runs on the base
+                # KUBECONFIG, the broker's own cluster, which is the
+                # management cluster an install may exclude.
+                ambient = self._ambient_target()
+                if ambient is not None:
+                    self._refuse_excluded(ambient)
             kubeconfig_path = None
         result = self._execute(
             command,
@@ -11102,6 +11116,10 @@ class CommandExecutor:
         behind it rotates, and a file that outlives its token fails as an
         authentication error somewhere far from here.
         """
+        # Before the pool and before the cache: every kubeconfig this broker
+        # hands out or runs a command under comes through here, a cached file
+        # included, so an excluded cluster is refused whatever filled the cache.
+        self._refuse_excluded(target)
         if self.scoped_pool is None or not scoped:
             # Not scoped: a non-kubectl request that named a kubeconfig. The
             # file is still regenerated -- the name-not-content property does
@@ -11127,6 +11145,10 @@ class CommandExecutor:
         finally:
             scratch.unlink(missing_ok=True)
         return scoped
+
+    def _refuse_excluded(self, target: ClusterTarget) -> None:
+        """Raise scope_exclude.ExcludedCluster for a cluster the install excludes."""
+        self.exclusions.check(target.project, target.location, target.cluster)
 
     def _ambient_target(self) -> ClusterTarget | None:
         """The cluster a request that names none resolves to.
@@ -11465,6 +11487,9 @@ class CommandExecutor:
         # runs: `_file_managed_kubeconfig` compares against it to tell a
         # settled file that lands during the fetch from one already there.
         seen_target = _get_credentials_target(command)
+        if seen_target is not None:
+            # Before GKE is asked anything: an excluded cluster's fetch never runs.
+            self._refuse_excluded(seen_target)
         seen_mtime_ns = (_mtime_ns_or_none(self._managed_kubeconfig(seen_target))
                          if seen_target is not None else None)
         attempted, decision = self._decision_for_callers_fetch(command)
@@ -11480,6 +11505,11 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
+                    # The fetch's target is only certain now when argv didn't
+                    # name it in full (gcloud's own defaults): an excluded
+                    # cluster's file is neither filed nor returned, and the
+                    # scratch copy goes in the finally below.
+                    self._refuse_excluded(target)
                     # Outside `_kubeconfig_lock`, as before: a scaffold never
                     # waits behind a cold read's gcloud runs. The filing step
                     # takes `_marker_lock` by itself, so the file and its
@@ -13123,6 +13153,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     scope_slots: "SessionSlots | None" = None
     # The scope role's member window: one per broker process (scope_policy).
     scope_window: scope_policy.MemberWindow = scope_policy.MemberWindow()
+    # The executor's own reader in `main`, so a profile task's target and the
+    # kubeconfig paths judge one copy of spec.scope.exclude.clusters.
+    exclusions: scope_exclude.Exclusions = scope_exclude.Exclusions()
     # The profile role's, the same way (profile_slot_limit_from_env).
     profile_slots: "SessionSlots | None" = None
     # The resource watermark gate, installed by serve() beside the executor;
@@ -13851,6 +13884,15 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
                 return
             argv, kubeconfig_context = confined.argv, confined.kubeconfig_context
+            # A task whose target the install excludes is refused outright,
+            # metadata reads included: the gateway should never have granted it.
+            if principal.task_target is not None:
+                try:
+                    target = principal.task_target
+                    self.exclusions.check(target.project, target.location, target.cluster)
+                except scope_exclude.ExcludedCluster as exc:
+                    self._refuse_excluded_cluster(exc, request_id, audit, count)
+                    return
         # The scope role's whole surface: five lookups, each on an argument
         # scope.json declares or an earlier lookup returned (scope_policy).
         scope_admitted = None
@@ -14101,6 +14143,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 extra=audit(AUDIT_STATUS_BUSY),
             )
             self._busy(exc)
+            return
+        except scope_exclude.ExcludedCluster as exc:
+            self._refuse_excluded_cluster(exc, request_id, audit, count)
             return
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
@@ -14495,6 +14540,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
         decision, offered = mcp_relay_decision(principal, server_name, message)
+        if decision.allowed:
+            decision = self._mcp_exclusion_decision(server_name, message) or decision
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -14905,6 +14952,26 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 self._busy(exc)
                 return
         target, k8s_path = watcher_policy.split_k8s_target(rest)
+        # Before the endpoint lookup or a token: an excluded cluster's API is
+        # never reached, and a watch on one is refused at its first request.
+        try:
+            self.exclusions.check(target["project"], target["location"], target["cluster"])
+        except scope_exclude.ExcludedCluster as exc:
+            LOGGER.warning("watcher k8s excluded cluster request_id=%s rule=%s", request_id, exc.rule)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": f"SECURITY_POLICY_BLOCKED ({exc.rule}): {exc}",
+                    "reason": "Forbidden",
+                    "details": {"causes": [{"reason": "SECURITY_POLICY_BLOCKED", "message": exc.rule}]},
+                    "code": HTTPStatus.FORBIDDEN.value,
+                },
+            )
+            return
         resolved = self._watcher_cluster_endpoint(target, request_id)
         if resolved is None:
             return
@@ -15999,6 +16066,54 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         with self._pressure_admission(), slot:
             yield
 
+    def _mcp_exclusion_decision(
+        self, server_name: str, message: dict[str, Any] | None,
+    ) -> "command_policy.Decision | None":
+        """A refusal for a gke in-cluster tool call on an excluded cluster, or None.
+
+        The tool names its cluster in its arguments (mcp_policy.k8s_tool_clusters).
+        One the broker can't tie to a cluster is refused while any is excluded.
+        """
+        clusters = mcp_policy.k8s_tool_clusters(server_name, message)
+        if clusters is None:
+            return None
+        try:
+            if not clusters:
+                self.exclusions.check_unnamed()
+            for project, location, cluster in clusters:
+                self.exclusions.check(project, location, cluster)
+        except scope_exclude.ExcludedCluster as exc:
+            return command_policy.Decision(allowed=False, rule_id=exc.rule, message=str(exc))
+        return None
+
+    def _refuse_excluded_cluster(
+        self, exc: "scope_exclude.ExcludedCluster", request_id: str, audit: Callable, count: Callable,
+    ) -> None:
+        """Answer a request whose cluster the install's scope excludes (scope_exclude).
+
+        Its own rule id, like the pool's refusal, so the agent can say the
+        cluster is out of scope rather than that a policy blocked it. The
+        message names only the target's three name parts, each already held to
+        the GKE context grammar, and the cap bounds the line regardless.
+        """
+        LOGGER.warning(
+            "excluded cluster refused request_id=%s rule=%s reason=%s",
+            request_id,
+            exc.rule,
+            _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
+            extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
+        )
+        count(TOOL_STATUS_BLOCKED)
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "status": "blocked",
+                "code": "SECURITY_POLICY_BLOCKED",
+                "rule": exc.rule,
+                "message": str(exc),
+            },
+        )
+
     def _busy(self, exc: CommandSlotUnavailable) -> None:
         """Answer a broker at its concurrency cap or child memory budget, or
         refusing under resource pressure, on whichever route asked.
@@ -16441,6 +16556,7 @@ def serve(args: argparse.Namespace) -> None:
     MemorySampler(memory_reader, gate=gate).start()
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    CredentialProxyHandler.exclusions = executor.exclusions
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
     CredentialProxyHandler.profile_slots = SessionSlots(
         profile_slot_limit_from_env(executor.class_cap(CLASS_BACKGROUND)),

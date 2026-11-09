@@ -402,8 +402,9 @@ func TestTheScopeResolvedCondition(t *testing.T) {
 	}
 }
 
-// The broker's side follows two gates. Under mode next it reads the
-// declaration (the mount and CREDENTIAL_PROXY_SCOPE_FILE). While the
+// The broker's side follows two gates. In every mode it reads the
+// declaration (the mount and CREDENTIAL_PROXY_SCOPE_FILE), which is where
+// it reads spec.scope.exclude.clusters from. While the
 // operator says the gateway pod admission policy is rendered and the scope
 // declares something to resolve, its fence admits the publisher pods; when
 // the account is also this PlatformAgent's, it confers the scope role: the
@@ -424,7 +425,7 @@ func TestTheBrokerConfersTheScopeRoleOnlyBehindTheGatewayPodPolicy(t *testing.T)
 		{"next, policy true", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true, role: true, peer: true}},
 		{"next, policy true, account not ours", ptr.To("next"), "true", brokerCallerOwnership{mcp: true}, want{file: true, peer: true}},
 		{"next, policy true, nothing to resolve", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true}},
-		{"today, policy true", nil, "true", allBrokerCallersOwned, want{}},
+		{"today, policy true", nil, "true", allBrokerCallersOwned, want{file: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
