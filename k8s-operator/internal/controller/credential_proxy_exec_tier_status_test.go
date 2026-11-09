@@ -281,10 +281,49 @@ func TestAParkThatRenderedTheTierStillReportsIt(t *testing.T) {
 	}
 }
 
-// earlyParkTierCondition renders an agent at exec.replicas from, then parks it
-// on RuntimeClassNotFound, above the broker's reconcile, with the field at to.
-// It returns the condition on the park and after the park clears.
-func earlyParkTierCondition(t *testing.T, from, to int32) (onPark, afterPark *metav1.Condition) {
+// earlyParks are the four refusals above the broker's reconcile, each as the
+// spec edit that starts it and the edit that clears it.
+var earlyParks = []struct {
+	reason      string
+	park, clear func(*agentv1alpha1.PlatformAgent)
+}{
+	{
+		reason: reasonReservedServiceAccount,
+		park: func(a *agentv1alpha1.PlatformAgent) {
+			a.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: operatorServiceAccountNames(a)[0]}
+		},
+		clear: func(a *agentv1alpha1.PlatformAgent) { a.Spec.Security = nil },
+	},
+	{
+		reason: reasonForbiddenVolumeMount,
+		park: func(a *agentv1alpha1.PlatformAgent) {
+			a.Spec.Deployment.ExtraVolumeMounts = []corev1.VolumeMount{{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"}}
+		},
+		clear: func(a *agentv1alpha1.PlatformAgent) { a.Spec.Deployment.ExtraVolumeMounts = nil },
+	},
+	{
+		reason: reasonShellSandboxCannotBeDisabled,
+		park: func(a *agentv1alpha1.PlatformAgent) {
+			if a.Spec.Harness == nil {
+				a.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+			}
+			a.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)}}
+		},
+		clear: func(a *agentv1alpha1.PlatformAgent) { a.Spec.Harness.Experimental = nil },
+	},
+	{
+		reason: reasonRuntimeClassNotFound,
+		park: func(a *agentv1alpha1.PlatformAgent) {
+			a.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("missing-runtime-class")}
+		},
+		clear: func(a *agentv1alpha1.PlatformAgent) { a.Spec.Deployment.Availability = nil },
+	},
+}
+
+// earlyParkTierCondition renders an agent at exec.replicas from, then starts
+// one of the early parks with the field at to. It returns the condition on
+// the park and after the park clears.
+func earlyParkTierCondition(t *testing.T, reason string, park, clear func(*agentv1alpha1.PlatformAgent), from, to int32) (onPark, afterPark *metav1.Condition) {
 	t.Helper()
 	scheme := setupScheme()
 	agent := execTierTestAgent(ptr.To(from))
@@ -305,22 +344,24 @@ func earlyParkTierCondition(t *testing.T, from, to int32) (onPark, afterPark *me
 		}
 		return got
 	}
-	edit := func(got *agentv1alpha1.PlatformAgent, runtimeClass *string, replicas int32) {
+	update := func(got *agentv1alpha1.PlatformAgent) {
 		t.Helper()
-		got.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{RuntimeClassName: runtimeClass}
-		got.Spec.Deployment.CredentialProxy.Exec.Replicas = ptr.To(replicas)
 		if err := cl.Update(ctx, got); err != nil {
 			t.Fatal(err)
 		}
 	}
 	stored()
-	edit(stored(), ptr.To("missing-runtime-class"), to)
+	got := stored()
+	park(got)
+	got.Spec.Deployment.CredentialProxy.Exec.Replicas = ptr.To(to)
+	update(got)
 	parked := stored()
-	if ready := meta.FindStatusCondition(parked.Status.Conditions, "Ready"); ready == nil || ready.Reason != reasonRuntimeClassNotFound {
-		t.Fatalf("Ready = %+v, want the %s park", ready, reasonRuntimeClassNotFound)
+	if ready := meta.FindStatusCondition(parked.Status.Conditions, "Ready"); ready == nil || ready.Reason != reason {
+		t.Fatalf("Ready = %+v, want the %s park", ready, reason)
 	}
 	onPark = meta.FindStatusCondition(parked.Status.Conditions, credentialProxyExecReadyConditionType)
-	edit(parked, nil, to)
+	clear(parked)
+	update(parked)
 	afterPark = meta.FindStatusCondition(stored().Status.Conditions, credentialProxyExecReadyConditionType)
 	return onPark, afterPark
 }
@@ -328,24 +369,32 @@ func earlyParkTierCondition(t *testing.T, from, to int32) (onPark, afterPark *me
 // A park above the broker's reconcile leaves the tier running as it was, so
 // the condition stays too, until the park clears and the tier goes.
 func TestAnEarlyParkKeepsTheConditionWhenTheFieldGoesToZero(t *testing.T) {
-	onPark, afterPark := earlyParkTierCondition(t, 2, 0)
-	if onPark == nil || onPark.Message != "0 of 2 exec-tier replicas are Ready." {
-		t.Fatalf("on the park: %+v, want the condition as it stood", onPark)
-	}
-	if afterPark != nil {
-		t.Fatalf("after the park, at 0: %+v", afterPark)
+	for _, park := range earlyParks {
+		t.Run(park.reason, func(t *testing.T) {
+			onPark, afterPark := earlyParkTierCondition(t, park.reason, park.park, park.clear, 2, 0)
+			if onPark == nil || onPark.Message != "0 of 2 exec-tier replicas are Ready." {
+				t.Fatalf("on the park: %+v, want the condition as it stood", onPark)
+			}
+			if afterPark != nil {
+				t.Fatalf("after the park, at 0: %+v", afterPark)
+			}
+		})
 	}
 }
 
 // A park above the broker's reconcile applies no tier, so no condition reads
 // as a short one, until the park clears and the tier renders.
 func TestAnEarlyParkAddsNoConditionWhenTheFieldGoesAboveZero(t *testing.T) {
-	onPark, afterPark := earlyParkTierCondition(t, 0, 2)
-	if onPark != nil {
-		t.Fatalf("on the park: %+v, want no condition for a tier never applied", onPark)
-	}
-	if afterPark == nil || afterPark.Message != "0 of 2 exec-tier replicas are Ready." {
-		t.Fatalf("after the park: %+v", afterPark)
+	for _, park := range earlyParks {
+		t.Run(park.reason, func(t *testing.T) {
+			onPark, afterPark := earlyParkTierCondition(t, park.reason, park.park, park.clear, 0, 2)
+			if onPark != nil {
+				t.Fatalf("on the park: %+v, want no condition for a tier never applied", onPark)
+			}
+			if afterPark == nil || afterPark.Message != "0 of 2 exec-tier replicas are Ready." {
+				t.Fatalf("after the park: %+v", afterPark)
+			}
+		})
 	}
 }
 

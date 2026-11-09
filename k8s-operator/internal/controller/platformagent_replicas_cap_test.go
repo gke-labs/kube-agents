@@ -217,6 +217,7 @@ func TestTheDegradedPathCarriesReplicasLimitedOnlyAfterARender(t *testing.T) {
 	}{
 		{"after a render", workloadRendered},
 		{"before a render", workloadNotRendered},
+		{"before the broker's reconcile", brokerNotReconciled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := haAgent("cap-degraded", 3)
@@ -234,7 +235,7 @@ func TestTheDegradedPathCarriesReplicasLimitedOnlyAfterARender(t *testing.T) {
 			}
 			cond := meta.FindStatusCondition(agent.Status.Conditions, replicasLimitedConditionType)
 			if (tc.rendered == workloadRendered) != (cond != nil) {
-				t.Fatalf("%s present = %v after a pass with rendered=%v", replicasLimitedConditionType, cond != nil, tc.rendered)
+				t.Fatalf("%s present = %v after a pass %s", replicasLimitedConditionType, cond != nil, tc.name)
 			}
 			if cond != nil && cond.Reason != replicasLimitedReason {
 				t.Errorf("%s reason = %s, want %s", replicasLimitedConditionType, cond.Reason, replicasLimitedReason)
