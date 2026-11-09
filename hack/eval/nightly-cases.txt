@@ -1140,7 +1140,8 @@
 # one-line answer and the grade reads the store. Fixture: drift-outlier. A
 # tofu case, so it holds the infra lock; its stack carries a full drift audit
 # on main (red) and a collector plus precheck on the gate (green), priced at
-# the 900s audit band plus the plant.
+# the 900s audit band plus the plant. Listed in nightly-main-c.txt to balance
+# the stack chains.
 ./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
 
 # A drift run over a coverage gap keeps the previous finding on the cluster it

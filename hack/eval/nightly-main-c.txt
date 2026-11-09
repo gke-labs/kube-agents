@@ -11,3 +11,5 @@ fleet-audit-unchanged-finding-keeps-wording
 gitops-drift-load-bearing-change-triage
 gpu-stress-test-diagnosis
 obtainability-planted-orphan-service
+# Added 2026-11-09 when the case landed on main (#5000): the shortest chain then.
+fleet-audit-unchanged-manifest-skips-synthesis
