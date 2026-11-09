@@ -87,6 +87,11 @@ func IsStatusQuery(text string, wide bool) bool {
 	return statusish && interrogative
 }
 
+// DelegateWord opens a delegation (IsDelegate). Exported so a reader that
+// has to recognise the bare word, which IsDelegate refuses, matches the
+// same spelling.
+const DelegateWord = "delegate"
+
 // IsDelegate reports whether the turn asks for a delegated session worker -
 // the demo's "Delegate" flow, W4 amendment. Deterministic prefix, no model,
 // same shape as IsStatusQuery: the normalized text must START with
@@ -94,7 +99,7 @@ func IsStatusQuery(text string, wide bool) bool {
 // keeps its punctuation and casing - it is the task) is returned. A bare
 // "delegate" with nothing to do is not a delegation.
 func IsDelegate(text string) (string, bool) {
-	const word = "delegate"
+	const word = DelegateWord
 	trimmed := strings.TrimSpace(text)
 	if len(trimmed) < len(word) || !strings.EqualFold(trimmed[:len(word)], word) {
 		return "", false
