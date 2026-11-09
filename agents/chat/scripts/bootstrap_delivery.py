@@ -795,20 +795,23 @@ def _release_claim(data_dir: Path) -> None:
 
 def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
     """Release a claim whose run never recorded an outcome: a conversation-path one, or a no-human
-    one (``REPORT_CLAIMING_FILE`` beside it), each counted in its own record.
+    one (``REPORT_CLAIMING_FILE`` beside it), each recorded in its own record.
 
-    Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. It
-    counts as an attempt unless one was already recorded after the claim.
+    Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. A conversation-path release
+    counts as an attempt unless one was already recorded after the claim. A no-human release is
+    recorded but not counted: that run may have opened the issue before it died, and the count's cap
+    would stop the next run short of the lookup that finds the issue again.
     """
     if time.time() - claimed_at < STALE_CLAIM_SECONDS:
         return
-    name = REPORT_ATTEMPTS_FILE if (data_dir / REPORT_CLAIMING_FILE).exists() else CONVERSATION_ATTEMPTS_FILE
+    no_human = (data_dir / REPORT_CLAIMING_FILE).exists()
+    name = REPORT_ATTEMPTS_FILE if no_human else CONVERSATION_ATTEMPTS_FILE
     try:
         last = float(_read_attempts(data_dir, name).get(ATTEMPTS_AT))
     except (TypeError, ValueError):
         last = 0.0
     if last <= claimed_at:
-        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=True, name=name)
+        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=not no_human, name=name)
     _release_claim(data_dir)
 
 

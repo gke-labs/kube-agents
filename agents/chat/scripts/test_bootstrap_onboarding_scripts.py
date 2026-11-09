@@ -2258,14 +2258,36 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
 
-    def test_a_stale_no_human_claim_is_counted_in_its_own_record(self):
+    def test_a_stale_no_human_release_does_not_count_toward_the_cap(self):
+        """The released run may have opened the issue before it died (a record that did not land): a
+        counted release on the last allowed attempt would stop the next run short of finding it."""
+        self._filed(self.DAY + self.HOUR)
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps({
+            bootstrap_delivery.ATTEMPTS_COUNT: bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1,
+            bootstrap_delivery.ATTEMPTS_REASON: "refused", bootstrap_delivery.ATTEMPTS_AT: old - self.DAY,
+        }), encoding="utf-8")
+        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
+        (self.d / COMPLETED).touch()
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1)
+        self.assertEqual(self._main(), 0)
+        self.assertIn("issue-create", [c[0] for c in self.forge_calls], "the next run reaches the ledger again")
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+
+    def test_a_stale_no_human_claim_is_recorded_in_its_own_record_uncounted(self):
         self._filed(self.DAY + self.HOUR)
         (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
         (self.d / COMPLETED).touch()
         old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
         os.utime(self.d / COMPLETED, (old, old))
         self.assertEqual(self._main(), 0)
-        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)), 1)
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0, "a release is not a refused create")
         self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
 
     def test_a_filing_this_path_made_settles_whatever_binds_a_moment_later(self):
