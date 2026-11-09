@@ -30,6 +30,12 @@
 # seeded-networking, route unattached, no load balancer). A declared gap,
 # expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
 ./tasks/networking-gateway-ingress-port-mismatch/task.yaml
+# Capability row: networking fabric, load balancers and Gateway; the networking
+# fabric audit on a Private Service Connect endpoint whose producer rejects it
+# (the planted bench-psc-rejected forwarding rule, pscConnectionStatus REJECTED
+# through the service attachment's consumer reject list; two bench-owned VPCs,
+# nothing on the host cluster). A baseline: no gap declared.
+./tasks/networking-psc-routing-deadlock-baseline/task.yaml
 # Capability row: observability, logging and Managed Prometheus; the
 # obtainability audit on a Deployment whose container is OOM-killed in a loop
 # (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
