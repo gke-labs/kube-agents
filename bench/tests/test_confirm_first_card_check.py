@@ -12,26 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""chat-real-report-fix-files-confirm-first's filing entries, on both transports.
+"""chat-real-report-fix-files-confirm-first's gate, and what moved to the judge.
 
-The inject door sends the Planning Agent's arguments as shapes
-(``a2a/hermes-bridge/activity.go``, ``shapeOf``): its ``kanban_create`` arrives
-as ``{"assignee": "<string, 8 chars>", "body": "<string, 803 chars>", ...}``, so
-no pattern over the router's call can read the confirm-first criterion. The
-case reads the filing in two entries. ``the-fix-is-filed`` reads the router's
-``kanban_create`` by tool name alone, which both transports keep; it is
-trace-blind, so the scorer grades it on the inject lane too.
-``the-fix-is-filed-with-confirm-first`` is an any-of: the router's call with
-its readable ``body``, or, behind a successful ``kanban_create``, a
-``kanban_show`` by the platform worker whose result carries the criterion (any platform show in the run: ``tool_called``
-has no card selector, #4572). On the api lane the router leaf decides; on the
-inject lane only the worker read can, once the scorer grades worker entries
-there (#2619); until then the entry is worker-blind, set aside on inject.
+The case gates the filing, the front door's acknowledgement and the
+delegation boundary. How the card words its confirm-first criterion is a
+Critical Requirements bullet in ``expected_output``, scored by devops-bench's
+ChecklistScore, and never gates (#3240): a pattern over the body found a
+confirm phrase without telling whether it came first or was negated, and the
+inject door sends the Planning Agent's arguments as shapes
+(``a2a/hermes-bridge/activity.go``, ``shapeOf``), so no pattern over the
+router's call could read the criterion there.
 
-Every fixture runs through the whole entry as the runner grades it, built
-from the shapes the nightly recorded: the api lane's readable call
-(ci-kube-agents-eval-nightly 2113420200605913088 rep 1, 2026-10-23) and the
-inject lane's shaped call (2117044258501300224 rep 1, 2026-11-02).
+``the-fix-is-filed`` reads the router's ``kanban_create`` by tool name alone,
+which both transports keep; it is trace-blind, so the scorer grades it on the
+inject lane too. The fixtures are built from the shapes the nightly recorded:
+the api lane's readable call (ci-kube-agents-eval-nightly
+2113420200605913088 rep 1, 2026-10-23) and the inject lane's shaped call
+(2117044258501300224 rep 1, 2026-11-02). They name checkout-gateway, as those
+runs did; the filing entry reads no body, so the name doesn't matter to it.
 
 Run:  cd bench && python -m pytest -q tests/test_confirm_first_card_check.py
 """
@@ -39,10 +37,12 @@ Run:  cd bench && python -m pytest -q tests/test_confirm_first_card_check.py
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 import yaml
+from devops_bench.metrics.checklist import extract_checklist_items
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry
 
@@ -50,7 +50,9 @@ from kube_agents_bench import cases, transcript
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "chat-real-report-fix-files-confirm-first" / "task.yaml"
 FILED = "the-fix-is-filed"
+# The regex entry #3240 retired. Named here so a test can say it stays gone.
 CONFIRM_FIRST = "the-fix-is-filed-with-confirm-first"
+FLEET = Path(__file__).resolve().parent.parent / "tf"
 SAFEGUARD = "front-door-stays-out-of-the-worker-verbs"
 TIMEOUT_SEC = 5.0
 CARD = "t_72c5a3e7"
@@ -166,11 +168,10 @@ def _status(name: str, trajectory: list[dict]) -> str:
     return VerifierAgent().run_entry(_entry(name), timeout_sec=TIMEOUT_SEC).status
 
 
-def test_the_filing_entry_grades_on_the_inject_lane_and_the_criterion_entry_does_not():
+def test_the_filing_entry_grades_on_both_lanes():
     spec = cases.load_case(TASK)
     assert FILED in spec.trace_blind_checks
     assert FILED not in spec.worker_blind_checks
-    assert CONFIRM_FIRST in spec.worker_blind_checks
     assert SAFEGUARD in spec.negated_trace_blind_checks
 
 
@@ -178,91 +179,73 @@ def test_the_inject_lanes_shaped_create_passes_the_filing_entry():
     assert _status(FILED, INJECT_LANE) == "pass"
 
 
-def test_the_api_lanes_readable_create_passes_both_entries():
+def test_the_api_lanes_readable_create_passes_the_filing_entry():
     assert _status(FILED, API_LANE) == "pass"
-    assert _status(CONFIRM_FIRST, API_LANE) == "pass"
 
 
-def test_the_inject_lanes_card_as_the_worker_read_it_passes_the_criterion_entry():
-    """What the scorer sets aside on inject today still holds on the recorded
-    record through the whole entry: the shaped create fails the router leaf,
-    the worker's show of the card decides."""
-    assert _status(CONFIRM_FIRST, INJECT_LANE) == "pass"
-
-
-def test_a_card_without_the_confirm_step_fails_the_criterion_and_passes_the_filing():
-    assert _status(FILED, NO_CONFIRM) == "pass"
-    assert _status(CONFIRM_FIRST, NO_CONFIRM) == "fail"
-
-
-def test_a_confirm_first_card_never_read_passes_on_the_api_lane():
-    """The filing is the claim where the router's body is readable; the
-    worker read is the other way in, not a second condition."""
-    assert _status(FILED, [_readable_create()]) == "pass"
-    assert _status(CONFIRM_FIRST, [_readable_create()]) == "pass"
-
-
-def test_a_shaped_create_with_a_show_of_a_card_without_the_criterion_fails():
-    """The show leaf keeps its `result` read: with the router's body shaped,
-    only a show that carries the criterion can decide."""
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(NO_CONFIRM_BODY)) == "fail"
-
-
-def test_no_card_at_all_fails_both_entries():
-    """The worker arm sits behind a successful `kanban_create`, so a run that
-    filed nothing is a graded fail on both lanes, not a blocked repetition."""
+def test_no_card_at_all_fails_the_filing_entry():
     assert _status(FILED, NO_CARD) == "fail"
-    assert _status(CONFIRM_FIRST, NO_CARD) == "fail"
-    assert _status(CONFIRM_FIRST, []) == "fail"
+    assert _status(FILED, []) == "fail"
 
 
 def _errored(call: dict) -> dict:
     return {**call, "status": "error", "result": '{"ok": false, "error": "kanban unavailable"}'}
 
 
-def test_an_errored_create_fails_both_entries_whatever_the_worker_shows():
-    """`require_success` on the router leaves: a filing that errored is no
-    filing, on the body arm and in front of the worker arm alike."""
+def test_an_errored_create_fails_the_filing_entry_whatever_the_worker_shows():
+    """`require_success`: a filing that errored is no filing."""
     assert _status(FILED, [_errored(_readable_create())] + _worked(CONFIRM_FIRST_BODY)) == "fail"
-    assert _status(CONFIRM_FIRST, [_errored(_readable_create())] + _worked(CONFIRM_FIRST_BODY)) == "fail"
-    assert _status(CONFIRM_FIRST, [_errored(_readable_create())]) == "fail"
 
 
-@pytest.mark.parametrize("agent", ["platform-2", "PLATFORM", "cluster-seeded-a"], ids=["suffixed", "upper", "other-profile"])
-def test_a_show_by_any_other_agent_name_cannot_decide_the_criterion(agent):
-    """`agent: ^platform$` is anchored and case-sensitive: the profile name, not a prefix."""
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(INJECT_LANE_BODY, agent=agent)) == "fail"
+def test_a_card_without_the_confirm_step_passes_the_gate():
+    """The consequence of #3240, stated: the card's wording is the judge's, so
+    a card with no confirm step no longer turns the case red. The delegation
+    boundary and the lane's no-GitHub-write safeguard still gate what a worker
+    does with it."""
+    assert _status(FILED, NO_CONFIRM) == "pass"
 
 
-def test_an_errored_show_cannot_decide_the_criterion():
-    """`require_success` on the show leaf: an errored show whose payload still
-    carries the body does not count."""
-    body_in_error = {**_show(INJECT_LANE_BODY), "status": "error"}
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE, body_in_error]) == "fail"
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE, _errored(_show(INJECT_LANE_BODY))]) == "fail"
+def test_no_gate_entry_reads_the_cards_wording():
+    """The criterion stays judged: no entry by the retired name, and no entry
+    pattern-matches the router's `kanban_create` arguments or a worker's
+    `kanban_show` result, the two places the retired regex read the body."""
+    doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
+    assert CONFIRM_FIRST not in [e["name"] for e in doc["verification_spec"]]
+
+    def leaves(check: dict):
+        yield check
+        for child in check.get("checks", []):
+            yield from leaves(child)
+
+    for entry in doc["verification_spec"]:
+        for leaf in leaves(entry["check"]):
+            if leaf.get("type") == "tool_called" and {"kanban_create", "kanban_show"} & set(leaf.get("tool_names", [])):
+                assert "arguments" not in leaf and "result" not in leaf, entry["name"]
 
 
-# A body whose confirm-to-exists span is 75 characters raw and 81 in the
-# JSON the worker's show records (every quote an escape pair). The router
-# leaf's raw window admits it; the worker leaf's window counts an escape pair
-# as one unit, so it admits it too.
-QUOTED_BODY = (
-    "Goal: fix checkout-gateway.\n\nAcceptance criteria:\n"
-    '- First confirm "checkout-gateway" in "seeded-reliability" on cluster "seeded-a" actually exists before changing anything.'
-)
-# A newline escape inside the window: refused the way the raw pattern
-# refuses a line break.
-BROKEN_BODY = "Goal: fix checkout-gateway.\n- First confirm\nthe workload exists before changing anything."
+def test_the_expected_output_carries_the_three_judged_requirements():
+    """The bullets devops-bench's Checklist judge scores one by one: the ack,
+    the card's first criterion, and the specialist's answer."""
+    doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
+    items = extract_checklist_items(doc["expected_output"], use_mcp=True)
+    assert len(items) == 3, items
+    ack, criterion, answer = items
+    assert "first post" in ack and "asks the user nothing" in ack
+    assert "first acceptance criterion" in criterion and "confirms invoice-relay exists" in criterion
+    assert "not negated" in criterion
+    assert "could not find invoice-relay" in answer and "changed nothing" in answer
 
 
-def test_the_worker_leafs_window_counts_an_escape_pair_as_one_unit():
-    assert _status(CONFIRM_FIRST, [_readable_create(QUOTED_BODY)]) == "pass"
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(QUOTED_BODY)) == "pass"
-
-
-def test_the_worker_leafs_window_refuses_a_newline_escape():
-    assert _status(CONFIRM_FIRST, [_readable_create(BROKEN_BODY)] + _worked(BROKEN_BODY)) == "fail"
-    assert _status(CONFIRM_FIRST, [ACTIVITY_MARKER, SHAPED_CREATE] + _worked(BROKEN_BODY)) == "fail"
+def test_the_report_names_no_workload_the_fleet_has():
+    """#3629: the report's workloads and namespace exist on no fleet cluster,
+    so a worker that skips the confirm step has nothing real to act on."""
+    doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
+    prompt = doc["prompt"]
+    assert "checkout-gateway" not in prompt and "seeded-reliability" not in prompt
+    fleet = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in FLEET.rglob("*") if p.is_file())
+    for name in ("invoice-relay", "quote-cache", "seeded-billing"):
+        assert name in prompt
+        assert not re.search(rf"\b{re.escape(name)}\b", fleet), f"{name} is on the fleet"
 
 
 def test_the_front_door_working_the_card_itself_trips_the_safeguard():
