@@ -25,7 +25,9 @@ from its registration. The one standing piece is the public chart repository of 
 
    The registration goes in the `context_repos` key of the `<agent>-gitops-state` ConfigMap,
    which the operator seeds from the PlatformAgent and keeps administrator-added entries of (the
-   CR's `spec.integration.repositories[]` carries no `ref`). The ConfigMap reaches the broker and
+   CR's `spec.integration.repositories[]` carries no `ref`). An existing entry for the repository
+   with another `ref` or `type` stops the plant and is left as it is; the teardown removes only
+   the entry the stack wrote. The ConfigMap reaches the broker and
    the shell sandbox as a mounted directory that kubelet refreshes about once a minute, so the
    stack waits until both mounts carry the entry, then the broker's cache window, before the
    prompt is sent. A private repository would have to be in the same GitHub organization as the
@@ -40,8 +42,8 @@ from its registration. The one standing piece is the public chart repository of 
    owner, name and branch. Each file carries `managed-by: kube-agents-bench` in its labels; that
    line is how the stack's teardown, a later plant and the repository reset
    (`hack/ci_reset_agent_pulls.py`, `PLANTED_STACK_FILES`) know a file is the stack's, and a
-   file without it is never written over or deleted. The reset knows the pool's paths only (host
-   cluster `platform-agent-host`); on a dev install the teardown is the one remover. `values.enc.yaml` is SOPS-shaped filler: no
+   file without it is never written over or deleted. The reset knows the pool's paths only
+   (host cluster `platform-agent-host`); on a dev install the teardown is the one remover. `values.enc.yaml` is SOPS-shaped filler: no
    key decrypts it, which is the point. `legacy-env.yaml` is the decoy: a ConfigMap that carries
    the variable's name and that nothing consumes, so a text search in the writable repository
    finds a file whose edit changes nothing.
