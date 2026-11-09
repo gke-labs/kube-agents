@@ -190,6 +190,30 @@ class ProxyTestCase(unittest.TestCase):
     # Set to a subdirectory name to write segment files there (REPLAY_LOG_DIR).
     log_subdir = None
     data_max_bytes = replay_proxy.DEFAULT_DATA_MAX_BYTES
+    mode = "shadow"
+
+    def config(self, **overrides):
+        values = dict(
+            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
+            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
+            upstream_timeout_seconds=self.upstream_timeout,
+            model_behaviour_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
+            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
+            mode=self.mode, cache_dir=self.cache_dir,
+            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
+        )
+        values.update(overrides)
+        return replay_proxy.Config(**values)
+
+    def start_proxy(self, **overrides):
+        """Another proxy on the same upstream; returns (proxy, port, output)."""
+        out = io.StringIO()
+        server = replay_proxy.make_server(self.config(**overrides), host="127.0.0.1", out=out)
+        self.addCleanup(server.proxy.close)
+        threading.Thread(target=server.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.proxy, server.server_address[1], out
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -206,17 +230,10 @@ class ProxyTestCase(unittest.TestCase):
             self.store = os.path.join(temp, "a-file")  # no directory can be made under a file
             with open(self.store, "w"):
                 pass
+        self.cache_dir = os.path.join(temp, "cache")
         self.out = io.StringIO()
         self.log_dir = os.path.join(temp, self.log_subdir) if self.log_subdir else replay_proxy.UNSET
-        config = replay_proxy.Config(
-            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
-            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
-            upstream_timeout_seconds=self.upstream_timeout,
-            model_behaviour_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
-            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
-            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
-        )
-        self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
+        self.server = replay_proxy.make_server(self.config(), host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
         # Registered first, so it runs last: after a test's own cleanups have
         # released anything holding the worker.
@@ -230,8 +247,8 @@ class ProxyTestCase(unittest.TestCase):
         self.server.server_close()
         self.upstream.server_close()
 
-    def request(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+    def request(self, method, path, body=None, port=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=LOG_WAIT_SECONDS)
         data = json.dumps(body).encode() if isinstance(body, dict) else body
         conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
         resp = conn.getresponse()
@@ -243,14 +260,15 @@ class ProxyTestCase(unittest.TestCase):
         conn.close()
         return resp.status, headers, payload
 
-    def lines(self, count):
+    def lines(self, count, out=None):
+        out = out or self.out
         deadline = time.monotonic() + LOG_WAIT_SECONDS
         while time.monotonic() < deadline:
-            lines = [json.loads(l) for l in self.out.getvalue().splitlines() if l]
+            lines = [json.loads(l) for l in out.getvalue().splitlines() if l]
             if len(lines) >= count:
                 return lines
             time.sleep(POLL_SECONDS)
-        self.fail(f"expected {count} log lines, got: {self.out.getvalue()!r}")
+        self.fail(f"expected {count} log lines, got: {out.getvalue()!r}")
 
 
 class PassThroughTest(ProxyTestCase):
@@ -805,22 +823,19 @@ class LogLineTest(ProxyTestCase):
         plain = {"role": "assistant", "content": "notes written"}
         self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
 
-    def test_an_answer_naming_the_prompt_date_is_unstorable_as_a_date(self):
-        # The system prompt's date is counted in days, so the key matches the
-        # next day; an answer carrying the date must not be saved.
+    def test_an_identifier_holding_the_prompt_date_is_not_a_repeated_date(self):
+        # The date guard reads the answer after the swap: a session id is served
+        # with this run's value, so the date inside it doesn't repeat the day.
+        session = "20261104_002640_791a68"
         body = {"model": "model-default", "messages": [
             {"role": "system", "content": "Conversation started: Wednesday, November 04, 2026 (UTC, UTC+00:00)"},
-            {"role": "user", "content": "write today's notes"}]}
+            {"role": "user", "content": f"resume ~/.hermes/sessions/{session}/"}]}
         mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
         scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
         headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
-        dated = {"role": "assistant", "content": None, "tool_calls": [
-            {"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "memory/2026-11-04.md"}'}}]}
-        reasons = replay_proxy.unstorable_reasons(body, 200, dated, headers, mapping, scrubber)
-        self.assertIn("repeats_swapped_date", reasons)
-        self.assertNotIn("repeats_swapped_number", reasons)
-        plain = {"role": "assistant", "content": "notes written"}
-        self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
+        answer = {"role": "assistant", "content": f"Reading ~/.hermes/sessions/{session}/state.json"}
+        self.assertTrue(mapping.answer_repeats_date(answer["content"]), "the raw text does name the day")
+        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber), [])
 
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
@@ -828,6 +843,12 @@ class LogLineTest(ProxyTestCase):
         line = self.lines(1)[0]
         self.assertEqual(line["litellm_attempted_fallbacks"], "1")
         self.assertIn("fallback_attempted", line["unstorable"])
+
+    def test_an_answer_from_another_model_group_is_marked_unstorable(self):
+        FakeLiteLLM.model_group = "model-backup"
+        self.addCleanup(setattr, FakeLiteLLM, "model_group", "model-default")
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertIn("answered_by_other_model_group", self.lines(1)[0]["unstorable"])
 
     def test_scrubbed_text_is_stored(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))

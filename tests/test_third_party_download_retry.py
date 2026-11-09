@@ -15,7 +15,8 @@ of the tools themselves is the same kind of fetch and failed the same way once
 `NatsCliInstallRetryTest` runs a2a-test.yml's nats CLI step the same way. So
 did the module fetch inside the injector seam's `go test` (#4800):
 `OperatorModuleDownloadRetryTest` runs python-tests.yml's download steps the
-same way.
+same way. So did a provider download in `terraform init` (#5142):
+`TerraformInitRetryTest` runs validate.yml's Terraform step the same way.
 
 So the loop is *run*, not read: `RetryLoopBehaviourTest` points the recipe at a
 stub `setup-envtest` and counts invocations, which is what catches a backoff
@@ -281,6 +282,42 @@ if [ "$1" = mod ] && [ "$2" = download ]; then
   exit 0
 fi
 echo "unexpected: go $*" >&2
+exit 2
+"""
+
+#: The step in validate.yml that formats, initialises and validates every
+#: Terraform directory, found by name.
+TERRAFORM_WORKFLOW = "validate.yml"
+TERRAFORM_STEP = "Validate Terraform Modules"
+
+#: The tree the step walks in place of the checkout's: a module and an example,
+#: walked in that order, and a file beside them that the step skips. The root's
+#: name is what the stub records for the `fmt` call made from it.
+TERRAFORM_FIXTURE_ROOT = "checkout"
+TERRAFORM_FIXTURE_DIRS = ("terraform/modules/alpha", "terraform/examples/beta")
+TERRAFORM_FIXTURE_FILE = "terraform/modules/README.md"
+
+#: Stands in for terraform under the step. Each call appends its verb and the
+#: name of the directory it ran in to a calls file. `init` fails until that
+#: directory has more init calls on record than the failure count the test
+#: asked for, so each directory's attempts are counted apart; `fmt` and
+#: `validate` exit with the status the test asked for. Any other verb fails,
+#: so a step that stops running one of the three cannot pass.
+TERRAFORM_STUB = """#!/bin/sh
+dir=$(basename "$(pwd -P)")
+echo "$1 $dir" >> "%(calls)s"
+case "$1" in
+  fmt) exit %(fmt_status)d ;;
+  init)
+    if [ "$(grep -cxF "init $dir" "%(calls)s")" -le %(failures)d ]; then
+      echo "Error while installing hashicorp/google-beta v7.46.2: read: connection reset by peer" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+  validate) exit %(validate_status)d ;;
+esac
+echo "unexpected: terraform $*" >&2
 exit 2
 """
 
@@ -1348,6 +1385,81 @@ class OperatorModuleDownloadRetryTest(unittest.TestCase):
                 self.assertEqual(self._calls(), 3, "it should stop at the first success")
                 self.assertEqual(self._delays(), [delay, delay * 2])
                 self.assertEqual(result.stdout.count("::warning::"), 2, "each retry should leave a warning, the record of a rescued attempt")
+
+
+class TerraformInitRetryTest(unittest.TestCase):
+    """validate.yml's Terraform step retries `terraform init` alone, on the Makefile's schedule (#5142).
+
+    No directory the step walks commits a lock file, so each `terraform init`
+    downloads its providers, and one connection reset during a download failed
+    the step on main. The step is a `run:` block, so its loop is run the way
+    NatsCliInstallRetryTest runs the nats CLI step: lifted out of the workflow
+    and executed under `bash -e` in a fixture tree, with a stub `terraform` and
+    a stub `sleep`. fmt and validate make no network call, so a failure in
+    either is a verdict, and each still runs once.
+    """
+
+    def setUp(self):
+        steps = [step for step in _steps(_load_workflow(TERRAFORM_WORKFLOW)) if step.get("name") == TERRAFORM_STEP]
+        self.assertEqual(len(steps), 1, "%s should have exactly one %r step" % (TERRAFORM_WORKFLOW, TERRAFORM_STEP))
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="terraform-init-retry-")).resolve()
+        self.calls = self.tmp / "calls"
+        self.sleeps = self.tmp / "sleeps"
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+        self.checkout = self.tmp / TERRAFORM_FIXTURE_ROOT
+        for directory in TERRAFORM_FIXTURE_DIRS:
+            (self.checkout / directory).mkdir(parents=True)
+        (self.checkout / TERRAFORM_FIXTURE_FILE).write_text("")
+        self.script = self.tmp / "step.sh"
+        self.script.write_text(steps[0]["run"])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, init_failures, fmt_status=0, validate_status=0):
+        self.calls.write_text("")
+        self.sleeps.write_text("")
+        _executable(
+            self.toolchain / "terraform",
+            TERRAFORM_STUB % {"calls": self.calls, "failures": init_failures, "fmt_status": fmt_status, "validate_status": validate_status},
+        )
+        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
+        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]))
+        return subprocess.run(["bash", "-e", str(self.script)], cwd=self.checkout, capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
+
+    def _calls(self):
+        return self.calls.read_text().splitlines()
+
+    def _delays(self):
+        return [int(line) for line in self.sleeps.read_text().split()]
+
+    def test_a_failing_init_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
+        attempts, delay = _declared_retry_schedule()
+        result = self._run(NEVER_SUCCEEDS)
+        self.assertNotEqual(result.returncode, 0, "exhausting the attempts must fail the step")
+        self.assertEqual(self._calls(), ["fmt checkout"] + ["init alpha"] * attempts, result.stdout + result.stderr)
+        self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
+        self.assertIn("::error::", result.stdout)
+
+    def test_each_directory_starts_its_schedule_afresh_and_stops_at_its_first_success(self):
+        _, delay = _declared_retry_schedule()
+        result = self._run(2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            self._calls(),
+            ["fmt checkout"] + ["init alpha"] * 3 + ["validate alpha"] + ["init beta"] * 3 + ["validate beta"],
+        )
+        self.assertEqual(self._delays(), [delay, delay * 2] * 2)
+        self.assertEqual(result.stdout.count("::warning::"), 4, "each retry should leave a warning, the record of a rescued attempt")
+
+    def test_a_failing_fmt_or_validate_fails_the_step_without_a_retry(self):
+        for verb, calls in (("fmt", ["fmt checkout"]), ("validate", ["fmt checkout", "init alpha", "validate alpha"])):
+            with self.subTest(verb=verb):
+                result = self._run(0, **{"%s_status" % verb: 1})
+                self.assertNotEqual(result.returncode, 0, "a failed %s must fail the step" % verb)
+                self.assertEqual(self._calls(), calls, "%s makes no network call, so it runs once" % verb)
+                self.assertEqual(self._delays(), [])
 
 
 if __name__ == "__main__":

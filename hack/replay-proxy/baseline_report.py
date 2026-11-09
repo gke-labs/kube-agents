@@ -157,6 +157,9 @@ SKIP_DUPLICATE = "duplicate_request_id"
 SKIP_OUTSIDE_WINDOW = "outside_window"
 # The line's job.kind tag names a kind other than the folder it was filed under.
 SKIP_KIND_MISMATCH = "kind_mismatch"
+# Replay mode served a recorded answer: the model was not called, so the line
+# is no model usage (its tokens are the recording's), as in analyze_shadow.
+SKIP_SERVED = analyze_shadow.SKIP_SERVED
 
 # Report keys read back by render() and compare().
 REPORT_SCHEMA = "report_schema"
@@ -523,6 +526,9 @@ def _field(entry: Dict[str, Any], name: str, quality: Quality, maximum: int = MA
 
 def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[Line]:
     """`kind` is the folder's (or --kind); a line whose own tag disagrees is dropped and counted."""
+    if entry.get(F.SERVED) is True:
+        quality.skip(SKIP_SERVED)
+        return None
     job = entry.get(F.JOB)
     if not isinstance(job, dict) or job.get(F.JOB_KIND) not in JOB_KINDS:
         quality.skip(SKIP_UNTAGGED)

@@ -3983,6 +3983,7 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, out)
         self.assertIn(f"{self._short('bang')} feat(operator)!: drop the old field", out)
         self.assertIn("--allow-breaking-downgrade", out)
+        self.assertIn("https://gke-labs.github.io/kube-agents/deploy/rollback/", out)
         self.assertNotIn("CONTINUED", out)
 
     def test_a_breaking_change_footer_is_refused_and_named(self):

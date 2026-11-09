@@ -896,6 +896,21 @@ class KindFromFolder(unittest.TestCase):
             br.load_lines([loose], br.Quality())
 
 
+class ServedLines(unittest.TestCase):
+    def test_a_served_answer_is_no_model_usage(self):
+        r = report([
+            line("a", 1, prompt=1_000, completion=10, litellm_cost_usd=0.5, mode="replay", served=False),
+            line("b", 2, prompt=9_000, completion=90, litellm_cost_usd=4.0, mode="replay", served=True,
+                 served_from={"build": "7"}),
+            error_line(3, "analysis_dropped") | {"mode": "replay", "served": True},
+        ])
+        total = r["scopes"]["total"]
+        self.assertEqual((total["requests"], total["prompt_tokens"], total["completion_tokens"]), (1, 1_000, 10))
+        self.assertAlmostEqual(total["cost_usd"], 0.5)
+        self.assertEqual(total["model_time_s"], 1.0)
+        self.assertEqual(r["data_quality"]["skipped_lines"], {"served": 2})
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([

@@ -1,7 +1,8 @@
 """The shadow proxy's log line: event names, field names and unstorable reasons.
 
-replay_proxy.py writes these lines and analyze_shadow.py reads them; both use
-the names here, so a renamed field breaks the tests instead of the analysis.
+replay_proxy.py writes these lines and analyze_shadow.py and analyze_replay.py
+read them; all use the names here, so a renamed field breaks the tests instead
+of the analysis.
 """
 
 # 2: litellm_config_checksum became model_behaviour_checksum.
@@ -26,13 +27,14 @@ LATENCY_MS = "latency_ms"
 CLIENT_DISCONNECTED = "client_disconnected"
 UPSTREAM_INCOMPLETE = "upstream_incomplete"
 OBSERVE_FAILED = "observe_failed"
+# LiteLLM's headers; null on a served line, which never reached LiteLLM.
 LITELLM_MODEL_GROUP = "litellm_model_group"
 LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
 # The deployment's model behind the alias (x-litellm-model-name), the retries
 # LiteLLM made inside this request (x-litellm-attempted-retries), and its own
 # cost for the request in USD: usage.cost, else x-litellm-response-cost on a
 # non-streamed response only (a stream's headers go out before the cost is
-# known and say 0.0).
+# known and say 0.0). All three are null on a served line.
 LITELLM_MODEL_NAME = "litellm_model_name"
 LITELLM_ATTEMPTED_RETRIES = "litellm_attempted_retries"
 LITELLM_COST_USD = "litellm_cost_usd"
@@ -43,6 +45,7 @@ TOKENS_ESTIMATED = "tokens_estimated"
 CACHED_TOKENS = "cached_tokens"
 COMPLETION_TOKENS = "completion_tokens"
 # From usage.completion_tokens_details.reasoning_tokens; part of completion_tokens.
+# Null on a served line, as is CACHE_WRITE_TOKENS.
 REASONING_TOKENS = "reasoning_tokens"
 # From usage.cache_creation_input_tokens (Anthropic-style prompt cache writes).
 CACHE_WRITE_TOKENS = "cache_write_tokens"
@@ -56,6 +59,8 @@ DIAG_MESSAGE_HASHES = "diag_message_hashes"
 DIAG_SETTINGS_HASH = "diag_settings_hash"
 ROLES = "roles"
 ANSWER_HASH = "answer_hash"
+# Why replay would not have saved the answer; empty on a served line, whose
+# answer is a saved one and is never judged as a new one.
 UNSTORABLE = "unstorable"
 STORED = "stored"
 STORE_SKIPPED = "store_skipped"
@@ -90,7 +95,76 @@ UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
 UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
+# The answer repeats an age the key swapped (`--since 5m` after `AGE 5m`),
+# which is never put back: this run's age would change what it does.
+UNSTORABLE_REPEATS_AGE = "repeats_swapped_age"
+# Normalized, the answer still names an identifier or IP the request bound, so
+# it would be served with the recording's value.
+UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
+# Normalized, the answer still holds an identifier shape (a card, a pod, a
+# session) the request never bound, so it would be served as recorded.
+UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
+# The answer quotes a timestamp the request does not hold verbatim (one the
+# model made), which no placeholder can bring up to date.
+UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
 UNSTORABLE_REPEATS_DATE = "repeats_swapped_date"
 UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
+# The request holds the result of a tool call that printed a secret's value,
+# which the answer may repeat in a form no scrubber recognises; the
+# conversation runs live from the read on.
+UNSTORABLE_FOLLOWS_SECRET_READ = "follows_secret_read"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"
+
+# Proxy modes (REPLAY_MODE). Shadow and record never serve a saved answer.
+MODE_SHADOW = "shadow"
+MODE_RECORD = "record"
+MODE_REPLAY = "replay"
+MODES = (MODE_SHADOW, MODE_RECORD, MODE_REPLAY)
+
+# Fields every request line carries in every mode.
+MODE = "mode"
+# True when replay mode served a saved answer and the model was not called.
+SERVED = "served"
+# On a served line: the job that recorded the answer (its `job` block).
+SERVED_FROM = "served_from"
+# How a served answer matched: the exact key, or the answer-slot key.
+SERVED_VIA = "served_via"
+VIA_EXACT = "exact"
+VIA_ANSWER_SLOTS = "answer_slots"
+# In record mode: whether this request's answer was saved (false when the key
+# was already there, or the answer was unstorable).
+RECORDED = "recorded"
+# In record mode, when writing the cache failed: the exception's type name, or
+# RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
+RECORD_ERROR = "record_error"
+RECORD_ERROR_BUDGET = "budget_spent"
+# On a replay miss: the closest saved request and where this one differed.
+MISS = "miss"
+MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"
+MISS_MATCHED_MESSAGES = "matched_messages"
+MISS_INDEX = "index"
+MISS_ROLE = "role"
+# The normalized, scrubbed text of the differing message on each side, cut to
+# a short window around the first difference.
+MISS_SAVED_SNIPPET = "saved_snippet"
+MISS_CURRENT_SNIPPET = "current_snippet"
+# The two windows with digit and hex runs collapsed, for grouping misses.
+MISS_SIGNATURE = "signature"
+# On a replay miss whose request did match a saved answer that a guard then
+# refused to serve: which key matched (VIA_EXACT or VIA_ANSWER_SLOTS) and why.
+MISS_REFUSED = "refused"
+REFUSED_VIA = "via"
+REFUSED_GUARD = "guard"
+# A slot held an answer no recording stored for its context.
+GUARD_ANSWER_NOT_RECORDED = "answer_not_recorded"
+# Through a slot, the saved answer names a value only an assistant message binds.
+GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
+# The saved answer names a placeholder this request does not bind.
+GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
+# The saved answer is missing or not an answer.
+GUARD_UNREADABLE_ENTRY = "unreadable_entry"
+# Where the first difference is when it is not a message.
+MISS_ROLE_SETTINGS = "settings"
+MISS_ROLE_NONE = "none"
+MISS_ROLE_NO_CACHE = "no_saved_request"
