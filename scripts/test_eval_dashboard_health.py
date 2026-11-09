@@ -1863,6 +1863,14 @@ class PeriodicNote(unittest.TestCase):
 
 
 class PoolNote(unittest.TestCase):
+    def test_the_cap_messages_worst_wait_is_the_breached_days_not_the_windows(self):
+        # A single long wait on a quiet day moves no percentile and breaches
+        # nothing; the note quotes the longest wait among the days that did.
+        artifact = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        artifact["trend"]["worst_minutes"] = 300.0
+        note = health.pool_note(artifact, T0, None)
+        self.assertEqual((note["worst_s"], note["breached_days"]), (int(175.2 * 60), ["2026-09-06"]))
+
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet
         # default of 0.4/0.5 min throughout: the periodic breaches on a day's
@@ -1895,6 +1903,11 @@ class PoolNote(unittest.TestCase):
                 "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
+                # The cap message's facts: the breached day, its longest wait,
+                # and how many are queued now (the fixture's queue.waiting).
+                "breached_days": ["2026-09-06"],
+                "worst_s": int(175.2 * 60),
+                "waiting": 0,
             },
         )
         self.assertIn(

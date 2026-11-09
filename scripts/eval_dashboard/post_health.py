@@ -193,6 +193,10 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 # on them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
+# The cap message names the days the periodic breached on as month-day,
+# "11-05 and 11-06": the digit span after the year in the artifact's ISO day.
+DAY_MONTH_DAY = slice(5, None)
+DAYS_JOIN, DAYS_LAST_JOIN = ", ", " and "
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
 # Not a cause the periodic emits: the key `pool_causes` records when
 # CONTROL_PLANE is announced without the queue, which says something different
@@ -988,6 +992,17 @@ def pool_refusals(pool: dict) -> str:
     return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
+def days_text(days) -> str:
+    """"11-05 and 11-06" from the artifact's ISO days; "recent days" when it
+    named none."""
+    names = [day[DAY_MONTH_DAY] for day in (days or []) if isinstance(day, str) and len(day) > DAY_MONTH_DAY.start]
+    if not names:
+        return "recent days"
+    if len(names) == 1:
+        return names[0]
+    return DAYS_JOIN.join(names[:-1]) + DAYS_LAST_JOIN + names[-1]
+
+
 def pool_cause_text(pool: dict) -> str:
     """What to do, by cause. The four remedies differ and one of them spends
     money, so an unrecognised cause falls through to the message that asks for
@@ -1013,9 +1028,22 @@ def pool_cause_text(pool: dict) -> str:
             f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
+        # The presubmit sat at its own cap while runs queued. The pool is
+        # shared, so the cap's gap below the pool is the other jobs' share and
+        # the message gives no remedy: moving the cap is a human tradeoff.
+        cap = figure(pool.get("max_concurrency"))
+        if pool.get("waiting_now"):
+            waiting = pool.get("waiting")
+            count = f"{waiting} presubmit {plural(waiting, 'run is', 'runs are')}" if isinstance(waiting, int) else "presubmit runs are"
+            return (
+                f"*Smoke gate: queue* — {count} waiting, longest {wait_text(pool.get('waiting_longest_s'))};"
+                f" the presubmit is at its cap of {cap} slots."
+            )
+        worst = pool.get("worst_s")
+        waited = f"waited up to {wait_text(worst)}" if worst is not None else "waited past the limit"
         return (
-            f"*Smoke gate: concurrency cap* — the pool has {figure(pool.get('total'))} projects"
-            f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
+            f"*Smoke gate: queue* — presubmit runs {waited} on {days_text(pool.get('breached_days'))};"
+            f" the presubmit was at its cap of {cap} slots. Nothing waits now."
         )
     if cause == CAUSE_CONTROL_PLANE:
         if pool.get("waiting_now") is None:

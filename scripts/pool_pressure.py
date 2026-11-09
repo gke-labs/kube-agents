@@ -2316,9 +2316,9 @@ def _wait_cause(
             )
         lines += [
             "",
-            "Raise the cap in oss-test-infra's kube-agents presubmit to the number of",
-            "leasable projects before onboarding anything: the projects to absorb this",
-            "queue already exist and are being paid for.",
+            "The pool is shared: the gap between the cap and the pool is the share the",
+            "nightly, today, GitLab and reconcile jobs lease from. Moving the cap trades",
+            "presubmit throughput against their room, and is a human decision.",
         ]
         return CAUSE_CONCURRENCY_CAP, lines
 

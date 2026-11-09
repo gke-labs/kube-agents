@@ -478,10 +478,13 @@ The dashboard dates
 a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
-`concurrency cap` (raise it), `runs not starting` (projects were free, so the
-delay is Prow's; the message names the build cluster) and `queue backed up`
-(the job could not read how many projects were in use) carry the same lines
-under a different first one.
+`queue` at the presubmit's cap (runs waited while the presubmit sat at its
+`max_concurrency`; the message says how long, on which days, and the cap, and
+gives no remedy, because the pool is shared and the gap below it is the other
+jobs' share), `runs not starting` (projects were free, so the delay is Prow's;
+the message names the build cluster) and `queue backed up` (the job could not
+read how many projects were in use) carry the same lines under a different
+first one.
 
 Unlike the slow note, this one also says when it is over. The window is a
 rolling seven days, so an episode outlives the bad day by up to a week:

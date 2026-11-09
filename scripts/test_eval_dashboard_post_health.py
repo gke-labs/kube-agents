@@ -1002,12 +1002,18 @@ class PoolNote(RunHarness):
         )
         self.assertEqual(lines[2], "1 run waiting right now, past the 45 min p95 limit.")
 
-    def test_the_cap_message_names_the_cap_and_the_pool_it_is_below(self):
-        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26), self.at(10))
-        self.assertEqual(
-            self.first()[0],
-            "⏳ *Smoke gate: concurrency cap* — the pool has 30 projects but the concurrency cap is only 26. Raise the cap.",
-        )
+    def test_the_cap_message_says_the_wait_the_days_and_the_cap(self):
+        # A live queue: how many wait, how long, and the cap they wait at.
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26, waiting=6, waiting_longest_s=40 * 60), self.at(10))
+        self.assertEqual(self.first()[0], "⏳ *Smoke gate: queue* — 6 presubmit runs are waiting, longest 40 min; the presubmit is at its cap of 26 slots.")
+        # Nothing waits now: the breached days and their longest wait, past
+        # tense. decide() posts no breach without a live queue, so this form
+        # is the note's text for the surfaces that show a standing verdict.
+        note = pool_note(cause="CONCURRENCY_CAP", free=35, max_concurrency=35, total=40, waiting_now=False, waiting_longest_s=None, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. Nothing waits now.")
+        self.assertEqual(post_health.days_text(["2026-11-05"]), "11-05")
+        self.assertEqual(post_health.days_text(["2026-11-04", "2026-11-05", "2026-11-06"]), "11-04, 11-05 and 11-06")
+        self.assertEqual(post_health.days_text([]), "recent days")
 
     def test_the_control_plane_message_states_the_cause_and_names_the_build_cluster(self):
         # No hedge: decide() posts this only while runs are waiting, and the
@@ -1110,7 +1116,7 @@ class PoolNote(RunHarness):
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
         self.assertEqual(len(self.opener.requests), 2)
         self.assertIn("pool full", self.opener.texts[0])
-        self.assertIn("concurrency cap", self.opener.texts[1])
+        self.assertIn("at its cap of", self.opener.texts[1])
         self.assertEqual(self.recorded()["pool_causes"], ["CAPACITY", "CONCURRENCY_CAP"])
 
     def test_a_cause_the_episode_already_named_is_not_repeated(self):
