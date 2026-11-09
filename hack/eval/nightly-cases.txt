@@ -1279,6 +1279,16 @@
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
 
+# The stockout stream's declared-intent case (#1408): seeded-a's
+# declared-zonal-pool, a single-zone autoscaling pool with no node (role
+# declared-single-zone-pool), is the 3.9 zone-locked posture the same
+# knowledge/ note declares. It runs the capacity audit and grades its
+# ledger: no finding id for the declared pool, pinned-inference-pool still
+# a finding, and a Declared intent row naming the note. Red on main's
+# images (the finding published), three greens on the branch's, on a dev
+# install. deployer: noop, read-only over the seeded fleet.
+./tasks/stockout-declared-intent-no-finding/task.yaml
+
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
 # the flag after it (#2979, #3260). deployer: noop, transcript-only.

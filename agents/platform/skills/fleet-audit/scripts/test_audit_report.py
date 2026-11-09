@@ -6673,7 +6673,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Five streams have no declared-intent step. A worker on one of them that writes a
+        # Four streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6685,7 +6685,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 4)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -7734,6 +7734,179 @@ class TestCostDeclaredShapes(HarnessTestCase):
                     audit_report.validate_findings(copy.deepcopy(written), self.COST)
                 self.assertIn("declared[0].object", str(caught.exception))
                 self.assertIn("never a roll-up", str(caught.exception))
+
+
+class TestStockoutDeclaredShapes(HarnessTestCase):
+    """The stockout stream's one posture: a zone-locked pool. The pool at its ceiling shares the slug and stays a finding."""
+
+    STOCKOUT = "stockout-prevention"
+    CLUSTER = "acme-prod/us-east1-b/prod-us-east"
+    PROJECT = "project/acme-prod"
+    # The two arms as fleet_stockout.py's check_single_zone_nodepool spells
+    # them; a pool matching both carries both clauses, joined.
+    ZONE_LOCKED = "single-zone (['us-east1-b']), autoscaling enabled, no NAP, tainted (seeded-role), so no other pool is counted as its fallback"
+    AT_CEILING = "at its autoscaling ceiling: 9/10 live nodes (90% of maxNodeCount 10 x 1 zone), zones ['us-east1-b']"
+
+    def _pool_finding(self, fid, obj, excerpt):
+        return make_finding(fid=fid, check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="", obj=obj, excerpt=excerpt, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _quota_finding(self):
+        return make_finding(fid="quota", check="quota-exhaustion-risk", severity="critical", cluster=self.PROJECT, namespace="", obj="Quota/us-east1:CPUS", excerpt="CPUS at 95% of its limit", command="gcloud compute regions describe us-east1 --project=acme-prod --format=json(quotas)", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [
+            {"name": self.CLUSTER, "location": "us-east1-b", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.CLUSTER))},
+            {"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.PROJECT))},
+        ]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.STOCKOUT, clusters=clusters), self.STOCKOUT)
+
+    def _declaration(self, obj, check="single-zone-nodepool", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/zonal-pools.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_zone_locked_pool(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
+
+    def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
+        # One note names three pools and a quota. The zone-locked pool moves;
+        # the pool at its ceiling and the pool matching both arms stay, each
+        # said on stderr; the quota is never looked up.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        both = self._pool_finding("both", "NodePool/zonal-full", f"{self.ZONE_LOCKED}; {self.AT_CEILING}")
+        doc = self._doc([locked, ceiling, both, self._quota_finding()])
+        declarations = [self._declaration(obj) for obj in ("NodePool/zonal-batch", "NodePool/regional-web", "NodePool/zonal-full")]
+        declarations.append(self._declaration("Quota/us-east1:CPUS", check="quota-exhaustion-risk"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/regional-web", "NodePool/zonal-full", "Quota/us-east1:CPUS"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 2)
+        self.assertIn("at its autoscaling ceiling", err.getvalue())
+        self.assertIn("SOP §3.9", err.getvalue())
+        self.assertIn("acme/fleet:knowledge/zonal-pools.md stands and the finding publishes", err.getvalue())
+
+    def test_the_manifest_route_declares_a_zone_locked_candidate_and_not_one_at_its_ceiling(self):
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [locked, full]}]}
+        doc = self._doc([])
+        declarations = [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")]
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(locked))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+
+    def test_an_incomplete_search_withholds_both_arms_and_publishes_the_faults(self):
+        # The withhold cannot tell the arms apart without reading the excerpt
+        # and errs toward holding, as it does for `hpa-cannot-scale`.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling, self._quota_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["object"] for f in withheld), ["NodePool/regional-web", "NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Quota/us-east1:CPUS"])
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-batch", title="zonal-batch stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "spot-scarcity-risk", "ccc-missing-fallbacks"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "single-zone-nodepool"
+        for obj in ("Cluster/prod-us-east", "Deployment/web", "ComputeClass/zonal"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("nodepool", str(cm.exception))
+
+    def test_an_expired_declaration_leaves_the_pool_a_finding_and_a_standing_one_moves_it(self):
+        # Dates judged against the run's start day; pinned with the clock
+        # pinned beside it, so the test reads neither live.
+        run_day = date(2026, 11, 9)
+        self.patch_attr("run_start_day", lambda audit_id: run_day)
+        self.patch_attr("_today_utc", lambda: run_day)
+        yesterday = (run_day - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (run_day + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=yesterday), self._declaration("NodePool/regional-web", expires=yesterday)])
+        self.assertEqual(moved, [])
+        lapsed, held = doc["findings"]
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["path"], "knowledge/zonal-pools.md")
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["expires"], yesterday)
+        # A lapsed note is reported only against a posture it did cover: the
+        # pool at its ceiling was never covered, so it carries no line.
+        self.assertNotIn(audit_report.EXPIRED_DECLARATION_FIELD, held)
+        self.assertEqual(err.getvalue().count("DECLARATION EXPIRED"), 1)
+        doc = self._doc([self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=next_year)])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual(doc["declared"][0]["declaration"]["expires"], next_year)
+
+    def test_the_arm_marks_are_the_collectors_prefixes(self):
+        # The join reads the arm off the excerpt the collector writes, so each
+        # prefix's two copies are pinned to each other and to what
+        # check_single_zone_nodepool produces for a zone-locked pool and for
+        # one at its ceiling; a rewording on one side alone fails here.
+        import fleet_stockout
+
+        self.assertEqual(audit_report.ZONE_LOCKED_ARM_MARK, fleet_stockout.ZONE_LOCKED_ARM_PREFIX)
+        self.assertEqual(audit_report.CEILING_ARM_MARK, fleet_stockout.CEILING_ARM_PREFIX)
+        pool = {"name": "zonal-batch", "locations": ["us-east1-b"], "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2}, "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "zonal", "effect": "NO_SCHEDULE"}]}}
+        locked = fleet_stockout.check_single_zone_nodepool(pool, False, 0)
+        full = fleet_stockout.check_single_zone_nodepool(pool, False, 2)
+        self.assertTrue(audit_report._is_zone_locked_arm(locked), locked)
+        self.assertTrue(audit_report._is_ceiling_arm(full), full)
+        self.assertFalse(audit_report._is_zone_locked_arm(full), full)
+
+    def test_a_hand_written_excerpt_naming_no_arm_is_not_moved(self):
+        # A finding the worker wrote on a cluster the collector could not read
+        # carries the worker's wording; with neither prefix nothing says which
+        # arm it is, and the join errs toward not silencing.
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "2/2 live nodes, 100% of maxNodeCount 2, in us-east1-b")
+        # The zone-locked prefix counts only where the collector writes it, at
+        # the start: a full pool described in prose that mentions a single
+        # zone later on is still not the posture.
+        trailing = self._pool_finding("trailing", "NodePool/zonal-full", "2/2 live nodes, 100% of maxNodeCount 2, single-zone (us-east1-b) pool cannot grow")
+        doc = self._doc([prose, trailing])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/zonal-batch", "NodePool/zonal-full"])
+        self.assertEqual(err.getvalue().count("opens neither 3.9 arm"), 2)
+
+    def test_a_namespace_a_worker_wrote_onto_the_pool_is_folded_before_the_join(self):
+        # The collector files the pool with no namespace and the note writes
+        # `namespace: ""`; a worker's namespace would give the pool a third
+        # identity that neither matches, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        stray = make_finding(fid="stray", check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="kube-system", obj="NodePool/zonal-batch", excerpt=self.ZONE_LOCKED, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+        doc = self._doc([stray])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.nodepool-zonal-batch", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch")])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):

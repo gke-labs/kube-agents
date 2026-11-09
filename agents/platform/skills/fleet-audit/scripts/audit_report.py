@@ -422,6 +422,19 @@ AUDITS: dict[str, AuditSpec] = {
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
         ),
+        # §4a of the SOP: the one check that judges a shape an owner chooses,
+        # a node pool kept in one zone on a cluster that is single-zone by
+        # design (3.9's zone-locked arm), and so the only one a repository
+        # declaration may keep off the ledger. The slug's other arm, a pool at
+        # its autoscaling ceiling, is the pool's live headroom and stays a
+        # finding; the join tells the arms apart by the collector's excerpt
+        # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
+        # validator cannot, and the SOP's step carries that distinction. The
+        # other eleven are capacity faults no
+        # declaration excuses: a quota near its limit, a ComputeClass with no
+        # fallback, a Spot shape that gets preempted, an autoscaler that
+        # already failed to add a node.
+        declarable=("single-zone-nodepool",),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -1950,6 +1963,24 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # The allow-all fault names the policy; the withhold publishes only that spelling
 # and holds every other, so an object it cannot classify errs toward holding.
 ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
+# Stockout 3.9 `single-zone-nodepool` names two arms under one slug and one
+# object kind: the zone-locked arm is the posture a declaration may move (a
+# pool kept in one zone on purpose), and the at-ceiling arm is the pool's live
+# headroom, which no declaration excuses. Neither the slug nor the object
+# tells them apart; the collector's excerpt does, and each arm's clause opens
+# with its prefix (`ZONE_LOCKED_ARM_PREFIX` and `CEILING_ARM_PREFIX` in
+# fleet_stockout.py, which `check_single_zone_nodepool` writes and
+# `adopt_collector_evidence` copies onto the finding; a test pins these two
+# copies to those). A declaration moves a finding whose excerpt carries the
+# zone-locked prefix and not the ceiling one: a pool matching both arms stays
+# a finding, and so does a hand-written excerpt that carries neither, since
+# nothing then says which arm the worker saw. The withhold holds both arms, as
+# it holds both `hpa-cannot-scale` shapes: it errs toward holding a finding
+# back, the join toward not silencing one.
+ZONE_ARM_CHECK = "single-zone-nodepool"
+ZONE_ARM_KIND = "NodePool"
+ZONE_LOCKED_ARM_MARK = "single-zone ("
+CEILING_ARM_MARK = "at its autoscaling ceiling:"
 # A roll-up names the scope it covers, not an object: the cost SOP's §5
 # collapse gives one `Cluster/<name>` or `Namespace/<name>`, and its 3.5
 # ten-address roll-up `Project/<id>`. The cost stream refuses them the way
@@ -1978,6 +2009,20 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "idle-namespace": frozenset({"namespace"}),
     "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
 }
+# The stockout stream's one declarable check names a node pool and nothing
+# else: a `Cluster/` or a workload covers no pool's zone span. Folded as
+# `_object_kind_segment` folds kinds, like the cost table above.
+STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ZONE_ARM_CHECK: frozenset({"nodepool"}),
+}
+# Every declarable check with fixed object kinds, across streams, for the one
+# lookup (`_rollup_scope_reason`) the validator, the join and the manifest
+# route share. The cost table stays its own name because `_is_cost_declarable`
+# reads it for the measured-size title, which a stockout row does not carry.
+DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    **COST_DECLARABLE_OBJECT_KINDS,
+    **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+}
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
 # the collector measured and the grade it gave, `MAJOR` spelled out: a
@@ -1991,10 +2036,14 @@ COST_DECLARED_MINOR = "minor"
 # given a namespace may write it into the field, which would give the same
 # object a second identity, so the validator empties it on these checks before
 # the id is derived and the parser reads it as empty on a note item. Per check
-# and not per object kind: 3.9 files its pile as `Namespace/<ns>` with the
-# namespace set, and compliance 2.6 does too. Every slug here is the cost
-# stream's alone, so no stream test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup"})
+# and not per object kind: the cost stream's 3.9 files its pile as
+# `Namespace/<ns>` with the namespace set, and compliance 2.6 does too. The
+# stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
+# its collector files `NodePool/<pool>` with no namespace, and a worker's
+# namespace on the finding would give the pool an identity no declaration and
+# no candidate matches. Every slug here belongs to one stream, so no stream
+# test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -8478,8 +8527,9 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     record names. A partial list is no search, per the SOP.
 
     What goes: every finding whose check is declarable, the dangling-target
-    `hpa-cannot-scale` fault included, because it shares its slug with the
-    `min == max` posture and this side cannot tell them apart; the allow-all
+    `hpa-cannot-scale` fault and the at-ceiling `single-zone-nodepool` arm
+    included, because each shares its slug with a posture and this side
+    does not read the excerpt to tell them apart; the allow-all
     `NetworkPolicy/` fault of `netpol-missing` stays, because its object does
     tell it apart (`_is_namespace_object`). What stays: the
     faults, and every `declared[]` entry, each of which cites the file it
@@ -9136,12 +9186,42 @@ def _declaration_lookup(declarations: list[dict]) -> tuple[dict, dict]:
     return scoped, fleet_wide
 
 
+def _item_excerpt(item: dict) -> str:
+    """The collector's excerpt on a finding (`evidence.excerpt`, either stored shape) or a candidate (`excerpt`)."""
+    return _evidence_excerpt(item) or str(item.get("excerpt") or "")
+
+
+def _is_ceiling_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate carries 3.9's at-ceiling arm.
+
+    Read off the excerpt the collector wrote (`CEILING_ARM_MARK`), the one field
+    that names the arm: a pool matching both arms carries the mark too and is
+    judged a fault, since the headroom it reports is live whatever the zone
+    span was chosen for.
+    """
+    return CEILING_ARM_MARK in _item_excerpt(item)
+
+
+def _is_zone_locked_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate is the zone-locked posture alone.
+
+    The excerpt opens with `ZONE_LOCKED_ARM_MARK` (the collector writes the
+    zone-locked clause first) and carries no at-ceiling clause anywhere. An
+    excerpt that opens any other way — a worker's own wording on a cluster
+    the collector could not read, even one that mentions a single zone later
+    on — names no arm, and a declaration moves nothing it cannot place: the
+    finding publishes.
+    """
+    return _item_excerpt(item).startswith(ZONE_LOCKED_ARM_MARK) and not _is_ceiling_arm(item)
+
+
 def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) -> dict | None:
     """The declaration that justifies `item` (a finding or a collector candidate), or None.
 
     The dual-shape rules of `apply_declarations`, without its stderr lines: a
-    declaration moves only the `min == max` shape of `hpa-cannot-scale` and
-    only the `Namespace/` shape of `netpol-missing`.
+    declaration moves only the `min == max` shape of `hpa-cannot-scale`,
+    only the `Namespace/` shape of `netpol-missing`, and only the zone-locked
+    arm of `single-zone-nodepool`.
     """
     check = str(item.get("check", ""))
     if check not in declarable:
@@ -9154,6 +9234,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
     if check == DUAL_SHAPE_CHECK and str(item.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY:
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
+        return None
+    if check == ZONE_ARM_CHECK and not _is_zone_locked_arm(item):
         return None
     if _rollup_scope_reason(check, str(item.get("object", "")), str(item.get("namespace") or "")):
         return None
@@ -9261,12 +9343,13 @@ def fold_unnamespaced_check(entry: dict) -> None:
 def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | None:
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
-    A cost check with fixed object kinds accepts only those
-    (`COST_DECLARABLE_OBJECT_KINDS`). The two controller checks file whatever
+    A check with fixed object kinds accepts only those
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks and the stockout pool check).
+    The two controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
-    roll-up does not. Another stream's check is not judged here.
+    roll-up does not. A check in neither table is not judged here.
     """
     kind = _object_kind_segment(obj)
     if check in COST_CONTROLLER_CHECKS:
@@ -9275,7 +9358,7 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
         if kind in UNNAMESPACED_SCOPE_SPELLINGS and not str(namespace or "").strip():
             return f"names a roll-up's scope (`{kind}/` with no namespace), not a controller a {check} finding names"
         return None
-    allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
+    allowed = DECLARABLE_OBJECT_KINDS.get(check)
     if allowed is not None and kind not in allowed:
         return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
     return None
@@ -9385,6 +9468,26 @@ def apply_declarations(
                 f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
                 f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
                 f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
+        if match is not None and check == ZONE_ARM_CHECK and not _is_zone_locked_arm(finding):
+            # The slug names a posture (a pool kept in one zone) and a fault (a
+            # pool at its autoscaling ceiling), told apart by the collector's
+            # excerpt; a declaration justifies only the posture, a pool
+            # matching both arms keeps the fault, and an excerpt that names
+            # neither arm — a worker's own wording — moves nothing.
+            why = (
+                f"carries the `{CEILING_ARM_MARK}` arm (SOP §3.9), the pool's live headroom, which no "
+                "declaration excuses; the posture is the zone-locked arm alone"
+                if _is_ceiling_arm(finding)
+                else f"has an excerpt that opens neither 3.9 arm (`{ZONE_LOCKED_ARM_MARK}` or "
+                f"`{CEILING_ARM_MARK}`, as the collector writes them), so nothing says it is the "
+                "zone-locked posture"
+            )
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} {why}. "
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
