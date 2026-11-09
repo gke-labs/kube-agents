@@ -91,8 +91,19 @@ has passed and whose `expires_at` has not:
   hour ago and the wait has passed." A quiet run prints nothing.
 - Holds: the card stays blocked; the record's `checks`, `last_checked_at` and `last_outcome` are
   refreshed. No comment is written, for the reason above.
-- Past its expiry (`k8s` only): `outcome: expired`, said once on the card, and the record is left
-  for the digest.
+- Past its expiry (`k8s` only): `outcome: expired`, said once on the card and once in chat ("…did
+  not become Available before the re-checks ended."), and the record is left for the digest. The
+  retry limit below is said the same way, once, so a card that stays blocked for a person is not
+  silent for it.
+
+The job opens the board the way the Session KV server's card stop does: a plain connection with
+Hermes' PRAGMAs and a three-second busy timeout, not `kanban_db_connect.connect`, whose first call in
+a process takes a cross-process init lock, probes the whole file and runs the migrations, a cost
+with no benefit four times an hour on a board the dispatcher initialised. Before the unblock it
+re-reads the card's newest block event and drops the record when that event is not the one it
+describes: a slow cluster read earlier in the run is time enough for a person's Retry and a worker's
+new `needs_input` block. The `retried` event is written before the unblock, so the once-per-card
+bound holds even if the process dies between the two writes.
 
 Bounds, so a retry cannot spin:
 
@@ -113,6 +124,15 @@ after the expiry, "Re-check 1 hour ago could not read the cluster.", or "Conditi
 ago; already retried once, so it waits for someone." A row that groups cards carries the
 longest-waiting card's sentence. The card file and its Retry and Drop buttons are unchanged; the
 daily cadence and the once-a-week repeat do not change.
+
+The digest's rows come from upstream's `stuck_in_blocked` rule, which keys off a `blocked` event. A
+breaker trip writes `gave_up` and no `blocked` event, so a breaker-parked card never had a row; and
+the rule goes quiet after any `unblocked` event, which this job's retry writes, so a `transient` card
+the job retried and the breaker then parked would have left the digest for good. The digest now
+reads breaker-parked cards from the board itself (`kanban_board_health.breaker_parked`: `blocked`,
+a `gave_up` as the newest of its block, unblock and comment events, a day old or more) and lists
+them beside the engine's, once each, as "Stopped N days ago before finishing." with the record's
+sentence.
 
 ## What this slice does not do
 

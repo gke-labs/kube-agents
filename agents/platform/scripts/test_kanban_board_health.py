@@ -1164,9 +1164,69 @@ class BlockedContextTests(unittest.TestCase):
             finally:
                 conn.close()
         self.assertEqual(context["t_b"]["recheck"],
-                         {"check_after": 500, "expires_at": 500, "last_checked_at": 600, "last_outcome": "still_blocked"})
+                         {"check_after": 500, "last_checked_at": 600, "last_outcome": "still_blocked"})
         self.assertNotIn("recheck", context["t_c"])
         self.assertNotIn("t_gone", context)
+
+
+class BreakerParkedTests(unittest.TestCase):
+    """A card the circuit breaker parked has no `blocked` event, so the engine's
+    rule never lists it; the report does, from the board."""
+
+    NOW = 1_800_000_000
+
+    def board(self, tmp, events):
+        return make_board(
+            Path(tmp),
+            tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x"}, {"id": "t_d", "status": "done"}],
+            events=events,
+        )
+
+    def parked(self, db):
+        conn = kbh.read_only_connection(db)
+        try:
+            return kbh.breaker_parked(conn, self.NOW)
+        finally:
+            conn.close()
+
+    def test_a_day_old_breaker_trip_is_a_stuck_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2},
+                                   "created_at": self.NOW - 30 * 3600}])
+            items = self.parked(db)
+        self.assertEqual([(tid, diag["data"]["age_hours"], entry["title"]) for tid, diag, entry in items],
+                         [("t_g", 30.0, "Triage x")])
+
+    def test_a_fresh_trip_a_comment_or_an_unblock_since_leaves_it_out(self):
+        for since in ({"kind": "commented", "created_at": self.NOW - 3600},
+                      {"kind": "unblocked", "created_at": self.NOW - 3600}):
+            with tempfile.TemporaryDirectory() as tmp:
+                db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                      {"task_id": "t_g", **since}])
+                self.assertEqual(self.parked(db), [], since)
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
+
+    def test_the_report_adds_it_once_beside_the_engine_s_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            make_board(
+                home,
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Breaker"},
+                       {"id": "t_stuck", "status": "blocked", "title": "Engine", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "blocked", "payload": {"kind": "needs_input"},
+                         "created_at": self.NOW - 47 * 3600}],
+            )
+            tasks, lines = kbh.report(home, runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
+                                      binary="/bin/true", now=self.NOW)
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(t["task_id"] for t in tasks), ["t_g", "t_stuck"])
+        rows = kbh.stuck_rows(tasks)[1]
+        self.assertEqual([(r["title"], r["status"]) for r in rows if r["title"] == "Breaker"],
+                         [("Breaker", "Stopped 2 days ago before finishing.")])
 
     def test_an_unmigrated_board_yields_no_context_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -111,7 +112,7 @@ class DeriveRecordsTests(Board):
         self.assertEqual(rec["kind"], "transient")
         self.assertEqual(json.loads(rec["condition"]), {"kind": kbr.CONDITION_TIME})
         self.assertEqual(rec["check_after"], NOW - 10 + kbr.RETRY_AFTER_SECONDS["transient"])
-        self.assertEqual(rec["expires_at"], rec["check_after"])
+        self.assertIsNone(rec["expires_at"])  # a time condition clears; it does not expire
 
     def test_a_breaker_trip_retries_an_hour_after_it(self):
         self.card("t_2", event="gave_up", at=NOW - 10)
@@ -216,8 +217,10 @@ class RecheckTests(Board):
         self.event("t_1", kbr.EVENT_KIND, {"outcome": kbr.OUTCOME_RETRIED}, NOW - 4 * HOUR)
         self.event("t_1", "unblocked", {}, NOW - 4 * HOUR)
         self.event("t_1", "gave_up", {"failures": 2}, NOW - 2 * HOUR)
-        self.assertEqual(self.run_recheck(), [])
+        lines = self.run_recheck()
         self.assertEqual(self.unblocked, [])
+        self.assertEqual(len(lines), 1)
+        self.assertIn("already retried once", lines[0])
         rec = self.record("t_1")
         self.assertEqual(rec["last_outcome"], kbr.OUTCOME_RETRY_LIMIT)
         self.assertEqual(rec["last_checked_at"], NOW)
@@ -233,11 +236,63 @@ class RecheckTests(Board):
         self.run_recheck(now=NOW + 60)
         self.assertEqual(len(self.unblocked), kbr.MAX_RETRIES_PER_RUN + 2)
 
-    def test_a_card_that_moved_on_loses_its_record_without_an_event(self):
+    def test_a_card_that_moved_on_loses_its_record_and_is_not_said(self):
+        """The retried event is written before the unblock, so the once-per-card
+        bound survives a crash between the two; an unblock that finds the card
+        gone leaves that event behind and nothing else."""
         self.card("t_1", kind="transient", event="blocked", at=NOW - HOUR)
-        self.run_recheck(unblock_ok=False)
-        self.assertEqual(self.events, [])
+        lines = self.run_recheck(unblock_ok=False)
+        self.assertEqual(lines, [])
+        self.assertEqual([p["outcome"] for _tid, p in self.events], [kbr.OUTCOME_RETRIED])
         self.assertIsNone(self.record("t_1"))
+
+    def test_a_block_that_changed_under_the_record_is_not_unblocked(self):
+        """Between the derive and the write, a person retried the card and its
+        worker blocked it again with a question: that block is not this record's."""
+        self.card("t_1", kind="transient", event="blocked", at=NOW - HOUR)
+        kbr.derive_records(self.conn, now=NOW)
+
+        def kube(condition):
+            # A slow read elsewhere in the run; meanwhile the card blocks anew.
+            self.event("t_1", "unblocked", {}, NOW)
+            self.event("t_1", "blocked", {"reason": "which namespace?", "kind": "needs_input"}, NOW)
+            return deployment(True)
+
+        self.card("t_0", kind="needs_input", event="blocked", title="first in the loop")
+        kbr.record_condition(self.conn, "t_0", K8S, now=NOW - HOUR)
+        self.conn.execute(f"UPDATE {kbr.TABLE} SET check_after = ? WHERE task_id = 't_0'", (NOW - 2 * HOUR,))
+        self.conn.commit()
+        lines = self.run_recheck(kube=kube)
+        self.assertEqual(self.unblocked, ["t_0"])
+        self.assertIsNone(self.record("t_1"))
+        self.assertEqual(len(lines), 1)
+
+    def test_the_two_ends_are_said_once(self):
+        self.card("t_l", kind="transient", event="blocked", at=NOW - 5 * HOUR, title="Limit")
+        self.event("t_l", kbr.EVENT_KIND, {"outcome": kbr.OUTCOME_RETRIED}, NOW - 4 * HOUR)
+        self.event("t_l", "unblocked", {}, NOW - 4 * HOUR)
+        self.event("t_l", "gave_up", {"failures": 2}, NOW - 2 * HOUR)
+        self.card("t_e", kind="needs_input", event="blocked", title="Expiry")
+        kbr.record_condition(self.conn, "t_e", K8S, now=NOW - 3 * HOUR, expires_at=NOW - HOUR)
+        lines = self.run_recheck()
+        self.assertEqual(sorted(lines), sorted([
+            "**Limit** is still blocked: its condition cleared, but it was already retried once, so it waits for someone.",
+            "**Expiry** is still blocked: deployment/web in shop on c did not become Available before the re-checks ended.",
+        ]))
+        self.assertEqual(self.unblocked, [])
+        self.assertEqual(self.run_recheck(now=NOW + HOUR), [])
+
+    def test_watch_on_a_home_with_no_board_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as home, unittest.mock.patch.dict(
+                "os.environ", {"PLATFORM_AGENT_HOME": home}):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = kbr.main(["--watch", "t_x", "--project", "p", "--location", "l", "--cluster", "c",
+                                 "--namespace", "n", "--resource", "pod/x"], now=NOW)
+            self.assertEqual(code, kbr.EXIT_NO_BOARD)
+            self.assertIn(home, err.getvalue())
+            # The cron run on the same home is a quiet success.
+            self.assertEqual(kbr.main([], now=NOW), 0)
 
     def test_a_kubernetes_condition_that_holds_refreshes_the_record(self):
         self.card("t_k", kind="needs_input", event="blocked")

@@ -70,6 +70,7 @@ import gitops_workspace
 logger = logging.getLogger(__name__)
 
 JOB_ID = "kanban-block-recheck"
+BLOCKED_STATUS = "blocked"
 #: The record of each blocked card's condition, beside Hermes' own tables.
 TABLE = "kanban_block_rechecks"
 #: The event a re-check writes on the card: a retry, an expiry, or a retry limit.
@@ -116,11 +117,40 @@ OUTCOME_RETRY_LIMIT = "retry_limit"
 FINAL_OUTCOMES = frozenset({OUTCOME_EXPIRED, OUTCOME_RETRY_LIMIT})
 DETAIL_MAX_CHARS = 300
 UNTITLED_TASK = "Untitled task"
+#: The lines a run prints, which ``deliver: "chat"`` posts: a retry, and the two
+#: ends at which the card stays blocked for a person (said once each).
 RETRIED_TIME_LINE = "Retried **{title}**: it blocked {age} ago and the wait has passed."
 RETRIED_K8S_LINE = "Retried **{title}**: {resource} in {namespace} on {cluster} is {predicate} again."
+RETRY_LIMIT_LINE = (
+    "**{title}** is still blocked: its condition cleared, but it was already retried once, "
+    "so it waits for someone."
+)
+EXPIRED_LINE = (
+    "**{title}** is still blocked: {resource} in {namespace} on {cluster} did not become "
+    "{predicate} before the re-checks ended."
+)
 AGE_UNITS = (("day", "days"), ("hour", "hours"), ("minute", "minutes"))
 HOURS_PER_DAY = 24
 MINUTES_PER_HOUR = 60
+#: The board connection, as the Session KV server's card stop opens it: a plain
+#: connection with Hermes' PRAGMAs and a short busy timeout, not
+#: ``kanban_db_connect.connect``, whose first call in a process takes a
+#: cross-process init lock, probes the whole file and runs the migrations;
+#: four times an hour that is a cost with no benefit on a board the dispatcher
+#: initialised.
+BOARD_BUSY_TIMEOUT_SECONDS = 3.0
+BOARD_PRAGMAS = (
+    "synchronous=FULL",
+    "wal_autocheckpoint=100",
+    "journal_size_limit=8388608",
+    "foreign_keys=ON",
+    "secure_delete=ON",
+    "cell_size_check=ON",
+)
+MILLISECONDS_PER_SECOND = 1000
+#: ``--watch`` on a home with no board is a person's mistake, said as one.
+EXIT_NO_BOARD = 1
+NO_BOARD_MESSAGE = "no board at {path}: is PLATFORM_AGENT_HOME the agent's data root?"
 
 TABLE_DDL = (
     f"CREATE TABLE IF NOT EXISTS {TABLE} ("
@@ -137,7 +167,7 @@ TABLE_DDL = (
     " created_at      INTEGER NOT NULL"
     ")"
 )
-BLOCKED_CARDS_SQL = "SELECT id, title FROM tasks WHERE status = 'blocked'"
+BLOCKED_CARDS_SQL = f"SELECT id, title FROM tasks WHERE status = '{BLOCKED_STATUS}'"
 LATEST_BLOCK_EVENT_SQL = (
     "SELECT id, kind, payload, created_at FROM task_events "
     f"WHERE task_id = ? AND kind IN {BLOCK_EVENT_KINDS!r} ORDER BY id DESC LIMIT 1"
@@ -153,8 +183,10 @@ CHECKED_SQL = (
     f"UPDATE {TABLE} SET checks = checks + 1, last_checked_at = ?, last_outcome = ?, last_detail = ?"
     " WHERE task_id = ?"
 )
+#: The card's own ``retried`` events, read from the JSON rather than its spelling.
 AUTO_RETRIES_SQL = (
-    "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ? AND payload LIKE ?"
+    "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = ?"
+    " AND json_extract(payload, '$.outcome') = ?"
 )
 TASK_STATUS_SQL = "SELECT status FROM tasks WHERE id = ?"
 TASK_TITLE_SQL = "SELECT title FROM tasks WHERE id = ?"
@@ -228,8 +260,9 @@ def derive_records(conn: sqlite3.Connection, *, now: int) -> list[str]:
         if condition is None:
             continue
         check_after = blocked_at + RETRY_AFTER_SECONDS[kind]
+        # A time condition has no expiry: it clears at check_after.
         conn.execute(INSERT_SQL, (task_id, event_id, kind, json.dumps(condition, sort_keys=True),
-                                  check_after, check_after, now))
+                                  check_after, None, now))
         recorded.append(task_id)
     conn.commit()
     return recorded
@@ -272,15 +305,15 @@ def record_condition(conn: sqlite3.Connection, task_id: str, condition: dict, *,
     ensure_table(conn)
     stored = validate_condition(condition)
     row = conn.execute(TASK_STATUS_SQL, (task_id,)).fetchone()
-    if row is None or row["status"] != "blocked":
+    if row is None or row["status"] != BLOCKED_STATUS:
         raise ValueError(f"{task_id} is not a blocked card")
     latest = latest_block_event(conn, task_id)
     event_id, kind = (latest[0], latest[1]) if latest else (0, None)
     check_after = now if check_after is None else int(check_after)
-    if expires_at is None:
-        expires_at = check_after + (DEFAULT_K8S_EXPIRY_SECONDS if stored["kind"] == CONDITION_K8S else 0)
+    if expires_at is None and stored["kind"] == CONDITION_K8S:
+        expires_at = check_after + DEFAULT_K8S_EXPIRY_SECONDS
     conn.execute(INSERT_SQL, (task_id, event_id, kind, json.dumps(stored, sort_keys=True),
-                              check_after, int(expires_at), now))
+                              check_after, None if expires_at is None else int(expires_at), now))
     conn.commit()
     return dict(conn.execute(RECORD_SQL, (task_id,)).fetchone())
 
@@ -333,7 +366,7 @@ def evaluate(condition: dict, *, kube) -> tuple[bool, str]:
 
 def auto_retries(conn: sqlite3.Connection, task_id: str) -> int:
     """How many times this job has already retried the card."""
-    return int(conn.execute(AUTO_RETRIES_SQL, (task_id, EVENT_KIND, f'%"outcome": "{OUTCOME_RETRIED}"%')).fetchone()[0])
+    return int(conn.execute(AUTO_RETRIES_SQL, (task_id, EVENT_KIND, OUTCOME_RETRIED)).fetchone()[0])
 
 
 def _default_unblock(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -391,10 +424,13 @@ def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unbl
             if rec["last_outcome"] in FINAL_OUTCOMES or now < int(rec["check_after"]):
                 continue
             condition = json.loads(rec["condition"])
+            title_row = conn.execute(TASK_TITLE_SQL, (task_id,)).fetchone()
+            title = title_row["title"] if title_row else ""
             event_payload = {"condition": condition, "checked_at": now, "block_event_id": rec["block_event_id"]}
-            if rec["expires_at"] is not None and now > int(rec["expires_at"]) and condition.get("kind") != CONDITION_TIME:
+            if rec["expires_at"] is not None and now > int(rec["expires_at"]):
                 _mark(conn, task_id, now, OUTCOME_EXPIRED, "")
                 append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_EXPIRED})
+                lines.append(ended_line(title, condition, EXPIRED_LINE))
                 continue
             if retries >= MAX_RETRIES_PER_RUN:
                 continue
@@ -409,31 +445,67 @@ def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unbl
             if auto_retries(conn, task_id) >= MAX_AUTO_RETRIES_PER_CARD:
                 _mark(conn, task_id, now, OUTCOME_RETRY_LIMIT, detail)
                 append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_RETRY_LIMIT, "detail": detail})
+                lines.append(ended_line(title, condition, RETRY_LIMIT_LINE))
                 continue
-            title_row = conn.execute(TASK_TITLE_SQL, (task_id,)).fetchone()
-            blocked_at = (latest_block_event(conn, task_id) or (0, None, now))[2]
-            if not unblock(conn, task_id):
-                # The card moved on between the read and the write: nothing to retry.
+            # The block this record describes must still be the card's current
+            # one: a slow cluster read earlier in the loop is time enough for a
+            # person's Retry and a worker's new block.
+            latest = latest_block_event(conn, task_id)
+            if latest is not None and latest[0] != int(rec["block_event_id"]):
                 conn.execute(DELETE_SQL, (task_id,))
                 conn.commit()
                 continue
-            retries += 1
+            blocked_at = latest[2] if latest else now
+            # The event goes first, so the once-per-card bound holds even if the
+            # unblock lands and this process dies before a second write. An
+            # unblock that then finds the card gone leaves a retried event on a
+            # card that did not retry; the window is the write itself.
+            append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_RETRIED, "detail": detail})
+            unblocked = unblock(conn, task_id)
             conn.execute(DELETE_SQL, (task_id,))
             conn.commit()
-            append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_RETRIED, "detail": detail})
-            lines.append(retried_line(title_row["title"] if title_row else "", condition, now - blocked_at))
+            if not unblocked:
+                continue
+            retries += 1
+            lines.append(retried_line(title, condition, now - blocked_at))
             logger.info("%s: retried %s (%s)", JOB_ID, task_id, detail)
         except Exception as exc:  # noqa: BLE001 — one card must not stop the rest
             logger.warning("%s: could not re-check %s: %r", JOB_ID, task_id, exc)
     return lines
 
 
-def _hermes_connect(db: Path) -> sqlite3.Connection:
-    """The board through Hermes' own connector: its PRAGMAs, its migrations, its locks."""
-    from hermes_cli import kanban_db_connect
+def ended_line(title: str, condition: dict, template: str) -> str:
+    """``RETRY_LIMIT_LINE`` or ``EXPIRED_LINE`` for the card: the two ends at
+    which it stays blocked for a person."""
+    title = " ".join(str(title or "").split()) or UNTITLED_TASK
+    fields = {"title": title}
+    if condition.get("kind") == CONDITION_K8S:
+        fields.update(resource=condition["resource"], namespace=condition["namespace"], cluster=condition["cluster"],
+                      predicate=PREDICATE_BY_KIND[resource_kind(condition["resource"])])
+    return template.format(**fields)
 
-    conn = kanban_db_connect.connect(db)
-    conn.row_factory = sqlite3.Row
+
+def _board_connect(db: Path) -> sqlite3.Connection:
+    """The board as the card stop opens it (``BOARD_PRAGMAS``): registered with
+    Hermes' ``connect_tracked`` when this Hermes has one, so its byte-level
+    probes of the file refuse to close under this connection."""
+    try:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+    except ImportError:
+        connect_tracked = None
+    kwargs = {"timeout": BOARD_BUSY_TIMEOUT_SECONDS, "isolation_level": None}
+    if connect_tracked is not None:
+        conn = connect_tracked(str(db), connect_fn=sqlite3.connect, **kwargs)
+    else:
+        conn = sqlite3.connect(str(db), **kwargs)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(BOARD_BUSY_TIMEOUT_SECONDS * MILLISECONDS_PER_SECOND)}")
+        for pragma in BOARD_PRAGMAS:
+            conn.execute(f"PRAGMA {pragma}")
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -455,8 +527,12 @@ def main(argv=None, *, conn: sqlite3.Connection | None = None, now: int | None =
     if own:
         db = board_path(agent_home())
         if not db.exists():
+            # No board on this home: nothing for the job to do, a mistake for a person.
+            if args.watch:
+                print(NO_BOARD_MESSAGE.format(path=db), file=sys.stderr)
+                return EXIT_NO_BOARD
             return 0
-        conn = _hermes_connect(db)
+        conn = _board_connect(db)
     try:
         if args.watch:
             condition = {"kind": CONDITION_K8S, **{field: getattr(args, field) for field in K8S_FIELDS}}

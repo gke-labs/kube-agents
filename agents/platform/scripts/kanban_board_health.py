@@ -367,8 +367,25 @@ RECHECK_LINES = {
     _recheck.OUTCOME_UNKNOWN: RECHECK_UNREAD_LINE,
     _recheck.OUTCOME_RETRY_LIMIT: RECHECK_LIMIT_LINE,
 }
-RECHECK_FIELDS = ("check_after", "expires_at", "last_checked_at", "last_outcome")
+RECHECK_FIELDS = ("check_after", "last_checked_at", "last_outcome")
 STATUS_SENTENCE_SEPARATOR = " "
+# A card the circuit breaker parked: `blocked`, with a `gave_up` event as its
+# newest stop and nothing said on it since. The engine's `stuck_in_blocked`
+# rule keys off a `blocked` event, which a breaker trip never writes, and goes
+# quiet after any `unblocked` event, which the re-check job's retry writes, so
+# these rows come from here. The same stale age as the engine's default.
+BLOCKED_STALE_HOURS = 24
+BREAKER_PARKED_SQL = """
+    SELECT t.id, t.title, e.created_at
+      FROM tasks t
+      JOIN task_events e ON e.id = (
+           SELECT id FROM task_events
+            WHERE task_id = t.id
+              AND kind IN ('blocked', 'gave_up', 'unblocked', 'commented')
+            ORDER BY id DESC LIMIT 1)
+     WHERE t.status = 'blocked'
+       AND e.kind = 'gave_up'
+"""
 # The words `session_kv_server._triage_authorize_clauses(True)` puts in a
 # triage report's `To authorize:` bullet when the install opens the Pull
 # Request itself (`TRIAGE_OPEN_PR_MARKER` there). The Slack notifier
@@ -783,6 +800,24 @@ def stuck_due(tasks: list, state: dict, now: float) -> tuple[bool, dict]:
     return False, {STATE_SAID_KEY: sorted(said & set(current)), STATE_SAID_AT_KEY: said_at}
 
 
+def breaker_parked(conn: sqlite3.Connection, now: float) -> list:
+    """The breaker-parked cards stuck for ``BLOCKED_STALE_HOURS`` or more, as
+    ``(task_id, diag, entry)`` items the engine's would have been; [] on an
+    unmigrated board."""
+    items = []
+    try:
+        rows = conn.execute(BREAKER_PARKED_SQL).fetchall()
+    except sqlite3.OperationalError:
+        return items
+    for row in rows:
+        age_hours = (now - float(row["created_at"] or 0)) / SECONDS_PER_HOUR
+        if age_hours < BLOCKED_STALE_HOURS:
+            continue
+        diag = {"kind": STUCK_IN_BLOCKED, "data": {"blocked_at": row["created_at"], "age_hours": round(age_hours, 1)}}
+        items.append((row["id"], diag, {"title": row["title"] or ""}))
+    return items
+
+
 def invariant_violations(conn: sqlite3.Connection) -> list:
     """Rows that no code path in kanban_db.py can produce. Empty when healthy."""
     lines = []
@@ -1006,10 +1041,12 @@ def report(home: Path, *, env=None, max_chars: int | None = None, now: float | N
     volume = data_volume_line(home)
     if volume:
         lines.append(volume)
+    now = time.time() if now is None else now
     conn = read_only_connection(db)
     try:
         violations = invariant_violations(conn)
         context = blocked_context(conn)
+        parked = breaker_parked(conn, now)
     finally:
         conn.close()
 
@@ -1044,6 +1081,8 @@ def report(home: Path, *, env=None, max_chars: int | None = None, now: float | N
         lines = []
     if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
         return None, lines
+    listed = {str(task_id) for task_id, _diag, _entry in stuck}
+    stuck.extend(item for item in parked if str(item[0]) not in listed)
     return stuck_tasks(stuck, context, now), lines
 
 

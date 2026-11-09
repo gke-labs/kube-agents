@@ -579,9 +579,12 @@ is on the agent pod at `<agent home>/kanban.db`. `kanban_board_health.py` reads
 that file read-only, asks `hermes kanban diagnostics` for the shipped rule
 engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
-with no comment or unblock since. A worker's or operator's block is sticky by
-design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked.
+with no comment or unblock since, and a card the circuit breaker parked (a
+`gave_up` as its newest stop, which the engine's rule cannot see) for as long.
+A `needs_input` or `capability` block is sticky by design and nothing retries
+it (a `transient` block or a breaker trip is retried once by
+`kanban-block-recheck`, below), and #656 was a finished report parked that way
+for weeks because nothing periodically asked.
 
 The stuck cards are said in plain words for whoever is in the channel: a
 headline counting them ("2 tasks are stuck and need someone to decide."), then
@@ -658,14 +661,17 @@ check found. A condition that has cleared retries the card through Hermes' `unbl
 call Retry makes, writes a `block_rechecked` event on the card, and prints one line, which
 `deliver: "chat"` posts ("Retried **Investigate web**: it blocked 1 hour ago and the wait has
 passed."). A condition that holds leaves the card blocked and refreshes the record, which the
-digest's row reads ("Re-checked 2 hours ago, still blocked."). No comment is written: the
-digest's rule goes quiet after a comment, and the daily report is deliberate.
+digest's row reads ("Re-checked 2 hours ago, still blocked."). The two ends at which a card stays
+blocked for a person are said once each the same way: a condition that cleared on a card already
+retried once, and a Kubernetes condition past its expiry. No comment is written: the digest's rule
+goes quiet after a comment, and the daily report is deliberate.
 
 Two condition kinds. A **time** condition is derived with no record from anyone, for the blocks
 the harness files itself: a circuit-breaker trip (`gave_up`) retries an hour after the trip, and a
 `transient` block (the rate-limit exit, or a worker's `kanban_block(kind="transient")`) thirty
 minutes after the block; cards blocked before this job existed are covered on its first run. A
-`needs_input`, `capability` or untyped block is a question for a person and gets no record. A
+`needs_input`, `capability`, `dependency` or untyped block is a question for a person, or for
+`recompute_ready`, and gets no record. A
 **Kubernetes** condition names a pod or a deployment on a cluster and clears when the pod is
 `Ready` or the deployment `Available`, read with one `kubectl get -o json` through the shell
 sandbox on the per-cluster kubeconfig `stall-watch` keeps there. Record one on the pod:

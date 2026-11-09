@@ -111,7 +111,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 | `kanban-workspace-gc` | script, `kanban_workspace_gc.py` | Daily 05:40 | Kanban Workspace GC |
 | `session-retention` | script, `session_retention.py` | Daily 05:50 | Session Retention |
 | `kanban-board-health` | script, `kanban_board_health.py` | Daily 12:35 | Kanban Board Health |
-| `kanban-block-recheck` | script, `kanban_block_recheck.py` | `7,22,37,52 * * * *` | Kanban Block Re-check |
+| `kanban-block-recheck` | script, `kanban_block_recheck.py` | Four times an hour (:07, :22, :37, :52) | Kanban Block Re-check |
 | `feedback-prompt` | script, `feedback_prompt.py` | Daily 13:00 | Feedback Prompt |
 | `eod-event-watcher-daily-report` | script, `eod_report_generator.py` | Weekdays 21:00 | Event Watcher Daily Activity Recap |
 | `stall-watch` | script, `stall_watch.py` | Every 30 minutes | Controller Stall Watch |
@@ -129,7 +129,7 @@ The entries that share the Platform Agent's roster without being audits. The tab
 - `github-repo-watcher`: a poller, described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports).
 - `kanban-workspace-gc`: collects finished workers' workspaces, removes a sandbox cluster profile home the agent pod no longer has a profile for, and logs any unexpected top-level entries in the sandbox's profile homes.
 - `session-retention`: runs Hermes' own session prune daily for the machine home and every profile. It deletes ended sessions inactive for `spec.harness.retention.sessionDays` (default 90), and rotated log backups older than that. Hermes otherwise prunes a store only when a CLI or the gateway starts, which the gateway's own store and an idle profile's never do. Before each prune it pins every session another session still names as its parent, so that link survives.
-- `kanban-board-health`: names any kanban card blocked for more than a day in plain words, newest first, by its title and how long it has waited (cards with the same title that wait on a person, or do not, share a row; in Slack, and on Google Chat under `spec.mode: next`, each row has Retry and Drop buttons, which unblock or archive its cards). It speaks when a card first gets stuck and then once a week while any stays stuck, because a worker's or operator's block is sticky by design and a card nobody was told about would otherwise wait forever.
+- `kanban-board-health`: names any kanban card blocked for more than a day in plain words, newest first, by its title and how long it has waited (cards with the same title that wait on a person, or do not, share a row; in Slack, and on Google Chat under `spec.mode: next`, each row has Retry and Drop buttons, which unblock or archive its cards). It speaks when a card first gets stuck and then once a week while any stays stuck, because a block that waits on a person is sticky by design and a card nobody was told about would otherwise wait forever.
 
   When the agent's data volume is 90% full or more, a report with other findings leads with a line saying so, in the home-channel warning's words. When the board cannot be read because the disk is full, it says that instead of a bare error. Another read error keeps the bare error, followed by the volume line while the volume is 90% full or more.
 
