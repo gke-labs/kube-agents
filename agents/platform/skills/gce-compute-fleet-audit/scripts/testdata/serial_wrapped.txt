@@ -1,0 +1,11 @@
+-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T02:48:17.439738+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T02:58:17.438909+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T02:58:22.455119+00:00 startup-fail-seeded mwlid_extension[723]: Cloud Logging Client Error: rpc error: code = Unauthenticated desc = transport: per-RPC creds failed due to error: credentials: cannot fetch token: [REDACTED_SECRET] [REDACTED_SECRET] metadata "instance/service-accounts/default/token?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Flogging.write" not defined
+2026-10-17T03:08:17.438144+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T03:18:17.438985+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T03:28:17.438177+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T03:28:22.458063+00:00 startup-fail-seeded mwlid_extension[723]: Cloud Logging Client Error: rpc error: code = Unauthenticated desc = transport: per-RPC creds failed due to error: credentials: cannot fetch token: [REDACTED_SECRET] [REDACTED_SECRET] metadata "instance/service-accounts/default/token?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Flogging.write" not defined
+2026-10-17T03:38:17.438346+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T03:48:17.436360+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run
+2026-10-17T03:58:17.439281+00:00 startup-fail-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run

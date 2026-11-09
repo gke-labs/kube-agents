@@ -63,7 +63,12 @@ Field contracts assumed of `gcloud ... --format=json` output:
   cost the project its other check — but it does subtract from coverage: the
   instances that could not be read are named in the target's `limitations`,
   and a project where *every* RUNNING instance refused the read lists the slug
-  in `checks_unevaluated` rather than reporting a clean fleet.
+  in `checks_unevaluated` rather than reporting a clean fleet. The body is
+  what is left in a ring buffer of about 1 MiB, and the guest prints its
+  startup-script lines once per boot, so a console that holds no line opening
+  a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script counts
+  against coverage the same way: named in `limitations`, and the slug
+  unevaluated when no instance's run could be read.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
@@ -246,9 +251,17 @@ STARTUP_FAILURE_PATTERN = re.compile(
     r"|startup-script(?:-url)? exit status [1-9]\d*"
     r"|Finished running startup scripts with error"
 )
-# What `google_metadata_script_runner` prints as each startup-script run
-# begins, on old and current guest agents alike.
-STARTUP_RUN_MARKER = "Starting startup scripts"
+# The lines that open one startup-script run. The guest agent on the fleet
+# stack's Debian 12 VM (20260715.00, its 2026-10-07 boot read 2026-11-09) prints
+# `Running metadata script runner (version <v>) for "startup" event`; the
+# older agents print `Starting startup scripts`; and systemd prints `Starting
+# google-startup-scripts.service` before the unit's runner starts, whichever
+# agent runs in it.
+STARTUP_RUN_PATTERN = re.compile(
+    r"Starting startup scripts"
+    r'|Running metadata script runner \(version [^)]*\) for "startup" event'
+    r"|Starting google-startup-scripts\.service"
+)
 
 # §2.5's threshold. Measured against the snapshot's own `creationTimestamp`,
 # which is what this collector can see; §2.5 words the condition as the source
@@ -451,6 +464,27 @@ UNREAD_SERIAL_LIMITATION = (
     "`compute instances get-serial-port-output` failed for all {total} "
     "RUNNING instance(s) that run a startup script, so no serial console output was read. They were "
     "enumerated, not examined."
+)
+
+# A console was read, but it holds no line that opens a startup-script run
+# (`STARTUP_RUN_PATTERN`) and no failure line: the boot that ran the script
+# has rotated out of the ring buffer (`startup_run_visible`). The check passed
+# over these instances rather than cleared them.
+ROTATED_SERIAL_LIMITATION = (
+    "gce-startup-script-status read the serial console of {count} of the "
+    "{total} RUNNING instance(s) on this project that run a startup script, "
+    "but the console no longer holds the boot that ran the script: the serial "
+    "buffer keeps about 1 MiB, and later guest output has pushed the "
+    "startup-script lines out. The check passed over these instances rather "
+    "than cleared them: {names}."
+)
+# Every target was either refused or rotated, at least one of them rotated,
+# so the check reached no verdict on this project.
+UNSEEN_RUN_REASON = (
+    "No RUNNING instance whose console §2.1 reads on this project showed its "
+    "last startup-script run: {rotated} console(s) had rotated past the boot "
+    "that ran the script and {unread} refused `compute instances "
+    "get-serial-port-output`, so §2.1's markers had no run to match against."
 )
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
@@ -782,7 +816,7 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     lines = serial_text.splitlines()
     # The console buffer outlives a guest reboot, so a failure an operator has
     # since fixed is still in it. Only the last startup-script run counts.
-    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_MARKER in line]
+    starts = [index for index, line in enumerate(lines) if STARTUP_RUN_PATTERN.search(line)]
     for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
@@ -795,6 +829,20 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
                 "needs_triage": TRIAGE_GKE_NODE,
             }
     return None
+
+
+def startup_run_visible(serial_text: str) -> bool:
+    """Does the console still hold the start of a startup-script run?
+
+    `get-serial-port-output` returns what is left in a ring buffer of about
+    1 MiB, and the guest prints its startup-script lines once, at boot. A VM
+    that logs every few minutes pushes them out: the fleet's planted VM, which
+    prints two guest-agent errors an hour because it has no service account,
+    lost its boot lines about three weeks after it booted. A console with no
+    run marker and no failure line is therefore no evidence of a clean run.
+    The caller lists such an instance as passed over, not cleared.
+    """
+    return any(STARTUP_RUN_PATTERN.search(line) for line in serial_text.splitlines())
 
 
 def _metadata_keys(payload: dict, field: str) -> set[str]:
@@ -1239,7 +1287,15 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             if project_wide
             else running_instances(instances, require_startup_script=True)
         )
+        scripted = set(running_instances(instances, require_startup_script=True))
+        # The instances a script is known to run on: its own metadata sets
+        # one, or the common metadata read succeeded and sets one. Only on
+        # these does a console with no run marker mean the run rotated out.
+        # The fallback after a failed `project-info` read also reads consoles
+        # with no script behind them, where no marker is the expected shape.
+        common_script = isinstance(info_parsed, dict) and project_wide
         unread: list[str] = []
+        rotated: list[str] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
             result = run(argv)
@@ -1254,6 +1310,12 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
                 candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
+            elif (common_script or (instance_name, zone) in scripted) and not startup_run_visible(
+                result.stdout
+            ):
+                # The console was read, but the boot that ran the script is
+                # no longer in it. No failure line here proves nothing.
+                rotated.append(f"{instance_name} ({zone})")
 
         if not instances:
             not_applicable.append(
@@ -1284,14 +1346,35 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             # this listing exists to refuse.
             unevaluated.append({"check": STARTUP_SLUG, "reason": UNREAD_SERIAL_REASON})
             limitations.append(UNREAD_SERIAL_LIMITATION.format(total=len(targets)))
-        elif unread:
-            limitations.append(
-                PARTIAL_SERIAL_LIMITATION.format(
-                    read=len(targets) - len(unread),
-                    total=len(targets),
-                    names=", ".join(sorted(unread)),
+        else:
+            if len(unread) + len(rotated) == len(targets):
+                # Every console was refused or had lost its last boot, so the
+                # check decided nothing on this project: unevaluated, which
+                # keeps an open finding open instead of retiring it as clean.
+                unevaluated.append(
+                    {
+                        "check": STARTUP_SLUG,
+                        "reason": UNSEEN_RUN_REASON.format(
+                            rotated=len(rotated), unread=len(unread)
+                        ),
+                    }
                 )
-            )
+            if unread:
+                limitations.append(
+                    PARTIAL_SERIAL_LIMITATION.format(
+                        read=len(targets) - len(unread),
+                        total=len(targets),
+                        names=", ".join(sorted(unread)),
+                    )
+                )
+            if rotated:
+                limitations.append(
+                    ROTATED_SERIAL_LIMITATION.format(
+                        count=len(rotated),
+                        total=len(targets),
+                        names=", ".join(sorted(rotated)),
+                    )
+                )
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(

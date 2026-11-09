@@ -57,6 +57,36 @@ def unevaluated(entry: dict) -> dict:
     return {e["check"]: e["reason"] for e in entry.get("checks_unevaluated") or []}
 
 
+# A console that still holds a startup-script run that succeeded: the run's
+# opening line, as the current guest agent prints it, and its closing line.
+# A console without the opening line has lost its boot to the ring buffer and
+# leaves the check unevaluated (`startup_run_visible`), so a clean pass needs it.
+CLEAN_BOOT = (
+    'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "startup" event\n'
+    "google_metadata_script_runner[845]: Found startup-script in metadata\n"
+    "google_metadata_script_runner[845]: Finished running startup scripts\n"
+)
+
+# Recorded serial output (testdata/). `serial_wrapped.txt` is the head of the
+# planted VM's console as a pool project's nightly audit read it on
+# 2026-11-09: the buffer starts mid-line on 2026-10-17, holds only the guest
+# agent's periodic lines, and no longer holds the 2026-10-09 boot.
+# `serial_fresh_boot_failed.txt` is the same stack's VM on a dev project,
+# around its 2026-10-07 boot, read 2026-11-09 (host renamed to the pool's
+# name, interface and route lines dropped).
+TESTDATA = Path(__file__).resolve().parent / "testdata"
+WRAPPED_SERIAL = (TESTDATA / "serial_wrapped.txt").read_text(encoding="utf-8")
+FRESH_FAILED_SERIAL = (TESTDATA / "serial_fresh_boot_failed.txt").read_text(encoding="utf-8")
+RECORDED_FAILURE_LINE = (
+    "2026-10-07T02:18:03.065033+00:00 startup-fail-seeded google_metadata_script_runner[845]: "
+    'Script "startup-script" failed with error: exit status 1'
+)
+# The same boot with its failure line taken out: what a script that exits 0
+# leaves on this guest agent, which prints no line of its own for a success.
+FRESH_CLEAN_SERIAL = "".join(
+    line for line in FRESH_FAILED_SERIAL.splitlines(keepends=True) if "failed with error" not in line
+)
+
 # The metadata block that makes an instance one §2.1 has anything to say about.
 # Without a startup script `google_metadata_script_runner` never runs, so the
 # exit status the check greps for cannot appear and the instance is not a
@@ -211,6 +241,47 @@ class StartupScriptTest(unittest.TestCase):
         self.assertIsNone(cf.check_startup_script("vm-1", "us-central1-a", serial))
         failing_again = serial + 'google_metadata_script_runner[812]: Script "startup-script" failed with error: exit status 2\n'
         self.assertIsNotNone(cf.check_startup_script("vm-1", "us-central1-a", failing_again))
+
+    def test_the_current_agents_run_line_also_bounds_the_last_run(self):
+        """The guest agent on the fleet's Debian 12 VM prints `Running metadata
+        script runner ... for "startup" event`, not `Starting startup scripts`,
+        so before it was a run marker the whole console counted and a fixed
+        failure stayed a finding until the buffer rotated."""
+        earlier = FRESH_FAILED_SERIAL
+        later = FRESH_CLEAN_SERIAL.replace("[845]", "[912]")
+        self.assertIsNone(cf.check_startup_script("vm-1", "us-central1-a", earlier + later))
+        self.assertIsNotNone(cf.check_startup_script("vm-1", "us-central1-a", later + earlier))
+
+    def test_each_run_marker_counts(self):
+        for line in (
+            "google_metadata_script_runner[926]: Starting startup scripts (version 20250101)",
+            'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "startup" event',
+            "systemd[1]: Starting google-startup-scripts.service - Google Compute Engine Startup Scripts...",
+        ):
+            with self.subTest(line):
+                self.assertTrue(cf.startup_run_visible(line + "\n"))
+        # The shutdown event is a different run, and it is not a boot.
+        self.assertFalse(cf.startup_run_visible(
+            'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "shutdown" event\n'
+        ))
+
+    def test_a_recorded_wrapped_buffer_shows_no_run(self):
+        """The red: the console the 2026-11-09 nightly read. No failure line
+        and no run marker, which the check used to report as clean."""
+        self.assertIsNone(cf.check_startup_script("startup-fail-seeded", "us-central1-a", WRAPPED_SERIAL))
+        self.assertFalse(cf.startup_run_visible(WRAPPED_SERIAL))
+
+    def test_a_recorded_fresh_boot_is_a_finding(self):
+        for text in (FRESH_FAILED_SERIAL, FRESH_FAILED_SERIAL.replace("\n", "\r\n")):
+            with self.subTest(crlf="\r" in text):
+                hit = cf.check_startup_script("startup-fail-seeded", "us-central1-a", text)
+                self.assertEqual(hit["object"], "ComputeInstance/us-central1-a/startup-fail-seeded")
+                self.assertEqual(hit["excerpt"], RECORDED_FAILURE_LINE)
+                self.assertTrue(cf.startup_run_visible(text))
+
+    def test_a_fresh_boot_whose_script_succeeded_is_clean_and_visible(self):
+        self.assertIsNone(cf.check_startup_script("startup-fail-seeded", "us-central1-a", FRESH_CLEAN_SERIAL))
+        self.assertTrue(cf.startup_run_visible(FRESH_CLEAN_SERIAL))
 
     def test_a_windows_startup_script_failure_is_flagged(self):
         line = 'GCEMetadataScripts: Script "windows-startup-script-ps1" failed with error: exit status 1'
@@ -394,7 +465,7 @@ class CollectProjectTest(unittest.TestCase):
         responses = {
             "instances list": run_of(0, one_running_instance()),
             "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
-            "get-serial-port-output": run_of(0, "boot ok\n"),
+            "get-serial-port-output": run_of(0, CLEAN_BOOT),
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
             "node-groups list": run_of(0, "[]"),
@@ -1034,6 +1105,106 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
         self.assertNotIn(cf.STARTUP_SLUG, {e["check"] for e in entry["checks_not_applicable"]})
 
+    def test_a_rotated_console_is_unevaluated_not_clean(self):
+        """The planted VM after three weeks: its console was read, the boot
+        that ran the script is gone from it, and the project used to come
+        back with no candidate and the check in `checks_run`."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance("startup-fail-seeded")),
+                "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
+            })),
+        )
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertIn("rotated past the boot", unevaluated(entry)[cf.STARTUP_SLUG])
+        self.assertNotIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+        self.assertIn("passed over these instances rather than cleared them: startup-fail-seeded (us-central1-a)", entry["limitations"])
+
+    def test_a_fresh_console_is_still_a_finding(self):
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance("startup-fail-seeded")),
+                "get-serial-port-output": run_of(0, FRESH_FAILED_SERIAL),
+            })),
+        )
+        self.assertEqual([c["excerpt"] for c in entry["candidates"]], [RECORDED_FAILURE_LINE])
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertNotIn("limitations", entry)
+
+    def test_one_rotated_console_beside_a_read_one_is_a_partial_read(self):
+        instances = (
+            '[{"name": "vm-1", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}, '
+            '{"name": "vm-2", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}]'
+        )
+        entry = cf.collect_project(
+            "proj-1",
+            # Ahead of `clean()`'s catch-all serial stub: first match wins.
+            run=self.fake_run({
+                "get-serial-port-output vm-1": run_of(0, WRAPPED_SERIAL),
+                "get-serial-port-output vm-2": run_of(0, FRESH_FAILED_SERIAL),
+                **self.clean(**{"instances list": run_of(0, instances)}),
+            }),
+        )
+        self.assertEqual([c["object"] for c in entry["candidates"]], ["ComputeInstance/z1/vm-2"])
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+        self.assertIn("1 of the 2 RUNNING instance(s)", entry["limitations"])
+        self.assertIn("vm-1 (z1)", entry["limitations"])
+
+    def test_rotated_and_refused_consoles_together_are_unevaluated(self):
+        instances = (
+            '[{"name": "vm-1", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}, '
+            '{"name": "vm-2", "status": "RUNNING", "zone": "https://x/zones/z1", ' + STARTUP_META + '}]'
+        )
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run({
+                "get-serial-port-output vm-1": run_of(0, WRAPPED_SERIAL),
+                "get-serial-port-output vm-2": run_of(1, "", "instance not ready"),
+                **self.clean(**{"instances list": run_of(0, instances)}),
+            }),
+        )
+        reason = unevaluated(entry)[cf.STARTUP_SLUG]
+        self.assertIn("1 console(s) had rotated", reason)
+        self.assertIn("1 refused", reason)
+        self.assertIn("read serial console output from 1 of the 2", entry["limitations"])
+        self.assertIn("passed over these instances rather than cleared them: vm-1 (z1)", entry["limitations"])
+
+    def test_a_project_wide_script_makes_a_rotated_console_unevaluated(self):
+        """The common metadata sets the script, so it runs on an instance
+        whose own metadata sets none, and that console owes a run marker."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance(startup_script=False)),
+                "project-info describe": run_of(
+                    0, '{"commonInstanceMetadata": {"items": [{"key": "startup-script"}]}}'
+                ),
+                "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
+            })),
+        )
+        self.assertIn(cf.STARTUP_SLUG, unevaluated(entry))
+
+    def test_the_failed_project_info_fallback_does_not_demand_a_run_marker(self):
+        """After a failed `project-info` read every RUNNING instance is read,
+        scripted or not. An instance with no script prints no run marker on
+        any boot, so its console is a pass, as before."""
+        entry = cf.collect_project(
+            "proj-1",
+            run=self.fake_run(self.clean(**{
+                "instances list": run_of(0, one_running_instance(startup_script=False)),
+                "project-info describe": run_of(1, "", "permission denied"),
+                "get-serial-port-output": run_of(0, WRAPPED_SERIAL),
+            })),
+        )
+        self.assertNotIn(cf.STARTUP_SLUG, unevaluated(entry))
+        self.assertNotIn("limitations", entry)
+        self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
+
     # --- provenance ---------------------------------------------------------- #
 
     def test_the_recorded_command_is_the_argv_that_ran(self):
@@ -1051,7 +1222,7 @@ class CollectProjectTest(unittest.TestCase):
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
-                return run_of(0, "boot ok\n")
+                return run_of(0, CLEAN_BOOT)
             return run_of(0, "[]")
 
         entry = cf.collect_project("proj-1", run=run)
@@ -1091,7 +1262,7 @@ class CollectProjectTest(unittest.TestCase):
             if "instances list" in joined:
                 return run_of(0, f"[{instances}]")
             if "get-serial-port-output" in joined:
-                return run_of(0, "boot ok\n")
+                return run_of(0, CLEAN_BOOT)
             return run_of(0, "[]")
 
         entry = cf.collect_project("proj-1", run=run)
@@ -1314,7 +1485,7 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         not report a gap it can never close."""
         import audit_report
 
-        manifest = self.fleet(**{"get-serial-port-output": run_of(0, "boot ok\n")})
+        manifest = self.fleet(**{"get-serial-port-output": run_of(0, CLEAN_BOOT)})
         data = self._document(manifest)
         audit_report.cross_check_manifest(data, manifest)
         # The one gap is the `--project-id` narrowing, which is the run's to
@@ -1323,6 +1494,18 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
             [g for g in audit_report.coverage_gaps(data) if cf.UNENUMERATED_PROJECTS_TARGET not in g],
             [],
         )
+
+    def test_a_rotated_console_makes_the_run_partial(self):
+        """What `finish` does with the rotated console: a coverage gap on the
+        project, so the ledger stays open instead of retiring as clean."""
+        import audit_report
+
+        manifest = self.fleet(**{"get-serial-port-output": run_of(0, WRAPPED_SERIAL)})
+        data = self._document(manifest)
+        audit_report.cross_check_manifest(data, manifest)
+        gaps = [g for g in audit_report.coverage_gaps(data) if cf.UNENUMERATED_PROJECTS_TARGET not in g]
+        self.assertEqual(len(gaps), 1, gaps)
+        self.assertIn(cf.STARTUP_SLUG, gaps[0])
 
     def test_the_collectors_evidence_is_adopted_onto_the_model_finding(self):
         """The whole point of the conversion: the excerpt that ships is the
@@ -1576,7 +1759,7 @@ class AdversarialReviewRegressionTest(unittest.TestCase):
             run=self.fake_run(
                 {
                     "instances list": run_of(0, one_running_instance()),
-                    "get-serial-port-output": run_of(0, "boot ok\n"),
+                    "get-serial-port-output": run_of(0, CLEAN_BOOT),
                     "disks list": run_of(0, "[]"),
                     "snapshots list": run_of(0, "[]"),
                 }
@@ -1837,7 +2020,7 @@ class AutoscalingNodeGroupReadTest(unittest.TestCase):
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
-                return run_of(0, "boot ok\n")
+                return run_of(0, CLEAN_BOOT)
             if "project-info describe" in joined:
                 return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
             if "list-nodes" in joined:
@@ -1876,7 +2059,7 @@ class ExcludedNodeGroupCountTest(unittest.TestCase):
             if "instances list" in joined:
                 return run_of(0, one_running_instance())
             if "get-serial-port-output" in joined:
-                return run_of(0, "boot ok\n")
+                return run_of(0, CLEAN_BOOT)
             if "project-info describe" in joined:
                 return run_of(0, NO_PROJECT_STARTUP_SCRIPT)
             if "list-nodes ng-fixed" in joined:
@@ -1931,7 +2114,7 @@ class NewChecksInCollectProjectTest(unittest.TestCase):
         base = {
             "instances list": run_of(0, one_running_instance()),
             "project-info describe": run_of(0, NO_PROJECT_STARTUP_SCRIPT),
-            "get-serial-port-output": run_of(0, "boot ok\n"),
+            "get-serial-port-output": run_of(0, CLEAN_BOOT),
             "instance-groups managed list": run_of(0, json.dumps([mig()])),
             "node-groups list-nodes": run_of(0, "[]"),
             "node-groups list": run_of(0, "[]"),
