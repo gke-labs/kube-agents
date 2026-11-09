@@ -927,7 +927,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := ReservedServiceAccountOverride(instance); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1006,7 +1006,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := validateExtraVolumeMounts(instance, agentPlugins...); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1025,7 +1025,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1044,7 +1044,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
 			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, workloadNotRendered); statusErr != nil {
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, brokerNotReconciled); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			if guardrailErr != nil {
@@ -5803,29 +5803,37 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
-// workloadRenderState says whether the reconcile pass parking the agent on
-// Degraded reached the render, and is the argument updateStatusDegraded takes
-// to decide whether it may touch the VolumesDropped condition. Named rather
-// than a bare bool because the answer is not obvious from the call site: the
-// refusals read top to bottom and only their position in Reconcile says which
-// side of reconcileWorkload they are on.
-type workloadRenderState bool
+// workloadRenderState says how far the reconcile pass parking the agent on
+// Degraded got, and is the argument updateStatusDegraded takes to decide
+// which conditions it may touch: VolumesDropped and ReplicasLimited only after
+// the render, CredentialProxyExecReady only after the credential broker's
+// reconcile. Named rather than a bare value because the answer is not obvious
+// from the call site: the refusals read top to bottom and only their position
+// in Reconcile says which side of reconcileCredentialProxy and
+// reconcileWorkload they are on.
+type workloadRenderState int
 
 const (
+	// brokerNotReconciled is the four refusals above reconcileCredentialProxy,
+	// which return with the broker and its exec tier untouched:
+	// ReservedServiceAccountName, ForbiddenVolumeMount,
+	// ShellSandboxCannotBeDisabled, RuntimeClassNotFound.
+	brokerNotReconciled workloadRenderState = iota
+	// workloadNotRendered is the refusal between the broker's reconcile and the
+	// render, which returns with the workload untouched:
+	// EgressAllowlistRefused.
+	workloadNotRendered
 	// workloadRendered is the three refusals below the render:
 	// ModeNotRecognized, A2AProvisionFailed, ShellSandboxKeysMissing.
-	workloadRendered workloadRenderState = true
-	// workloadNotRendered is the four above it, which return with the workload
-	// untouched: ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
-	// RuntimeClassNotFound, EgressAllowlistRefused.
-	workloadNotRendered workloadRenderState = false
+	workloadRendered
 )
 
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded and
-// CredentialProxyExecReady conditions, which are not gated on the render.
+// VolumesDropped and ReplicasLimited conditions, the DataVolumeNotExpanded condition,
+// which is not gated, and the CredentialProxyExecReady condition, which execReady
+// leaves out (known false) on a pass that did not reconcile the broker.
 func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
@@ -5838,7 +5846,7 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
-	if !rendered {
+	if rendered != workloadRendered {
 		return true
 	}
 	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
@@ -5870,9 +5878,10 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
 //
-// rendered says whether the caller got as far as reconcileWorkload, and gates
-// the VolumesDropped condition alone -- everything else here is written either
-// way. See workloadRenderState.
+// rendered says how far the caller got: past reconcileWorkload gates the
+// VolumesDropped and ReplicasLimited conditions, and past
+// reconcileCredentialProxy gates CredentialProxyExecReady. See
+// workloadRenderState.
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState) error {
 	// VolumesDropped rides along on a pass that rendered, because the strip it
 	// reports happens at render and three of the refusals that land here
@@ -5891,7 +5900,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
-	if rendered {
+	if rendered == workloadRendered {
 		// Qualified the same way updateStatusReady qualifies it. That function
 		// reads the roll off the gateway workload it fetches anyway; this one
 		// is handed the CR and the refusal and nothing else, so it reads the
@@ -5915,7 +5924,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// ReplicasLimited rides along on the same terms as VolumesDropped: the cap
 	// happens at render, so only a pass that rendered writes or clears it.
 	replicasLimitedMsg := ""
-	if rendered {
+	if rendered == workloadRendered {
 		replicasLimitedMsg = replicasLimitedMessage(agent)
 	}
 	// DataVolumeNotExpanded rides along on every park, rendered or not:
@@ -5924,11 +5933,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	// CredentialProxyExecReady on every park, rendered or not: the tier is
-	// applied before the egress allowlist refusal parks unrendered, and a park
-	// can last days (ShellSandboxKeysMissing). The read reports the tier as it
-	// stands in the cluster, so it is true on any pass.
-	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	// CredentialProxyExecReady on every park that reconciled the broker,
+	// rendered or not: the tier is applied before the egress allowlist refusal
+	// parks unrendered, and a park can last days (ShellSandboxKeysMissing). A
+	// park above the broker's reconcile leaves it as it stands, on the
+	// VolumesDropped reasoning: the tier was neither applied nor removed, so a
+	// read would follow exec.replicas ahead of the cluster.
+	execReady := credentialProxyExecReadyRead{}
+	if rendered != brokerNotReconciled {
+		execReady = r.readCredentialProxyExecReady(ctx, agent)
+	}
 	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
@@ -5955,7 +5969,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
-	if rendered {
+	if rendered == workloadRendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}

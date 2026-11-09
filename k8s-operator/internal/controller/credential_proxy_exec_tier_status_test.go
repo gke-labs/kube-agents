@@ -281,6 +281,74 @@ func TestAParkThatRenderedTheTierStillReportsIt(t *testing.T) {
 	}
 }
 
+// earlyParkTierCondition renders an agent at exec.replicas from, then parks it
+// on RuntimeClassNotFound, above the broker's reconcile, with the field at to.
+// It returns the condition on the park and after the park clears.
+func earlyParkTierCondition(t *testing.T, from, to int32) (onPark, afterPark *metav1.Condition) {
+	t.Helper()
+	scheme := setupScheme()
+	agent := execTierTestAgent(ptr.To(from))
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	stored := func() *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	edit := func(got *agentv1alpha1.PlatformAgent, runtimeClass *string, replicas int32) {
+		t.Helper()
+		got.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{RuntimeClassName: runtimeClass}
+		got.Spec.Deployment.CredentialProxy.Exec.Replicas = ptr.To(replicas)
+		if err := cl.Update(ctx, got); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stored()
+	edit(stored(), ptr.To("missing-runtime-class"), to)
+	parked := stored()
+	if ready := meta.FindStatusCondition(parked.Status.Conditions, "Ready"); ready == nil || ready.Reason != reasonRuntimeClassNotFound {
+		t.Fatalf("Ready = %+v, want the %s park", ready, reasonRuntimeClassNotFound)
+	}
+	onPark = meta.FindStatusCondition(parked.Status.Conditions, credentialProxyExecReadyConditionType)
+	edit(parked, nil, to)
+	afterPark = meta.FindStatusCondition(stored().Status.Conditions, credentialProxyExecReadyConditionType)
+	return onPark, afterPark
+}
+
+// A park above the broker's reconcile leaves the tier running as it was, so
+// the condition stays too, until the park clears and the tier goes.
+func TestAnEarlyParkKeepsTheConditionWhenTheFieldGoesToZero(t *testing.T) {
+	onPark, afterPark := earlyParkTierCondition(t, 2, 0)
+	if onPark == nil || onPark.Message != "0 of 2 exec-tier replicas are Ready." {
+		t.Fatalf("on the park: %+v, want the condition as it stood", onPark)
+	}
+	if afterPark != nil {
+		t.Fatalf("after the park, at 0: %+v", afterPark)
+	}
+}
+
+// A park above the broker's reconcile applies no tier, so no condition reads
+// as a short one, until the park clears and the tier renders.
+func TestAnEarlyParkAddsNoConditionWhenTheFieldGoesAboveZero(t *testing.T) {
+	onPark, afterPark := earlyParkTierCondition(t, 0, 2)
+	if onPark != nil {
+		t.Fatalf("on the park: %+v, want no condition for a tier never applied", onPark)
+	}
+	if afterPark == nil || afterPark.Message != "0 of 2 exec-tier replicas are Ready." {
+		t.Fatalf("after the park: %+v", afterPark)
+	}
+}
+
 // On a today install nothing else asks for a sooner pass, so the short tier's
 // requeue is the one that brings the next read: 30s while short, and the
 // steady-state interval again once every replica is Ready.

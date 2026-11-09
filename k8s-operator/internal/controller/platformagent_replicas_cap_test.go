@@ -233,7 +233,7 @@ func TestTheDegradedPathCarriesReplicasLimitedOnlyAfterARender(t *testing.T) {
 				t.Fatalf("updateStatusDegraded failed: %v", err)
 			}
 			cond := meta.FindStatusCondition(agent.Status.Conditions, replicasLimitedConditionType)
-			if bool(tc.rendered) != (cond != nil) {
+			if (tc.rendered == workloadRendered) != (cond != nil) {
 				t.Fatalf("%s present = %v after a pass with rendered=%v", replicasLimitedConditionType, cond != nil, tc.rendered)
 			}
 			if cond != nil && cond.Reason != replicasLimitedReason {
