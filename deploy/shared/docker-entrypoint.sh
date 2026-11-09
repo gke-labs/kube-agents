@@ -560,8 +560,10 @@ fi
 # DEFAULTS_PLUGINS_DIR is copied over the volume's, except PINNED_EXTERNAL_PLUGINS. The copy
 # adds and overwrites without pruning, so a plugin's own runtime state on the volume
 # survives, and the loop walks directories only, so the files at the top of the plugins
-# directory are left as they are. A symlink is an operator-mounted plugin volume and is
-# left alone.
+# directory are left as they are. A symlinked destination is left alone, as in the cluster
+# loop. An operator-mounted default-profile plugin is a mount at this path, not a symlink;
+# its name is a Kubernetes object name, so it cannot carry the underscore the shipped
+# names do, and only `common` could collide with one.
 #
 # Each file is copied to a temporary name beside its target and renamed over it, as the
 # cluster loop in step 2.6 does: replicas share this volume, and a sibling that imports a

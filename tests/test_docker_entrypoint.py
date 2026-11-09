@@ -1685,6 +1685,35 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
         self.assertEqual(refreshed, "image\n", "one failed plugin stopped the loop")
 
+    def test_a_failed_rename_in_step_2b_removes_its_temporary_file(self):
+        # The copy lands first and the rename fails: the temporary file is removed, the old
+        # module stays whole, and the start continues with a warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            shims = pathlib.Path(tmp) / "bin"
+            shims.mkdir()
+            (shims / "mv").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            (shims / "mv").chmod(0o755)
+            proc = subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image) + "\necho reached-the-next-step"],
+                env={**os.environ, "TARGET_DIR": str(pvc), "PATH": f"{shims}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            kept = (pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8")
+            leftovers = sorted(p.name for p in (pvc / "plugins" / "chat_metrics").iterdir() if ".refresh." in p.name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reached-the-next-step", proc.stdout)
+        self.assertIn("WARN: could not refresh", proc.stderr)
+        self.assertEqual(kept, "stale\n")
+        self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
+
     def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
         # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
         # an old plugin beside the new script writes no greeting hold.
