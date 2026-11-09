@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -70,9 +71,28 @@ class Repo:
         self.rows = [f"| {release} | {change} | x |\n" if f"| {change} |" in r else r for r in self.rows]
         self.write_page()
 
-    def check(self) -> tuple[int, str]:
-        result = subprocess.run([sys.executable, str(SCRIPT)], cwd=self.root, capture_output=True, text=True)
+    def check(self, **env: str) -> tuple[int, str]:
+        # The run's own GitHub Actions event is not the one under test.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        result = subprocess.run([sys.executable, str(SCRIPT)], cwd=self.root, capture_output=True, text=True,
+                                env={**clean, **env})
         return result.returncode, result.stderr
+
+    def mislabel(self) -> str:
+        """A row labelled 1.0.0 that 1.0.0, cut from the commit before it, does not contain."""
+        base = self.commit("feat: before the branch point")
+        self.commit("fix: b", row=row("1.0.0", "change b"))
+        self.tag("1.0.0", base)
+        return self.git("rev-parse", "HEAD").strip()
+
+    def pull_request(self, *, page: bool) -> None:
+        """Check out the merge commit of a branch that changes the page, or only code."""
+        self.git("checkout", "-q", "-b", "feature")
+        self.commit("feat: the pull request's change",
+                    row=row("9.9.9", "an unreleased change") if page else None)
+        self.git("checkout", "-q", "main")
+        self.git("checkout", "-q", "-b", "merge")
+        self.git("merge", "-q", "--no-ff", "-m", "merge", "feature", at=self.tick())
 
 
 def row(release: str, change: str) -> str:
@@ -181,6 +201,59 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check()
         self.assertEqual(code, 1)
         self.assertIn("no release tag", err)
+
+    def test_a_pull_request_that_changes_the_page_fails_on_a_wrong_label(self):
+        self.repo.mislabel()
+        self.repo.pull_request(page=True)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 1)
+        self.assertIn('"change b"', err)
+        self.assertNotIn("warning:", err)
+
+    def test_a_pull_request_that_leaves_the_page_alone_only_warns(self):
+        self.repo.mislabel()
+        self.repo.pull_request(page=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 0)
+        self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
+        self.assertIn("main's push run fails until a pull request relabels them", err)
+
+    def test_a_push_to_main_fails_on_a_wrong_label(self):
+        head = self.repo.mislabel()
+        # As in CI, origin/main is the pushed commit itself: the page did not change against it.
+        self.repo.git("update-ref", "refs/remotes/origin/main", head)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('"change b"', err)
+
+    def test_a_merge_group_that_leaves_the_page_alone_only_warns(self):
+        base = self.repo.mislabel()
+        self.repo.commit("feat: the group's change")
+        event = Path(self.tmp.name) / "event.json"
+        event.write_text(json.dumps({"merge_group": {"base_sha": base}}), encoding="utf-8")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="merge_group", GITHUB_EVENT_PATH=str(event))
+        self.assertEqual((code, "warning:" in err), (0, True))
+
+    def test_a_local_run_compares_with_origin_main(self):
+        base = self.repo.mislabel()
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.commit("feat: a local change")
+        code, err = self.repo.check()
+        self.assertEqual((code, "warning:" in err), (0, True))
+        self.repo.relabel("change b", "1.0.0 ")  # an edit to the page: the label fails again
+        code, _ = self.repo.check()
+        self.assertEqual(code, 1)
+
+    def test_a_shallow_clone_fails_even_where_a_wrong_label_would_only_warn(self):
+        self.repo.commit("feat: i")
+        clone = Path(self.tmp.name) / "shallow-pr"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--no-local", str(self.repo.root), str(clone)],
+                       check=True, capture_output=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        result = subprocess.run([sys.executable, str(SCRIPT)], cwd=clone, capture_output=True, text=True,
+                                env={**env, "GITHUB_EVENT_NAME": "pull_request"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("shallow", result.stderr)
 
     def test_a_shallow_clone_fails(self):
         self.repo.commit("feat: i")
