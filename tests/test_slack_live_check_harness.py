@@ -1390,6 +1390,9 @@ class UnitTest(unittest.TestCase):
         profile_notice = "a task is still running here; stop it or wait for it before asking an agent profile"
         self.assertIn(f'noticeProfileWhileRunning = "{profile_notice}"', sources["profiles.go"])
         rendered.add("⚠️ not started: " + profile_notice)
+        confirm_notice = "a task is still running here; stop it or wait for it before confirming a change"
+        self.assertIn(f'noticeConfirmWhileRunning = "{confirm_notice}"', sources["profiles.go"])
+        rendered.add("⚠️ not started: " + confirm_notice)
         self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
         # The session cap's count phrase, both forms.
         self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])
