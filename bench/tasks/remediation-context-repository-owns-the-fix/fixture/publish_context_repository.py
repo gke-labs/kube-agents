@@ -47,8 +47,10 @@ DEFAULT_BRANCH = "main"
 BLOB_MODE = "100644"
 COMMIT_MESSAGE = "fixture: the platform charts context repository for remediation-context-repository-owns-the-fix"
 USAGE = "usage: publish_context_repository.py <owner>/<name> [<branch>]"
-# What gh prints when the Git Data API refuses a repository with no commit (HTTP 409).
-EMPTY_REPOSITORY_TEXT = "Git Repository is empty"
+# `gh api --include` prints the response's status line first (`HTTP/2.0 409
+# Conflict`); 409 is what GitHub answers on a repository with no commit.
+HTTP_VERSION_PREFIX = "HTTP/"
+HTTP_CONFLICT = 409
 
 
 def gh_api(method: str, path: str, body: dict | None = None) -> dict:
@@ -72,9 +74,10 @@ def fixture_files(root: Path = CONTEXT_REPOSITORY_DIR) -> list[tuple[str, bytes]
 
 
 def repository_is_empty(repo: str) -> bool:
-    """GitHub answers 409 to every Git Data call on a repository with no commit."""
-    probe = subprocess.run(["gh", "api", f"repos/{repo}/commits?per_page=1"], capture_output=True, text=True, check=False)
-    return probe.returncode != 0 and EMPTY_REPOSITORY_TEXT in probe.stderr
+    """GitHub answers 409 to a commit list, as to every Git Data call, on a repository with no commit."""
+    probe = subprocess.run(["gh", "api", "--include", f"repos/{repo}/commits?per_page=1"], capture_output=True, text=True, check=False)
+    status_line = probe.stdout.splitlines()[0] if probe.stdout else ""
+    return status_line.startswith(HTTP_VERSION_PREFIX) and f" {HTTP_CONFLICT} " in status_line + " "
 
 
 def seed_empty_repository(repo: str, branch: str) -> None:

@@ -137,9 +137,10 @@ class FakeHost:
         if verb in self.fail:
             return 1, "", f"{verb} refused by the fake"
         if verb == "get" and args[1] == "namespace":
+            assert "--ignore-not-found" in args and "json" in args, args
             if self.namespace_labels is None:
-                return 1, "", f'Error from server (NotFound): namespaces "{NAMESPACE}" not found'
-            return 0, self.namespace_labels.get("managed-by", ""), ""
+                return 0, "", ""
+            return 0, json.dumps({"metadata": {"name": NAMESPACE, "labels": self.namespace_labels}}), ""
         if verb == "delete" and args[1] == "namespace":
             self.namespace_labels = None
             return 0, "", ""
@@ -279,6 +280,26 @@ def test_the_registration_joins_other_entries_and_is_not_added_twice():
     _stack(FakeGitHub(), host2).plant()
     assert json.loads(host2.configmap["context_repos"]) == [OTHER_ENTRY, CONTEXT_ENTRY]
     assert not any("patch" in c for c in host2.calls)
+
+
+def test_an_entry_for_the_repository_with_another_ref_stops_the_plant_and_stays():
+    other_ref = {**CONTEXT_ENTRY, "ref": "v0.4.2"}
+    host = FakeHost(configmap={"context_repos": json.dumps([other_ref])})
+    github = FakeGitHub()
+    stack = _stack(github, host)
+    with pytest.raises(RuntimeError, match="already names"):
+        stack.plant()
+    # main() runs the teardown next: the files and the namespace go, the entry stays.
+    assert stack.teardown()
+    assert json.loads(host.configmap["context_repos"]) == [other_ref]
+    assert github.files == {}
+    assert host.namespace_labels is None
+
+
+def test_the_plant_refuses_a_fixture_directory_without_the_fixture(tmp_path):
+    stack = plant.Stack(_settings(fixture_dir=str(tmp_path)), FakeGitHub(), run=FakeHost())
+    with pytest.raises(RuntimeError, match="TF_VAR_fixture_dir"):
+        stack.plant()
 
 
 def test_a_mount_that_never_sees_the_entry_fails_the_plant_and_removes_the_rest():
@@ -463,7 +484,10 @@ def test_every_fixture_file_carries_the_label_the_teardown_and_the_reset_read():
 def test_the_live_manifest_is_the_rendered_release():
     docs = [doc for doc in yaml.safe_load_all((FIXTURE / plant.FIXTURE_LIVE_MANIFEST).read_text()) if doc]
     assert docs[0]["kind"] == "Namespace" and docs[0]["metadata"]["name"] == plant.WORKLOAD_NAMESPACE
-    assert "labels" not in docs[0]["metadata"], "the stack's labels on the namespace would be removed by the apply"
+    # The plant labels the namespace before it applies this document; apply's
+    # three-way merge keeps labels the document never carried, and would
+    # overwrite a managed-by the document did carry.
+    assert "labels" not in docs[0]["metadata"], "a managed-by label in the namespace document would overwrite the stack's at apply"
     deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
     assert deployment["metadata"]["name"] == plant.WORKLOAD_DEPLOYMENT
 
@@ -509,6 +533,23 @@ def test_the_stacks_defaults_name_the_registered_repository():
     settings = _settings(context_owner=defaults["context_repository_owner"], context_name=defaults["context_repository_name"], context_ref=defaults["context_repository_ref"])
     assert settings.context_url == CONTEXT_URL
     assert settings.context_entry == CONTEXT_ENTRY
+
+
+def test_the_install_names_the_stack_waits_on_are_the_operators():
+    # A renamed workload, container or mount would show only as a 240 s wait
+    # on every nightly run, so the names are held against the Go source.
+    controller = REPO / "k8s-operator" / "internal" / "controller"
+    manifests = (controller / "platformagent_manifests.go").read_text()
+    broker = (controller / "credential_proxy_manifests.go").read_text()
+    shell = (controller / "shell_sandbox_manifests.go").read_text()
+    agent_controller = (controller / "platformagent_controller.go").read_text()
+    assert f'gitopsStateDir        = "{plant.GITOPS_STATE_DIR}"' in manifests
+    assert f'const credentialProxyContainerName = "{plant.BROKER_CONTAINER}"' in broker
+    assert f'agent.Name + "{plant.BROKER_DEPLOYMENT.format(agent="")}"' in broker
+    assert f'agent.Name + "{plant.SHELL_STATEFULSET.format(agent="")}"' in shell
+    assert f'shellSandboxContainerName = "{plant.SHELL_CONTAINER}"' in shell
+    assert f'gitopsStateConfigMapSuffix = "{plant.STATE_CONFIGMAP.format(agent="")}"' in agent_controller
+    assert f'gitopsStateContextReposKey = "{plant.CONTEXT_REPOS_KEY}"' in agent_controller
 
 
 def test_the_publisher_lists_the_chart_tree_and_nothing_else():

@@ -60,8 +60,10 @@ Terraform skips the destroy provisioner of a resource whose create failed.
 
 teardown, each step independent of the others:
 
-1. Removes the stack's entry from `context_repos`; the key goes when the
-   list is then empty, so the ConfigMap reads as it did before the plant.
+1. Removes the stack's entry (the same type, URL and ref it writes) from
+   `context_repos`; an entry that names the repository with other fields
+   stops the plant and is never removed. The key goes when the list is then
+   empty, so the ConfigMap reads as it did before the plant.
 2. Deletes the `demo-shop` namespace when it carries the stack's label.
 3. Closes every open pull request that a `[bot]` login opened from a
    branch in the repository and that changes a file under the directory,
@@ -317,6 +319,11 @@ class Stack:
         missing = [name for name, value in required if not value]
         if missing:
             raise RuntimeError(f"{', '.join(missing)} must be set: the GitOps repository and a file that holds a write token for it, the agent host and its install, the case's fixture directory, and the context repository")
+        if not (Path(self.settings.fixture_dir) / FIXTURE_LIVE_MANIFEST).is_file():
+            # main.tf resolves the directory relative to the stack, which a
+            # copy of the tf root alone (devops-bench's isolated mode) loses;
+            # the variable names the way round.
+            raise RuntimeError(f"{self.settings.fixture_dir} does not hold the case's fixture ({FIXTURE_LIVE_MANIFEST} is missing); when the stack runs from a copy of bench/tf, set TF_VAR_fixture_dir to the absolute path of bench/tasks/{CASE}/fixture")
 
     def fixture_file(self, relative: Path) -> str:
         return (Path(self.settings.fixture_dir) / relative).read_text(encoding="utf-8")
@@ -489,12 +496,15 @@ class Stack:
 
     def namespace_owner(self) -> str | None:
         """The namespace's managed-by label, "" when unlabelled, None when absent."""
-        code, out, err = self.kubectl("get", "namespace", WORKLOAD_NAMESPACE, "-o", f"jsonpath={{.metadata.labels.{MANAGED_BY_KEY}}}")
+        # --ignore-not-found: an absent namespace is an empty answer with exit
+        # 0, so absence is read from the value, not from kubectl's wording.
+        code, out, err = self.kubectl("get", "namespace", WORKLOAD_NAMESPACE, "--ignore-not-found", "-o", "json")
         if code != 0:
-            if "NotFound" in err or "not found" in err:
-                return None
             raise RuntimeError(f"cannot read namespace {WORKLOAD_NAMESPACE} on {self.settings.cluster}: {err.strip()}")
-        return out.strip()
+        if not out.strip():
+            return None
+        labels = ((json.loads(out) or {}).get("metadata") or {}).get("labels") or {}
+        return str(labels.get(MANAGED_BY_KEY) or "")
 
     def plant_workload(self) -> None:
         owner = self.namespace_owner()
@@ -560,8 +570,13 @@ class Stack:
             raise RuntimeError(f"{CONTEXT_REPOS_KEY} in {self.settings.state_configmap} is not a JSON list; refusing to rewrite it")
         return entries
 
-    def is_registration(self, entry: object) -> bool:
+    def names_context_repository(self, entry: object) -> bool:
+        """The entry is for the context repository's URL, whatever else it says."""
         return isinstance(entry, dict) and str(entry.get("url") or "").rstrip("/").lower() == self.settings.context_url.lower()
+
+    def is_registration(self, entry: object) -> bool:
+        """The entry is the stack's: the same type, URL and ref it writes."""
+        return self.names_context_repository(entry) and {k: entry.get(k) for k in self.settings.context_entry} == self.settings.context_entry
 
     def write_context_repos(self, entries: list | None) -> None:
         if entries is None:
@@ -575,8 +590,14 @@ class Stack:
 
     def register(self) -> None:
         entries = self.context_repos() or []
+        foreign = [entry for entry in entries if self.names_context_repository(entry) and not self.is_registration(entry)]
+        if foreign:
+            # As for a file or a namespace that is not the stack's: an entry
+            # someone registered by hand, with another ref or type, is
+            # neither adopted nor removed.
+            raise RuntimeError(f"{CONTEXT_REPOS_KEY} in {self.settings.state_configmap} already names {self.settings.context_url} with other fields ({json.dumps(foreign[0])}); this stack did not register it, so it does not write over it")
         if any(self.is_registration(entry) for entry in entries):
-            log(f"{self.settings.context_url} is already in {CONTEXT_REPOS_KEY}; the entry is kept as it is")
+            log(f"{self.settings.context_url} at {self.settings.context_ref} is already in {CONTEXT_REPOS_KEY}; the stack's own entry is kept")
         else:
             self.write_context_repos([*entries, self.settings.context_entry])
             log(f"registered {self.settings.context_url} at {self.settings.context_ref} in {CONTEXT_REPOS_KEY}")

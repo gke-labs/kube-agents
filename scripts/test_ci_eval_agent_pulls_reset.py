@@ -385,6 +385,11 @@ class PlantedStackFileTest(unittest.TestCase):
     def test_the_path_and_the_label_are_the_stacks(self):
         stack = (REPO_ROOT / "bench" / "tf" / "prebuilt" / "kustomize-overlay-declaration")
         self.assertEqual(helper.PLANTED_STACK_FILES, (PLANTED, *CONTEXT_FIX_FILES))
+        # The context stack plants under the host cluster hack/ci-eval-pr.sh
+        # exports from hack/ci-env.sh; the reset's copy of that name has to be
+        # the same, or a killed unit's four files stay while the reset reads clean.
+        ci_env = (REPO_ROOT / "hack" / "ci-env.sh").read_text()
+        self.assertIn(f'HOST_CLUSTER_NAME="{helper.POOL_HOST_CLUSTER}"', ci_env)
         self.assertIn('default     = "clusters/seeded-a/seeded-reliability"', (stack / "variables.tf").read_text())
         plant = (stack / "plant.py").read_text()
         self.assertIn(f'MANAGED_BY_KEY = "{helper.STACK_LABEL_KEY}"', plant)

@@ -59,8 +59,10 @@ terraform {
 }
 
 locals {
-  # The case's fixture tree, beside this stack in the repository.
-  fixture_dir = abspath("${path.module}/../../../tasks/remediation-context-repository-owns-the-fix/fixture")
+  # The case's fixture tree, beside this stack in the repository, unless the
+  # run names it (a copy of bench/tf alone has no tasks/ beside it; plant.py
+  # refuses a directory without the fixture and names the variable).
+  fixture_dir = var.fixture_dir != "" ? var.fixture_dir : abspath("${path.module}/../../../tasks/remediation-context-repository-owns-the-fix/fixture")
 
   # The settings plant.py reads, the same for the plant and the teardown.
   # Destroy-time provisioners may read only `self`, so the triggers carry them.

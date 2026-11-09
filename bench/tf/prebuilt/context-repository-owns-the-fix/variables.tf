@@ -45,6 +45,15 @@ variable "agent_name" {
   default     = "platform-agent"
 }
 
+# The case's fixture tree. Empty means the tree beside this stack in the
+# repository (main.tf resolves it); devops-bench's isolated mode copies only
+# bench/tf, so a run under it sets the absolute path here.
+variable "fixture_dir" {
+  type        = string
+  description = "Absolute path of bench/tasks/remediation-context-repository-owns-the-fix/fixture; empty resolves it relative to this stack"
+  default     = ""
+}
+
 # Exported to this unit only, because the stack declares the marker below.
 variable "gitops_repo" {
   type        = string
