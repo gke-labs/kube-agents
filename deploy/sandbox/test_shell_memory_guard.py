@@ -355,6 +355,9 @@ class LoggableCommandTest(unittest.TestCase):
             ("curl https://x/?access_token=abc", "curl"),                 # '?' and '=' are not plain
             ("tool " + "A" * 60, "tool"),                                   # a long word may be a secret
             ("a b c d e f g", "a b c d e"),
+            ("python3 push.py ghp_" + "a1" * 18, "python3 push.py"),       # a positional token holds digits
+            ("python3 call.py 0123456789abcdef0123456789abcdef", "python3 call.py"),
+            ("tool AKIAIOSFODNN7EXAMPLE", "tool"),
             ("", ""),
         ]
         for cmd, expected in cases:

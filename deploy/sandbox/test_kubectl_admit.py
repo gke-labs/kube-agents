@@ -66,6 +66,14 @@ class KeyTest(unittest.TestCase):
             (("get", "pods", "--all-namespaces=false"), "get pods namespace table"),
             (("get", "pods", "-A", "--watch=false"), "get pods cluster table"),    # not a watch
             (("get", "pods", "-A=false", "-nteam"), "get pods namespace table"),   # glued -n, -A off
+            (("get", "pods", "-Ao", "json"), "get pods cluster json"),             # a stacked shorthand
+            (("get", "pods", "-Aojson"), "get pods cluster json"),
+            (("get", "pods", "-Ao", "wide"), "get pods cluster table"),
+            (("get", "pods", "-Alapp=x", "-o", "json"), "get pods cluster json"),
+            (("get", "pods.metrics.k8s.io", "-A"), "get pods.metrics.k8s.io cluster table"),  # PodMetrics
+            (("get", "nodes.metrics.k8s.io"), "get nodes.metrics.k8s.io namespace table"),
+            (("get", "deployments.v1.apps", "-A", "-o", "json"), "get deployments cluster json"),
+            (("get", "deployments.batch", "-A"), "get deployments.batch cluster table"),  # not its group
         ]
         for argv, expected in cases:
             with self.subTest(argv=argv):
@@ -80,6 +88,10 @@ class KeyTest(unittest.TestCase):
                      ("get", "-k", "dir"), ("get", "-f", "x.yaml"), ("get",), ()]:
             with self.subTest(argv=argv):
                 self.assertIsNone(key(*argv))
+
+    def test_a_stacked_selector_is_a_selector(self):
+        self.assertTrue(parsed("get", "pods", "-Al", "app=x")["selector"])
+        self.assertTrue(parsed("get", "pods", "-Alapp=x")["all_namespaces"])
 
     def test_a_glued_selector_is_a_selector(self):
         self.assertTrue(parsed("get", "pods", "-A", "-lapp=x")["selector"])
@@ -294,6 +306,7 @@ class AdmitTest(unittest.TestCase):
 
     def test_local_verbs_watches_and_streams_take_no_slot(self):
         for argv in [("config", "view"), ("version",), ("get", "pods", "-A", "-w"), ("port-forward", "svc/x", "80"),
+                     ("get", "pods", "-A", "--help"), ("get", "pods", "-Ah"),
                      ("logs", "-f", "x"), ("logs", "x", "--follow"), ("exec", "-it", "x", "--", "sh"),
                      ("rollout", "status", "deploy/x"), ("wait", "--for=condition=Ready", "pod/x")]:
             with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, "pass_through"):

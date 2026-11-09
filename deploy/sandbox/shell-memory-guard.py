@@ -47,8 +47,10 @@ floor), it says so once, then waits.
 
 Each kill, hold, release and "no candidate" is one JSON line on stderr, which is
 the container's log. A kill names the command by its program and the plain words
-before its first flag; flags, their values and long words are left out, so a
-token a session put on its command line never reaches the log.
+before its first flag. A flag and its value, a long word, and a word with a digit or
+with punctuation outside `.,_-/:` end what is kept, so a token passed by flag, in a URL,
+or as a word holding a digit does not reach the log; a positional secret made only of
+letters could.
 """
 
 from __future__ import annotations
@@ -109,11 +111,12 @@ STATUS_RSS = "VmRSS"
 STATUS_RSS_ANON = "RssAnon"
 STATUS_RSS_SHMEM = "RssShmem"
 # What a kill log keeps of a command line: the program's name and at most this many
-# following words, stopping at the first flag, each word of plain characters and at
-# most LOGGED_WORD_MAX characters.
+# following words, stopping at the first flag or the first word that is long, holds a digit
+# or holds a character outside LOGGED_WORD_CHARS. Tokens and keys carry digits; a subcommand,
+# a kind or a script path seldom does.
 LOGGED_WORDS_MAX = 4
 LOGGED_WORD_MAX = 48
-LOGGED_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,_-/:")
+LOGGED_WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.,_-/:")
 ROOT_UID = 0
 KIB = 1024
 
@@ -247,7 +250,8 @@ def choose_victim(procs: list[tuple[int, int, int, str]]) -> tuple[int, int, str
 
 
 def loggable_command(cmd: str) -> str:
-    """The program and the plain words before its first flag: never a flag's value or a long word."""
+    """The program and the plain words before its first flag: never a flag's value, a long word,
+    or a word with a digit or punctuation."""
     words = cmd.split()
     if not words:
         return ""

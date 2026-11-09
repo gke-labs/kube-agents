@@ -44,6 +44,21 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual(pods["example"], "kubectl get pods -A -o name")
         self.assertFalse([k for k in commands if " namespace " in k or " object " in k])  # only cluster reads
 
+    def test_a_key_example_reaches_the_table_without_its_credential_or_endpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            table = Path(tmp) / "costs.json"
+            table.write_text(json.dumps({"about": "x", "tiers": {}}))
+            example = "--server https://10.0.0.1 --token SECRETVALUE get widgets.example.com -A -ojsonpath={.items}"
+            with mock.patch.object(profile, "COMMANDS", []), \
+                    mock.patch.object(profile, "measure_alone", return_value=(5 * profile.MIB, 0.1, 0)), \
+                    mock.patch.object(profile, "kubectl_version", return_value="v1.35.10"):
+                profile.main(["--tier", "t", "--reference", "r", "--table", str(table), "--key-example", example])
+            text = table.read_text()
+        entry = json.loads(text)["tiers"]["t"]["commands"]["get widgets.example.com cluster json"]
+        self.assertEqual(entry["example"], "kubectl get widgets.example.com -A -o jsonpath")
+        for leaked in ("SECRETVALUE", "10.0.0.1", "--token", "--server"):
+            self.assertNotIn(leaked, text)
+
     def test_a_command_killed_for_memory_aborts_the_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             table = Path(tmp) / "costs.json"

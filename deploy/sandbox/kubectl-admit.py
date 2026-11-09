@@ -101,7 +101,10 @@ EVENTS_LOG_MAX_BYTES = 1024 * 1024
 TEMP_SUFFIX = ".tmp"
 FALSE_VALUES = ("false", "0", "f")
 # Short value flags kubectl also takes glued to their value (`-ojson`, `-lapp=x`, `-nteam`).
-GLUED_SHORT_FLAGS = ("-o", "-l", "-n")
+# The shorthands that take a value. pflag reads a short cluster left to right: each letter
+# before the first of these is a boolean flag (`-Ao json` is `-A -o json`), and that one takes
+# the rest of the word, or the next word when nothing is left (`-Aojson`, `-nteam`).
+SHORT_VALUE_FLAGS = frozenset("olnLcfksv")
 PROC_ROOT = "/proc"
 # The guard's module once loaded; `rss` reads processes through it.
 GUARD = None
@@ -143,6 +146,7 @@ API_GROUP_PATHS = {"deployments": "/apis/apps/v1", "statefulsets": "/apis/apps/v
                    "clusterroles": "/apis/rbac.authorization.k8s.io/v1",
                    "clusterrolebindings": "/apis/rbac.authorization.k8s.io/v1"}
 CORE_API_PATH = "/api/v1"
+CORE_VERSION = "v1"
 UNKNOWN_COLLECTION = "/apis/<group>/<version>/<kind>"
 VALUE_FLAGS = {"-n", "--namespace", "--context", "--kubeconfig", "-l", "--selector", "-o", "--output",
                "--field-selector", "--request-timeout", "--chunk-size", "--sort-by", "-L", "--label-columns",
@@ -164,8 +168,19 @@ def parse(argv: list[str]) -> dict:
     words, flags, i = [], {}, 0
     while i < len(argv):
         w = argv[i]
-        if w[:2] in GLUED_SHORT_FLAGS and not w.startswith("--") and len(w) > 2:
-            flags.setdefault(w[:2], []).append(w[2:].lstrip("="))
+        if w.startswith("-") and not w.startswith("--") and len(w) > 2:
+            for j in range(1, len(w)):
+                name, rest = "-" + w[j], w[j + 1:]
+                if rest.startswith("="):
+                    flags.setdefault(name, []).append(rest[1:])
+                    break
+                if w[j] in SHORT_VALUE_FLAGS:
+                    if not rest:
+                        rest = argv[i + 1] if i + 1 < len(argv) else ""
+                        i += 1
+                    flags.setdefault(name, []).append(rest)
+                    break
+                flags.setdefault(name, []).append("true")
         elif w.startswith("-") and w != "-":
             name, eq, value = w.partition("=")
             if name in VALUE_FLAGS and not eq:
@@ -195,16 +210,25 @@ def parse(argv: list[str]) -> dict:
         "raw": last("--raw") is not None,
         "watch": on("-w", "--watch", "--watch-only"),
         "files": last("-f", "--filename", "-k", "--kustomize") is not None,
+        "help": on("-h", "--help"),
     }
 
 
 def canonical(kind: str) -> str:
-    """A kind's canonical plural (`pods.v1`, `deployments.apps` and `pod/name` included), else itself."""
+    """A kind's canonical plural (`pods.v1`, `deployments.apps` and `pod/name` included), else itself.
+
+    A group suffix counts only when it is the kind's own group: `pods.metrics.k8s.io` is
+    PodMetrics, not the Pod list, and is charged as the unknown kind it is."""
     base = kind.lower().split("/", 1)[0]
     if base in KINDS:
         return KINDS[base][0]
-    head = base.split(".", 1)[0]
-    return KINDS[head][0] if head in KINDS else base
+    head, _, suffix = base.partition(".")
+    if head not in KINDS:
+        return base
+    name = KINDS[head][0]
+    group = API_GROUP_PATHS[name].split("/")[2] if name in API_GROUP_PATHS else ""
+    own = {group, f"{CORE_VERSION}.{group}"} if group else {CORE_VERSION}
+    return name if suffix in own else base
 
 
 def kinds_of(cmd: dict) -> list[str] | None:
@@ -444,7 +468,8 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
     cmd = parse(argv)
     used = guard.memory_in_use()
     follows = cmd["verb"] == "logs" and any(a in FOLLOW_FLAGS or a.startswith("--follow=t") for a in argv)
-    if cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or follows or limit is None or used is None:
+    if (cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or cmd["help"] or follows
+            or limit is None or used is None):
         pass_through(argv)
     kinds = kinds_of(cmd)
     charged = bool(kinds) and scope_of(cmd, kinds) == CLUSTER_SCOPE

@@ -110,6 +110,17 @@ def kubectl_version(kubectl: str) -> str:
         return "unknown"
 
 
+def example_of(cmd: dict) -> str:
+    """The table's example, from the words its key is built from only: a `--key-example` may carry
+    `--token`, `--server` or `--kubeconfig`, and the table is committed and shipped in the image."""
+    words = ["kubectl", "get", cmd["args"][0]]
+    if cmd["all_namespaces"]:
+        words.append("-A")
+    if cmd["output"]:
+        words += ["-o", cmd["output"].split("=", 1)[0]]
+    return " ".join(words)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--tier", required=True)
@@ -137,9 +148,9 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if key is None or rc != 0:
             continue  # not a list the admission charges, or a kind the reference cluster does not serve
-        entry = commands.setdefault(key, {"peak_mib": 0, "example": "kubectl " + " ".join(words)})
+        entry = commands.setdefault(key, {"peak_mib": 0, "example": example_of(admit.parse(words))})
         if mib > entry["peak_mib"]:
-            entry.update(peak_mib=mib, example="kubectl " + " ".join(words))
+            entry.update(peak_mib=mib, example=example_of(admit.parse(words)))
     if killed:
         print(f"not written: {len(killed)} command(s) were killed before they finished, so their peaks are "
               f"unknown (give the run more memory): {killed}", file=sys.stderr)

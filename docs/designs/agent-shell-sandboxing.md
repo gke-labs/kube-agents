@@ -1029,7 +1029,7 @@ gVisor the shell has cgroup v1 with no `memory.stat`, so nothing is subtracted, 
 GiB limit, as on runc. Under gVisor the sentry also holds host memory per guest process that the
 guest's figures do not show: in a fan-out of about 180 processes the host OOM-killed the sentry while
 the guest read 1,795 MiB of 2 GiB, at least 1.4 MiB a process. The guard detects gVisor from the
-kernel release and lowers its watermark by 3 MiB, about twice that, per running process. Each kill, hold, release and `no-candidate` is a JSON line on the container's log. A kill names the command by its program and the plain words before its first flag, so a token a session put on its command line never reaches the log. The guard does not make an oversized read succeed: the read fails
+kernel release and lowers its watermark by 3 MiB, about twice that, per running process. Each kill, hold, release and `no-candidate` is a JSON line on the container's log. A kill names the command by its program and the plain words before its first flag. A flag and its value, a long word, and a word with a digit or punctuation end what is kept, so a token passed by flag, in a URL, or as a word holding a digit does not reach the log; a positional secret made only of letters could. The guard does not make an oversized read succeed: the read fails
 every time until it is narrowed.
 
 #### A cost check in front of kubectl
