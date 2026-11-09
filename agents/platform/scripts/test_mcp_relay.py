@@ -289,6 +289,13 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
             # One the broker can't tie to a cluster, while any is excluded.
             self.k8s_call("projects/p/locations/-/clusters/scratch"),
             self.k8s_call("scratch"),
+            # A readable allowed name can't vouch for one the broker can't read.
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "get_k8s_resource", "arguments": {
+                "parent": "projects/p/locations/us-east4/clusters/%73cratch",
+                "context": "projects/p/locations/us-east4/clusters/other"}}},
+            self.k8s_call("projects/p/locations/us-east4/clusters/other/../scratch"),
+            self.k8s_call("projects/p/zones/us-east4-a/clusters/scratch"),
+            self.k8s_call("projects/P/locations/us-east4/clusters/scratch"),
         ):
             with self.subTest(message=message):
                 status, _, body = self._request(message=message)

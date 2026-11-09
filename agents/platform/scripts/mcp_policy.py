@@ -105,7 +105,10 @@ GKE_READ_TOOLS = frozenset(
 GKE_K8S_TOOLS = frozenset(tool for tool in GKE_READ_TOOLS if "_k8s_" in tool)
 
 # A cluster's resource name, as the gke server's in-cluster tools take it in
-# `parent` (or `name`). A `-` location is every location, not one cluster.
+# `parent` (or `name`), matched whole. A `-` location is every location, not
+# one cluster. RESOURCE_LIKE is what makes a string argument one that has to
+# match it: any spelling of a resource path segment, or a percent escape.
+RESOURCE_LIKE = re.compile(r"(?i)projects|locations|zones|clusters|%")
 CLUSTER_RESOURCE = re.compile(
     r"projects/(?P<project>[a-z0-9][a-z0-9-]*)/locations/(?P<location>[a-z0-9][a-z0-9-]*|-)"
     r"/clusters/(?P<cluster>[a-z0-9][a-z0-9-]*)"
@@ -203,9 +206,13 @@ def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def k8s_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[tuple[str, str, str]] | None:
     """The clusters a gke in-cluster tool call names, or None when it isn't one.
 
-    Each string argument is searched for a cluster resource name. An empty list
-    is a call this broker can't tie to a cluster: no resource name it can read,
-    or one under the `-` location. The caller decides what that means.
+    Strict, so one readable name can't vouch for a call that names another the
+    broker can't read: every string argument that looks like a resource name
+    (it mentions projects, locations, zones or clusters, in any case or
+    encoding the broker doesn't decode) has to be exactly one cluster's
+    resource name, and at least one has to be. Otherwise the list is empty: a
+    call the broker can't tie to a cluster, which the caller refuses while any
+    cluster is excluded. So is a `-` location, which is every location.
     """
     if server_name != "gke" or not isinstance(message, dict) or message.get("method") != "tools/call":
         return None
@@ -221,11 +228,11 @@ def k8s_tool_clusters(server_name: str, message: dict[str, Any] | None) -> list[
             values.extend(value.values())
         elif isinstance(value, list):
             values.extend(value)
-        elif isinstance(value, str):
-            for match in CLUSTER_RESOURCE.finditer(value):
-                if match["location"] == "-":
-                    return []
-                clusters.append((match["project"], match["location"], match["cluster"]))
+        elif isinstance(value, str) and RESOURCE_LIKE.search(value):
+            match = CLUSTER_RESOURCE.fullmatch(value)
+            if match is None or match["location"] == "-":
+                return []
+            clusters.append((match["project"], match["location"], match["cluster"]))
     return clusters
 
 

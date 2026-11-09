@@ -1058,13 +1058,13 @@ spec:
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
   the onboarding sweep and the fleet-audit collectors that list clusters leave it out.
 
-  The credential broker refuses every route to an excluded cluster's Kubernetes API, for every
-  caller, the agents' own commands included. That covers a kubeconfig it would mint or use,
-  `gcloud container clusters get-credentials`, the watchers' cluster relay and the `gke` MCP
-  server's in-cluster tools, each refused with the rule `scope.excluded-cluster`. While any cluster
-  is excluded, a target that names its project by number is refused too, and so is an in-cluster
-  MCP call whose cluster the broker can't read. A broker that can't read the scope it was given
-  reaches no cluster until it can.
+  The credential broker and `kube-proxy` refuse every route to an excluded cluster's Kubernetes
+  API, for every caller, the agents' own commands included. That covers a kubeconfig the broker mints or uses, `gcloud container clusters get-credentials`, `kubectl` through `kube-proxy`,
+  the watchers' cluster relay and the `gke` MCP server's in-cluster tools, each refused as `scope.excluded-cluster`. While any cluster is excluded, a target that names its project by
+  number is refused too, and so is an in-cluster MCP call whose cluster the broker can't read.
+  Spell entries by project ID: an entry spelled by project number refuses its location and cluster
+  name in every project. A broker or `kube-proxy` that can't read the scope it was given reaches no
+  cluster until it can (`scope.exclude-unreadable`).
 
   Reads of the GKE control plane stay allowed: the project's cluster list and a cluster's
   describe. Exclusion keeps the agents out of a cluster's API and workloads, not out of the

@@ -1050,10 +1050,11 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     stdin, beside both scripts' sources."""
     if scope is None:
         return []
-    # No --scope-exclude-clusters, on purpose: the watch's report covers the
-    # clusters spec.scope.exclude.clusters excludes, one of the reads the CRD
-    # field names as still covering them (#3081); the report enumerates by
-    # project, so the scope goes without its cluster exclusion.
+    # No --scope-exclude-clusters, on purpose: the watch's report still lists
+    # and grades the versions of the clusters spec.scope.exclude.clusters
+    # excludes, through control-plane reads (#3081, narrowed by #3461); the
+    # report enumerates by project, so the scope goes without its cluster
+    # exclusion, and report_argv names them for the in-cluster reads it skips.
     return list(dataclasses.replace(scope, excluded_clusters=()).collector_argv())
 
 

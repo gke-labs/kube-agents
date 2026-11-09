@@ -71,6 +71,13 @@ class ExclusionsTest(unittest.TestCase):
         self.assertEqual(RULE_EXCLUDED_CLUSTER, exc.rule)
         self.assertIn("project ID", str(exc))
 
+    def test_an_entry_spelled_by_project_number_refuses_that_name_in_any_project(self):
+        self.write(rendered(dict(EXCLUDED, projectId="123456789012")))
+        exclusions = self.exclusions()
+        self.refused(exclusions, "payments-staging", "us-central1", "scratch")
+        self.refused(exclusions, "payments-prod", "us-central1", "scratch")
+        exclusions.check("payments-staging", "us-central1", "other")
+
     def test_an_unset_variable_excludes_nothing(self):
         Exclusions(path=lambda: "").check("payments-staging", "us-central1", "scratch")
 

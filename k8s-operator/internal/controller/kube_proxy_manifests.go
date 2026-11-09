@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path"
 	"strconv"
 	"time"
 
@@ -170,6 +171,18 @@ func hostClusterContextName(agent *agentv1alpha1.PlatformAgent) string {
 	return inClusterContextName
 }
 
+// kubeProxyHostClusterID is the gke_ ID of the cluster the install runs in, from the
+// harness's project, location and cluster name, or "" when any is unset (kind, or an
+// install that names none). kube-proxy checks in-cluster against the exclusions as it;
+// with none, in-cluster is refused while any cluster is excluded.
+func kubeProxyHostClusterID(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harnessOnKind(harness) || harness.ProjectID == "" || harness.Location == "" || harness.ClusterName == "" {
+		return ""
+	}
+	return "gke_" + harness.ProjectID + "_" + harness.Location + "_" + harness.ClusterName
+}
+
 func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
@@ -219,13 +232,22 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}
 	envVars = append(envVars, kubeProxyOTelEnvVars(agent, otlpEndpoint, otlpDisabled)...)
+	// spec.scope.exclude.clusters: kube-proxy refuses every request to an excluded
+	// cluster's API from the same scope.json the credential broker reads, and checks
+	// in-cluster as the cluster the harness names (kubeProxyHostClusterID).
+	envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_SCOPE_FILE", Value: path.Join(brokerScopeDir, scopeFileName)})
+	if host := kubeProxyHostClusterID(agent); host != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", Value: host})
+	}
 
 	volumeMounts := []corev1.VolumeMount{
 		{Name: kubeProxyTLSVolumeName, MountPath: kubeProxyTLSMountPath, ReadOnly: true},
 		{Name: kubeAPITokenVolumeName, MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+		scopeConfigMount(brokerScopeDir),
 	}
 
 	volumes := []corev1.Volume{
+		scopeConfigVolume(agent),
 		{
 			Name: kubeProxyTLSVolumeName,
 			VolumeSource: corev1.VolumeSource{

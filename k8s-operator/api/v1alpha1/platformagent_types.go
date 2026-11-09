@@ -198,10 +198,11 @@ type ScopeExcludeSpec struct {
 	// every project.
 	// An excluded cluster gets no Cluster Agent, and fleet answers, the
 	// onboarding sweep and the fleet-audit collectors that list clusters leave
-	// it out. The credential broker refuses every route to its Kubernetes
-	// API, for every caller, the agents' own commands included: a kubeconfig,
-	// get-credentials, the watchers' relay and the gke MCP server's in-cluster
-	// tools. Reads of the GKE control plane stay allowed (the project's cluster
+	// it out. The credential broker and kube-proxy refuse every route to its
+	// Kubernetes API, for every caller, the agents' own commands included: a
+	// kubeconfig, get-credentials, kube-proxy, the watchers' relay and the gke
+	// MCP server's in-cluster tools. Spell entries by project ID: one spelled
+	// by project number refuses its location and name in any project. Reads of the GKE control plane stay allowed (the project's cluster
 	// list, a cluster's describe), and these still cover it through them only:
 	// the daily upgrade-readiness watch's version table (its in-cluster
 	// readiness rules skip the cluster), the networking audit's subnet usage,

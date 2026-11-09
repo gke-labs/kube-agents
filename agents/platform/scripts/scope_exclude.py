@@ -13,7 +13,9 @@ Matching is exact, field by field. A cluster's location is the one GKE gives it,
 a zone or a region, so a zonal name never matches a regional entry. A project
 named by its number can't be told apart from an excluded project's ID without a
 lookup, so while any cluster is excluded a target whose project is all digits is
-refused too, naming the project ID as the way through.
+refused too, naming the project ID as the way through; and an entry spelled by
+its project number refuses its location and cluster name in any project, which
+over-refuses rather than miss the cluster. Spell entries by project ID.
 
 Fail-closed: when the broker is told where the file is and can't read or parse
 it, every cluster target is refused until it can. The variable unset is a broker
@@ -142,7 +144,9 @@ class Exclusions:
                 f"{error}, so the broker can't tell whether this cluster is excluded"
                 " and reaches no cluster until it can",
             )
-        if (project, location, cluster) in triples:
+        if (project, location, cluster) in triples or any(
+            PROJECT_NUMBER.match(p) and (l, c) == (location, cluster) for p, l, c in triples
+        ):
             raise ExcludedCluster(
                 RULE_EXCLUDED_CLUSTER,
                 f"cluster {cluster} ({project}, {location}) is excluded by this install's"
