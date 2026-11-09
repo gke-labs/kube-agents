@@ -753,6 +753,13 @@ module "github_minter" {
   service_account_id = var.github_minter_service_account_id
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
+  # The owning install, which lifecycle.sh's adoption step checks before it
+  # imports a key ring or key this state doesn't hold (#3504).
+  owner_labels = {
+    "kube-agents-cluster"   = var.cluster_name
+    "kube-agents-namespace" = var.namespace
+  }
+  owner_description = "kube-agents GitHub token minter for install ${var.cluster_name}/${var.namespace}"
 
   # module.gke_cluster for the reason module.kube_agents_iam's depends_on
   # states in full: the module's workload_identity binding names the pool as

@@ -813,6 +813,17 @@ variable "github_minter_kms_key" {
   default     = "github-token-minter-key"
 }
 
+variable "github_minter_shared_key" {
+  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. Terraform itself reads nothing from it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_key))
+    error_message = "github_minter_shared_key must be empty or <keyring>/<key>."
+  }
+}
+
 variable "github_app_id" {
   description = "GitHub App ID the minter signs as. Set, the chart creates the github-app-credentials Secret; empty, that Secret must already exist in the release namespace before the minter pod can start."
   type        = string

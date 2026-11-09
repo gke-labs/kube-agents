@@ -652,6 +652,66 @@ adoption_target_exists() { # <kind> <id>
   esac
 }
 
+# The labels the composition sets on the minter's crypto key name the install
+# that owns it (#3504): module.github_minter's owner_labels. A key ring carries
+# no labels in Cloud KMS, so the ring is owned through its key.
+readonly MINTER_OWNER_CLUSTER_LABEL="kube-agents-cluster"
+readonly MINTER_OWNER_NAMESPACE_LABEL="kube-agents-namespace"
+
+# Refuses the apply before adopt_kms imports a minter key ring or key that this
+# state doesn't hold, unless the key is this install's own (its owner labels
+# name this cluster and namespace) or the one github_minter_shared_key names.
+# Importing another install's key would put it in this state, so a destroy or a
+# GitOps-off run here would schedule its versions for destruction, and this
+# install's minter would be granted signing rights on it. A key with no owner
+# labels may be another install's, from before the labels existed, so it is
+# refused too: the operator says so by naming it as shared. A ring whose key
+# doesn't exist yet holds nothing to protect and is adopted as before. Runs
+# once per call; the ring and the key share the answer.
+guard_minter_adoption() {
+  local keyring=$1 key=$2 location=$3 project=$4
+  [[ "${MINTER_ADOPTION_CHECKED:-}" == "true" ]] && return 0
+  MINTER_ADOPTION_CHECKED=true
+  local shared cluster namespace labels owner_cluster="" owner_namespace="" pair
+  shared=$(tfvar github_minter_shared_key)
+  if [[ -n "$shared" && "$shared" == "$keyring/$key" ]]; then
+    log "adopting the minter key $keyring/$key: github_minter_shared_key names it as shared on purpose"
+    return 0
+  fi
+  if ! adoption_target_exists key "projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"; then
+    return 0
+  fi
+  if ! labels=$(gcloud kms keys describe "$key" --keyring "$keyring" --location "$location"       --project "$project" --format='value(labels)' 2>/dev/null); then
+    warn "Could not read the owner labels of the minter key '$location/$keyring/$key', which exists and is not in this state."
+    warn "Refusing to adopt it without knowing whose it is. Check this identity can describe the key (cloudkms.cryptoKeys.get), then apply again."
+    exit 1
+  fi
+  # value(labels) prints the map as key=value pairs joined by ';'.
+  local IFS=';'
+  for pair in $labels; do
+    case "$pair" in
+      "$MINTER_OWNER_CLUSTER_LABEL="*)   owner_cluster=${pair#*=} ;;
+      "$MINTER_OWNER_NAMESPACE_LABEL="*) owner_namespace=${pair#*=} ;;
+    esac
+  done
+  unset IFS
+  cluster=$(tfvar cluster_name)
+  namespace=$(tfvar namespace)
+  if [[ "$owner_cluster" == "$cluster" && "$owner_namespace" == "$namespace" ]]; then
+    log "adopting the minter key $keyring/$key: its owner labels name this install"
+    return 0
+  fi
+  if [[ -n "$owner_cluster" || -n "$owner_namespace" ]]; then
+    warn "The minter key '$location/$keyring/$key' belongs to install ${owner_cluster:-?}/${owner_namespace:-?} (its owner labels), not this one ($cluster/$namespace)."
+  else
+    warn "The minter key '$location/$keyring/$key' exists, is not in this state, and carries no owner labels, so it may be another install's."
+  fi
+  warn "Refusing to adopt it: this state would then own that install's App key, and a destroy here would schedule its versions for destruction."
+  warn "Choose other names (github_minter_kms_keyring and github_minter_kms_key), or, to share this key on purpose,"
+  warn "set github_minter_shared_key = \"$keyring/$key\" in terraform.tfvars (MINTER_SHARED_KEY in install.env)."
+  exit 1
+}
+
 adopt_kms() {
   local project location keyring key
   load_state
@@ -751,6 +811,10 @@ adopt_kms() {
     fi
 
     adoption_target_exists "$kind" "$id" || continue
+
+    if [[ "$address" == "$MINTER_KMS_KEYRING_ADDRESS" || "$address" == "$MINTER_KMS_KEY_ADDRESS" ]]; then
+      guard_minter_adoption "$minter_keyring" "$minter_key" "$location" "$project"
+    fi
 
     log "adopting pre-existing resource: $id"
     [[ -f "$OVERRIDE_FILE" && -f "$SCOPE_OVERRIDE_FILE" ]] || with_override
