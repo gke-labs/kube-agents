@@ -1321,10 +1321,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the

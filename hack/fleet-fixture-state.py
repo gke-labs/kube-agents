@@ -58,10 +58,14 @@ output contract a consumer reads.
 A project-scoped role (`cluster_slot: null`: the startup-fail VM, the
 world-open firewall rule and its VM) is published as `<role>.confirmed`
 alone, and its subjects are read with `gcloud compute instances list` or
-`gcloud compute firewall-rules list` in the project.
+`gcloud compute firewall-rules list` in the project. `serial_contains` reads
+an instance subject's serial port 1 output as well, with `gcloud compute
+instances get-serial-port-output`: the startup-fail VM's failure line is
+printed at boot only, and the buffer that holds it rotates within weeks.
 
 What it never does: mutate anything (every read is `kubectl get -o json`,
-`gcloud container clusters describe` or `gcloud compute ... list`), address a cluster it discovered itself
+`gcloud container clusters describe`, `gcloud compute ... list` or `gcloud
+compute instances get-serial-port-output`), address a cluster it discovered itself
 (the runner recorded each slot's cluster and location in `.fleet-context`), or
 kill the job. Weather -- an unreachable API server, a refused describe -- leaves
 the role "not checked" with a warning and no drift file; only positive
@@ -195,13 +199,31 @@ OPS_ONLY_TIME_CLEARS = frozenset({OP_AGE_HOURS_GE})
 # a matched node that reports no allocatable yet (still registering) leaves the
 # role not checked for the pass rather than drifted.
 OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
-OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE})
+# `serial_contains` reads the serial port 1 output of every instance a
+# project-scoped `instance/<prefix>*` subject matched and wants `value`, a
+# literal string, in at least one of them. No instance matched fails it; a
+# console read that failed, with no other console holding the string, leaves
+# the role not checked for the pass rather than drifted. The output is a ring
+# buffer of about 1 MiB, so a line the guest prints at boot only is there
+# until later output pushes it out.
+OP_SERIAL_CONTAINS = "serial_contains"
+OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE, OP_AGE_HOURS_GE, OP_SERIAL_CONTAINS})
 # Ops whose `value` must be a number; anything else is a catalog bug.
 OPS_WITH_NUMERIC_VALUE = frozenset({OP_AGE_HOURS_GE})
+# Ops whose `value` must be a non-empty string.
+OPS_WITH_STRING_VALUE = frozenset({OP_SERIAL_CONTAINS})
 OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW, OP_NOT_AHEAD})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
 # Ops that read the subject's objects whole and therefore take no path.
-OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE})
+OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE, OP_SERIAL_CONTAINS})
+# Ops whose subject must be a project-scoped `instance/<prefix>*`.
+INSTANCE_SUBJECT_ONLY_OPS = frozenset({OP_SERIAL_CONTAINS})
+INSTANCE_KIND = "instance"
+# The serial port the guest agent and systemd write to; gcloud's own default,
+# named so the command line says which console was read.
+SERIAL_PORT = 1
+# A Compute Engine zone as the instance list's `zone` URL ends in it.
+ZONE_RE = re.compile(r"[a-z]+-[a-z]+[0-9]+-[a-z]")
 # Ops whose subject must be a `node?<selector>`.
 NODE_SELECTOR_ONLY_OPS = frozenset({OP_NODE_CPU_SPARE})
 NODE_KIND = "node"
@@ -379,6 +401,12 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 raise CatalogError(f"{where}: op {op!r} applies to the cluster subject only")
             if op in NODE_SELECTOR_ONLY_OPS and not str(subject).startswith(f"{NODE_KIND}?"):
                 raise CatalogError(f"{where}: op {op!r} applies to a `{NODE_KIND}?<selector>` subject only")
+            if op in INSTANCE_SUBJECT_ONLY_OPS and not (
+                project_scoped and str(subject).startswith(f"{INSTANCE_KIND}/")
+            ):
+                raise CatalogError(f"{where}: op {op!r} applies to a project-scoped `{INSTANCE_KIND}/<prefix>*` subject only")
+            if op in OPS_WITH_STRING_VALUE and not (isinstance(entry.get("value"), str) and entry["value"]):
+                raise CatalogError(f"{where}: op {op!r} takes a non-empty string")
             if (op in OPS_WITH_VALUE) != ("value" in entry):
                 raise CatalogError(
                     f"{where}: op {op!r} {'takes' if op in OPS_WITH_VALUE else 'takes no'} value"
@@ -391,8 +419,8 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 if op not in OPS_WITHOUT_PATH:
                     raise CatalogError(f"{where}: op {op!r} needs a path")
                 steps = None
-            elif op in NODE_SELECTOR_ONLY_OPS:
-                raise CatalogError(f"{where}: op {op!r} reads the nodes whole and takes no path")
+            elif op in NODE_SELECTOR_ONLY_OPS or op in INSTANCE_SUBJECT_ONLY_OPS:
+                raise CatalogError(f"{where}: op {op!r} reads the objects whole and takes no path")
             elif isinstance(path, str):
                 steps = parse_path(path)
             else:
@@ -517,6 +545,24 @@ def read_compute(project: str, subject: str) -> list[dict]:
     if not isinstance(doc, list):
         raise Unreadable(f"compute {collection} list printed an unexpected document")
     return [item for item in doc if isinstance(item, dict)]
+
+
+def read_serial(project: str, name: str, zone: str) -> str:
+    """One instance's serial port 1 output. The name and zone come from the
+    instance list; anything outside their shapes is refused rather than put on
+    a command line. A failed or empty read is Unreadable."""
+    if not NAME_RE.fullmatch(name) or not ZONE_RE.fullmatch(zone):
+        raise Unreadable(f"instance {name!r} in zone {zone!r} is not a name this script reads")
+    cmd = [
+        "gcloud", "compute", "instances", "get-serial-port-output", name,
+        f"--zone={zone}", f"--port={SERIAL_PORT}", f"--project={project}",
+    ]
+    rc, out, err = _run(cmd, GCLOUD_TIMEOUT_SECONDS)
+    if rc != 0:
+        raise Unreadable(f"get-serial-port-output {name} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    if not out.strip():
+        raise Unreadable(f"get-serial-port-output {name} returned no output")
+    return out
 
 
 def read_cluster(project: str, name: str, location: str) -> dict:
@@ -692,7 +738,7 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=None, pods_by_node=None, serial_for=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
 
     `channel_default` is a callable returning the channel default version for
@@ -702,7 +748,8 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
     resolved lazily so a role that never needs server-config never pays for it.
     `pods_by_node` is a callable returning {node name: [pod, ...]} for every
     bound pod in the cluster, used by `node_cpu_spare_ge` only, lazy for the
-    same reason.
+    same reason. `serial_for` is a callable returning one listed instance's
+    serial port 1 output, used by `serial_contains` only.
     """
     op, expected = entry["op"], entry["value"]
     label = " ".join(part for part in (entry["subject"], entry["path"], op) if part)
@@ -793,6 +840,27 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
         spare = _spare_by_node(objects, pods_by_node()) if objects else {}
         ok = bool(spare) and want is not None and all(v >= want for v in spare.values())
         return None if ok else f"{label}: {_describe([spare] if spare else [])}"
+    elif op == OP_SERIAL_CONTAINS:
+        if serial_for is None:  # pragma: no cover - check_role always supplies it
+            raise CatalogError(f"op {op!r} needs the serial reader")
+        if not objects:
+            return f"{label}: no instance matched"
+        searched, failed = [], []
+        for obj in objects:
+            name = str(obj.get("name") or "")
+            zone = str(obj.get("zone") or "").rstrip("/").rsplit("/", 1)[-1]
+            try:
+                text = serial_for(name, zone)
+            except Unreadable as exc:
+                failed.append(str(exc))
+                continue
+            if expected in text:
+                return None
+            searched.append(f"{name} ({zone}, {len(text)} characters)")
+        if failed:
+            # Only positive evidence is drift: a console nobody read may hold it.
+            raise Unreadable("; ".join(failed))
+        return f"{label}: not in the serial port {SERIAL_PORT} output of {', '.join(searched)}"
     else:  # pragma: no cover - load_assertions rejects unknown ops
         raise CatalogError(f"unknown op {op!r}")
     return None if ok else f"{label}: {_describe(values)}"
@@ -817,6 +885,7 @@ class Reader:
         # per location and channel whichever way it went.
         self._channels: dict[tuple[str, str], dict | None | Unreadable] = {}
         self._pods: dict[Path, dict[str, list]] = {}
+        self._serial: dict[tuple[str, str], str | Unreadable] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -871,6 +940,19 @@ class Reader:
 
         return lookup
 
+    def serial_for(self, name: str, zone: str) -> str:
+        """One instance's serial port 1 output, read once per pass."""
+        key = (name, zone)
+        if key not in self._serial:
+            try:
+                self._serial[key] = read_serial(self.project, name, zone)
+            except Unreadable as exc:
+                self._serial[key] = exc
+        cached = self._serial[key]
+        if isinstance(cached, Unreadable):
+            raise cached
+        return cached
+
     def pods_by_node_for(self, role: str):
         """The cluster's bound pods grouped by node, read once per role per pass."""
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -920,6 +1002,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
                 channel_default=reader.channel_default_for(spec),
                 channel_valid=reader.channel_valid_for(spec),
                 pods_by_node=reader.pods_by_node_for(role),
+                serial_for=reader.serial_for,
             )
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
