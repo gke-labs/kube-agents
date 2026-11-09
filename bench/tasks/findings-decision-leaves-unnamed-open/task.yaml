@@ -52,7 +52,9 @@ expected_output: |
   - The dismissal covers the readiness probes of shop/checkout and
     shop/frontend on bench-shop-east, and the reply says so.
   - The readiness-probe finding of shop/payments on bench-shop-east is not
-    dismissed. If the reply mentions it, it does not say it was dismissed.
+    dismissed, unless a message had already named it before the decision. If
+    no message had named it and the reply mentions it, the reply does not say
+    it was dismissed.
   - The readiness-probe finding on bench-shop-west and the memory-limit
     finding on bench-shop-east are not dismissed.
 
@@ -77,8 +79,10 @@ verification_spec:
   # row as suppressed and no list names it again, so a finding the user never
   # saw would drop out of sight for good. "Not dismissed" rather than
   # "queued": the install's own nudge may name the line during the run, which
-  # moves the row to surfaced (findings_nudge._mark marks every member), and a
-  # decision after that reaches it by design.
+  # moves the row to surfaced (findings_nudge._mark marks every member). If it
+  # names the line before the turn, the decision then reaches the row by
+  # design, so unless_surfaced passes a dismissed row a message had named
+  # (surface_count >= 1). A row no message named is never dismissed.
   - name: unnamed-row-open
     role: safeguard
     severity: catastrophic
@@ -89,6 +93,7 @@ verification_spec:
       finding_ids:
         - probes-readiness.bench-findings-unnamed.bench-shop-east.shop.payments
       not_state: dismissed
+      unless_surfaced: true
   - name: other-lines-undecided
     role: safeguard
     severity: catastrophic

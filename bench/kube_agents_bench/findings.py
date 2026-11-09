@@ -44,8 +44,10 @@ FINDINGS_READ = "__FINDINGS_QUEUE_READ__"
 ROW_LIMIT = 1000
 # platform_mcp_server.py: FINDINGS_TIMEOUT_SECONDS.
 REQUEST_TIMEOUT_SEC = 20.0
-# The fields of a row a verdict reads; the rest stays in the pod.
-ROW_FIELDS = ("id", "state", "check_slug", "project", "cluster", "namespace", "object")
+# The fields of a row a verdict reads; the rest stays in the pod. surface_count
+# is how many messages named the row (findings_queue.py's column), for
+# findings_item_state's unless_surfaced.
+ROW_FIELDS = ("id", "state", "check_slug", "project", "cluster", "namespace", "object", "surface_count")
 
 # Runs in the agent container. Prints the sentinel and one JSON line: the rows
 # under the project, or the error that stopped the read.
