@@ -5024,14 +5024,24 @@
 
       function updateComposer() {
         const busy = isThreadBusy(findThread(activeId));
-        $("btn-send").disabled = busy;
+        const input = $("prompt-input");
+        $("btn-send").disabled =
+          busy && !isLocalSlashCommand(input ? input.value : "");
         document.querySelectorAll(".chip[data-prompt]").forEach((c) => {
           c.disabled = busy;
         });
       }
 
       function updateSideComposer() {
-        $("side-send").disabled = pane.mode === "post" && !!inflight[pane.id];
+        const busy = pane.mode === "post" && !!inflight[pane.id];
+        const input = $("side-input");
+        $("side-send").disabled =
+          busy && !isLocalSlashCommand(input ? input.value : "");
+      }
+
+      function syncComposerButton(input) {
+        if (input && input.id === "side-input") updateSideComposer();
+        else updateComposer();
       }
 
       function updateTitle() {
@@ -5525,6 +5535,12 @@
         await refreshPane(true);
       }
 
+      function sideLocalRows(body, id) {
+        return [...body.querySelectorAll('[data-local-row="1"]')].filter(
+          (el) => !el.dataset.postId || el.dataset.postId === id,
+        );
+      }
+
       // Re-reads the open post's transcript and redraws it when it changed.
       // Returns false when the read failed.
       async function refreshPane(force) {
@@ -5536,20 +5552,24 @@
           return true;
         const body = $("side-body");
         if (result.error) {
-          if (force)
+          if (force) {
+            const localRows = sideLocalRows(body, id);
             body.replaceChildren(
               messageRow(
                 "agent",
                 `Could not load this thread: ${result.error}`,
                 "error",
               ),
+              ...localRows,
             );
+          }
           return false;
         }
         const data = result.data;
         if (!force && data.latest_id === pane.latestId) return true;
         pane.latestId = data.latest_id;
         const follow = force || nearBottom(body);
+        const localRows = sideLocalRows(body, id);
         body.replaceChildren();
         pending.side = null;
         const messages = data.messages || [];
@@ -5594,6 +5614,7 @@
             body.appendChild(messageRow("user", turn.text));
           showPending("side", id);
         }
+        localRows.forEach((el) => body.appendChild(el));
         if (follow) body.scrollTop = body.scrollHeight;
         return true;
       }
@@ -5605,10 +5626,17 @@
       // Sends a reply into the open post's session: the event triage or
       // scheduled session itself, which the server checks before the turn.
       async function sendFromSide() {
-        if (pane.mode !== "post" || inflight[pane.id]) return;
+        if (pane.mode !== "post") return;
         const input = $("side-input");
         const text = input.value.trim();
         if (!text) return;
+        if (isLocalSlashCommand(text)) {
+          input.value = "";
+          updateSideComposer();
+          handleSlashCommand(text, "side");
+          return;
+        }
+        if (inflight[pane.id]) return;
         input.value = "";
         if (handleSlashCommand(text, "side")) return;
         const id = pane.id;
@@ -6084,8 +6112,14 @@
 
       function sendFromInput() {
         const input = $("prompt-input");
-        if (isThreadBusy(findThread(activeId))) return;
         const text = input.value;
+        if (isLocalSlashCommand(text)) {
+          input.value = "";
+          updateComposer();
+          handleSlashCommand(text, "centre");
+          return;
+        }
+        if (isThreadBusy(findThread(activeId))) return;
         input.value = "";
         submitMessage(text);
       }
@@ -6969,10 +7003,12 @@
         const text = `Apply the $${name} skill: `;
         if (pane.mode === "post") {
           $("side-input").value = text;
+          updateSideComposer();
           $("side-input").focus();
         } else {
           if (view !== "thread") newChat();
           $("prompt-input").value = text;
+          updateComposer();
           $("prompt-input").focus();
         }
       }
@@ -9049,6 +9085,13 @@
         }
       }
 
+      function markSideLocalRow(row, where) {
+        if (where === "side" && row) {
+          row.dataset.localRow = "1";
+          row.dataset.postId = pane.id;
+        }
+      }
+
       // /feedback in the chat: posts an email draft into the thread as a card
       // with Copy, mail-client and edit actions. Nothing is sent by the page.
       function postFeedbackDraft(where, kindKey, title) {
@@ -9060,6 +9103,7 @@
         const mailto = feedbackMailtoHref(kindKey, title, body);
         const container = where === "side" ? $("side-body") : $("chat-stream");
         const row = appendTo(container, "agent", "", "feedback draft");
+        markSideLocalRow(row, where);
         const artId = registerArtifact(
           `Feedback email (${kindKey})`,
           email,
@@ -9440,13 +9484,24 @@
         },
       ];
 
-      function handleSlashCommand(text, where) {
+      function findSlashCommand(text) {
         const trimmed = (text || "").trim();
-        if (!trimmed.startsWith("/")) return false;
+        if (!trimmed.startsWith("/")) return null;
         const cmdToken = trimmed.split(/\s+/)[0].toLowerCase();
-        const rest = trimmed.slice(cmdToken.length).trim();
         const def = SLASH_COMMANDS.find((c) => c.token === cmdToken);
-        if (!def) return false;
+        if (!def) return null;
+        return { def, rest: trimmed.slice(cmdToken.length).trim() };
+      }
+
+      function isLocalSlashCommand(text) {
+        const match = findSlashCommand(text);
+        return !!(match && match.def.local);
+      }
+
+      function handleSlashCommand(text, where) {
+        const match = findSlashCommand(text);
+        if (!match) return false;
+        const { def, rest } = match;
         if (def.local === "agents") {
           openRoster();
           return true;
@@ -9494,12 +9549,13 @@
               "- `/feedback question <title>` — a question.\n" +
               "- `/feedback form` — open the form instead (email or GitHub issue); the form has a **Polish** button that asks this install's own model to fix spelling and wording.\n\n" +
               "Reports carry versions, dates and counts only: no cluster, project, namespace, workload or user names.";
-            appendTo(
+            const row = appendTo(
               where === "side" ? $("side-body") : $("chat-stream"),
               "agent",
               helpMd,
               "help",
             );
+            markSideLocalRow(row, where);
             return true;
           }
           postFeedbackDraft(where, kindKey, words.slice(1).join(" "));
@@ -9531,7 +9587,8 @@
             "- `Cmd/Ctrl + K` — Open the Quick Jump & Artifact Command Palette.";
           const container =
             where === "side" ? $("side-body") : $("chat-stream");
-          appendTo(container, "agent", helpMd, "help");
+          const row = appendTo(container, "agent", helpMd, "help");
+          markSideLocalRow(row, where);
           return true;
         }
         if (def.prompt) {
@@ -9578,6 +9635,7 @@
           const caret = replaceRange.start + inserted.length;
           input.setSelectionRange(caret, caret);
           closeAc();
+          syncComposerButton(input);
           input.focus();
         }
 
@@ -9604,6 +9662,7 @@
         }
 
         input.addEventListener("input", () => {
+          syncComposerButton(input);
           const val = input.value;
           const pos = input.selectionStart || 0;
           if (insideCodeFence(val, pos)) {
@@ -10408,10 +10467,12 @@
         const handle = btn.dataset.mentionAgent;
         if (pane.mode === "post") {
           $("side-input").value = `${handle} `;
+          updateSideComposer();
           $("side-input").focus();
         } else {
           newChat();
           $("prompt-input").value = `${handle} `;
+          updateComposer();
           $("prompt-input").focus();
         }
       });

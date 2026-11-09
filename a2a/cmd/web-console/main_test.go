@@ -1795,3 +1795,158 @@ func TestPageUpgradeDialogFetchesTheEnvironment(t *testing.T) {
 		}
 	}
 }
+
+// Local slash commands such as /feedback and /help must still run from the
+// centre and side composers when the active thread has a turn in flight,
+// while prompt commands and regular messages remain blocked until idle.
+func TestPageLocalSlashCommandsBypassBusyGuard(t *testing.T) {
+	script := `const makeInput = id => {
+  const listeners = {};
+  return {
+    id, value: "", selectionStart: 0,
+    setSelectionRange(s) { this.selectionStart = s; },
+    focus() {},
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    fire(ev, e = {}) { (listeners[ev] || []).forEach(fn => fn(e)); },
+  };
+};
+const makePopup = () => ({ hidden: true, innerHTML: "", addEventListener() {}, querySelector() { return null; } });
+const promptInput = makeInput("prompt-input");
+const sideInput = makeInput("side-input");
+const centreAc = makePopup();
+const sideAc = makePopup();
+const btnSend = { disabled: false };
+const sideSend = { disabled: false };
+const chatChildren = [];
+const sideChildren = [];
+const makeStream = arr => ({
+  scrollTop: 0, scrollHeight: 100, clientHeight: 100,
+  querySelectorAll: sel => sel === '[data-local-row="1"]' ? arr.filter(c => c.dataset && c.dataset.localRow === "1") : [],
+  replaceChildren: (...els) => { arr.length = 0; arr.push(...els); },
+  appendChild: el => arr.push(el),
+});
+const chatStream = makeStream(chatChildren);
+const sideBody = makeStream(sideChildren);
+const elems = {
+  "prompt-input": promptInput, "side-input": sideInput,
+  "centre-ac": centreAc, "side-ac": sideAc,
+  "btn-send": btnSend, "side-send": sideSend,
+  "chat-stream": chatStream, "side-body": sideBody,
+};
+const $ = id => elems[id];
+const document = { querySelectorAll: () => [] };
+let activeId = "t1", view = "thread", paneToken = 0;
+const pane = { mode: "post", id: "p1", latestId: null };
+const pending = { side: null };
+const inflight = { p1: {} };
+const lastTurnMeta = {};
+const FEEDBACK_EMAIL = "kube-agents-feedback@google.com";
+const FEEDBACK_KINDS = { bug: { body: "bug body" } };
+const findThread = id => ({ id });
+const isThreadBusy = () => true;
+const calls = [];
+const submitMessage = text => calls.push(["submit", text]);
+const runTurn = (id, text) => calls.push(["turn", id, text]);
+let nextTranscript = { data: { latest_id: 2, messages: [{ id: 2, role: "assistant", content: "reply", timestamp: 100 }] } };
+const fetchTranscript = async () => nextTranscript;
+const fetchEnvironment = async () => {};
+const feedbackContextMarkdown = () => "env";
+const feedbackEmailText = (k, t, b) => k + ":" + t + ":" + b;
+const feedbackMailtoHref = () => "mailto:x";
+const escapeHtml = s => String(s);
+const registerArtifact = () => "art1";
+const artifactStore = { art1: {} };
+const nearBottom = () => true;
+const recordSpecialistFromCard = () => {};
+const noteMessageActivity = () => {};
+const dayLabel = () => "";
+const messageRow = (role, text, tag) => ({ role, text, tag, dataset: {}, querySelector: () => ({ innerHTML: "", querySelector: () => null }) });
+const appendTo = (container, role, text, tag) => { const r = messageRow(role, text, tag); container.appendChild(r); return r; };
+const refreshSkillsBars = () => {};
+const closeSkillModal = () => {};
+` + pageJS(t, "SLASH_COMMANDS", "findSlashCommand", "isLocalSlashCommand", "updateComposer", "updateSideComposer", "syncComposerButton", "markSideLocalRow", "sideLocalRows", "refreshPane", "postFeedbackDraft", "handleSlashCommand", "insideCodeFence", "wireAutocomplete", "useSkillInChat", "sendFromInput", "sendFromSide") + `
+(async () => {
+  wireAutocomplete(promptInput, "centre-ac", sendFromInput);
+  wireAutocomplete(sideInput, "side-ac", sendFromSide);
+
+  promptInput.value = "";
+  updateComposer();
+  const btnBusyEmpty = btnSend.disabled;
+
+  // Typing /feedback and pressing Enter accepts autocomplete; button enables immediately.
+  promptInput.value = "/feedback";
+  promptInput.selectionStart = 9;
+  promptInput.fire("input");
+  promptInput.fire("keydown", { key: "Enter", shiftKey: false, preventDefault() {} });
+  const afterAcVal = promptInput.value;
+  const btnBusyAfterAc = btnSend.disabled;
+
+  // Clicking Send (or pressing Enter again) runs /feedback and re-disables the button.
+  sendFromInput();
+  const feedbackVal = promptInput.value;
+  const btnAfterFeedback = btnSend.disabled;
+
+  // useSkillInChat replaces a local command with a non-local prompt and disables the button.
+  promptInput.value = "/help";
+  promptInput.selectionStart = 5;
+  promptInput.fire("input");
+  const btnBeforeSkill = btnSend.disabled;
+  pane.mode = "closed";
+  useSkillInChat("gke-audit");
+  const btnAfterSkill = btnSend.disabled;
+  pane.mode = "post";
+
+  // Prompt commands stay blocked while busy.
+  promptInput.value = "/status";
+  promptInput.selectionStart = 7;
+  promptInput.fire("input");
+  const btnBusyStatus = btnSend.disabled;
+  sendFromInput();
+  const statusVal = promptInput.value;
+
+  // Side pane: real handleSlashCommand (/help) and postFeedbackDraft (/feedback bug x)
+  // mark local rows and survive both normal and error refreshPane(true).
+  sideInput.value = "/help";
+  sideInput.selectionStart = 5;
+  sideInput.fire("input");
+  const sideBtnBusyHelp = sideSend.disabled;
+  await sendFromSide();
+  const sideHelpVal = sideInput.value;
+  const sideBtnAfterHelp = sideSend.disabled;
+
+  sideInput.value = "/feedback bug broken";
+  sideInput.selectionStart = sideInput.value.length;
+  sideInput.fire("input");
+  await sendFromSide();
+
+  delete inflight.p1;
+  await refreshPane(true);
+  const keptAfterRefresh = sideChildren.filter(c => c.dataset && c.dataset.localRow === "1").length;
+
+  nextTranscript = { error: "upstream 502" };
+  await refreshPane(true);
+  const keptAfterErrorRefresh = sideChildren.filter(c => c.dataset && c.dataset.localRow === "1").length;
+
+  inflight.p1 = {};
+  sideInput.value = "/status";
+  sideInput.selectionStart = 7;
+  sideInput.fire("input");
+  const sideBtnBusyStatus = sideSend.disabled;
+  await sendFromSide();
+  const sideStatusVal = sideInput.value;
+
+  console.log(JSON.stringify({
+    btnBusyEmpty, afterAcVal, btnBusyAfterAc, feedbackVal, btnAfterFeedback,
+    btnBeforeSkill, btnAfterSkill, btnBusyStatus, statusVal,
+    sideBtnBusyHelp, sideHelpVal, sideBtnAfterHelp,
+    keptAfterRefresh, keptAfterErrorRefresh,
+    sideBtnBusyStatus, sideStatusVal,
+    chatTags: chatChildren.map(c => c.tag),
+    calls,
+  }));
+})();`
+	want := `{"btnBusyEmpty":true,"afterAcVal":"/feedback ","btnBusyAfterAc":false,"feedbackVal":"","btnAfterFeedback":true,"btnBeforeSkill":false,"btnAfterSkill":true,"btnBusyStatus":true,"statusVal":"/status","sideBtnBusyHelp":false,"sideHelpVal":"","sideBtnAfterHelp":true,"keptAfterRefresh":2,"keptAfterErrorRefresh":2,"sideBtnBusyStatus":true,"sideStatusVal":"/status","chatTags":["help"],"calls":[]}`
+	if got := runPageJS(t, script); got != want {
+		t.Errorf("local slash command busy-guard result = %s, want %s", got, want)
+	}
+}
