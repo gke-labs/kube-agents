@@ -1671,6 +1671,18 @@ MAX_NOTE_CHARS = 2000
 # collector's rotated serial consoles are the one producer
 # (docs/designs/fleet-audit-collector-manifest.md).
 SCOPE_NOTES_KEY = "notes"
+# The key on `finish`'s JSON line that holds the targets' notes as
+# `{target, note}` objects (`notes_payload`). It is on the line only when a
+# target has a note, so a run without one prints the line it printed before.
+NOTES_RESULT_KEY = "notes"
+NOTE_TARGET_FIELD = "target"
+NOTE_TEXT_FIELD = "note"
+# A collected target's manifest entry may list the objects its `notes` names
+# as `{check, object}` (and `namespace` where the check has one): each one an
+# object a check read but could not see. `finish` refuses a `resolved_because`
+# entry for one of them (`refuse_resolved_over_notes`), because the run did
+# not see the finding go away.
+NOTED_OBJECTS_KEY = "noted_objects"
 MAX_CELL_CHARS = 120
 # `cluster`, `namespace` and `object` are Kubernetes identifiers, and the API
 # bounds every one of them: a namespace is a 63-character DNS label, a resource
@@ -7570,12 +7582,12 @@ def adopt_collector_notes(data: dict, manifest: dict | None) -> list[str]:
     return changed
 
 
-def scope_notes(data: dict) -> list[str]:
-    """`<target>: <note>` for every audited target that carries `notes`.
+def scope_note_entries(data: dict) -> list[dict]:
+    """`{target, note}` for every audited target that carries `notes`.
 
-    Rendered on the ledger (the scope table and the clean comment) so a run
-    never reads as having cleared what it could not see; never a coverage gap,
-    because what it describes is the ordinary state of a healthy fleet.
+    The JSON line of `finish` carries these on every status
+    (`notes_payload`), so the worker can relay them: on a clean run with no
+    open ledger, the line is the only place the note goes.
     """
     out = []
     for cluster in (data.get("scope") or {}).get("clusters") or []:
@@ -7584,8 +7596,77 @@ def scope_notes(data: dict) -> list[str]:
         note = publishable_text(str(cluster.get(SCOPE_NOTES_KEY) or "")).strip()
         if note:
             name = str(cluster.get("name", "")).strip() or "(unnamed)"
-            out.append(f"{name}: {note[:MAX_NOTE_CHARS]}")
+            out.append({NOTE_TARGET_FIELD: name, NOTE_TEXT_FIELD: note[:MAX_NOTE_CHARS]})
     return out
+
+
+def notes_payload(data: dict) -> dict:
+    """`{NOTES_RESULT_KEY: [...]}` for the JSON line, or nothing when no target has a note."""
+    entries = scope_note_entries(data)
+    return {NOTES_RESULT_KEY: entries} if entries else {}
+
+
+def scope_notes(data: dict) -> list[str]:
+    """`<target>: <note>` for every audited target that carries `notes`.
+
+    Rendered on the ledger (the scope table, the clean comment and the held
+    comment) so a run never reads as having cleared what it could not see;
+    never a coverage gap, because what it describes is the ordinary state of
+    a healthy fleet.
+    """
+    return [f"{e[NOTE_TARGET_FIELD]}: {e[NOTE_TEXT_FIELD]}" for e in scope_note_entries(data)]
+
+
+def _comment_scope_notes(data: dict) -> list[str]:
+    """The comment lines that list the targets' notes, or none without a note."""
+    notes = scope_notes(data)
+    if not notes:
+        return []
+    out = ["", f"Read but not visible, which is not a coverage gap ({len(notes)}):", ""]
+    out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
+    if len(notes) > MAX_SCOPE_ROWS:
+        out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
+    return out
+
+
+def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
+    """Refuse a `resolved_because` entry for an object a target's note names.
+
+    The collector lists under `noted_objects` each object whose check it ran
+    but could not see: a GCE instance whose serial console rotated past its
+    last startup-script run. A previous finding on such an object did not go
+    away in this run's sight, so "resolved" closes a fault that can still be
+    there. The worker carries it forward: it reports the finding again from
+    the previous finding.
+    """
+    noted = set()
+    for entry in _manifest_clusters(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        for item in entry.get(NOTED_OBJECTS_KEY) or []:
+            if isinstance(item, dict) and item.get("check") and item.get("object"):
+                noted.add(
+                    derive_finding_id(
+                        {
+                            "check": str(item["check"]),
+                            "cluster": str(entry.get("name") or ""),
+                            "namespace": str(item.get("namespace") or ""),
+                            "object": str(item["object"]),
+                        }
+                    )
+                )
+    if not noted:
+        return
+    for i, entry in enumerate(data.get("resolved_because") or []):
+        if isinstance(entry, dict) and derive_finding_id(entry) in noted:
+            raise ValidationError(
+                f"resolved_because[{i}]: {entry.get('object')!r} on {entry.get('cluster')!r} "
+                f"is named in that target's `{SCOPE_NOTES_KEY}`: the collector ran "
+                f"{entry.get('check')!r} there but could not see the result, so this "
+                "run did not see the finding go away. Do not write it as resolved. "
+                "Carry it forward: report it again in `findings`, from the previous "
+                "finding that `start` listed under `carried`."
+            )
 
 
 def adopt_collector_evidence(findings: list[dict], manifest: dict | None) -> list[str]:
@@ -12517,7 +12598,10 @@ def _render_scope(
         if show_notes:
             # Not a gap, so not in the Limitations column: the row's checks
             # ran, and this says what one of them could not see.
-            row += f"| {_cell(cluster.get(SCOPE_NOTES_KEY, ''), limit=MAX_NOTE_CHARS) or '—'} "
+            # Clipped as the Limitations cell is: 60 rows of full notes do
+            # not fit in the body. The full note stays in the stored
+            # document and in the clean comment.
+            row += f"| {_cell(cluster.get(SCOPE_NOTES_KEY, '')) or '—'} "
         out.append(row + "|")
     if len(clusters) > MAX_SCOPE_ROWS:
         remaining = len(clusters) - MAX_SCOPE_ROWS
@@ -13917,15 +14001,10 @@ def render_clean_comment(
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
 
-    # What the run read but could not see, which is not a gap: a clean
-    # comment is the one place a clean run says so, because it does not
-    # rewrite the body's scope table.
-    notes = scope_notes(data)
-    if notes:
-        out += ["", f"Read but not visible, which is not a coverage gap ({len(notes)}):", ""]
-        out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
-        if len(notes) > MAX_SCOPE_ROWS:
-            out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
+    # What the run read but could not see, which is not a gap. On the
+    # ledger, the clean comment is the place a clean run says so, because a
+    # clean run does not rewrite the body's scope table.
+    out += _comment_scope_notes(data)
 
     # The postures held back for want of a declared-intent search, one per
     # line. A clean run over a withheld posture is a clean run only because
@@ -14125,6 +14204,9 @@ def render_held_comment(
         out += [f"- {clip_text(gap, MAX_HOLD_LINE_CHARS)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+    # The notes say what the run could not see, so a reader does not take
+    # the instances they name as cleared.
+    out += _comment_scope_notes(data)
     out += _comment_resolved(data)
     out += _comment_declared(data)
     out += _comment_evidence(audit_id, clusters, out)
@@ -22902,6 +22984,9 @@ def _finish_without_forge(
     payload = {
         "status": NO_FORGE_STATUS,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        **notes_payload(data),
         "issue_url": None,
         "new": len(new_ids),
         "resolved": len(resolved_ids),
@@ -23612,6 +23697,9 @@ def _finish_store_ledger(
     payload = {
         "status": STORE_LEDGER_STATUS,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        **notes_payload(data),
         "issue_url": None,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -24226,6 +24314,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # body both do — so what renders is what the collector observed.
         adopted = adopt_collector_evidence(data["findings"], manifest)
         adopt_collector_notes(data, manifest)
+        # Before the dry-run split, so the preview refuses what the real run refuses.
+        refuse_resolved_over_notes(data, manifest)
         if adopted:
             shown = ", ".join(adopted[:MANIFEST_LOG_IDS])
             if len(adopted) > MANIFEST_LOG_IDS:
@@ -25287,6 +25377,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # this line, and "clean" is the one thing it is not.
             "status": "HELD" if unaccounted or held_unread else "CLEAN",
             **precheck_payload(),
+            # The targets' notes, on every status: the line is what the worker
+            # relays, and on a clean run with no ledger it is the only place.
+            **notes_payload(data),
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -25859,6 +25952,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     payload = {
         "status": status,
         **precheck_payload(),
+        # The targets' notes, on every status: the line is what the worker
+        # relays, and on a clean run with no ledger it is the only place.
+        **notes_payload(data),
         "issue_url": issue_url,
         "new": reported_new,
         "resolved": reported_resolved,

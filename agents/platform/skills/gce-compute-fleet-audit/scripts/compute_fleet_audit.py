@@ -69,7 +69,9 @@ Field contracts assumed of `gcloud ... --format=json` output:
   a run (`STARTUP_RUN_PATTERN`) on an instance known to run a script is not
   a clean result. It is not a coverage gap either, because every VM that runs
   for some weeks reaches that state: the target's `notes` names it
-  (`ROTATED_SERIAL_NOTE`), which `finish` shows and does not count as a gap.
+  (`ROTATED_SERIAL_NOTE`), which `finish` shows and does not count as a gap,
+  and `noted_objects` lists it, so `finish` refuses to resolve a previous
+  finding on it.
 - `compute disks list` items carry `name` and `selfLink`; a snapshot's
   `sourceDisk` appears in the wild in both forms, so both are indexed.
 - `compute snapshots list` items carry `sourceDisk`, `creationTimestamp`
@@ -484,6 +486,12 @@ ROTATED_SERIAL_NOTE = (
 )
 ROTATED_NOTE_NAMES = 10
 ROTATED_NOTE_MORE = ", and {more} more"
+# The manifest key that lists every instance the note covers, with no limit,
+# as `{check, object}`. `finish` refuses a `resolved_because` for one of
+# them: the audit did not see that finding go away.
+NOTED_OBJECTS_KEY = "noted_objects"
+# An instance's finding identity (`check_startup_script`).
+INSTANCE_OBJECT_FORMAT = "ComputeInstance/{zone}/{name}"
 
 # §2.1's Do-NOT-flag limb is a GKE-node exclusion this collector does not
 # apply, and §2.5's is a legal-hold exclusion it cannot see. `needs_triage` is
@@ -821,7 +829,7 @@ def check_startup_script(instance_name: str, zone: str, serial_text: str) -> dic
     for line in lines[starts[-1] if starts else 0 :]:
         if STARTUP_FAILURE_PATTERN.search(line):
             return {
-                "object": f"ComputeInstance/{zone}/{instance_name}",
+                "object": INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name),
                 "excerpt": redact(line.strip()),
                 "impact": (
                     f"Instance {instance_name} failed initialization and may be in a "
@@ -1231,6 +1239,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     # Information for the reader that is not a coverage gap
     # (ROTATED_SERIAL_NOTE); the manifest's `notes`.
     notes: list[str] = []
+    # The objects the notes cover (NOTED_OBJECTS_KEY).
+    noted_objects: list[dict] = []
 
     def gated(argv: list[str], slug: str) -> list:
         parsed, result = run_and_gate(argv, run=run)
@@ -1300,6 +1310,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         common_script = isinstance(info_parsed, dict) and project_wide
         unread: list[str] = []
         rotated: list[str] = []
+        rotated_objects: list[str] = []
         for instance_name, zone in targets:
             argv = _serial_argv(instance_name, zone, project)
             result = run(argv)
@@ -1323,6 +1334,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 # no longer in it. No failure line here proves nothing, so the
                 # note below says so; GKE nodes are outside §2.1's universe.
                 rotated.append(f"{instance_name} ({zone})")
+                rotated_objects.append(INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name))
 
         if not instances:
             not_applicable.append(
@@ -1367,6 +1379,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             if len(rotated) > len(shown):
                 names += ROTATED_NOTE_MORE.format(more=len(rotated) - len(shown))
             notes.append(ROTATED_SERIAL_NOTE.format(count=len(rotated), names=names))
+            noted_objects += [{"check": STARTUP_SLUG, "object": obj} for obj in sorted(rotated_objects)]
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(
@@ -1516,6 +1529,8 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         entry["limitations"] = "; ".join(limitations)
     if notes:
         entry["notes"] = "; ".join(notes)
+    if noted_objects:
+        entry[NOTED_OBJECTS_KEY] = noted_objects
     return entry
 
 

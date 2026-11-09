@@ -318,7 +318,8 @@ document to `findings_path`, with each remediation's note as the worker wrote it
 notes, without the previous run's search record and with each `declared[]` entry's declaration as
 this run's `start` filed it, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
 the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
-`precheck: unchanged`, and the run is over. In every other case the line says `closed: false` and
+`precheck: unchanged`, and the run is over. Relay its `notes`, when it has them, as
+[`finish`](finish.md) says. In every other case the line says `closed: false` and
 why, the findings file is as it was, and the SOP continues; a close that dies puts the file back
 too, and the run's in-flight note stays until the SOP's own `finish`. Without the flag it never
 closes a run: an on-demand run is answered by the person who asked for it, in full.

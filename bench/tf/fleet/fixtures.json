@@ -1177,7 +1177,7 @@
           "subject": "instance/startup-fail-*",
           "op": "serial_contains",
           "value": "Script \"startup-script\" failed with error",
-          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector reports the check unevaluated and gce-startup-script-failure has no finding to grade. The daily reconcile resets the VM to print it again"
+          "why": "the audit can file only the failure line it reads on the serial console; the guest prints it at boot only, and later output pushes it out of the buffer within weeks, after which the collector writes a note on the target and files nothing, so gce-startup-script-failure has no finding to grade. The daily reconcile resets the VM to print it again"
         }
       ]
     },

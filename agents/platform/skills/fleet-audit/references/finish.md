@@ -80,7 +80,13 @@ posture findings `finish` held back because the document recorded no complete de
 search (empty everywhere but on a declaring stream that skipped the step; see
 [`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
+[The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
+target has one: a list of `{target, note}`, each one a sentence from the collector about what a check
+read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
+and it does not change `silent_ok`. Relay each note in your report on every status, and do not
+report the objects it names as clean. A previous finding on such an object did not go away in this run's
+sight: report it again from the previous finding, because `finish` refuses a `resolved_because`
+entry for it. A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report
 store, `new` and `resolved` count against it. When that earlier `finish` reported news or opened a
 pull request, the line also carries `silent_floor: true`: its `silent_ok` stays `false` and its

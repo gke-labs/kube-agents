@@ -59,8 +59,9 @@ def unevaluated(entry: dict) -> dict:
 
 # A console that still holds a startup-script run that succeeded: the run's
 # opening line, as the current guest agent prints it, and its closing line.
-# A console without the opening line has lost its boot to the ring buffer and
-# leaves the check unevaluated (`startup_run_visible`), so a clean pass needs it.
+# A console without the opening line has lost its boot to the ring buffer, so
+# the collector writes a note on the target and files nothing
+# (`startup_run_visible`). A clean pass needs the opening line.
 CLEAN_BOOT = (
     'google_metadata_script_runner[845]: Running metadata script runner (version 20260715.00) for "startup" event\n'
     "google_metadata_script_runner[845]: Found startup-script in metadata\n"
@@ -1124,6 +1125,10 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn(cf.STARTUP_SLUG, [c["check"] for c in entry["commands"]])
         self.assertIn("is not visible", entry["notes"])
         self.assertIn("startup-fail-seeded (us-central1-a)", entry["notes"])
+        self.assertEqual(
+            entry[cf.NOTED_OBJECTS_KEY],
+            [{"check": cf.STARTUP_SLUG, "object": "ComputeInstance/us-central1-a/startup-fail-seeded"}],
+        )
 
     def test_a_fresh_console_is_still_a_finding(self):
         entry = cf.collect_project(
@@ -1218,6 +1223,12 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("vm-09 (z1)", entry["notes"])
         self.assertNotIn("vm-10", entry["notes"])
         self.assertIn("and 3 more", entry["notes"])
+        # The note text stops at ten names; the structured list does not, so
+        # `finish` can refuse a resolve on the eleventh instance too.
+        self.assertEqual(
+            entry[cf.NOTED_OBJECTS_KEY],
+            [{"check": cf.STARTUP_SLUG, "object": f"ComputeInstance/z1/vm-{i:02d}"} for i in range(13)],
+        )
 
     def test_the_failed_project_info_fallback_does_not_demand_a_run_marker(self):
         """After a failed `project-info` read every RUNNING instance is read,
@@ -1545,6 +1556,31 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
         clean = audit_report.render_clean_comment(self.AUDIT, data, stamp, gaps=[])
         self.assertIn("Read but not visible, which is not a coverage gap (1)", clean)
         self.assertIn("vm-1 (us-central1-a)", clean)
+
+    def test_a_resolve_on_a_rotated_instance_is_refused(self):
+        """A finding filed on the VM before its console rotated cannot be
+        written as resolved: the audit did not see it go away. The noted
+        object is the finding's own identity, so the refusal matches it."""
+        import audit_report
+
+        manifest = self.fleet(**{"get-serial-port-output": run_of(0, WRAPPED_SERIAL)})
+        data = self._document(manifest)
+        data["resolved_because"] = [
+            {
+                "check": cf.STARTUP_SLUG,
+                "cluster": "project/proj-1",
+                "namespace": "",
+                "object": "ComputeInstance/us-central1-a/vm-1",
+                "reason": "The serial console shows no startup-script failure line.",
+            }
+        ]
+        audit_report.validate_findings(data, self.AUDIT)
+        with self.assertRaisesRegex(audit_report.ValidationError, "Carry it forward"):
+            audit_report.refuse_resolved_over_notes(data, manifest)
+        # A console that still shows the clean run notes nothing, so the
+        # same resolve stands.
+        clean = self.fleet(**{"get-serial-port-output": run_of(0, CLEAN_BOOT)})
+        audit_report.refuse_resolved_over_notes(data, clean)
 
     def test_a_long_lived_scripted_vm_leaves_no_gap_and_carries_a_note(self):
         """The review's repro: the current guest agent prints the MWLID line

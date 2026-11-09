@@ -389,7 +389,8 @@ or announce the gap.
 
 A third way is slower and needs no one to act. The startup-fail VM prints its failure line
 once per boot, and its serial buffer rotates the line out about three weeks later. The
-reconcile resets the VM each time it reaches a project, and the `serial_contains` assertion in
+reconcile resets the VM after each project it brings to the tree
+([§6.2](../ci-pool-projects.md#62-the-scheduled-reconcile)), and the `serial_contains` assertion in
 the fixture scan reads a buffer without the line as drift.
 
 None of these is a reason for a case to hedge. A case that tolerates its fixture being

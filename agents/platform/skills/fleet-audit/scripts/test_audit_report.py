@@ -25917,6 +25917,125 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
 
 
+# A target's note, as the GCE collector writes one when a serial console
+# has rotated past the last startup-script run.
+ROTATED_NOTE = "netpol-missing: the status of 1 object is not visible: Namespace/a."
+
+
+class TestScopeNotesReachTheReader(HarnessTestCase):
+    """A collector's `notes` on a target reaches the worker on every status,
+    and a previous finding on a noted object cannot be written as resolved."""
+
+    def manifest_file(self, manifest):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def noted_manifest(self, noted_objects=True):
+        manifest = _full_manifest()
+        manifest["clusters"][0]["notes"] = ROTATED_NOTE
+        if noted_objects:
+            manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
+                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+            ]
+        return manifest
+
+    def previous_a(self):
+        """An open ledger whose last body carried finding `a`."""
+        previous_body = published_body(make_doc(findings=[make_finding(fid="a", title="Alpha finding")]), generated_at=NOW)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        return previous_body
+
+    def test_a_clean_run_with_no_ledger_carries_the_notes_on_its_line(self):
+        """No issue is opened, closed or commented on, so the JSON line is
+        the only place the note can reach anyone."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        self.assertEqual(payload["coverage_gaps"], [])
+
+    def test_a_findings_run_carries_the_notes_on_its_line(self):
+        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "OPENED")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+
+    def test_a_run_without_notes_prints_no_notes_key(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("notes", self.stdout_json())
+
+    def test_the_held_comment_and_line_show_the_notes(self):
+        self.previous_a()
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "HELD")
+        self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+        comment = self.harness.bodies_for("issue-comment")[-1]
+        self.assertIn("Read but not visible, which is not a coverage gap (1)", comment)
+        self.assertIn(f"prod-us-east: {ROTATED_NOTE}", comment)
+
+    def test_a_resolve_on_a_noted_object_is_refused(self):
+        """The collector could not see `a`, so the run did not see it go
+        away; the worker carries it forward instead."""
+        previous_body = self.previous_a()
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 2)
+        self.assertIn("resolved_because[0]", self.err)
+        self.assertIn("Carry it forward", self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        # The preview refuses it too.
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 2)
+        self.assertIn("Carry it forward", self.err)
+
+    def test_a_resolve_on_an_object_no_note_names_closes(self):
+        previous_body = self.previous_a()
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=False))])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+
+    def test_a_carried_finding_on_a_noted_object_publishes(self):
+        """Reported again, the finding stays on the ledger."""
+        self.previous_a()
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual((payload["status"], payload["new"], payload["resolved"]), ("UPDATED", 0, 0))
+
+
+class TestScopeNotesFitTheBody(unittest.TestCase):
+    def test_sixty_projects_with_long_notes_fit_the_body(self):
+        """The Notes cell is clipped as the Limitations cell is. A cell of
+        the full note on every row of a large fleet is over the body limit."""
+        clusters = [
+            {"name": f"project/p-{i:02d}", "notes": f"n{i:02d} " + "x" * audit_report.MAX_NOTE_CHARS}
+            for i in range(audit_report.MAX_SCOPE_ROWS)
+        ]
+        doc = make_doc(findings=[], audit="gce-compute-fleet-audit", clusters=clusters)
+        body = audit_report.render_issue_body(doc, generated_at=NOW, audit_id="gce-compute-fleet-audit").body
+        self.assertIn("| Notes |", body)
+        self.assertIn("n59 x", body)
+        self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), body)
+
+
 class TestFinishManifestFlag(HarnessTestCase):
     """The `--manifest-file` / `--no-collector-manifest` wiring in `handle_finish`.
 
