@@ -3593,7 +3593,8 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
     """The scorer sets a router-scope check aside on an inject record with no
     activity marker and nothing outside the envelope. A worker's entry would
     end that, grading the check against no router calls, so on such a record
-    the workers' entries stay off the trajectory; with a marker they join it."""
+    the workers' entries stay off the trajectory and a gap entry stands in
+    for them; with a marker they join it."""
     if door_shows_trace:
         api_executor.probe_activity = []
     build_session_store(tmp_path, created=[CARD_A])
@@ -3613,6 +3614,10 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
         assert "terminal" not in names
         assert scoring._inject_blind(result.trajectory)
         assert result.metadata["worker_entries_withheld"] == 1
+        # A gap entry takes their place, so a record that merges this turn
+        # with one whose workers were kept does not read as a full capture.
+        assert result.trajectory[-1] == worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+        assert not scoring._inject_workers_carried([*result.trajectory, dict(WORKER_ENTRY)])
     # The counts are not entries and do not move the scorer: they stay.
     assert result.tokens["workers"] is not None
 

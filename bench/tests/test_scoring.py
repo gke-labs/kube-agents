@@ -44,8 +44,8 @@ import dataclasses
 
 import pytest
 
-from kube_agents_bench import scoring
-from kube_agents_bench.cases import CaseSpec, load_case
+from kube_agents_bench import scoring, worker_trajectory
+from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, CaseSpec, load_case
 from kube_agents_bench.scoring import (
     DEFAULT_AGGREGATE_MARGIN,
     DEFAULT_JUDGED_MARGIN,
@@ -2702,6 +2702,168 @@ def test_a_worker_check_stays_set_aside_when_the_door_shows_the_trace(write_task
     rep = classify_rep(spec, inject_run(mutate=errored_worker_checks_only), 1)
     assert rep.outcome == "pass" and rep.correctness == 1.0
     assert rep.not_applicable_checks == [BLIND_CHECK, *worker_checks]
+
+
+WORKER_ONLY_CHECK = "the-worker-ran-kubectl"
+WORKER_AND_ROUTER_CHECK = "the-router-filed-and-a-cluster-agent-worked"
+WORKER_UNTRACED_CHECKS = ["the-router-filed-for-a-cluster-agent", "the-stated-time-was-read"]
+TAGGED_WORKER_ENTRY = {
+    "name": "terminal",
+    "args": {"command": "kubectl get pods"},
+    "result": "pod/web Running",
+    "status": "completed",
+    "agent": "cluster-a",
+    "task": "t_1",
+}
+
+
+@pytest.fixture
+def worker_lane_spec(write_task):
+    """A case with one worker-reading entry of each kind the inject lane
+    tells apart: one that reads only the workers, one that also reads the
+    router's calls by name, and two that read what the inject trace never
+    carries (a router argument value, every tool output)."""
+    return load_case(
+        write_task(
+            "worker-lane",
+            {
+                "id": "worker-lane",
+                "name": "Worker lane",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {
+                        "name": WORKER_ONLY_CHECK,
+                        "role": "objective",
+                        "check": {"type": "worker_commands", "required_patterns": ["kubectl"]},
+                    },
+                    {
+                        "name": WORKER_AND_ROUTER_CHECK,
+                        "role": "objective",
+                        "check": {
+                            "type": "sequence",
+                            "checks": [
+                                {"type": "tool_called", "tool_names": ["kanban_create"]},
+                                {"type": "worker_agents", "required_agents": ["cluster-.*"]},
+                            ],
+                        },
+                    },
+                    {
+                        "name": WORKER_UNTRACED_CHECKS[0],
+                        "role": "objective",
+                        "check": {
+                            "type": "sequence",
+                            "checks": [
+                                {
+                                    "type": "tool_called",
+                                    "tool_names": ["kanban_create"],
+                                    "arguments": {"assignee": "cluster-.*"},
+                                },
+                                {"type": "worker_agents", "required_agents": ["cluster-.*"]},
+                            ],
+                        },
+                    },
+                    {
+                        "name": WORKER_UNTRACED_CHECKS[1],
+                        "role": "objective",
+                        "check": {"type": "report_times_in_window", "label_patterns": ["as of"]},
+                    },
+                ],
+            },
+        )
+    )
+
+
+def _failed_entry(name):
+    return {
+        "name": name,
+        "role": "objective",
+        "severity": None,
+        "weight": 1.0,
+        "mode": "assert",
+        "status": "fail",
+        "success": False,
+        "reason": "recorded fail",
+    }
+
+
+def _worker_lane_run(inject_run, *, workers=True, gap=False, loss=None):
+    """The captured inject repetition with the activity marker (reporting
+    ``loss``), a tagged worker entry when ``workers``, a capture-gap entry
+    when ``gap``, and every worker-reading entry recorded as failed."""
+
+    def mutate(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 0, "dropped": 0, **(loss or {})}})
+        if workers:
+            rec["trajectory"].append(dict(TAGGED_WORKER_ENTRY))
+        if gap:
+            rec["trajectory"].append(worker_trajectory.gap_entry(["session store for cluster-a: locked"]))
+        names = [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+        rec["verification_report"] = [
+            e for e in rec["verification_report"] if e.get("name") != BLIND_CHECK
+        ] + [_failed_entry(n) for n in names]
+        # devops-bench's rollup over five objectives, four failed.
+        rec["scores"]["VerificationCorrectness"] = 0.2
+
+    return inject_run(mutate=mutate)
+
+
+def test_the_worker_lane_case_sorts_its_worker_reading_entries(worker_lane_spec):
+    spec = worker_lane_spec
+    assert spec.worker_blind_checks == {WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS}
+    assert spec.worker_router_checks == {WORKER_AND_ROUTER_CHECK, WORKER_UNTRACED_CHECKS[0]}
+    assert spec.worker_untraced_checks == set(WORKER_UNTRACED_CHECKS)
+    assert spec.trace_blind_checks == set()
+
+
+def test_a_worker_check_grades_on_an_inject_record_that_carries_the_workers(worker_lane_spec, inject_run):
+    """#5236: the delegation wait puts the workers' tagged entries on the
+    inject record, so a check that reads only the workers grades there as
+    on the api transport, and so does one that also reads the router's
+    calls by name when the door's marker reports no loss. A check that
+    reads what the trace never carries stays set aside."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run), 1)
+    assert rep.not_applicable_checks == WORKER_UNTRACED_CHECKS, rep.reason
+    assert rep.outcome == "fail"
+    failed = {f.split(":")[0] for f in rep.failed_checks}
+    assert failed == {WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK}
+    assert rep.correctness == pytest.approx(1 / 3)
+
+
+def test_a_worker_check_stays_set_aside_on_an_inject_record_without_the_workers(
+    worker_lane_spec, inject_run
+):
+    """No tagged worker entry: the capture did not run or found nothing, so
+    every worker-reading entry is set aside, as before #5236."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run, workers=False), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+    assert rep.outcome == "pass" and rep.correctness == 1.0
+
+
+def test_a_worker_check_stays_set_aside_on_a_capture_with_a_gap(worker_lane_spec, inject_run):
+    """The harness writes ``worker_trajectory.GAP_ENTRY`` when the capture
+    could not read everything. A worker-reading check graded over the part
+    it read could fail a call that happened or pass a safeguard over one,
+    so on such a record every one is set aside, tagged entries or not."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run, gap=True), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+    assert rep.outcome == "pass" and rep.correctness == 1.0
+    assert worker_trajectory.GAP_ENTRY in HARNESS_WRITTEN_ENTRIES
+
+
+def test_a_worker_check_that_reads_the_router_stays_set_aside_on_a_lossy_trace(
+    worker_lane_spec, inject_run
+):
+    """With the workers carried but a marker that reports a loss, the
+    router's calls may be short, so an entry that also reads them is set
+    aside; one that reads only the workers still grades."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run, loss={"dropped": 2}), 1)
+    assert rep.not_applicable_checks == [WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+    assert rep.outcome == "fail"
+    assert {f.split(":")[0] for f in rep.failed_checks} == {WORKER_ONLY_CHECK}
 
 
 def test_a_tripped_never_called_safeguard_stays_graded_on_a_lossy_trace(write_task, inject_run):

@@ -317,8 +317,8 @@ recorded run(s), 5 more needed …` at the presubmit's key (gemini-4-argon, mode
   alone (`read-from-monitoring-not-the-audit-log`, a `worker_commands` check that read one
   command and no `gcloud`) with the two report objectives passing and the answer naming the
   policy as disabled, and the judge reading `gcloud alpha monitoring policies list` in the
-  worker's trajectory. That objective and the `no-monitoring-write` safeguard are set aside on
-  the inject lane, so the merge-blocking presubmit and the main nightly grade neither, and the
+  worker's trajectory. That objective and the `no-monitoring-write` safeguard were set aside on
+  the inject lane until #5236, so the merge-blocking presubmit and the main nightly graded neither, and the
   seat blocks there on the two report objectives. The today lane ([below](#the-inject-lane))
   runs the presubmit matrix over the api transport, where both are graded: this seat puts the
   case on that matrix with the route objective live and its one api-transport record at 0/3,
@@ -782,10 +782,12 @@ graded there, but the job does not block a merge.
 
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
-when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
-`tool_called` with a `result` pattern as blind on
-every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
+when the turn ran under the bridge's `api` executor and puts the workers' calls on the record, so the
+scorer grades `worker_commands`, `worker_agents`, `worker_budget` and a `tool_called` in the
+`workers` scope on an inject record that carries those entries with no capture gap. It still
+treats them as blind on any other inject record, and treats `report_times_in_window` and a
+router-scope `tool_called` with a `result` or `arguments` pattern as blind on every inject record.
+A door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
 those entries aside as not applicable on that transport and grades the rest, and a case whose
 only objectives are of that kind is reported `NOT_GRADED_ON_TRANSPORT` rather than collapsed —
@@ -793,9 +795,8 @@ evaluated, outside the pass rate, never weather
 ([`docs/designs/eval-scorer.md`](designs/eval-scorer.md), "The inject lane sets aside what its
 transport cannot show"). No roster edit is involved. The half of the rule for a router-scope
 `tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
-reporting no loss), whether or not the run made a call. The delegation wait for this path is
-rebuilt, but the worker half stays until `scoring.py` takes those entries out of
-`worker_blind_checks` for a record that carries the workers.
+reporting no loss), whether or not the run made a call. The worker half retires on a record that
+carries the workers' tagged entries and no `harness_worker_capture_gaps` entry (#5236).
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The front door's delegation cases are not on it: the

@@ -5476,9 +5476,8 @@ def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
 def test_settle_marks_the_guardrail_block_on_the_inject_lane_whether_or_not_the_worker_acted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The presubmit grades the inject lane, where the scorer sets the
-    worker-blind safeguards aside on every record; the mark reads the same
-    there as on the api transport (#4871's build 2118527973618356224: two
+    """The presubmit grades the inject lane; the mark reads the same there
+    as on the api transport (#4871's build 2118527973618356224: two
     workers that ran terminal commands, then died on 429s)."""
     inject_front = [{"name": harness.inject.EVENT_ENTRY_TASK}, {"name": "kanban_create"}]
     for entries in (_ACTED, [_worker_entry("read_file", path="x")]):
@@ -5702,6 +5701,44 @@ def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
+
+
+@pytest.mark.parametrize(
+    ("summary", "gaps"),
+    [
+        ({"unread": ["session store for platform: locked"], "errors": []}, ["session store for platform: locked"]),
+        ({"clipped": ["calls"], "errors": []}, [harness.worker_trajectory.CALL_CAP_GAP]),
+        ({"unread": [], "clipped": [], "errors": ["redactor unavailable"]}, None),
+    ],
+    ids=["unread", "clipped", "complete"],
+)
+def test_settle_records_a_capture_gap_on_the_trajectory(
+    summary: dict[str, Any], gaps: list[str] | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """devops-bench drops ``metadata``, so a capture with gaps leaves
+    ``worker_trajectory.GAP_ENTRY`` after the workers' entries, where the
+    scorer reads it; a complete capture leaves none. The entry is not a
+    front-door action: the run stays graded."""
+    worker = {"name": "terminal", "args": {"command": "kubectl get pods"}, "agent": "cluster-a", "task": "t_1"}
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": None})
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(worker)], summary=summary),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    names = [e.get("name") for e in res.trajectory]
+    if gaps is None:
+        assert harness.worker_trajectory.GAP_ENTRY not in names
+    else:
+        assert res.trajectory[-1] == harness.worker_trajectory.gap_entry(gaps)
+        assert res.trajectory[-2]["agent"] == "cluster-a"
+    assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
 def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
