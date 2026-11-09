@@ -407,3 +407,22 @@ func TestScrubInlineSecretsValueColumnsAndDecodeParens(t *testing.T) {
 		}
 	}
 }
+
+// Every value column of a key/value table is redacted, encoded columns
+// included, and a short row's last cell; a parenthetical is kept only when
+// the whole rest of the line is a status word. Synthetic values.
+func TestScrubInlineSecretsAllValueColumnsAndWholeStatusValue(t *testing.T) {
+	positives := []struct{ in, want string }{
+		{"| Name | Decoded | Encoded |\n|---|---|---|\n| password | quietpasture | cXVpZXRwYXN0dXJl |",
+			"| Name | Decoded | Encoded |\n|---|---|---|\n| password | [redacted] | [redacted] |"},
+		{"| Name | Decoded | Encoded |\n|---|---|---|\n| password | quietpasture |",
+			"| Name | Decoded | Encoded |\n|---|---|---|\n| password | [redacted] |"},
+		{"Password (decoded): enabled quietpasture word", "Password (decoded): [redacted]"},
+		{"Password (prod): ready quietpasture", "Password (prod): [redacted]"},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
