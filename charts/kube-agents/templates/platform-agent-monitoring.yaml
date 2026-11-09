@@ -132,6 +132,31 @@ spec:
     - port: 8444
       path: /metrics
       interval: 30s
+---
+{{- /*
+The NATS exporter sidecar (a2aNATSMetricsPort in the operator), in each pod of
+the A2A bus: JetStream stream bytes and max_bytes, and the server's storage
+used, reserved and maximum, read from the server's monitor port over the pod's
+loopback. Like the A2A gateway's, the pods exist only under spec.mode next;
+elsewhere this selects no pod. The selector is the operator's app label for
+the bus's pods and the port is the exporter's; the operator's bus
+NetworkPolicy admits the collector on that port and on no other.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-a2a-nats-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-a2a-nats
+  endpoints:
+    - port: 7777
+      path: /metrics
+      interval: 30s
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
 ---

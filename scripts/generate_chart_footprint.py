@@ -97,7 +97,7 @@ _AGENT_DATA_CLAIM = "platformagent-data"
 _SHELL_DATA_CLAIM_TEMPLATE = "data"
 
 # What spec.mode: next adds, by footprint key: the A2A stack's workloads (kind, name, the
-# one container each runs), the hermes-bridge container in the agent pod, the
+# containers each runs), the hermes-bridge container in the agent pod, the
 # provisioning Job, and the NATS StatefulSet's JetStream claim.
 _A2A_NATS = "a2aNats"
 _A2A_CALLOUT = "a2aCallout"
@@ -152,13 +152,14 @@ _KIND_JOB = "Job"
 _KIND_CRON_JOB = "CronJob"
 _KIND_POD = "Pod"
 
-# The A2A workloads next mode adds: footprint key -> (kind, name, the one container each runs).
+# The A2A workloads next mode adds: footprint key -> (kind, name, the containers each
+# runs, summed into one entry). The NATS pod carries the server and its metrics exporter.
 _A2A_WORKLOADS = {
-    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, "nats"),
-    _A2A_CALLOUT: (_KIND_DEPLOYMENT, "platformagent-a2a-callout", "callout"),
-    _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", "verifier"),
-    _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", "console"),
-    _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", "gateway"),
+    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, ("nats", "nats-exporter")),
+    _A2A_CALLOUT: (_KIND_DEPLOYMENT, "platformagent-a2a-callout", ("callout",)),
+    _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", ("verifier",)),
+    _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", ("console",)),
+    _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", ("gateway",)),
 }
 
 # Kinds that put pods on a cluster. Every golden document of one of these has to reach the
@@ -760,13 +761,14 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 " blessed without RunSettledGoldenTest leaves it out"
             )
         summed_containers.add(_container_key(_GATEWAY_WORKLOAD_KEY, _BRIDGE_CONTAINER))
-        for key, (kind, name, container) in _A2A_WORKLOADS.items():
-            if key not in a2a_found or container not in a2a_found[key][0]:
-                raise ValueError(
-                    f"container {container!r} of {kind}/{name} not found in the next-mode"
-                    " golden"
-                )
-            summed_containers.add(_container_key(a2a_found[key][2], container))
+        for key, (kind, name, containers) in _A2A_WORKLOADS.items():
+            for container in containers:
+                if key not in a2a_found or container not in a2a_found[key][0]:
+                    raise ValueError(
+                        f"container {container!r} of {kind}/{name} not found in the next-mode"
+                        " golden"
+                    )
+                summed_containers.add(_container_key(a2a_found[key][2], container))
         if len(provision_jobs) != 1 or _A2A_PROVISION_CONTAINER not in provision_jobs[0][0]:
             raise ValueError(
                 f"expected one {_A2A_PROVISION_JOB_PREFIX}* Job running"
@@ -841,9 +843,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 ),
             },
         }
-        for key, (_, _, container) in _A2A_WORKLOADS.items():
+        for key, (_, _, names) in _A2A_WORKLOADS.items():
             containers, replicas, _, surges = a2a_found[key]
-            following[key] = _workload_entry([containers[container]], pods=1, replicas=replicas)
+            following[key] = _workload_entry(
+                [containers[name] for name in names], pods=1, replicas=replicas
+            )
             following[key][_SURGES] = surges
         following[_A2A_PROVISION] = _workload_entry(
             [provision_jobs[0][0][_A2A_PROVISION_CONTAINER]], pods=1

@@ -4072,6 +4072,34 @@ spec:
               readOnly: true
             - mountPath: /data
               name: data
+        - args:
+            - -port=7777
+            - -varz
+            - -jsz=all
+            - http://127.0.0.1:8222
+          image: natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255
+          name: nats-exporter
+          ports:
+            - containerPort: 7777
+              name: nats-metrics
+          resources:
+            limits:
+              cpu: 100m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65534
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
@@ -4436,6 +4464,13 @@ spec:
               app: platformagent-a2a-console
       ports:
         - port: 9222
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 7777
           protocol: TCP
     - from:
         - podSelector:

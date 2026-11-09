@@ -129,17 +129,17 @@ nextMode:
       pods: 0
   a2aNats:
     requests:
-      cpu: 750m
-      memory: 1536Mi
+      cpu: 780m
+      memory: 1632Mi
       ephemeral-storage: "0"
     limits:
-      cpu: "3"
-      memory: 3Gi
+      cpu: 3300m
+      memory: 3456Mi
       ephemeral-storage: "0"
-    cpuMillisRequest: 750
-    cpuMillisLimit: 3000
-    memoryBytesRequest: 1610612736
-    memoryBytesLimit: 3221225472
+    cpuMillisRequest: 780
+    cpuMillisLimit: 3300
+    memoryBytesRequest: 1711276032
+    memoryBytesLimit: 3623878656
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
     pods: 3

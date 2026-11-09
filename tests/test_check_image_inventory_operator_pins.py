@@ -3,8 +3,9 @@ compiled into the operator to its images.json entry (#1557).
 
 The operator falls back to a compiled constant whenever an image env var is
 unset; the ones that are inventory entries are the fluent-bit sidecar, and the
-NATS and nats-box images a `spec.mode: next` install renders. The last two
-reach no chart render, so this check is the only one that sees them. The
+NATS, nats-box and NATS exporter images a `spec.mode: next` install renders.
+The last three reach no chart render, so this check is the only one that sees
+them. The
 first-party next defaults (gateway, worker, callout, console, Hermes bridge) are release images with
 no fixed tag, so `check_compiled_image_name` holds the operator's bare image
 names to the inventory's entries (and each entry's repository to the name
@@ -45,6 +46,7 @@ _CALL_SITES = (
     "check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage",
     "check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage",
     "check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage",
+    "check_operator_pin prometheus-nats-exporter k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSExporterImage",
     "check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName",
     "check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName",
     "check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName",
