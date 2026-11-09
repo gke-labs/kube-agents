@@ -352,14 +352,49 @@ to stall in a namespace with an open alert is added to that alert's card at once
 1440; unset or `0` alerts on the first sweep that sees the stall.
 
 `kinds` replaces the default list of resources the watch scans: Deployments, StatefulSets,
-DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and cert-manager Certificates. Write each
-item as kubectl names the resource, in lower case: `deployments`,
-`gateways.gateway.networking.k8s.io`. The single item `all` scans every namespaced kind the cluster
-serves, with one read per kind in each namespace, which is slow on a large fleet. The API server
-refuses `all` next to another item, and refuses Secrets, ConfigMaps, Events, Endpoints,
-EndpointSlices, ControllerRevisions and Leases, which the scan reports nothing from. Up to 20
-items. A kind a cluster does not serve is left out on
-that cluster.
+DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, cert-manager Certificates, and
+`*.cnrm.cloud.google.com`, the Config Connector kinds. Write each item as kubectl names the
+resource, in lower case: `deployments`, `gateways.gateway.networking.k8s.io`. An item of the
+form `*.<suffix>` is a group wildcard for every namespaced kind whose API group ends in the
+suffix. A list you set replaces the wildcard too: name `*.cnrm.cloud.google.com` in it to keep
+the Config Connector kinds.
+
+The single item `all` scans every namespaced kind the cluster serves, with one read per kind in
+each namespace, which is slow on a large fleet. The API server refuses `all` next to another
+item, and refuses Secrets, ConfigMaps, Events, Endpoints, EndpointSlices, ControllerRevisions and
+Leases, which the scan reports nothing from. Up to 20 items. A kind a cluster does not serve is
+left out on that cluster.
+
+The Config Connector wildcard is in the default list because a managed resource that Config
+Connector cannot apply shows it in two places only. The controller does not crash and logs only on
+the object. It records at most a Warning event there, which the event watcher forwards
+([a day in the life](/kube-agents/overview/day-in-the-life/) lists the reasons), and it sets the
+object's own `Ready` condition. The `ConfigConnector` object's status reports the controller's
+health, not the health of the resources it manages. `stall_report.py` reads the `Ready` condition
+as a stale condition once it has been false for longer than the stall threshold, so a `SQLInstance`
+stuck on `UpdateFailed` is a stall like a Deployment past its progress deadline, event or no event.
+
+Two reasons are in progress, not stalled, at any age: `Updating` (a create or update under way) and
+`Deleting`. `DependencyNotReady`, which lasts as long as the referenced resource's own create, is a
+stall after 60 minutes rather than after the usual 15.
+
+The add-on serves about three hundred kinds, so the watch does not read each one in each
+namespace. On each cluster that serves them, it discovers once which kinds have objects and in
+which namespaces, with one `kubectl get` over every namespace for each batch of 10 kinds. It
+keeps the result in its ledger and reads in a namespace only the kinds it found there, 20 per
+sweep.
+
+A namespace with more is read in turns, the next 20 on the next sweep, so every kind is
+read within a few sweeps. The ledger says which kinds wait. Objects in the system namespaces, in
+`excludeNamespaces` and in exempt namespaces do not reach the record.
+
+It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
+clusters per sweep, so a fleet's refreshes spread out.
+
+A kind that gained its first object between two discoveries is read from the next one. A kind a
+discovery could not read, or one the cluster started to serve since the last discovery, holds its
+ledger rows as unread rather than clearing them. A cluster that serves no Config Connector kind
+runs no discovery.
 
 Separate from this block, the annotation `kubeagents.x-k8s.io/stall-watch: exempt` opts out
 without a CR change. On a namespace, the watch does not read the namespace, as if
@@ -457,6 +492,17 @@ exhausts either stops mid-task without ever calling a terminal kanban tool. The 
 for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for an `apiMaxRetries`
 exhaustion that ends with no response — and retrying re-runs into the same wall, so read that text
 and the upstream error rate before suspecting the worker.
+
+A `maxTurns` exhaustion keeps what the run found. At the cap the runtime asks the model for a
+closing summary and discards any tool call in the answer, and the worker saves the summary as the
+run's hand-off. `hermes kanban show <id>` prints it as the card's latest summary, the card carries
+it as a comment that names the budget used, and the next attempt reads it in its prompt under the
+prior attempt. The card's own `result` stays empty, as for every run that does not complete.
+
+The text is the model's, cut on a word at 4000 characters. When the summary call fails, the
+worker's last written answer is saved instead, and the comment says so. A summary that names a
+GitHub pull request URL is saved on the run only, with no comment: the dispatcher holds a card whose
+recent comments name one, and the retry is what the hand-off is for.
 
 One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on provider rate
 limits (429s), the worker blocks its own card instead, kind `transient`, with the provider's error
@@ -839,7 +885,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   the whole status write — `Ready`, the phase and every other condition with it.
 
 - `podAnnotations` — annotations applied to the generated pod template.
-- `scaleToZero` — when `true`, scales the deployment to 0 replicas (idle cost saving).
+- `scaleToZero` — when `true`, scales the gateway Deployment to 0 replicas (idle cost saving). The shell sandbox, the credential broker and, under `mode: next`, the A2A stack keep running. Once the gateway has no ready replica the `PlatformAgent` reads `phase: Paused`, with `Ready` `False` and reason `ScaledToZero`. That tells a paused install from one whose rollout never finishes. Set the field to `false` or remove it, and the normal phases return: `Provisioning` while the gateway starts, then `Ready`. [What `Ready` reports](#what-ready-reports) has the detail.
 - `sizingProfile` — the preset row the credential-proxy container, the `agent-api-auth` sidecar and the shell container start from, before the per-key overrides above and under [`shellSandbox`](#shellsandbox) are applied over it; an explicit key always wins. One of `small` (the default, and what an absent field means: the operator's defaults as documented above), `medium`, `fleet` or `auto`. The agent container's own `resources` are not part of a profile.
 
   | Tier     | Credential proxy                                                                                     | `agent-api-auth`   | Shell            |
@@ -1448,9 +1494,10 @@ The origins reading (`proposalsFromChat`, `proposalsFromConsole`, `proposalsFrom
 `proposalsFromIssue`, `proposalsFromOther`) comes from the chat plugin's proposals ledger: the pull
 requests the agent opened and the forge confirmed, counted by the origin of the work that started
 each. The operator reads it on the gateway pod's chat metrics listener, summed over the chat
-platform. The reading is present when all nine origins resolve; the plugin serves every origin,
-zero included, from its first ledger read. Until then, and while the served CRD predates them, the
-nine fields are absent.
+platform. The reading is present when all nine origins resolve and the plugin's read age, when the body
+carries it, is not above two poll intervals; the plugin serves every origin, zero included, from its
+first ledger read. Until then, and while the served CRD predates them, the nine fields are absent. A
+ledger that stops answering therefore clears them about twenty minutes later.
 
 A poll that reads no body with all nine is a miss, and the second miss in a row clears them. A 0 is
 a reading, and none of the nine moves `lastActiveTime` or `lastHumanActiveTime`. A proposal the
@@ -1528,7 +1575,7 @@ These condition types appear in `conditions`; only `Ready` is always present:
 
 | Type                       | Written                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`                    | Always                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared.                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `Ready`                    | Always                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when.                                                                                                                                                                                                                                            |
 | `Degraded`                 | Only while degraded                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Something in the spec, cluster state, or operator install cannot be honoured. `Reason` is one of `InvalidGitRepoURL`, `CorruptManagedRepos`, `MinterPruningHeld`, `InvalidCredentialProxyResources`, `InvalidAgentAPIAuthResources`, `InvalidShellSandboxResources` or `RBACIncomplete`; [What `Degraded` reports](#what-degraded-reports) says what each means. The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `BusCredentialsReady`      | Under `mode: next`, and while a callout Deployment exists                                                                                                                                                                                                                                                                                                                                                                                                                 | Whether every replica the callout Deployment asks for is ready, and therefore both serving an identity map and attached to the bus. `Reason: CalloutServing` (`True`), `CalloutUnavailable`, or `CalloutAbsent`. The operator's own gates do not read it, and it reads `False` with `1 of 2 replicas ready` while the gateway exists and dispatches; [What `BusCredentialsReady` reports](#what-buscredentialsready-reports) has the gate it differs from and when it is removed.                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `A2AIdentityMapApplied`    | Under `mode: next`, once the operator renders an identity map                                                                                                                                                                                                                                                                                                                                                                                                             | Whether the auth callout took the identity map this operator rendered, read from every Ready callout pod's `/status` by pod IP, again every 30 seconds while unsettled. `True`, `Serving`: every Ready pod answered and serves it. `False`, `Refused`: a pod refused it and serves its previous map, which can be wider; the message quotes the refusal. `False`, `Pending`: a pod is still on an older map or mid-way through its shards. `Unknown`, `StatusUnreadable`: a Ready pod didn't answer and may hold a refusal, so turning to it is a Warning event (a NetworkPolicy on the callout must admit the operator). `Unknown`, `NoReadyCallout`: no pod is Ready. Removed when the A2A stack is off.                                                                                                                                                                                           |
@@ -1600,6 +1647,10 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 ```
 
 ### What `Ready` reports
+
+A deliberate pause is not a failure, and the condition says which it is. While `spec.deployment.scaleToZero` is `true` and the gateway Deployment has no ready replica, the phase reads `Paused`. `Ready` then reads `False` with reason `ScaledToZero`, and the message names the field and says how to resume. The pause is reported once the scale-down has converged: a replica still serving keeps the install `Ready` for the seconds the Deployment controller takes to remove it.
+
+The pod scan still runs first. A crash loop or an unpullable image in the shell sandbox, the credential broker, the A2A gateway or the verifier parks `Degraded`, as on a running install, since those workloads are not scaled with the gateway. A workload the scan names no fault in but that has no ready replica (a failing readiness probe, a StatefulSet that is gone) keeps the phase `Paused`, and the message names it after the pause. Clearing the field returns the normal phases: `Provisioning` while the gateway starts, `Ready` once it is up. A gateway at zero replicas with the field unset is the start-up wait it always was, `Provisioning` with `Waiting for deployment replicas to be ready`.
 
 Of the reasons that park `phase: Degraded`, `ModeNotRecognized` and `ShellSandboxKeysMissing` render today's stack in full and report at the end rather than returning early: `ModeNotRecognized` because it is a version skew rather than a bad spec, `ShellSandboxKeysMissing` because the objects are wanted in place so the Pod starts by itself once the Secret appears.
 

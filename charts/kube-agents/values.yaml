@@ -15,7 +15,10 @@
 #
 # The same value installs templates/a2a-gateway-pod-admission-policy.yaml, which
 # holds the pods the A2A gateway creates to the session pod shape, and sets
-# A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
+# A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both. Likewise
+# templates/a2a-dispatcher-job-admission-policy.yaml, which holds the Jobs the A2A
+# dispatcher creates to the operator-rendered template, and A2A_DISPATCHER_JOB_POLICY=true,
+# without which the operator runs no dispatcher Job mode.
 #
 # It also installs templates/web-console-cr-admission-policy.yaml where the web
 # console and its environment page are on: the console's ServiceAccount may
@@ -1115,8 +1118,9 @@ platformAgent:
       # excludeNamespaces: ["load-test", "payments-canary"]
       # Hold a new alert until a stall has lasted this many minutes (0-1440).
       # minStallAgeMinutes: 30
-      # Replaces the default kind list; ["all"] scans every namespaced kind.
-      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
+      # Replaces the default kind list, Config Connector's group wildcard
+      # included; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io", "*.cnrm.cloud.google.com"]
     # How long the agent keeps its working data: ended sessions in every
     # profile's state.db (with their transcript files) and rotated log backups.
     # Hermes prunes on its own schedule and the session-retention cron job runs

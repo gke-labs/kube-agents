@@ -224,7 +224,7 @@ check_literal_from() {
   got="$(normalise "$ref")"
   if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] || [ -z "$got" ] ||
     [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src $dest" ] ||
-    printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
+    LC_ALL=C grep -q '[^[:print:]]' <<<"$body"; then
     fail "$dockerfile: after comment and blank lines, a plugin or persona Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src $dest', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
     return
   fi
@@ -278,8 +278,7 @@ check_plugin_dockerfiles_are_fenced
 check_go_directive() {
   local dockerfile=$1 version_arg=$2 go_mod=${3:-$GO_MOD}
   local builder_tag directive builder_ver builder_mm directive_mm
-  awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile" |
-    grep -qx "$GOTOOLCHAIN_PIN" ||
+  grep -qx "$GOTOOLCHAIN_PIN" <<<"$(awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile")" ||
     fail "$dockerfile: no line exactly '$GOTOOLCHAIN_PIN' between the FROM \${$GOLANG_IMAGE_ARG} line and that stage's first RUN, so a substituted $GOLANG_IMAGE_ARG without that default downloads a toolchain the pin does not name instead of failing."
   builder_tag="$(arg_default "$dockerfile" "$version_arg")"
   directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$go_mod" | head -n1)"
