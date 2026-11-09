@@ -71,8 +71,8 @@ verification_spec:
         - '\b(?:repository|repo|\w+/[\w.-]+)\s+(?:\w+\s+){0,2}(?:does\s+not|doesn''t|do\s+not|don''t)\s+(?:\w+\s+){0,2}(?:declare|contain|define|hold|have|include|manage|own)\b[^.\n]{0,40}\b(?:manifest|declaration|namespace|seeded-stall|it)\b'
         - '\b(?:seeded-stall|namespace|it)\s+(?:is\s+not|isn''t)\s+(?:\w+\s+){0,2}(?:declared|defined|managed|owned)\s+(?:in|by)\s+(?:the\s+)?(?:\S+\s+){0,2}(?:repository|repo)\b'
         - '\bno\s+(?:\w+\s+){0,2}(?:manifest|declaration)\s+(?:\w+\s+){0,3}(?:in|for)\s+(?:the\s+)?(?:\S+\s+){0,2}(?:repository|repo|seeded-stall|namespace)\b'
-        # The same stop in the words the nightly replies wrote (Claude Opus
-        # 5.5, 2026-10-22 to 10-27): the repository "has never defined",
+        # The same stop in the words the nightly replies wrote
+        # (2026-10-22 to 10-27): the repository "has never defined",
         # "never declares", "doesn't mention" the namespace; the namespace
         # "isn't in the registered repo"; "no GitOps repository manages it";
         # "nothing in the registered GitOps repository manages it". Each

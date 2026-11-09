@@ -497,17 +497,24 @@ It adds exactly two workloads to `kubeagents-system`.
   per-model `additional_drop_params` for `temperature`, `top_p` and `top_k`
   ([inference gateway](../site/src/content/docs/concepts/inference-gateway.md#setting-the-default-model)).
   The `none` stays, for a model outside that test that refuses temperature.
-- Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, reported at
-  about 9m on a live install when the request came down from 2 CPU; the install and the
-  sampling window were not recorded, so read it as an order of magnitude. The limit is
-  the ceiling the reranker may burst to during recall, and raising it buys nothing — see
+- Requests 500m CPU/2Gi, limits 4 CPU/4Gi. The requests are sized to be livable as the
+  limits: an Autopilot cluster without Pod bursting sets each limit equal to its request,
+  and the 1.4 GB of model weights the API loads in process did not fit the 1Gi it used to
+  request, so 2Gi holds them, and recall keeps half a core there. Steady state is far
+  under both, reported at about 9m of CPU on a live install when the request came down
+  from 2 CPU; the install and the sampling window were not recorded, so read it as an
+  order of magnitude. The limit is the ceiling the reranker may burst to during recall
+  where bursting is on, and raising it buys nothing — see
   [What a recall costs](#what-a-recall-costs). CPU above the request is best-effort, so
-  on a node shared with other CPU-heavy tenants the request is the number to raise. An
-  Autopilot cluster without Pod bursting sets the limit equal to the request, which caps
-  recall at 250m until the request is raised.
+  on a node shared with other CPU-heavy tenants the request is the number to raise.
   Runs non-root under a `RuntimeDefault` seccomp profile, no privilege escalation, all
   capabilities dropped; its root filesystem stays writable, and what the API writes
   under `/` has not been enumerated.
+- A `NetworkPolicy` (`hindsight-api` in `networkpolicy.yaml`) confines ingress on
+  8888 to pods in the same namespace and GKE Managed Prometheus (`gke-gmp-system`),
+  and confines egress to cluster DNS, `hindsight-postgresql` on 5432, and the
+  in-cluster inference gateway (`app: litellm` and `app: standalone-replay` on 80,
+  4000, and 8080).
 
 **2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
 
@@ -579,9 +586,9 @@ It adds exactly two workloads to `kubeagents-system`.
   password would have to be generated, agreed between two keys and rotated by
   someone. Note this is read by `initdb` once and written into `pg_hba.conf`;
   flipping it on an existing volume does nothing.
-- A `NetworkPolicy` (`networkpolicy.yaml`) permits ingress on 5432 **only** from
-  pods labelled as the API component. Ingress only — Postgres makes no outbound
-  calls.
+- A `NetworkPolicy` (`hindsight-postgresql` in `networkpolicy.yaml`) permits ingress
+  on 5432 **only** from pods labelled as the API component. Ingress only — Postgres
+  makes no outbound calls.
 
 Deleting the Postgres PVC is a complete, safe reset of memory — see
 [Bank provisioning is lazy](#bank-provisioning-is-lazy).
@@ -741,7 +748,7 @@ consolidation nor race Alembic.
 
 [`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) still ships
 `replicas: 1`, and `kage-management` runs two by hand. Two replicas add a second
-250m request, which fits almost anywhere, but the gain above came from the pods
+500m request, which fits almost anywhere, but the gain above came from the pods
 sitting on different nodes: two replicas sharing one `e2-standard-4` share the two
 physical cores the single-pod result already saturates, and a small cluster has no
 second node to offer. Nothing in either manifest keeps the pair apart — neither carries

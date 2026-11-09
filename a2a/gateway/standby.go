@@ -33,6 +33,10 @@ const (
 // retry period, about how long a released lease takes to be taken.
 var standbyRetryAfter = strconv.Itoa(int(electionRetryPeriod / time.Second))
 
+// standbyReadyPrefix opens a standby's readiness line, so /readyz says which
+// role the answer is for.
+const standbyReadyPrefix = "standby: "
+
 // LeaseView is the lease holder the election last read: every standby
 // retry reads the Lease, so it is at most a retry period old.
 type LeaseView struct {
@@ -56,6 +60,30 @@ func (v *LeaseView) read() (string, bool) {
 		return *h, true
 	}
 	return "", false
+}
+
+// ElectedReadiness is an elected replica's readiness. The replica holding
+// the lease (identity) answers with the gateway's own Readiness. A standby is
+// ready once it is connected to the bus and has read the Lease, so a
+// rollout's new pod reads Ready as a standby before an old one stops
+// (gateway-replicas.md, "Operator changes").
+func ElectedReadiness(gw *Gateway, view *LeaseView, identity string) func() (bool, string) {
+	return func() (bool, string) {
+		holder, read := view.read()
+		if read && holder == identity {
+			return gw.Readiness()
+		}
+		if gw.client != nil && !gw.client.Connected() {
+			return false, standbyReadyPrefix + "waiting for the bus: the NATS connection is down"
+		}
+		if !read {
+			return false, standbyReadyPrefix + "the lease hasn't been read yet"
+		}
+		if holder == "" {
+			return true, standbyReadyPrefix + "connected, and no replica holds the lease"
+		}
+		return true, standbyReadyPrefix + "connected, lease held by " + holder
+	}
 }
 
 // StandbyDoors serve the 503 on the doors' addresses until Stop.

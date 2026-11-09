@@ -74,6 +74,8 @@ The operator runs the gateway as one replica whatever `spec.deployment.availabil
 
 To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
 
+The fold window is the other value `hack/ci-deploy.sh` pins for the eval install. `INCIDENT_WORKLOAD_DEDUP_SECONDS` defaults to an hour, and on a dev install that keeps the default, a case that re-plants one workload and waits for that repetition's own card (`autoops-warning-event-triage`, `autoops-crashloop-config-triage`, `autoops-warning-event-no-action-triage`) folds its second and third repetition into the first's incident, so no card comes and the plant times out. Before running one of those three times back to back, set the window to 150 s as CI does, with the chart key `platformAgent.deployment.incidentWorkloadDedupSeconds: 150` (an `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry in `platformAgent.deployment.env` wins over it); `hack/ci-deploy.sh` says how the number was chosen.
+
 ## Running evals
 
 ```bash
@@ -174,7 +176,9 @@ and no pull request and no nightly runs a case named there. A certification case
 case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
 `scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
 outside the roster, and the script refuses an entry that is also in `presubmit-cases.txt` or
-`nightly-cases.txt`, so one case holds one record on one lane. The blocking roster is a subset of
+`nightly-cases.txt`, so one case holds one record on one lane. The roster starts with cases of its own; a nightly case
+joins it in a later change by moving its line out of the nightly file, and until then the page
+certifies a nightly case from its nightly record. The blocking roster is a subset of
 the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
 the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked

@@ -411,7 +411,7 @@ func (n *Notifier) keepWork(keeps <-chan keepJob, done chan<- struct{}) {
 	defer close(done)
 	for job := range keeps {
 		if n.isStopping() {
-			job.answer(n.refuse(notifyStoppingRefusal))
+			job.answer(n.refuseRetry(notifyStoppingRefusal))
 			continue
 		}
 		n.storeMu.Lock()

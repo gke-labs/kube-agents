@@ -101,8 +101,9 @@ BLOCK_RE = re.compile(
 )
 
 ITEM_REQUIRED = ("check", "project", "cluster", "object", "title")
-ITEM_OPTIONAL = ("namespace", "detail", "severity_hint", "provider_managed")
-ITEM_STRINGS = ITEM_REQUIRED + ("namespace", "detail", "severity_hint")
+ITEM_OPTIONAL_STRINGS = ("location", "namespace", "detail", "severity_hint")
+ITEM_OPTIONAL = ITEM_OPTIONAL_STRINGS + ("provider_managed",)
+ITEM_STRINGS = ITEM_REQUIRED + ITEM_OPTIONAL_STRINGS
 
 SCORE_REQUIRED = ("rubric", "recommendation", "remediation", "verification")
 SCORE_OPTIONAL = ("actionable", "provider_managed", "root_cause")
@@ -206,7 +207,7 @@ def _clean_item(raw: dict, lineno: int, errors: list[str]) -> dict | None:
         return None
 
     item = {key: raw[key].strip() for key in ITEM_REQUIRED}
-    for key in ("namespace", "detail", "severity_hint"):
+    for key in ITEM_OPTIONAL_STRINGS:
         value = (raw.get(key) or "").strip()
         if value:
             item[key] = value

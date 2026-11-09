@@ -1,0 +1,128 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// dispatcherJobPolicyName names the dispatcher Job admission policy and its
+// binding (config/admission/a2a-dispatcher-job-policy.yaml).
+const dispatcherJobPolicyName = "kube-agents-a2a-dispatcher-job"
+
+// reasonDispatcherJobPolicyMissing is the Warning Event on the PlatformAgent
+// when the chart signalled the Job admission policy but it isn't in the
+// cluster as rendered, so the dispatcher gets no Job mode.
+const reasonDispatcherJobPolicyMissing = "DispatcherJobPolicyMissing"
+
+// dispatcherJobPolicyInPlace reports whether the dispatcher Job admission
+// policy and its binding are in the cluster as the chart renders them, and if
+// not, why. A2A_DISPATCHER_JOB_POLICY says the chart rendered them, not that
+// they still hold: a Helm disable deletes them before the operator rolls, and
+// anyone with the rights can delete or loosen the binding. So before the
+// dispatcher gets its Jobs Role, every reconcile reads both (uncached, by
+// name: the operator holds get on these two kinds, nothing else) and checks
+// the parts the policy's guarantee rests on: the binding denies, finds params
+// only by the operator's labels with no params denied, is scoped to profile
+// namespaces, and names the policy; the policy fails closed and reads
+// DispatchJobTemplate params. Gone (NotFound), unreadable for want of the
+// grant (Forbidden), or loosened is not in place. Any other read error (a
+// timeout, throttling, a control-plane upgrade) says nothing either way and
+// comes back as err: the caller changes nothing, rather than tear down Job
+// mode, running Jobs included, on a transient failure.
+func (r *PlatformAgentReconciler) dispatcherJobPolicyInPlace(ctx context.Context) (bool, string, error) {
+	var policy admissionregistrationv1.ValidatingAdmissionPolicy
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, &policy); err != nil {
+		return policyReadFailure("ValidatingAdmissionPolicy", err)
+	}
+	var binding admissionregistrationv1.ValidatingAdmissionPolicyBinding
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, &binding); err != nil {
+		return policyReadFailure("ValidatingAdmissionPolicyBinding", err)
+	}
+	ps := policy.Spec
+	switch {
+	case ps.FailurePolicy == nil || *ps.FailurePolicy != admissionregistrationv1.Fail:
+		return false, "its failurePolicy is not Fail", nil
+	case ps.ParamKind == nil || ps.ParamKind.APIVersion != agentv1alpha1.GroupVersion.String() || ps.ParamKind.Kind != "DispatchJobTemplate":
+		return false, "its params are not the operator's DispatchJobTemplates", nil
+	}
+	bs := binding.Spec
+	ref := bs.ParamRef
+	switch {
+	case bs.PolicyName != dispatcherJobPolicyName:
+		return false, fmt.Sprintf("its binding names policy %q", bs.PolicyName), nil
+	case !slices.Contains(bs.ValidationActions, admissionregistrationv1.Deny):
+		return false, "its binding does not deny", nil
+	case ref == nil || ref.Name != "" || ref.Selector == nil || ref.ParameterNotFoundAction == nil ||
+		*ref.ParameterNotFoundAction != admissionregistrationv1.DenyAction:
+		return false, "its binding does not select params by label with no params denied", nil
+	case ref.Selector.MatchLabels[labelManagedBy] != fieldOwner || ref.Selector.MatchLabels[dispatchJobTemplateLabel] != "true" ||
+		len(ref.Selector.MatchExpressions) != 0:
+		return false, "its binding's params are not the operator's labelled DispatchJobTemplates alone", nil
+	case bs.MatchResources == nil || bs.MatchResources.NamespaceSelector == nil ||
+		!maps.Equal(bs.MatchResources.NamespaceSelector.MatchLabels, profileNamespaceSelector) ||
+		len(bs.MatchResources.NamespaceSelector.MatchExpressions) != 0:
+		// Exactly these labels: one more, or any expression, narrows the
+		// binding past the profile namespace profileNamespaceSelectedByJobPolicy
+		// checks, which then gets the Jobs Role with no policy over it.
+		return false, "its binding is not scoped to profile namespaces by exactly the profile namespace's labels", nil
+	}
+	return true, "", nil
+}
+
+func policyReadFailure(kind string, err error) (bool, string, error) {
+	switch {
+	case apierrors.IsNotFound(err):
+		return false, fmt.Sprintf("the %s %s is not in the cluster", kind, dispatcherJobPolicyName), nil
+	case apierrors.IsForbidden(err):
+		return false, fmt.Sprintf("the operator can't read the %s %s (its role lacks the get grant): %v", kind, dispatcherJobPolicyName, err), nil
+	}
+	return false, "", fmt.Errorf("read the %s %s: %w", kind, dispatcherJobPolicyName, err)
+}
+
+// profileNamespaceSelectedByJobPolicy reports whether the profile namespace
+// carries every label the policy's binding selects it by: one that lacks one
+// is not held to the policy, so the dispatcher must not create Jobs there.
+func (r *PlatformAgentReconciler) profileNamespaceSelectedByJobPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	var ns corev1.Namespace
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+		return false, fmt.Errorf("read the profile namespace %s: %w", profileNamespaceName(agent), err)
+	}
+	for k, v := range profileNamespaceSelector {
+		if ns.Labels[k] != v {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// profileNamespaceSelector is the binding's namespaceSelector, exactly: the
+// labels the operator requires of a profile namespace.
+var profileNamespaceSelector = map[string]string{
+	profileNamespaceComponentLabel: profileNamespaceComponent,
+	labelPartOf:                    partOfKubeAgents,
+}

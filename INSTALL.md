@@ -1129,13 +1129,16 @@ at nothing and the policies silently inert:
 # the chart, which checks the version itself, this apply will fail there.
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
+kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
 such step. Skipping it here leaves agent RBAC without its admission backstop, and leaves the
 pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceAccount in the
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
-an operator feature that needs the second policy stays off. Read each file's header for what the
+an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
+without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
+and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 
@@ -1578,7 +1581,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
-     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record doesn't decode (logged first as `notify: session record unreadable`). A record that couldn't be read in time gets `the conversation's record couldn't be read in time; not posted` instead, which the sender retries.
   2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'

@@ -19,6 +19,10 @@
 # tags, or the chat integrations' user allowlists. Whatever drives the console, or takes over its
 # pod, could change any of them. This policy holds the console to what a2a/cmd/web-console writes:
 # its own annotations and three keys of `spec.integration` (`forges`, `repositories`, `github`).
+# Inside `forges` it also holds where a credential goes: the console copies a same-name forge's
+# fields and sets the host from the request, so without checks 4 to 6 a write could pair a forge's
+# `credentialsRef` with a new host, or move the install's GitHub host, where the broker spends the
+# GitHub App token.
 #
 # WHAT IT CHECKS, for an UPDATE of a PlatformAgent whose requester is a ServiceAccount named
 # `<release>-web-console` in the CR's own namespace (the console's identity):
@@ -29,6 +33,26 @@
 #   2. Every annotation except the console's own keys (the list below, the constants in
 #      a2a/cmd/web-console models.go, patches.go and repositories.go) is unchanged.
 #   3. Labels, finalizers and owner references are unchanged.
+#   4. A forge that already existed (matched by name) keeps its host, port, scheme, provider,
+#      credentialsRef, caBundleRef and identity (the account a Bitbucket token acts as, which the
+#      broker uses to tell the install's own proposals from another person's), and its namespace
+#      when it has a credentialsRef.
+#   5. A forge the console adds carries no credentialsRef and no caBundleRef.
+#   6. The install's GitHub host (the first GitHub forge's host, github.com by default) is unchanged,
+#      and a GitHub forge the console adds sits at a host a GitHub forge already uses (github.com
+#      when there is none). The second part covers the operator's fallback to the first usable
+#      GitHub forge when the first one is refused for its host. Removing the install's only GitHub
+#      Enterprise forge moves the host back to github.com, so the console cannot do that either.
+#
+# Adding a repository on a forge with a credentialsRef still widens that forge's served
+# namespaces, and with them the token's allowed paths: adding repositories is the console's job, so
+# this policy does not refuse it.
+#
+# A second limit: the policy reads the install's GitHub host as the first GitHub forge's host. It
+# does not repeat the operator's rules for a forge whose host it refuses (a reserved domain, a
+# single-label host, a host a forge of another provider holds, or a stored forge with no provider).
+# When the declaration already has such a forge, the console can still move the host by removing,
+# reordering or changing a forge, but only to a host the declaration names or to github.com.
 #
 # resourceVersion, generation and managedFields are not compared: the API server sets the first
 # two and rewrites managedFields on every write, and none of them grants anything. The status
@@ -39,9 +63,9 @@
 # defaulting webhook can add a spec field during the console's write, and this policy then refuses
 # that write. A later update by anyone else persists the default.
 #
-# A test in k8s-operator (web_console_cr_policy_envtest_test.go) runs this file in a real API
-# server, and tests/test_web_console_cr_policy_shipped.py holds the key list to the console's
-# constants.
+# Two tests in k8s-operator (web_console_cr_policy_envtest_test.go, and
+# web_console_cr_forge_policy_envtest_test.go for checks 4 to 6) run this file in a real API server,
+# and tests/test_web_console_cr_policy_shipped.py holds the key lists to the console's constants.
 #
 # Requires Kubernetes >= 1.30, where ValidatingAdmissionPolicy reached v1.
 apiVersion: admissionregistration.k8s.io/v1
@@ -84,6 +108,41 @@ spec:
       expression: "'integration' in variables.oldSpec ? variables.oldSpec.integration : {}"
     - name: newIntegration
       expression: "'integration' in variables.newSpec ? variables.newSpec.integration : {}"
+    - name: oldForges
+      expression: "'forges' in variables.oldIntegration ? variables.oldIntegration.forges : []"
+    - name: newForges
+      expression: "'forges' in variables.newIntegration ? variables.newIntegration.forges : []"
+    # The install's GitHub host, as gitspec.go's GitHubHost reads it: the first forge whose provider
+    # is github (an absent provider is github), its host trimmed and lowercased, with github.com's
+    # own spellings read as github.com, and github.com when it sets none or no forge is a GitHub
+    # one (the deprecated `github` alias included). The broker's GitHub entry, which spends the
+    # install's GitHub App token, points at this host.
+    - name: oldGitHubForges
+      expression: >-
+        variables.oldForges.filter(f, !has(f.provider) || f.provider.trim().lowerAscii() in ['', 'github'])
+    - name: newGitHubForges
+      expression: >-
+        variables.newForges.filter(f, !has(f.provider) || f.provider.trim().lowerAscii() in ['', 'github'])
+    - name: oldGitHubHost
+      expression: >-
+        size(variables.oldGitHubForges) == 0 || !has(variables.oldGitHubForges[0].host) ||
+          variables.oldGitHubForges[0].host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+          'github.com' : variables.oldGitHubForges[0].host.trim().lowerAscii()
+    - name: newGitHubHost
+      expression: >-
+        size(variables.newGitHubForges) == 0 || !has(variables.newGitHubForges[0].host) ||
+          variables.newGitHubForges[0].host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+          'github.com' : variables.newGitHubForges[0].host.trim().lowerAscii()
+    # Every GitHub forge's host, read the same way, before the update. A GitHub forge the console
+    # adds must sit at one of them (github.com when there are none): GitHubHost falls back to the
+    # first usable GitHub forge when the first one is refused for its host, so holding the first
+    # forge alone would let a new one take the host over.
+    - name: oldGitHubHosts
+      expression: >-
+        size(variables.oldGitHubForges) == 0 ? ['github.com'] :
+          variables.oldGitHubForges.map(o, !has(o.host) ||
+            o.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+            'github.com' : o.host.trim().lowerAscii())
     - name: oldAnnotations
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
     - name: newAnnotations
@@ -100,6 +159,48 @@ spec:
           (k in variables.oldIntegration && variables.newIntegration[k] == variables.oldIntegration[k])) &&
         variables.oldIntegration.all(k, k in variables.consoleIntegrationKeys || k in variables.newIntegration)
       message: "the web console may change only spec.integration.forges, repositories and github on a PlatformAgent"
+      reason: Forbidden
+    # A forge that already existed (matched by name) keeps where its credential goes: host (trimmed
+    # and lowercased, and on a GitHub forge the github.com spellings read as github.com, as the
+    # operator's canonicalHost reads it), port, scheme, provider (absent reads as github),
+    # credentialsRef, caBundleRef and identity (whose account the credential acts as), and the
+    # namespace when it has a credentialsRef, since that namespace scopes the token's allowed paths.
+    # The console copies a same-name forge's fields, so its own writes pass.
+    - expression: >-
+        variables.newForges.all(f, variables.oldForges.all(o, o.name != f.name || (
+          ((has(o.provider) && o.provider.trim() != '' ? o.provider.trim().lowerAscii() : 'github') == 'github' &&
+            (!has(o.host) || o.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com']) ?
+            'github.com' : (has(o.host) ? o.host.trim().lowerAscii() : '')) ==
+          ((has(f.provider) && f.provider.trim() != '' ? f.provider.trim().lowerAscii() : 'github') == 'github' &&
+            (!has(f.host) || f.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com']) ?
+            'github.com' : (has(f.host) ? f.host.trim().lowerAscii() : '')) &&
+          (has(o.port) ? o.port : 0) == (has(f.port) ? f.port : 0) &&
+          (has(o.scheme) ? o.scheme : '') == (has(f.scheme) ? f.scheme : '') &&
+          (has(o.provider) && o.provider.trim() != '' ? o.provider.trim().lowerAscii() : 'github') ==
+            (has(f.provider) && f.provider.trim() != '' ? f.provider.trim().lowerAscii() : 'github') &&
+          has(o.credentialsRef) == has(f.credentialsRef) &&
+          (!has(o.credentialsRef) || o.credentialsRef == f.credentialsRef) &&
+          has(o.caBundleRef) == has(f.caBundleRef) &&
+          (!has(o.caBundleRef) || o.caBundleRef == f.caBundleRef) &&
+          (has(o.identity) ? o.identity : '') == (has(f.identity) ? f.identity : '') &&
+          (!has(o.credentialsRef) || (has(o.namespace) ? o.namespace : '') == (has(f.namespace) ? f.namespace : '')))))
+      message: "the web console may not change where an existing forge's credential goes or whose account it acts as: its host, port, scheme, provider, credentialsRef, caBundleRef or identity, or the namespace of a forge with a credentialsRef"
+      reason: Forbidden
+    # A forge the console adds carries no credential: an administrator adds credentials.
+    - expression: >-
+        variables.newForges.all(f, variables.oldForges.exists(o, o.name == f.name) ||
+          (!has(f.credentialsRef) && !has(f.caBundleRef)))
+      message: "a forge the web console adds may not carry a credentialsRef or a caBundleRef"
+      reason: Forbidden
+    - expression: >-
+        variables.newGitHubForges.all(f, variables.oldForges.exists(o, o.name == f.name) ||
+          (!has(f.host) || f.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+            'github.com' : f.host.trim().lowerAscii()) in variables.oldGitHubHosts)
+      message: "a GitHub forge the web console adds must sit at a host a GitHub forge already uses"
+      reason: Forbidden
+    - expression: "variables.newGitHubHost == variables.oldGitHubHost"
+      messageExpression: >-
+        'the web console may not change the install\'s GitHub host (' + variables.oldGitHubHost + ')'
       reason: Forbidden
     - expression: >-
         variables.newAnnotations.all(k, k in variables.consoleAnnotations ||

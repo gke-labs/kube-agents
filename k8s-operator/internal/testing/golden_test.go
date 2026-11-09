@@ -7,6 +7,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -64,6 +65,8 @@ func newTestScheme() *runtime.Scheme {
 	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
 	// reconcile, which is every golden case.
 	_ = batchv1.AddToScheme(s)
+	// The gateway's election Lease, on by default under next.
+	_ = coordinationv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
@@ -226,6 +229,22 @@ func TestAgentsGolden(t *testing.T) {
 			name:         "PlatformAgentShellSandboxResources",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-sandbox-resources.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sandbox-resources.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// spec.deployment.sizingProfile medium. Diff this against
+			// platformagent-tagged.yaml and the whole of what the field renders
+			// is the credential-proxy container's requests and limits on the
+			// proxy Deployment and the agent-api-auth sidecar's memory limit on
+			// the gateway pod; the shell keeps the small row, which has no
+			// medium figure. The default golden stays byte-identical, which is
+			// what holds an install that never set the field where it was.
+			name:         "PlatformAgentSizingMedium",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-sizing-medium.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-sizing-medium.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}

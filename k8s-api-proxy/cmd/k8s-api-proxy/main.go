@@ -22,7 +22,21 @@ import (
 )
 
 const (
+	decimalBase             = 10
+	int64Bits               = 64
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
+	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
+	metricsPortFlag         = "metrics-port"
+
+	// otelShutdownTimeout bounds the flush of buffered spans on exit.
+	otelShutdownTimeout = 5 * time.Second
+	// readHeaderTimeout closes a connection whose request headers have not
+	// arrived in time, so a slow client cannot hold one open indefinitely.
+	readHeaderTimeout = 15 * time.Second
+	// serverShutdownTimeout bounds srv.Shutdown after SIGTERM. main does not
+	// wait for Shutdown to return, so a request still in flight when the
+	// process exits is cut.
+	serverShutdownTimeout = 10 * time.Second
 )
 
 func envOrDefault(key, fallback string) string {
@@ -51,15 +65,41 @@ func envIntOrDefault(key string, fallback int) int {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("%s: KUBE_PROXY_METRICS_PORT is not an integer", metricsUnavailableAlert)
-		return 0
+		log.Printf("ALERT %s=%q is not an integer; using %d", key, raw, fallback) // #nosec G706 -- %q escapes newlines and control characters, so the value cannot forge a log line
+		return fallback
+	}
+	return v
+}
+
+func envInt64OrDefault(key string, fallback int64) int64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, decimalBase, int64Bits)
+	if err != nil {
+		log.Printf("warning: %s is not a base-10 integer; using default %d", key, fallback)
+		return fallback
+	}
+	return v
+}
+
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("warning: %s is not a valid duration; using default %s", key, fallback)
+		return fallback
 	}
 	return v
 }
 
 func startMetricsListener(ctx context.Context, port int, metrics *k8sapiproxy.Metrics, logger *slog.Logger) {
 	if port == 0 {
-		logger.Info("metrics listener disabled: KUBE_PROXY_METRICS_PORT is unset")
+		logger.Info("metrics listener disabled: --" + metricsPortFlag + " resolved to 0 (its default comes from " + metricsPortEnv + ")")
 		return
 	}
 	srv, err := k8sapiproxy.NewMetricsServer(port, metrics, logger)
@@ -98,7 +138,7 @@ func parseAllowedCallers(raw string) ([]string, error) {
 func main() {
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
-		metricsPort              = flag.Int("metrics-port", envIntOrDefault("KUBE_PROXY_METRICS_PORT", 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
+		metricsPort              = flag.Int(metricsPortFlag, envIntOrDefault(metricsPortEnv, 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
 		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
 		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
@@ -110,6 +150,10 @@ func main() {
 		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
 		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
+		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
+		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
+		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 	)
 	flag.Parse()
 
@@ -126,7 +170,7 @@ func main() {
 		log.Printf("warning: failed to initialize OpenTelemetry tracing, continuing with no-op tracer: %v", err)
 	} else if otelShutdown != nil {
 		defer func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), otelShutdownTimeout)
 			defer cancel()
 			_ = otelShutdown(shutdownCtx)
 		}()
@@ -155,6 +199,9 @@ func main() {
 	})
 
 	var upstreamTransport k8sapiproxy.UpstreamTransport
+	// The scoped pool does not route the host's gke_ ID in-cluster, so only the default
+	// transport makes it an alias the cache folds into in-cluster.
+	var inClusterAlias string
 	if scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv)) {
 		poolPath := envOrDefault(scopedPoolFileEnv, defaultScopedPoolFile)
 		members, err := loadScopedSAPool(poolPath)
@@ -174,11 +221,23 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to initialize upstream transport: %v", err)
 		}
+		inClusterAlias = *hostClusterIDF
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	metrics := k8sapiproxy.NewMetrics()
 	startMetricsListener(ctx, *metricsPort, metrics, logger)
+
+	var cacheCfg *k8sapiproxy.CacheConfig
+	if *cacheMaxBytes > 0 {
+		cacheCfg = &k8sapiproxy.CacheConfig{
+			MaxBytes:            *cacheMaxBytes,
+			MaxEntryBytes:       *cacheMaxEntryBytes,
+			DefaultResourceTTL:  *cacheResourceTTL,
+			DefaultDiscoveryTTL: *cacheDiscoveryTTL,
+			HostClusterID:       inClusterAlias,
+		}
+	}
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
 		Authenticator: authn,
@@ -188,6 +247,7 @@ func main() {
 			RedactSecrets:            *redactSecrets,
 			AllowUpgradeSubresources: *allowUpgradeSubresources,
 		},
+		Cache:          cacheCfg,
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,
@@ -199,7 +259,7 @@ func main() {
 	srv := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           handler,
-		ReadHeaderTimeout: 15 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
@@ -207,16 +267,16 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d)", *listenAddr, mode, *redactSecrets, *metricsPort)
+		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d)", *listenAddr, mode, *redactSecrets, *metricsPort)
+		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServe()
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

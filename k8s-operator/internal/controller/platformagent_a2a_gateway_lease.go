@@ -27,14 +27,13 @@ import (
 // Role gets only get and update on that one object; because the gateway can't
 // recreate it, the operator watches it and recreates it after a deletion.
 const (
-	// a2aGatewayElectionEnvVar, set to "true" in the operator's own
-	// environment, switches the election on: the Lease, the gateway's grant
-	// on it and the gateway's election env. Off by default. With the
+	// a2aGatewayElectionEnvVar, set to "false" in the operator's own
+	// environment, switches the election off: no Lease, no grant on it, no
+	// election env, and one unelected gateway. On by default. With the
 	// election on, the gateway needs the API server to keep leading, so a
 	// control-plane outage longer than its renew deadline (a zonal
 	// cluster's control-plane upgrade) stops it until the API server is
-	// back; the default flips once that trade-off is decided. CI and the
-	// live runs turn it on.
+	// back, a trade-off accepted on #4206.
 	a2aGatewayElectionEnvVar = "A2A_GATEWAY_ELECTION"
 
 	// a2aGatewayLeaseEnvVar names the Lease to the gateway, and
@@ -70,10 +69,13 @@ var a2aGatewayLeaseEvents = predicate.Funcs{
 	GenericFunc: func(event.GenericEvent) bool { return false },
 }
 
-// a2aGatewayElectionEnabled reports whether the operator was deployed with
-// the election switched on. Anything but an explicit "true" is off.
+// a2aGatewayElectionEnabled reports whether the gateway's election is on:
+// by default, and off only for an explicit "false". An elected gateway
+// steps down while the API server is unreachable
+// (docs/designs/gateway-replicas.md, "What it costs"); "false" is the way
+// back to one unelected replica.
 func a2aGatewayElectionEnabled() bool {
-	return os.Getenv(a2aGatewayElectionEnvVar) == "true"
+	return os.Getenv(a2aGatewayElectionEnvVar) != "false"
 }
 
 // a2aGatewayLeaseName is the Lease's fixed name, the gateway's own: the eval

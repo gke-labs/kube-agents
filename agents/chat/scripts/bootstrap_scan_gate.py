@@ -122,6 +122,13 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md",
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
+# The sweep worker's Step 3 as one command per cluster: reads Steps 2 to 4 of
+# the single-cluster SOP and prints its Step 5 `metadata` object. It lives in
+# the fleet-audit skill tree the shell sandbox stages from its image, beside
+# the other collectors, and runs where the worker's terminal does.
+CLUSTER_INVENTORY_COLLECTOR_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/cluster_inventory_collect.py"
+# Where that script leaves each cluster's object for the hand-off (bootstrap_handoff.SWEEP_DIR).
+SWEEP_DIR = bootstrap_handoff.SWEEP_DIR
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
 # a single-agent walk of the fleet; when present, the gate files one audit card per Cluster
 # Agent up to the first-run cap, and the sweep audits the rest.
@@ -280,6 +287,8 @@ def cluster_agents(capped: bool = True) -> list[dict]:
             "key": f"{CLUSTER_IDEMPOTENCY_KEY_PREFIX}{name}",
             "title": f"Report cluster inventory: {label}",
             "cluster_label": label,
+            # The hand-off predicts the collector's file for a cluster past the cap from this.
+            "identity": {k: identity[k] for k in ("project", "location", "cluster")},
         })
     # The first-run cap (#3702): the first so many by profile name, a stable
     # order across ticks; the rest stay off the roster, so the sweep audits them.
@@ -688,17 +697,29 @@ def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
         "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
         "Step 3.** That is the normal case for a single-cluster install and it is not an "
         "error.\n\n"
-        "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
-        "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
-        f"exists:\n{cluster_audit_list}\n\n"
-        f"and record each in that SOP's `metadata` shape. {step3_count}\n\n"
+        "**Step 3 — audit the clusters the list does not cover.** For each one run, once, from your "
+        "card's workspace (its environment names your card, which the file carries), with the "
+        "terminal's `timeout` set to 600:\n\n"
+        f"    {CLUSTER_INVENTORY_COLLECTOR_PATH} --project <project> --location <location> --cluster <cluster> "
+        "--sweep-id <this card's id>\n\n"
+        "It reads Steps 2 to 4 of the single-cluster audit SOP in three reads (one gcloud describe "
+        "through the credential proxy, two paged kubectl dumps through the sandbox's kube-proxy "
+        "kubeconfig), writes that SOP's `metadata` object to "
+        f"`{SWEEP_DIR}/<project>__<location>__<cluster>.json`, where the onboarding gate reads it, and "
+        "prints it; any read that failed is in its `gaps`. Do not copy the object anywhere: the gate "
+        "takes it from the file. Do not walk the SOP by hand for a cluster the script answered; walk "
+        "it (its own numbering, reading whichever of these exists) only where the script itself "
+        f"cannot run, and record that walk's object in Step 4:\n{cluster_audit_list}\n\n"
+        f"{step3_count}\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
         "`metadata`, and files the ranking card itself. Call `kanban_complete` with a short "
         "factual `result` and this `metadata`: `fleet` — one `{project, cluster, location, "
-        "status}` object per cluster Step 1 listed; `clusters` — the Step 3 audits, each in the "
-        "single-cluster SOP's shape (an empty list only when no cluster lacked a Cluster Agent and none "
+        "status}` object per cluster Step 1 listed; `clusters` — one `{project, location, cluster, "
+        "gaps}` entry per cluster Step 3 audited, naming it and nothing more when the script wrote "
+        "its file (the gate reads the audit from the file), the SOP's full object only for a by-hand "
+        "walk (an empty list only when no cluster lacked a Cluster Agent and none "
         "was past the first-run cap); `telemetry` — "
         "the PlatformAgent's `.status.telemetry`, one line; `gaps` — anything you could not do, and why. A cluster you could not reach goes in `gaps`, not "
         "silently out of `fleet`.\n\n"

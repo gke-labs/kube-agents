@@ -104,8 +104,9 @@ expected_output: ""
 # `hold`), with only the search-api objectives kept. This case asks where the
 # agent's pull request lands, not how much of b-0022b it repairs: search-api's
 # readiness port is the fault every recorded run's pull request fixed, while
-# the shelfview and price-refresh objectives failed even for claude-opus-5 on
-# b-0022b-gitops (run_20260918_185657_889776 scored 4 of 6), so they would
+# the shelfview and price-refresh objectives failed even on the 2026-09-18
+# b-0022b-gitops campaign run (4 of 6 objectives; its record is not kept in
+# the tree), so they would
 # fail a green for reasons unrelated to the base. The objectives are the base
 # check: Argo syncs only the run branch with self-heal on, and the agent is
 # read-only on the cluster, so they converge only when a fix merged onto the

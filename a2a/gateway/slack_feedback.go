@@ -35,25 +35,9 @@ const (
 	slackFeedbackButtons     = "feedback_buttons"
 	slackViewSubmission      = "view_submission"
 
-	// The words the controls and the modal show (the approved mock,
-	// phase2/feedback).
-	slackFeedbackGood     = "Good answer"
-	slackFeedbackBad      = "Bad answer"
-	slackFeedbackTitle    = "What went wrong?"
-	slackFeedbackLabel    = "Anything else?"
-	slackFeedbackSubmit   = "Send"
-	slackFeedbackClose    = "Cancel"
-	slackFeedbackKeptLine = "Your question and this answer are kept on your install for %s so an operator can turn them into a test."
-	// slackFeedbackKeptNoAsk is the kept line when the ask is no longer on
-	// record (AskTTL, a reaped session), so only the answer is kept.
-	slackFeedbackKeptNoAsk  = "This answer is kept on your install for %s so an operator can turn it into a test."
-	slackFeedbackDays       = "%d days"
-	slackFeedbackOneDay     = "1 day"
-	slackFeedbackThanksLine = "Thanks. I kept this answer for your team to review."
-	// slackFeedbackFormLine points the rater at the project's feedback form,
-	// with nothing pre-filled: the install never files anything itself.
-	slackFeedbackFormLine = "To tell the kube-agents maintainers as well, use <%s>. It opens a public issue, so leave out cluster names and other details from your install."
-	slackFeedbackFormURL  = "https://gke-labs.github.io/kube-agents/feedback"
+	// slackFeedbackFormLink is Slack's link markup around feedbackFormURL
+	// in the thanks line; the words are in feedback_text.go.
+	slackFeedbackFormLink = "<%s>"
 
 	// slackFeedbackDeadline bounds the Slack calls one tap makes.
 	slackFeedbackDeadline = 15 * time.Second
@@ -130,8 +114,8 @@ func slackFeedbackBlock(taskID string) map[string]any {
 		"elements": []any{map[string]any{
 			"type":            slackFeedbackButtons,
 			"action_id":       slackFeedbackAction,
-			"positive_button": button(slackFeedbackGood, FeedbackUp),
-			"negative_button": button(slackFeedbackBad, FeedbackDown),
+			"positive_button": button(feedbackGoodLabel, FeedbackUp),
+			"negative_button": button(feedbackBadLabel, FeedbackDown),
 		}},
 	}
 }
@@ -275,34 +259,26 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, actionType, blockID, v
 
 // slackFeedbackThanks is the line a kept note is thanked with.
 func slackFeedbackThanks() string {
-	return slackFeedbackThanksLine + " " + fmt.Sprintf(slackFeedbackFormLine, slackFeedbackFormURL)
+	return feedbackThanks(fmt.Sprintf(slackFeedbackFormLink, feedbackFormURL))
 }
 
 // slackFeedbackModal is the note a 👎 asks for; its kept line names the
 // question only when askKept.
 func slackFeedbackModal(meta slackFeedbackMeta, days int, askKept bool) slack.ModalViewRequest {
 	raw, _ := json.Marshal(meta)
-	kept := fmt.Sprintf(slackFeedbackDays, days)
-	if days == 1 {
-		kept = slackFeedbackOneDay
-	}
-	line := slackFeedbackKeptLine
-	if !askKept {
-		line = slackFeedbackKeptNoAsk
-	}
-	input := slack.NewInputBlock(slackFeedbackNoteID, slack.NewTextBlockObject(slackPlainText, slackFeedbackLabel, false, false), nil,
+	input := slack.NewInputBlock(slackFeedbackNoteID, slack.NewTextBlockObject(slackPlainText, feedbackNoteLabel, false, false), nil,
 		slack.NewPlainTextInputBlockElement(nil, slackFeedbackNoteID).WithMaxLength(feedbackNoteChars))
 	input.Optional = true
 	return slack.ModalViewRequest{
 		Type:            slack.VTModal,
 		CallbackID:      slackFeedbackCallback,
-		Title:           slack.NewTextBlockObject(slackPlainText, slackFeedbackTitle, false, false),
-		Submit:          slack.NewTextBlockObject(slackPlainText, slackFeedbackSubmit, false, false),
-		Close:           slack.NewTextBlockObject(slackPlainText, slackFeedbackClose, false, false),
+		Title:           slack.NewTextBlockObject(slackPlainText, feedbackNoteTitle, false, false),
+		Submit:          slack.NewTextBlockObject(slackPlainText, feedbackNoteSend, false, false),
+		Close:           slack.NewTextBlockObject(slackPlainText, feedbackNoteCancel, false, false),
 		PrivateMetadata: string(raw),
 		Blocks: slack.Blocks{BlockSet: []slack.Block{
 			input,
-			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, fmt.Sprintf(line, kept), false, false)),
+			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, feedbackKeptText(days, askKept), false, false)),
 		}},
 	}
 }
