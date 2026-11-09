@@ -1461,5 +1461,94 @@ class PresubmitWallTimeTest(unittest.TestCase):
         self.assertEqual(got["presubmit wall estimate, minutes"], -(-eval_rosters.presubmit_wall_estimate()["total"] // 60))
 
 
+# ─── Roster comments carry the outcome, not the record (#5245) ───────────────
+# .agents/rules/public_surfaces.md: a committed file names a run's outcome and
+# where its record is, nothing from inside it. A roster comment therefore says
+# red, green, a miss, a collapse, above or under the bar, and cites the build;
+# the counts, ratios and judge scores stay on the domain scorecard. Every
+# `hack/eval/*.txt` is read, comment text only.
+ROSTER_COMMENT_FILES = sorted(eval_rosters.EVAL_DIR.glob("*.txt"))
+# A judge reading (`1.0`, `0.8`) stands alone: not inside a version
+# (`1.36.3`, `v0.17.0`, `GKE 1.36`), a section reference (`§1.5`) or a
+# longer number.
+JUDGE_READING_RE = re.compile(r"(?<!GKE )(?<![\w.§])[01]\.\d+(?![\w.])")
+RESULT_SHAPES = {
+    "a pass ratio (N/M)": re.compile(r"\b\d+/\d+\b"),
+    "a count of passes (N of M)": re.compile(r"\b\d+ of \d+\b"),
+    "a percentage": re.compile(r"\b\d+(\.\d+)? ?%"),
+    "a judge score name": re.compile(r"OutcomeValidity|Verification(Catastrophic|Coverage)"),
+    "a judge reading": JUDGE_READING_RE,
+    "a repetition count": re.compile(r"\b\d+ (graded |passing )?repetitions?\b"),
+    "a miss count": re.compile(r"\b\d+ misses\b"),
+    "a per-repetition verdict": re.compile(r"passed every|failed every|fails every|nights in a row"),
+}
+# Exact substrings of the comment lines where a number is a budget or
+# infrastructure fact, not a run's result. Short on purpose: a new entry
+# needs the same kind of reason.
+RESULT_SHAPE_ALLOWLIST = {
+    # nightly-budget-history.txt: the share of the deadline the first night used.
+    "used 71% of the budget",
+    # nightly-budget-history.txt: how many cases the deadline reached, a budget fact.
+    "cut the night at 32 of 73",
+    # nightly-budget-history.txt: the infra-lock chain's share of the build's wall clock.
+    "The chain is 72 to 85% of the build, 79% summed",
+    # nightly-cases.txt: the fixture scan over the pool projects, infrastructure.
+    "reads the role healthy on 40 of 40",
+}
+RESULT_SHAPE_RULE = (
+    "a roster comment states the outcome and cites the run; the numbers are on the "
+    "domain scorecard (.agents/rules/public_surfaces.md)"
+)
+
+
+def roster_comment_lines(text: str):
+    """(line number, comment text) for every comment in a roster file, the
+    parsed markers left out: `# part N` and the nightly's sorted-section marker."""
+    for number, raw in enumerate(text.splitlines(), start=1):
+        if "#" not in raw:
+            continue
+        if eval_rosters.PART_MARKER_RE.match(raw) or raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
+            continue
+        yield number, raw.split("#", 1)[1]
+
+
+def result_shape_findings(path: pathlib.Path, text: str) -> list[str]:
+    findings = []
+    for number, comment in roster_comment_lines(text):
+        if any(allowed in comment for allowed in RESULT_SHAPE_ALLOWLIST):
+            continue
+        for name, pattern in RESULT_SHAPES.items():
+            if pattern.search(comment):
+                findings.append(f"{path.name}:{number}: {comment.strip()!r} carries {name}; {RESULT_SHAPE_RULE}")
+    return findings
+
+
+class RosterCommentsCarryNoResultsTest(unittest.TestCase):
+    def test_no_roster_comment_carries_a_count_ratio_or_score(self):
+        self.assertTrue(ROSTER_COMMENT_FILES, "no hack/eval/*.txt to read")
+        findings = []
+        for path in ROSTER_COMMENT_FILES:
+            findings.extend(result_shape_findings(path, path.read_text(encoding="utf-8")))
+        self.assertEqual(findings, [], "\n".join(findings))
+
+    def test_the_shapes_catch_a_result_and_pass_a_citation(self):
+        caught = result_shape_findings(pathlib.Path("x.txt"), "# 3/3 on build 1\n")
+        self.assertEqual(len(caught), 1, caught)
+        self.assertIn("a pass ratio", caught[0])
+        clean = (
+            "# green on build 2113733214391504896 (2026-10-23); a miss on GKE 1.36.3-gke.1244000,\n"
+            "# SOUL §1.5, v0.17.0, 2026-10-14 (#2016), 40 of 40 pool projects read healthy\n"
+        )
+        self.assertEqual(
+            result_shape_findings(pathlib.Path("x.txt"), clean.replace("40 of 40 pool", "reads the role healthy on 40 of 40 pool")), [])
+        self.assertEqual(result_shape_findings(pathlib.Path("x.txt"), "# part 2\n./tasks/a/task.yaml\n"), [])
+
+    def test_every_allowlist_entry_still_matches_a_line(self):
+        text = "\n".join(p.read_text(encoding="utf-8") for p in ROSTER_COMMENT_FILES)
+        for allowed in RESULT_SHAPE_ALLOWLIST:
+            with self.subTest(allowed=allowed):
+                self.assertIn(allowed, text, "an allowlist entry no roster comment carries any more: delete it")
+
+
 if __name__ == "__main__":
     unittest.main()

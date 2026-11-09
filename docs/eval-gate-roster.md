@@ -255,7 +255,10 @@ the demotion of 2026-10-17 (#3120) put it back, and the return of 2026-10-26 too
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
 the nine that used to wait commented out in the script (the reasons each cannot take a
-presubmit seat yet are beside its line in `hack/eval/nightly-cases.txt`). A new case lands
+presubmit seat yet are beside its line in `hack/eval/nightly-cases.txt`;
+`scripts/test_eval_rosters.py` holds every roster comment to
+[`public_surfaces.md`](../.agents/rules/public_surfaces.md): the outcome and the run, no counts,
+ratios or scores). A new case lands
 there by default and earns its presubmit seat — which is its roster seat — on the record
 the nightly builds ([`docs/designs/bench-case-format.md`](designs/bench-case-format.md),
 "Registration").
