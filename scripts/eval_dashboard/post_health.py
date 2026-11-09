@@ -1016,9 +1016,9 @@ def days_text(days) -> str:
 
 
 def pool_cause_text(pool: dict) -> str:
-    """What to do, by cause. The four remedies differ and one of them spends
-    money, so an unrecognised cause falls through to the message that asks for
-    nothing."""
+    """What is wrong, by cause, and the remedy where there is one. The causes
+    call for different things and one of them spends money, so an unrecognised
+    cause falls through to the message that asks for nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
         # The counts are this hour's Boskos reading and carry the remedy on

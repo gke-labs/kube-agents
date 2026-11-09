@@ -422,7 +422,7 @@ reads every project as it did before.
 
 The poster sends one line when the note appears, and again if its verdict
 changes inside the episode. The header names the cause, because the four
-causes have four different remedies and one of them spends money:
+causes call for different things and one of them spends money:
 
 ```text
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
@@ -511,8 +511,8 @@ artifact.
 
 This note files no `presubmit-gate` issue, unlike an OUTAGE, lost pods, fixture
 drift and pool drift. A full pool is a capacity fact, not a defect a code change
-closes; its remedies are onboarding and raising the cap, which are planned
-work. Chat, the Brief and the digest carry it, and nothing opens.
+closes; its remedy is onboarding, which is planned work, or a cap the operator
+weighs. Chat, the Brief and the digest carry it, and nothing opens.
 
 The digest carries the median wait every morning whether or not anything is
 wrong (`typical wait`, beside `typical run`), and repeats a one-line version

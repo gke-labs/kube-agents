@@ -2249,7 +2249,7 @@ def cause(
     while the report prints the prose underneath.
 
     Three causes look identical from the outside -- runs queue, nothing fails --
-    and they have three different remedies, one of which costs a project.
+    and they call for three different things, one of which costs a project.
 
     Ordered by what can be ruled out cheapest. A full pool is unambiguous. A
     pool with free projects that nothing can reach is the concurrency cap, and
