@@ -7,7 +7,7 @@
 # SNAT and their egress is dropped by the far side while the DaemonSet reads
 # Ready. On slot a the DaemonSet covers the default pool's nodes alone;
 # `idle-batch-pool` and `pinned-inference-pool` carry a NoSchedule taint it
-# does not tolerate, while every GKE-managed DaemonSet covers all four nodes.
+# does not tolerate, while every GKE-managed DaemonSet covers every node.
 # A declared gap: expected_fail until the check lands
 # (gke-labs/kube-agents#2576, item 2, which proposes
 # `network-daemonset-missing-ccc-toleration`). The networking fabric audit
