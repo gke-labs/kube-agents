@@ -87,7 +87,7 @@ The ledger issue and every remediation pull request (a merge request on GitLab) 
 
 ### Tier 1 — the ledger issue
 
-Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`). Its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail. The detail is evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.
+Each audit stream owns exactly one **GitHub issue** per install, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, `audit-scope:<slug>` (the install's host cluster, from `spec.harness`) and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> (<host cluster>) — <n> findings (<c> critical)`). Its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail. The detail is evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.
 
 A run that finds nothing **closes the issue as completed**, and closes any remediation PRs still open for the stream. That is the point of the shape: a closed issue reads as _done_.
 
@@ -229,7 +229,7 @@ A PR a **human** closed renders as **`fix refused`** and is final: re-proposing 
 
 Three properties follow from the script owning the artefacts rather than the model:
 
-- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
+- **One ledger per audit stream per install.** The `--audit` id is checked against a fixed allowlist; the branch names are derived from it and the labels from it and from the install's host cluster, rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
 - **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block, and the harness keeps its own copy of each body it publishes in a report store on the agent's volume. The next run diffs finding ids against that stored copy, so a hand edit to the public issue cannot change what the harness believes it published.
 
   Only a run for a stream and repository the store has never held, as the first after an upgrade or on a replaced volume is, reads the block back once to seed it. A stored record that is missing, unreadable, or does not match the issue is never re-seeded from the issue: the run treats its memory as lost and withholds the delta rather than trusting the public body.
