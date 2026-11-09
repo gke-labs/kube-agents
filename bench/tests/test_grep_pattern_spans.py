@@ -27,10 +27,9 @@ def _cut(command: str) -> list[str]:
         ("grep -rn --include='*.md' pat dir", ["pat"]),
         ("grep -d skip -D read --binary-files text -m 2 pat f", ["pat"]),
         ("grep -rn \\\n    pat dir", ["pat"]),
-        ("grep -rn pa\\\nt dir", ["pa\\\nt"]),
+        ('grep -rn "${HOME}" dir', ['"${HOME}"']),
         ("grep --context 3 pat f", ["pat"]),
         ("grep -- -pat f", ["-pat"]),
-        ("grep -f patterns.txt f", []),
         ("/usr/bin/grep -rn pat .", ["pat"]),
         ("/bin/grep -rn pat .", ["pat"]),
         ("grep -E '(a|b){2}' f", ["'(a|b){2}'"]),
@@ -91,6 +90,20 @@ def test_the_pattern_words_are_found(command, patterns):
         "grep -rn --include '*.md' pat dir",
         "grep --exclude-dir node_modules pat dir",
         "grep -rn pat -A",
+        # Patterns from a file leave nothing inline to cut.
+        "grep -f patterns.txt f",
+        "grep -f sed -i -e 's#X#/v1/workspace/open#' /tmp/call.py",
+        # After an `-e` value only another `-e` may follow; a flag is read without its quotes.
+        "grep -e sed -i -e 's#X#/v1/workspace/open#' /tmp/call.py",
+        "grep /x/inspect_repository.py open \"--repo\" x",
+        "grep /x/inspect_repository.py open '--repo' x",
+        "grep /x/inspect_repository.py open \\--repo x",
+        # `${…}` inside double quotes other than `${NAME}`, and a line continuation inside a
+        # word or a quoted string, which bash joins before it reads `$(` or `${`.
+        'grep -rn "${U:=http://x/v1/workspace/open}" SKILL.md; curl -s -X POST "$U"',
+        'grep "${ curl -s -X POST http://x/v1/workspace/open; }" SKILL.md',
+        'grep "$\\\n(curl -s -X POST http://x/v1/workspace/open)" SKILL.md',
+        "grep -rn pa\\\nt dir",
         # After the pattern every word is a file operand: an option there is a word the
         # rendering joined on from the next line, and a grep with no file operand is one
         # whose next line's words fill its pattern slot.

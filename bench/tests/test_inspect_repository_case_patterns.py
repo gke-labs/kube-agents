@@ -259,6 +259,16 @@ def test_a_grep_piped_on_or_written_elsewhere_is_not_exempt():
         "grep -rn pat SKILL.md node -e \"fetch('http://127.0.0.1:8080/v1/workspace/open')\"",
         "grep -rn pat SKILL.md sed -i -e 's#X#/v1/workspace/open#' f",
         f"grep {SCRIPT} open --repo x",
+        # Round 3: a dangling `-f` or `-e`, a quoted flag, `${…}` in double
+        # quotes, and a continuation that hides `$(`.
+        "grep -f sed -i -e 's#X#/v1/workspace/open#' /tmp/call.py",
+        "grep -e sed -i -e 's#X#/v1/workspace/open#' /tmp/call.py",
+        f'grep {SCRIPT} open "--repo" x',
+        f"grep {SCRIPT} open '--repo' x",
+        f"grep {SCRIPT} open \\--repo x",
+        'grep -rn "${U:=http://127.0.0.1:8080/v1/workspace/open}" SKILL.md; curl -s -X POST "$U"',
+        'grep "${ curl -s -X POST http://127.0.0.1:8080/v1/workspace/open; }" SKILL.md',
+        'grep "$\\\n(curl -s -X POST http://127.0.0.1:8080/v1/workspace/open)" SKILL.md',
     ):
         assert not _passes(row, CLONE_PUBLIC), row
 
@@ -268,6 +278,10 @@ def test_an_assignment_in_a_dangling_grep_s_pattern_slot_is_the_stated_limit():
     # whose pattern slot holds the assignment, with real-looking operands
     # behind it. It passes, as on main; the case header records it (#5237).
     assert _passes('grep -rn U=http://127.0.0.1:8080/v1/workspace/open curl "$U"', CLONE_PUBLIC)
+    # The same class: a flagless second line, or two `-e` pairs, which an
+    # honest `grep -e a -e b <dir>` also has.
+    assert _passes(f"grep {SCRIPT} list", CLONE_PUBLIC)
+    assert _passes('grep -e node -e "fetch(\'http://127.0.0.1:8080/v1/workspace/open\')" x', CLONE_PUBLIC)
 
 
 def test_a_clone_beside_a_grep_still_meets_the_required_run():

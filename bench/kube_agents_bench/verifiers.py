@@ -2758,7 +2758,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     typed newline into a space and ``grep -A`` above a fetch would otherwise
     hand the fetch's URL to the pattern slot. After the pattern every word is
     a file operand: an option there, or a grep with no file operand, is a line
-    the rendering joined on, and refuses the grep. It grades: the options, the file operands,
+    the rendering joined on, and refuses the grep; so does an option other
+    than another ``-e`` after an ``-e`` value (a flag is read without its
+    quotes), and ``-f`` (a pattern file leaves nothing inline to cut). It
+    grades: the options, the file operands,
     and every other segment of the line (:func:`grep_pattern_spans`). It
     decides on the line's shell segments, not a regex over the row, so an
     operator glued to the pattern (``grep x;curl …``) ends the segment as it
@@ -2766,7 +2769,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     grep does not qualify when its output is piped on, when it redirects
     anywhere but /dev/null, or when it sits outside a system bin directory;
     nor does any grep on a row that groups commands, runs a substitution,
-    quotes with ``$'…'``, holds a comment or is a collapsed chain. The pattern
+    expands ``${…}`` other than ``${NAME}`` (inside double quotes too), quotes
+    with ``$'…'``, holds a comment, continues a line inside a word or a quoted
+    string, or is a collapsed chain. The pattern
     exemptions read the row first, and the grep cut reads what they left. The
     required runs read the rest of a grep-cut command (a clone beside a grep
     still runs the clone); the required patterns, which read text, leave the

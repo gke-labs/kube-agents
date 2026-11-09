@@ -303,7 +303,10 @@ verification_spec:
       # only as `--include=…`): the rendering joins a typed newline into a
       # space, so `grep -A` above a fetch must not hand its URL to the
       # pattern slot. After the pattern every word is a file operand, so an
-      # option there, or a grep with no file operand, refuses the grep too.
+      # option there, or a grep with no file operand, refuses the grep too, as
+      # does an option other than another `-e` after an `-e` value (read
+      # without its quotes), `-f`, `${…}` other than `${NAME}` inside double
+      # quotes, and a line continuation inside a word or a quoted string.
       # `rg` is not exempt (its `--pre` runs a command per file), and an
       # import probe (`python3 -c "import google.auth"`) is graded as the
       # library it loads. A pip query for a library's presence, `pip show

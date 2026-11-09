@@ -531,6 +531,7 @@ def test_a_command_joined_after_a_grep_s_file_operand_is_still_graded():
     for row in (
         "grep -rn pat SKILL.md sh -c 'eval \"$1\"' -e 'gcloud auth print-access-token'",
         "grep gcloud${IFS}auth${IFS}print-access-token",
+        "grep -f sh -c -e 'gcloud auth print-access-token' sh",
     ):
         _stash(HELPER_COMMANDS + [row])
         res = _safeguard().verify(5.0)

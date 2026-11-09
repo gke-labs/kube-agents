@@ -510,6 +510,10 @@ def _grep_row_refused(command: str) -> bool:
     while i < len(command):
         char = command[i]
         if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            if command.startswith(_SHELL_LINE_END, i + 1) and (quote is not None or i == 0 or not command[i - 1].isspace()):
+                # A line continuation inside a word or a quoted string: bash joins the two
+                # sides before it reads `$(`, `$'` or `${`, which this scan tests at `$`.
+                return True
             i += 2
             continue
         if quote is not None:
@@ -519,6 +523,14 @@ def _grep_row_refused(command: str) -> bool:
                 return True
             elif quote == _SHELL_DOUBLE_QUOTE and char == _SHELL_BACKTICK:
                 return True
+            elif quote == _SHELL_DOUBLE_QUOTE and command.startswith("${", i):
+                # Inside double quotes bash still expands `${…}`: `${U:=…}` assigns and
+                # `${ cmd; }` runs a command. Only `${NAME}` is read.
+                match = _BRACED_PARAMETER_RE.match(command, i)
+                if match is None:
+                    return True
+                i = match.end()
+                continue
         elif char in _SHELL_QUOTE_CHARS:
             if char == _SHELL_SINGLE_QUOTE and i > 0 and command[i - 1] == _SHELL_EXPANSION_PREFIX:
                 return True
@@ -533,6 +545,17 @@ def _grep_row_refused(command: str) -> bool:
             return True
         i += 1
     return False
+
+
+def _bare_word(text: str) -> str:
+    """A word's text with its quotes and escapes removed, as bash hands it to the program."""
+    return re.sub(r"[\\'\"]", "", text)
+
+
+def _is_pattern_flag(text: str) -> bool:
+    """Whether a word is `-e`, `-eX`, `--regexp` or `--regexp=X` (a further pattern option)."""
+    bare = _bare_word(text)
+    return bare.startswith("-e") or bare.partition("=")[0] == "--regexp"
 
 
 def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple[int, int]] | None:
@@ -563,13 +586,16 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
             take = None
         elif not options_over and text == _SHELL_OPTIONS_END:
             options_over = True
-        elif (operands or positional is not None) and text.startswith(_SHELL_FLAG_PREFIX):
+        elif (operands or positional is not None or (patterns and not _is_pattern_flag(text))) and _bare_word(text).startswith(_SHELL_FLAG_PREFIX):
             # Every word after the pattern is a file operand: an option there is a word the
             # rendering joined on from the next line (`grep pat f` over `node -e …`).
             return None
         elif not options_over and text.startswith("--"):
             name, has_value, _ = text.partition("=")
-            if name in _GREP_PATTERN_FLAGS or name in _GREP_FILE_FLAGS:
+            if name in _GREP_FILE_FLAGS:
+                # Patterns from a file: there is no inline pattern to cut.
+                return None
+            if name in _GREP_PATTERN_FLAGS:
                 from_flags = True
                 if name in _GREP_PATTERN_FLAGS and has_value:
                     patterns.append((start + len(name) + 1, end))
@@ -579,8 +605,10 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
                 take = name
         elif not options_over and text.startswith("-") and len(text) > 1:
             for offset, flag in enumerate(text[1:], start=1):
+                if flag in _GREP_FILE_FLAGS:
+                    return None
                 if flag in _GREP_SHORT_VALUE_FLAGS:
-                    if flag in _GREP_PATTERN_FLAGS or flag in _GREP_FILE_FLAGS:
+                    if flag in _GREP_PATTERN_FLAGS:
                         from_flags = True
                     if text[offset + 1:]:
                         if flag in _GREP_PATTERN_FLAGS:

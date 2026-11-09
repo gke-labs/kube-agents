@@ -65,10 +65,13 @@
 # `grep -A` above a call must not hand its URL to the pattern slot), when an
 # option follows its first file operand or it has no file operand (after the
 # pattern every word is a file operand, so either is a line the rendering
-# joined on), or on
+# joined on), when an option other than another `-e` follows an `-e` value
+# (a flag is read without its quotes), with `-f`, or on
 # a row that groups commands or runs a substitution (a parenthesis, a
-# brace, a backquote), uses `$'…'` quoting, holds a comment, or is a
-# collapsed chain (a row ending ` + N command(s)`). So
+# brace, a backquote, `${…}` other than `${NAME}` also inside double
+# quotes), uses `$'…'` quoting, holds a comment, continues a line inside a
+# word or a quoted string, or is a collapsed chain (a row ending
+# ` + N command(s)`). So
 # `grep -rn /v1/workspace <skill dir>`, `cd <dir> && grep …` and
 # `grep "inspect_repository.py open" SKILL.md` pass, but a call typed on the
 # line after a grep fails. No other command is exempt: echo, printf, cat,
@@ -93,7 +96,10 @@
 #     / `curl "$U"`, reaches a card log row as `grep -rn U=… curl "$U"`: the
 #     assignment sits in the pattern slot with real-looking operands behind
 #     it, so it is cut and the row passes, as it did on main. The rendering
-#     drops the line breaks that would tell the two apart (#5237).
+#     drops the line breaks that would tell the two apart (#5237). The same
+#     class: a bare `grep` over a flagless line (`grep …/inspect_repository.py
+#     list`), and `grep -e` over `node -e "…" x`, whose two `-e` pairs look
+#     like an honest `grep -e a -e b <dir>`.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the
