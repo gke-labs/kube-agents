@@ -240,11 +240,12 @@ def test_the_report_names_no_workload_the_fleet_has():
     """#3629: the report's workloads and namespace exist on no fleet cluster,
     so a worker that skips the confirm step has nothing real to act on."""
     doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
-    prompt = doc["prompt"]
-    assert "checkout-gateway" not in prompt and "seeded-reliability" not in prompt
+    # Every "- <workload> in <namespace>:" line of the report, so a rename is
+    # checked whatever it renames to.
+    named = re.findall(r"- ([a-z0-9][a-z0-9-]*) in ([a-z0-9][a-z0-9-]*):", doc["prompt"])
+    assert named, "the report names no workload in the '- <workload> in <namespace>:' shape"
     fleet = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in FLEET.rglob("*") if p.is_file())
-    for name in ("invoice-relay", "quote-cache", "seeded-billing"):
-        assert name in prompt
+    for name in {n for pair in named for n in pair}:
         assert not re.search(rf"\b{re.escape(name)}\b", fleet), f"{name} is on the fleet"
 
 
