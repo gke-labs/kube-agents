@@ -35,7 +35,7 @@ their own copies:
 | `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
 | `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
 | `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
-| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | The minter's GCP service account id (`kubeagents-github-minter-gsa`); one per project  |
+| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | Existing installs' minter GSA (`kubeagents-github-minter-gsa`); see below              |
 | `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project |
 | `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
 | `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
@@ -61,8 +61,11 @@ their own copies:
 | `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
+| `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                         |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
 | `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
+
+**The token minter's names (#3504).** A new install gets a key ring, key and GSA named after its cluster (`<cluster>-minter-keyring`, `<cluster>-minter-key`, `<cluster>-minter`, from `minter_derived_names`). An install whose state already holds a minter keeps those names, because a KMS key can't be deleted and renaming one plans a replacement. A name set in `install.env` (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`) always wins. `lifecycle.sh` refuses to adopt a minter key ring or key that another install's owner labels claim, or that carries no owner labels, unless `MINTER_SHARED_KEY` names it as `<keyring>/<key>`.
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds

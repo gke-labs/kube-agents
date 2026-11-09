@@ -128,8 +128,9 @@ The deployment requires the following variables in `install.env` or via CLI flag
 - `GITOPS_ORG` (`--gitops-org`) — the organization hosting the GitOps repository.
 - `GITOPS_REPO` (`--gitops-repo`) — GitOps repository name (default `gke-fleet-iac`).
 - `GITHUB_PEM_PATH` (`--github-pem-path`) — path to `.pem` (Path 1 only; omitted when key is pre-provisioned).
-- `KMS_KEYRING` (`--kms-keyring`) — Cloud KMS keyring name (default `github-token-minter-keyring`).
-- `KMS_KEY` (`--kms-key`) — Cloud KMS key name (default `github-token-minter-key`).
+- `KMS_KEYRING` (`--kms-keyring`) — Cloud KMS keyring name (default `<cluster>-minter-keyring` on a new install; an existing install keeps the name it has).
+- `KMS_KEY` (`--kms-key`) — Cloud KMS key name (default `<cluster>-minter-key` on a new install, likewise).
+- `MINTER_SHARED_KEY` — a key the install shares on purpose, as `<keyring>/<key>`. The installer won't adopt a key another install owns, or one with no owner labels, unless this names it.
 
   `GITOPS_ORG` and `GITOPS_REPO` were previously named `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
   deprecation warning.
@@ -154,7 +155,7 @@ Names and values baked into the deployment templates ([`k8s-operator/config/inte
 
 - **Kubernetes Service / Deployment:** `github-token-minter` (namespace `kubeagents-system`), listening on port `8080` with a `/version` health endpoint.
 - **Image:** substituted from `GITHUB_MINTER_IMAGE`, run as `/minty server run`. The upstream reference and pin live in `images.json`; see the [Docker images](docker-images.md) inventory.
-- **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to GSA `kubeagents-github-minter-gsa` (which holds `roles/cloudkms.signerVerifier` on the KMS key).
+- **Kubernetes SA:** `kubeagents-github-minter`, Workload-Identity-bound to the minter GSA, `<cluster>-minter` on a new install and `kubeagents-github-minter-gsa` on an older one (which holds `roles/cloudkms.signerVerifier` on the KMS key).
 - **Scopes:** the ConfigMap rule exposes three. `platform-agent-scope` grants `contents: write`, `pull_requests: write`, and `issues: write`, and is what the agent's managed repositories ride. `platform-agent-read-scope` grants `contents: read` alone, and is what the credential broker requests for its clone of a context repository. `platform-agent-sweep-scope` grants `contents`, `pull_requests` and `issues` read, and is what the broker requests per managed repository to read the outcome of the agent's own proposals; context repository policies do not carry it. A request names one in its `scope` field.
 - An install from the Kustomize bases re-applies the minter ConfigMap when it upgrades to this release: a rule without `platform-agent-sweep-scope` refuses the broker's sweep mint, and the install has no proposal readings until it carries the scope.
 - The App ID is injected from the `github-app-credentials` Secret, and the KMS key reference (`projects/.../cryptoKeyVersions/<n>`) points at the configured key version (the chart's `githubMinter.kms.keyVersion`), which must be ENABLED — i.e. imported — before the Deployment passes readiness.

@@ -486,6 +486,22 @@ PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
 PARAM_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
 PARAM_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_KMS_KEY="${KMS_KEY:-}"
+# Whether the operator named the minter's key ring and key (install.env, the
+# environment or a flag) before resolve_shared_defaults fills in a default:
+# apply_minter_name_defaults gives a new install per-install names only when
+# nobody did (#3504).
+PARAM_KMS_KEYRING_GIVEN="false"
+PARAM_KMS_KEY_GIVEN="false"
+[ -n "$PARAM_KMS_KEYRING" ] && PARAM_KMS_KEYRING_GIVEN="true"
+[ -n "$PARAM_KMS_KEY" ] && PARAM_KMS_KEY_GIVEN="true"
+# The minter's GSA name the same way. This file never calls common.sh's
+# export_identity_names, so the flag is set here, after bootstrap_install_env
+# has read install.env, for apply_minter_name_defaults to read.
+if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
+  export GITHUB_MINTER_GSA_NAME_GIVEN="true"
+else
+  export GITHUB_MINTER_GSA_NAME_GIVEN="false"
+fi
 # GitLab: the forge, a self-managed host, the Secret's name, and a FILE the
 # token is read from. There is deliberately no token-value input: a value in
 # argv or the environment is a value in `ps`, shell history and CI logs.
@@ -1173,8 +1189,8 @@ parse_args() {
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
-      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
-      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
+      --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; PARAM_KMS_KEYRING_GIVEN="true"; shift ;;
+      --kms-key=*) PARAM_KMS_KEY="${1#*=}"; PARAM_KMS_KEY_GIVEN="true"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
       --scope-projects=*)
@@ -2341,6 +2357,10 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
     write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
     write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # A minter key this install shares on purpose (#3504), kept beside its names.
+    if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+      write_env_var "$tmp" MINTER_SHARED_KEY "${MINTER_SHARED_KEY}"
+    fi
     # The path of the App's private key, never the key: the path this run
     # uses (--github-pem-path, the PEM prompt, or the path install.env
     # recorded). A rewrite of the forge keys must not drop a key the operator
@@ -2983,6 +3003,10 @@ bootstrap_install_env_file() {
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
   write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+  # A minter key this install shares on purpose (#3504), kept beside its names.
+  if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+    write_env_var "$tmp" MINTER_SHARED_KEY "${MINTER_SHARED_KEY}"
+  fi
   write_env_var "$tmp" MEMORY "$PARAM_MEMORY"
   write_env_var "$tmp" USER_PROFILE_ENABLED "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}"
   write_env_var "$tmp" HERMES_DASHBOARD_ENABLED "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}"
@@ -3322,6 +3346,24 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
+# Gives the token minter this install's own key ring, key and GSA names where
+# the operator named none (#3504): the names its state holds on an install
+# that already has a minter, else names derived from the cluster
+# (minter_derived_names). Called once project and cluster are settled and
+# before anything reads the names: the PEM decision, the interview's
+# defaults, and the KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME this run
+# records in install.env, which keep a new install's names on later runs.
+apply_minter_name_defaults() {
+  local project=$1 cluster=$2 names ring key gsa
+  names="$(minter_name_defaults "$project" "$cluster")"
+  IFS=$'\t' read -r ring key gsa <<<"$names"
+  [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
+  [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
+  if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
+    export GITHUB_MINTER_GSA_NAME="$gsa"
+  fi
+}
+
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
   resolve_platform_agent_mode_fallback
@@ -7675,6 +7717,7 @@ main() {
   # authenticated, and project and region are settled -- step 5 can still
   # change the region, and it has run. Called before the locals below copy
   # PARAM_GITHUB_PEM_PATH, so every consumer in this step sees one answer.
+  apply_minter_name_defaults "$project_id" "$cluster_name"
   resolve_missing_pem_against_kms "$region" "$project_id" || exit 1
 
   local github_org="$PARAM_GITOPS_ORG"

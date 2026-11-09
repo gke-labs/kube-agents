@@ -4121,6 +4121,84 @@ sys.exit(0)
 ' "$TF_PUBSUB_SUBSCRIPTION_TYPE" "$TF_CHAT_EVENTS_SUBSCRIPTION_NAME" "$TF_RESOURCE_MODE_MANAGED" "$TF_STATE_RC_UNREADABLE"
 }
 
+# ─── The minter's per-install names (#3504) ──────────────────────────────────
+# The token minter's key ring, key and GSA used to default to one fixed name
+# per project, so a second install that took the defaults adopted the first
+# install's App key. A new install now derives them from its cluster. An
+# install whose state already holds a minter keeps the names in its state: a
+# KMS key ring or key cannot be deleted, and renaming one plans a replacement
+# that would leave the old key and its versions behind.
+
+# The names a new install derives from its cluster, tab-separated: key ring,
+# key, GSA. A GSA id is 6-30 characters, so a cluster name too long for
+# "<cluster>-minter" keeps its first 18 characters and gains four hex
+# characters of its hash, which keeps two long names that share a prefix apart.
+minter_derived_names() {
+  local cluster=$1 gsa prefix hash
+  gsa="${cluster}-minter"
+  if [ "${#gsa}" -gt 30 ]; then
+    hash="$(printf '%s' "$cluster" | shasum -a 256 | cut -c1-4)"
+    prefix="${cluster:0:18}"
+    prefix="${prefix%-}"
+    gsa="${prefix}-${hash}-minter"
+  fi
+  printf '%s\t%s\t%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
+}
+
+# The minter's key ring, key and GSA names as this install's state records
+# them (module.github_minter[0]), tab-separated; a field the state doesn't
+# hold is empty, and all three are when there is no minter in state or no
+# state. tf_state_read's return code when the state could not be read.
+# shellcheck disable=SC2120
+tf_state_minter_names() {
+  trap - ERR
+  local state
+  state=$(tf_state_read "$@") || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(int(sys.argv[1]))
+want = {"google_kms_key_ring": "name", "google_kms_crypto_key": "name", "google_service_account": "account_id"}
+found = {}
+for r in doc.get("resources", []):
+    if r.get("module") != "module.github_minter[0]" or r.get("mode") != "managed":
+        continue
+    attr = want.get(r.get("type"))
+    if not attr or r.get("name") != "minter":
+        continue
+    for i in r.get("instances", []):
+        value = (i.get("attributes") or {}).get(attr)
+        if value:
+            found[r["type"]] = value
+print("\t".join(found.get(t, "") for t in want))
+' "$TF_STATE_RC_UNREADABLE"
+}
+
+# This install's default minter names, tab-separated: key ring, key, GSA. An
+# install with a minter in its state gets the names it holds (a field the
+# state lacks falls back to the project-wide default it was created under). An
+# install with none gets the names derived from its cluster. When the state
+# can't be read, nothing can be said about which install this is, so it gets
+# the project-wide defaults an existing install was created with, and says so:
+# a new install there should set its names.
+minter_name_defaults() {
+  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa=""
+  names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
+  if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME to names of its own." >&2
+    printf '%s\t%s\t%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    return 0
+  fi
+  IFS=$'\t' read -r ring key gsa <<<"$names"
+  if [ -n "${ring}${key}${gsa}" ]; then
+    printf '%s\t%s\t%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+    return 0
+  fi
+  minter_derived_names "$cluster"
+}
+
 # Refuse an apply that would stop on a service account this install does not
 # own. Every GSA the composition creates has ONE fixed name per project while
 # state is kept per cluster, so the second install in a project -- or a
@@ -4200,6 +4278,16 @@ check_service_account_ownership() {
   for line in ${foreign[@]+"${foreign[@]}"}; do
     IFS=$'\t' read -r label key account_id email <<<"$line"
     print_error "Service account '${account_id}' (${label}) already exists in project '${PROJECT_ID}' and is not managed by this install's Terraform state (gs://$(tf_state_bucket)/$(tf_state_prefix))."
+    # A minter GSA names the install that owns it in its description (#3504);
+    # say whose it is when it does. A describe that fails says nothing extra.
+    if [ "$key" = "GITHUB_MINTER_GSA_NAME" ]; then
+      local owner
+      owner="$(trap - ERR; gcloud iam service-accounts describe "$email" --project "${PROJECT_ID}" \
+        --format='value(description)' 2>/dev/null)" || owner=""
+      if [[ "$owner" == *"for install "* ]]; then
+        print_info "Its description names its owner: ${owner}."
+      fi
+    fi
     print_info "Applying would stop on a 409 creating it. If another kube-agents install in this project owns it, give this install its own name: set ${key}=<a-different-name> in install.env, or on a first install, which has no install.env yet, run ${key}=<a-different-name> ./install.sh ... and the name is recorded in the install.env it creates. If it is left over from an install removed without uninstall.sh, delete it first: gcloud iam service-accounts delete ${email} --project ${PROJECT_ID}"
   done
   return 1
@@ -5492,6 +5580,12 @@ write_tfvars_from_state() {
     fi
     if [ -n "${KMS_KEY:-}" ]; then
       echo "github_minter_kms_key = $(hcl_str "${KMS_KEY}")"
+    fi
+    # The one minter key lifecycle.sh may adopt from another install, or from
+    # outside any install, as <keyring>/<key> (#3504). Unset adopts only this
+    # install's own.
+    if [ -n "${MINTER_SHARED_KEY:-}" ]; then
+      echo "github_minter_shared_key = $(hcl_str "${MINTER_SHARED_KEY}")"
     fi
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"

@@ -77,6 +77,14 @@ readonly GITHUB_MINTER_KSA_NAME_FIXED="kubeagents-github-minter"
 readonly LITELLM_KSA_NAME_FIXED="kubeagents-litellm"
 
 export_identity_names() {
+  # Whether the operator named the minter's GSA, before the default fills it
+  # in: install.sh gives a new install a per-install name only when nobody did
+  # (#3504, apply_minter_name_defaults).
+  if [ -n "${GITHUB_MINTER_GSA_NAME:-}" ]; then
+    export GITHUB_MINTER_GSA_NAME_GIVEN="${GITHUB_MINTER_GSA_NAME_GIVEN:-true}"
+  else
+    export GITHUB_MINTER_GSA_NAME_GIVEN="${GITHUB_MINTER_GSA_NAME_GIVEN:-false}"
+  fi
   export NAMESPACE="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   export PLATFORM_AGENT_GSA_NAME="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
   export GITHUB_MINTER_GSA_NAME="${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"

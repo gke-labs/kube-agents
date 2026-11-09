@@ -62,7 +62,7 @@ What the install creates in your project:
 
 - The agent's service account, `kubeagents-platform-gsa`, always. Its roles are the [permission set](/kube-agents/reference/security-and-iam/#gcp-iam-permission-sets) you choose.
 - `kubeagents-litellm-gsa`, the model gateway's, with `--model-provider=vertex_ai` only.
-- `kubeagents-github-minter-gsa`, the GitHub token minter's, with the GitHub integration only.
+- `<cluster>-minter`, the GitHub token minter's, with the GitHub integration only. An install from an earlier release keeps `kubeagents-github-minter-gsa`.
 - One reader service account per project in scope, with `--scoped-sa-pool-enabled` only.
 - The Google-managed service agents the grants above name: GKE's for CMEK, Logging's for the drift sink, and Google Chat's with Chat.
 - A versioned Cloud Storage bucket, `<PROJECT_ID>-kube-agents-tfstate`, for the Terraform state.
