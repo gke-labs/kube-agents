@@ -174,6 +174,12 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 			forbidden: []string{"Synth3tic-expired", "synth-9f3c2a-valid", "SynthPass-mounted", "synth-0001-set"},
 			wantSub:   []string{"The password is [redacted].", "The token was [redacted],", "the secret is [redacted]", "api_key=[redacted]"},
 		},
+		{
+			name:      "fail closed: a lower-case hyphenated passphrase, whatever word it ends in",
+			in:        "The passphrase is quiet-meadow-lantern-expired and the password is meadow-lantern-plaintext.",
+			forbidden: []string{"quiet-meadow-lantern-expired", "meadow-lantern-plaintext"},
+			wantSub:   []string{"The passphrase is [redacted] and the password is [redacted]."},
+		},
 	}
 	for _, tc := range positives {
 		t.Run(tc.name, func(t *testing.T) {

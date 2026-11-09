@@ -1040,9 +1040,19 @@ var credentialStateWords = map[string]bool{
 	"stale": true, "used": true, "unused": true, "needed": true, "not": true, "a": true, "an": true,
 	"the": true, "managed": true, "generated": true, "provided": true, "injected": true,
 	"exposed": true, "leaked": true, "compromised": true, "only": true, "same": true, "different": true,
-	// Whole values only, never matched as a phrase's last word.
+}
+
+// credentialWholeValueWords are more values that are not a value, matched
+// only as the whole value, never as part of a phrase.
+var credentialWholeValueWords = map[string]bool{
 	"base64": true, "base64-encoded": true, "plaintext": true, "read-only": true, "write-only": true,
 	"not-set": true,
+}
+
+// statePhraseQualifiers are the words a plain hyphenated state phrase may
+// open with (plainHyphenatedStatePhrase).
+var statePhraseQualifiers = map[string]bool{
+	"now": true, "still": true, "already": true, "not": true, "never": true,
 }
 
 // trimValueEdges strips what wraps a value in text and is not part of it:
@@ -1067,7 +1077,7 @@ func valueNotASecret(v string) bool {
 		return true
 	}
 	lower := strings.ToLower(v)
-	if credentialStateWords[lower] {
+	if credentialStateWords[lower] || credentialWholeValueWords[lower] {
 		return true
 	}
 	if plainHyphenatedStatePhrase(v) {
@@ -1076,15 +1086,15 @@ func valueNotASecret(v string) bool {
 	return len(v) <= 5 && isAllDigits(v)
 }
 
-// plainHyphenatedStatePhrase says whether v is words joined by hyphens, each
-// lower-case letters only, whose last word is a state word of four letters
-// or more (now-expired, still-mounted): a phrase, not a token. A value with
-// a digit, a capital or a symbol in it, or one ending in a short function
-// word (-on, -set, -not), is not one, so a secret ending in a state word
-// stays redacted.
+// plainHyphenatedStatePhrase says whether v is a qualifier and a state word
+// joined by hyphens, at most three words, each lower-case letters only: one
+// of statePhraseQualifiers first, a state word of four letters or more last
+// (now-expired, still-mounted, not-yet-rotated). Anything else hyphenated,
+// a lower-case passphrase or a value with a digit, a capital or a symbol in
+// it, is not one and stays redacted.
 func plainHyphenatedStatePhrase(v string) bool {
 	parts := strings.Split(v, "-")
-	if len(parts) < 2 {
+	if len(parts) < 2 || len(parts) > 3 || !statePhraseQualifiers[parts[0]] {
 		return false
 	}
 	for _, p := range parts {
