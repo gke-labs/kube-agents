@@ -24,6 +24,12 @@
 # pull request.
 
 # part 1
+# Capability row: networking fabric, load balancers and Gateway; the
+# obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
+# no backing container declares or serves (the planted backend-api-svc in
+# seeded-networking, route unattached, no load balancer). A declared gap,
+# expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
+./tasks/networking-gateway-ingress-port-mismatch/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on an admission webhook whose CA bundle certificate has expired (the
 # planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
