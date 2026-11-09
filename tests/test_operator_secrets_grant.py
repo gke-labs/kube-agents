@@ -207,6 +207,54 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             False,
         )
 
+    def test_rendered_kube_proxy_enforces_secret_redaction_when_minimal_role_grants_secrets(self):
+        # Every golden fixture where kubeagents:minimal grants `secrets` must
+        # also render `<agent>-kube-proxy` with `KUBE_PROXY_REDACT_SECRETS=true`
+        # and keep the agent pod's `automountServiceAccountToken` disabled while
+        # routing `KUBE_PROXY_URL` to `<agent>-kube-proxy`.
+        golden_dir = REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected"
+        checked = 0
+        for fixture in sorted(golden_dir.glob("*.yaml")):
+            docs = [d for d in yaml.safe_load_all(fixture.read_text(encoding="utf-8")) if isinstance(d, dict)]
+            minimal_roles = [
+                d for d in docs
+                if d.get("kind") == "ClusterRole"
+                and str(d.get("metadata", {}).get("name", "")).startswith("kubeagents:minimal:")
+            ]
+            if not minimal_roles:
+                continue
+            grants_secrets = any(
+                SECRETS_RESOURCE in (rule.get("resources") or [])
+                for rule in (minimal_roles[0].get("rules") or [])
+            )
+            if not grants_secrets:
+                continue
+            checked += 1
+            deployments = {
+                d["metadata"]["name"]: d
+                for d in docs
+                if d.get("kind") == "Deployment"
+            }
+            kube_proxy_deploys = [
+                d for name, d in deployments.items() if name.endswith("-kube-proxy")
+            ]
+            self.assertEqual(
+                len(kube_proxy_deploys),
+                1,
+                f"{fixture.name}: expected one *-kube-proxy Deployment alongside kubeagents:minimal secrets grant",
+            )
+            kp_containers = kube_proxy_deploys[0]["spec"]["template"]["spec"]["containers"]
+            kp_env = {
+                item["name"]: item.get("value")
+                for item in kp_containers[0].get("env", [])
+            }
+            self.assertEqual(
+                kp_env.get("KUBE_PROXY_REDACT_SECRETS"),
+                "true",
+                f"{fixture.name}: kube-proxy Deployment must set KUBE_PROXY_REDACT_SECRETS=true when secrets are granted",
+            )
+        self.assertGreater(checked, 0, "expected at least one golden fixture granting secrets on kubeagents:minimal")
+
 
 if __name__ == "__main__":
     unittest.main()

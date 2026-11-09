@@ -6,7 +6,7 @@ It answers `connection_status`, `read_topics` and `inspect_pr`, the turn tools `
 
 ## Turn it on
 
-The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's. With it set, the operator renders, beside the console server:
+The server is off unless the operator runs with `A2A_MCP_DOOR=true`, an operator-level flag like the inject backend's, which the chart sets from `operator.mcpServer.enabled`. With it set, the operator renders, beside the console server:
 
 - `<agent>-a2a-mcp`: a Deployment running `/mcp` from the `a2a-console` image, and a ClusterIP Service on port 8089;
 - `<agent>-a2a-mcp-netpol`: deny-all ingress on that pod, so the only way in is `kubectl port-forward`;
@@ -17,6 +17,8 @@ The operator also renders the server's ServiceAccount, `<agent>-a2a-mcp`, and it
 Unset the flag and all of it is removed, the token included.
 
 ## Connect a client
+
+For a step-by-step setup of the workstation bridge in Antigravity, which reads the token and opens the port-forward itself, see [Using kube-agents from Antigravity](../../docs/site/src/content/docs/install/antigravity-mcp.md).
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -105,5 +107,7 @@ What it keeps is live only. Lost:
 `send_message` gathers the reports. Once the turn's task, and the tasks delegated from it, have ended, it keeps collecting the reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first. Only reports heard after the turn was sent count, so a report from an earlier turn on the same task isn't taken for this one. The turn also reads the gateway's `result` frame for its own task: one without `cardsPending` means no work went to cards, and gathering stops at once; with `cardsPending`, or when no result frame arrives (an older gateway), it waits for the quiet period as above. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped: the tasks were still running, so these are only the reports that had arrived; or they ended and no new report came; or they ended and the wait ran out. A card's report can take minutes, so for card work pass a longer `wait_seconds`, or read later reports with `poll_events`.
 
 `poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. A name must be one the server knows; an unknown name is refused rather than created. A token the server hadn't heard of is listened to from that call on. It returns the frames newer than `since` in cursor order, the new cursor, how many were dropped, and whether any dropped frame was newer than `since`. An updated report comes back under a new cursor. One cursor counts across all conversations, so a cursor stays valid when a conversation's listener goes and comes back; a `since` past the server's cursor, as after a restart, reads from 0.
+
+The workstation bridge (`kube-agents-mcp`) offers `poll_events` too and forwards it here. It takes the `conversation_token` and `since` a `send_message` answer gives, as written. Given its own conversation alias or console token instead, it sends the alias, the name its `send_message` sent the turns under, since its console tokens are not this server's. It clamps `wait_seconds` to 60.
 
 The swarm view's pending events come from this buffer in a later change.

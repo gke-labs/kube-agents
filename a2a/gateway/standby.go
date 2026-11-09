@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // A standby's doors (docs/designs/gateway-replicas.md, "Reaching the active
@@ -30,6 +32,10 @@ const (
 // standbyRetryAfter is the 503's Retry-After, in seconds: the election's
 // retry period, about how long a released lease takes to be taken.
 var standbyRetryAfter = strconv.Itoa(int(electionRetryPeriod / time.Second))
+
+// standbyReadyPrefix opens a standby's readiness line, so /readyz says which
+// role the answer is for.
+const standbyReadyPrefix = "standby: "
 
 // LeaseView is the lease holder the election last read: every standby
 // retry reads the Lease, so it is at most a retry period old.
@@ -54,6 +60,30 @@ func (v *LeaseView) read() (string, bool) {
 		return *h, true
 	}
 	return "", false
+}
+
+// ElectedReadiness is an elected replica's readiness. The replica holding
+// the lease (identity) answers with the gateway's own Readiness. A standby is
+// ready once it is connected to the bus and has read the Lease, so a
+// rollout's new pod reads Ready as a standby before an old one stops
+// (gateway-replicas.md, "Operator changes").
+func ElectedReadiness(gw *Gateway, view *LeaseView, identity string) func() (bool, string) {
+	return func() (bool, string) {
+		holder, read := view.read()
+		if read && holder == identity {
+			return gw.Readiness()
+		}
+		if gw.client != nil && !gw.client.Connected() {
+			return false, standbyReadyPrefix + "waiting for the bus: the NATS connection is down"
+		}
+		if !read {
+			return false, standbyReadyPrefix + "the lease hasn't been read yet"
+		}
+		if holder == "" {
+			return true, standbyReadyPrefix + "connected, and no replica holds the lease"
+		}
+		return true, standbyReadyPrefix + "connected, lease held by " + holder
+	}
 }
 
 // StandbyDoors serve the 503 on the doors' addresses until Stop.
@@ -143,6 +173,15 @@ func standbyHandler(namespace, port string, view *LeaseView) http.Handler {
 		if holder == "" {
 			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
 				Error: "this gateway replica is the standby, and no replica holds the lease right now; retry in a few seconds",
+			})
+			return
+		}
+		// The Lease's holder is a string anyone who can write the Lease sets,
+		// and the standby puts it into a command a person is told to copy
+		// and run, so only a pod's name (a DNS-1123 subdomain) goes in.
+		if len(validation.IsDNS1123Subdomain(holder)) > 0 {
+			writeJSON(w, http.StatusServiceUnavailable, standbyAnswer{
+				Error: "this gateway replica is the standby, and the lease names a holder that isn't a pod name; read the Lease to see who holds it",
 			})
 			return
 		}

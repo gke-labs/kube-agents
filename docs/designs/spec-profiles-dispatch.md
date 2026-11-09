@@ -340,10 +340,28 @@ leave open:
   the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
   dispatches the task afresh. With no free pod the submission waits over its cap and is
   redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
-  long expired that no held submission has (its submission aged off the stream). A record
-  nobody can read counts as a running one: its task is treated as started, and the sweep
-  waits as long from the record's last write. Answers a pod
+  long expired that no held submission has (its submission aged off the stream), reading the
+  bucket in one pass and logging a pass cut short. A record nobody can read (or of another
+  shape) has one meaning for every reader: a started task, last seen alive at the entry's
+  write, so it expires a lease after that like any record. A renewal from the pod its key
+  names has the dispatcher, the bucket's one writer, write it back readable. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
+- **Task credentials.** With a task-signing key (a cluster seed, read from the file
+  `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
+  mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
+  `taskCredential` (audience `nats`) is the password of the worker's task connection.
+  `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
+  admission, and a task that names no cluster gets none. Both name the task, its profile and
+  tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
+  offer's deadline plus the callout's 30s clock skew, and never later than
+  `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
+  never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
+  offered the task. The credentials are minted on the accept, before the lease is recorded.
+  If the pod's UID changed since the offer, or the mint fails, the offer is withdrawn as a
+  declined one is, and the task is offered again. With the variable unset, confirms carry neither, workers keep their
+  pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
+  or holds another key type stops the dispatcher at startup. The dispatcher logs a
+  credential's `jti`, never the token.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
@@ -365,8 +383,15 @@ leave open:
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
-  once it is older than the stream's retention plus an hour (`lib.ProfileSubmitRetention`
-  until the dispatch config carries the stream's max age).
+  once it is older than the stream's retention plus an hour. The retention is the dispatch
+  config's `submitRetentionSeconds`, never less than `lib.ProfileSubmitRetention` (72h). The
+  operator renders the longer of the constant it creates the stream with and the live stream's
+  max age, which the provision Job reads back and reports when it is longer
+  (`status.profileSubmitMaxAgeSeconds`). The operator never edits an existing stream, so a
+  stream an older release created longer, or one edited by hand, is covered this way, once the
+  Job's next run (at most a day) has read it. The retention is capped at a year
+  (`lib.MaxSubmitRetention`): a stream with no age limit, or a longer one, keeps tombstones that
+  long (#4948).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.
@@ -377,6 +402,19 @@ leave open:
   had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
   amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
   from the bus's side.
+- **A profile that leaves.** A profile removed from the install, or one whose identity stops
+  rendering, drains (#5074). The operator keeps it in the dispatch config with no durables and
+  `drainingUntil` set to the longest deadline any task can carry (six hours, the ceiling on
+  `maxTaskDeadlineSeconds`) plus fifteen minutes past the moment it left, so nothing new is
+  dispatched for it. A task keeps the deadline it was confirmed with, so a lower limit set since
+  doesn't shorten the window. The dispatcher's identity keeps its `.supervisor` and
+  stop-record grants and drops its durable grants, so the terminals of the tasks it still holds
+  reach their requesters. The applied dispatch config is the state: a profile it lists that the
+  render no longer has starts draining, and one already draining keeps its time until that
+  passes, when it leaves the config and the identity together. The set is read once a pass for
+  both, and only an entry the render could itself produce (subject-token name and tiers) is
+  carried forward, since its name becomes a grant. A held task whose submission goes back to the
+  stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
   identity for one.
@@ -388,7 +426,27 @@ leave open:
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
-  admission, and `lease-expired` and `deadline-exceeded` while it holds.
+  admission, and `lease-expired` and `deadline-exceeded` while it holds. A terminal is retried
+  until it lands, except for a profile that has left the install config: its `.supervisor`
+  grant goes at the next reconnect, so after `DroppedTerminalGiveUp` (fifteen minutes, well past
+  a brief drop from the config) the task is settled without one: its slot is freed, the
+  terminal is lost, and the loss is logged as an error (#5074).
+- **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. While it is open, for
+  `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
+  cap, never refused: a refusal would let one input that keeps killing workers fail every
+  other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
+  the oldest held submission is admitted alone as the probe of that opening, and the rest
+  wait while it runs; a child of the probe (sharing its correlationId) is part of its attempt
+  and is admitted. The next expiry opens it again. Below the threshold any finished task
+  resets the run; once it has opened, only that opening's probe closes it, by finishing or
+  by running to its deadline still renewing. A stop never opens or closes the breaker by
+  itself, but its worker's silence counts as a loss: a worker that stops renewing, after a
+  stop or not, is counted, whether the lease runs out first or the stop's grace does (the
+  grace is never shorter than a renewal and two ticks, so one silent since before the stop is
+  always past the count's threshold when it ends). The
+  state is in memory, and the dispatcher's health lists open and half-open breakers. A held
+  task isn't told it is held yet (#4362).
 
 ### Execution
 

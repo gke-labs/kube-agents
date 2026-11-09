@@ -798,6 +798,43 @@ Mutation(
         "the broker's credential",
     ),
     Mutation(
+        "C1-watcher-pod-metadata-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n',
+         '        if accept and not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "let a named Pod read through when the caller sends no Accept at all -- the "
+        "Pod then comes back whole, spec, env and status, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:\n',
+         '    if match.groupdict().get("ns") and match.group("resource") == POD_RESOURCE:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "drop the core-group guard on the named Pod rule, so any API group's "
+        "resource called pods (metrics.k8s.io's PodMetrics, a CRD's plural) is "
+        "relayed on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-unprojected-labels",
+        "agents/platform/scripts/watcher_policy.py",
+        ('                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}\n',
+         '                projected["labels"] = dict(labels)\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay every label of a named Pod instead of the owner lookup's one, "
+        "widening what the watcher token reads of any Pod in the fleet",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-controller-kind",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):\n',
+         '        if kind != POD_METADATA_HASH_OWNER_KIND or has_hash:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay a named Pod's controller whatever its kind (a static Pod's Node, a "
+        "custom controller), which the owner lookup never folds on",
+    ),
+    Mutation(
         "C1-watcher-count-list-widened-to-secrets",
         "agents/platform/scripts/watcher_policy.py",
         ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
@@ -2336,7 +2373,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:               true,\n", ""),
+        ("\ta2aBusUserEnv:                 true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",

@@ -120,8 +120,10 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # identity has to create GKE clusters for the eval tasks, so handing it to the
 # verifiers would be handing them cluster-admin on the shared fleet.
 #
-# roles/container.viewer is the whole grant, verified against the live role
-# rather than assumed: get/list only, no create/update/delete/patch on any
+# roles/container.viewer is the whole grant on the clusters, verified against
+# the live role rather than assumed (roles/compute.viewer, below, reads the
+# project-scoped Compute Engine fixtures): get/list only, no
+# create/update/delete/patch on any
 # Kubernetes object (its one *.create is container.tokenReviews.create, the
 # read-shaped token validation API), and no container.secrets.* at all -- so
 # this account cannot read a Secret on platform-agent-host either. It is
@@ -144,6 +146,20 @@ resource "google_service_account" "fleet_reader" {
 resource "google_project_iam_member" "fleet_reader_container_viewer" {
   project = var.project_id
   role    = "roles/container.viewer"
+  member  = "serviceAccount:${google_service_account.fleet_reader.email}"
+}
+
+# The project-scoped fixtures (the startup-fail VM, the world-open firewall
+# rule and its VM; fixtures.json roles with cluster_slot null) are Compute
+# Engine objects, which container.viewer cannot read. The CI health bot's scan
+# runs every gcloud read as this account, so the presence probe and the state
+# pass list instances and firewall rules as it (#2483, #2682).
+# roles/compute.viewer is get and list on Compute Engine resources, with no
+# create, update or delete. It does show instance metadata, so no secret goes
+# in this project's instance metadata.
+resource "google_project_iam_member" "fleet_reader_compute_viewer" {
+  project = var.project_id
+  role    = "roles/compute.viewer"
   member  = "serviceAccount:${google_service_account.fleet_reader.email}"
 }
 
@@ -321,6 +337,19 @@ resource "google_container_cluster" "seeded_a" {
     channel = "CHANNEL_STANDARD"
   }
 
+  # The GKE Config Connector add-on (#4218). The Config Connector eval cases
+  # need a cluster in the audited fleet that runs Config Connector, and only
+  # this cluster gets it. GKE installs the CRDs and the operator. The
+  # ConfigConnector object that turns on namespaced mode is in
+  # config-connector.tf. Not a drift facet (fleet_consistency_drift_sop.md
+  # section 4), so it changes no consistency finding. An in-place update.
+  # Workload Identity, which the add-on needs, is on above.
+  addons_config {
+    config_connector_config {
+      enabled = true
+    }
+  }
+
   # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
   # enroll in REGULAR and take a maintenance window. Unlike seeded-b there
   # is no version fixture here, so auto-upgrade is welcome; enrollment also
@@ -359,13 +388,22 @@ resource "google_container_cluster" "seeded_a" {
 }
 
 resource "google_container_node_pool" "seeded_a_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_a.name
-  node_count = 2
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_a.name
+  # Three since the Config Connector add-on (#4218), two before. Measured on
+  # a dev cluster that runs the add-on, its pods request about 1,020m CPU at
+  # all times (cnrm-webhook-manager 2 x 250m, cnrm-deletiondefender 250m,
+  # cnrm-unmanaged-detector 250m, cnrm-resource-stats-recorder 20m), 100m
+  # more for each namespaced controller while a ConfigConnectorContext
+  # exists, and the configconnector-operator pod: more than the core each
+  # node had spare, and default-pool-headroom requires 100m spare on every
+  # node. A node_count change is an in-place resize, not a
+  # replace: no reconcile-allow.json entry, and the machine type stays.
+  node_count = 3
 
   node_config {
-    # e2-standard-2, two of them (2026-10-20, #3607; two e2-mediums since
+    # e2-standard-2 (2026-10-20, #3607; two e2-mediums since
     # #1278, one before). The binding constraint is CPU *requests*: GKE's
     # system pods (kube-dns at 270m a replica, kube-proxy, metadata-server,
     # fluentbit, konnectivity, ...) take 700-860m of an e2-medium's 940m

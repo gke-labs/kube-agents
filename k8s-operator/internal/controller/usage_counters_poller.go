@@ -52,9 +52,20 @@ const (
 	// usageNewerFieldPeople names the two people readings' shared pruning
 	// record: they arrived in one release and a CRD serves both or neither.
 	usageNewerFieldPeople = "the two people readings"
+	// usageNewerFieldOrigins names the nine origin readings' shared pruning
+	// record: they arrived in one release and a CRD serves all nine or none.
+	usageNewerFieldOrigins = "the nine origin readings"
 	// usageNewerFieldLastHumanActive is lastHumanActiveTime's pruning record
 	// key, the status field's name.
 	usageNewerFieldLastHumanActive = "lastHumanActiveTime"
+	// usageNewerFieldTopTools is topTools' pruning record key, the status
+	// field's name: it arrived after the people readings, so a served CRD can
+	// carry every reading and prune it.
+	usageNewerFieldTopTools = "topTools"
+	// usageTopToolsShown is how many tool and subcommand pairs topTools
+	// carries, the summary block's "top 5"; the CRD caps the list at the same
+	// number.
+	usageTopToolsShown = 5
 	// gatewayLeaderLabel is the label leader_elect.py stamps on the gateway pod
 	// that holds the lease and runs Hermes, the one the gateway Service selects
 	// (platformagent_manifests.go); the chat listener lives in that process.
@@ -64,11 +75,18 @@ const (
 	// and, when a total moved, writes the status: the interval the controller
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
 	// the same reasoning that one status write per interval is a cost nobody
-	// notices. The first poll runs one interval after the manager elects this
-	// replica, by which time the initial reconcile pass has rendered the
-	// policies admitting the operator; a CR it reaches before that costs one
-	// failed poll, under the streak that records no event.
+	// notices.
 	usageCountersPollInterval = 5 * time.Minute
+	// usageCountersFirstPollDelay is how long after the manager elects this
+	// replica the first poll runs, the later polls following at the interval
+	// above. Long enough on a warm install for the initial reconcile pass to
+	// have rendered the policies admitting the operator, and short enough
+	// that a CR under spec.deployment.sizingProfile auto has its cluster
+	// count, and so its tier, within a minute of an operator start rather
+	// than a full interval later. A CR the first poll reaches before its
+	// policies admit the operator costs one failed poll, under the streak
+	// that records no event.
+	usageCountersFirstPollDelay = 30 * time.Second
 	// usageCountersConfigMapSuffix names the ConfigMap that holds the
 	// document, in the CR's namespace: <name>-usage-counters.
 	usageCountersConfigMapSuffix = "-usage-counters"
@@ -121,10 +139,12 @@ const (
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
 // negativeFeedbackTotal, lastActiveTime and lastHumanActiveTime on every
-// PlatformAgent, the two cluster gauges, the six proposal readings and the
-// two people readings (peopleSeen7d, peopleSeen30d), from the broker's, the
-// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
-// manager Runnable on the leader, off the reconcile path.
+// PlatformAgent, the two cluster gauges, the six proposal readings, the
+// two people readings (peopleSeen7d, peopleSeen30d), the broker's top
+// tools (topTools) and the nine origin readings (proposalsFromChat to
+// proposalsFromOther), from the broker's, the watcher's, the chat plugin's
+// and the A2A gateway's metrics listeners, as a manager Runnable on the
+// leader, off the reconcile path.
 // docs/designs/usage-counters-producer.md is the design; the rules the
 // counters follow are in usage_counters_fold.go, the scrape in
 // usage_counters_scrape.go. This file is the loop and the two
@@ -139,6 +159,11 @@ type UsageCounterPoller struct {
 	// past it, so an unreachable listener holding a dial open does not freeze
 	// the CRs behind it. A seam so a test need not wait a real interval.
 	pollBudget func() time.Duration
+	// firstPollDelay and pollInterval are Start's schedule,
+	// usageCountersFirstPollDelay and usageCountersPollInterval from the
+	// constructor; seams so a test of Start need not wait either.
+	firstPollDelay time.Duration
+	pollInterval   time.Duration
 
 	// streaks is the in-memory failure record per listener (pod and port), for the one log line
 	// when a listener first fails, the one when it recovers, and the Warning
@@ -217,20 +242,31 @@ type usageTarget struct {
 // the pods' listeners over the pod network.
 func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 	return &UsageCounterPoller{
-		r:          r,
-		source:     newPodUsageSource(),
-		now:        time.Now,
-		pollBudget: func() time.Duration { return usageCountersPollInterval },
-		streaks:    map[usageStreakKey]*usageScrapeStreak{},
-		sweepSeen:  map[string]bool{},
-		sweptKeys:  map[string]bool{},
+		r:              r,
+		source:         newPodUsageSource(),
+		now:            time.Now,
+		pollBudget:     func() time.Duration { return usageCountersPollInterval },
+		firstPollDelay: usageCountersFirstPollDelay,
+		pollInterval:   usageCountersPollInterval,
+		streaks:        map[usageStreakKey]*usageScrapeStreak{},
+		sweepSeen:      map[string]bool{},
+		sweptKeys:      map[string]bool{},
 	}
 }
 
-// Start polls every interval until ctx is cancelled. It satisfies
-// manager.Runnable; main.go adds the poller to the manager.
+// Start polls once after firstPollDelay and then every pollInterval until
+// ctx is cancelled. It satisfies manager.Runnable; main.go adds the poller to
+// the manager, which starts it on election.
 func (p *UsageCounterPoller) Start(ctx context.Context) error {
-	ticker := time.NewTicker(usageCountersPollInterval)
+	first := time.NewTimer(p.firstPollDelay)
+	defer first.Stop()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-first.C:
+		p.pollOnce(ctx)
+	}
+	ticker := time.NewTicker(p.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -537,6 +573,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 				// DataVolume rides with Clusters: both come from the
 				// watcher's body alone.
 				DataVolume: reading.DataVolume,
+				ToolPairs:  reading.ToolPairs,
 			})
 		}
 	}
@@ -552,7 +589,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
-	readings, readingsKnown := usageReadingsForPoll(cached, scraped, p.noteReadings(cached, scraped))
+	misses := p.noteReadings(cached, scraped)
+	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
+	topTools, topToolsKnown := usageTopToolsForPoll(scraped, misses[usageReadingTopTools])
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -601,7 +640,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if ctx.Err() == nil {
 		p.recordStandingFailures(cached, failing, nil)
 	}
-	if err := p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown); err != nil {
+	if err := p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown, topTools, topToolsKnown); err != nil {
 		return err
 	}
 	return p.projectDataVolume(ctx, agent, volume, volumeKnown)
@@ -646,8 +685,9 @@ func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usa
 // fields to absent: no body has carried it for the event streak, or, for the
 // people reading, peopleReadingEnabled is false. known true with values is
 // the largest of each field across the bodies that carried the reading: the
-// broker is one pod by design, and every A2A gateway replica counts from the
-// one shared bucket. A zero is a reading, and is written as one.
+// broker is one pod by design, every A2A gateway replica counts from the
+// one shared bucket, and the chat listener is read on the gateway leader
+// alone. A zero is a reading, and is written as one.
 func usageReadingsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, misses map[usageReadingKind]int) (values map[string]*int64, known map[usageReadingKind]bool) {
 	values = map[string]*int64{}
 	known = map[usageReadingKind]bool{}
@@ -675,9 +715,96 @@ func usageReadingsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScr
 	return values, known
 }
 
+// usageTopToolsForPoll is the top-tools reading this poll projects, on the
+// proposal readings' rules: known false is a poll that says nothing about the
+// field, no broker body read for fewer polls in a row than the event streak,
+// so the rows keep their last values; known true with nil rows clears the
+// field to absent, after the streak of misses or when the broker pods read
+// have run nothing; known true with rows is the sum of each pair's counts
+// across the broker pods read, since the broker's pods never run the same
+// command twice, cut to the usageTopToolsShown largest totals, ties broken by
+// tool then subcommand ascending, so the status is byte-stable across polls
+// in which nothing ran. The table is per pod: a pod's entries, one per
+// counter its body fed, carry the one table, which is summed once.
+func usageTopToolsForPoll(scraped []usageScrapedPod, misses int) (rows []agentv1alpha1.ToolUsageSummary, known bool) {
+	summed := map[usageToolPair]usageToolCounts{}
+	seen := map[string]bool{}
+	for _, s := range scraped {
+		if !s.ReadingsPresent[usageReadingTopTools] || seen[s.UID] {
+			continue
+		}
+		seen[s.UID] = true
+		known = true
+		for pair, counts := range s.ToolPairs {
+			if summed[pair] == nil {
+				summed[pair] = usageToolCounts{}
+			}
+			for status, count := range counts {
+				summed[pair][status] += count
+			}
+		}
+	}
+	if !known {
+		return nil, misses >= usageScrapeFailureEventStreak
+	}
+	for pair, counts := range summed {
+		row := agentv1alpha1.ToolUsageSummary{Tool: pair.Tool, Subcommand: pair.Subcommand}
+		for _, status := range toolInvocationsStatusOrder {
+			count := counts[status]
+			row.Total += count
+			switch status {
+			case toolStatusSuccess:
+				row.Success = count
+			case toolStatusError:
+				row.Error = count
+			case toolStatusBlocked:
+				row.Blocked = count
+			case toolStatusBusy:
+				row.Busy = count
+			case toolStatusAbandoned:
+				row.Abandoned = count
+			}
+		}
+		if row.Total > 0 {
+			rows = append(rows, row)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Total != rows[j].Total {
+			return rows[i].Total > rows[j].Total
+		}
+		if rows[i].Tool != rows[j].Tool {
+			return rows[i].Tool < rows[j].Tool
+		}
+		return rows[i].Subcommand < rows[j].Subcommand
+	})
+	if len(rows) > usageTopToolsShown {
+		rows = rows[:usageTopToolsShown]
+	}
+	if len(rows) == 0 {
+		return nil, true
+	}
+	return rows, true
+}
+
+// usageTopToolsEqual reports whether two topTools values are the same rows in
+// the same order; nil and empty are the same absent field.
+func usageTopToolsEqual(a, b []agentv1alpha1.ToolUsageSummary) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // usageReadingStatusField is the status field a reading spec's field names, nil
-// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings and
-// the poller's tests reach every spec.
+// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings,
+// TestUsageGauges_PointerRowsForTheNineOriginReadings and the poller's tests
+// reach every spec.
 func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **int64 {
 	switch field {
 	case usageExportRemediationsMerged:
@@ -696,16 +823,38 @@ func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **
 		return &u.PeopleSeen7d
 	case usageExportPeopleSeen30d:
 		return &u.PeopleSeen30d
+	case usageExportProposalsFromChat:
+		return &u.ProposalsFromChat
+	case usageExportProposalsFromConsole:
+		return &u.ProposalsFromConsole
+	case usageExportProposalsFromApi:
+		return &u.ProposalsFromApi
+	case usageExportProposalsFromEvent:
+		return &u.ProposalsFromEvent
+	case usageExportProposalsFromDrift:
+		return &u.ProposalsFromDrift
+	case usageExportProposalsFromAudit:
+		return &u.ProposalsFromAudit
+	case usageExportProposalsFromScheduled:
+		return &u.ProposalsFromScheduled
+	case usageExportProposalsFromIssue:
+		return &u.ProposalsFromIssue
+	case usageExportProposalsFromOther:
+		return &u.ProposalsFromOther
 	}
 	return nil
 }
 
 // usageReadingRecord is the newer-fields record a reading's fields share: the
 // people readings arrived at a later release than the six proposal readings,
-// so a served CRD can carry the six and prune the pair.
+// and the origin readings later again, so a served CRD can carry the six and
+// prune the pair, or carry both and prune the nine.
 func usageReadingRecord(kind usageReadingKind) string {
-	if kind == usageReadingPeople {
+	switch kind {
+	case usageReadingPeople:
 		return usageNewerFieldPeople
+	case usageReadingOrigins:
+		return usageNewerFieldOrigins
 	}
 	return usageNewerFieldReadings
 }
@@ -782,13 +931,15 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		podRead func(*corev1.Pod) bool
 	}{
 		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
-		{gatewayPodSelector(agent), usageChatCounters, nil, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		// The chat listener also serves the origins reading, from the proposals
+		// ledger, on the same gate as its counters.
+		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
 		// The A2A gateway, a pod a next-mode install runs and a today install
 		// does not: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod},
-		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
+		{credentialProxySelector(agent), usageBrokerCounters, []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingTopTools}, credentialProxyContainerName, credentialProxyMetricsPortName, true, everyPod},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -1225,13 +1376,15 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 // carries everything accumulated since. A difference in a newer field alone, a
 // gauge or a later counter, is likewise skipped while the newer-fields record
 // is fresh, the served CRD at a previous schema, so the first counters that
-// CRD serves keep landing every poll. The proposal readings and the people
-// readings, each under its own record, follow the gauges' rule, per reading:
-// a field of a reading readingsKnown names is written as readings holds it,
-// nil included, and differs in either direction; a reading readingsKnown does
-// not name leaves its fields as they are. No reading moves lastActiveTime or
-// lastHumanActiveTime.
-func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool, readings map[string]*int64, readingsKnown map[usageReadingKind]bool) error {
+// CRD serves keep landing every poll. The proposal readings, the people
+// readings and the origin readings, each under its own record, follow the
+// gauges' rule, per reading: a field of a reading readingsKnown names is
+// written as readings holds it, nil included, and differs in either
+// direction; a reading readingsKnown does not name leaves its fields as they
+// are. topTools follows the same rule under its own record: written as
+// topTools holds it, nil included, when topToolsKnown. No reading moves
+// lastActiveTime or lastHumanActiveTime.
+func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool, readings map[string]*int64, readingsKnown map[usageReadingKind]bool, topTools []agentv1alpha1.ToolUsageSummary, topToolsKnown bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
 	proposed := doc.Totals[usageCounterRemediationsProposed]
@@ -1248,15 +1401,16 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
 	// counter, the errored counter, the background-tasks counter, the
-	// feedback counter, the chat sessions, the proposal readings and the
-	// people readings arrived later, each at its own release, and a CRD at a
-	// previous schema prunes some or all of them, so a difference in one of
-	// them alone waits while that field's record is fresh rather than
-	// re-patching every poll, and the others keep landing.
+	// feedback counter, the chat sessions, the proposal readings, the people
+	// readings and the origin readings arrived later, each at its own
+	// release, and a CRD at a previous schema prunes some or all of them, so
+	// a difference in one of them alone waits while that field's record is
+	// fresh rather than re-patching every poll, and the others keep landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	readingRecordPruned := map[string]bool{
 		usageNewerFieldReadings: p.newerFieldPruned(agent, usageNewerFieldReadings),
 		usageNewerFieldPeople:   p.newerFieldPruned(agent, usageNewerFieldPeople),
+		usageNewerFieldOrigins:  p.newerFieldPruned(agent, usageNewerFieldOrigins),
 	}
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
@@ -1266,6 +1420,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
 	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
+	topToolsPruned := p.newerFieldPruned(agent, usageNewerFieldTopTools)
+	topToolsMoved := topToolsKnown && !topToolsPruned && !usageTopToolsEqual(usage.TopTools, topTools)
 	humanBehind := !humanPruned && doc.LastHumanMoved != nil && (usage.LastHumanActiveTime == nil || !usage.LastHumanActiveTime.Equal(doc.LastHumanMoved))
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
@@ -1279,7 +1435,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
 		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) ||
-		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) || readingsMoved
+		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) || readingsMoved || topToolsMoved
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
@@ -1313,6 +1469,11 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if gaugesKnown {
 		usage.ClustersRegistered = wantRegistered
 		usage.ClustersMonitored = wantMonitored
+	}
+	// Written only while unpruned, as chatSessionsTotal is, so a patch for
+	// another field does not carry it and refresh a fresh record.
+	if topToolsKnown && !topToolsPruned {
+		usage.TopTools = topTools
 	}
 	// The readings written as values, by record, the ones whose echo says
 	// whether the served CRD carries them.
@@ -1348,7 +1509,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if gauges != nil {
 		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
 	}
-	for _, record := range []string{usageNewerFieldReadings, usageNewerFieldPeople} {
+	for _, record := range []string{usageNewerFieldReadings, usageNewerFieldPeople, usageNewerFieldOrigins} {
 		if len(written[record]) == 0 {
 			continue
 		}
@@ -1385,6 +1546,11 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// fresh pruning record is not refreshed by a patch for another field.
 	if !chatSessionsPruned && chatSessions > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageStatusFieldChatSessions, agent.Status.Usage.ChatSessionsTotal == chatSessions)
+	}
+	// Rows written that come back absent are the field's own record; a patch
+	// that cleared the field says nothing either way.
+	if topToolsKnown && !topToolsPruned && len(topTools) > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldTopTools, usageTopToolsEqual(agent.Status.Usage.TopTools, topTools))
 	}
 	return nil
 }

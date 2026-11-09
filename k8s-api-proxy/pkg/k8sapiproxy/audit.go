@@ -13,7 +13,8 @@ import (
 type Outcome string
 
 const (
-	// OutcomeForwarded is a request the upstream answered; StatusCode is its status. A Secret
+	// OutcomeForwarded is a request the upstream or the response cache answered; Cache says
+	// which, and StatusCode is the status the caller got. A Secret
 	// response the handler cannot redact is refused, and Err says why: StatusCode is then the
 	// handler's 502, or on a watch the 200 the stream began with.
 	OutcomeForwarded Outcome = "forwarded"
@@ -59,6 +60,7 @@ const (
 	auditKeyGroups      = "caller_groups"
 	auditKeyUserAgent   = "user_agent"
 	auditKeyError       = "error"
+	auditKeyCache       = "cache"
 )
 
 // AuditEvent describes one request the handler finished. The handler puts no request or
@@ -84,6 +86,9 @@ type AuditEvent struct {
 	Outcome     Outcome
 	Reason      RejectionReason
 	StatusCode  int
+	// Cache is the response cache's result (hit, miss, coalesced or bypass) when the cache
+	// handled the request. A hit or a coalesced request never reached the upstream.
+	Cache string
 	// Duration runs to the end of the response, so for a watch or an upgraded stream it is
 	// how long the stream stayed open.
 	Duration time.Duration
@@ -131,6 +136,7 @@ func (s slogAuditSink) Record(ctx context.Context, e AuditEvent) {
 		{auditKeyName, e.Name},
 		{auditKeyReason, string(e.Reason)},
 		{auditKeyUserAgent, e.UserAgent},
+		{auditKeyCache, e.Cache},
 	}
 	for _, o := range optional {
 		if o.value != "" {

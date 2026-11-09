@@ -918,6 +918,12 @@ def send_notification(message: str, session_id: str = "") -> str:
                 # below must not turn a report that did post into a duplicate.
                 return True, (f"SUCCESS: Notification to {platform_name} may have posted "
                               f"(the gateway did not answer in time); do not resend it.")
+            if chat_notify.kept(e.returncode):
+                # Refused for want of a home channel and kept by the gateway,
+                # which posts it in a digest once one is set. Handled: no
+                # home-channel fallback below, and no resend by the caller.
+                return True, (f"KEPT: Notification to {platform_name} was not posted (no home channel); "
+                              f"the gateway kept it for the digest it posts once one is set. Do not resend it.")
             return False, f"ERROR: Failed to send notification to {platform_name}: {e.stderr.strip()}"
         except Exception as e:
             return False, f"ERROR: {platform_name}: {e}"

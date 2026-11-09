@@ -11,7 +11,8 @@
 > and no credential shim named `git`. `inspect_repository.py` reads repositories
 > this install does not manage, and context repositories, through the `snapshot`
 > verb: one revision with no history, which `clone` does not offer, on purpose
-> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
+> ([The seam](#3-the-seam)). The broker's content workspace (`/v1/workspace/*`)
+> is retired (#4243); every read it served goes through `snapshot`. The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
@@ -274,7 +275,9 @@ The two designs it was measured against are the shared-volume credential proxy
 and content passing, on identical probes and identical corpora: twenty
 read probes at three repository sizes, plus a four-probe write rung. It was also
 the only one of the three that never reached past its own interface. Full method
-and results in [The experiment](#10-the-experiment).
+and results in [The experiment](#10-the-experiment). Content passing shipped as
+the broker's content workspace (`/v1/workspace/*`). It is retired (#4243), and
+the reads it served go through `snapshot`.
 
 Those numbers are a sanity check, not the justification. The justification is
 the customer requirement above. What the measurement establishes is that meeting
@@ -578,10 +581,10 @@ without a pull request (`PROTECTED_BRANCH`, status 409).
 `/v1/vcs/branch-delete` refuses to remove any of them, whatever proposals exist:
 outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default branch,
 base override or pinned base under the prefix) as `PROTECTED_BRANCH`.
-Across the broker's other write doors, protected branch policy is enforced under
-their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
-with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
-execution door (`/v1/exec`) refuses with HTTP 403 `SECURITY_POLICY_BLOCKED`.
+On the broker's other write door, the command execution door (`/v1/exec`),
+protected branch policy is enforced under its own protocol: it refuses with
+HTTP 403 `SECURITY_POLICY_BLOCKED`. The content workspace door
+(`/v1/workspace/*`) was a third write door; it is retired (#4243).
 
 The branch a proposal must target is configuration the agent cannot reach.
 A `gitops` or `managed` repository entry names it in `baseBranch`
@@ -610,10 +613,7 @@ A first-round `publish` refuses one too, before the bundle is read. A publish wi
 can retarget that proposal, and refusing would only strand follow-ups on a
 proposal a person opened onto another branch. A `clone` that names no branch
 checks out the base instead of the remote's default, and refuses a base the
-remote does not hold with `BASE_BRANCH_MISSING` rather than a git failure. The
-content door's `open` uses the base as the workspace base when the caller names
-none, and refuses a missing one with `workspace.base-branch-missing` (409),
-shallow opens included.
+remote does not hold with `BASE_BRANCH_MISSING` rather than a git failure.
 `clone` and `capabilities` answer `baseBranch` so the client can default to it.
 The command execution door needs no rule of its own: `/v1/exec` runs only
 `gcloud` and `kubectl`, so no proposal can be opened through it. With no base
@@ -1050,8 +1050,12 @@ tip is not in the fresh copy, so no caller has to know which setting the
 repository has.
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
-`BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE`, 400 `PATH_NOT_FOUND` (a `snapshot`
-path that names nothing at the ref; the refusal carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+`BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
+refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
+level below what was asked, with its `path`, its `type`, its count of `manifests`, and
+the `bytes` a snapshot of it alone measures; past 4096 entries it carries none),
+400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
+carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
 `NOT_SPENT` and `DELETE_REFUSED`, 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
@@ -2606,6 +2610,7 @@ side of each.
 | `url`               | `web_url`                         |                                                                                        |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                                          |
 | `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open                            |
+| `mergeCommit`       | `merge_commit_sha`                | else `squash_commit_sha`; `null` unless merged, and for a fast-forward merge           |
 | `body`              | `description`                     | GitLab's name for it                                                                   |
 | `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                                          |
 
@@ -2764,13 +2769,16 @@ problem from the administrator who set it. On a GitHub Enterprise Server the
 token minter reads the same CA too: see
 [GitHub Enterprise Server](#github-enterprise-server).
 
-### GitLab in the content workspace
+### GitLab in the snapshot verb
 
-The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
-the install serves. The caller names a repository and never a host or a URL:
+The broker's `snapshot` verb (`/v1/vcs/snapshot`) reads a repository on any forge
+the install serves. It took over these reads from the content workspace
+(`/v1/workspace/*`), which is retired (#4243). The caller names a repository and
+never a host or a URL:
 
-- **A bare `owner/name` is GitHub's,** and the workspace composes its github.com URL
-  as it always has.
+- **A bare `owner/name` is GitHub's,** and the verb composes its github.com URL
+  ([What this does not fix](#11-what-this-does-not-fix) covers an install with no
+  GitHub forge).
 - **A host-qualified name is resolved through the forges the install serves.** The
   forge parses it (nested groups, `allowed_paths`) and composes the clone URL with
   `clone_url`. A name no served forge owns is refused before anything is cloned.
@@ -2779,13 +2787,11 @@ What a clone presents follows the forge's credential:
 
 - **GitHub is unchanged.** A context repository gets a read-only minted token. A
   managed repository rides the write credential the CLI installed in the broker,
-  so its clone, fetch and push carry no credential of their own.
+  so its clone carries no credential of its own.
 - **GitLab's credential is a stored token, with nothing ambient behind it.** A
-  managed repository's clone, fetch and push present it through the forge's
-  credential helper, so the token never enters argv, the environment or the tree.
-  The token is asked for again before every fetch and push, so a repository
-  unregistered after `open` stops receiving it. An unregistered repository
-  presents nothing, as on GitHub.
+  managed repository's clone presents it through the forge's credential helper,
+  so the token never enters argv, the environment or the tree. An unregistered
+  repository presents nothing, with the ambient helper cleared, as on GitHub.
 
 **A context repository never receives the write token.** It gets the forge's
 read-only credential when the forge offers one. On GitLab that is a second stored
@@ -2799,7 +2805,7 @@ or one that does not hold one line of printable ASCII (the rule the git helper a
 returns `NoCredential`, and the clone presents nothing. That reads a public project and
 refuses a private one at the clone, with a log line saying why. The
 recommended token is a project or group access token with the Reporter role and
-only the `read_repository` scope. The write gate is unchanged: `commit`, `push`,
+only the `read_repository` scope. The write gate is unchanged: the write verbs,
 the API routes and the refresh route resolve the repository's own forge, refuse
 anything that forge's managed list does not hold, and present only the write
 credential.
@@ -3487,8 +3493,8 @@ and every member of a directory laid out as a bare repository (`HEAD` with
 `config` it would read. Git tooling commits such directories as test fixtures,
 so one of them does not cost the rest of the tree. Both of the
 sandbox's gits also run with `safe.bareRepository=explicit`, so git opens a bare
-repository only when it is named. A bare `owner/name` is GitHub's, as it is to
-the content workspace. On an install with a GitHub forge it is read on that
+repository only when it is named. A bare `owner/name` is GitHub's, as it was to
+the retired content workspace. On an install with a GitHub forge it is read on that
 forge. On an install with none it is read from github.com with no credential,
 because github.com is not in that install's host table and a URL cannot name
 it, unless the install's own forge lists the name as managed or context; then
@@ -3498,7 +3504,7 @@ The `inspect-repository` skill's `clone` and `fleet-upgrade-verification`'s `api
 
 **Registered context repositories** are the one unmanaged read the install does
 grant a credential for. A repository under `context_repos` is read for declared intent and
-never written, and it is usually private. The broker's content-mode `open`
+never written, and it is usually private. The broker's `snapshot`
 resolves the repository's registered role from the ConfigMap — `managed`,
 `context`, or neither, decided by the broker and never by a forge — and for a
 context repository asks the forge for `read_credential(repo)`: a credential that
@@ -3509,14 +3515,14 @@ helper cleared in that same layer so the write token is never tried in its
 place. On GitHub it is a `contents: read` App installation token minted from the
 repository's own minter policy, which the operator renders per context
 repository. On GitLab it is the stored `read-token` beside the write token
-(§7, "GitLab in the content workspace"). It is not minted per repository: GitLab
+(§7, "GitLab in the snapshot verb"). It is not minted per repository: GitLab
 sets its reach, a project or a group. The broker still presents it only for a
 registered context repository inside the forge's `allowedPaths`. A forge without a read-only
 credential answers `NoCredential` and the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
-by every `/v1/vcs` verb but `capabilities` and `snapshot`, by `commit` and
-`push`, and by the refresh route. `snapshot` presents the same read-only
-credential, minted under the request's own memory reservation.
+by every `/v1/vcs` verb but `capabilities` and `snapshot`, and by the refresh
+route. The read-only credential is minted under the request's own memory
+reservation.
 
 ## 12. Open questions
 

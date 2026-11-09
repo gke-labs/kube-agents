@@ -67,6 +67,16 @@ Environment:
         presubmit sets it per repetition), on either transport: under
         ``inject`` the opening task from the door accepting it to its
         terminal. Unset, nothing is written.
+    KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES: ``1`` turns off devops-bench's
+        ``ToolInvocation`` and ``Checklist`` judge scores for the process the
+        harness is built in (:func:`_skip_report_only_judges`). The presubmit
+        sets it on a pull request; unset, every score runs.
+    KUBE_AGENTS_SHAPE_FILE: When set, the shape of the reply the run
+        delivered is written there (best effort; the presubmit sets it per
+        repetition): whether it opens on its answer, whether it apologizes,
+        how many messages the thread received, and its word counts
+        (:mod:`kube_agents_bench.chat_shape`). Reported, never scored. Unset,
+        or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -147,6 +157,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -154,23 +165,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from devops_bench.agents import AgentHarness, AgentResult
+from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
     RATE_LIMIT_REASON_PREFIX as _RATE_LIMIT_REASON_PREFIX,
     STATUS_TOOL,
     _INFRA_FAILURE_REASONS,
+    _TASK_ID_RE,
     _json_object,
     delegated_task_ids,
     delivered_results,
@@ -191,12 +203,23 @@ SERVICE_API_PORT = 8642
 # Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
 # recorded a condition under which no answer can be graded: transport exhausted,
 # the server reporting a provider rate limit or billing stop on the opening turn,
-# or a delegated worker encountering quota exhaustion before acting.
+# or a delegated worker's card blocked by its rate-limit guardrail with no
+# completion or block call of the worker's own and no artifact (#4998),
+# whether or not the worker acted first.
 # ``scoring.py`` matches this string on a record's error and classifies the repetition
 # as infrastructure rather than grading it. The literal is duplicated there (importing
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
 # asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# Set to ``1`` by the presubmit on a pull request (hack/ci-eval-pr.sh). The two
+# judge scores it turns off gate nothing: the verdict reads the deterministic
+# Verification* scores and OutcomeValidity, ``RepetitionRecord.judged`` keeps
+# ToolInvocation "for reporting only", and ChecklistScore only feeds
+# OutcomeScore when a record has no VerificationCorrectness. A pull request
+# never records a baseline, so the nightly, which keeps both, is where their
+# trend lives.
+SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
 # The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
@@ -217,6 +240,20 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
+# The block kind the worker's rate-limit guardrail files
+# (deploy/docker/patches/kanban_guardrail_exit.py, RATE_LIMIT_BLOCK_KIND;
+# test_harness.py holds the two equal) and the status it leaves the card in.
+_GUARDRAIL_BLOCK_KIND = "transient"
+_GUARDRAIL_BLOCK_STATUS = "blocked"
+# The one failure reason the guardrail blocks on (its RATE_LIMIT_FAILURE_REASONS;
+# a billing stop is not blocked transient, so a billing reason is not its write).
+_GUARDRAIL_FAILURE_REASON = "rate_limit"
+# The verbs by which a worker closes or blocks its own card. The guardrail
+# blocks from the exit path with no tool call, so a card whose worker made
+# one of these calls was closed by the model, whatever text it carries.
+_WORKER_CARD_VERBS = frozenset({"kanban_block", "kanban_complete"})
+
+
 def _is_substantive_worker_action(name: str | None) -> bool:
     """Whether a tool entry recorded for a delegated worker constitutes substantive action.
 
@@ -230,7 +267,7 @@ def _is_substantive_worker_action(name: str | None) -> bool:
     if not name:
         return False
     # Worker terminal verbs that complete or block cards
-    if name in {"kanban_complete", "kanban_block"}:
+    if name in _WORKER_CARD_VERBS:
         return True
     # Terminal, shell, and direct command execution
     if name in {"terminal", "bash", "sh", "exec", "shell", "kubectl", "gcloud"}:
@@ -278,9 +315,15 @@ _INJECT_REMOTE_PORT = 8099
 # The A2A gateway's Lease, whose holder is the one replica serving the doors
 # once the gateway runs more than one (docs/designs/gateway-replicas.md). The
 # tunnel forwards to that pod, read again on every respawn; a standby answers
-# 503 and a respawn finds the new holder. With no Lease, or none readable,
-# the install runs one unelected gateway and the door's Service reaches it.
+# 503 and a respawn finds the new holder. With no Lease, or no holder, the
+# install runs one unelected gateway and the door's Service reaches it.
 _GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
+# The most the harness waits on a 503's Retry-After before it respawns the
+# tunnel: a gateway standby asks for its election's retry period
+# (electionRetryPeriod in a2a/gateway/election.go), and a handover leaves the
+# lease with no holder for about that long, so retrying at once would spend
+# the transport budget before the new leader serves.
+_RETRY_AFTER_CAP = 10.0
 _LEASE_READ_TIMEOUT = 15
 # How much of a failed kubectl read's stderr the warning quotes.
 _KUBECTL_STDERR_LOG_CHARS = 300
@@ -422,6 +465,24 @@ DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 # finished answer by searching the filesystem.
 _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
+# Where a purge that could not delete every card leaves what it owes, one JSON
+# file per purge (:data:`_PURGE_ROWS_SCRIPT`). On the agent's data volume,
+# because each repetition is its own process and the next one retries them
+# before its agent is invoked (:meth:`KubeAgentsHarness.run`).
+_PURGE_PENDING_DIR = f"{_LOGS_DIR}/.purge-pending"
+_PURGE_PENDING_SUFFIX = ".json"
+# How long a pending purge is retried before it is given up. A card still
+# running a day later is stuck, and a nightly is over well inside it; a count of
+# tries would not do, since every purge retries and a nightly runs hundreds.
+_PURGE_PENDING_MAX_AGE_SECONDS = 24 * 60 * 60
+# What an id read back from a pending file must look like before the purge
+# joins it to a path or prints it: anything with a shell on the volume can
+# write there. The harness's own id grammar, so no id it owes is refused;
+# that grammar has no ``/``, and an id of dots alone is refused, since ``..``
+# or ``.`` would widen a delete to other cards' files. The run's own ids are
+# held to the same rule before they reach a path (:data:`_PATH_COMPONENTS`).
+_PURGE_PENDING_ID = _TASK_ID_RE.pattern
+_PATH_COMPONENTS = frozenset({".", ".."})
 # The hermes CLI in the agent pod, for when it is not on the exec shell's PATH.
 _HERMES_BIN_FALLBACK = "/opt/hermes/.venv/bin/hermes"
 # What ``hermes kanban archive <id>`` prints on success. A refusal goes to
@@ -449,6 +510,9 @@ _ARTIFACTS_ENV = "ARTIFACTS"
 _TIMING_FILE_ENV = "KUBE_AGENTS_TIMING_FILE"
 _TIMING_TURN1_KEY = "turn1_s"
 _TIMING_DECIMALS = 3
+# Where the delivered reply's shape goes (chat_shape.measure), for the eval
+# dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
+_SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -470,14 +534,21 @@ _MAX_ARTIFACTS = 8
 _EXEC_TIMEOUT = 60.0
 
 # The agent pod's clock at the run's start, the purge's floor for the run's own
-# cards (:func:`_pod_clock`). ``sh`` and ``date``, two process spawns, not
-# python3: that takes about 30 s to start in the sandboxed container. Shorter than
-# ``_EXEC_TIMEOUT`` because the run waits on it before the agent is invoked.
-_POD_CLOCK_SCRIPT = "date +%s"
+# cards (:func:`_pod_start`), and whether an earlier purge left work pending,
+# printed as ``_PURGE_PENDING_PRESENT`` on the next line. Shell builtins and
+# ``date``, not python3: that takes about 30 s to start in the sandboxed
+# container, so it is started only when there is something to retry. Shorter
+# than ``_EXEC_TIMEOUT`` because the run waits on it before the agent is invoked.
+_PURGE_PENDING_PRESENT = "purge-pending"
+_POD_CLOCK_SCRIPT = (
+    f"date +%s; for f in {_PURGE_PENDING_DIR}/*{_PURGE_PENDING_SUFFIX}; do "
+    f'[ -e "$f" ] && echo {_PURGE_PENDING_PRESENT}; break; done'
+)
 _POD_CLOCK_TIMEOUT_SECONDS = 15.0
 # How long the purge's shell fallback (clearing the run's files when the script
-# never sorted them) may take. Short: it is ``rm`` alone, and on a pod the
-# purge could not reach at all it would otherwise cost a second full timeout.
+# never sorted them, and writing down the purge it owes) may take. Short: it is
+# ``rm``, ``printf`` and ``mv``, and on a pod the purge could not reach at all
+# it would otherwise cost a second full timeout.
 _FALLBACK_CLEAR_TIMEOUT_SECONDS = 15.0
 
 _PF_LOCK = threading.Lock()  # guards the registries below
@@ -613,7 +684,8 @@ def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> st
     A failure is logged with kubectl's stderr: a forbidden Lease read, say,
     shows up in the run rather than silently forwarding the Service. A
     ``NotFound`` is expected when ``missing_ok`` (no Lease on an unelected
-    install) and logged only at debug.
+    install): it is logged only at debug and returns ``""``, an answer, so a
+    caller can tell it from a read that failed.
     """
     cmd = ["kubectl", *args, "-n", os.environ.get("AGENT_NAMESPACE", _DEFAULT_AGENT_NAMESPACE)]
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
@@ -630,20 +702,21 @@ def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> st
         stderr = proc.stderr.strip()[:_KUBECTL_STDERR_LOG_CHARS]
         if missing_ok and "NotFound" in stderr:
             _log.debug("%s not found", what)
-        else:
-            _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
+            return ""
+        _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
         return None
     return proc.stdout
 
 
-def _gateway_door_target(agent_service: str, service: str) -> str:
-    """The port-forward target for a gateway door: the Lease holder's pod, or
-    the door's Service when no Lease names one.
+def _gateway_door_target(agent_service: str, service: str) -> str | None:
+    """The port-forward target for a gateway door: the Lease holder's pod, the
+    door's Service when no Lease names one, or ``None`` when a read failed.
 
     ``AGENT_GATEWAY_LEASE`` overrides the Lease's name (default
-    ``<AGENT_SERVICE_NAME>-a2a-gateway``). Best effort: a Lease that is
-    missing, unreadable or held by nobody leaves the Service, which is what
-    every install that renders no Lease serves the door through.
+    ``<AGENT_SERVICE_NAME>-a2a-gateway``). A Lease that is missing or held by
+    nobody leaves the Service, which is what every install that renders no
+    Lease serves the door through. A read that failed answers nothing about
+    where the door is, so the caller keeps the forward it has.
 
     The holder is taken only if it is one of the pods the door's Service
     selects. The tunnel carries the door's bearer token, and a Lease's
@@ -659,10 +732,14 @@ def _gateway_door_target(agent_service: str, service: str) -> str:
         f"lease {lease}",
         missing_ok=True,
     )
-    holder = (out or "").strip()
+    if out is None:
+        return None
+    holder = out.strip()
     if not holder:
         return fallback
     raw = _kubectl_read(["get", "svc", service, "-o", "jsonpath={.spec.selector}"], f"service {service}'s selector")
+    if raw is None:
+        return None
     try:
         selector = json.loads(raw) if raw else {}
     except ValueError:
@@ -675,7 +752,9 @@ def _gateway_door_target(agent_service: str, service: str) -> str:
         ["get", "pods", "-l", label_selector, "-o", "jsonpath={.items[*].metadata.name}"],
         f"the pods service {service} selects",
     )
-    if holder not in (names or "").split():
+    if names is None:
+        return None
+    if holder not in names.split():
         _log.warning(
             "lease %s names %s, which is not a pod service %s selects; forwarding to the service",
             lease,
@@ -759,25 +838,28 @@ def _agent_shell(script: str, timeout: float) -> str:
     return proc.stdout
 
 
-def _pod_clock() -> int | None:
-    """The agent pod's clock in epoch seconds, or ``None`` when it could not be read.
+def _pod_start() -> tuple[int | None, bool]:
+    """The agent pod's clock in epoch seconds (``None`` when unread), and whether a purge is pending.
 
-    Read before the agent is invoked and passed to the stall archive and every
-    purge as their floor: a top-level card whose ``tasks.created_at`` is earlier
-    was not filed by this run, whatever its ``kanban_create`` result said
-    (:data:`_PURGE_ROWS_SCRIPT`, :func:`_archive_stalled_cards`).
+    Read before the agent is invoked. The clock is passed to the stall archive
+    and every purge as their floor: a top-level card whose ``tasks.created_at``
+    is earlier was not filed by this run, whatever its ``kanban_create`` result
+    said (:data:`_PURGE_ROWS_SCRIPT`, :func:`_archive_stalled_cards`).
     The pod's clock, not the runner's, because hermes stamps ``created_at``
-    from it.
+    from it. The flag says an earlier run's purge left cards for
+    :func:`_retry_pending_purges`.
     """
-    out = _agent_shell(_POD_CLOCK_SCRIPT, _POD_CLOCK_TIMEOUT_SECONDS).strip()
-    if out.isascii() and out.isdigit():
-        return int(out)
+    lines = [line.strip() for line in _agent_shell(_POD_CLOCK_SCRIPT, _POD_CLOCK_TIMEOUT_SECONDS).splitlines()]
+    clock = lines[0] if lines else ""
+    pending = _PURGE_PENDING_PRESENT in lines
+    if clock.isascii() and clock.isdigit():
+        return int(clock), pending
     _log.warning(
         "could not read the agent pod's clock (%s); the stall archive and the purge will take "
         "every card the front door's kanban_create returned as the run's own",
-        out[:_LOG_EXCERPT_CHARS] or "no output",
+        clock[:_LOG_EXCERPT_CHARS] or "no output",
     )
-    return None
+    return None, pending
 
 
 def _ensure_port_forward(
@@ -847,6 +929,13 @@ def _ensure_port_forward(
             raise
 
 
+def _wait_retry_after(exc: BaseException) -> None:
+    """Sleep for the Retry-After a transport failure carried, capped."""
+    retry_after = getattr(exc, "retry_after", None)
+    if retry_after:
+        time.sleep(min(retry_after, _RETRY_AFTER_CAP))
+
+
 def _owned_forward_target(local_port: int) -> str | None:
     """The target this process's live forward on ``local_port`` was spawned
     for, or ``None`` when it owns none there."""
@@ -910,6 +999,60 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
+
+
+def _guardrail_blocked_cards(
+    awaited: Sequence[str],
+    on_board: dict[str, board.BoardCard] | None,
+    captured: worker_trajectory.WorkerCapture | None,
+    with_artifact: set[str],
+    front_trajectory: Sequence[Any] = (),
+) -> list[str]:
+    """The awaited cards when EVERY one is the rate-limit guardrail's block, else ``[]``.
+
+    A card counts when the board holds it blocked with the guardrail's kind
+    and its newest run summary opens on the guardrail's prefix with a
+    rate-limit or billing reason, no artifact was produced for it, and the
+    captured worker trajectory (present, or nothing counts) holds no
+    ``kanban_block`` or ``kanban_complete`` call for it, nor a wrapper call
+    that could hide one, from its own worker, another card's worker (the
+    call's ``task_id``) or the front door (``front_trajectory``). One card
+    that reads otherwise is a delivery, and the run is graded on it.
+    """
+    if not awaited or on_board is None or captured is None:
+        return []
+    # A ``tool_call`` wrapper whose arguments cannot be read (not a dict, a
+    # clipped ``raw`` string, no names) may hold the worker's own close, as
+    # #3988 counts it as acted; it is read as a close here too, fail closed.
+    closed: set[str] = set()
+    for e in [*captured.entries, *front_trajectory]:
+        if not isinstance(e, dict):
+            continue
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        names = {e.get("name")} | worker_trajectory.wrapped_tool_names(e)
+        unreadable_wrapper = e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER and (
+            not isinstance(e.get("args"), dict)
+            or isinstance(args.get("raw"), str)
+            or not worker_trajectory.wrapped_tool_names(e)
+        )
+        if names & _WORKER_CARD_VERBS or unreadable_wrapper:
+            closed.add(str(e.get("task")))
+            if args.get("task_id"):
+                closed.add(str(args["task_id"]))
+    blocked: list[str] = []
+    for tid in awaited:
+        card = on_board.get(tid)
+        if (
+            card is None
+            or card.status != _GUARDRAIL_BLOCK_STATUS
+            or card.block_kind != _GUARDRAIL_BLOCK_KIND
+            or _extract_infra_failure_reason(card.summary or "") != _GUARDRAIL_FAILURE_REASON
+            or tid in with_artifact
+            or tid in closed
+        ):
+            return []
+        blocked.append(tid)
+    return blocked
 
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
@@ -1097,8 +1240,9 @@ def _artifact_paths(task_ids: list[str], timeout: float) -> list[str]:
     return paths[:_MAX_ARTIFACTS]
 
 
-def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> None:
+def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) -> set[str]:
     """Append the files the delegated cards produced to the graded answer.
+    Returns the ids of the cards that produced one.
 
     On a task whose deliverable is a written report, the worker's card result is
     a summary *of* the report and the report is a file the judge never sees --
@@ -1106,17 +1250,20 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     work is done and correct. Reading it back makes the deliverable part of the
     answer, the same way :func:`_append_delivered` does for the card result.
     """
+    produced: set[str] = set()
     if not task_ids:
-        return
+        return produced
     sections = []
     for path in _artifact_paths(task_ids, timeout):
         text = _agent_shell(f"head -c {_MAX_ARTIFACT_BYTES} {_shell_quote(path)}", timeout)
         if text.strip():
             tid, _, name = path[len(_ATTACHMENTS_DIR) + 1 :].partition("/")
             sections.append(f"Artifact {name} produced by delegated task {tid}:\n{text.rstrip()}")
+            produced.add(tid)
     if sections:
         result.output = "\n\n".join(filter(None, [result.output, *sections]))
     _append_final(result, sections)
+    return produced
 
 
 _LOG_PRESENT = "__WORKER_LOG__"
@@ -1452,7 +1599,7 @@ def _created_before(ids: Sequence[str], floor: int, timeout: float) -> set[str] 
 def _archive_stalled_cards(stalled: Sequence[str], timeout: float, floor: int | None = None) -> None:
     """Archive the cards that ran to the ceiling, and the cards they fanned out.
 
-    With ``floor`` (the run's :func:`_pod_clock`), a stalled card created
+    With ``floor`` (the run's :func:`_pod_start`), a stalled card created
     before it is left running, and so is its fan-out: the front door's create
     handed it back by its key, so it is not the run's. When the board cannot be
     read to tell, every stalled card is archived, as without a floor.
@@ -1544,10 +1691,11 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 #
 # The run's own cards come first and are taken as given, unless the harness
 # passed the run's start floor (the pod's clock before the agent was invoked,
-# :func:`_pod_clock`) and the card's ``tasks.created_at`` is earlier: a
+# :func:`_pod_start`) and the card's ``tasks.created_at`` is earlier: a
 # front-door ``kanban_create`` whose ``idempotency_key`` matches a live card
 # returns that card in a result that looks like a create (#4591). Such a card
-# is printed ``foreign <id>`` and left alone, files included. The other own
+# is printed ``foreign <id>`` and left alone, files included, unless an earlier
+# purge owes it (below). The other own
 # cards' files go before the board step, so they still go when it fails; with
 # a floor but no board read to check it against, every root's files go too: a
 # stranger's card losing its files is rarer, and cheaper, than the run's own
@@ -1567,24 +1715,50 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # ``kanban_fanout_reaper`` finds an overdue running fan-out card only through
 # its creator's row and a sibling's attribution row, and skips follow-ups.
 #
+# What it could not delete it owes (#4658): a file in ``PENDING`` holding the
+# kept cards (taken as given next time, since they were sorted already), or,
+# when the board step failed, the whole purge with its floor, so a retry decides
+# exactly as this purge would have. Each id written is printed ``pending <id>``.
+# Every run of the script, the harness's pre-run retry included
+# (:func:`_retry_pending_purges`), takes those purges on after its own, through
+# the same rules, and writes what it still keeps as a new file with the old one's
+# earliest first-owed time (the old file goes only once the new one is written); one owed
+# longer than ``MAX_AGE`` is printed ``abandoned <id>`` and dropped. Each purge is
+# held to its own floor: a card the run's front door handed back by its key is
+# foreign to the run and still owed by the purge that kept it. A retried purge's
+# files go only with its rows: the purge that owed it already cleared its own
+# roots', and a card it kept keeps them. A file that cannot be read for any
+# reason, or whose ids are not card ids or times not whole numbers, is dropped
+# unread; a first-owed time in the future counts as now. Two scripts retrying the same file at once each take the write
+# lock in turn, so the second finds the rows gone; a card both keep is owed twice,
+# which costs a second look.
+#
 # Raw ``sqlite3`` rather than ``hermes kanban archive --rm``: that is two cold
 # hermes starts, over a minute in the sandboxed container, and its ``archived``
 # event is one the gateway's notifier delivers to the card's subscribers.
 # Everything the harness also knows is passed in (:func:`_purge_argv`), so the
 # markers it parses are spelled once.
 _PURGE_ROWS_SCRIPT = r"""
-import json, os, shutil, sqlite3, sys
+import json, os, re, shutil, sqlite3, sys, time, uuid
 ROOT, BUSY = sys.argv[1], float(sys.argv[2])
 KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS, SORTED = sys.argv[3:9]
 FLOOR = int(sys.argv[9]) if sys.argv[9] else None
-rest = [a for a in sys.argv[11:] if a]
-roots, fanned = rest[:int(sys.argv[10])], rest[int(sys.argv[10]):]
+PENDING, SUFFIX, LEFT, ABANDONED = sys.argv[10:14]
+MAX_AGE, CARD = int(sys.argv[14]), re.compile(sys.argv[15])
+rest = [a for a in sys.argv[17:] if a]
+roots, fanned = rest[:int(sys.argv[16])], rest[int(sys.argv[16]):]
+NOW = int(time.time())
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
 LIVE = ("todo", "scheduled", "ready", "running")
 def unlink(tid):
     shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
     try:
         os.remove(os.path.join(LOGS, tid + ".log"))
+    except OSError:
+        pass
+def drop(path):
+    try:
+        os.remove(path)
     except OSError:
         pass
 def mark_sorted(on):
@@ -1595,27 +1769,97 @@ def mark_sorted(on):
             os.remove(SORTED)
     except OSError:
         pass
+def owe(owed_roots, owed_fanned, floor, first):
+    if not owed_roots + owed_fanned:
+        return True
+    name = uuid.uuid4().hex
+    tmp = os.path.join(PENDING, "." + name)
+    try:
+        os.makedirs(PENDING, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"roots": owed_roots, "fanned": owed_fanned, "floor": floor, "first": first}, f)
+        os.replace(tmp, os.path.join(PENDING, name + SUFFIX))
+    except OSError:
+        drop(tmp)
+        return False
+    for tid in owed_roots + owed_fanned:
+        print("%s %s" % (LEFT, tid))
+    return True
+def card_ids(v):
+    if not isinstance(v, list) or not all(isinstance(t, str) and CARD.fullmatch(t) and t.strip(".") for t in v):
+        raise ValueError(v)
+    return v
+def whole(v):
+    if type(v) is not int:
+        raise ValueError(v)
+    return v
+def still_owed():
+    for g in groups[1:]:
+        for tid in g[0] + g[1]:
+            print("%s %s" % (LEFT, tid))
+groups = [(roots, fanned, FLOOR, NOW, None)]
+try:
+    names = sorted(n for n in os.listdir(PENDING) if n.endswith(SUFFIX))
+except OSError:
+    names = []
+for name in names:
+    path = os.path.join(PENDING, name)
+    try:
+        with open(path) as f:
+            g = json.load(f)
+        floor = None if g["floor"] is None else whole(g["floor"])
+        group = (card_ids(g["roots"]), card_ids(g["fanned"]), floor, min(whole(g["first"]), NOW), path)
+    except Exception:
+        drop(path)
+        continue
+    if NOW - group[3] > MAX_AGE:
+        for tid in group[0] + group[1]:
+            print("%s %s" % (ABANDONED, tid))
+        drop(path)
+        continue
+    groups.append(group)
 kb, older, failed = None, set(), None
 try:
     kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
-    if FLOOR is not None:
-        for tid in roots:
+    for i, g in enumerate(groups):
+        if g[2] is None:
+            continue
+        for tid in g[0]:
             r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
-            if r is not None and r[0] is not None and int(r[0]) < FLOOR:
-                older.add(tid)
+            if r is not None and r[0] is not None and int(r[0]) < g[2]:
+                older.add((i, tid))
 except sqlite3.Error as exc:
     failed = exc
-for tid in roots:
-    if tid in older:
-        print("%s %s" % (FOREIGN, tid))
-    else:
-        unlink(tid)
+owed = {tid for i, g in enumerate(groups) for tid in g[0] if (i, tid) not in older}
+for i, g in enumerate(groups):
+    for tid in g[0]:
+        if (i, tid) not in older:
+            if i == 0:
+                unlink(tid)
+        elif tid not in owed:
+            print("%s %s" % (FOREIGN, tid))
 mark_sorted(True)
 if failed is not None:
     mark_sorted(False)
+    owe(roots, fanned, FLOOR, NOW)
+    still_owed()
     print("rows kept: %s" % failed)
     sys.exit(0)
-roots = [t for t in roots if t not in older]
+order, seen, first = [], set(), {}
+for g in groups:
+    for tid in g[0] + g[1]:
+        first[tid] = min(first.get(tid, g[3]), g[3])
+for i, g in enumerate(groups):
+    for tid in g[0]:
+        if (i, tid) not in older and tid not in seen:
+            seen.add(tid)
+            order.append((tid, i))
+own = set(seen)
+for i, g in enumerate(groups):
+    for tid in g[1]:
+        if tid not in seen:
+            seen.add(tid)
+            order.append((tid, i))
 try:
     kb.execute("BEGIN IMMEDIATE")
     tables = {r[0] for r in kb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -1628,8 +1872,8 @@ try:
             "WHERE l.parent_id = c.creator_id AND l.child_id = c.child_id)" % ",".join("?" * len(LIVE)),
             LIVE,
         )}
-    taken, gone = set(roots), []
-    for tid in roots + fanned:
+    taken, gone, left = set(own), [], {}
+    for tid, i in order:
         row = kb.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
         if row is None:
             continue
@@ -1655,8 +1899,9 @@ try:
             creator, creator_status = (r[0], r[1]) if r else (None, None)
         if row[0] == "running" or creator_status == "running" or tid in held or creator in held:
             print("%s %s" % (KEPT, tid))
+            left.setdefault(i, []).append(tid)
             continue
-        if tid not in roots:
+        if i > 0 or tid not in own:
             gone.append(tid)
         kb.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (tid, tid))
         for table in BY_TASK:
@@ -1670,8 +1915,13 @@ try:
     kb.execute("COMMIT")
     for tid in gone:
         unlink(tid)
+    for i, g in enumerate(groups):
+        if (owe(left[i], [], None, min(first[t] for t in left[i])) if i in left else True) and g[4]:
+            drop(g[4])
     print(DONE)
 except sqlite3.Error as exc:
+    owe(roots, fanned, FLOOR, NOW)
+    still_owed()
     print("rows kept: %s" % exc)
 mark_sorted(False)
 """
@@ -1679,9 +1929,11 @@ mark_sorted(False)
 # (``worker_trajectory`` ``SQLITE_BUSY_TIMEOUT``).
 _PURGE_BUSY_TIMEOUT_SECONDS = 10
 # What the purge prints before each card it kept or left alone as not the
-# run's, and once it committed.
+# run's, owes a later purge or gave up owing, and once it committed.
 _PURGE_KEPT_MARKER = "kept"
 _PURGE_FOREIGN_MARKER = "foreign"
+_PURGE_PENDING_MARKER = "pending"
+_PURGE_ABANDONED_MARKER = "abandoned"
 _PURGE_DONE_MARKER = "purged"
 # The file the purge script leaves in the logs directory while it has sorted
 # the roots and not yet exited. Named for this process as well as the run's
@@ -1706,6 +1958,12 @@ def _purge_argv(
         _LOGS_DIR,
         _purge_sorted_marker(task_ids),
         "" if floor is None else str(floor),
+        _PURGE_PENDING_DIR,
+        _PURGE_PENDING_SUFFIX,
+        _PURGE_PENDING_MARKER,
+        _PURGE_ABANDONED_MARKER,
+        str(_PURGE_PENDING_MAX_AGE_SECONDS),
+        _PURGE_PENDING_ID,
         str(len(task_ids)),
         *task_ids,
         *fanned_out,
@@ -1727,7 +1985,7 @@ def _purge_card_state(
     which is how a repeat of a task reads back the previous attempt's answer
     instead of doing the work. Scoped to cards this run filed: ``task_ids`` are
     the harness's own, unless one was created before ``floor`` (the pod's
-    clock at the run's start, :func:`_pod_clock`; ``None`` takes them all), and
+    clock at the run's start, :func:`_pod_start`; ``None`` takes them all), and
     a card in ``fanned_out`` (in walk order, creators first) goes only when
     hermes recorded one of them as its creator. With a floor but no board to
     check it against, or a script that never sorted the roots, every root's
@@ -1739,10 +1997,11 @@ def _purge_card_state(
     off), so a run left on the board hands the next run of the same case its
     predecessor's summary in the worker's first ``kanban_show`` (#1730).
     """
-    fanned_out = [t for t in fanned_out if t not in task_ids]
+    # Joined to paths below, by the script and the shell alike.
+    task_ids = [t for t in task_ids if t not in _PATH_COMPONENTS]
+    fanned_out = [t for t in fanned_out if t not in task_ids and t not in _PATH_COMPONENTS]
     if not task_ids:
         return
-    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out, floor))
     # With no floor every root is the run's own, so its files go from the shell
     # first and still go when python cannot start; with one, the script decides,
     # and the shell clears them afterwards only if the script never ran.
@@ -1751,33 +2010,33 @@ def _purge_card_state(
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
         "done; "
     )
-    script = (
-        ("" if floor is not None else clear_roots)
-        + f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
-        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
-        f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
-    )
+    script = ("" if floor is not None else clear_roots) + _purge_python(task_ids, fanned_out, floor)
     out = _agent_shell(script, timeout)
-    if floor is not None and not out.strip():
+    queued = False
+    if not out.strip():
         # No output: no python, or the exec failed or timed out. The marker says
         # whether the script got as far as sorting the roots; without it the
-        # run's own reports must not outlive it.
+        # run's own reports must not outlive it. Either way the purge is owed,
+        # and nothing in the pod wrote that down.
         marker = _shell_quote(_purge_sorted_marker(task_ids))
-        _agent_shell(
-            f"if [ -e {marker} ]; then rm -f {marker}; else {clear_roots}fi", _FALLBACK_CLEAR_TIMEOUT_SECONDS
-        )
+        sort_check = f"if [ -e {marker} ]; then rm -f {marker}; else {clear_roots}fi; " if floor is not None else ""
+        owed = _agent_shell(sort_check + _owe_script(task_ids, fanned_out, floor), _FALLBACK_CLEAR_TIMEOUT_SECONDS)
+        queued = _PURGE_PENDING_PRESENT in owed.split()
     lines = out.splitlines()
+    mine = {*task_ids, *fanned_out}
+    pending = [t for t in _purge_marked(lines, _PURGE_PENDING_MARKER) if t in mine]
+    queued = queued or bool(pending)
+    then = (
+        "; owed to a later purge, which the next run tries before its agent starts"
+        if queued else "; the next run's role-history digest can show their summaries"
+    )
 
-    def marked(marker: str) -> list[str]:
-        return [line.split()[1] for line in lines if line.startswith(marker + " ")]
-
-    if kept := marked(_PURGE_KEPT_MARKER):
+    if kept := [t for t in _purge_marked(lines, _PURGE_KEPT_MARKER) if t in mine]:
         _log.warning(
             "cards %s were still running, or in a fan-out with a card that can still run (follow-ups "
-            "aside), and stay on the board; the next run's role-history digest can show their "
-            "summaries", ", ".join(kept),
+            "aside), and stay on the board%s", ", ".join(kept), then,
         )
-    foreign = marked(_PURGE_FOREIGN_MARKER)
+    foreign = _purge_marked(lines, _PURGE_FOREIGN_MARKER)
     if older := [t for t in foreign if t in task_ids]:
         # Someone else's card, or an earlier repetition's leftover that the
         # front door's create handed back by its key: nothing purges it now.
@@ -1786,17 +2045,96 @@ def _purge_card_state(
             "created before this run started; if one is an earlier run's, its summary can reach the "
             "next run's role-history digest", ", ".join(older),
         )
-    if adopted := [t for t in foreign if t not in task_ids]:
+    if adopted := [t for t in foreign if t in fanned_out]:
         _log.info(
             "left cards %s on the board: not created by the run's own cards (a fan-out of a card "
             "that predates the run, or a card a worker's create handed back by its key)",
             ", ".join(adopted),
         )
+    if still := _log_retried(lines, mine):
+        _log.info("cards %s, owed by an earlier run's purge, are still on the board", ", ".join(still))
     if _PURGE_DONE_MARKER not in lines:
         _log.warning(
-            "could not delete the board rows of cards %s; the next run's role-history digest can "
-            "show their summaries (%s)", ", ".join([*task_ids, *fanned_out]),
+            "could not delete the board rows of cards %s%s (%s)", ", ".join([*task_ids, *fanned_out]), then,
             out[:_LOG_EXCERPT_CHARS] or "no output",
+        )
+
+
+def _purge_python(task_ids: list[str], fanned_out: Sequence[str], floor: int | None) -> str:
+    """The shell line that runs :data:`_PURGE_ROWS_SCRIPT` in the agent pod's python."""
+    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out, floor))
+    return (
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
+    )
+
+
+def _purge_marked(lines: list[str], marker: str) -> list[str]:
+    """The ids the purge script printed after ``marker``."""
+    return [parts[1] for parts in map(str.split, lines) if len(parts) > 1 and parts[0] == marker]
+
+
+def _owe_script(task_ids: list[str], fanned_out: Sequence[str], floor: int | None) -> str:
+    """A shell line that writes the whole purge to :data:`_PURGE_PENDING_DIR`, as the script would.
+
+    For a purge that printed nothing, so never wrote what it owes. Shell only:
+    python may be what failed. Renamed into place, so a retry never reads half
+    a file, and ``first`` is the pod's clock, as the script stamps it.
+    """
+    name = uuid.uuid4().hex
+    tmp, final = f"{_PURGE_PENDING_DIR}/.{name}", f"{_PURGE_PENDING_DIR}/{name}{_PURGE_PENDING_SUFFIX}"
+    fields = [json.dumps(list(task_ids)), json.dumps(list(fanned_out)), json.dumps(floor)]
+    return (
+        f"{{ mkdir -p {_PURGE_PENDING_DIR} && "
+        "printf '{\"roots\": %s, \"fanned\": %s, \"floor\": %s, \"first\": %s}' "
+        f"{' '.join(_shell_quote(f) for f in fields)} \"$(date +%s)\" > {_shell_quote(tmp)} && "
+        f"mv {_shell_quote(tmp)} {_shell_quote(final)} && echo {_PURGE_PENDING_PRESENT}; }} "
+        f"|| rm -f {_shell_quote(tmp)}"
+    )
+
+
+def _log_retried(lines: list[str], mine: Collection[str] = ()) -> list[str]:
+    """Warn of earlier runs' owed cards the script gave up or found not theirs; return those it still owes."""
+    if foreign := [t for t in _purge_marked(lines, _PURGE_FOREIGN_MARKER) if t not in mine]:
+        _log.warning(
+            "left cards %s on the board for good: an earlier run's owed purge found them not that run's "
+            "(created before it started, or not filed by its cards); if one is an earlier run's, its "
+            "summary can reach a later run's role-history digest", ", ".join(foreign),
+        )
+    if abandoned := [t for t in _purge_marked(lines, _PURGE_ABANDONED_MARKER) if t not in mine]:
+        _log.warning(
+            "gave up purging cards %s: an earlier run's purge has owed them for over %d s; if one "
+            "is still on the board, its summary can reach a later run's role-history digest",
+            ", ".join(abandoned), _PURGE_PENDING_MAX_AGE_SECONDS,
+        )
+    owed = [*_purge_marked(lines, _PURGE_KEPT_MARKER), *_purge_marked(lines, _PURGE_PENDING_MARKER)]
+    return [t for t in dict.fromkeys(owed) if t not in mine]
+
+
+def _retry_pending_purges(timeout: float) -> None:
+    """Take on the purges earlier runs could not finish, before this run's agent is invoked.
+
+    A purge keeps a card it cannot safely delete (it, or a card in its
+    fan-out, can still run) and, when the board step fails, every card; each
+    leaves a file in :data:`_PURGE_PENDING_DIR` (:data:`_PURGE_ROWS_SCRIPT`).
+    A later repetition is a separate process, so the retry happens here: by the
+    time the next run starts, the card that was running has usually settled,
+    and deleting it now keeps its summary out of this run's role-history
+    digest (#4658). What is still owed after this is logged; this run is not
+    independent of it.
+    """
+    out = _agent_shell(_purge_python([], [], None), timeout)
+    lines = out.splitlines()
+    if still := _log_retried(lines):
+        _log.warning(
+            "cards %s, left by an earlier run's purge, are still on the board; this run's "
+            "role-history digest can show their summaries", ", ".join(still),
+        )
+    if _PURGE_DONE_MARKER not in lines:
+        _log.warning(
+            "could not retry the purges earlier runs left pending; their cards' summaries can reach "
+            "this run's role-history digest (%s)", out[:_LOG_EXCERPT_CHARS] or "no output",
         )
 
 
@@ -2095,13 +2433,41 @@ def _connection_dropped(exc: BaseException) -> bool:
 
 
 def _write_turn_timing(turn1_s: float) -> None:
-    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``.
+    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``."""
+    _write_sidecar(
+        _TIMING_FILE_ENV, {_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, "turn timing"
+    )
+
+
+def _write_chat_shape(result: AgentResult) -> None:
+    """Write the delivered reply's shape to ``KUBE_AGENTS_SHAPE_FILE``.
+
+    Nothing is written for a run whose reply the thread never showed: none
+    at all, a silence marker the gateway swallows, or an inject answer
+    adopted from the stream because the relay posted nothing. The inject
+    transport counts the posts it saw; the api transport leaves the count to
+    the final message's delivered sections.
+    """
+    final_message = str(result.metadata.get("final_message") or "")
+    if is_intentional_silence_response(final_message) or result.metadata.get("outcome") == inject.OUTCOME_STREAM_TERMINAL:
+        return
+    posts = result.metadata.get("window_posts")
+    shape = chat_shape.measure(
+        final_message,
+        posts if isinstance(posts, int) and not isinstance(posts, bool) else None,
+    )
+    if shape is not None:
+        _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
+
+
+def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
+    """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
     Best effort, like the worker logs: a file that will not write is logged
     and never changes the run. The temp file and ``os.replace`` make sure a
     reader never sees half a file.
     """
-    path = os.environ.get(_TIMING_FILE_ENV)
+    path = os.environ.get(env)
     if not path:
         return
     target = Path(path)
@@ -2109,10 +2475,10 @@ def _write_turn_timing(turn1_s: float) -> None:
     try:
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, handle)
+            json.dump(payload, handle)
         os.replace(tmp, target)
     except OSError as exc:
-        _log.warning("could not write the turn timing to %s: %s", target, exc)
+        _log.warning("could not write the %s to %s: %s", what, target, exc)
         if tmp is not None:
             try:
                 os.unlink(tmp)
@@ -2312,6 +2678,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "reason_token": fold.reason_token or None,
             "executor_states": list(fold.executor_states),
             "posts": len(fold.posts),
+            # The messages this task posted (its window), which the reply
+            # shape counts.
+            "window_posts": len(fold.window_posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
             # The marker's arguments (calls written, calls dropped), or None
@@ -2341,6 +2710,34 @@ class _DelegationTransportExhausted(Exception):
     """
 
 
+def _never_applies(self: object, ctx: object) -> bool:
+    return False
+
+
+def _skip_report_only_judges() -> None:
+    """Turn off devops-bench's ToolInvocation and Checklist evaluators in this process.
+
+    devops-bench scores a run in the process that built its harness, after the
+    run, from every evaluator in its metrics registry whose ``applies`` is true.
+    It has no switch for leaving one out, so the two classes' ``applies`` is
+    replaced: they stay registered and are skipped on every record, as a
+    checklist with no bullets already is. Importing the classes here does not
+    register them twice; the scoring pass imports the same modules.
+    """
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        evaluator.applies = _never_applies  # type: ignore[method-assign]
+    # stderr, not ``_log``: nothing configures a handler that shows INFO here
+    # (devops-bench attaches only a NullHandler), and the unit log the
+    # presubmit keeps (eval_<case>_rep<n>.log) captures stderr.
+    print(
+        f"{SKIP_REPORT_ONLY_JUDGES_ENV}=1: ToolInvocation and Checklist judge scores are off for this run",
+        file=sys.stderr,
+    )
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -2349,7 +2746,12 @@ class KubeAgentsHarness(AgentHarness):
     net covers anything unexpected.
     """
 
-    # The purge's floor (:func:`_pod_clock`), set by :meth:`run`; ``None`` for
+    def __init__(self, config: AgentConfig | None = None) -> None:
+        super().__init__(config)
+        if os.environ.get(SKIP_REPORT_ONLY_JUDGES_ENV) == "1":
+            _skip_report_only_judges()
+
+    # The purge's floor (:func:`_pod_start`), set by :meth:`run`; ``None`` for
     # a run that could not read it, or an ``_execute`` called without ``run``.
     _pod_floor: int | None = None
 
@@ -2378,8 +2780,11 @@ class KubeAgentsHarness(AgentHarness):
         # run's merged PR is still listed against it.
         self._run_started_at = started_at
         # Before the agent is invoked, so every card this run files is stamped
-        # at or after it.
-        self._pod_floor = _pod_clock()
+        # at or after it, and so an earlier run's leftovers are off the board
+        # before this run's first card view digests them.
+        self._pod_floor, pending = _pod_start()
+        if pending:
+            _retry_pending_purges(_EXEC_TIMEOUT)
         result = super().run(prompt, workspace_path)
         transcript.set(
             result.output,
@@ -2392,6 +2797,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
         )
+        _write_chat_shape(result)
         return result
 
     def _execute(
@@ -2946,17 +3352,26 @@ class KubeAgentsHarness(AgentHarness):
         # The last target the tunnel was aimed at, for the messages below.
         tunnel_target = [f"svc/{service}"]
 
-        def _tunnel(reset: bool) -> None:
+        def _tunnel(reset: bool, after_standby: bool = False) -> None:
+            """Establish or respawn the inject tunnel. ``after_standby``: the
+            failure being retried was a standby's 503 (it carried a
+            Retry-After) through the forward this process owns, so that
+            forward is not one to keep when the lease can't be read."""
             if not own_tunnel:
                 return
             # Resolved on every spawn: after a 503 from a standby or a tunnel
             # dropped with its pod, the lease names where the door is now.
-            tunnel_target[0] = _gateway_door_target(agent_service, service)
+            resolved = _gateway_door_target(agent_service, service)
+            owned = _owned_forward_target(local_port)
+            # A read that failed says nothing about where the door is: keep
+            # the forward this process owns, or the Service if it owns none
+            # or the owned one just answered as a standby.
+            keep = None if after_standby else owned
+            tunnel_target[0] = resolved or keep or f"svc/{service}"
             # A tunnel this process already owns on the port (from an earlier
             # exchange) may still go where the lease pointed then; a port that
             # is open says nothing about where, so it is replaced.
-            owned = _owned_forward_target(local_port)
-            if owned is not None and owned != tunnel_target[0]:
+            if resolved is not None and owned is not None and owned != resolved:
                 reset = True
             forward = _reset_port_forward if reset else _ensure_port_forward
             forward(local_port, service=tunnel_target[0], remote_port=_INJECT_REMOTE_PORT)
@@ -3079,8 +3494,9 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
                         raise
+                    _wait_retry_after(exc)
                     try:
-                        _tunnel(reset=True)
+                        _tunnel(reset=True, after_standby=exc.retry_after is not None)
                     except RuntimeError as pf_exc:
                         # Counted, not raised: the ceiling above ends it.
                         _log.warning(
@@ -3249,8 +3665,9 @@ class KubeAgentsHarness(AgentHarness):
                         raise _TransportError(
                             f"the stop could not reach the gateway: {exc}"
                         ) from exc
+                    _wait_retry_after(exc)
                     try:
-                        _tunnel(reset=True)
+                        _tunnel(reset=True, after_standby=exc.retry_after is not None)
                     except RuntimeError as pf_exc:
                         _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
             if started:
@@ -4294,7 +4711,10 @@ class KubeAgentsHarness(AgentHarness):
         buckets stay the front door's (:func:`_inject_tokens`).
         """
         _append_delivered(result, observed, awaited)
-        _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        with_artifact = _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        # The cards as the board holds them, read before the purge below
+        # deletes them: the guardrail block's key is their status and kind.
+        on_board = board.read_board_cards(_agent_shell, awaited, _EXEC_TIMEOUT) if awaited else None
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
@@ -4419,6 +4839,37 @@ class KubeAgentsHarness(AgentHarness):
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+            )
+            return
+
+        # The guardrail's own block, whether or not the worker acted first
+        # (#4998). A worker that spent its model-call retries on 429s is
+        # blocked by kanban_guardrail_exit from the exit path: status blocked,
+        # kind transient, the provider's text as the newest run summary, and
+        # no kanban_block or kanban_complete call of its own, which is the one
+        # board-visible difference from a model that typed the same words and
+        # blocked its card itself. Every awaited card has to read so, with no
+        # artifact, for the run to hold no answer; a worker that acted and then
+        # died is still set aside, because the answer it never gave is not
+        # evidence of the agent under test, and rung 1 grades what it did
+        # before that above this mark. On the inject lane the scorer sets the
+        # worker-blind safeguards aside on every record, died or completed,
+        # so keeping an acting worker's death graded there would protect
+        # nothing the lane has; the mark reads the same on both transports.
+        # The front door is another matter: one that acted after the card
+        # died (a command of its own, an answer it made up) produced
+        # something the judge must see, so it stays graded, as on the path
+        # above. A capture with a gap may have dropped the worker's own
+        # close, so it stays graded too.
+        guardrail_blocked = _guardrail_blocked_cards(
+            awaited, on_board, captured, with_artifact, result.trajectory
+        )
+        if guardrail_blocked and trajectory_clean and logs_clean and not front_door_acted:
+            _mark_result_infra_failure(
+                result,
+                "delegated worker hit infrastructure failure (rate_limit): the rate-limit "
+                f"guardrail blocked {', '.join(guardrail_blocked)} with no completion or block "
+                "call of the worker's own and no artifact, so the run holds no answer",
             )
 
     @staticmethod

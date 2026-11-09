@@ -45,13 +45,17 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+
+import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import eval_rosters
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 # The TASKS array's uncommented entries at the split (main at 8263e7fd), in
@@ -237,11 +241,11 @@ ADMITTED_AFTER_THE_SPLIT = [
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
     # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
-    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the claude-opus-5-5 key of 10-19, 9/9 since #3145, the store at collecting.
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the agent-model key of 10-19, 9/9 since #3145, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
-    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
+    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the agent-model key of 10-19), the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
-    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the agent-model key of 10-19, 5/5 under spec.mode next), the store at collecting.
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
     # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
     ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
@@ -398,6 +402,67 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.presubmit_cases())
         self.assertTrue(eval_rosters.nightly_cases())
         self.assertTrue(eval_rosters.blocking_roster())
+
+
+def cases_without_a_suite_line(roster: pathlib.Path, tasks_dir: pathlib.Path) -> list[str]:
+    """Certification-roster cases whose task file lacks `suite: certification`,
+    read as the validator reads it: the parsed top-level key, not a raw line."""
+    return [
+        case for case in eval_rosters.certification_cases(roster)
+        if (yaml.safe_load((tasks_dir / case / "task.yaml").read_text(encoding="utf-8")) or {}).get("suite")
+        != eval_rosters.CERTIFICATION_SUITE
+    ]
+
+
+class CertificationFileTest(unittest.TestCase):
+    """hack/eval/certification-cases.txt: the suite's own lane, in `# part N`
+    sections, disjoint from the presubmit and nightly files."""
+
+    def test_the_parts_parser_reads_the_markers_the_shell_reads(self):
+        text = "# header\n./tasks/a-case/task.yaml\n# part 2\n./tasks/b-case/task.yaml # note\n\n#  part 4\n./tasks/c-case/task.yaml\n# part 3\n"
+        self.assertEqual(eval_rosters.parse_certification_parts(text), {1: ["a-case"], 2: ["b-case"], 4: ["c-case"]})
+        self.assertEqual(eval_rosters.parse_certification_parts("# part 1\n"), {})
+        with self.assertRaises(ValueError):
+            eval_rosters.parse_certification_parts("# part 1\na-case\n")
+
+    def test_a_line_that_is_not_a_marker_to_the_shell_is_a_comment_here_too(self):
+        # The awk twin in hack/ci-eval-pr.sh: `#` then whitespace, `part`, a
+        # number from 1, nothing else, at the start of the line.
+        for not_a_marker in ("#part 2\n", "  # part 2\n", "# part 0\n", "# part 2 # note\n", "# parts 2\n"):
+            with self.subTest(line=not_a_marker):
+                parts = eval_rosters.parse_certification_parts(not_a_marker + "./tasks/a-case/task.yaml\n")
+                self.assertEqual(parts, {1: ["a-case"]})
+
+    def test_the_suite_line_check_runs_over_a_scratch_roster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cases = (
+                ("with-line", "id: with-line\nsuite: certification\n"),
+                ("quoted-with-note", 'id: quoted-with-note\nsuite: "certification"  # the page row\n'),
+                ("without-line", "id: without-line\n"),
+                ("line-in-prompt", "id: line-in-prompt\nprompt: |\n  x\nsuite: certification\n".replace("\nsuite:", "\n  suite:")),
+            )
+            for case, body in cases:
+                (root / case).mkdir()
+                (root / case / "task.yaml").write_text(body)
+            roster = root / "certification-cases.txt"
+            roster.write_text("".join(f"./tasks/{case}/task.yaml\n" for case, _ in cases))
+            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line", "line-in-prompt"])
+
+    def test_the_real_file_parses_and_shares_no_case_with_the_other_rosters(self):
+        certification = eval_rosters.certification_cases()
+        self.assertEqual(sorted(certification), sorted(set(certification)), "a case is listed once")
+        shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
+        self.assertEqual(shared, set(), "a certification case runs on its lane only")
+        self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
+
+    def test_every_certification_case_declares_its_suite(self):
+        self.assertEqual(cases_without_a_suite_line(eval_rosters.CERTIFICATION_CASES_FILE, TASKS_DIR), [])
+
+    def test_the_summary_counts_the_file(self):
+        got = eval_rosters.summary()
+        self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
+        self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
 
 
 class NightlySortedSectionTest(unittest.TestCase):
@@ -879,6 +944,10 @@ INJECT_LANE_REQUESTING = [
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-setting-request-proposes-pr",
+    # obtainability-major-pdb-auto-pr: the sweep opens the no-pdb pull
+    # request for checkout-gateway; its objective's pull_request_opened leaf
+    # allows one.
+    "obtainability-major-pdb-auto-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the

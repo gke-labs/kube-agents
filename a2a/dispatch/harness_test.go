@@ -297,6 +297,17 @@ func (b *bus) submit(profile, tier, kind, taskID string) {
 	b.submitWith(profile, tier, kind, taskID, "cap-ok", map[string]string{})
 }
 
+// submitCorr submits with a given correlationId (the user interaction a task
+// serves, which a child carries from its parent).
+func (b *bus) submitCorr(profile, tier, kind, taskID, correlation string) {
+	b.t.Helper()
+	env := submissionEnv(b.t, profile, taskID, "cap-ok", map[string]string{})
+	env.CorrelationID = correlation
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID), env); err != nil {
+		b.t.Fatalf("submit %s: %v", taskID, err)
+	}
+}
+
 func (b *bus) submitWith(profile, tier, kind, taskID, capKey string, params map[string]string) {
 	b.t.Helper()
 	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID),
@@ -372,14 +383,16 @@ func (b *bus) pending(durable string) (ackPending int, numPending uint64) {
 type fakeVerifier struct {
 	mu     sync.Mutex
 	refuse map[string]bool
-	calls  []string
+	// refuseTarget refuses any ref asked about one of these targets.
+	refuseTarget map[capability.Scope]bool
+	calls        []string
 }
 
 func (v *fakeVerifier) CheckProfileRun(_ context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls = append(v.calls, fmt.Sprintf("%s|%s|%s|%s", ref.Key, profile, tier, target))
-	if v.refuse[ref.Key] {
+	if v.refuse[ref.Key] || v.refuseTarget[target] {
 		return &capability.Refusal{Rule: "the grant does not reach that target"}
 	}
 	return nil
@@ -402,9 +415,19 @@ func (b *bus) runDispatcher(cfg Config, ti *testInstall, v Verifier) (*Dispatche
 // test can kill it.
 func (b *bus) runDispatcherOn(c *lib.Client, cfg Config, ti *testInstall, v Verifier) (*Dispatcher, func()) {
 	b.t.Helper()
+	return b.runPrepared(c, cfg, ti, v, nil)
+}
+
+// runPrepared is runDispatcherOn with prepare called on the dispatcher
+// before it runs (nil for none), so a test can wrap its internals.
+func (b *bus) runPrepared(c *lib.Client, cfg Config, ti *testInstall, v Verifier, prepare func(*Dispatcher)) (*Dispatcher, func()) {
+	b.t.Helper()
 	d, err := New(cfg, c, ti.src, ti.pool, v, quietLog())
 	if err != nil {
 		b.t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(d)
 	}
 	ctx, cancel := context.WithCancel(b.ctx)
 	done := make(chan struct{})
@@ -452,6 +475,9 @@ type fakeWorker struct {
 	// skipFinal publishes the terminal but sends no final renewal (a crash
 	// between the two).
 	skipFinal bool
+	// evictOnAbandon publishes a failed terminal for a running task it is
+	// told to abandon, as a worker evicting it does.
+	evictOnAbandon bool
 	// noRenew accepts and never renews.
 	noRenew bool
 	// acceptDelay holds each accept back that long (a late accept).
@@ -551,10 +577,14 @@ func (w *fakeWorker) onMessage(msg *nats.Msg) {
 	case lib.DispatchAbandon:
 		w.abandons = append(w.abandons, m)
 		delete(w.pending, m.TaskID)
-		if c := w.cancels[m.TaskID]; c != nil {
+		c := w.cancels[m.TaskID]
+		if c != nil {
 			c()
 		}
 		w.mu.Unlock()
+		if c != nil && w.evictOnAbandon {
+			w.terminal(m.TaskID, lib.StateFailed)
+		}
 		return
 	case lib.DispatchConfirm:
 		w.confirms = append(w.confirms, m)
@@ -648,6 +678,14 @@ func (w *fakeWorker) work(ctx context.Context, cancel context.CancelFunc, m lib.
 // finish publishes the task's terminal as its executor, then the final
 // renewal unless skipFinal.
 func (w *fakeWorker) finish(taskID string, state lib.TaskState) {
+	w.terminal(taskID, state)
+	if !w.skipFinal {
+		w.publish(lib.DispatchLeaseSubject(w.profile, w.tier, w.pod), lib.LeaseRenewal{TaskID: taskID, Final: true})
+	}
+}
+
+// terminal publishes the task's terminal as its executor.
+func (w *fakeWorker) terminal(taskID string, state lib.TaskState) {
 	payload, _ := json.Marshal(lib.StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID,
 		Status: lib.TaskStatus{State: state, Message: &lib.Message{Role: "agent", MessageID: "done-" + taskID,
 			Parts: []lib.Part{{Kind: "text", Text: "done"}}}}, Final: true})
@@ -660,9 +698,6 @@ func (w *fakeWorker) finish(taskID string, state lib.TaskState) {
 	// The worker's grant is core publish on .events; the stream stores it.
 	if err := w.nc.Publish(lib.TaskEventsSubject(w.profile, taskID), data); err != nil {
 		w.t.Errorf("publish terminal: %v", err)
-	}
-	if !w.skipFinal {
-		w.publish(lib.DispatchLeaseSubject(w.profile, w.tier, w.pod), lib.LeaseRenewal{TaskID: taskID, Final: true})
 	}
 }
 

@@ -802,10 +802,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -1420,8 +1420,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -1717,6 +1715,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -1772,6 +1772,8 @@ spec:
               value: /etc/a2a-nats-ca/ca.crt
             - name: A2A_BUS_USER
               value: agent
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: A2A_ACTIVITY_SECRET
@@ -1995,6 +1997,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -2046,6 +2050,8 @@ spec:
               value: example-project
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: PATH
@@ -2082,6 +2088,13 @@ spec:
                   optional: true
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: BRIDGE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
+            - name: BRIDGE_DEBUG_ERROR_TEXT
+              value: "false"
             - name: A2A_CAPABILITY_REQUIRED
               value: "true"
           image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
@@ -2090,10 +2103,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 250m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2808,7 +2821,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "8074ba90e1da2a3d",
+      "version": "4b0b34d2bf914fb8",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2836,6 +2849,7 @@ data:
               "$JS.API.STREAM.CREATE.KV_people",
               "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
               "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+              "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
               "$JS.API.STREAM.INFO.TASKS",
               "$JS.API.STREAM.INFO.DIRECTORY",
               "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -2847,6 +2861,7 @@ data:
               "$JS.API.STREAM.INFO.KV_people",
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+              "$JS.API.STREAM.INFO.DISPATCH_STOPS",
               "_INBOX.provision.>"
             ],
             "subscribe": [
@@ -2916,7 +2931,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 8074ba90e1da2a3d
+    kubeagents.x-k8s.io/a2a-authmap-version: 4b0b34d2bf914fb8
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3580,6 +3595,8 @@ stringData:
                   "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
                   "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
                   "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+                  "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
+                  "$JS.API.STREAM.INFO.DISPATCH_STOPS",
                   "_INBOX.seed.>"
                 ]
               }
@@ -3656,7 +3673,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -3699,7 +3717,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -3831,7 +3850,8 @@ stringData:
                 ]
                 deny = [
                   "a2a.cap.>",
-                  "a2a.dispatch.>"
+                  "a2a.dispatch.>",
+                  "a2a.stop.>"
                 ]
               }
             }
@@ -4505,6 +4525,11 @@ spec:
               value: localhost:8080,127.0.0.1:8080
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: WEB_CONSOLE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
           livenessProbe:
             failureThreshold: 6
@@ -4525,10 +4550,10 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 256Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -4633,7 +4658,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "27"
+    pods: "36"
 status: {}
 ---
 apiVersion: v1
@@ -4710,6 +4735,15 @@ rules:
       - get
       - patch
   - apiGroups:
+      - coordination.k8s.io
+    resourceNames:
+      - platformagent-a2a-gateway
+    resources:
+      - leases
+    verbs:
+      - get
+      - update
+  - apiGroups:
       - ""
     resourceNames:
       - platformagent-resolved-scope
@@ -4785,6 +4819,27 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+    kubeagents.x-k8s.io/a2a-gateway-lease: "true"
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec: {}
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -4794,7 +4849,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-75f02ec0
+  name: platformagent-a2a-provision-da9e6400
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5009,41 +5064,52 @@ spec:
               stream add PROFILE_SUBMITS --allow-direct \\\n  --subjects='a2a.submit.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=1073741824
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=1 --dupe-window=2m
-              \\\n  --max-consumers=64 --defaults\n\n# TASKS older than this render: the
-              limits the create above could not apply.\n#\n# Provisioning is create-only
-              convergence - the info-then-add guards never\n# edit an existing stream,
-              which buildA2AProvisionJob says in terms - so an\n# install whose TASKS
-              predates a limit keeps the stream it was created with\n# and gains nothing
-              from a re-run. Both limits this render puts on TASKS are\n# in exactly that
-              position on every install that already has the stream, and\n# the two gaps
-              are not the same kind:\n#\n#   max_consumers short is a capacity shortfall
-              with a load-time failure\n#   attached. A legitimate session's consumer
-              create is refused, surfaced as\n#   a task failure, with nothing in it pointing
-              at the stream. Worth\n#   refusing over here, where the number that caused
-              it is in hand.\n#\n#   max_msgs_per_subject absent is a missing bound, not
-              a broken one: the\n#   install behaves exactly as it did before this render
-              carried the flag.\n#   Applying it would be a TIGHTENING, and a tightening
-              evicts: a\n#   stream edit that lowers max_msgs_per_subject drops every
-              message over\n#   the new limit on every subject the moment it lands. Truncating
-              a running\n#   install's task history as an automatic side effect of an
-              operator\n#   upgrade is not a decision this script takes on an operator's
-              behalf. It\n#   reports, names the edit and what the edit costs, and moves
-              on.\n#\n# This runs LAST, after every other stream and bucket, so the refusal
-              below\n# leaves a fully provisioned bus short one limit rather than a bus
-              missing\n# DIRECTORY, the topic streams and the KV buckets. The refusal
-              is reached on\n# an operator upgrade alone, with no CR edit involved - an
-              install already\n# running maxSessions above what its stream holds has been
-              under-provisioned\n# the whole time, and this is the first thing that says
-              so.\n#\n# Parsed with grep rather than jq: nats-box is the image, and grep
-              is in\n# busybox for certain. An unparseable answer FAILS - a check that
-              silently\n# skips when its extractor stops matching is not a check.\ntasks_json=\"$($NATS
-              stream info TASKS --json | tr -d ' \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf
-              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}'
-              | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ];
-              then\n  echo \"could not read max_msgs_per_subject off the TASKS stream;
-              refusing to report this install as provisioned\" >&2\n  exit 1\nfi\n#\n#
-              Unbounded and merely different are not the same report. An unbounded stream\n#
-              is the gap: nothing stops one task evicting another session's history, which\n#
+              \\\n  --max-consumers=64 --defaults\n\n# DISPATCH_STOPS: the gateway's stop
+              records for AgentProfile tasks, one per\n# task (a2a.stop.<profile>.<task>),
+              read by the dispatcher by subject (contract\n# addendum 9). It is outside
+              a2a.dispatch. on purpose: the dispatcher publishes\n# there, and a stop
+              must have one writer, the gateway (granted with #4127). A\n# record outlives
+              any task (24h against the 6h deadline cap). Nothing makes a\n# consumer
+              here; --max-consumers=1 is the tightest cap JetStream has, since 0\n# means
+              unlimited.\n$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream
+              add DISPATCH_STOPS --allow-direct \\\n  --subjects='a2a.stop.>' --storage=file
+              --retention=limits \\\n  --max-age=24h --max-bytes=67108864 --discard=old
+              --replicas=1 \\\n  --max-msgs-per-subject=1 --max-consumers=1 --defaults\n\n#
+              TASKS older than this render: the limits the create above could not apply.\n#\n#
+              Provisioning is create-only convergence - the info-then-add guards never\n#
+              edit an existing stream, which buildA2AProvisionJob says in terms - so an\n#
+              install whose TASKS predates a limit keeps the stream it was created with\n#
+              and gains nothing from a re-run. Both limits this render puts on TASKS are\n#
+              in exactly that position on every install that already has the stream, and\n#
+              the two gaps are not the same kind:\n#\n#   max_consumers short is a capacity
+              shortfall with a load-time failure\n#   attached. A legitimate session's
+              consumer create is refused, surfaced as\n#   a task failure, with nothing
+              in it pointing at the stream. Worth\n#   refusing over here, where the number
+              that caused it is in hand.\n#\n#   max_msgs_per_subject absent is a missing
+              bound, not a broken one: the\n#   install behaves exactly as it did before
+              this render carried the flag.\n#   Applying it would be a TIGHTENING, and
+              a tightening evicts: a\n#   stream edit that lowers max_msgs_per_subject
+              drops every message over\n#   the new limit on every subject the moment
+              it lands. Truncating a running\n#   install's task history as an automatic
+              side effect of an operator\n#   upgrade is not a decision this script takes
+              on an operator's behalf. It\n#   reports, names the edit and what the edit
+              costs, and moves on.\n#\n# This runs LAST, after every other stream and
+              bucket, so the refusal below\n# leaves a fully provisioned bus short one
+              limit rather than a bus missing\n# DIRECTORY, the topic streams and the
+              KV buckets. The refusal is reached on\n# an operator upgrade alone, with
+              no CR edit involved - an install already\n# running maxSessions above what
+              its stream holds has been under-provisioned\n# the whole time, and this
+              is the first thing that says so.\n#\n# Parsed with grep rather than jq:
+              nats-box is the image, and grep is in\n# busybox for certain. An unparseable
+              answer FAILS - a check that silently\n# skips when its extractor stops matching
+              is not a check.\ntasks_json=\"$($NATS stream info TASKS --json | tr -d '
+              \\t\\r\\n')\"\n\nlive_subject_cap=\"$(printf '%s' \"${tasks_json}\" \\\n
+              \ | grep -o '\"max_msgs_per_subject\":-\\{0,1\\}[0-9]\\{1,\\}' | head -n1
+              | cut -d: -f2 || true)\"\nif [ -z \"${live_subject_cap}\" ]; then\n  echo
+              \"could not read max_msgs_per_subject off the TASKS stream; refusing to
+              report this install as provisioned\" >&2\n  exit 1\nfi\n#\n# Unbounded and
+              merely different are not the same report. An unbounded stream\n# is the
+              gap: nothing stops one task evicting another session's history, which\n#
               is the whole reason the render carries the flag. A stream carrying some
               other\n# finite cap is bounded already, and telling the operator who chose
               it that\n# their stream \"predates the limit\" is telling them something
@@ -5095,19 +5161,37 @@ spec:
               >&2\n  echo \"  Provisioning does not edit an existing stream; to append
               the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
               TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
-              >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only where the kubelet
-              has mounted the file: outside a pod there is\n# nothing to write to, and
-              a copy of a report is not a reason to fail a fully\n# provisioned bus. Nor
-              is a write that fails (a full or faulting disk under\n# the kubelet's file):
-              under set -e that would exit 1 on a bus this script\n# just finished provisioning,
-              and exit 1 matches no podFailurePolicy rule, so\n# the Job would burn its
-              backoff into BackoffLimitExceeded. A pod that has no\n# file, or whose write
-              failed, leaves no message, and the reconcile logs that\n# rather than reading
-              it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n  printf '%s' \"${report}\"
-              > \"/dev/termination-log\" \\\n    || echo \"WARNING: could not write the
-              provision report to the termination log; the log above is this run's only
-              record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf '%s'
-              \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
+              >&2\nfi\n#\n# PROFILE_SUBMITS older than this render: read its live max
+              age back. The\n# dispatcher keeps a finished task's tombstone for the max
+              age the operator\n# renders, and a submission still on the stream past its
+              tombstone would be\n# run again; provisioning never edits the stream (lowering
+              a max age evicts\n# queued submissions), so a stream an older operator created
+              longer than this\n# render's 259200s is reported, and the operator\n# renders
+              the longer one (#4948). 0 is no age limit. Same stance as the\n# extractors
+              above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
+              stream info PROFILE_SUBMITS --json | tr -d ' \\t\\r\\n')\"\nlive_submit_max_age_ns=\"$(printf
+              '%s' \"${submits_json}\" \\\n  | grep -o '\"max_age\":[0-9]\\{1,\\}' | head
+              -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_submit_max_age_ns}\" ]; then\n
+              \ echo \"could not read max_age off the PROFILE_SUBMITS stream; refusing
+              to report this install as provisioned\" >&2\n  exit 1\nfi\nlive_submit_max_age=$((live_submit_max_age_ns
+              / 1000000000))\nif [ \"${live_submit_max_age_ns}\" = \"0\" ] || [ \"${live_submit_max_age}\"
+              -gt 259200 ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"submit_max_age\\\":{\\\"live\\\":${live_submit_max_age}}\"\n
+              \ echo \"NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s
+              (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
+              dispatcher is told the longer one, so a finished task's tombstone outlives
+              its submission.\" >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only
+              where the kubelet has mounted the file: outside a pod there is\n# nothing
+              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
+              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
+              file): under set -e that would exit 1 on a bus this script\n# just finished
+              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
+              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
+              or whose write failed, leaves no message, and the reconcile logs that\n#
+              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
+              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
+              could not write the provision report to the termination log; the log above
+              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
+              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to
               report this install as provisioned\" >&2\n  exit 1\nfi\nif [ \"${live_consumers}\"
@@ -5305,6 +5389,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -5386,11 +5471,23 @@ spec:
               value: /var/run/secrets/a2a-chat-relay/token
             - name: A2A_RESOLVED_SCOPE_CONFIGMAP
               value: platformagent-resolved-scope
+            - name: A2A_GATEWAY_LEASE
+              value: platformagent-a2a-gateway
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.name
           image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
           name: gateway
           ports:
             - containerPort: 9096
               name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
           resources:
             limits:
               cpu: 500m
@@ -5421,6 +5518,15 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       serviceAccountName: platformagent-a2a-gateway
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
       volumes:
         - configMap:
             name: principal-map

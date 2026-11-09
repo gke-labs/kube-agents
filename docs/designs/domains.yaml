@@ -58,7 +58,7 @@
 # only a roster line counts as coverage.
 # consistency is the exception since 2026-10-26: its seat is the full drift
 # audit, consistency-drift-outlier, which runs at about 200s a repetition on
-# the claude-opus-5-5 agent model.
+# the agent model of 2026-10-19.
 
 # Not a domain, and no case claims it: who a nightly eval failure caused by
 # infrastructure (pool projects, seeded fleet, CI, Prow) is filed to. Area

@@ -7344,7 +7344,7 @@ main() {
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
-    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
   }

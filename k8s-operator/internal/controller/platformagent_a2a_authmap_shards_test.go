@@ -74,7 +74,7 @@ func TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale(t *testing.T
 		t.Fatalf("the unsharded map at %d profiles is %d bytes, under the %d-byte limit; this test would pass without sharding", profileCount, len(wholeBody), configMapSizeLimit)
 	}
 
-	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("buildA2AAuthMapConfigMaps: %v", err)
 	}
@@ -157,11 +157,11 @@ func TestTheShardPartitionIsStable(t *testing.T) {
 			p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		}))
 	}
-	first, _, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	first, _, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("first render: %v", err)
 	}
-	second, _, err := buildA2AAuthMapConfigMaps(agent, profiles)
+	second, _, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("second render: %v", err)
 	}

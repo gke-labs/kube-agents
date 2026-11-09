@@ -159,6 +159,34 @@ func TestTheA2AGatewayDeclaresItsMetricsListener(t *testing.T) {
 	}
 }
 
+// The gateway is not ready until its event relay binds (a2a/gateway's
+// ReadyzPath on the metrics listener), so the Deployment shows a gateway
+// waiting for the provision Job's TASKS stream instead of a crash loop. The
+// probe is served by the gateway's own listener on its named port, and
+// Recreate is what keeps it from opening a gap in a roll.
+func TestTheA2AGatewayIsReadyOnlyOnceItsRelayBinds(t *testing.T) {
+	dep := buildA2AGatewayDeployment(a2aTestAgent())
+	c := dep.Spec.Template.Spec.Containers[0]
+	if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet == nil {
+		t.Fatalf("the gateway container has no HTTP readinessProbe: %+v", c.ReadinessProbe)
+	}
+	get := c.ReadinessProbe.HTTPGet
+	if get.Path != "/readyz" || get.Port.String() != a2aGatewayMetricsPortName {
+		t.Errorf("readinessProbe GET %s on %s, want /readyz on %s", get.Path, get.Port.String(), a2aGatewayMetricsPortName)
+	}
+	if c.LivenessProbe != nil {
+		t.Errorf("a liveness probe would restart a gateway that is only waiting for TASKS: %+v", c.LivenessProbe)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("strategy %s: the probe was argued safe under Recreate", dep.Spec.Strategy.Type)
+	}
+	// A wait for TASKS past the 600s default would read ProgressDeadlineExceeded
+	// and end every `kubectl rollout status` early.
+	if pd := dep.Spec.ProgressDeadlineSeconds; pd == nil || *pd < 1800 {
+		t.Errorf("progressDeadlineSeconds %v: a gateway waiting on a slow provision Job outlives the 600s default", pd)
+	}
+}
+
 // TestTheA2AGatewayFenceMirrorsTheBrokersCollectorRule: the gateway's one
 // ingress rule is the credential broker's second rule with the gateway's
 // metrics port in it, the same peer byte for byte, on every fence (the

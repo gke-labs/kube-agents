@@ -38,7 +38,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from github_api import GitHubAPI, log  # noqa: E402
+from github_api import GitHubAPI, has_marker_comment, log  # noqa: E402
 
 #: A hold label for the enqueue sweep (`HOLD_LABELS` in `merge_gate.py`) and written by no Prow
 #: plugin, which is what lets this script own it outright.
@@ -132,14 +132,6 @@ def label_is_ours(api, number):
     return actor == BOT_LOGIN
 
 
-def already_explained(api, number):
-    """Whether a comment carrying COMMENT_MARKER is already on the pull request."""
-    return any(
-        (comment.get("body") or "").startswith(COMMENT_MARKER)
-        for comment in api.get_all(f"/repos/{api.repo}/issues/{number}/comments")
-    )
-
-
 def decide(pull, unresolved):
     """(ACTION_ADD | ACTION_REMOVE | None, reason) for one pull request, from what a sweep read.
 
@@ -186,7 +178,7 @@ def sweep(api, dry_run=False):
                 action, reason = None, "every thread resolved, but the label was applied by a person; leaving it"
             if action == ACTION_ADD and not dry_run:
                 api.post(f"/repos/{api.repo}/issues/{number}/labels", {"labels": [LABEL]})
-                if already_explained(api, number):
+                if has_marker_comment(api, number, COMMENT_MARKER):
                     reason += "; the comment is already there"
                 else:
                     api.post(

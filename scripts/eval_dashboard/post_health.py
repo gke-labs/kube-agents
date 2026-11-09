@@ -101,7 +101,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
+    from eval_dashboard import forge_lane, gate_issue, ghcli, nightly, nightly_latency, periodics
 
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
@@ -122,7 +122,7 @@ try:
     )
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli, nightly, nightly_latency, periodics
+    from eval_dashboard import forge_lane, gate_issue, ghcli, nightly, nightly_latency, periodics
     from eval_dashboard.health import (
         CAPACITY_ROLES,
         POOL_BREACH,
@@ -1607,7 +1607,7 @@ def nightly_latency_line(data: dict, now: datetime) -> str | None:
         night, _ = nightly.last_night(data, now)
         if night is None:
             return None
-        return nightly_latency.night_line(nightly.night_reports(data, running=nightly.running_nights(data, now)))
+        return nightly_latency.night_line(nightly.night_dates(data, running=nightly.running_nights(data, now)))
     except Exception:  # noqa: BLE001 -- the digest must still go out
         traceback.print_exc()
         log("warning: nightly latency line skipped")
@@ -1675,6 +1675,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None, section
         lines.append(NIGHTLY_URL)
         if isinstance(section, str):
             lines.append(NIGHTLY_SKIPPED.format(reason=section))
+    forge = forge_lane.digest_line(data, now) if data is not None else None
+    if forge:
+        lines.append(forge)
     lines.extend(coverage)
     fleet = fixture_digest_line(health)
     if fleet:

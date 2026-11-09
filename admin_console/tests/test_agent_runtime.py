@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +32,10 @@ from admin_console.agent_runtime import (
 from admin_console.kanban_view import display_status
 from admin_console.kube_access import GKEKubeAccess, KubeCommandResult, KubeFailure
 from admin_console.project_config import DeploymentTarget
+
+# The broker's provider list, so the console's pull-request scan is held to
+# every forge the broker serves.
+PROVIDERS_DIR = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts"
 
 # A result that cites a status page and a log path. It does not link a PR.
 CITED_RESULT = (
@@ -325,6 +330,39 @@ class NonCanonicalAgentRunner:
                 ),
             )
         return KubeCommandResult(1, stderr="unexpected command")
+
+
+class PullRequestUrlPatternTest(unittest.TestCase):
+    def test_the_scan_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        sys.path.insert(0, str(PROVIDERS_DIR))
+        self.addCleanup(sys.path.remove, str(PROVIDERS_DIR))
+        import providers
+
+        # The scan runs inside the pod as part of _READ_SCRIPT, so its pattern is
+        # read out of that script's text.
+        literal = re.search(r'^PR_URL_PATTERN = re\.compile\(r"(.+)"\)$', agent_runtime._READ_SCRIPT, re.MULTILINE)
+        self.assertIsNotNone(literal, "the read script no longer declares PR_URL_PATTERN on one line")
+        pattern = re.compile(literal.group(1))
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/infra/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/infra/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/infra/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/infra/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/infra/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(pattern.search(f"Opened {url} for review."))
+        for issue in (
+            "https://gitea.example.com/acme/infra/issues/12",
+            "https://bitbucket.org/acme/infra/issues/12",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=issue):
+                self.assertFalse(pattern.search(f"Filed {issue}."))
 
 
 class EmbeddedReadScriptTest(unittest.TestCase):
@@ -727,6 +765,24 @@ class EmbeddedReadScriptTest(unittest.TestCase):
                     "Opened https://gitlab.example/acme/infra/-/merge_requests/4.",
                 ),
                 (
+                    "t_result_gitea",
+                    "done",
+                    None,
+                    "Opened https://gitea.example.com/acme/infra/pulls/12.",
+                ),
+                (
+                    "t_result_bitbucket",
+                    "done",
+                    None,
+                    "Opened https://bitbucket.org/acme/infra/pull-requests/12/_/diff.",
+                ),
+                (
+                    "t_result_bitbucket_dc",
+                    "done",
+                    None,
+                    "Opened https://bitbucket.example.com/projects/ACME/repos/infra/pull-requests/12/overview.",
+                ),
+                (
                     "t_result_issue",
                     "done",
                     None,
@@ -762,6 +818,11 @@ class EmbeddedReadScriptTest(unittest.TestCase):
                 ),
                 ("t_pr_false", "done", None, None),
                 ("t_pr_zero", "done", None, None),
+                ("t_pr_none", "done", None, None),
+                ("t_pr_na", "done", None, None),
+                ("t_pr_issue", "done", None, None),
+                ("t_pr_new", "done", None, None),
+                ("t_pr_mixed", "done", None, None),
                 ("t_input", "blocked", "needs_input", None),
                 ("t_access", "blocked", "capability", None),
                 ("t_gave_up", "blocked", "needs_input", None),
@@ -791,6 +852,14 @@ class EmbeddedReadScriptTest(unittest.TestCase):
                     # Only a text value is a URL.
                     ("t_pr_false", '{"pr_url": false}'),
                     ("t_pr_zero", '{"pr_url": 0}'),
+                    # A text value counts only when it is a PR or MR URL, as in
+                    # the result.
+                    ("t_pr_none", '{"pr_url": "none"}'),
+                    ("t_pr_na", '{"pr_url": "n/a"}'),
+                    ("t_pr_issue", '{"pr_url": "https://github.com/acme/infra/issues/5"}'),
+                    ("t_pr_new", '{"pr_url": "https://github.com/acme/infra/pull/new/fix-branch"}'),
+                    ("t_pr_mixed", '{"pr_url": "none"}'),
+                    ("t_pr_mixed", '{"pr_url": "https://github.com/acme/infra/pull/9"}'),
                 ],
             )
             connection.executemany(
@@ -822,6 +891,9 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             "t_done_bad": (None, 0, 0),
             "t_result_pr": (None, 0, 1),
             "t_result_mr": (None, 0, 1),
+            "t_result_gitea": (None, 0, 1),
+            "t_result_bitbucket": (None, 0, 1),
+            "t_result_bitbucket_dc": (None, 0, 1),
             "t_result_issue": (None, 0, 0),
             "t_result_cited": (None, 0, 0),
             "t_result_spaced": (None, 0, 0),
@@ -829,6 +901,11 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             "t_running_pr": (None, 0, 0),
             "t_pr_false": (None, 0, 0),
             "t_pr_zero": (None, 0, 0),
+            "t_pr_none": (None, 0, 0),
+            "t_pr_na": (None, 0, 0),
+            "t_pr_issue": (None, 0, 0),
+            "t_pr_new": (None, 0, 0),
+            "t_pr_mixed": (None, 0, 1),
             "t_input": ("needs_input", 0, 0),
             "t_access": ("capability", 0, 0),
             "t_gave_up": ("needs_input", 1, 0),
@@ -880,6 +957,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
         for payload in (
             board["tasks"],
             tasks["tasks"],
+            detail["task"],
             detail["parents"],
             detail["children"],
         ):
@@ -888,6 +966,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             self.assertNotIn("github.com/acme/infra/pull", text)
             self.assertNotIn("merge_requests", text)
             self.assertNotIn("pr_scan_result", text)
+            self.assertNotIn("pr_scan_metadata", text)
 
     def test_reads_tolerate_a_board_without_card_state_columns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -900,6 +979,7 @@ class EmbeddedReadScriptTest(unittest.TestCase):
             (row["block_kind"], row["gave_up"], row["has_pr"]), (None, 0, 0)
         )
         self.assertNotIn("pr_scan_result", row)
+        self.assertNotIn("pr_scan_metadata", row)
 
     def test_provider_parses_card_state_from_the_real_read(self):
         with tempfile.TemporaryDirectory() as directory:

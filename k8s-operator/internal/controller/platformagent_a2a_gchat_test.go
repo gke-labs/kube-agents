@@ -189,6 +189,8 @@ func TestDisplayModeFollowsTheCRField(t *testing.T) {
 // gate holds it in a fake client).
 func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	// The unelected render; the election's env is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	for _, tc := range []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
@@ -491,11 +493,12 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
 // container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat and the home channel is a space name, and
-// the kanban notifier to send a card's report back to its conversation
-// whenever the gateway arms the route (home channel unset or a space name).
-// Telling either with no route behind it sends posts to a subject nobody
-// answers.
+// the next stack holds Google Chat and the home channel is a space name, or
+// is unset with no Slack to fall back to (the gateway then keeps the refused
+// posts for the digest); and the kanban notifier to send a card's report
+// back to its conversation whenever the gateway arms the route (home channel
+// unset or a space name). Telling either with no route behind it sends posts
+// to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
@@ -505,7 +508,8 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 		{"today with chat", gchatTestAgent("", true), false, false},
 		{"skew with chat", gchatTestAgent("later", true), false, false},
 		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), false, true},
+		{"next with chat, no home channel", gchatTestAgent("next", true), true, true},
+		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), false, true},
 		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
 		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
 		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
@@ -533,4 +537,34 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 	agent.Spec.Integration.GoogleChat.HomeChannel = home
 	return agent
+}
+
+// TestGchatAnswerFeedbackOffIsTheOnlyRenderedState: googleChat.answerFeedback
+// reaches the gateway only as its off switch, and only when Chat is the
+// gateway's backend; unset or true renders nothing.
+func TestGchatAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	off, on := false, true
+	for _, tc := range []struct {
+		name    string
+		agent   *agentv1alpha1.PlatformAgent
+		setting *bool
+		want    string
+		present bool
+	}{
+		{"unset", gchatTestAgent("next", true), nil, "", false},
+		{"true", gchatTestAgent("next", true), &on, "", false},
+		{"false", gchatTestAgent("next", true), &off, "false", true},
+		{"false under today", gchatTestAgent("", true), &off, "", false},
+		{"false with chat disabled", gchatTestAgent("next", false), &off, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.agent.Spec.Integration.GoogleChat.AnswerFeedback = tc.setting
+			env := envMapOf(buildA2AGatewayDeployment(tc.agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aGchatAnswerFeedbackEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aGchatAnswerFeedbackEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
 }

@@ -21,6 +21,7 @@ import (
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientfeatures "k8s.io/client-go/features"
@@ -272,6 +273,108 @@ func TestTheFirstBusConnectIsRetried(t *testing.T) {
 		cancel()
 		if err == nil || calls != 1 {
 			t.Fatalf("an untrusted certificate (%T): %v after %d calls; want an error after 1", untrusted, err, calls)
+		}
+	}
+}
+
+// writeSeed writes seed to a file in a fresh temp dir and returns its path.
+func writeSeed(t *testing.T, seed []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "seed")
+	if err := os.WriteFile(path, seed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// bufferLog is a logger writing JSON lines into the returned buffer.
+func bufferLog() (*slog.Logger, *strings.Builder) {
+	var b strings.Builder
+	return slog.New(slog.NewJSONHandler(&b, nil)), &b
+}
+
+// The task-signing key (#3889). Unset, there is no key and a warning says so
+// once: confirms carry no task credentials. A file holding a task-signing
+// seed loads it, with no warning, and the seed is never logged. A file that
+// can't be read, or holds a seed of another key type or no seed at all, or
+// an unusable lifetime cap, is an error: the process refuses to start.
+func TestTheTaskSigningKeyIsLoadedFromItsSeedFile(t *testing.T) {
+	log, out := bufferLog()
+	kp, lifetime, err := taskSigning(env(map[string]string{}), log)
+	if err != nil || kp != nil || lifetime != 0 {
+		t.Fatalf("unset: key %v, lifetime %v, err %v; want no key, the default and no error", kp, lifetime, err)
+	}
+	if n := strings.Count(out.String(), `"level":"WARN"`); n != 1 || !strings.Contains(out.String(), "running without a task-signing key") ||
+		!strings.Contains(out.String(), "confirms will carry no task credentials") || !strings.Contains(out.String(), "profile-wide bus reach") {
+		t.Errorf("unset: want one warning that confirms carry no task credentials, logged %s", out)
+	}
+
+	signing, err := nkeys.CreateCluster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seed, _ := signing.Seed()
+	pub, _ := signing.PublicKey()
+	log, out = bufferLog()
+	kp, lifetime, err = taskSigning(env(map[string]string{envTaskSigningSeedFile: writeSeed(t, append(seed, '\n')), envTaskCredentialMaxLifetime: "2h"}), log)
+	if err != nil || kp == nil || lifetime != 2*time.Hour {
+		t.Fatalf("a valid seed: key %v, lifetime %v, err %v", kp, lifetime, err)
+	}
+	if got, _ := kp.PublicKey(); got != pub {
+		t.Errorf("loaded key %s, want %s", got, pub)
+	}
+	if strings.Contains(out.String(), `"level":"WARN"`) || strings.Contains(out.String(), "running without") {
+		t.Errorf("a loaded key logged the no-key warning: %s", out)
+	}
+	if strings.Contains(out.String(), string(seed)) {
+		t.Error("the seed was logged")
+	}
+
+	account, _ := nkeys.CreateAccount()
+	accountSeed, _ := account.Seed()
+	user, _ := nkeys.CreateUser()
+	userSeed, _ := user.Seed()
+	for name, e := range map[string]map[string]string{
+		"a missing file":       {envTaskSigningSeedFile: filepath.Join(t.TempDir(), "missing")},
+		"a directory":          {envTaskSigningSeedFile: t.TempDir()},
+		"an empty file":        {envTaskSigningSeedFile: writeSeed(t, nil)},
+		"not a seed":           {envTaskSigningSeedFile: writeSeed(t, []byte("not a seed"))},
+		"an account seed":      {envTaskSigningSeedFile: writeSeed(t, accountSeed)},
+		"a user seed":          {envTaskSigningSeedFile: writeSeed(t, userSeed)},
+		"a bad lifetime":       {envTaskSigningSeedFile: writeSeed(t, seed), envTaskCredentialMaxLifetime: "forever"},
+		"a bad lifetime alone": {envTaskCredentialMaxLifetime: "-1h"},
+	} {
+		log, out := bufferLog()
+		if kp, _, err := taskSigning(env(e), log); err == nil || kp != nil {
+			t.Errorf("%s: key %v, err %v; want a refusal", name, kp, err)
+		} else if strings.Contains(err.Error(), string(seed)) || strings.Contains(err.Error(), string(accountSeed)) || strings.Contains(err.Error(), string(userSeed)) {
+			t.Errorf("%s: the error names the seed", name)
+		}
+		if strings.Contains(out.String(), string(seed)) {
+			t.Errorf("%s: the seed was logged", name)
+		}
+	}
+}
+
+// A seed file that is set but unusable stops the process at startup, with
+// the config exit code, before it reaches the cluster or the bus: it never
+// runs minting nothing.
+func TestABadSeedFileStopsTheDispatcherAtStartup(t *testing.T) {
+	account, _ := nkeys.CreateAccount()
+	accountSeed, _ := account.Seed()
+	base := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "agent-a2a-dispatch",
+		"NATS_USER": "dispatcher", "NATS_PASSWORD": "pw"}
+	for name, path := range map[string]string{
+		"missing":           filepath.Join(t.TempDir(), "missing"),
+		"wrong key type":    writeSeed(t, accountSeed),
+		"not a seed at all": writeSeed(t, []byte("junk")),
+	} {
+		e := map[string]string{envTaskSigningSeedFile: path}
+		for k, v := range base {
+			e[k] = v
+		}
+		if code := run(env(e)); code != 2 {
+			t.Errorf("%s: run exited %d, want 2 (refused at startup)", name, code)
 		}
 	}
 }
