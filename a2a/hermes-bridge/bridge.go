@@ -1095,7 +1095,7 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(text))
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(scrubAnswer(run, text)))
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
@@ -1833,6 +1833,12 @@ func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, res
 }
 
 func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) {
+	// The answer as it goes on TASKS, the chat message folded from it
+	// included: scrubbed (scrubAnswer), before any lock, as the fold is.
+	if resultOutput != nil {
+		scrubbed := scrubAnswer(run, *resultOutput)
+		resultOutput = &scrubbed
+	}
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1887,6 +1893,10 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	b.publishHandoff(ctx, run, state)
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
+	// The task's answers are out: the values seen for their scrub go.
+	if a := run.act.Load(); a != nil {
+		a.secrets.clear()
+	}
 	run.mu.Unlock()
 	b.waitActivity(run)
 	if err != nil {

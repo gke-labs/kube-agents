@@ -545,6 +545,11 @@ type activityState struct {
 	// has said so; one line per task (publishSteps).
 	stepRefused atomic.Bool
 
+	// secrets is the secret values this task's tool results carried
+	// (answer_scrub.go), redacted out of its answer and cleared when it
+	// finalizes.
+	secrets seenSecrets
+
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
 	// entry can sit between a queue and a drain when finalize runs.
@@ -1381,6 +1386,13 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// and the entry would then be dropped as post-terminal - present in the
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
+	// The result's secret values, for the answer's scrub, read before
+	// run.mu: the read is CPU only and bounded, and holding run.mu over it
+	// would hold the heartbeat and a finalize behind it. A value that lands
+	// after the answer was published scrubs nothing; the answer is out.
+	if d.Event == hookPostToolCall {
+		act.secrets.collectToolResult(d.Extra.Result)
+	}
 	run.mu.Lock()
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
