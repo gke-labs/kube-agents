@@ -93,6 +93,13 @@ readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+# The least a spend ceiling can be when it is on, in US dollars. The chart
+# splits the amount across the gateway replicas and renders each share with
+# four decimals, refusing a share that rounds to 0; a cent keeps the share above
+# that floor at up to 100 replicas, and the refusal happens here, before any
+# apply, rather than in the Helm render. The chart's values.schema.json and the
+# composition's litellm_budget validation carry the same floor.
+readonly LITELLM_BUDGET_MIN_USD="0.01"
 
 # ─── Data volume size ─────────────────────────────
 # The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
@@ -5191,6 +5198,12 @@ write_tfvars_from_state() {
   local litellm_budget_on="false"
   if [[ ! "$litellm_budget_usd" =~ ^0+(\.0+)?$ ]]; then
     litellm_budget_on="true"
+    # Below the floor the chart's per-replica share rounds to nothing and its
+    # render refuses the value at helm_release apply; refused here instead.
+    if awk -v amount="$litellm_budget_usd" -v floor="$LITELLM_BUDGET_MIN_USD" 'BEGIN { exit !(amount + 0 < floor + 0) }'; then
+      print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is under ${LITELLM_BUDGET_MIN_USD} USD, the least a ceiling can be when it is on (the chart splits it across the gateway replicas and renders each share with four decimals). Set 0 for no ceiling, or at least ${LITELLM_BUDGET_MIN_USD}, in install.env."
+      return 1
+    fi
     if ! is_valid_litellm_budget_period "$litellm_budget_period"; then
       print_error "LITELLM_BUDGET_PERIOD='${litellm_budget_period}' is not a LiteLLM duration. Set a whole number and s, m, h, d, w or mo, such as 1d, or leave it empty, in install.env."
       return 1

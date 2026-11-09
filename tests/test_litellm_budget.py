@@ -76,6 +76,13 @@ class BudgetRenderTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         self.assertIn(needle, proc.stderr)
 
+    def _schema_refuses(self, values_text: str, key: str) -> None:
+        # Helm 3 names the key as litellm.budget.usd, Helm 4 as the JSON
+        # pointer /litellm/budget/usd; the chart is rendered by both.
+        proc = _render(values_text)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertRegex(proc.stderr, "litellm[./]budget[./]" + key)
+
     @staticmethod
     def _config(configmap: dict) -> dict:
         return yaml.safe_load(configmap["data"]["config.yaml"])
@@ -158,17 +165,28 @@ class BudgetRenderTest(unittest.TestCase):
 
     def test_a_share_that_rounds_to_zero_fails_the_render(self) -> None:
         # LiteLLM treats a budget_limit of 0 as no limit, so a ceiling that
-        # would render as one is refused rather than silently lifted.
-        self._fails(_VERTEX_VALUES + "  budget:\n    usd: 0.00009\n", "under 0.0001 USD per replica")
+        # would render as one is refused rather than silently lifted. The
+        # schema's floor (0.01) keeps this out of reach up to 100 replicas;
+        # beyond that the render is the backstop.
+        self._fails(_VERTEX_VALUES + "  replicaCount: 1000\n  budget:\n    usd: 0.01\n", "under 0.0001 USD per replica")
+
+    def test_the_floor_renders_and_below_it_the_schema_refuses_before_the_render(self) -> None:
+        # A cent, the least a ceiling can be when it is on; the installer and
+        # the Terraform example refuse the same values before any apply.
+        router = self._router(_VERTEX_VALUES + "  budget:\n    usd: 0.01\n")
+        self.assertEqual(router["provider_budget_config"]["vertex_ai"]["budget_limit"], 0.005)
+        for amount in ("0.005", "0.0099", "0.00009"):
+            with self.subTest(amount=amount):
+                self._schema_refuses(_VERTEX_VALUES + f"  budget:\n    usd: {amount}\n", "usd")
 
     def test_a_budget_without_a_period_fails_the_render(self) -> None:
         self._fails(_VERTEX_VALUES + "  budget:\n    usd: 1\n    period: \"\"\n", "is not a LiteLLM duration")
 
     def test_the_schema_refuses_a_negative_budget_a_bad_period_and_a_string(self) -> None:
-        self._fails(_VERTEX_VALUES + "  budget:\n    usd: -1\n", "litellm.budget.usd")
-        self._fails(_VERTEX_VALUES + "  budget:\n    usd: 1\n    period: 1x\n", "litellm.budget.period")
-        self._fails(_VERTEX_VALUES + "  budget:\n    usd: 1\n    period: 0d\n", "litellm.budget.period")
-        self._fails(_VERTEX_VALUES + "  budget:\n    usd: \"0.5\"\n", "litellm.budget.usd")
+        self._schema_refuses(_VERTEX_VALUES + "  budget:\n    usd: -1\n", "usd")
+        self._schema_refuses(_VERTEX_VALUES + "  budget:\n    usd: 1\n    period: 1x\n", "period")
+        self._schema_refuses(_VERTEX_VALUES + "  budget:\n    usd: 1\n    period: 0d\n", "period")
+        self._schema_refuses(_VERTEX_VALUES + "  budget:\n    usd: \"0.5\"\n", "usd")
 
     def test_the_default_render_carries_no_router_settings_the_kustomize_base_lacks(self) -> None:
         unset_cm, _ = self._documents()

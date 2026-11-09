@@ -465,9 +465,15 @@ variable "litellm_budget" {
   # The same checks as the chart's values.schema.json, so a bad value fails the
   # plan rather than the helm_release apply. The period is checked only beside
   # an amount above zero: the chart reads it then and not otherwise.
+  # 0.01 is the least a ceiling can be when it is on: the chart splits the
+  # amount across the gateway replicas and renders each share with four
+  # decimals, refusing a share that rounds to 0 at the helm_release apply. A
+  # cent keeps the share above that floor at up to 100 replicas, and the
+  # refusal happens at the plan. The installer's LITELLM_BUDGET_MIN_USD and the
+  # chart's values.schema.json carry the same floor.
   validation {
-    condition     = var.litellm_budget.usd >= 0
-    error_message = "litellm_budget.usd must be an amount in US dollars, 0 or more."
+    condition     = var.litellm_budget.usd == 0 || var.litellm_budget.usd >= 0.01
+    error_message = "litellm_budget.usd must be 0 (no ceiling) or an amount in US dollars of at least 0.01."
   }
   validation {
     condition     = var.litellm_budget.usd == 0 || can(regex("^[1-9][0-9]*(s|m|h|d|w|mo)$", var.litellm_budget.period))

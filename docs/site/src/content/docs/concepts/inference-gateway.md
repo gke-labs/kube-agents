@@ -91,7 +91,9 @@ On non-adaptive Anthropic Claude models, LiteLLM maps `fallback.reasoningEffort`
 
 ### Setting a spend ceiling
 
-`LITELLM_BUDGET_USD` is the most the gateway spends, in US dollars as LiteLLM's cost map prices each response, in every window of `LITELLM_BUDGET_PERIOD` (a LiteLLM duration: a whole number and `s`, `m`, `h`, `d`, `w` or `mo`; the default is `1d`). Set both in `install.env` (there is no flag) and re-run `upgrade.sh`; they reach the Terraform example as `litellm_budget` and the chart as `litellm.budget.usd` and `litellm.budget.period`. On a direct Helm install set them through a values file or `--set-json litellm.budget.usd=25`: `--set` passes a decimal as a string, which the schema refuses. At the default of `0` nothing is rendered and the gateway config is what it was.
+`LITELLM_BUDGET_USD` is the most the gateway spends, in US dollars as LiteLLM's cost map prices each response, in every window of `LITELLM_BUDGET_PERIOD` (a LiteLLM duration: a whole number and `s`, `m`, `h`, `d`, `w` or `mo`; the default is `1d`). Set both in `install.env` (there is no flag) and re-run `upgrade.sh`; they reach the Terraform example as `litellm_budget` and the chart as `litellm.budget.usd` and `litellm.budget.period`. On a direct Helm install set them through a values file or `--set-json litellm.budget.usd=25`: `--set` passes a decimal as a string, which the schema refuses.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. On, the amount is at least `0.01`: the installer, the Terraform example and the chart's schema all refuse less, before any apply, because a smaller amount splits into per-replica shares the chart cannot render.
 
 The chart renders the ceiling as LiteLLM's provider budget for the one provider every alias routes to, with the amount split evenly across `litellm.replicaCount`. With `MODEL_PROVIDER=vertex_ai`, `LITELLM_BUDGET_USD=10` and the default two replicas the config reads:
 

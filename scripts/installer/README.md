@@ -760,8 +760,10 @@ gives the buckets, the defaults, and what happens to entries added to the CR by 
 `DEFAULT_LITELLM_BUDGET_USD` (`0`, no ceiling) and `DEFAULT_LITELLM_BUDGET_PERIOD` (`1d`).
 `write_tfvars_from_state` writes `litellm_budget` only while the amount is above `0`, so an install
 without a ceiling keeps the file it had; the period is read, and checked, only then. The generator
-refuses an amount that is not a number of `0` or more, or a period that is not a LiteLLM duration
-(a whole number and `s`, `m`, `h`, `d`, `w` or `mo`), and names the key. `install.sh` records both
+refuses an amount that is not a number of `0` or more, an amount above `0` and under
+`LITELLM_BUDGET_MIN_USD` (`0.01`: the chart splits the amount across the gateway replicas and renders
+each share with four decimals, so a smaller amount would fail at the Helm apply), or a period that is
+not a LiteLLM duration (a whole number and `s`, `m`, `h`, `d`, `w` or `mo`), and names the key. `install.sh` records both
 keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
 value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
 apply these keys; the operator and harness modes of `upgrade.sh` use the values that the release

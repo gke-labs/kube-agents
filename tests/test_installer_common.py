@@ -1304,6 +1304,7 @@ class InstallerCommonTest(unittest.TestCase):
                 ({"LITELLM_BUDGET_USD": "0"}, None),
                 ({"LITELLM_BUDGET_USD": "0.0", "LITELLM_BUDGET_PERIOD": "not-a-duration"}, None),
                 ({"LITELLM_BUDGET_USD": "25"}, 'litellm_budget = { usd = 25, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "0.01"}, 'litellm_budget = { usd = 0.01, period = "1d" }\n'),
                 ({"LITELLM_BUDGET_USD": "2.50", "LITELLM_BUDGET_PERIOD": "7d"}, 'litellm_budget = { usd = 2.50, period = "7d" }\n'),
             ):
                 with self.subTest(env=env):
@@ -1329,6 +1330,11 @@ class InstallerCommonTest(unittest.TestCase):
                 ({"LITELLM_BUDGET_USD": "-1"}, "LITELLM_BUDGET_USD"),
                 ({"LITELLM_BUDGET_USD": "$25"}, "LITELLM_BUDGET_USD"),
                 ({"LITELLM_BUDGET_USD": "25."}, "LITELLM_BUDGET_USD"),
+                # Under the floor the chart's per-replica share rounds to nothing
+                # and its render would refuse at the apply; refused here first.
+                ({"LITELLM_BUDGET_USD": "0.005"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.0099"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.00009"}, "under 0.01 USD"),
                 ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "1x"}, "LITELLM_BUDGET_PERIOD"),
                 ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "0d"}, "LITELLM_BUDGET_PERIOD"),
             ):

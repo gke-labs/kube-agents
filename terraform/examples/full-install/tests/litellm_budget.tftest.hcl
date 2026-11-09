@@ -95,6 +95,16 @@ run "zero_renders_no_budget_key_whatever_the_period" {
   }
 }
 
+# Under the floor the chart's per-replica share rounds to nothing and its
+# render would refuse at the helm_release apply; the plan refuses it first.
+run "a_budget_under_a_cent_fails_the_plan" {
+  command = plan
+  variables {
+    litellm_budget = { usd = 0.005 }
+  }
+  expect_failures = [var.litellm_budget]
+}
+
 run "a_negative_budget_fails_the_plan" {
   command = plan
   variables {

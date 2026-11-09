@@ -976,7 +976,9 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   calls above, and a restarted pod starts its count over. The share is
   rendered with four decimals, always with a
   dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
-  LiteLLM treats a budget_limit of 0 as no limit.
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
 */}}
 {{- $budget := .budget | default dict -}}
 {{- $budgetUSD := float64 ($budget.usd | default 0) -}}

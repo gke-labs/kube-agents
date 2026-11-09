@@ -221,7 +221,7 @@
           "properties": {
             "usd": {
               "type": "number",
-              "minimum": 0
+              "anyOf": [{ "const": 0 }, { "minimum": 0.01 }]
             },
             "period": {
               "type": "string",

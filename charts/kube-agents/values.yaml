@@ -422,7 +422,9 @@ litellm:
   # A spend ceiling at the gateway, off by default. budget.usd is the most the
   # gateway spends, in US dollars as LiteLLM's cost map prices each response,
   # in every window of budget.period (LiteLLM's duration syntax: a whole
-  # number and s, m, h, d, w or mo). Above 0 it renders
+  # number and s, m, h, d, w or mo). On, at least 0.01: a smaller amount splits
+  # into shares the render refuses, so the schema, the installer and the
+  # Terraform example refuse it first. Above 0 it renders
   # router_settings.provider_budget_config for the model's provider, with the
   # ceiling split evenly across replicaCount: LiteLLM counts spend per gateway
   # process (the chart runs no Redis), so each replica holds one share. A
