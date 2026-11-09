@@ -678,6 +678,84 @@ class ConditionsBlockTest(unittest.TestCase):
         self.assertIn("not a string literal or constant", str(caught.exception))
 
 
+class FootprintBlocksTest(unittest.TestCase):
+    """The install footprint is rendered from the chart, onto the page and into JSON."""
+
+    def test_the_blocks_target_the_page_and_the_json_and_need_helm(self):
+        prefix = generate_docs.FOOTPRINT_BLOCK_PREFIX
+        self.assertEqual(generate_docs.BLOCKS[prefix][0], (generate_docs.FOOTPRINT_PAGE,))
+        self.assertEqual(generate_docs.BLOCKS[f"{prefix}-profiles"][0], (generate_docs.FOOTPRINT_PROFILES_JSON,))
+        for block_id in (prefix, f"{prefix}-profiles"):
+            self.assertTrue(generate_docs.needs_helm(block_id))
+            self.assertFalse(generate_docs.needs_go(block_id))
+
+    def test_a_json_target_is_replaced_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (True, "{}\n"))
+            target.write_text("{}\n", encoding="utf-8")
+            self.assertEqual(generate_docs.splice(target, "x", "{}\n"), (False, "{}\n"))
+            self.assertEqual(generate_docs.splice(target, "x", "[]\n"), (True, "[]\n"))
+
+    def test_without_helm_a_write_run_skips_the_footprint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "data.json"
+            target.write_text("stale\n", encoding="utf-8")
+            blocks = {"install-footprint-x": ((target,), lambda: "FRESH\n")}
+            out = io.StringIO()
+            with mock.patch.object(
+                generate_docs.shutil, "which", side_effect=lambda b: None if b == generate_docs.HELM_BINARY else "/bin/x"
+            ):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(generate_docs.main([], blocks), 0)
+            self.assertIn("skipped  [install-footprint-x]: needs `helm`", out.getvalue())
+            self.assertEqual(target.read_text(encoding="utf-8"), "stale\n")
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_a_hand_edited_figure_fails_the_check(self):
+        page_text = generate_docs.FOOTPRINT_PAGE.read_text(encoding="utf-8")
+        row = next(line for line in page_text.splitlines() if line.startswith("| `today`, GKE Standard |"))
+        cells = row.split(" | ")
+        cells[1] = str(int(cells[1]) + 1)
+        edited = page_text.replace(row, " | ".join(cells), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "prerequisites.md"
+            blocks = {"install-footprint": ((page,), generate_docs.install_footprint.render_tables)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_the_figures_come_from_the_chart_and_the_golden(self):
+        footprint = generate_docs.install_footprint
+        model = footprint.profiles_model()["profiles"]
+        self.assertIsNone(model["today-standard"]["sessionQuotaPods"])
+        self.assertEqual(model["next-standard"]["sessionQuotaPods"], footprint.golden_session_quota())
+        # Autopilot counts the credential proxy at its Autopilot requests.
+        self.assertGreater(
+            model["today-autopilot"]["requirements"]["requestsCpu"],
+            model["today-standard"]["requirements"]["requestsCpu"],
+        )
+        # Hindsight and the minter add chart pods, which the session quota counts.
+        self.assertGreater(model["next-hindsight-minter"]["sessionQuotaPods"], model["next-standard"]["sessionQuotaPods"])
+        self.assertEqual(footprint.cpu(2000), "2")
+        self.assertEqual(footprint.cpu(2756), "2756m")
+        self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
+        self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
+
+    @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
+    def test_a_next_mode_workload_the_table_does_not_list_fails_the_render(self):
+        footprint = generate_docs.install_footprint
+        with mock.patch.object(footprint, "NEXT_WORKLOADS", footprint.NEXT_WORKLOADS[1:]):
+            with self.assertRaises(SystemExit) as caught:
+                footprint.workloads_rows()
+        self.assertIn("a2aNats", str(caught.exception))
+        self.assertIn("NEXT_WORKLOADS", str(caught.exception))
+
+
 class ReplayBaselineMetricsTest(unittest.TestCase):
     """The replay proxy README's metric table is baseline_report.py's METRICS and CASE_METRICS."""
 

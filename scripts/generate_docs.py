@@ -36,12 +36,14 @@ prefix to refresh the CRD field pages and the conditions table beside the CRD
 YAML.
 
 Standard library only, deliberately -- this must run in CI and in a bare clone
-without installing anything. The one tool it calls out to is ``go``: the CRD
-field pages are read from the operator's Go API types by
+without installing anything. The two tools it calls out to are ``go`` and
+``helm``. The CRD field pages are read from the operator's Go API types by
 ``scripts/gen_crd_docs.go``, and the PlatformAgent conditions table from the
 controller package by ``scripts/gen_condition_docs.go``, both standard library,
-reading syntax, and run with the installed toolchain. Without ``go`` on PATH a
-write run skips those blocks and says so, so the other regions still refresh; ``--check`` fails, since a check
+reading syntax, and run with the installed toolchain. The install footprint is
+rendered from the chart by ``helm`` (``scripts/install_footprint.py``). Without
+``go`` or ``helm`` on PATH a write run skips the blocks that need it and says
+so, so the other regions still refresh; ``--check`` fails, since a check
 that cannot read the pages cannot vouch for them.
 """
 
@@ -59,6 +61,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import install_footprint
 from generate_sop_geography import SOP_REF_RE
 
 REPO = Path(__file__).resolve().parent.parent
@@ -174,6 +177,13 @@ CONDITIONS_TABLE_HEADER = (
     "| ---- | ------- | ------- |",
 )
 CONDITIONS_REASONS_PLACEHOLDER = "{reasons}"
+# The install footprint, rendered from the chart by helm (scripts/install_footprint.py):
+# the tables on the prerequisites page, and the same profiles' totals as JSON for the
+# installer's summary test. Both blocks need helm, as the CRD blocks need go.
+FOOTPRINT_BLOCK_PREFIX = "install-footprint"
+FOOTPRINT_PAGE = REPO / "docs/site/src/content/docs/install/prerequisites.md"
+FOOTPRINT_PROFILES_JSON = REPO / "tests/data/footprint_profiles.json"
+HELM_BINARY = install_footprint.HELM_BINARY
 # The paragraph above the tables, rendered once here rather than kept by hand
 # on each page, so the three pages cannot drift apart. It states what the
 # tables leave out: standard metadata, the inside of upstream Kubernetes
@@ -982,10 +992,14 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
         for kind, page in CRD_KINDS.items()
     },
     CONDITIONS_BLOCK: ((CONDITIONS_PAGE,), gen_platformagent_conditions),
+    FOOTPRINT_BLOCK_PREFIX: ((FOOTPRINT_PAGE,), install_footprint.render_tables),
+    f"{FOOTPRINT_BLOCK_PREFIX}-profiles": ((FOOTPRINT_PROFILES_JSON,), install_footprint.profiles_json),
 }
 
 # Generated artifacts that are a whole file rather than a region inside a
-# hand-written document, written verbatim from their generator.
+# hand-written document, written verbatim from their generator: a block whose
+# target has one of these suffixes replaces the file, markers and all.
+WHOLE_FILE_SUFFIXES = (".json",)
 
 
 # --------------------------------------------------------------------------- #
@@ -1019,6 +1033,10 @@ def splice(path: Path, block_id: str, body: str, text: str | None = None) -> tup
     the text the previous one produced, so the last result carries them all.
     Left ``None``, the file is read from disk.
     """
+    if path.suffix in WHOLE_FILE_SUFFIXES:
+        if text is None:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        return body != text, body
     if text is None:
         text = path.read_text(encoding="utf-8")
     begin, end, notice = region_markers(path, block_id)
@@ -1112,6 +1130,19 @@ def needs_go(block_id: str) -> bool:
     return block_id.startswith(CRD_FAMILY_PREFIX)
 
 
+def needs_helm(block_id: str) -> bool:
+    """Whether a block's generator renders the chart."""
+    return block_id.startswith(FOOTPRINT_BLOCK_PREFIX)
+
+
+def missing_tool(block_id: str) -> str | None:
+    """The tool a block needs that is not on PATH, if any."""
+    for needed, binary in ((needs_go, GO_BINARY), (needs_helm, HELM_BINARY)):
+        if needed(block_id) and shutil.which(binary) is None:
+            return binary
+    return None
+
+
 def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -1135,13 +1166,15 @@ def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     args = ap.parse_args(argv)
 
     selected = select_blocks(args.blocks, args.block_prefix, blocks)
-    # A write run on a machine without Go still refreshes every region that
-    # needs none; the CRD pages are reported skipped, not silently left. A
+    # A write run on a machine without Go or helm still refreshes every region
+    # that needs neither; the others are reported skipped, not silently left. A
     # block asked for by name is wanted, so it fails as it would in --check.
-    if not args.check and not args.blocks and not args.block_prefix and shutil.which(GO_BINARY) is None:
-        for block_id in [b for b in selected if needs_go(b)]:
-            print(f"  skipped  [{block_id}]: needs `{GO_BINARY}` on PATH; regions that need none are refreshed")
-            del selected[block_id]
+    if not args.check and not args.blocks and not args.block_prefix:
+        for block_id in list(selected):
+            binary = missing_tool(block_id)
+            if binary:
+                print(f"  skipped  [{block_id}]: needs `{binary}` on PATH; regions that need none are refreshed")
+                del selected[block_id]
 
     targets = collect_targets(selected)
 
