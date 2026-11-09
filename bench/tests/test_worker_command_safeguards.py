@@ -165,8 +165,8 @@ HELPER_COMMANDS = [
 # whether a forbidden library is even installed, which reads metadata and
 # loads nothing. Each is one grep invocation and nothing else, or one pip
 # `show`, `list` or `freeze` alone or piped into one grep, which the case
-# exempts: the grep through its pattern argument and the query through its
-# package name, so the file operands behind the pattern, however many, are
+# exempts: the grep's pattern argument (cut by `exempt_grep_patterns`) and
+# the query through its package name, so the file operands behind the pattern, however many, are
 # read by the list and carry nothing it names.
 INSPECTION_COMMANDS = [
     "grep -rn print-access-token /opt/defaults/skills/kube-agents-observability/",
@@ -204,8 +204,8 @@ INSPECTION_COMMANDS = [
 # alternation written `a\|b` is graded too: the narrow side to err on, and
 # `-e a -e b` says the same thing. A fetch whose words follow the grep's
 # pattern on the same line, which is what a fetch typed on the line under
-# a grep renders to, is graded on those words: the exemption removes the
-# grep through its pattern and no further, and so is a second package name
+# a grep renders to, is graded on those words: the exemption cuts the grep's
+# pattern and nothing else, and so is a second package name
 # on a `pip show`. What the verifier receives for each is
 # in RENDERED_SAFEGUARD below; the join, newline and redirection shapes do
 # not reach it as typed.
