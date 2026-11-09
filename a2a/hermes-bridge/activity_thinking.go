@@ -28,13 +28,11 @@ var (
 	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
 	// A credential after an HTTP auth scheme word wherever the word stands
 	// (a header value, a curl -H argument, a JSON map, a header list's
-	// value, a table row, prose). With no Authorization key in front of it
-	// the scheme word is just a word, so the value must be token-shaped
-	// (valueTokenShaped): "basic monitoring" and "Bearer tokens" are prose.
-	// Where an Authorization key does stand in front, the key=value rule
-	// owns the pair and redacts the value whatever its shape
+	// value, a table row, prose), as authSchemeCredentialRedacted says.
+	// Where an Authorization key stands in front, the key=value rule owns
+	// the pair and redacts the value whatever its shape
 	// (authHeaderKVLeadPattern).
-	authSchemeCredentialPattern = regexp.MustCompile(`(?i)\b(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+([^\s"'\x60,;)\]}>|]+)`)
+	authSchemeCredentialPattern = regexp.MustCompile(`(?i)\b(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+([^\s"'\x60,;)\]}>|]+)`)
 	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)authorization\\?["']?[ \t]*[:=][ \t]*\\?["']?[ \t]*$`)
 	// "Authorization", "<scheme> <credential>": a header setter call or a
 	// header pair in code, the credential redacted whatever its shape.
@@ -975,15 +973,43 @@ func inlineSecretKey(k string) bool {
 	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
 }
 
-// strongSecretKey says whether a key inlineSecretKey accepts names the
-// credential itself: its last component is the credential word
-// (db_password, accessToken, X-Api-Key, Authorization, PGPASSWORD,
-// AWS_CREDS, tls.key). The value under such a key is redacted unless it is
-// plainly not a secret (keyedValueRedacted). Any other accepted key carries
-// the word somewhere else (token-minter, credential-proxy,
-// binaryAuthorization.evaluationMode, a token-ttl) or is one of the
-// ambiguous short words (pass, pwd, auth, which ordinary text uses as
-// labels), and its value is redacted only when token-shaped.
+// The value policy under a key inlineSecretKey accepts depends on what the
+// key names (secretKeyClassOf):
+//
+//   - a strong key names the credential itself: its last component is the
+//     credential word (db_password, accessToken, X-Api-Key, Authorization,
+//     PGPASSWORD, AWS_CREDS, tls.key). Its value is redacted unless it is
+//     plainly not a value (valueNotASecret);
+//   - an ambiguous key is one of the short words ordinary text also uses as
+//     a label (pass, pwd, auth). Its value is redacted unless it is plainly
+//     not a value, a path, prose (more than one word, or a lower-case word
+//     the sentence runs on from: "Fix auth: redirect loop"); one of six or
+//     more bytes holding a digit is redacted whatever follows it;
+//   - any other accepted key carries the credential word somewhere other
+//     than last (token-minter, credential-proxy,
+//     binaryAuthorization.evaluationMode, token-ttl): it names something
+//     else, a container, a proxy, a field, a setting, and its value is
+//     redacted only when token-shaped (valueTokenShaped).
+type secretKeyClass int
+
+const (
+	otherSecretKey secretKeyClass = iota
+	ambiguousSecretKey
+	strongSecretKeyClass
+)
+
+func secretKeyClassOf(k string) secretKeyClass {
+	switch {
+	case strongSecretKey(k):
+		return strongSecretKeyClass
+	case ambiguousSecretKeyPattern.MatchString(k) && !secretLookingKey(k):
+		return ambiguousSecretKey
+	}
+	return otherSecretKey
+}
+
+// strongSecretKey says whether a key's last component is the credential
+// word (secretKeyClass).
 func strongSecretKey(k string) bool {
 	return strongSecretKeyEndPattern.MatchString(k) || strongSecretCamelEndPattern.MatchString(k) ||
 		redactedUpperSuffixPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
@@ -992,17 +1018,28 @@ func strongSecretKey(k string) bool {
 var (
 	strongSecretKeyEndPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|apikey|private[_-]?key|privatekey|ssh[_-]?key|signing[_-]?key|key[_-]?data|access[_-]?key|secret[_-]?key|credential|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)s?$|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	strongSecretCamelEndPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Cookie|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Access[_-]?Key|Secret[_-]?Key|Credential)s?$`)
+	ambiguousSecretKeyPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth)(?:$|[_.-])`)
 	// A value that stands for a secret rather than being one: an
 	// environment reference, a command substitution, a <placeholder>.
 	secretPlaceholderPattern = regexp.MustCompile(`^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(.*\)|<[^<>]+>)$`)
 )
 
-// nonSecretLiterals are the values a credential key takes in config and
-// prose that are not a credential: a YAML or JSON literal, a switch.
-var nonSecretLiterals = map[string]bool{
+// credentialStateWords are what text says a credential is, or what a
+// credential key is set to, that is not a value: a literal, a switch, a
+// state. A short list on purpose: after an explicit credential word any
+// other value is redacted.
+var credentialStateWords = map[string]bool{
 	"true": true, "false": true, "null": true, "nil": true, "none": true, "yes": true, "no": true,
-	"on": true, "off": true, "enabled": true, "disabled": true, "unset": true, "empty": true,
-	"required": true, "optional": true, "n/a": true,
+	"on": true, "off": true, "enabled": true, "disabled": true, "set": true, "unset": true,
+	"empty": true, "blank": true, "required": true, "optional": true, "n/a": true,
+	"mounted": true, "rotated": true, "expired": true, "revoked": true, "valid": true, "invalid": true,
+	"stored": true, "missing": true, "present": true, "absent": true, "configured": true,
+	"unconfigured": true, "unchanged": true, "changed": true, "correct": true, "incorrect": true,
+	"wrong": true, "encoded": true, "encrypted": true, "hashed": true, "redacted": true,
+	"masked": true, "hidden": true, "available": true, "unavailable": true, "unknown": true,
+	"stale": true, "used": true, "unused": true, "needed": true, "not": true, "a": true, "an": true,
+	"the": true, "managed": true, "generated": true, "provided": true, "injected": true,
+	"exposed": true, "leaked": true, "compromised": true, "only": true, "same": true, "different": true,
 }
 
 // trimValueEdges strips what wraps a value in text and is not part of it:
@@ -1017,28 +1054,68 @@ func trimValueEdges(v string) string {
 	return strings.Trim(v, "`\"'")
 }
 
-// keyedValueRedacted says whether the value under a key inlineSecretKey
-// accepts is redacted: never one with no letter or digit (a line
-// continuation, "{", markdown), a marker already placed, or a placeholder;
-// under a strong key anything else but a non-secret literal or a short
-// number (max_tokens: 4096); under any other key only a token-shaped value.
-func keyedValueRedacted(key, value string) bool {
-	return valueRedacted(strongSecretKey(key), value)
+// valueNotASecret says a value after an explicit credential word is plainly
+// not a value: no letter or digit in it (a line continuation, "{",
+// markdown), a marker already placed, a placeholder, a state word (or a
+// compound ending in one: base64-encoded, read-only), or a short number
+// (max_tokens: 4096).
+func valueNotASecret(v string) bool {
+	if !hasAlnum(v) || strings.Contains(v, redactedValue) || secretPlaceholderPattern.MatchString(v) {
+		return true
+	}
+	lower := strings.ToLower(v)
+	if credentialStateWords[lower] {
+		return true
+	}
+	if i := strings.LastIndexByte(lower, '-'); i > 0 && credentialStateWords[lower[i+1:]] {
+		return true
+	}
+	return len(v) <= 5 && isAllDigits(v)
 }
 
-// valueRedacted is keyedValueRedacted with the key's strength decided.
-func valueRedacted(strongKey bool, value string) bool {
+// keyedValueRedacted says whether the value under a key inlineSecretKey
+// accepts is redacted, as its secretKeyClass says. followedByWord says the
+// text after the value runs on as a sentence (a space, then a lower-case
+// word), which only the ambiguous keys read.
+func keyedValueRedacted(key, value string, followedByWord bool) bool {
+	return classValueRedacted(secretKeyClassOf(key), value, followedByWord)
+}
+
+func classValueRedacted(class secretKeyClass, value string, followedByWord bool) bool {
 	v := trimValueEdges(value)
-	if !hasAlnum(v) || strings.Contains(v, redactedValue) || secretPlaceholderPattern.MatchString(v) {
+	if valueNotASecret(v) {
 		return false
 	}
-	if strongKey {
-		if nonSecretLiterals[strings.ToLower(v)] {
+	switch class {
+	case strongSecretKeyClass:
+		return true
+	case ambiguousSecretKey:
+		if strings.HasPrefix(v, "/") || strings.HasPrefix(v, "~/") || strings.HasPrefix(v, "./") || strings.Contains(v, "://") {
 			return false
 		}
-		return !(len(v) <= 5 && isAllDigits(v))
+		if len(v) >= 6 && strings.ContainsAny(v, "0123456789") {
+			return true
+		}
+		if strings.ContainsAny(v, " \t") {
+			return false
+		}
+		return !(followedByWord && isLowerWord(v))
 	}
 	return valueTokenShaped(v)
+}
+
+// proseValueRedacted is the prose rule's test: after an explicit credential
+// word and a verb ("the password is ..."), the value is redacted unless it
+// is plainly not one (valueNotASecret) or a word too short to be one.
+func proseValueRedacted(value string) bool {
+	v := trimValueEdges(value)
+	return !valueNotASecret(v) && len(v) >= 3
+}
+
+// runsOnAsSentence says whether rest (the text after a value) continues a
+// sentence: a space, then a lower-case letter.
+func runsOnAsSentence(rest string) bool {
+	return len(rest) >= 2 && rest[0] == ' ' && rest[1] >= 'a' && rest[1] <= 'z'
 }
 
 // valueTokenShaped says whether a value looks like a credential rather than
@@ -1155,7 +1232,7 @@ var inlineScrubRules = []inlineScrubRule{
 		return redactSubmatch(authHeaderPairPattern, s, 1, sink, nil)
 	}},
 	{"auth-scheme", func(s string, sink secretSink) string {
-		return redactSubmatch(authSchemeCredentialPattern, s, 1, sink, authSchemeCredentialRedacted)
+		return redactSubmatch(authSchemeCredentialPattern, s, 2, sink, authSchemeCredentialRedacted)
 	}},
 	{"url-userinfo", func(s string, sink secretSink) string {
 		return redactSubmatch(inlineURLCredPattern, s, 2, sink, nil)
@@ -1166,7 +1243,7 @@ var inlineScrubRules = []inlineScrubRule{
 	{"cli-flag", scrubCLISecretFlags},
 	{"prose", func(s string, sink secretSink) string {
 		return redactSubmatch(proseSecretPattern, s, 2, sink, func(s string, m []int) bool {
-			return valueTokenShaped(trimValueEdges(s[m[4]:m[5]]))
+			return proseValueRedacted(s[m[4]:m[5]])
 		})
 	}},
 	{"key-value", scrubInlineKVSecrets},
@@ -1224,13 +1301,35 @@ func redactSubmatch(re *regexp.Regexp, s string, group int, sink secretSink, kee
 // authSchemeCredentialRedacted says whether a credential after a scheme
 // word is redacted here: not where an Authorization key leads it on its
 // line (the key=value rule takes the whole value there, a Digest's
-// parameters included), and elsewhere only when token-shaped.
+// parameters included). After Bearer or Basic, which prose uses only as an
+// adjective, any credential of 8 bytes or more is redacted unless it is one
+// word in lower case or capitalised ("basic monitoring", "Basic
+// Authentication"). After the other scheme words, which are ordinary
+// English too (a token, a digest), only a token-shaped one.
 func authSchemeCredentialRedacted(s string, m []int) bool {
 	lineStart := strings.LastIndexByte(s[:m[0]], '\n') + 1
 	if authHeaderKVLeadPattern.MatchString(s[lineStart:m[0]]) {
 		return false
 	}
-	return valueTokenShaped(trimValueEdges(s[m[2]:m[3]]))
+	cred := trimValueEdges(s[m[4]:m[5]])
+	switch strings.ToLower(s[m[2]:m[3]]) {
+	case "bearer", "basic":
+		return len(cred) >= 8 && !isPlainWord(cred)
+	}
+	return valueTokenShaped(cred)
+}
+
+// isPlainWord says whether w is letters only, in lower case after an
+// optional capital: a dictionary word's spelling, not a token's.
+func isPlainWord(w string) bool {
+	if w == "" {
+		return false
+	}
+	start := 0
+	if w[0] >= 'A' && w[0] <= 'Z' {
+		start = 1
+	}
+	return start < len(w) && isLowerWord(w[start:])
 }
 
 // pgpassEntryRedacted tells a password file entry from a timestamp or an
@@ -1290,7 +1389,7 @@ func flagValueRedacted(name, sep, value string) bool {
 	if sep != "=" && sep != ":" && strings.HasPrefix(value, "-") {
 		return false
 	}
-	return keyedValueRedacted(name, value)
+	return keyedValueRedacted(name, value, false)
 }
 
 func scrubYAMLSecretBlocks(s string, sink secretSink) string {
@@ -1379,13 +1478,9 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 			rest = rest[sloc[1]:]
 		}
 		lineLeading := isLineLeadingKVKey(s, matchStart)
-		strongKey := strongSecretKey(key)
-		label := sep == ':' && hadPostSepSpace && openQuote == "" && closeQuote == "" && !lineLeading && isLowerWord(key)
-		redacts := func(v string) bool {
-			if label && isLowerWord(strings.ToLower(trimValueEdges(v))) {
-				return false
-			}
-			return valueRedacted(strongKey, v)
+		class := secretKeyClassOf(key)
+		redacts := func(v, after string) bool {
+			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
 		}
 		if openQuote != "" && closeQuote == "" && sep == ':' && !strings.HasPrefix(rest, `"`) && !strings.HasPrefix(rest, `'`) && !strings.HasPrefix(rest, `\"`) && !strings.HasPrefix(rest, `\'`) {
 			var closeIdx int
@@ -1394,7 +1489,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 			} else {
 				closeIdx = findUnescapedQuote(rest, openQuote[0])
 			}
-			if closeIdx >= 0 && redacts(rest[:closeIdx]) {
+			if closeIdx >= 0 && redacts(rest[:closeIdx], "") {
 				sb.WriteString(redactedValue)
 				sink.emit(rest[:closeIdx])
 				pos = matchEnd + closeIdx
@@ -1416,7 +1511,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 			} else if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
 				val = afterOpen[:nl]
 			}
-			if !redacts(val) {
+			if !redacts(val, "") {
 				pos = matchEnd
 				continue
 			}
@@ -1446,7 +1541,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 			if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(val); sloc != nil && closeIdx >= 0 {
 				schemeEnd = sloc[1]
 			}
-			if !redacts(val[schemeEnd:]) {
+			if !redacts(val[schemeEnd:], "") {
 				pos = matchEnd
 				continue
 			}
@@ -1478,7 +1573,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 				}
 				lineRest := strings.TrimRight(rest[:lineEnd], " \t")
 				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
-					if !redacts(lineRest) {
+					if !redacts(lineRest, "") {
 						pos = matchEnd
 						continue
 					}
@@ -1502,7 +1597,7 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 				}
 				valLen++
 			}
-			if valLen == 0 || !redacts(rest[:valLen]) {
+			if valLen == 0 || !redacts(rest[:valLen], rest[valLen:]) {
 				pos = matchEnd
 				continue
 			}

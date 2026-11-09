@@ -142,6 +142,32 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 			forbidden: []string{"c3ludGhldGljOnBhc3MtMDAwMQ==", "Synth3ticT0kenValue0001", "Synth3tic-Pass-0001", "Synth3ticT0kenValue0002"},
 			wantSub:   []string{"Basic [redacted] was sent.", "The token is [redacted].", "pass=[redacted]", "auth: [redacted]"},
 		},
+		// After an explicit credential word the rules fail closed: a plain
+		// word is a value unless it is a state word.
+		{
+			name:      "fail closed: a plain-word password after a credential noun and verb",
+			in:        "The password is quietpasture. The secret was meadowlark, and the token is expired.",
+			forbidden: []string{"quietpasture", "meadowlark"},
+			wantSub:   []string{"The password is [redacted].", "The secret was [redacted],", "the token is expired."},
+		},
+		{
+			name:      "fail closed: a lower-case word under a strong key, mid-sentence",
+			in:        "Log in with password: quietpasture and then token: meadowlark today",
+			forbidden: []string{"quietpasture", "meadowlark"},
+			wantSub:   []string{"password: [redacted] and", "token: [redacted] today"},
+		},
+		{
+			name:      "fail closed: an ambiguous key's word value, and one with a digit before more words",
+			in:        "auth: quietpasture\nUse pass: synth3t1c and more",
+			forbidden: []string{"quietpasture", "synth3t1c"},
+			wantSub:   []string{"auth: [redacted]", "pass: [redacted] and more"},
+		},
+		{
+			name:      "fail closed: a letters-only mixed-case credential after Bearer",
+			in:        "the client sent Bearer SynThEtIcToKeNvAlUe to the API",
+			forbidden: []string{"SynThEtIcToKeNvAlUe"},
+			wantSub:   []string{"sent Bearer [redacted] to the API"},
+		},
 	}
 	for _, tc := range positives {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,7 +206,7 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"Use --password-file /etc/app/db-pass and --token-ttl 30m.",
 		"The node fe80:0:0:0:200:f8ff:fe21:67cf answered at 10:15:30:123:456 UTC.",
 		"See http://localhost:8080/healthz and https://example.test/docs/page.",
-		"Rotate the token: run `kubectl create token app-sa` and update the Secret.",
+		"Enable Basic Authentication on the ingress; the token is valid and the password is unchanged.",
 		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
 		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
 	}
