@@ -70,14 +70,18 @@ verification_spec:
         - 'github\.com/example-org/gitops/issues/75[\s\S]*github\.com/example-org/gitops/issues/75'
 
   # Answer first: the address comes after the opener, never as the first
-  # sentence. The first sentence ends at the first period, question mark or
-  # exclamation mark.
-  - name: the-link-is-not-the-first-sentence
+  # words. The opener closes on the wave, with no sentence punctuation of its
+  # own, so the first pattern forbids the address anywhere before a wave or a
+  # sentence end, and the second forbids it within the three words that follow
+  # the wave.
+  - name: the-link-is-not-the-first-words
     role: objective
     mode: assert
     check:
       type: report_contains
-      forbidden_patterns: ['\A[^.!?]*github\.com/example-org/gitops/issues/75']
+      forbidden_patterns:
+        - '\A[^👋.!?]*github\.com/example-org/gitops/issues/75'
+        - '👋\s*(?:\S+\s+){0,2}\S*github\.com/example-org/gitops/issues/75'
 
   - name: says-the-report-was-filed-as-an-issue
     role: objective
