@@ -7,7 +7,7 @@ meanwhile said "no issue yet, file one". This is the bot filing it:
 
     the state becomes OUTAGE
     and health.json names no tracking issue (case-notes.yaml has none)
-    and no OPEN issue already names the same cases
+    and no open issue carries the marker or names the same cases
     -> create one, labelled `presubmit-gate`, and say "Tracking #NNN"
 
 The second shape (#1478): on 2026-09-11 five nodes of the Prow build cluster
@@ -45,7 +45,9 @@ The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
 deadline kills and the pool findings, in the title -- wins and the bot adopts
 their issue and labels it `presubmit-gate` (#3664: the open issue for a
-drifted fixture carried `bug`/`Infra` and was never found). One rule for a
+drifted fixture carried `bug`/`Infra` and was never found); the bot's own
+outage issue is re-found by its `gate-outage` marker, whose case list is the
+only place its body names the cases. One rule for a
 title: any open issue. One rule for a body: a `presubmit-gate` issue, or an
 unlabelled one whose body also carries a word the condition's own evidence
 uses ("drift", "pending" for a fixture; "NotReady", "lost" for a node), so a
@@ -79,10 +81,10 @@ import re
 import sys
 
 try:
-    from .health import parse_iso, pool_drift_split
+    from .health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from health import parse_iso, pool_drift_split
+    from health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 
 LABEL = "presubmit-gate"
 # Who an infrastructure issue goes to: top-level keys of domains.yaml,
@@ -150,11 +152,22 @@ LOST_PODS_BODY_WORDS = ("notready", "not ready", "lost")
 # How a name is found in a title or body: not preceded by a letter, digit or
 # underscore ("kill" is not in "skill" nor in "deadline_kill").
 NAME_START_RE = r"(?<![a-z0-9_]){name}"
-# The other direction: the deadline body quotes only the deadline evidence
-# lines. health.py's evidence also carries per-case collapse lines whenever a
-# case clears the shared-break floors, and a body naming those cases would
-# be adopted as the tracker of a break that fires later.
+# The other direction: each body quotes only its own condition's evidence
+# lines, by their fixed start (public_evidence). health.py's evidence also
+# carries per-case collapse lines whenever a case clears the shared-break
+# floors (a body naming those cases would be adopted as the tracker of a
+# break that fires later) and the watched periodics' lines, which quote a
+# build log's last error line; the repository is public, and the incident
+# brief carries the rest. The fixture scan's lines start with the role
+# (health's scan loop: "<role> drifted on N pool project(s) …").
 DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
+LOST_PODS_EVIDENCE_PREFIX = EVIDENCE_LOST_PODS
+FIXTURE_DRIFT_EVIDENCE_PREFIX = "{role} " + FIXTURE_SCAN.verb + " "
+# A second layer under the prefixes: the lines that grade a case
+# (health.shared_break's per-case collapse line, its coverage line and the
+# PR-caused lines, which health.assess concatenates into health["evidence"]
+# whether or not the break fires) are dropped from every body.
+PUBLIC_EVIDENCE_DROP_RE = re.compile("|".join((re.escape(EVIDENCE_CASE_COLLAPSE), "^" + re.escape(EVIDENCE_CASES_EXPLAIN), "^" + re.escape(EVIDENCE_PR_CAUSED))))
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -166,22 +179,22 @@ ISSUE_BODY_MAX_CHARS = 65536
 ADDRESSEE_RESERVE_CHARS = 256
 POOL_DRIFT_PROJECTS_OMITTED = "- … and {count} more project(s) omitted to fit the issue; pool-state.json carries every project's repair command (docs/ci-health.md, The pool-state scan)"
 
-TITLE = "Smoke gate outage: {count} {noun} failing on every PR since {since}"
-CASE_NOUN = ("case", "cases")
+# The outage issue names no failing case and quotes no evidence line: the
+# repository is public, and both are on the incident brief it links. Its
+# marker carries the case ids (sorted, comma-joined; an HTML comment does not
+# render), which is how the bot re-finds its own issue when the title or the
+# state file no longer leads to it, as the pool-drift marker does.
+OUTAGE_MARKER = "<!-- kube-agents-bot:gate-outage cases={cases} -->"
+OUTAGE_MARKER_RE = re.compile(r"<!-- kube-agents-bot:gate-outage cases=([^ >]*) -->")
+TITLE = "Smoke gate outage since {since}"
 BODY = """\
-The smoke gate (`{job}`) is in OUTAGE: the cases below fail every repetition on every pull request that runs them, so a red on an open PR is not that PR's code.
-
-**Failing cases**
-
-{cases}
+{marker}
+The smoke gate (`{job}`) is in OUTAGE: a shared break turns every pull request's run red, so a red on an open PR is not that PR's code.
 
 **Window:** since {since} ({since_iso}), {prs} PRs red so far.
 **Class:** {cause} (`{condition}`).
-**Evidence:**
 
-{evidence}
-
-Incident brief: {brief}
+The failing cases and the evidence are on the incident brief: {brief}
 
 Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue.
 """
@@ -362,23 +375,19 @@ def as_issue(payload: dict | None, condition: str | None = None) -> dict | None:
 
 
 def render_title(health: dict, since_text: str) -> str:
-    cases = health.get("failing_cases") or []
-    return TITLE.format(count=len(cases), noun=CASE_NOUN[len(cases) != 1], since=since_text)
+    return TITLE.format(since=since_text)
 
 
 def render_body(health: dict, since_text: str, brief_link: str) -> str:
-    cases = health.get("failing_cases") or []
     incident = health.get("incident") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
     return BODY.format(
+        marker=OUTAGE_MARKER.format(cases=",".join(sorted(health.get("failing_cases") or []))),
         job=JOB_NAME,
-        cases="\n".join(f"- `{case}`" for case in cases),
         since=since_text,
         since_iso=health.get("since") or "?",
         prs=len(incident.get("prs") or []),
-        cause=health.get("cause") or "shared break",
+        cause=public_cause(health),
         condition=health.get("condition") or "?",
-        evidence="\n".join(evidence) or NO_EVIDENCE,
         brief=brief_link,
     )
 
@@ -411,11 +420,21 @@ def render_lost_pods_title(health: dict, when_text: str) -> str:
     return title
 
 
+def public_evidence(health: dict, prefixes: tuple[str, ...] | None = None) -> list[str]:
+    """``health["evidence"]`` as a public body may quote it: given
+    ``prefixes``, only the lines that start with one of them (the condition's
+    own), and never a line that grades a case (PUBLIC_EVIDENCE_DROP_RE)."""
+    lines = [str(line) for line in health.get("evidence") or []]
+    if prefixes is not None:
+        lines = [line for line in lines if line.startswith(prefixes)]
+    return [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
+
+
 def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     nodes = incident.get("nodes") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health, (LOST_PODS_EVIDENCE_PREFIX,))]
     return LOST_PODS_BODY.format(
         job=JOB_NAME,
         when=when_text,
@@ -438,7 +457,7 @@ def render_deadline_kill_title(health: dict, since_text: str) -> str:
 def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in health.get("evidence") or [] if str(line).startswith(DEADLINE_EVIDENCE_PREFIX)]
+    evidence = [f"- {line}" for line in public_evidence(health, (DEADLINE_EVIDENCE_PREFIX,))]
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,
@@ -473,7 +492,7 @@ def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) ->
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
     drift = incident.get("drift") or {}
-    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    evidence = [f"- {line}" for line in public_evidence(health, tuple(FIXTURE_DRIFT_EVIDENCE_PREFIX.format(role=role) for role in roles))]
     per_project = []
     for project in sorted(drift):
         per_project.append(f"- `{project}`")
@@ -533,7 +552,7 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
         consequence = POOL_DRIFT_REDS_RUNS
     drift = incident.get("drift") or {}
     repairs = incident.get("repairs") or {}
-    evidence = [f"- {line}" for line in _pool_evidence(health.get("evidence") or [], findings)]
+    evidence = [f"- {line}" for line in _pool_evidence(public_evidence(health), findings)]
     blocks = []
     for project in sorted(drift):
         block = [f"- `{project}`"]
@@ -684,9 +703,9 @@ class Tracker:
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
         bodies. `skip` is the numbers the episode already carries: the bot's
-        own fixture or node issue quotes the evidence, case lines included,
-        and must not become the break's tracker as well, or its close under
-        the live break takes the break's citation with it."""
+        own fixture or node issue quotes its own evidence lines only
+        (public_evidence) and must not become the break's tracker as well, or
+        its close under the live break takes the break's citation with it."""
         self._skip = {int(number) for number in skip}
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
@@ -700,7 +719,9 @@ class Tracker:
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
-        found = self.existing(cases)
+        # The bot's own by its marker (the body names no case otherwise),
+        # else a human's that names every case.
+        found = self.existing(cases, marker=OUTAGE_MARKER_RE) or self.existing(cases)
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every failing case)")
             return dict(found, condition=condition) if condition else found

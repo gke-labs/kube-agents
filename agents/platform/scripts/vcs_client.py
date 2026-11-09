@@ -1192,6 +1192,11 @@ def snapshot(
             code=DESTINATION_NOT_EMPTY,
         )
     payload: dict = {"repository": repository}
+    # The broker refuses a tree whose files pass this bound, with the entries a
+    # caller can ask for one by one; a tree it served and this side then
+    # refused would come with none. A bound below 0 is this side's alone.
+    if max_bytes >= 0:
+        payload["maxBytes"] = max_bytes
     if ref:
         payload["ref"] = ref
     if paths:

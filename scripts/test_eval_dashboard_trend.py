@@ -219,7 +219,9 @@ class NightOneTest(unittest.TestCase):
     def test_the_night_is_joined_to_the_collectors_nightly_run(self):
         (night,) = self.doc["nights"]
         self.assertEqual(night, {"id": f"build:{NIGHT_1_BUILD}", "at": "2026-09-17T05:54:31Z", "build": NIGHT_1_BUILD, "commit": "b458323d9c1dbf36551b498e6ab097828b4c2cba",
-                                 "started": "2026-09-17T00:00:10+00:00", "log_url": NIGHT_1_RUN["log_url"], "cases": 4})
+                                 # The run's log_url is a Spyglass link into the private nightly bucket: linked in the Console.
+                                 "started": "2026-09-17T00:00:10+00:00", "cases": 4,
+                                 "log_url": f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/{NIGHT_1_BUILD}"})
         # Without the run in data.json the night stands on its own stamp.
         alone = trend.trend_document(store_doc(night_one_records()), data_with_nightly(DOMAINS))
         self.assertEqual((alone["nights"][0]["started"], alone["nights"][0]["log_url"]), (None, None))

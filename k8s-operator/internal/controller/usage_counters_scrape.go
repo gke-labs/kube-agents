@@ -98,8 +98,17 @@ const (
 	// chatFeedbackNegativeSeries is the chat plugin's count of thumbs-down
 	// reactions a person put on the bot's messages, summed over its platform
 	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
-	// it, and no A2A family joins it.
+	// it.
 	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
+	// a2aAnswerFeedbackSeries is the A2A gateway's count of the ratings
+	// verified senders gave its answers, by platform and rating: under
+	// a2aRatingDown the next-mode half of negativeFeedbackTotal, under
+	// a2aRatingUp the whole of positiveFeedbackTotal, each summed over the
+	// family's other labels (a2a/gateway/metrics.go).
+	a2aAnswerFeedbackSeries = "kubeagents_a2a_gateway_answer_feedback_total"
+	a2aRatingLabel          = "rating"
+	a2aRatingUp             = "up"
+	a2aRatingDown           = "down"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -189,6 +198,13 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// The series' three labels, the cluster's triple as the watcher's profile
+	// names it, read into usageClusterGauges.Refs for the ScopeUndeclared
+	// condition (usage_scope.go). Label values are the peer's text and are
+	// validated where they are printed, not here.
+	clusterUpClusterLabel  = "cluster"
+	clusterUpProjectLabel  = "project"
+	clusterUpLocationLabel = "location"
 	// usageClusterGaugeCeiling bounds the series counted into the gauges in one
 	// body. The gauges are a reading, not an accumulation, so the per-poll delta
 	// ceiling does not reach them; this is what bounds what a body on the
@@ -370,6 +386,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return kanbanGaveUpSeries, nil
 	case usageCounterNegativeFeedback:
 		return chatFeedbackNegativeSeries, nil
+	case usageCounterPositiveFeedback:
+		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
@@ -380,7 +398,9 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 // each with its own filter: the chat counter and the chat sessions come from
 // the chat_metrics plugin on a gateway pod and from the A2A gateway on its own
 // pod, under the same label set; the errored counter comes from the plugin
-// whole and from the A2A gateway's task terminals under the errored states.
+// whole and from the A2A gateway's task terminals under the errored states;
+// the thumbs-downs come from the plugin whole and from the A2A gateway's
+// answer ratings under the down rating.
 func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
@@ -389,6 +409,8 @@ func usageSiblingsFor(counter string) []usageSibling {
 		return []usageSibling{{family: a2aSessionsSeries}}
 	case usageCounterChatTurnsErrored:
 		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
+	case usageCounterNegativeFeedback:
+		return []usageSibling{{family: a2aAnswerFeedbackSeries, filter: usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}}}
 	}
 	return nil
 }
@@ -586,6 +608,20 @@ type usageDataVolume struct {
 type usageClusterGauges struct {
 	Registered int64
 	Monitored  int64
+	// Refs is every series' triple as the watcher labelled it, in body order,
+	// one per Registered; read by the ScopeUndeclared condition (usage_scope.go).
+	// The values are the peer's text, unvalidated here.
+	Refs []usageClusterRef
+}
+
+// usageClusterRef is one cluster_up series' labels: the cluster's name, project
+// and location as its profile's identity names them. The watcher's directly
+// reached cluster carries an empty project and location until its profile is
+// absorbed.
+type usageClusterRef struct {
+	Name     string
+	Project  string
+	Location string
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
@@ -856,6 +892,11 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						if value == clusterUpMonitored {
 							clusters.Monitored++
 						}
+						clusters.Refs = append(clusters.Refs, usageClusterRef{
+							Name:     usageLabelValue(metric, clusterUpClusterLabel),
+							Project:  usageLabelValue(metric, clusterUpProjectLabel),
+							Location: usageLabelValue(metric, clusterUpLocationLabel),
+						})
 						continue
 					}
 					if pairs != nil && name == toolInvocationsSeries {
