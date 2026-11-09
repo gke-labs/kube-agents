@@ -349,3 +349,42 @@ func TestScrubInlineSecretsKeepsTheStrictnessOfBefore(t *testing.T) {
 		}
 	}
 }
+
+// The markdown rules stay deny-by-default; each false positive the
+// nightlies showed is kept out by an exclusion tied to its own non-secret
+// shape (a status word or a tally in the parenthetical, a listing's header
+// words, a feature-name qualifier, a state word after "is"), so the
+// near-identical credential layouts are still redacted. Synthetic values.
+func TestScrubInlineSecretsMarkdownExclusionsStayNarrow(t *testing.T) {
+	const word = "quietpasture"
+	positives := []struct{ in, want string }{
+		// Any other parenthetical before the colon is read past.
+		{"Password (prod): " + word, "Password (prod): [redacted]"},
+		{"- **DB password (current):** `" + word + "`", "- **DB password (current):** `[redacted]`"},
+		// A table whose headers are not a listing's: its first cells are keys.
+		{"| Item | Setting |\n|---|---|\n| password | " + word + " |", "| Item | Setting |\n|---|---|\n| password | [redacted] |"},
+		{"| Variable | Current |\n| --- | --- |\n| `DB_PASSWORD` | `" + word + "` |", "| Variable | Current |\n| --- | --- |\n| `DB_PASSWORD` | `[redacted]` |"},
+		// A compound credential name ending in a bare noun is strong.
+		{"| App | Client Secret |\n|---|---|\n| web | " + word + " |", "| App | Client Secret |\n|---|---|\n| web | [redacted] |"},
+		{"| api key | " + word + " |", "| api key | [redacted] |"},
+		{"| DB Token | " + word + " |", "| DB Token | [redacted] |"},
+		// A hyphenated or dotted name before the noun is still read.
+		{"The app-db password is " + word + ".", "The app-db password is [redacted]."},
+		{"spring.datasource.password is " + word + ".", "spring.datasource.password is [redacted]."},
+		{"`app-db-password` is `" + word + "`.", "`app-db-password` is `[redacted]`."},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	negatives := []string{
+		"- **Password rotation (`WARN`):** `rotation is overdue`",
+		"**Password (status):** enabled",
+	}
+	for _, in := range negatives {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}

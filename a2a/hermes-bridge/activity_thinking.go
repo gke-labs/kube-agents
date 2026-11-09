@@ -72,7 +72,7 @@ var (
 	// by a qualifier (now, currently, still, just, simply, set to, equal
 	// to) or a colon, none of which is the value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)(?:^|[^A-Za-z0-9_./-])((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -1080,6 +1080,7 @@ var credentialStateWords = map[string]bool{
 	"stale": true, "used": true, "unused": true, "needed": true, "not": true, "a": true, "an": true,
 	"the": true, "managed": true, "generated": true, "provided": true, "injected": true,
 	"exposed": true, "leaked": true, "compromised": true, "only": true, "same": true, "different": true,
+	"declared": true,
 }
 
 // credentialWholeValueWords are more values that are not a value, matched
@@ -1743,8 +1744,9 @@ func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
 // names a credential key: in a row whose first cell is one, the second
-// cell, where the table has no header or a key/value one (a row's first
-// cell is more often a resource's name: | seeded-token | Active |); under
+// cell, unless the table's headers show a listing whose first column is
+// resources' names (| Namespace | Status | Age |) or a description of each
+// key (tableHeadersShowAListing); under
 // a header cell that is one, that column's cells in every row below the
 // delimiter row. A cell is read with its markdown normalised away
 // and redacted where it stands. Only a key whose class is strong counts
@@ -1770,8 +1772,7 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 				}
 			}
 			if h := block[0].cells; len(h) >= 2 {
-				h0, h1 := tableHeaderWord(s, h[0]), tableHeaderWord(s, h[1])
-				firstCellKeys = tableValueHeaders[h1] || tableKeyHeaders[h0] && !tableDescriptionHeaders[h1]
+				firstCellKeys = !tableHeadersShowAListing(s, h)
 			}
 			start = 2
 		}
@@ -1859,44 +1860,54 @@ func markdownDelimiterRow(s string, cells [][2]int) bool {
 }
 
 var (
-	// tableKeyHeaders and tableValueHeaders head the columns of a key/value
-	// table, whose rows' first cells are keys.
-	tableKeyHeaders = map[string]bool{
-		"key": true, "keys": true, "field": true, "name": true, "variable": true, "var": true, "env": true,
-		"env var": true, "environment variable": true, "setting": true, "property": true, "parameter": true,
-		"param": true, "item": true, "entry": true, "data key": true, "secret key": true, "credential": true,
-	}
-	tableValueHeaders = map[string]bool{
-		"value": true, "values": true, "decoded": true, "decoded value": true, "secret value": true,
-		"content": true, "contents": true, "plaintext": true, "plain text": true,
-	}
-	// tableDescriptionHeaders head a column that describes the key in the
-	// first, not its value (| Field | Meaning |).
-	tableDescriptionHeaders = map[string]bool{
+	// tableListingHeaderWords are header words of a listing whose first
+	// column names resources or checks, not keys (| Namespace | Status |
+	// Age |, | Check | Status | Detail |), and of a table whose second
+	// column describes the key in the first (| Field | Meaning |).
+	tableListingHeaderWords = map[string]bool{
+		"status": true, "state": true, "phase": true, "age": true, "namespace": true, "namespaces": true,
+		"ready": true, "restarts": true, "node": true, "nodes": true, "check": true, "checks": true,
+		"result": true, "severity": true, "cluster": true, "clusters": true, "created": true, "health": true,
+		"finding": true, "findings": true, "pod": true, "pods": true, "zone": true, "region": true,
 		"description": true, "meaning": true, "purpose": true, "notes": true, "note": true, "usage": true,
-		"explanation": true, "details": true, "comment": true, "comments": true, "what it is": true, "used for": true,
+		"explanation": true, "comment": true, "comments": true,
 	}
 	tableKeyCellPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*(?: [A-Za-z0-9_.-]+){0,3}$`)
 	// bareCredentialNouns head a table column of names as often as one of
 	// values (| Secret | Namespace |).
+	// nonCredentialQualifiers are words that, before a bare credential
+	// noun, name a feature or a setting, not a credential.
+	nonCredentialQualifiers = map[string]bool{
+		"binary": true, "rbac": true, "rotation": true, "type": true, "name": true, "count": true,
+		"ttl": true, "expiry": true, "header": true, "scheme": true, "mode": true, "policy": true,
+	}
 	bareCredentialNouns = map[string]bool{
 		"secret": true, "secrets": true, "token": true, "tokens": true, "credential": true,
 		"credentials": true, "key": true, "keys": true, "cookie": true, "authorization": true,
 	}
 )
 
-// tableHeaderWord is a header cell's text, markdown normalised away, in
-// lower case.
-func tableHeaderWord(s string, cell [2]int) string {
-	n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
-	return strings.ToLower(strings.TrimSpace(n))
+// tableHeadersShowAListing says whether any word of a table's header
+// cells is one of tableListingHeaderWords, read with the markdown
+// normalised away and in lower case.
+func tableHeadersShowAListing(s string, header [][2]int) bool {
+	for _, cell := range header {
+		n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
+		for _, w := range strings.FieldsFunc(strings.ToLower(n), func(r rune) bool { return !(r >= 'a' && r <= 'z') }) {
+			if tableListingHeaderWords[w] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tableSecretKeyClass says whether a table cell (a header or a row's first
 // cell) names a credential key, and the value policy under it: a key of
-// the strong class (Password, DB password, api_key), but one whose last
-// word is a bare credential noun (Token, API Key, Binary Authorization)
-// only as the other class. Words joined by spaces read as one key.
+// the strong class (Password, DB password, Client Secret, API key), but a
+// bare credential noun (Secret, Token), alone or after a word that names
+// something else (nonCredentialQualifiers: Binary Authorization), only as
+// the other class. Words joined by spaces read as one key.
 func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 	n, _ := normalizeMarkdown(cell)
 	n = strings.TrimSpace(strings.TrimRight(strings.TrimSpace(n), ":"))
@@ -1907,9 +1918,17 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 	if !inlineSecretKey(key) || secretKeyClassOf(key) != strongSecretKeyClass {
 		return 0, false
 	}
-	words := strings.Fields(n)
-	if bareCredentialNouns[strings.ToLower(words[len(words)-1])] {
-		return otherSecretKey, true
+	words := strings.Fields(strings.ToLower(n))
+	if bareCredentialNouns[words[len(words)-1]] {
+		qualified := false
+		for _, w := range words[:len(words)-1] {
+			if !nonCredentialQualifiers[w] {
+				qualified = true
+			}
+		}
+		if !qualified {
+			return otherSecretKey, true
+		}
 	}
 	return strongSecretKeyClass, true
 }
@@ -1965,6 +1984,9 @@ func normalizeMarkdown(s string) (string, []int) {
 		lineStart = lineEnd + 1
 	}
 	for _, m := range markdownKeyParenPattern.FindAllStringSubmatchIndex(s, -1) {
+		if markdownParenKept(s[m[4]:m[5]], s[m[6]:m[7]]) {
+			continue
+		}
 		if m[2] > 0 && (isWordByte(s[m[2]-1]) || strings.IndexByte("*_`", s[m[2]-1]) >= 0) {
 			for i := m[2]; i < m[3]; i++ {
 				drop[i] = true
@@ -2000,16 +2022,40 @@ func normalizeMarkdown(s string) (string, []int) {
 }
 
 var (
-	// markdownKeyParenPattern is a parenthetical before a colon that says
-	// how the value is written ("Password (decoded):", "**password**
-	// (base64-decoded):"), emphasis or a code span allowed between. Any
-	// other parenthetical ("Binary Authorization (WARN):") is a note on the
-	// label, not on a value, and stays.
-	markdownKeyParenPattern = regexp.MustCompile(`(?i)([ \t]*\([ \t]*(?:(?:base64|b64)[ -]?)?(?:decoded|encoded|plain[ -]?text|plaintext|raw|literal|base64|b64|value|decoded value)[ \t]*\))[*_\x60 \t]*:`)
+	// markdownKeyParenPattern is a short parenthetical before a colon
+	// ("Password (decoded):", "**password** (prod):"), emphasis or a code
+	// span allowed between. normalizeMarkdown keeps one only in the
+	// non-secret shapes markdownParenKept names.
+	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\(([^()\r\n:]{1,40})\))[*_\x60 \t]*:[*_\x60 \t]*([A-Za-z/]*)`)
+	// markdownTallyPattern is a parenthetical that counts ("5 major, 25
+	// minor").
+	markdownTallyPattern = regexp.MustCompile(`^[0-9]+ [A-Za-z]+(?:, ?[0-9]+ [A-Za-z]+)*$`)
 	// markdownArrowPattern is an arrow used as a key's separator, spaced or
 	// after a closing quote, code span or emphasis.
 	markdownArrowPattern = regexp.MustCompile("[ \\t\"'`*](\u2192|\u21d2|->|=>)[ \\t]")
 )
+
+// statusWords are the status a label reports in a check list or a
+// listing, not a value: a parenthetical holding one ("Binary Authorization
+// (WARN):") notes the label, and one after the colon is the label's
+// status.
+var statusWords = map[string]bool{
+	"pass": true, "passed": true, "fail": true, "failed": true, "warn": true, "warning": true, "ok": true,
+	"error": true, "info": true, "critical": true, "high": true, "medium": true, "low": true, "none": true,
+	"unknown": true, "enabled": true, "disabled": true, "active": true, "inactive": true, "ready": true,
+	"running": true, "pending": true, "true": true, "false": true, "yes": true, "no": true, "on": true,
+	"off": true, "n/a": true, "skip": true, "skipped": true,
+}
+
+// markdownParenKept says whether a parenthetical before a colon stays when
+// normalizeMarkdown reads the text: its content (marks taken off) is a
+// status word or a tally, or the first word after the colon is a status
+// word. Any other is dropped, so the label reads as the key.
+func markdownParenKept(content, after string) bool {
+	c := strings.ToLower(strings.TrimSpace(strings.Trim(strings.TrimSpace(content), "*_`")))
+	c = strings.ReplaceAll(strings.ReplaceAll(c, "`", ""), "*", "")
+	return statusWords[c] || markdownTallyPattern.MatchString(c) || statusWords[strings.ToLower(after)]
+}
 
 // markPairedMarkdownRuns marks in drop the emphasis and code-span runs of
 // s[lo:hi] (one line) that pair: a run of *, _ or ` (an emphasis run not
