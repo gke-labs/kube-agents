@@ -68,9 +68,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
     import fixture_state
     import periodics
     import pool_state
@@ -228,11 +229,26 @@ STORM_MIN_PRS = 3
 # meaning: the reader does. test_eval_dashboard_health.py pins the wrapper
 # phrases against the two sources.
 SCORER_INFRA_WRAPPER_RE = re.compile(
-    r"^the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
-    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade \()?",
+    r"^(?:the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
+    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade(?: \(|$))?"
+    r"|KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade \("
+    r"|KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is"
+    r" .*? because the empty report could not name them \()",
     re.S,
 )
+# The scorer closes the detail it opened with ")"; the detail keeps its own
+# parentheses, so the wrapper's is the one unmatched close at the end.
+SCORER_WRAPPER_OPEN, SCORER_WRAPPER_CLOSE = "(", ")"
 HARNESS_TERMINAL_PREFIX_RE = re.compile(r"^task \S+ ended (?:failed|canceled|rejected): ")
+# The harness's other task phrasings keep the task id mid-sentence ("task
+# <id> on <conversation> sat queued", "no executor took task <id> on"); the id
+# is the repetition's, so it gives way to a placeholder like the run id.
+HARNESS_TASK_ID_RE = re.compile(r"\btask \S+(?= (?:on|was|did|ended) )")
+HARNESS_TASK_ID_FORM = "task [id]"
+# The board's card ids ("still waiting on: t_3f67a81e"), hermes's "t_" + 8
+# hex, are the repetition's as well.
+KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+KANBAN_CARD_ID_FORM = "[card]"
 # The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
 # (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
 # its own phrasing on every repetition, so the run id and the repetition
@@ -830,26 +846,53 @@ def rep_kind(rep: dict) -> str:
 def storm_cause(rep: dict) -> str:
     """A storm repetition's own words for how it died: the reason with the
     scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
-    peeled, cut before the "(reason:" echo, scrubbed (periodics.quotable) and
-    cut at STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has
-    no words (no reason, or the scorer's "no reason given")."""
+    peeled, the task id, card ids and the conversation key reduced to placeholders, cut
+    before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
+    STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
+    (no reason, or the scorer's "no reason given")."""
     reason = str(rep.get("reason") or "")
-    text = SCORER_INFRA_WRAPPER_RE.sub("", reason, count=1)
-    text = HARNESS_TERMINAL_PREFIX_RE.sub("", text, count=1)
+    wrapper = SCORER_INFRA_WRAPPER_RE.match(reason)
+    detail = reason[wrapper.end() :] if wrapper else reason
+    text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
+    text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
+    text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
     text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
+    whole = STORM_CAUSE_STOP not in text
     text = text.split(STORM_CAUSE_STOP, 1)[0]
     # The collector's 300-character cut can land inside the echo: a trailing
     # " (rea" is the echo's head, not words.
     tail = text.rfind(STORM_CAUSE_STOP[:2])
     if tail != -1 and ")" not in text[tail:] and STORM_CAUSE_STOP[2:].startswith(text[tail + 2 :]):
         text = text[:tail]
+        whole = False
     text = text.strip()
     if text.rstrip(")") == SCORER_NO_DETAIL:
         return ""
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still ends on a ")" is read as whole.
+    cut_by_collector = (
+        len(reason) >= collect.REP_REASON_MAX_CHARS
+        and whole
+        and bool(text)
+        and not detail.rstrip().endswith(SCORER_WRAPPER_CLOSE)
+    )
+    # The wrapper's own close, when the wrapper opened one and the collector's
+    # cut did not take it: the one ")" more than the detail opened.
+    if (
+        wrapper
+        and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
+        and text.endswith(SCORER_WRAPPER_CLOSE)
+        and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
+    ):
+        text = text[: -len(SCORER_WRAPPER_CLOSE)]
     text = periodics.quotable(text)
     if len(text) > STORM_CAUSE_MAX_CHARS:
         head = text[:STORM_CAUSE_MAX_CHARS]
         text = (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CAUSE_ELLIPSIS
+    elif cut_by_collector:
+        text = (text[: text.rfind(" ")] if " " in text else text).rstrip() + STORM_CAUSE_ELLIPSIS
     return text
 
 

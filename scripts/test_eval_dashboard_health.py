@@ -555,6 +555,27 @@ class Storm(unittest.TestCase):
             (wrap + "the inject exchange on devops-bench-2dead1cad2fd/x/1 failed: URLError from http://10.1.2.3:8080 <urlopen error>)", "the inject exchange on [run]/x/[rep] failed: URLError from http://10.1.2.3:8080…"),
             (wrap + "the inject exchange on devops-bench-0badc0ffee11/x/3 failed: URLError from http://10.1.2.3:8080 <urlopen error>)", "the inject exchange on [run]/x/[rep] failed: URLError from http://10.1.2.3:8080…"),
             (wrap + "no reason given)", ""),
+            # Older records carry the wrapper and no detail at all.
+            ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade", ""),
+            (wrap + "the kanban board could not be read 3 times running; still waiting on: t_3f67a81e)", "the kanban board could not be read 3 times running; still waiting on: [card]"),
+            # Short, echo-less details keep nothing of the wrapper's own ")".
+            (wrap + "opening turn hit infrastructure failure (rate_limit): HTTP 429)", "opening turn hit infrastructure failure (rate_limit): HTTP 429"),
+            (wrap + "the inject exchange on devops-bench-2dead1cad2fd/x/1 failed: ConnectionResetError)", "the inject exchange on [run]/x/[rep] failed: ConnectionResetError"),
+            # The scorer's two other wrappers (scoring.py classify_rep).
+            ("KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (the gateway was gone before the run)", "the gateway was gone before the run"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade (no reason given)", ""),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (task task-9 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
+            # The harness's other task phrasings carry the id mid-sentence.
+            (wrap + "task task-7a on devops-bench-2dead1cad2fd/x/1 sat queued (submitted, never working) for the whole 600s budget)", "task [id] on [run]/x/[rep] sat queued (submitted, never working) for the whole…"),
+            (wrap + "no executor took task task-7b on devops-bench-2dead1cad2fd/x/2: nothing reached its event stream)", "no executor took task [id] on [run]/x/[rep]: nothing reached its event stream"),
+            (wrap + "task task-7c was ended by the gateway rather than by an executor (state failed))", "task [id] was ended by the gateway rather than by an executor (state failed)"),
+            # The collector's cut inside the words, and inside the run id.
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (the kanban board could not be read 3 tim", "the kanban board could not be read 3…"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (the inject exchange on devops-bench-0d0b", "the inject exchange on…"),
+            # A cut inside a detail that had an id reduced; a whole detail that
+            # happens to end at the cap.
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (no executor took task task-7b on devops-", "no executor took task [id] on…"),
+            ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
             (RETRIES, ""),
             ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-4 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
             (EMPTY_RECORD, "the record is not evidence of a real agent run: the trajectory is empty: the…"),
@@ -570,9 +591,21 @@ class Storm(unittest.TestCase):
         root = pathlib.Path(__file__).resolve().parent.parent / "bench" / "kube_agents_bench"
         scorer = (root / "scoring.py").read_text(encoding="utf-8")
         harness = (root / "harness.py").read_text(encoding="utf-8")
-        for fragment in ('"the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "', 'answer in it to grade ({detail or \'no reason given\'})'):
+        for fragment in (
+            '"the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "',
+            'answer in it to grade ({detail or \'no reason given\'})',
+            'f"{INFRA_FAILURE_MARKER}: the record holds no scored run, so "',
+            'f"there is nothing to grade ({detail or \'no reason given\'})"',
+            '"request(s) because the empty report could not name them "',
+        ):
             self.assertIn(fragment, scorer, fragment)
         self.assertIn('f"task {exchange.task_id} ended {exchange.fold.terminal}: {infrastructure} "', harness)
+        for fragment in (
+            'f"task {exchange.task_id} on {exchange.conversation} sat queued (submitted, "',
+            'f"no executor took task {exchange.task_id} on {exchange.conversation}: nothing "',
+            'f"task {exchange.task_id} was ended by the gateway rather than by an executor "',
+        ):
+            self.assertIn(fragment, harness, fragment)
         self.assertIn('f"(reason: {exchange.fold.terminal_reason or \'none given\'})"', harness)
         self.assertIn('_RUN_ID_PREFIX = "devops-bench-"', harness)
         # The collector keeps 300 characters: the wrappers plus the longest
