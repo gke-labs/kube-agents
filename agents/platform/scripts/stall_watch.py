@@ -150,7 +150,10 @@ tick it falls short, and chat hears it once, on the tick the sweep first falls
 short, and once more when the fleet fits in one tick again. On a fleet the
 budget does not cover, a cluster is read across consecutive ticks, so the
 interval the operator has is the ticks a full pass takes, not the schedule;
-the budget entry is where to read it.
+the budget entry is where to read it, and the ledger's ``cluster_timings``
+and ``tick_timing`` entries say what each cluster and the tick cost, so the
+cluster that takes the time and the ticks a pass takes are read from the
+ledger rather than timed by hand.
 """
 
 from __future__ import annotations
@@ -405,6 +408,40 @@ DISCOVERY_UNKNOWN_KEY = "unknown"
 #: Per namespace, where the next tick's window of WILDCARD_KINDS_CAP kinds
 #: starts in that namespace's sorted kind list; absent or stale means 0.
 DISCOVERY_TURN_KEY = "turn"
+#: Ledger key for what each cluster cost to read, one record per cluster the
+#: sweep reached, kept across ticks on the credentials' terms (a cluster the
+#: budget did not reach keeps its last record; one gone from the listing
+#: loses it): {cluster id: {TIMING_AT_KEY: the tick that read it,
+#: TIMING_SECONDS_KEY: wall-clock seconds from its first call to its last,
+#: TIMING_NAMESPACES_KEY: namespaces in the watch's scope (system, excluded
+#: and exempt ones left out), TIMING_SCANS_KEY: namespaces scanned,
+#: TIMING_CUT_KEY: whether the budget stopped the sweep inside it}}. A tick
+#: that resumes a cut cluster at the cursor carries the cut record's seconds
+#: and scans forward, so the record it leaves is the whole pass over the
+#: cluster, not the tick's slice. Scans short of the namespaces without the
+#: cut is a namespace that could not be read, and the unreadable entry says
+#: which; the span from the oldest `at` to the newest, over the schedule, is
+#: how many ticks a full pass takes; the largest `seconds` is where the
+#: budget goes. The scheduler discards a script's stderr on exit 0, so the
+#: ledger is the one durable place for these figures (#5259).
+CLUSTER_TIMINGS_KEY = "cluster_timings"
+TIMING_AT_KEY = "at"
+TIMING_SECONDS_KEY = "seconds"
+TIMING_NAMESPACES_KEY = "namespaces"
+TIMING_SCANS_KEY = "scans"
+TIMING_CUT_KEY = "cut"
+#: Ledger key for the figures of the last tick whose sweep ran (a failed
+#: sweep leaves the previous entry, and `at` says which): {TIMING_AT_KEY,
+#: TIMING_SECONDS_KEY: the whole tick, the sweep and the alerts it raised or
+#: closed, TIMING_SWEEP_KEY: the sweep alone, TIMING_LISTING_KEY: the cluster
+#: listing alone, TIMING_CLUSTERS_KEY: clusters read, TIMING_SCANS_KEY:
+#: namespaces scanned}; `sweep_seconds` at the budget on every tick is the
+#: signature of a fleet the budget does not cover.
+TICK_TIMING_KEY = "tick_timing"
+TIMING_SWEEP_KEY = "sweep_seconds"
+TIMING_LISTING_KEY = "listing_seconds"
+TIMING_CLUSTERS_KEY = "clusters"
+TIMING_DECIMALS = 1
 CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: What a failed first read on a reused kubeconfig says when the kubeconfig
 #: itself is the problem, so one more fetch repairs it: the shim's refusal of
@@ -662,6 +699,21 @@ STDERR_EXCERPT_CHARS = 200
 # --------------------------------------------------------------------------
 # sandbox plumbing
 # --------------------------------------------------------------------------
+
+
+def seconds_since(start: float) -> float:
+    """Wall-clock seconds since `start`, a `time.perf_counter` reading, for
+    the ledger's timings. A clock apart from the budget's `time.monotonic`,
+    which the tests drive with fixed readings to place the budget's cut."""
+    return round(time.perf_counter() - start, TIMING_DECIMALS)
+
+
+def timing_record(now: str, start: float, namespaces: int, scans: int, cut: bool = False, carried_seconds: float = 0.0) -> dict:
+    """A cluster's CLUSTER_TIMINGS_KEY record. `carried_seconds` is what the
+    tick that the budget cut inside this cluster had already spent there, so
+    the record a resume completes is the whole pass over the cluster."""
+    seconds = round(carried_seconds + seconds_since(start), TIMING_DECIMALS)
+    return {TIMING_AT_KEY: now, TIMING_SECONDS_KEY: seconds, TIMING_NAMESPACES_KEY: namespaces, TIMING_SCANS_KEY: scans, TIMING_CUT_KEY: cut}
 
 
 def now_iso() -> str:
@@ -1218,6 +1270,8 @@ def empty_state() -> dict:
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
         DISCOVERED_KINDS_KEY: {},
+        CLUSTER_TIMINGS_KEY: {},
+        TICK_TIMING_KEY: None,
         BUDGET_EXHAUSTED_KEY: False,
         BUDGET_EXHAUSTED_VIEW_KEY: None,
         BUDGET_HELD_TICKS_KEY: 0,
@@ -1288,6 +1342,7 @@ def with_project(data: dict, project: str) -> dict:
         CURSOR_KEY: cursor,
         CREDENTIALS_KEY: {prefix + k: v for k, v in (data.get(CREDENTIALS_KEY) or {}).items()},
         DISCOVERED_KINDS_KEY: {prefix + k: v for k, v in (data.get(DISCOVERED_KINDS_KEY) or {}).items()},
+        CLUSTER_TIMINGS_KEY: {prefix + k: v for k, v in (data.get(CLUSTER_TIMINGS_KEY) or {}).items()},
     }
 
 
@@ -1365,6 +1420,10 @@ class Sweep:
         #: Each listed cluster's wildcard discovery, for the ledger, kept on
         #: the same terms as the credentials.
         self.discovered: dict[str, dict] = {}
+        #: What each cluster the sweep reached cost (CLUSTER_TIMINGS_KEY),
+        #: kept on the same terms, and the tick's own figures (TICK_TIMING_KEY).
+        self.cluster_timings: dict[str, dict] = {}
+        self.tick_timing: dict = {}
 
     @property
     def clusters(self) -> int:
@@ -1548,28 +1607,33 @@ def sweep_fleet(
     credentials: dict[str, str] | None = None,
     now: str | None = None,
     discovered: dict[str, dict] | None = None,
+    cluster_timings: dict[str, dict] | None = None,
 ) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
     fails the sweep. `credentials` is the ledger's record of when each
     cluster's kubeconfig was last fetched (see CREDENTIALS_KEY), `discovered`
     its record of each cluster's wildcard discovery (DISCOVERED_KINDS_KEY),
-    and `now` the tick's time, which a fetch or discovery this tick is
-    recorded as."""
+    `cluster_timings` its record of what each cluster cost to read
+    (CLUSTER_TIMINGS_KEY), and `now` the tick's time, which a fetch, a
+    discovery or a read this tick is recorded as."""
     projects, unread_profiles = roster_projects()
     sweep = Sweep({management_project} | projects)
     sweep.unread_profiles = set(unread_profiles)
     sweep.unreadable.update(unread_profiles)
     records = dict(credentials or {})
     discoveries = dict(discovered or {})
+    timings = dict(cluster_timings or {})
     refreshed = 0
     now = now or now_iso()
     started = time.monotonic()
+    clock = time.perf_counter()
     source = report_source()
     excluded = excluded_namespaces()
     wildcards = wildcard_kinds()
     failures: dict[str, Exception] = {}
     listings = list_projects(sorted(sweep.projects), management_project, started)
+    listing_seconds = seconds_since(clock)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
@@ -1602,6 +1666,10 @@ def sweep_fleet(
         project, name, location = split_cluster_id(cid)
         if sweep.out_of_budget(started, cid):
             break
+        cluster_clock = time.perf_counter()
+        scans = 0  # namespaces scanned on this cluster, for its timing record
+        carried_seconds = 0.0  # what the tick the budget cut here had already spent
+        budget_cut = False  # the budget stopped the sweep inside this cluster
         fetched = False  # a fetch was attempted this tick: at most one per cluster
         wrote = False  # that fetch returned, so gcloud wrote the kubeconfig
         readable = False  # the namespace read on it returned
@@ -1674,6 +1742,7 @@ def sweep_fleet(
                     records[cid] = now
                 else:
                     records.pop(cid, None)
+            timings[cid] = timing_record(now, cluster_clock, 0, 0)
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
@@ -1682,8 +1751,16 @@ def sweep_fleet(
             # Resume inside the cluster the last tick stopped in; the namespaces
             # before the cursor were read then and are unknown now, not gone.
             namespaces = namespaces[namespaces.index(cursor["namespace"]):]
+            # The timing record carries on from the cut: what this tick adds
+            # completes the pass over the cluster, and the record says what
+            # the whole pass cost rather than this tick's slice of it.
+            previous = timings.get(cid)
+            if previous and previous.get(TIMING_CUT_KEY):
+                carried_seconds = previous.get(TIMING_SECONDS_KEY) or 0.0
+                scans = previous.get(TIMING_SCANS_KEY) or 0
         for namespace in namespaces:
             if sweep.out_of_budget(started, cid, namespace):
+                budget_cut = True
                 break
             namespace_kinds = join_kinds(kinds, extra_kinds.get(namespace))
             try:
@@ -1703,6 +1780,7 @@ def sweep_fleet(
             except READ_FAILURES as exc:
                 sweep.unreadable[scope_key(cid, namespace)] = failure_text(exc)
                 continue
+            scans += 1
             sweep.read_scopes.add(scope_key(cid, namespace))
             if namespace in next_turns and isinstance(record, dict):
                 # The namespace was read: its window moves on for the next
@@ -1737,6 +1815,10 @@ def sweep_fleet(
                     # The object's own age, which the minimum-age gate reads.
                     "stalled_seconds": f.get("stalled_seconds", 0),
                 }
+        # Recorded whether the loop ran out or the budget cut it; the cut is
+        # its own field, because a cluster with a namespace it could not read
+        # also scans fewer than it listed.
+        timings[cid] = timing_record(now, cluster_clock, len(sweep.listed_namespaces[cid]), scans, budget_cut, carried_seconds)
     # Clusters the budget never reached keep their records, and so does every
     # unlisted cluster whose rows `verdict` holds (`holds_unlisted`): a listing
     # that fails once, or an identity file unreadable for one tick, must not
@@ -1751,6 +1833,22 @@ def sweep_fleet(
         cid: record
         for cid, record in discoveries.items()
         if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    sweep.cluster_timings = {
+        cid: record
+        for cid, record in timings.items()
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    # `tick` fills TIMING_SECONDS_KEY once the alerts are raised and closed; a
+    # ledger saved before then (an alert's persist, then a tick that died)
+    # shows None there, which says the tick did not reach its end.
+    sweep.tick_timing = {
+        TIMING_AT_KEY: now,
+        TIMING_SECONDS_KEY: None,
+        TIMING_SWEEP_KEY: seconds_since(clock),
+        TIMING_LISTING_KEY: listing_seconds,
+        TIMING_CLUSTERS_KEY: sweep.clusters,
+        TIMING_SCANS_KEY: sweep.namespaces,
     }
     return sweep
 
@@ -2477,6 +2575,7 @@ def namespace_of(scope: str) -> str:
 
 def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     now = now_iso()
+    clock = time.perf_counter()
     lines: list[str] = []
     try:
         project = project_id()
@@ -2488,7 +2587,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     try:
         if lookup_error:
             raise lookup_error
-        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now, state.get(DISCOVERED_KINDS_KEY))
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now, state.get(DISCOVERED_KINDS_KEY), state.get(CLUSTER_TIMINGS_KEY))
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -2502,6 +2601,8 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state[CURSOR_KEY] = sweep.cursor
         state[CREDENTIALS_KEY] = sweep.credentials
         state[DISCOVERED_KINDS_KEY] = sweep.discovered
+        state[CLUSTER_TIMINGS_KEY] = sweep.cluster_timings
+        state[TICK_TIMING_KEY] = sweep.tick_timing
         view = sweep.view()
         if sweep.budget_exhausted:
             if not state.get(BUDGET_EXHAUSTED_KEY):
@@ -2536,6 +2637,8 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
                 state[BUDGET_HELD_TICKS_KEY] = 0
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
+        # The whole tick, alerts included: what the scheduler's run time shows.
+        state[TICK_TIMING_KEY][TIMING_SECONDS_KEY] = seconds_since(clock)
     if not dry_run:
         save_state(state_path, state)
     return lines

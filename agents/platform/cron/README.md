@@ -109,7 +109,9 @@ exhausting sweep listed (a sweep that fit without one of them, because its listi
 identity could not be read, says nothing about the fit and posts nothing, for up to three
 consecutive ticks, after which the missing project counts as a standing fault and the fit
 stands); the ledger's budget entry carries the same coverage on every tick that falls short,
-and says when and why the flag is held. A new stall's notice is the alert the Session KV server
+and says when and why the flag is held, and its `cluster_timings` and `tick_timing` entries
+record what each cluster and the last sweeping tick cost to read
+(`docs/designs/stall-watch-inject.md` §3.9). A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so

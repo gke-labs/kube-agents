@@ -2953,7 +2953,25 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		capRef = nil
 	}
 
-	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route)
+	// A turn for the conversation's own session pod carries the agents its
+	// requester may delegate to, which the pod's delegate tool names. Per
+	// turn, so a reused pod sees profiles as they come and go.
+	// A wake runs without the tool, so it carries none.
+	var extra []lib.Part
+	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
+		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
+		if unknown && approximate {
+			// The record's people overflow the cap, but the pod's seeded set
+			// (the primer's turns) may not: no list, so the tool falls back
+			// to platform rather than being told there is no one.
+			g.log.Info("delegate targets not attached: the record's people pass the author cap before the primer's turns are known", "taskId", taskID)
+		} else if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
+			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
+		} else {
+			extra = append(extra, part)
+		}
+	}
+	payload, err := submissionPayload(ts.Text, taskID, rec.ContextID, ts.Route, extra...)
 	if err != nil {
 		g.log.Error("message payload build failed", "err", err)
 		return "", false
@@ -3399,9 +3417,9 @@ func messagePayload(text, taskID, contextID string) ([]byte, error) {
 }
 
 // messagePayloadParts builds the A2A Message for one submission or steer
-// from its parts. Every chat turn's are its text alone (messagePayload); the
-// card-stop control's are the cardStop data part alone (cardStopPayload),
-// which no text a person types can produce.
+// from its parts. A chat turn's are its text, then any data parts the gateway
+// adds (submissionPayload); the card-stop control's are the cardStop data
+// part alone (cardStopPayload), which no text a person types can produce.
 func messagePayloadParts(parts []lib.Part, taskID, contextID string) ([]byte, error) {
 	return marshalMessage(lib.Message{
 		Role:      "user",

@@ -3285,6 +3285,10 @@
                   <option value="github">GitHub</option>
                   <option value="gitlab">GitLab</option>
                   <option value="gitea">Gitea</option>
+                  <option value="bitbucket">Bitbucket Cloud</option>
+                  <option value="bitbucket-datacenter">
+                    Bitbucket Data Center
+                  </option>
                 </select>
                 <input
                   type="text"
@@ -3371,6 +3375,10 @@
                   <option value="github">GitHub</option>
                   <option value="gitlab">GitLab</option>
                   <option value="gitea">Gitea</option>
+                  <option value="bitbucket">Bitbucket Cloud</option>
+                  <option value="bitbucket-datacenter">
+                    Bitbucket Data Center
+                  </option>
                 </select>
                 <input
                   type="text"
@@ -3461,6 +3469,10 @@
                   <option value="github">GitHub</option>
                   <option value="gitlab">GitLab</option>
                   <option value="gitea">Gitea</option>
+                  <option value="bitbucket">Bitbucket Cloud</option>
+                  <option value="bitbucket-datacenter">
+                    Bitbucket Data Center
+                  </option>
                 </select>
                 <input
                   type="text"
@@ -3539,6 +3551,10 @@
                   <option value="github">GitHub</option>
                   <option value="gitlab">GitLab</option>
                   <option value="gitea">Gitea</option>
+                  <option value="bitbucket">Bitbucket Cloud</option>
+                  <option value="bitbucket-datacenter">
+                    Bitbucket Data Center
+                  </option>
                 </select>
                 <input
                   type="text"
@@ -7676,6 +7692,8 @@
             <option value="github" ${!data.provider || data.provider === "github" ? "selected" : ""}>GitHub</option>
             <option value="gitlab" ${data.provider === "gitlab" ? "selected" : ""}>GitLab</option>
             <option value="gitea" ${data.provider === "gitea" ? "selected" : ""}>Gitea</option>
+            <option value="bitbucket" ${data.provider === "bitbucket" ? "selected" : ""}>Bitbucket Cloud</option>
+            <option value="bitbucket-datacenter" ${data.provider === "bitbucket-datacenter" ? "selected" : ""}>Bitbucket Data Center</option>
           </select>
           <input type="text" class="input-box custom-repo-path" value="${escapeHtml(data.repository || "")}" placeholder="org/repo or URL" style="padding:4px 6px;font-size:11.5px;font-family:var(--font-mono);" />
           <input type="text" class="input-box custom-repo-branch" value="${escapeHtml(isContext ? "" : data.base_branch || "main")}" placeholder="${isContext ? "n/a (context)" : "main"}" ${isContext ? "disabled" : ""} style="padding:4px 6px;font-size:11.5px;font-family:var(--font-mono);" title="Base branch" />
