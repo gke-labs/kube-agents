@@ -25210,10 +25210,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
-    # Every id the ledger carried, for the stale close's reading of an
-    # unlabelled pull request: the body's block, and the stored document
-    # behind it, which also names the ids the body budget cut.
-    ledger_ids_known = sorted(set(parse_delta_block(previous_body)) | set(_stored_finding_places(memory)))
     previous_ids = parse_delta_block(previous_body)
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
@@ -25236,6 +25232,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             "a rename as a fix."
         )
     filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
+    # Every id the ledger carried, for the stale close's reading of an
+    # unlabelled pull request: the body's block, the stored document behind
+    # it, and the complete block of a body that cut findings for space, which
+    # is all a memory seeded from the issue body has of them.
+    ledger_ids_known = sorted(set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut)
     # Where the last scheduled run's ids are read from (see `scheduled_ids`
     # below). Read here, so the run's first `finish` saves what it read with
     # the baseline.
