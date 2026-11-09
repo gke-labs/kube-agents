@@ -143,6 +143,11 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "CREDENTIAL_PROXY_TOKEN_FILE", Value: profileWorkerBrokerTokenPath + "/" + profileWorkerBrokerTokenFile},
 		{Name: "CREDENTIAL_PROXY_TASK_TOKEN_FILE", Value: profileWorkerTaskTokenPath + "/token"},
 	}
+	// The exec tier, while it renders, as for the sandbox: read at start, so a
+	// change between 0 and a positive count rolls the warm pools.
+	if credentialProxyExecTierEnabled(agent) {
+		env = append(env, corev1.EnvVar{Name: credentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+	}
 	if m := profile.Spec.Harness.Model; m != "" {
 		env = append(env, corev1.EnvVar{Name: "A2A_MODEL", Value: m})
 	}

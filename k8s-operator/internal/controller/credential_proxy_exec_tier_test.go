@@ -680,10 +680,23 @@ func TestSessionPodsReachTheExecTierOnlyUnderTheClusterView(t *testing.T) {
 	}
 }
 
-// The profile namespace's fence opens to the tier at a positive count only.
+// Profile workers get the tier's URL, and the profile namespace's fence opens
+// to the tier, at a positive count only.
 func TestProfileWorkersReachTheExecTierOnlyWhileItRenders(t *testing.T) {
 	for _, replicas := range []int32{0, 2} {
 		agent := execTierTestAgent(ptr.To(replicas))
+		profile := testAgentProfile(agent.Namespace, "auditor")
+		for _, mode := range []profileWorkerMode{profileWorkerPool, profileWorkerOneShot} {
+			spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", mode, false)
+			// The literal name: the shim reads CREDENTIAL_PROXY_EXEC_URL (§12).
+			url, set := execTierEnvValue(spec.Containers[0].Env, "CREDENTIAL_PROXY_EXEC_URL")
+			if replicas > 0 && url != "http://test-agent-credential-proxy-exec-tier.test-ns.svc.cluster.local:8765" {
+				t.Errorf("at %d replicas the profile worker's %s = %q (mode %v)", replicas, credentialProxyExecURLEnv, url, mode)
+			}
+			if replicas == 0 && set {
+				t.Errorf("at 0 replicas the profile worker has %s (mode %v)", credentialProxyExecURLEnv, mode)
+			}
+		}
 		peers := brokerEgressPeers(t, buildProfileNetworkPolicy(agent, []string{"10.96.0.10"}))
 		if hasNamespacedExecTierPeer(agent, peers) != (replicas > 0) {
 			t.Errorf("at %d replicas the profile egress to the exec tier in the agent's namespace is %v", replicas, hasNamespacedExecTierPeer(agent, peers))
@@ -713,5 +726,9 @@ func TestARefusedNameGivesCallersNoExecTier(t *testing.T) {
 	}
 	if hasNamespacedExecTierPeer(agent, brokerEgressPeers(t, buildProfileNetworkPolicy(agent, []string{"10.96.0.10"}))) {
 		t.Error("the profile fence opens to a refused tier")
+	}
+	profile := testAgentProfile(agent.Namespace, "auditor")
+	if _, set := execTierEnvValue(buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false).Containers[0].Env, credentialProxyExecURLEnv); set {
+		t.Error("the profile worker gets the URL of a refused tier")
 	}
 }

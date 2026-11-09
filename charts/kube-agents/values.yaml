@@ -1406,9 +1406,10 @@ platformAgent:
       # The exec tier: stateless broker replicas beside the stateful broker that
       # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
       # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
-      # none. Above 0 the shell sandbox and the session pods are given its
-      # address, and a change between 0 and a positive value restarts the shell
-      # sandbox (and the A2A gateway under the cluster view). Each replica requests and is
+      # none. Above 0 the shell sandbox, the profile workers and the session
+      # pods are given its address, and a change between 0 and a positive value
+      # restarts the shell sandbox and the profile warm pools (and the A2A
+      # gateway under the cluster view). Each replica requests and is
       # limited to 2 CPU and 2Gi. On an
       # existing install the chart fails the upgrade when the installed CRD
       # predates the field; apply crds/ first (upgrade.sh does).
