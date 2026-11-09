@@ -4308,12 +4308,6 @@ func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	return n
 }
 
-// a2aChartPodsDiscard is why a2aChartPodsCount discarded the annotation, or "".
-func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
-	_, why := a2aChartPodsCount(agent)
-	return why
-}
-
 // a2aStandingPods is every pod the operator keeps running for agent in next
 // mode, summed from the builders that render them, so a resized workload is
 // counted at its new size. A new standing workload has to be added here:
