@@ -41,7 +41,8 @@ describes both, and marks each step that applies to one of them only.
     repository (`~user/repo`) is not supported.
 - **The host.**
   - Bitbucket Cloud needs no host. It is `bitbucket.org` only.
-  - Bitbucket Data Center needs `--gitops-host`: a lowercase DNS name with at least two labels,
+  - Bitbucket Data Center needs a host: `--gitops-host` in a non-interactive run, or the answer to
+    the hostname question in an interactive one. It is a lowercase DNS name with at least two labels,
     such as `bitbucket.example.com`. The instance must serve at the root path on port 443. An
     instance under a context path (`https://example.com/bitbucket`) or on another port (for
     example `:7990`) is not supported in this release. Put a reverse proxy in front of such an
@@ -220,6 +221,12 @@ it. Give the new token with `--gitops-token-file`, or name the Secret that holds
 `--gitops-token-secret`. A non-interactive run, or a run with no terminal, stops before it changes
 anything when it has neither. An interactive run asks for the new token after the apply, does not
 offer to keep the old one, and stops if you enter none.
+
+A switch also drops the recorded repository path, because the GitLab, Cloud and Data Center path
+forms often fit each other: give `--gitops-repo` (an interactive run asks for it). If a switch stops
+before the new token is stored (an empty answer, an interrupt or a failed apply), `install.env` keeps
+the old forge in `GITOPS_SWITCH_FROM_FORGE` and `GITOPS_SWITCH_FROM_SECRET`, and the next run applies
+the same rules. The installer removes the two keys after it stores the new token.
 
 When the run keeps the recorded Secret and gives no read token, the installer removes the Secret's `read-token` key, which holds the old
 forge's read token, and says so. Give the new read token with `GITOPS_READ_TOKEN_FILE`.

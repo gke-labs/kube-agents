@@ -362,7 +362,8 @@ bootstrap_install_env() {
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY \
+    GITOPS_SWITCH_FROM_FORGE GITOPS_SWITCH_FROM_SECRET
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -536,6 +537,21 @@ PARAM_GITOPS_OLD_TOKEN_SECRET=""
 # keeps the recorded App or key (INSTALL_ENV_RECORDS_GITHUB_APP).
 PARAM_GITOPS_RECORDED_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
+# The token Secret and the repository install.env records, read once here:
+# validate_gitops_forge_flags runs more than once, and the interview can
+# change both values between the runs.
+PARAM_GITOPS_RECORDED_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
+PARAM_GITOPS_RECORDED_REPO="${GITOPS_REPO:-}"
+# A forge switch that an earlier run started and did not finish: it recorded
+# the new forge, but stopped before it stored the new forge's token. The old
+# forge and its Secret stay in install.env (GITOPS_SWITCH_FROM_FORGE and
+# GITOPS_SWITCH_FROM_SECRET) until the token steps succeed, so this run treats
+# the switch as live. PARAM_GITOPS_SWITCH_FROM is the forge this run switches
+# from, set by validate_gitops_forge_flags.
+PARAM_GITOPS_PENDING_FROM_FORGE="${GITOPS_SWITCH_FROM_FORGE:-}"
+PARAM_GITOPS_PENDING_FROM_SECRET="${GITOPS_SWITCH_FROM_SECRET:-}"
+PARAM_GITOPS_SWITCH_FROM=""
+PARAM_GITOPS_REPO_FROM_FLAG="false"
 PARAM_RECORDED_KMS_KEYRING="${KMS_KEYRING:-}"
 PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
 # The App ID install.env records, for the same check: a move of GitHub host
@@ -1200,7 +1216,7 @@ parse_args() {
       --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
       --litellm-env-secret=*) PARAM_LITELLM_ENV_SECRET_NAME="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
-      --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
+      --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; PARAM_GITOPS_REPO_FROM_FLAG="true"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*|--gitops-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
@@ -2352,7 +2368,8 @@ record_gitops_forge_keys() {
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
   # run's validator would refuse the pair. GITHUB_PEM_PATH too: a GitLab
   # install has no App. The GitHub branch below writes it back.
-  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH
+    GITOPS_SWITCH_FROM_FORGE GITOPS_SWITCH_FROM_SECRET)
   # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
   # switch of host names the new App's key (--kms-key), and the next
   # upgrade.sh must render that key and not the old App's.
@@ -2370,6 +2387,13 @@ record_gitops_forge_keys() {
     # Only a Bitbucket forge reads an identity, so only it records one.
     if [ -n "${GITOPS_IDENTITY:-}" ]; then
       write_env_var "$tmp" GITOPS_IDENTITY "${GITOPS_IDENTITY}"
+    fi
+    # A switch between two forges with a token stays pending until the new
+    # token is stored (clear_gitops_pending_switch), so a run that stops
+    # before that still knows which forge's tokens the Secret holds.
+    if [ -n "${PARAM_GITOPS_SWITCH_FROM:-}" ]; then
+      write_env_var "$tmp" GITOPS_SWITCH_FROM_FORGE "${PARAM_GITOPS_SWITCH_FROM}"
+      write_env_var "$tmp" GITOPS_SWITCH_FROM_SECRET "${PARAM_GITOPS_OLD_TOKEN_SECRET:-}"
     fi
   else
     if [ -n "$current_host" ]; then
@@ -5228,6 +5252,21 @@ gitlab_repo_url() {
   printf 'https://%s/%s' "${GITOPS_HOST:-gitlab.com}" "${GITOPS_REPO:-}"
 }
 
+# Removes the pending forge switch from install.env FILE: the new forge's
+# token steps succeeded, so the token Secret holds nothing of the old forge.
+clear_gitops_pending_switch() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
+  grep -q -E "^[[:space:]]*(export[[:space:]]+)?GITOPS_SWITCH_FROM_(FORGE|SECRET)=" "$file" || return 0
+  local tmp="${file}.tmp.$$"
+  ( umask 077; : >"$tmp" )
+  grep -E -v "^[[:space:]]*(export[[:space:]]+)?GITOPS_SWITCH_FROM_(FORGE|SECRET)=" "$file" >"$tmp" || true
+  mv "$tmp" "$file"
+  PARAM_GITOPS_PENDING_FROM_FORGE=""
+  PARAM_GITOPS_PENDING_FROM_SECRET=""
+}
+
 # True for a forge whose credential is an access token the administrator puts
 # in a Kubernetes Secret: every forge but github, which uses the GitHub App.
 gitops_forge_uses_token() {
@@ -5347,10 +5386,13 @@ validate_bitbucket_forge_flags() {
     fi
   else
     local host="${PARAM_GITOPS_HOST:-}"
-    if [ -z "$host" ]; then
+    # An interactive run asks for the host in the interview, which comes
+    # after this check; only a run that cannot ask needs the flag here.
+    if [ -z "$host" ] && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; }; then
       print_error "--gitops-forge=bitbucket-datacenter needs --gitops-host: the instance's hostname."
       return 1
     fi
+    if [ -n "$host" ]; then
     # D9: the broker builds the instance's URLs from the hostname alone, so an
     # instance under a context path (https://host/bitbucket) or on another
     # port is not served in this release.
@@ -5365,6 +5407,7 @@ validate_bitbucket_forge_flags() {
     if [[ "$host" =~ $BITBUCKET_RESERVED_HOST_RE ]] || [[ "$host" =~ $GITHUB_RESERVED_HOST_RE ]] || [[ "$host" =~ (^|\.)gitlab\.com$ ]]; then
       print_error "'${host}' is a hosted service's domain, not a Bitbucket Data Center instance. For Bitbucket Cloud, pass --gitops-forge=bitbucket."
       return 1
+    fi
     fi
   fi
   if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
@@ -5449,27 +5492,52 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded ${recorded_label} identity '${PARAM_GITOPS_IDENTITY}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_IDENTITY=""
     fi
-    # The token Secret install.env recorded holds the other forge's token,
-    # whatever its name: bitbucket and bitbucket-datacenter share the default
-    # name, and a custom name carries over too. Kept, the broker would send
-    # one forge's token to the other's host. So it is kept only when this run
-    # names the new token or the Secret that holds it.
-    if gitops_forge_uses_token "$recorded_forge" && gitops_forge_uses_token "$forge" &&
-      [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
-      PARAM_GITOPS_OLD_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$(default_gitops_token_secret "$recorded_forge")}"
+    # The repository install.env recorded is the old forge's: the three
+    # grammars (group/project, workspace/slug, KEY/slug) often fit each other,
+    # so it would pass the new forge's check and name the wrong repository.
+    if gitops_forge_uses_token "$forge" && [ "${PARAM_GITOPS_REPO_FROM_FLAG:-false}" != "true" ] &&
+      [ -n "${PARAM_GITOPS_REPO:-}" ] && [ "$PARAM_GITOPS_REPO" = "${PARAM_GITOPS_RECORDED_REPO:-}" ]; then
+      print_info "Dropping the recorded ${recorded_label} repository '${PARAM_GITOPS_REPO}': this run's GitOps forge is ${forge_label}."
+      PARAM_GITOPS_REPO=""
     fi
-    if gitops_forge_uses_token "$recorded_forge" && gitops_forge_uses_token "$forge" &&
-      [ -z "${PARAM_GITLAB_TOKEN_FILE:-}" ] && [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
+  fi
+  # A switch between two forges with a token: a live one, or one an earlier
+  # run left pending (it recorded the new forge and stopped before the token
+  # steps). The old forge's Secret is the one install.env recorded, never a
+  # name this run or its interview chose.
+  local switch_from="" old_secret=""
+  if [ -n "$recorded_forge" ] && [ "$recorded_forge" != "$forge" ]; then
+    switch_from="$recorded_forge"
+    old_secret="${PARAM_GITOPS_RECORDED_TOKEN_SECRET:-$(default_gitops_token_secret "$recorded_forge")}"
+  elif [ -n "${PARAM_GITOPS_PENDING_FROM_FORGE:-}" ] && [ "$PARAM_GITOPS_PENDING_FROM_FORGE" != "$forge" ]; then
+    switch_from="$PARAM_GITOPS_PENDING_FROM_FORGE"
+    old_secret="${PARAM_GITOPS_PENDING_FROM_SECRET:-$(default_gitops_token_secret "$switch_from")}"
+  fi
+  PARAM_GITOPS_SWITCH_FROM=""
+  PARAM_GITOPS_OLD_TOKEN_SECRET=""
+  PARAM_GITOPS_TOKEN_MUST_REPLACE="false"
+  if [ -n "$switch_from" ] && gitops_forge_uses_token "$switch_from" && gitops_forge_uses_token "$forge"; then
+    local from_label to_label
+    from_label="$(gitops_forge_label "$switch_from")"
+    to_label="$(gitops_forge_label "$forge")"
+    PARAM_GITOPS_SWITCH_FROM="$switch_from"
+    PARAM_GITOPS_OLD_TOKEN_SECRET="$old_secret"
+    # The old Secret holds the other forge's token, whatever its name:
+    # bitbucket and bitbucket-datacenter share the default name, and a custom
+    # name carries over too. Kept, the broker would send one forge's token to
+    # the other's host. So it is kept only when this run names the new token
+    # or the Secret that holds it.
+    if [ -z "${PARAM_GITLAB_TOKEN_FILE:-}" ] && [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
       # No terminal is the same as --non-interactive here: the token prompt
       # after the apply cannot run, and the old token would stay.
       if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
-        print_error "The recorded token Secret '${PARAM_GITLAB_TOKEN_SECRET:-}' holds the ${recorded_label} token, and this run's GitOps forge is ${forge_label}. Give the ${forge_label} token with --gitops-token-file, or name the Secret that holds it with --gitops-token-secret."
+        print_error "The token Secret '${old_secret}' holds the ${from_label} token, and this run's GitOps forge is ${to_label}. Give the ${to_label} token with --gitops-token-file, or name the Secret that holds it with --gitops-token-secret."
         return 1
       fi
       PARAM_GITOPS_TOKEN_MUST_REPLACE="true"
     fi
     if [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ] &&
-      [ "${PARAM_GITLAB_TOKEN_SECRET:-}" = "$(default_gitops_token_secret "$recorded_forge")" ]; then
+      [ "${PARAM_GITLAB_TOKEN_SECRET:-}" = "$(default_gitops_token_secret "$switch_from")" ]; then
       PARAM_GITLAB_TOKEN_SECRET="$(default_gitops_token_secret "$forge")"
     fi
   fi
@@ -8037,7 +8105,10 @@ main() {
         prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
         gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
         prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
+        local gl_secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
         prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # A name typed here is this run's choice, as --gitops-token-secret is.
+        [ "$PARAM_GITLAB_TOKEN_SECRET" != "$gl_secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
         # Only a self-managed instance can be behind a private CA.
         # No default: empty must stay a way to answer "none" on every pass.
         if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
@@ -8079,12 +8150,17 @@ main() {
         else
           prompt_read "Repository path (workspace/repo-slug)" github_repo "${github_repo}"
         fi
+        local secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
         prompt_read "Kubernetes Secret to hold the ${bb_label} token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+        # A name typed here is this run's choice, as --gitops-token-secret is.
+        [ "$PARAM_GITLAB_TOKEN_SECRET" != "$secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
         if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
           prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
         fi
         PARAM_GITOPS_REPO="$github_repo"
-        if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
+        if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_HOST:-}" ]; then
+          print_error "A Bitbucket Data Center install needs the instance's hostname."
+        elif [ -n "$github_repo" ] && validate_gitops_forge_flags; then
           github_repo="$PARAM_GITOPS_REPO"
           break
         fi
@@ -9190,6 +9266,8 @@ main() {
     create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1
+    # Only now does the Secret hold nothing of a forge this run switched from.
+    clear_gitops_pending_switch "$INSTALL_ENV_FILE"
   elif [ -n "${GITOPS_HOST:-}" ]; then
     # A GitHub Enterprise Server: the CA before the minter restart, which is
     # how the minter reads it. The broker reads it on each call.

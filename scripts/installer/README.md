@@ -420,7 +420,13 @@ keep the recorded token Secret, which holds the old forge's token: the run must 
 `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run or a run with
 no terminal stops, and an interactive run asks for the new token after the apply and stops if none
 is entered. When the run keeps the recorded Secret and gives no read token, the installer removes
-the Secret's `read-token` key, which holds the old forge's read token.
+the Secret's `read-token` key, which holds the old forge's read token. A switch to a forge with a
+token drops the recorded `GITOPS_REPO` unless `--gitops-repo` gives it: a non-interactive run then
+stops, and an interactive run asks. The installer records the old forge and its Secret as
+`GITOPS_SWITCH_FROM_FORGE` and `GITOPS_SWITCH_FROM_SECRET` with the new forge, and removes them
+only after the new token steps succeed, so a run that stops in between leaves the switch pending
+for the next run. A Data Center host is asked for in an interactive run; a non-interactive run, or
+a run with no terminal, needs `--gitops-host`.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.

@@ -588,7 +588,10 @@ Rules for the agent:
   the run needs `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run,
   or a run with no terminal, stops before it changes anything, because the recorded Secret holds the
   old forge's token. When the recorded Secret is kept and no read token is given, the installer
-  removes its `read-token` key; pass the new read token with `GITOPS_READ_TOKEN_FILE`.
+  removes its `read-token` key; pass the new read token with `GITOPS_READ_TOKEN_FILE`. A switch also
+  drops the recorded repository path: pass `--gitops-repo`. If `install.env` has
+  `GITOPS_SWITCH_FROM_FORGE`, an earlier switch stopped before the new token was stored; the same
+  rules apply until a run stores it.
 - Only for a Data Center instance behind a private CA, add `--gitops-ca-file` (a regular PEM file).
 - Tell the operator that Bitbucket has no issue tracker: the fleet audits keep their ledger in the
   report store and post to chat, and still open pull requests in the GitOps repository.

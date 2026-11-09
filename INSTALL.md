@@ -350,7 +350,10 @@ Rules for the agent:
   Bitbucket product), give the new token with `--gitops-token-file` or name its Secret with
   `--gitops-token-secret`: the installer refuses to keep the recorded Secret, which holds the old
   forge's token. A run with no terminal is refused like a non-interactive one. When the recorded
-  Secret is kept and no read token is given, the installer removes its `read-token` key.
+  Secret is kept and no read token is given, the installer removes its `read-token` key. A switch
+  also drops the recorded repository path, so give `--gitops-repo`. A switch that stops before the
+  new token is stored stays pending in `install.env` (`GITOPS_SWITCH_FROM_FORGE`,
+  `GITOPS_SWITCH_FROM_SECRET`), and the next run needs the same flags.
 - Only for a Data Center instance whose certificate a private CA signed, add
   `--gitops-ca-file="$HOME/secure/internal-ca.pem"`. The installer stores it in the Secret
   `bitbucket-forge-ca`. The installer refuses it for Cloud.

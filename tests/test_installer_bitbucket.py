@@ -276,6 +276,89 @@ class BitbucketFlagsTest(unittest.TestCase):
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
         self.assertIn("--gitops-token-file", proc.stdout + proc.stderr)
 
+    # --- A switch that a stopped run left pending (install.env records the
+    # new forge, and GITOPS_SWITCH_FROM_* the old one) ---
+    def _pending(self, **extra):
+        return self._cloud(PARAM_GITOPS_RECORDED_FORGE="bitbucket", PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token",
+                           PARAM_GITOPS_RECORDED_TOKEN_SECRET="bitbucket-forge-token",
+                           PARAM_GITOPS_PENDING_FROM_FORGE="bitbucket-datacenter",
+                           PARAM_GITOPS_PENDING_FROM_SECRET="bitbucket-forge-token", **extra)
+
+    def test_a_rerun_after_a_stopped_switch_still_refuses_the_old_token(self):
+        proc = self._validate(self._pending())
+        out = proc.stdout + proc.stderr
+        self.assertRegex(proc.stdout, r"rc=[1-9]", out)
+        self.assertIn("--gitops-token-file", out)
+
+    def test_a_rerun_after_a_stopped_switch_still_removes_the_old_read_token(self):
+        tok = self._tmp / "tok"
+        tok.write_text("x")
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._pending(PARAM_GITLAB_TOKEN_FILE=str(tok)).items())
+        proc = self._run_install_func(f'{body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc old=$PARAM_GITOPS_OLD_TOKEN_SECRET"')
+        self.assertIn("rc=0 old=bitbucket-forge-token", proc.stdout, proc.stderr)
+
+    def test_install_env_switch_keys_are_read_at_load(self):
+        env = self._tmp / "pending.env"
+        env.write_text("GITOPS_FORGE=bitbucket\nGITLAB_TOKEN_SECRET=bb\nGITOPS_SWITCH_FROM_FORGE=bitbucket-datacenter\n"
+                       "GITOPS_SWITCH_FROM_SECRET=bb-old\nGITOPS_REPO=acme/infra\n")
+        proc = self._run_install_func(
+            'echo "pf=$PARAM_GITOPS_PENDING_FROM_FORGE ps=$PARAM_GITOPS_PENDING_FROM_SECRET '
+            'rs=$PARAM_GITOPS_RECORDED_TOKEN_SECRET rr=$PARAM_GITOPS_RECORDED_REPO"',
+            env={"KUBE_AGENTS_INSTALL_ENV": str(env)})
+        self.assertIn("pf=bitbucket-datacenter ps=bb-old rs=bb rr=acme/infra", proc.stdout, proc.stderr)
+
+    # --- The old Secret is the one install.env recorded, read once ---
+    def test_a_second_validation_keeps_the_recorded_secret_as_the_old_one(self):
+        """validate_gitops_forge_flags runs more than once, and the interview
+        can change the Secret's name between the runs: the old Secret is still
+        the recorded one, never the new name."""
+        tok = self._tmp / "tok"
+        tok.write_text("x")
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._cloud(
+            PARAM_GITOPS_RECORDED_FORGE="gitlab", PARAM_GITLAB_TOKEN_SECRET="gitlab-forge-token",
+            PARAM_GITOPS_RECORDED_TOKEN_SECRET="gitlab-forge-token", PARAM_GITLAB_TOKEN_FILE=str(tok)).items())
+        proc = self._run_install_func(
+            f"{body}validate_gitops_forge_flags >/dev/null; validate_gitops_forge_flags >/dev/null; "
+            'echo "twice=$PARAM_GITOPS_OLD_TOKEN_SECRET secret=$PARAM_GITLAB_TOKEN_SECRET"; '
+            "PARAM_GITLAB_TOKEN_SECRET=typed-at-the-prompt; validate_gitops_forge_flags >/dev/null; "
+            'echo "prompt=$PARAM_GITOPS_OLD_TOKEN_SECRET"')
+        self.assertIn("twice=gitlab-forge-token secret=bitbucket-forge-token", proc.stdout, proc.stderr)
+        self.assertIn("prompt=gitlab-forge-token", proc.stdout, proc.stderr)
+
+    # --- The Data Center host is asked for in an interactive run ---
+    def test_an_interactive_dc_run_without_a_host_goes_on_to_the_interview(self):
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._dc(
+            PARAM_GITOPS_HOST="", PARAM_NON_INTERACTIVE="false").items())
+        proc = self._run_install_func(
+            f'has_controlling_tty() {{ return 0; }}; {body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"')
+        self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+        proc = self._run_install_func(
+            f'has_controlling_tty() {{ return 1; }}; {body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"')
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+
+    # --- A switch drops the recorded repository ---
+    def test_a_switch_drops_the_recorded_repository(self):
+        tok = self._tmp / "tok"
+        tok.write_text("x")
+        base = dict(PARAM_GITOPS_RECORDED_FORGE="gitlab", PARAM_GITOPS_RECORDED_REPO="acme/infra",
+                    PARAM_GITOPS_REPO="acme/infra", PARAM_GITLAB_TOKEN_FILE=str(tok),
+                    PARAM_GITLAB_TOKEN_SECRET="gitlab-forge-token", PARAM_GITOPS_RECORDED_TOKEN_SECRET="gitlab-forge-token")
+        proc = self._validate(self._cloud(**base))
+        out = proc.stdout + proc.stderr
+        self.assertRegex(proc.stdout, r"rc=[1-9]", out)
+        self.assertIn("Dropping the recorded GitLab repository 'acme/infra'", out)
+        self.assertIn("needs --gitops-repo", out)
+        proc = self._validate(self._cloud(PARAM_GITOPS_REPO_FROM_FLAG="true", **base))
+        self.assertIn("rc=0 repo=acme/infra ", proc.stdout, proc.stderr)
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._cloud(PARAM_NON_INTERACTIVE="false", **base).items())
+        proc = self._run_install_func(
+            f'has_controlling_tty() {{ return 0; }}; {body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc repo=[$PARAM_GITOPS_REPO]"')
+        self.assertIn("rc=0 repo=[]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_parse_args_marks_a_named_repository(self):
+        proc = self._run_install_func('parse_args --gitops-repo=acme/infra; echo "flag=$PARAM_GITOPS_REPO_FROM_FLAG"')
+        self.assertIn("flag=true", proc.stdout, proc.stderr)
+
     def test_parse_args_marks_a_named_secret(self):
         proc = self._run_install_func(
             'parse_args --gitops-token-secret=s1; echo "flag=$PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG"')
@@ -407,6 +490,36 @@ class BitbucketInstallEnvTest(unittest.TestCase):
             f'load_install_env "{dest}"; echo "forge=$GITOPS_FORGE repo=$GITOPS_REPO id=$GITOPS_IDENTITY"\n'
         )
         self.assertIn(f"forge=bitbucket repo=acme/infra id={_UUID}", proc.stdout, proc.stderr)
+
+    def test_a_switch_records_the_pending_old_forge_and_clearing_removes_it(self):
+        dest = self._tmp / "install.env"
+        dest.write_text("PROJECT_ID=p\nGITOPS_FORGE=bitbucket-datacenter\nGITOPS_HOST=bb.example.com\n"
+                        "GITLAB_TOKEN_SECRET=bitbucket-forge-token\nGITOPS_REPO=INFRA/gitops\n")
+        proc = self._bash(
+            "export GITOPS_FORGE=bitbucket GITOPS_HOST= GITOPS_REPO=acme/infra GITLAB_TOKEN_SECRET=bitbucket-forge-token "
+            "GITOPS_CA_SECRET= GITOPS_IDENTITY=\n"
+            "PARAM_GITOPS_SWITCH_FROM=bitbucket-datacenter PARAM_GITOPS_OLD_TOKEN_SECRET=bitbucket-forge-token\n"
+            f'record_gitops_forge_keys "{dest}"\n'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        text = dest.read_text()
+        self.assertIn("GITOPS_FORGE=bitbucket\n", text)
+        self.assertIn("GITOPS_SWITCH_FROM_FORGE=bitbucket-datacenter\n", text)
+        self.assertIn("GITOPS_SWITCH_FROM_SECRET=bitbucket-forge-token\n", text)
+        proc = self._bash(f'clear_gitops_pending_switch "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        text = dest.read_text()
+        self.assertNotIn("GITOPS_SWITCH_FROM", text)
+        self.assertIn("GITOPS_FORGE=bitbucket\n", text)
+        self.assertIn("PROJECT_ID=p\n", text)
+
+    def test_the_pending_switch_is_cleared_only_after_both_token_steps(self):
+        source = _INSTALL_SH.read_text()
+        write = source.index('    create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1')
+        read = source.index('    create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1')
+        clear = source.index('    clear_gitops_pending_switch "$INSTALL_ENV_FILE"')
+        self.assertLess(write, read)
+        self.assertLess(read, clear)
 
     def test_an_unchanged_bitbucket_install_env_is_not_rewritten(self):
         dest = self._tmp / "install.env"
