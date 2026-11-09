@@ -78,6 +78,47 @@ Slack back to the credential broker, and the Slack app back to its `today` setti
 that section gives, instead of leaving you to find the app without its slash commands after the
 rollback.
 
+### A bus left down by a rollback under `next`
+
+Since the release that separates the bus's accounts, the bus keeps its stored streams under a
+`TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
+past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
+the A2A gateway and the agent's bridge fail behind it.
+
+Upgrade forward to the release you came from. The operator then replaces the stuck pod: once the
+StatefulSet carries the forward template, it deletes a bus pod that has not been Ready for two
+minutes on an earlier revision, and records an `A2ABusPodReplaced` event on the `PlatformAgent`. The
+forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus,
+so the operator holds the bus on its earlier template until the callouts' rollout deadline, about
+ten minutes. The callout Deployment reports `ProgressDeadlineExceeded` and the `PlatformAgent` shows the
+`A2ACalloutRolloutStalled` condition meanwhile; both are expected here.
+
+A forward run in harness or full mode waits for the agent, and completes once the bus is back.
+To see the replacement:
+
+```bash
+kubectl get events -n kubeagents-system --field-selector reason=A2ABusPodReplaced
+```
+
+An operator that predates this repair does not replace the pod. If the pod is still not Ready about
+fifteen minutes after the forward upgrade was applied, run the checks below. Delete the pod once its
+`controller-revision-hash` label differs from the StatefulSet's `status.updateRevision` (the default
+agent name is `platform-agent`); a pod deleted before then comes back on the earlier template. The
+delete is the same one the operator makes, so it is safe with either operator:
+
+```bash
+kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
+  -o jsonpath='{.status.updateRevision}{"\n"}'
+kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}{"\n"}'
+kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
+```
+
+Then roll back as this page says: switch to `today` first, and move the bus's store back as the
+bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says before you return to `next`.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:
@@ -213,8 +254,9 @@ full-mode apply sets it again.
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
 entrypoint's doing, and every published release's entrypoint does the same. Skills are not kept:
-on every start the entrypoint replaces the platform profile's `skills/`, and every cluster
-profile's, whole from the image. A skill `N` added is therefore gone at the first start after the
+on every start the entrypoint replaces the platform profile's `skills/` whole from the image, and
+a cluster profile's whenever its boot stamp does not match the image, which a start on a
+different image always is. A skill `N` added is therefore gone at the first start after the
 harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
 skill).

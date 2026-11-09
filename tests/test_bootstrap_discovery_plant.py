@@ -78,6 +78,7 @@ _INTERPOLATIONS = {
     "local.run_wait": "900",
     "local.poll": "15",
     "local.inventory": "/opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md",
+    "local.sweep_dir": "/opt/data/INVENTORY.sweep",
     "local.gate_script": "oobe.py bootstrap_scan_gate.py",
     "local.gate_wait": "300",
     "local.list_tries": "3",
@@ -116,6 +117,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.python": _INTERPOLATIONS["local.python"],
     "self.triggers.key_like": _INTERPOLATIONS["local.key_like"],
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
+    "self.triggers.sweep_dir": _INTERPOLATIONS["local.sweep_dir"],
     "self.triggers.cap_file": _INTERPOLATIONS["local.cap_file"],
     "self.triggers.cards_cap": _INTERPOLATIONS["local.cards_cap"],
     "self.triggers.cap_mark": _INTERPOLATIONS["local.cap_mark"],
@@ -210,7 +212,9 @@ elif "/opt/data/.first_run_cluster_cards" in cmd:
         sys.exit(1)
 elif "rm" in cmd and "/opt/data/.bootstrap_scan_filed" in cmd:
     record("rearm")
-elif "rm" in cmd and "/opt/data/INVENTORY.md" in cmd:
+elif ("rm" in cmd or script.startswith("rm -f ")) and "/opt/data/INVENTORY.md" in " ".join(cmd):
+    # The agent pod's rm is a bare argv; the sandbox's is `sh -c "rm -f <files> && rm -rf <dir>"`,
+    # the files and the collector's sweep directory in one exec.
     record("clear " + target)
     if os.environ.get("INVENTORY_RM_FAIL") == target:
         sys.stderr.write("error: unable to upgrade connection: container not found\n")
@@ -460,6 +464,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(self._indices(calls, "[rearm]"), [])
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
         self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
 
     def test_a_failed_card_listing_stops_the_apply_before_the_marker_goes(self):
@@ -554,6 +559,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(self._indices(calls, "[archive]"), [])
         self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 2)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
 
     def test_the_destroy_clears_the_inventory_files_when_it_cannot_list_the_cards(self):
         completed, calls = self._run(script=self._destroy_script, FAILED_LISTINGS="1")
@@ -561,6 +567,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 1)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
 
     def test_the_destroy_clears_the_sandbox_when_the_agents_rm_fails(self):
         completed, calls = self._run(
@@ -638,6 +645,18 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         # A plant that succeeds leaves it for the verifier; the destroy removes it.
         self.assertEqual(self._indices(calls, "[uncap+unmark]"), [])
         self.assertIn("First-run cluster card cap set to 2", completed.stdout)
+
+    def _assert_sandbox_clear_removes_the_sweep_dir(self, calls):
+        # The sandbox's one exec removes the INVENTORY files and the collector's
+        # sweep directory; a clear that drops the directory leaves the previous
+        # sweep's files for the next hand-off to read.
+        cleared = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+        self.assertTrue(cleared, calls)
+        for i in cleared:
+            self.assertIn(
+                "rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md && rm -rf /opt/data/INVENTORY.sweep [clear pod/platform-agent-shell-0]",
+                calls[i],
+            )
 
     def _assert_cap_then_sentinel_removed(self, calls):
         # One exec, cap first: the sentinel's rm runs only after the cap's

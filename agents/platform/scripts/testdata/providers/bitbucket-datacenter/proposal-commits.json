@@ -1,0 +1,68 @@
+{
+  "payload": {
+    "number": 10
+  },
+  "responses": [
+    {
+      "values": [
+        {
+          "id": "ae20e95ac2776c278e49aa1de74cb7f3839a3291",
+          "displayId": "ae20e95ac27",
+          "author": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL"
+          },
+          "authorTimestamp": 1793644393000,
+          "committer": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL"
+          },
+          "committerTimestamp": 1793644393000,
+          "message": "Keep one replica through an eviction",
+          "parents": [
+            {
+              "id": "a2c792f9f4a487fc0ed38d3aff35d0fff0523958",
+              "displayId": "a2c792f9f4a"
+            }
+          ]
+        },
+        {
+          "id": "a2c792f9f4a487fc0ed38d3aff35d0fff0523958",
+          "displayId": "a2c792f9f4a",
+          "author": {
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
+          },
+          "authorTimestamp": 1793644386000,
+          "committer": {
+            "name": "platform-agent",
+            "emailAddress": "platform-agent@kube-agents.invalid"
+          },
+          "committerTimestamp": 1793644386000,
+          "message": "Raise the replica floor",
+          "parents": [
+            {
+              "id": "adae32302776860009d732ce2599f15be92954d9",
+              "displayId": "adae3230277"
+            }
+          ]
+        }
+      ],
+      "size": 2,
+      "isLastPage": true,
+      "start": 0,
+      "limit": 100,
+      "nextPageStart": null
+    }
+  ]
+}

@@ -201,9 +201,9 @@ only when its text is the report being relayed, with the flag on and a channel k
 leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
-(`chat_from_card`), with Retry and Drop under each row on Slack; the Google Chat renderer
-draws no row actions yet, so there the rows post with their card ids carried and no buttons.
-Its outcomes, and the report going out as text where the card does not post, are the audit
+(`chat_from_card`), with Retry and Drop under each row on Slack and, on Google Chat, under
+the message and labelled by the row's number (`a2a/gateway/slack_board.go`,
+`a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
 card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row
@@ -540,8 +540,8 @@ exactly as before, and the index only runs where the hook previously did nothing
 Google Chat opens a thread around every top-level message, so the thread name on
 an inbound payload cannot say whether the user posted at top level or replied
 inside a real thread. Chat's `message.threadReply` flag does say (it is true only
-for a reply in a thread; the `mode: next` gateway reads it, per
-`spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
+for a reply in a thread; the `mode: next` gateway reads it to mark a top-level ask and keys every DM
+message by its thread, per `spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
 the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
 than in the thread. Both writers of that counter live in the gateway process. A
@@ -645,13 +645,18 @@ profile's — then per-platform environment signals for an install neither file
 describes.
 
 An install with no chat route gets no send at all: when the managed scope turns
-every platform off and nothing routes one through the gateway — a `next` install
-whose only chat platform is held by the gateway with no home channel, or an
-install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
-platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
-channel (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
-exists when no platform can be named.
+every platform off and nothing routes one through the gateway — an install with
+neither Google Chat nor Slack, or one whose home channel is malformed, which routes
+nothing — the relay answers 502 without posting, and the detail says that no route
+exists. A `next` install whose only chat platform is held by the gateway with no home
+channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
+sends, and the gateway refuses the post and keeps it for the digest it posts once a
+home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
+the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
+says the post is kept, is in the gateway's and the session server's logs. A pod
+rendered before the operator routed it still answers the platform-naming detail
+(`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
@@ -748,7 +753,8 @@ standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
 drops a dressed marker with the Slack sender's predicate, and upstream's, on an
 install without the relay, carries no such guard; no roster job uses `"all"`.
 
-The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`
+(and, where the SOP runs the gate, to `precheck`).
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier
 ([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 

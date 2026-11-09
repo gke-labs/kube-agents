@@ -81,6 +81,12 @@ cryptography
 # hermes-agent through rich; nothing above pulls it in.
 markdown-it-py
 
+# agents/chat/scripts/cron_idle_policy.py computes a held job's next slot with
+# croniter, which the runtime image gets from hermes-agent's own dependencies
+# (its scheduler reads cron expressions with it). Listed here so the ticker's
+# tests run the real schedule arithmetic rather than a stand-in.
+croniter
+
 # `make coverage`, which the CI `test-shard` jobs run (the `test` job joins their
 # data with `make coverage-merge`). coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the

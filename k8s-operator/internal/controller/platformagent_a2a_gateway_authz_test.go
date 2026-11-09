@@ -204,6 +204,19 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		t.Errorf("the wildcard direct get answered %q, not the submission; live_test.go reads this reply's body", lastIn.Data)
 	}
 
+	// gateway.readDirectory, the profile cards' start-up read: the
+	// directory's subject list, then a direct get by card subject. An empty
+	// subject answers not-found, which is the server answering, not refusing.
+	dirStream, err := js.Stream(ctx, a2aDirectoryStream)
+	allowed("STREAM.INFO DIRECTORY (readDirectory js.Stream)", err)
+	_, err = dirStream.Info(ctx, jetstream.WithSubjectFilter(a2aDirectorySubjectPrefix+"*"))
+	allowed("STREAM.INFO DIRECTORY with a subject filter (readDirectory)", err)
+	_, err = dirStream.GetLastMsgForSubject(ctx, a2aDirectorySubjectPrefix+"platform")
+	if errors.Is(err, jetstream.ErrMsgNotFound) {
+		err = nil
+	}
+	allowed("DIRECT.GET DIRECTORY last-for-subject, a card (readDirectory)", err)
+
 	// gateway.Registry, over the session-state bucket.
 	kv, err := js.KeyValue(ctx, a2aSessionStateBucket)
 	allowed("STREAM.INFO KV_session-state (Registry js.KeyValue)", err)
@@ -250,6 +263,32 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$KV.feedback delete (feedbackDesk.Rate, a 👍)", fb.Delete(ctx, "t1.U1"))
 
+	// The people count (a2a/gateway/people.go): bound and its max age read
+	// at start, the desk's watch started and stopped, a person's put, the
+	// purge's key list and delete.
+	people, err := js.KeyValue(ctx, a2aPeopleBucket)
+	allowed("STREAM.INFO KV_people (tryPeople js.KeyValue)", err)
+	if status, err := people.Status(ctx); err != nil || status.TTL() <= 0 {
+		t.Errorf("the people bucket's max age read as %v (err %v); the gateway counts nobody without one", status, err)
+	}
+	peopleWatch, err := people.WatchAll(ctx)
+	allowed("CONSUMER.CREATE KV_people, watcher (peopleDesk.follow WatchAll)", err)
+	if err == nil {
+		allowed("CONSUMER.DELETE KV_people, watcher Stop (peopleDesk.follow)", peopleWatch.Stop())
+	}
+	const personKey = "people.0123456789abcdef"
+	_, err = people.Put(ctx, personKey, []byte("2026-11-02T00:00:00Z"))
+	allowed("$KV.people put (peopleDesk.put)", err)
+	_, err = people.Get(ctx, personKey)
+	allowed("DIRECT.GET KV_people", err)
+	peopleKeys, err := people.ListKeys(ctx)
+	allowed("CONSUMER.CREATE KV_people, watcher (purgePeople ListKeys)", err)
+	if err == nil {
+		for range peopleKeys.Keys() {
+		}
+	}
+	allowed("$KV.people delete (purgePeople)", people.Delete(ctx, personKey))
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))
@@ -275,13 +314,14 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + ".bridge-platform", ""},
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
 		{"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
-		// The directory: the identity plane. The gateway reads it by
-		// subscribing to the cards, and holds nothing on it here.
-		{"$JS.API.STREAM.INFO.DIRECTORY", ""},
+		// The directory: the identity plane. Subscribing alone misses cards
+		// published before the gateway started, so it reads them too, by
+		// DIRECT.GET on card subjects only (table 1). Nothing past that: no
+		// purge or delete, no consumer, no batch get across the stream.
 		{"$JS.API.STREAM.PURGE.DIRECTORY", ""},
 		{"$JS.API.STREAM.DELETE.DIRECTORY", ""},
 		{"$JS.API.CONSUMER.CREATE.DIRECTORY.peek", `{"stream_name":"DIRECTORY","config":{"name":"peek","deliver_subject":"_INBOX.gateway.peek"}}`},
-		{"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform", ""},
+		{"$JS.API.DIRECT.GET.DIRECTORY", `{"multi_last":["a2a.agents.*"],"batch":10}`},
 		// The blackboard, which nothing in a2a/gateway touches.
 		{"$JS.API.STREAM.INFO." + a2aTopicsStateStream, ""},
 		{"$JS.API.DIRECT.GET." + a2aTopicsStateStream + ".a2a.topics.shared.blueprint", ""},

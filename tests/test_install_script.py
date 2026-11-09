@@ -1452,6 +1452,126 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             combined = proc.stdout + proc.stderr
             self.assertIn("not a regular file", combined)
 
+    def test_print_minter_restore_advice_names_the_restore_for_scheduled_versions(self):
+        """A minter key whose versions a destroy scheduled needs a restore, not a
+        re-import: the helper names gcloud's restore and enable and returns 0."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "kms_key_scheduled_version() { echo 3; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are scheduled for destruction, as a destroy of the key leaves them.", out)
+        # gcloud's restore works in or out of Terraform state; adopt-kms would
+        # need a checkout and state backend the installers do not have here.
+        self.assertNotIn("adopt-kms", out)
+        self.assertIn(
+            "gcloud kms keys versions restore <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
+            out,
+        )
+
+    def test_print_minter_restore_advice_is_silent_with_nothing_scheduled(self):
+        """A key never imported, or a failed query, has nothing to restore: the
+        helper prints nothing and returns 1, so the caller's import advice stands."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'kms_key_scheduled_version() { echo ""; }; '
+            'kms_key_disabled_version() { echo ""; }; '
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("scheduled for destruction", proc.stdout + proc.stderr)
+        self.assertNotIn("disabled", proc.stdout + proc.stderr)
+
+    def test_print_minter_restore_advice_names_the_enable_for_disabled_versions(self):
+        """A restore leaves a version DISABLED until it is enabled: the helper names
+        gcloud's enable, not a re-import, and returns 0."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'kms_key_scheduled_version() { echo ""; }; '
+            "kms_key_disabled_version() { echo 1; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are disabled, as a restore leaves them.", out)
+        self.assertIn(
+            "gcloud kms keys versions enable <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
+            out,
+        )
+        self.assertIn("If a version was disabled on purpose, for example a revoked App key, import the new App key into a new Cloud KMS key with install.sh --kms-key instead.", out)
+        self.assertNotIn("versions restore", out)
+
+    def test_print_minter_restore_advice_names_the_restore_when_versions_are_also_disabled(self):
+        """Scheduled versions need the restore first; its advice already names the enable."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "kms_key_scheduled_version() { echo 2; }; "
+            "kms_key_disabled_version() { echo 1; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are scheduled for destruction", out)
+        self.assertNotIn("Its versions are disabled", out)
+
+    def test_kms_key_scheduled_version_asks_for_destroy_scheduled_versions(self):
+        """The query filters on DESTROY_SCHEDULED, and a failing gcloud reads as none."""
+        asks = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'gcloud() { case "$*" in *"state=DESTROY_SCHEDULED"*) echo 3 ;; *) echo wrong ;; esac; }; '
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[3]", self._run_install_func(asks).stdout)
+        fails = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "gcloud() { return 1; }; "
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[]", self._run_install_func(fails).stdout)
+
+    def test_kms_key_disabled_version_asks_for_disabled_versions(self):
+        """The query filters on DISABLED, and a failing gcloud reads as none."""
+        asks = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'gcloud() { case "$*" in *"state=DISABLED"*) echo 1 ;; *) echo wrong ;; esac; }; '
+            'echo "v=[$(kms_key_disabled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[1]", self._run_install_func(asks).stdout)
+        fails = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "gcloud() { return 1; }; "
+            'echo "v=[$(kms_key_disabled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[]", self._run_install_func(fails).stdout)
+
+    def test_both_installers_name_the_restore_before_their_import_advice(self):
+        """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
+        restore advice comes first, and their own import advice only when it returns 1."""
+        for script, refusal, advice in (
+            (_INSTALL_SH, "but its KMS signing key still has no ENABLED version", 'print_info "Fix the App key import'),
+            (_REPO_ROOT / "upgrade.sh", "but its KMS signing key has no ENABLED version", 'print_info "Import the App key with install.sh'),
+        ):
+            with self.subTest(script=script.name):
+                text = script.read_text()
+                # Anchor on the final refusal's own print_error, not the first
+                # restore-advice call in the file: the helper runs three times
+                # since #4570, and anchoring on the first left the final refusal
+                # free to drop its advice with the test still green.
+                start = text.index(refusal)
+                window = text[start : text.index(advice, start)]
+                # The opening quote matches the call, not upgrade.sh's
+                # `declare -F print_minter_restore_advice` guard line.
+                self.assertIn('print_minter_restore_advice "', window)
+                self.assertIn(" ||\n", window)
+        # upgrade.sh sources the target tree's helpers, which may predate this one.
+        self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
+
     def test_validate_non_interactive_minter_config(self):
         """validate_non_interactive_minter_config enforces intent-driven validation."""
         # 1. No App ID and no PEM path -> succeeds (optional feature omitted)
@@ -1480,6 +1600,35 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc4 = self._run_install_func(cmd4)
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+
+        # 4b. The same, but the key's versions are scheduled for destruction -> the
+        # restore is named instead of the import, and the run still stops.
+        cmd4b = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'kms_key_scheduled_version() { echo 2; }; '
+            'rc=0; validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org" || rc=$?; echo "rc=$rc"'
+        )
+        proc4b = self._run_install_func(cmd4b)
+        out4b = proc4b.stdout + proc4b.stderr
+        self.assertIn("rc=1", proc4b.stdout, out4b)
+        self.assertIn("Its versions are scheduled for destruction", out4b)
+        self.assertNotIn("for automated import, or pre-import", out4b)
+
+        # 4c. The same, but a restore left the key's versions DISABLED -> the
+        # enable is named instead of the import, and the run still stops.
+        cmd4c = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'kms_key_scheduled_version() { echo ""; }; '
+            'kms_key_disabled_version() { echo 1; }; '
+            'rc=0; validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org" || rc=$?; echo "rc=$rc"'
+        )
+        proc4c = self._run_install_func(cmd4c)
+        out4c = proc4c.stdout + proc4c.stderr
+        self.assertIn("rc=1", proc4c.stdout, out4c)
+        self.assertIn("Its versions are disabled", out4c)
+        self.assertNotIn("for automated import, or pre-import", out4c)
 
         # 5. App ID provided with org and existing KMS key version (AOT path) -> succeeds
         cmd5 = (
@@ -4869,6 +5018,7 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         legacy_np="False",
         status="RUNNING",
         accept="",
+        env_overrides=None,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -4901,7 +5051,10 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env), **(env_overrides or {})},
+                    bin_dir=str(bin_dir),
+                ),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -4933,6 +5086,20 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Node Pool Metadata Migration: Refused", proc.stdout)
         self.assertIn("install will abort", proc.stdout)
+
+    def test_the_gvisor_line_names_the_sizing_inputs_not_a_fixed_shape(self):
+        """The pool's shape is decided by the module's sizing inputs, which reach
+        the apply as TF_VAR_ lines in install.env that this summary cannot see;
+        a line that names a machine type misstates the pool for an install.env
+        that sizes it."""
+        for env_overrides in ({}, {"TF_VAR_sizing_profile": "fleet"}, {"TF_VAR_gvisor_machine_type": "n2-standard-4"}):
+            with self.subTest(env_overrides=env_overrides):
+                proc = self._run(env_overrides=env_overrides)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("gVisor Sandbox Node Pool: Will create 'gvisor-pool'", proc.stdout)
+                self.assertIn("sizing_profile", proc.stdout)
+                self.assertIn("install.env", proc.stdout)
+                self.assertNotRegex(proc.stdout, r"[a-z][0-9]+[a-z]*-(standard|highmem|highcpu)-[0-9]+")
 
     def test_summary_reflects_unreadable_network_policy(self):
         proc = self._run(status="")
@@ -5053,6 +5220,30 @@ class MissingPemAgainstKmsTest(unittest.TestCase):
         self.assertIn("GitHub App private key PEM file does not exist", combined)
         self.assertIn("has no ENABLED version, so the import still needs that file", combined)
         self.assertIn("PEM=[/tmp/never-existed-12345.pem] RC=1", proc.stdout)
+
+    def test_a_missing_pem_names_the_restore_when_the_key_versions_are_scheduled(self):
+        """A key whose versions a destroy scheduled needs a restore, not the PEM again."""
+        proc = self._resolve(
+            "/tmp/never-existed-12345.pem", "",
+            overrides='kms_key_scheduled_version() { echo 2; }; ',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Its versions are scheduled for destruction", combined)
+        self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", combined)
+        self.assertNotIn("the import still needs that file", combined)
+
+    def test_a_missing_pem_names_the_enable_when_the_key_versions_are_disabled(self):
+        """A key a restore left DISABLED needs an enable, not the PEM again."""
+        proc = self._resolve(
+            "/tmp/never-existed-12345.pem", "",
+            overrides='kms_key_scheduled_version() { echo ""; }; kms_key_disabled_version() { echo 1; }; ',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Its versions are disabled", combined)
+        self.assertIn("gcloud kms keys versions enable <version> --key github-token-minter-key", combined)
+        self.assertNotIn("the import still needs that file", combined)
 
     def test_an_overridden_keyring_and_key_are_what_kms_is_asked_about(self):
         """--kms-keyring/--kms-key must reach the probe, or the fallback checks the wrong key."""
@@ -5918,6 +6109,26 @@ class ServiceAccountOwnershipIsCheckedOnEveryApplyDoorTest(unittest.TestCase):
         apply = self.source.index("run_lifecycle_apply", menu_generator)
         self.assertLess(menu_generator, check)
         self.assertLess(check, apply)
+
+
+class FootprintSummaryIsPrintedInTheStepElevenSummaryTest(unittest.TestCase):
+    """The footprint and modeled-cost block is part of the step 11 summary: after the
+    generator wrote the tfvars it reads, inside the summary, and before the dry-run exit
+    and the confirmation, so the dry run and the real run both show it."""
+
+    def setUp(self):
+        self.source = _INSTALL_SH.read_text()
+
+    def test_the_block_sits_between_the_summary_heading_and_the_dry_run_exit(self):
+        generator = self.source.index('write_tfvars_from_state "$tfvars_file" "$image_tag"')
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"', generator)
+        call = self.source.index('print_footprint_summary "$repo_dir" "$tfvars_file"', summary)
+        dry_run = self.source.index('if [ "$PARAM_DRY_RUN" = "true" ]; then', summary)
+        confirm = self.source.index("Proceed with automated GKE cluster & Platform Agent provisioning?", summary)
+        self.assertLess(summary, call)
+        self.assertLess(call, dry_run)
+        self.assertLess(dry_run, confirm)
+        self.assertEqual(self.source.count("print_footprint_summary "), 1)
 
 
 class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
@@ -7970,7 +8181,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=7", proc.stdout, out)
         self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
         self.assertIn("SLACK_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
         out = proc.stdout + proc.stderr
         self.assertIn("went on ASKED=6", proc.stdout, out)
@@ -7987,12 +8198,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
                 proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
             with self.subTest(locale=locale, platform="google_chat"):
                 proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
@@ -8004,7 +8215,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=6", proc.stdout, out)
         self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
         self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
         self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
         # Under today the prompt stays optional and nothing is confirmed.
@@ -10773,19 +10984,32 @@ class PtyChildTestMixin:
     def _watch_pty_child(self, pid, fd):
         drain = threading.Thread(target=self._drain, args=(fd,), daemon=True)
         drain.start()
-        self.addCleanup(self._cleanup_pty, pid, fd)
+        self.addCleanup(self._cleanup_pty, pid)
 
     @staticmethod
     def _drain(fd):
+        """Read the pty until the child's side closes, then close the descriptor.
+
+        Only this thread closes the descriptor. If the cleanup closes it, its
+        number is free while this thread can still be between two reads. On a
+        loaded runner the scheduler can hold this thread there until a later
+        test runs. This thread's next read then takes bytes from the file that
+        the later test opened with the same number. For install.sh it takes all
+        of them, and the later test's read_text() returns an empty string.
+        """
         while True:
             try:
                 if not os.read(fd, 4096):
-                    return
+                    break
             except OSError:
-                return
+                break
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     @staticmethod
-    def _cleanup_pty(pid, fd):
+    def _cleanup_pty(pid):
         for killer in (lambda: os.killpg(os.getpgid(pid), signal.SIGKILL), lambda: os.kill(pid, signal.SIGKILL)):
             try:
                 killer()
@@ -10793,10 +11017,6 @@ class PtyChildTestMixin:
                 pass
         try:
             os.waitpid(pid, 0)
-        except OSError:
-            pass
-        try:
-            os.close(fd)
         except OSError:
             pass
 
@@ -10807,6 +11027,55 @@ class PtyChildTestMixin:
                 return path.read_text().strip()
             time.sleep(self._POLL_INTERVAL_SECS)
         self.fail(f"timed out after {self._READY_TIMEOUT_SECS}s waiting for {what} at {path}")
+
+
+@unittest.skipUnless(hasattr(pty, "fork"), "the mixin under test forks a child under a pty")
+class PtyChildDrainClosesThePtyTest(PtyChildTestMixin, unittest.TestCase):
+    """The drain thread closes the pty descriptor, and the cleanup does not.
+
+    This test holds the drain thread between two reads, as a loaded runner can,
+    and runs the cleanup. The descriptor must still name the pty after the
+    cleanup, so that no file a later test opens can get its number.
+    """
+
+    def test_a_drain_held_between_reads_keeps_the_pty_open_through_the_cleanup(self):
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - runs in the forked child
+            try:
+                os.write(pty.STDOUT_FILENO, b"ready\n")
+                time.sleep(self._READY_TIMEOUT_SECS)
+            finally:
+                os._exit(0)
+        held, release = threading.Event(), threading.Event()
+        test_thread = threading.current_thread()
+        drain_reads = []
+        real_read = os.read
+
+        def read(read_fd, size):
+            # Holds the drain thread before its second read of the pty.
+            if read_fd == fd and threading.current_thread() is not test_thread:
+                drain_reads.append(threading.current_thread())
+                if len(drain_reads) == 2:
+                    held.set()
+                    release.wait(self._READY_TIMEOUT_SECS)
+            return real_read(read_fd, size)
+
+        with mock.patch.object(os, "read", read):
+            self._watch_pty_child(pid, fd)
+            try:
+                self.assertTrue(held.wait(self._READY_TIMEOUT_SECS), "the drain thread did not come back for a second read")
+                self.doCleanups()
+                try:
+                    still_the_pty = stat.S_ISCHR(os.fstat(fd).st_mode)
+                except OSError:
+                    still_the_pty = False
+            finally:
+                release.set()
+            drain_reads[0].join(self._READY_TIMEOUT_SECS)
+        self.assertTrue(still_the_pty, "the cleanup closed the pty while the drain thread could still read it")
+        self.assertFalse(drain_reads[0].is_alive(), "the drain thread did not stop after the child was gone")
+        with self.assertRaises(OSError, msg="the drain thread left the pty open"):
+            os.fstat(fd)
 
 
 @unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")

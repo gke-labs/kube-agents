@@ -196,6 +196,7 @@ func TestBrokerClientMapsRefusals(t *testing.T) {
 		{"500", `{"error":"boom ` + testToken + `"}`, 500, "", "failed (HTTP 500)"},
 		{"503 not json", `<html>` + testToken + `</html>`, 503, "", "busy; try again later"},
 		{"503 the broker's own busy", `{"status":"busy","code":"CREDENTIAL_PROXY_BUSY","error":"all slots in use"}`, 503, "CREDENTIAL_PROXY_BUSY", "the credential broker is busy with other requests"},
+		{"429 under resource pressure", `{"status":"busy","code":"CREDENTIAL_PROXY_RESOURCE_PRESSURE","error":"at its hard resource watermark (memory=86%)","retry_after":12}`, 429, "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "short of memory or scratch disk"},
 		{"a code of the wrong shape is not repeated", `{"error":"x","code":"<script>` + testToken + `"}`, 502, "", "failed (HTTP 502)"},
 		{"400 keeps the broker's words, without the token", `{"error":"'x y' is not a repository URL or owner/name ` + testToken + `"}`, 400, "", "is not a repository URL"},
 		{"501 names the gap", `{"error":"names no host, and this install serves more than one forge","code":"FORGE_UNSUPPORTED"}`, 501, "FORGE_UNSUPPORTED", "serves more than one forge"},

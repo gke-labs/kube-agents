@@ -38,15 +38,18 @@ import (
 // size grows with the fleet, measured at the fleet the gate names, against the
 // API server's object limit.
 //
-// Three objects grow past the limit today, so the checks below are inverted:
-// each asserts its object is STILL over the limit and fails, naming the fix
-// issue, the moment a change brings it under. The fix pull request drops the
-// issue from the requireConfigMapSizeGate call in the same diff, which turns
-// it into the forward check, and that is how the gate records the regression
-// on main without holding every other pull request red, and how the fix
-// proves itself. A forward check that goes red on main would be turned off;
-// an inverted one turns itself into the forward check at the moment the fix
-// lands.
+// An object that grows past the limit on main is checked inverted: the check
+// asserts its object is STILL over the limit and fails, naming the fix issue,
+// the moment a change brings it under. The fix pull request drops the issue
+// from the requireConfigMapSizeGate call in the same diff, which turns it into
+// the forward check, and that is how the gate records the regression on main
+// without holding every other pull request red, and how the fix proves
+// itself. A forward check that goes red on main would be turned off; an
+// inverted one turns itself into the forward check at the moment the fix
+// lands. The minter policy map and the identity map are forward checks now:
+// the policies name one repository each and the map is cut into shards, every
+// one of which is gated below. The dispatch config is still over the limit and
+// stays inverted.
 //
 // Each check first confirms its fixture is the fleet the gate names, and does
 // so on the renderer's input (the repositories the sync parses, the profiles
@@ -93,10 +96,10 @@ const (
 	fleetScaleProject           = "fleet-project"
 	fleetScaleLocation          = "us-central1"
 	fleetScaleProfileNameFormat = "cluster-" + fleetScaleProject + "-cluster-%04d-" + fleetScaleLocation
-	// The fix issues the inverted checks name: the minter policy, the identity
-	// map and the dispatch config shrink under #4431.
-	minterConfigMapFixIssue   = "#4431"
-	identityMapFixIssue       = "#4431"
+	// The fix issue the one inverted check names. #4431 shrank the minter
+	// policy map and the identity map; the dispatch config, rendered only
+	// when the dispatcher image is set, is the part it left, and the issue
+	// that takes it moves this constant.
 	dispatchConfigMapFixIssue = "#4431"
 )
 
@@ -275,8 +278,10 @@ func TestTheConfigMapSizeVerdictAtItsBoundaries(t *testing.T) {
 }
 
 // The minter policy ConfigMap at R=500: the sync writes one policy key per
-// repository and lists every repository under each key, so the object grows
-// with R squared.
+// repository, each naming that repository alone, so the object grows with R.
+// It listed every repository under each key before, R squared, and crossed
+// the limit near 119 repositories; this is the forward check that holds it
+// under from here on.
 func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -340,11 +345,16 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 	t.Logf("%s at R=%d: %d operator-managed policy keys, %d repository lines across them",
 		synced.Name, fleetScaleRepositories, len(managedKeys), repoLines)
 
-	requireConfigMapSizeGate(t, synced, fmt.Sprintf("R=%d repositories", fleetScaleRepositories), minterConfigMapFixIssue)
+	requireConfigMapSizeGate(t, synced, fmt.Sprintf("R=%d repositories", fleetScaleRepositories), "")
 }
 
 // The identity map at N=2,500: one entry per (profile, tier), each carrying
-// its ServiceAccount, user, profile and topics, indented for reading.
+// its ServiceAccount, user, profile and topics, indented for reading, cut
+// into numbered shards under a byte budget. The API server's limit applies
+// to each shard, so every shard the render produces goes through the forward
+// check; a map that fit one object again would be one shard and the same
+// check. The shard count and the placement of the entries are
+// TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale's.
 func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	// The shipped shape: no install sets the dispatcher image today, and
 	// its identity would add every durable's name to the map on top.
@@ -352,17 +362,23 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
-	cm, _, err := buildA2AAuthMapConfigMap(agent, profiles)
+	cms, version, err := buildA2AAuthMapConfigMaps(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("rendering the identity map for %d profiles: %v", fleetScaleProfiles, err)
 	}
-	var doc a2aAuthMapDocument
-	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
-		t.Fatalf("decoding the rendered map: %v", err)
+	if len(cms) == 0 {
+		t.Fatalf("rendering the identity map for %d profiles produced no shard", fleetScaleProfiles)
 	}
-	t.Logf("%s at N=%d: %d identities rendered", cm.Name, fleetScaleProfiles, len(doc.Identities))
-
-	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), identityMapFixIssue)
+	identities := 0
+	for i, cm := range cms {
+		var doc a2aAuthMapDocument
+		if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
+			t.Fatalf("decoding shard %d of the rendered map: %v", i, err)
+		}
+		identities += len(doc.Identities)
+		requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles, shard %d of %d", fleetScaleProfiles, i, len(cms)), "")
+	}
+	t.Logf("identity map at N=%d: %d identities rendered across %d shards, version %s", fleetScaleProfiles, identities, len(cms), version)
 }
 
 // The dispatch config at N=2,500, rendered only when the dispatcher image is
@@ -373,7 +389,7 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
-	cm, err := buildA2ADispatchConfigMap(agent, profiles)
+	cm, err := buildA2ADispatchConfigMap(agent, profiles, nil)
 	if err != nil {
 		t.Fatalf("rendering the dispatch config for %d profiles: %v", fleetScaleProfiles, err)
 	}

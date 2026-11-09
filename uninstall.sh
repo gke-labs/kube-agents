@@ -306,7 +306,7 @@ resolve_state_location() {
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  elif ! printf '%s' "$probe_err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+  elif ! grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$probe_err"; then
     # Anything that is not a clean "absent" — refuse rather than report an
     # empty target. Reaching the local-state branches below on a permission
     # error would be the same mistake one level down.
@@ -937,6 +937,9 @@ main() {
   # value, and the destroy removes the two serving-project resources in state
   # whichever way the key renders.
   export VERTEX_MANAGE_SERVING_PROJECT=""
+  # The release's upgrade_install switch, likewise: the generator refuses a
+  # misspelt value, and the destroy removes the release however it renders.
+  export HELM_UPGRADE_INSTALL=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""

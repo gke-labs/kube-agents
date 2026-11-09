@@ -14,17 +14,17 @@ these names:
   - `Merge labels`: the label test of Tide's query for this repository, read
     from the labels.
 
-A smoke green from before the blocking job changed what it grades does not
-pass. While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time, the
-same cutoff `pin_smoke_status.py` applies to its re-pins, `Smoke gate` stays
-pending on a green whose build first reported before that time, until a run
-from after it replaces it. The time is the earliest success status on the
-commit naming the same build, as that script reads it: a re-pin is a fresh copy
-with its own creation time. A green with no build link counts from the earliest
-success with none. That is one more read per green while the variable is set,
-skipped when the head `Smoke gate` is already green.
+A smoke green from before the blocking job changed what it grades does not pass.
+While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time,
+`Smoke gate` stays pending on a green whose build first reported before that
+time, until a run from after it replaces it. The time is the earliest success
+status on the commit naming the same build: each re-pin that the retired
+`pin_smoke_status.py` posted is a fresh copy with its own creation time. A green
+with no build link counts from the earliest success with none. That is one more
+read per green while the variable is set, skipped when the head `Smoke gate` is
+already green.
 An `/override` links its own comment, so it counts from when it was posted. A
-green that `pin_smoke_status.py` expired carries its note and stays pending
+green that the retired `pin_smoke_status.py` expired carries its note and stays pending
 even after the variable is cleared. A green from before the cutoff that the
 script did not expire, because Tide already saw it as stale, has no note. So
 leave the variable set: clearing it lets such a green pass again. An
@@ -89,7 +89,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from github_api import PER_PAGE, GitHubAPI, log  # noqa: E402
+from github_api import PER_PAGE, GitHubAPI, has_marker_comment, log  # noqa: E402
 
 #: The queue is `main`'s alone; a release line still merges through Tide.
 BASE = "main"
@@ -100,12 +100,11 @@ SMOKE_CONTEXT = "pull-kube-agents-smoke-test"
 SMOKE_GATE = "Smoke gate"
 LABELS_GATE = "Merge labels"
 GATES = (SMOKE_GATE, LABELS_GATE)
-#: The repository variable that holds the smoke cutoff (module docstring), read as
-#: `pin_smoke_status.py` reads it.
+#: The repository variable that holds the smoke cutoff (module docstring).
 NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
 #: What `Smoke gate` says while it waits on a green from before the cutoff.
 SMOKE_PREDATES = f"smoke predates {NOT_BEFORE_ENV}; push a new commit to rerun {SMOKE_CONTEXT}"
-#: The note `pin_smoke_status.py` (EXPIRED_NOTE) adds to a pre-cutoff green that Tide still
+#: The note the retired `pin_smoke_status.py` added to a pre-cutoff green that Tide still
 #: credited. It holds that green with or without the variable, as it did for Tide.
 SMOKE_EXPIRED_NOTE = f"(predates {NOT_BEFORE_ENV}: retest)"
 #: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wanted both.
@@ -123,10 +122,8 @@ HOLD_LABELS = (
 STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
-#: k8s-api-proxy/ is there by choice, and only until the sandbox routes kubectl through the
-#: proxy (issue #4087); test_merge_gate fails once it does.
 SMOKE_SKIP_RE = re.compile(
-    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/|k8s-api-proxy/)"
+    r"^(docs/|\.github/|examples/|tests/|scripts/release/|scripts/eval_dashboard/)"
     r"|^scripts/test_[^/]+\.py$|^[^/]+\.md$"
     r"|^(LICENSE|OWNERS|OWNERS_ALIASES|\.gitignore|install\.sh|upgrade\.sh|uninstall\.sh)$"
 )
@@ -235,6 +232,13 @@ PUSH_REMOVAL_WINDOW = timedelta(minutes=2)
 CHECK_SUITES_READ = 10
 #: Queue removals read per pull request: enough to count the `failed_checks` ones since the push.
 REMOVALS_READ = 10
+#: Open pull requests read per page of the sweep's query. Each node carries labels, the queue
+#: entry, the head's check suites and its whole status rollup, so GitHub answers one page as a
+#: heavy request; at 50 the query began timing out with HTTP 504 at the repository's open-PR count,
+#: failing the scheduled sweep so approved pull requests were not enqueued. A smaller page keeps
+#: each request inside GitHub's gateway timeout; the retry in github_api does not help a request
+#: that is too heavy to answer at all, only one that fails in transit.
+PULLS_PAGE_SIZE = 20
 #: How many times per head commit the sweep puts a pull request back after `failed_checks`
 #: removals. `LEFT_OUT_HEADLINES` and the sweep's log line say "one retry"; change them with it.
 FAILED_CHECKS_RETRIES = 1
@@ -243,7 +247,7 @@ FAILED_CHECKS_RETRIES = 1
 PULLS_QUERY = """
 query($owner: String!, $name: String!, $base: String!, $after: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(states: OPEN, baseRefName: $base, first: 50, after: $after) {
+    pullRequests(states: OPEN, baseRefName: $base, first: %(page)d, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
         id number isDraft headRefOid
@@ -357,7 +361,7 @@ def smoke_first_reported(api, sha):
 
     The earliest success status naming the same build (its target URL); for a
     status with no link, the earliest success with none, because each re-pin
-    copies it with a new creation time. None
+    copied it with a new creation time. None
     when the latest smoke status is not green or a creation time is unreadable
     or zoneless, which the cutoff counts as before it.
     """
@@ -605,8 +609,7 @@ def comment_left_out(api, pull, line, dry_run=False):
     path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
     try:
         # The marker comment is newer than the removal, so only comments since then can hold it.
-        since = f"{path}?since={removed}" if removed else path
-        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+        if has_marker_comment(api, pull["number"], marker, since=removed):
             return f"#{pull['number']}: left-out comment already posted"
         if not dry_run:
             body = left_out_comment(pull, marker, line)
@@ -622,12 +625,12 @@ def parse_time(stamp):
 
 
 def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
-    """Every open pull request on `base`, with what the sweep reads, in one query per 50."""
+    """Every open pull request on `base`, with what the sweep reads, a page (`PULLS_PAGE_SIZE`) per query."""
     owner, name = api.repo.split("/", 1)
     pulls = []
     after = None
     while True:
-        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ}, {"owner": owner, "name": name, "base": base, "after": after})
+        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ, "page": PULLS_PAGE_SIZE}, {"owner": owner, "name": name, "base": base, "after": after})
         page = page["repository"]["pullRequests"]
         for node in page["nodes"]:
             commits = node["commits"]["nodes"]

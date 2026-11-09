@@ -72,7 +72,11 @@ cross-checked against the same issues read through GraphQL
 (``listing_doubt``); when GraphQL cannot be read, or names more issues
 than the listing holds, the listings are read again (LISTING_ATTEMPTS),
 and when no read agrees the tick writes nothing and logs why; the next tick
-retries. Comments are read the same way: an issue whose listing counts
+retries. With ``--state``, a live run counts those held ticks in a small JSON
+file (``held_state``); past HELD_TICKS_DIGEST of them in a row the morning
+digest says filing is held (``held_digest_lines``), until the first trusted
+tick clears it. A dry run records nothing held: it files nothing anyway.
+Comments are read the same way: an issue whose listing counts
 more comments than the read returned is not commented on that tick.
 
 All GitHub traffic goes through ``ghcli.Gh``. **Dry run is the default**:
@@ -89,6 +93,7 @@ import functools
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
@@ -104,10 +109,12 @@ except ImportError:  # scripts/ is not on sys.path yet
     import case_owner
 try:
     from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -154,6 +161,23 @@ LISTING_ATTEMPTS = 4
 # The pause between those reads: the empty answers came in bursts, so reads
 # back to back can all land in one.
 LISTING_RETRY_DELAY_S = 3
+# How many ticks in a row with no trusted listing (15 minutes apart: about
+# two hours) before the digest says filing is held (#3769). Fewer is the
+# REST listing's ordinary bursts, which the next tick rides out.
+HELD_TICKS_DIGEST = 8
+# A state file not rewritten for this long says nothing about filing now:
+# the step stopped running or could not write, and the job log says why.
+HELD_STATE_FRESH = datetime.timedelta(hours=1)
+# What `gcloud storage cat` says of an absent object: the patterns
+# ci-health.yml greps for. Any other failed read is not "no hold on record".
+STATE_ABSENT_RE = re.compile(r"matched no objects|not found: 404")
+# How much of gcloud's stderr a failed state read quotes in its warning.
+STATE_ERROR_CHARS = 200
+# A hold older than this prints its start with the date, so a week-old hold
+# does not read as this morning's (post_health.RECONCILE_RUN_DATED_AFTER).
+HELD_SINCE_DATED_AFTER = datetime.timedelta(days=1)
+HELD_SINCE_UNKNOWN = "an unrecorded time"
+HELD_DIGEST_LINE = "🚫 Nightly bug filing held since {since}: the nightly-red issue listing is untrusted ({doubt}), so no bugs are filed or commented on."
 GRAPHQL_PATH = "graphql"
 GRAPHQL_FIRST = 100
 LISTING_QUERY = """\
@@ -171,8 +195,8 @@ COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
 # The bot's issue carries this, so it re-finds its own whatever the title
 # has been edited to; an issue without one (a human's) is adopted when its
 # title or body names the case as a whole word. A bot issue is matched on
-# its marker alone: its body quotes failure reasons, which can name another
-# case.
+# its marker alone: an infra issue's body quotes infra reasons, which can name
+# another case.
 # The three kinds of issue, each with a marker of its own: a case's domain
 # bug, a case kept from running by infrastructure, a part's lost nights.
 KIND_RED = "nightly-red"
@@ -199,10 +223,6 @@ NAME_IN_TRANSCRIPT_RE = r"\beval_{name}_rep[0-9]+\.log"
 # GitHub's limits: a longer title or body is refused and files nothing.
 TITLE_MAX_CHARS = 256
 ISSUE_BODY_MAX_CHARS = 65536
-# Distinct failing-check reasons quoted per night, and their length
-# (nightly.REASON_MAX_CHARS, the collector's own cap).
-REASONS_PER_NIGHT = 3
-REASON_MAX_CHARS = nightly.REASON_MAX_CHARS
 UNKNOWN = "unknown"
 # The domain owner in an issue body; a domain with no owner on record is
 # said so rather than @-mentioning an account named "unknown".
@@ -232,14 +252,15 @@ Nightly report: {nightly_url}
 
 Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here when the case passes every repetition again; it never closes the issue.
 """
-NIGHT_LINE = "- {date}: {passed}/{graded} passed{infra} · [run]({run_url}) · [transcript]({transcript_url})"
-NIGHT_LINE_NO_LINK = "- {date}: {passed}/{graded} passed{infra}"
-# A reason is quoted as code: it can carry `@login` or `org/repo#N`, which
-# GitHub would otherwise turn into a mention or a cross-reference.
-REASON_LINE = "  - failed: {reason}"
+# One line per night: the date and the private links. The night's pass count
+# and the checks' reasons are on the dashboard behind them; the repository is
+# public, so the issue carries neither.
+NIGHT_LINE = "- {date} · [run]({run_url}) · [transcript]({transcript_url})"
+NIGHT_LINE_NO_LINK = "- {date}"
+# An infra reason is quoted as code: it can carry `@login` or `org/repo#N`,
+# which GitHub would otherwise turn into a mention or a cross-reference.
 # What a quoted reason's `<` becomes: SINGLE LEFT-POINTING ANGLE QUOTATION MARK.
 MARKER_SAFE_LT = "\u2039"
-NO_REASON_LINE = "  - (no reason recorded)"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
 # A refused login is shown as code, not @-mentioned: GitHub just said it is
@@ -253,7 +274,7 @@ UNASSIGNED = "**Unassigned** ({why})."
 ASSIGNEES_FIELD = gate_issue.ASSIGNEES_FIELD
 RECOVERY_COMMENT = """\
 {marker}
-`{case}` passed every graded repetition ({passed}/{graded}) on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
+`{case}` passed every graded repetition on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
 """
 INFRA_TRIAGE = """\
 **What triage decides (within a week)**
@@ -378,7 +399,7 @@ def resolve_assignee(owner: str | None, domain: str, domain_owners: dict[str, st
 def graded_nights(data: dict) -> dict[str, list[dict]]:
     """``{case: [night verdict, ...]}``, oldest first, over the newest
     LOOKBACK_NIGHTS dates on record. A verdict is ``{date, build, outcome,
-    passed, graded, infra, reasons, run_url, transcript_url}`` for a night
+    passed, graded, infra, run_url, transcript_url}`` for a night
     that graded the case (module docstring: what is skipped)."""
     nights = nightly.group_nights(nightly.sorted_nightly_runs(data))
     dates = sorted({nightly.night_date(nightly.night_parts(n)[0]) for n in nights} - {None})
@@ -407,11 +428,6 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                 # Claimed only by a verdict: an ungraded line in one part does
                 # not hide another part's verdict for the case that night.
                 seen.add(name)
-                reasons = []
-                for rep in classify.task_reps(task):
-                    reason = classify.clean_reason(rep.get("reason"))[:REASON_MAX_CHARS]
-                    if classify.rep_kind(rep) == classify.REP_FAIL and reason and reason not in reasons:
-                        reasons.append(reason)
                 by_date.setdefault(day, {})[name] = {
                     "date": day.isoformat(),
                     "started": run.get("started"),
@@ -421,7 +437,6 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                     "passed": counts["pass"],
                     "graded": counts["pass"] + counts["fail"],
                     "infra": counts["infra"] + counts["ceiling"] + counts["fixture"],
-                    "reasons": reasons[:REASONS_PER_NIGHT],
                     "run_url": nightly.build_url(run),
                     "transcript_url": nightly.transcript_url(run, name),
                 }
@@ -458,7 +473,7 @@ def recovery_night(verdicts: list[dict], news=lambda v: True) -> dict | None:
 
 
 def quoted(text: str | None) -> str:
-    """``text`` as inline code on one line (REASON_LINE says why), with
+    """``text`` as inline code on one line (the comment above MARKER_SAFE_LT says why), with
     ``<`` swapped for a look-alike so a reason can never carry a bot marker
     (``<!-- kube-agents-bot:... -->``) that dedupe would read as this
     issue's."""
@@ -468,12 +483,8 @@ def quoted(text: str | None) -> str:
 def night_block(streak: list[dict]) -> str:
     lines = []
     for v in reversed(streak):
-        infra = f", {v['infra']} infra" if v["infra"] else ""
         template = NIGHT_LINE if v["run_url"] else NIGHT_LINE_NO_LINK
-        lines.append(template.format(date=v["date"], passed=v["passed"], graded=v["graded"], infra=infra, run_url=v["run_url"], transcript_url=v["transcript_url"]))
-        lines.extend(REASON_LINE.format(reason=quoted(reason)) for reason in v["reasons"])
-        if not v["reasons"]:
-            lines.append(NO_REASON_LINE)
+        lines.append(template.format(date=v["date"], run_url=v["run_url"], transcript_url=v["transcript_url"]))
     return "\n".join(lines)
 
 
@@ -641,6 +652,64 @@ def read_listings(gh: ghcli.Gh, since: str | None, label: str = LABEL) -> tuple[
     return open_issues, closed_issues, doubt
 
 
+def held_state(prev: dict | None, doubt: str | None, live: bool, now: datetime.datetime) -> dict:
+    """The ``--state`` document after a pass whose listings were read:
+    ``held_ticks`` live passes in a row with no trusted listing, since
+    ``held_since``, last for ``doubt``. A trusted pass, or a dry run, holds
+    nothing. A count older than HELD_STATE_FRESH starts over: the ticks
+    between went unrecorded, so they were not held in a row."""
+    prev = prev or {}
+    updated = post_health.parse_iso(prev.get("updated_at"))
+    if not updated or now - updated > HELD_STATE_FRESH:
+        prev = {}
+    stamp = now.isoformat(timespec="seconds")
+    if not (doubt and live):
+        return {"held_ticks": 0, "held_since": None, "doubt": None, "updated_at": stamp}
+    ticks = prev.get("held_ticks") if isinstance(prev.get("held_ticks"), int) else 0
+    return {"held_ticks": ticks + 1, "held_since": (prev.get("held_since") if ticks else None) or stamp, "doubt": doubt, "updated_at": stamp}
+
+
+class StateUnreadable(OSError):
+    """The ``--state`` object exists, or may, and could not be read."""
+
+
+def read_held_state(location: str, runner=subprocess.run) -> dict | None:
+    """The ``--state`` document, or None when there is none yet. A gs://
+    read that failed for any reason but an absent object raises
+    StateUnreadable, so the filer does not write a fresh count over the
+    record and the digest does not take the failure for no hold."""
+    if not location.startswith(post_health.GS_PREFIX):
+        return post_health.read_state(location)
+    result = runner([post_health.GCLOUD, post_health.STORAGE_GROUP, "cat", location], capture_output=True, text=True)
+    if result.returncode != 0:
+        if STATE_ABSENT_RE.search(result.stderr or ""):
+            return None
+        raise StateUnreadable(f"gcloud storage cat {location} failed: {(result.stderr or '').strip()[:STATE_ERROR_CHARS]}")
+    try:
+        loaded = json.loads(result.stdout)
+    except ValueError:
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def held_digest_lines(state: dict | None, now: datetime.datetime) -> list[str]:
+    """The digest's line while filing has been held HELD_TICKS_DIGEST ticks
+    in a row; none otherwise, or when the state is stale (HELD_STATE_FRESH)."""
+    state = state or {}
+    ticks = state.get("held_ticks")
+    updated = post_health.parse_iso(state.get("updated_at"))
+    if not isinstance(ticks, int) or ticks < HELD_TICKS_DIGEST or not updated or now - updated > HELD_STATE_FRESH:
+        return []
+    since = post_health.parse_iso(state.get("held_since"))
+    if not since:
+        since_text = HELD_SINCE_UNKNOWN
+    elif now - since > HELD_SINCE_DATED_AFTER:
+        since_text = f"{since.astimezone(post_health.LOCAL_TZ).strftime('%a %b %-d')} {post_health.clock(since)}"
+    else:
+        since_text = post_health.clock(since, weekday=True)
+    return [HELD_DIGEST_LINE.format(since=since_text, doubt=state.get("doubt") or "no reason recorded")]
+
+
 class Filer:
     def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
         self.gh = gh
@@ -653,6 +722,9 @@ class Filer:
             log(f"warning: could not read domains.yaml: {exc}")
             self.domain_owners = {}
         self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / case_owner.DOMAINS_PATH)
+        # The listing's verdict this pass: None until it was read, then the
+        # doubt or "" (trusted). main records it in --state.
+        self.doubt = None
 
     def commented(self, issue: dict, marker: str) -> bool | None:
         """Whether a comment on ``issue`` carries ``marker``; None when the
@@ -683,6 +755,7 @@ class Filer:
         if open_issues is None or closed_issues is None:
             log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
+        self.doubt = doubt or ""
         if doubt:
             log("warning: no trusted nightly-red issue listing this pass; nothing filed or commented, retried next tick")
             return result
@@ -947,6 +1020,7 @@ def parse_args(argv=None):
     parser.add_argument("--data", required=True, type=pathlib.Path, help="data.json the collector wrote")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding bench/tasks and domains.yaml")
+    parser.add_argument("--state", help="held-filing state (held_state): local path or gs:// object; read and rewritten each pass whose listings were read")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="print every write instead of sending it (the default)")
     mode.add_argument("--live", dest="dry_run", action="store_false", help="send the writes")
@@ -964,8 +1038,23 @@ def main(argv=None, gh_runner=None) -> int:
         log(f"ERROR: {args.data}: {exc}")
         return 1
     gh = ghcli.Gh(args.repo, gh_runner, dry_run=args.dry_run) if gh_runner else ghcli.Gh(args.repo, dry_run=args.dry_run)
-    result = Filer(gh, args.repo_root).run(data if isinstance(data, dict) else {})
+    filer = Filer(gh, args.repo_root)
+    result = filer.run(data if isinstance(data, dict) else {})
     print(summary(result, args.dry_run))
+    # A live pass that could not read the listings at all neither trusted
+    # nor doubted them: it carries an open hold forward with the count
+    # unchanged, so an hour of failed reads does not age it out
+    # (HELD_STATE_FRESH) and restart it.
+    if args.state and (filer.doubt is not None or not args.dry_run):
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            prev = read_held_state(args.state)
+            if filer.doubt is not None:
+                post_health.write_state(args.state, held_state(prev, filer.doubt, not args.dry_run, now))
+            elif (prev or {}).get("held_ticks"):
+                post_health.write_state(args.state, dict(prev, updated_at=now.isoformat(timespec="seconds")))
+        except (OSError, subprocess.CalledProcessError) as exc:
+            log(f"warning: could not update {args.state}: {exc}; the held-tick count is retried next tick")
     return 0
 
 

@@ -602,7 +602,8 @@ def triage_message(triage: Mapping[str, Any], fold_text: str) -> dict | None:
     """``slack_ux_incident.parse_triage``'s result as the alert's edit, or None when it cannot fold.
 
     Each label is the option's title, the recommended one primary rather than suffixed, and its reply
-    starts with that label: "<label> — apply Option B".
+    starts with that label: "<label> — apply Option B". A ``detail`` (a drift alert's what, who and
+    when, ``slack_ux_incident.drift_triage``) sits under the headline.
     """
     if len(fold_text) > FOLD_TEXT_MAX:
         return None
@@ -617,6 +618,7 @@ def triage_message(triage: Mapping[str, Any], fold_text: str) -> dict | None:
         return None
     return message(
         headline=_headline(triage["headline"]),
+        detail=str(triage.get("detail") or "")[:DETAIL_MAX],
         fold={"title": str(triage.get("fold_title") or FOLD_TITLE_DEFAULT)[:FOLD_TITLE_MAX], "text": fold_text},
         choices=choices,
         links=_links([(TRIAGE_LINK_LABEL.format(label=label), url) for label, url in triage.get("links") or ()]),
@@ -627,5 +629,5 @@ def triage_text(triage: Mapping[str, Any], report: str) -> str:
     """The alert edit's fallback: the headline, what each button sends, then the report."""
     replies = [_triage_reply(_presenter._clip(_line(str(label).removesuffix(RECOMMENDED_SUFFIX)), _presenter.BUTTON_TEXT_MAX), reply)
                for label, reply, _rec in triage["choices"]]
-    head = "\n".join([_headline(triage["headline"]), *replies])
+    head = "\n".join([_headline(triage["headline"]), *([triage["detail"]] if triage.get("detail") else []), *replies])
     return f"{head}\n\n{report}"

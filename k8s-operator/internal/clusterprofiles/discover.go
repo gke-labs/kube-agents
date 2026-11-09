@@ -170,6 +170,24 @@ func (d Discoverer) describe(ctx context.Context, id Identity) (*container.Clust
 	return describeClusterViaAPI(ctx, id)
 }
 
+// DescribeCluster reads one cluster's GKE description the way Discover reads
+// it for a profile: through Describe when set, else through Broker, filled
+// from BrokerFromEnv when nil as DiscoverAndBuild fills it, else the GKE API
+// with this process's own credentials. For a caller that wants a field of the
+// description after discovery (the event watcher's fleet-shape probe reads
+// CurrentNodeCount every interval) without re-reading the profiles directory;
+// through the broker the answer carries only the fields its projection keeps.
+func (d Discoverer) DescribeCluster(ctx context.Context, id Identity) (*container.Cluster, error) {
+	if d.Describe == nil && d.Broker == nil {
+		broker, err := BrokerFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		d.Broker = broker
+	}
+	return d.describe(ctx, id)
+}
+
 func (d Discoverer) tokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 	if d.TokenSource != nil {
 		return d.TokenSource(ctx)

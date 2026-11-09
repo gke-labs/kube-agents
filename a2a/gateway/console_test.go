@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -81,7 +82,7 @@ func TestConsoleFrameBecomesAnInboundMessage(t *testing.T) {
 	waitFor(t, "inbound", func() bool { return len(r.inbound()) == 1 })
 	got := r.inbound()[0]
 	want := InboundMessage{Conversation: "console:tab-1", Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "hello there"}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("inbound = %+v, want %+v", got, want)
 	}
 }

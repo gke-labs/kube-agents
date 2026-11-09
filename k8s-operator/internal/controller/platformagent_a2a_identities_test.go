@@ -232,7 +232,7 @@ func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	for _, id := range staticIdentities(identityTestAgent()) {
 		got = append(got, id.user)
 	}
-	want := []string{"gateway", a2aBridgeUser, "seed", "web", "console", "sys"}
+	want := []string{"gateway", a2aBridgeUser, "seed", "web", "console", a2aConsoleMCPUser, "sys"}
 	if !slices.Equal(got, want) {
 		t.Errorf("static principals = %v, want %v.\nA new static principal needs a recorded reason it cannot present a ServiceAccount token, and a card that closes it if it can.", got, want)
 	}
@@ -598,7 +598,7 @@ func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 	if want := a2aServiceAccountName(agent.Namespace, gatewayServiceAccountName(agent)); agentSA != want {
 		t.Fatalf("the `agent` identity is keyed on %q, want the gateway's own %q", agentSA, want)
 	}
-	if _, _, err := buildA2AAuthMapConfigMap(agent, nil); err != nil {
+	if _, _, err := buildA2AAuthMapConfigMaps(agent, nil, nil); err != nil {
 		t.Errorf("an override of the broker's ServiceAccount broke the bus map: %v", err)
 	}
 }

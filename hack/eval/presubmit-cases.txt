@@ -55,7 +55,10 @@
 # change edits only its own entry. The mix: domain probes, a reliability
 # prompt variation, cluster-debugging cases, the incident-triage probe, the
 # kanban smoke, the consistency drift audit (since 2026-10-26, the one full
-# audit on the roster), the two cases here that request a pull request (the
+# audit on the roster), the observability seat (since 2026-11-02, the one
+# case here with a tofu stack of its own: it plants one disabled alert
+# policy in the leased project per repetition, a few seconds of apply and
+# destroy), the two cases here that request a pull request (the
 # remediation writer pdb-remediation-pr and the source-control branch-reuse
 # writer), and the held-out seats (the compliance canary among them since
 # 2026-09-29, ~1000-2000s a repetition; its three repetitions serialize on
@@ -78,13 +81,14 @@
 # covered by a PROBE -- a targeted question about that domain's planted
 # defect, graded on the reply, the shape cluster-agent-crashloop-debug
 # proved at 142s. (consistency-drift-outlier came back as a full audit on
-# 2026-10-26, at about 200s a repetition on the claude-opus-5-5 agent model.)
+# 2026-10-26, at about 200s a repetition on the agent model of 2026-10-19.)
 # The full audit kept here as the machinery canary
 # (compliance-rbac-overgrant, under the fleet-audits domain) ran on every
 # pull request from 2026-08-25 until 2026-09-22 without ever being admitted,
-# was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
-# since (#2013); fleet-audits stays on the docs/designs/domains.yaml
-# allowlist until its roster line lands. The comment above EVAL_REPETITIONS
+# was a nightly case 2026-09-22 to 2026-09-29, sat held out below from
+# 2026-09-29 (#2013) and took its roster line on 2026-11-02 (#2013 step 4),
+# which took fleet-audits off the docs/designs/domains.yaml allowlist. The
+# comment above EVAL_REPETITIONS
 # in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
@@ -99,7 +103,7 @@
 # consistency-authorized-networks-probe, was demoted on 2026-10-21 (#3598).
 # Not a probe: the full fleet-consistency-drift audit, one of the four
 # recast out of this file on 2026-08-26 at 600-1300s a repetition, which
-# runs at about 200s on the claude-opus-5-5 agent model. 33/34 graded
+# runs at about 200s on the agent model of 2026-10-19. 33/34 graded
 # repetitions on the twelve main nightlies that graded it 2026-10-13 to
 # 10-26 (UTC build start; 10-21's build uploaded nothing and 10-25's hit its
 # deadline before grading), the one miss on 10-16 on the Gemini setup (the
@@ -141,7 +145,7 @@
 # an *-infra repository with no manifest for checkout-gateway). Back
 # 2026-10-26 after #3145 (merged 2026-10-23) seeded that manifest into every
 # pool repository, on the writers nightly record: 21/21 since the agent model
-# became claude-opus-5-5 on 2026-10-19, 9/9 on the three nights since #3145,
+# changed on 2026-10-19, 9/9 on the three nights since #3145,
 # all three under spec.mode next (#3783); median repetition 172s on those
 # nine. The evidence store reads `collecting` (9/9 at the next-mode key).
 # It requests a pull request, so its three repetitions run in the fan-out's
@@ -196,6 +200,44 @@
 # incident-triage off the docs/designs/domains.yaml allowlist.
 ./tasks/incident-triage-oom-event-probe/task.yaml
 
+# The observability domain's first roster seat (#4095; #3633 authored the
+# case for #3467, #3778 registered it), moved in from nightly-cases.txt on
+# 2026-11-02 on the record it
+# built there: 21/21 graded repetitions on the seven main-b nightlies
+# (ci-kube-agents-eval-nightly-main-b) 2026-10-27 to 11-02, every night 3/3,
+# no infra repetition, all under spec.mode next on the inject lane; 6/6 on
+# the two nights before 2026-10-29 and 15/15 on the five since the agent model
+# became gemini-4-argon on 2026-10-29. Median repetition 201s (43-974s) over
+# the 21; 243s (66-448s) over the 15. The main nightly's builds of 10-24 to
+# 10-26, before the main-b periodic's first night, each ran two repetitions
+# and ended at their deadline before grading, so wrote no artifact for it.
+# The evidence
+# store reads `collecting` (15/15 at the gemini-4-argon next-mode key, 5
+# short of a window). Its one recorded miss is off the current key: the
+# retired today-mode nightly of 2026-10-26 (api transport) failed
+# all three repetitions on the route objective alone, the two report
+# objectives passing, when the worker_commands read saw one command and no
+# gcloud. The inject lane sets that objective aside; the today lane, which
+# runs this file over the api transport, grades it, so a red there on that
+# objective alone is the api transport's read of a platform card.
+# An alert-policy question is answered from Cloud Monitoring through the
+# broker: the planted policy is named and reported disabled, two
+# report_contains objectives graded on every lane; the route objective and
+# the no-write safeguard are worker_commands checks, set aside on the inject
+# lane as for every case. deployer: tofu, the one case in this file with a
+# stack of its own: bench/tf/prebuilt/monitoring-alert-policy plants one
+# disabled, channel-less alert policy in the leased project per repetition
+# (about 2s to apply and 1s to destroy, measured on the main-b nightly) and
+# needs roles/monitoring.alertPolicyEditor on both runners, which the pool
+# verifier checks (#3632). No seeded-fleet role, no seeded cluster named in
+# its checks, no pull request, so it runs in the first phase, its three
+# repetitions one after another on its task lock and on lock-infra, which
+# no other case here takes. A unit killed between apply and destroy leaves
+# its policy behind; the hourly Compute plant sweep deletes it (#3797).
+# Priced at 600s in unit_cost_hint. This line took observability off the
+# docs/designs/domains.yaml allowlist.
+./tasks/monitoring-alert-policy-read/task.yaml
+
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
 # 2026-08-27 redesign (a real SRE question graded on kanban_create plus
@@ -206,11 +248,11 @@
 # moved in from nightly-cases.txt on 2026-10-23 on the record it built
 # there: 42/42 graded repetitions over the fourteen writers nightlies
 # 2026-10-09 to 10-22, every night 3/3 (12/12 on the four since the agent
-# model became claude-opus-5-5 on 2026-10-19), median repetition 173s;
-# 18/18 under spec.mode next on ci-kube-agents-eval-nightly-next-claude
+# model changed on 2026-10-19), median repetition 173s;
+# 18/18 under spec.mode next on the retired next-mode nightly
 # 2026-10-16 to 10-21; 15/15 on the five GitLab nightlies that graded,
 # 2026-10-17 to 10-22.
-# The evidence store reads `collecting` (12/12 at the claude key, 8 short
+# The evidence store reads `collecting` (12/12 at the 2026-10-19 key, 8 short
 # of a window) because the model change reset the key. deployer: noop; it
 # seeds its own spent branch, so no fixture and no seeded cluster. It opens
 # two pull requests a repetition on the leased *-infra repository through
@@ -223,10 +265,35 @@
 # docs/designs/domains.yaml allowlist.
 ./tasks/vcs-spent-branch-reuse/task.yaml
 
+# The audit-machinery canary (fleet-audits), on the roster since 2026-11-02
+# (#2013 step 4, #4094) on the record it built in the held-out section
+# below from 2026-09-29: 36/36 graded repetitions on the twelve main
+# nightlies that graded it 2026-10-20 to 11-02, every night 3/3 (30/30 on the
+# ten with a job verdict); 15/15 at the gemini-4-argon next-mode key (10-29
+# to 11-02, the store at `collecting`, five short of a window); on the
+# presubmit itself, 10-27 to 11-02, 1068 of 1117 graded repetitions (95.6 %)
+# over 399 builds and no build with every graded repetition failed (the last
+# such build was 2026-10-22, before the audits' own turn budget, #3602, and
+# the model change; 678 builds since, no collapse). Demoted from the
+# roster 2026-09-02 (#1171, closed 2026-09-08; the bar then lived on #2013
+# step 3), nightly 2026-09-22 to 2026-09-29, held out here 2026-09-29 to
+# 2026-11-02. One of the presubmit cases that write to GitHub, with
+# pdb-remediation-pr and vcs-spent-branch-reuse above, and one of the two
+# that write a ledger, with consistency-drift-outlier above: the minted
+# token, the cloned *-infra workspace, the ledger write; it requests no pull
+# request, so it runs in the first phase, its three repetitions one after
+# another on its task lock. 732s median / 1450s p90 over the 1068 passing
+# presubmit repetitions of 10-27 to 11-02 (1002s / 2074s over 903 in
+# 2026-09-04 to 09-15), the 3000s delegation ceiling, priced at 1000 in
+# unit_cost_hint. The residual miss class is #2856 (the worker publishes no
+# ledger), 31 of those 49 misses. This line took fleet-audits off the
+# docs/designs/domains.yaml allowlist.
+./tasks/compliance-rbac-overgrant/task.yaml
+
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
-# coverage tracker (today #2013, fleet-audits; #2016's seat became a
-# roster line 2026-10-14). A case
+# coverage tracker (today none: #2013's seat, the compliance canary, became
+# a roster line 2026-11-02 and #2016's on 2026-10-14). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
 # in blocking-roster.txt, so rung 4 (collapse) and rung 6 (judged
@@ -246,18 +313,10 @@
 # added or withdrawn here edits only its own entry; SLOW_MIN_TASKS in
 # scripts/eval_dashboard/health.py reads this file.
 
-# The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
-# Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
-# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. One of the
-# presubmit cases that write to GitHub, with pdb-remediation-pr and
-# vcs-spent-branch-reuse above, and one of the two that write a ledger,
-# with consistency-drift-outlier above since 2026-10-26: the minted token,
-# the cloned *-infra workspace, the ledger write.
-# 1002s median / 2074s p90 over 903 presubmit
-# repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
-# unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
-# fleet-audits stays on the docs/designs/domains.yaml allowlist until then.
-./tasks/compliance-rbac-overgrant/task.yaml
+# The section is empty since 2026-11-02. Its two seats so far:
+# pdb-remediation-pr (#2016 step 2, 2026-09-28 to 2026-10-14) and the
+# compliance canary (#2013 step 2, 2026-09-29 to 2026-11-02), each moved
+# up into the list above on its record.
 
 # Moved out to nightly-cases.txt, for the record:
 #   the seven held-out cases this file ran without blocking, on 2026-09-22
@@ -265,7 +324,8 @@
 #   security-overgrant-remediation-proposal, obtainability-pdb-semantics,
 #   obtainability-fleet-exposure-sweep, obtainability-healthy-namespace-silence,
 #   rca-remediation-pr, compliance-rbac-overgrant (back here held out
-#   2026-09-29, #2013) and cluster-agent-healthy-workload-no-finding, each
+#   2026-09-29, #2013; on the roster above since 2026-11-02) and
+#   cluster-agent-healthy-workload-no-finding, each
 #   with its hold-out reason as the # line above it there;
 #   gpu-stress-test-diagnosis and
 #   autoops-warning-event-triage, 2026-09-03 (tofu wall clock, #1218/#1202);

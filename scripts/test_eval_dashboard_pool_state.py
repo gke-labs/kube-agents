@@ -209,7 +209,12 @@ class OneProject(ScanHarness):
         self.assertFalse(pool_state.passes_leases(FINDING))
         self.assertFalse(pool_state.passes_leases("gke/cluster/seeded-b"))
         self.assertTrue(pool_state.passes_leases(verifier.FINDING_FORGE_ZONE_MISSING))
-        candidates = (FINDING, "gke/host-otel-scope", verifier.FINDING_COMPUTE_SWEEPER_MISSING, "gke/cluster/seeded-b", verifier.FINDING_DNS_API) + tuple(verifier.FORGE_FINDINGS)
+        # The Gemini key findings red runs: a run under MODEL_PROVIDER=gemini
+        # stops at hack/ci-deploy.sh's FATAL line without the secret or grant,
+        # and fails at its first agent call on a wrong restriction.
+        for finding_id in verifier.GEMINI_KEY_FINDINGS:
+            self.assertFalse(pool_state.passes_leases(finding_id), finding_id)
+        candidates = (FINDING, "gke/host-otel-scope", verifier.FINDING_COMPUTE_SWEEPER_MISSING, "gke/cluster/seeded-b", verifier.FINDING_DNS_API) + tuple(verifier.FORGE_FINDINGS) + tuple(verifier.GEMINI_KEY_FINDINGS)
         self.assertEqual(frozenset(f for f in candidates if pool_state.passes_leases(f)), verifier.LEASE_SILENT_FINDINGS)
 
     def test_the_stub_exits_the_way_the_verifier_does(self):

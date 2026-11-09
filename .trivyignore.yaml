@@ -1,10 +1,13 @@
 # .trivyignore.yaml
 # Scoped vulnerability and misconfiguration ignore rules for Trivy scanner.
 misconfigurations:
-  # Ignore sample, testing, plugin scratch bundles, and legacy test-workload misconfigurations in repository manifests
+  # Ignore sample, testing, plugin and persona data bundles, and legacy test-workload misconfigurations in repository manifests.
+  # A persona image (a2a/Dockerfile.persona-*) is data under /files on busybox, like a plugin image: its only process is the
+  # staging copy, which runs under the worker pod's non-root, restricted securityContext.
   - id: DS-0002
     paths:
       - "agentplugins/**"
+      - "a2a/Dockerfile.persona-*"
       - "examples/**"
       - "k8s-operator/internal/testing/**"
       - "k8s-operator/testing/**"

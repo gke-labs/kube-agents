@@ -203,11 +203,12 @@ lets the budget admit more, up to the slot cap, and lowering it cannot OOM while
 such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
-measure first if four proves tight. One install in this repository does raise it: the smoke
-pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose lanes of Platform
-Agents fanning Cluster Agents out over the seeded fleet queued behind four slots to median
-waits of 8 to 22 s and a longest wait inside the refusal bound, so it runs the proxy at 2Gi,
-where the budget admits nine and the slot cap binds again.
+measure first if four proves tight. One install in this repository raised it while the default
+was 1Gi: the smoke pipeline's (`hack/ci-deploy.sh`, `EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT`), whose
+lanes of Platform Agents fanning Cluster Agents out over the seeded fleet queued behind four
+slots to median waits of 8 to 22 s and a longest wait inside the refusal bound, so it ran the
+proxy at 2Gi, where the budget admits nine and the slot cap binds again. The default is now 2Gi
+too, and the pipeline keeps the figure as a pin.
 
 ### 2.3 Waiting, refusing, and the degenerate case
 
@@ -223,7 +224,12 @@ the slots and bytes in use are gauges beside their caps, with the budget gauge a
 budget is off (the site's observability page names the series).
 On the exec and vcs routes the exception is raised where a slot refusal is raised, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
-and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
+and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. Since
+#4333 the same arm also answers the resource watermark gate's refusal: `ResourcePressure`, a
+`CommandSlotUnavailable` raised before the queue when live cgroup memory or a scratch volume is
+at its hard watermark, answered `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` with `Retry-After` and
+counted under `bound="pressure"`; the session role is the interactive class that keeps one slot
+(`docs/credential-isolation-design.md` has the thresholds and the routes). The
 forge refresh route takes no slot, and has its own busy handler answering the same 503, so a
 refusal does not reach its generic branch and read as a `FORGE_TOKEN_REFRESH_FAILED` 502; it
 also has the hang-up handler §2.1 names. The content-workspace route reserves nothing (§2.1) and
@@ -260,10 +266,11 @@ requests' cost), and admits by slot alone. The case is real. GKE Autopilot witho
 container's limits equal to its requests, so the proxy's limit there is its memory request. At
 the 512Mi the operator first declared, the budget would admit one request and serialise every
 brokered command; a listing phase that cannot run two at once costs more than the out-of-memory
-exposure the budget prevents. The operator now declares the request at 1Gi, above the floor, so
-that the budget engages on Autopilot without bursting as well, admitting four there; the floor
-still applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set
-alone under 1Gi is refused as crossing the default request. The operator's sizing test
+exposure the budget prevents. The operator now declares the request at 2Gi on Autopilot (and 1Gi
+on Standard, where the 2Gi limit stands), above the floor, so that the budget engages on Autopilot
+without bursting as well, admitting nine there, held to eight by the slot cap; the floor still
+applies to a CR override whose `requests.memory` is smaller, and a `limits.memory` set alone below
+the default request lowers that request to it. The operator's sizing test
 holds its own limit to the same floor (`credentialProxyMinimumAdmittedRequests`) and its request
 to it too (`TestCredentialProxyBudgetArithmeticAtTheDefaults`).
 
@@ -303,9 +310,10 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 ### 2.5 The sizing test's child term
 
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` asserts
-`request + output_burst(all slots) <= limit`, with the container's 1Gi memory request as the
-resting term, upstream's statement of what the pod holds with nothing in flight. It also makes a second assertion in the broker's own terms, with the broker's fixed reserves as the
-resting term, because those are the numbers the broker subtracts and so the budget the children
+`resting + output_burst(all slots) <= limit`, with the broker's two fixed reserves as the
+resting term (the memory request no longer models it: on Autopilot it is 2Gi, equal to the limit,
+to sit on the band). It also makes a second assertion in the broker's own terms, with the same
+fixed reserves as the resting term, because those are the numbers the broker subtracts and so the budget the children
 see. A slot in use is a request holding a reservation, so the slot count and the reservation
 count are one variable, not two, and the assertion is the admission rule itself at a floor:
 the budget admits at least two requests at once, each with its output allowance, so a listing
@@ -339,7 +347,8 @@ requests at once the eight-wide burst of both listing pools coinciding waits one
 retry is added here. (Those are the 1Gi figures; at the 2Gi default the budget admits nine and
 the slot cap of eight binds.) The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight (the request has since moved to 1Gi so that
-the budget runs on Autopilot without bursting, §2.3; the footprint moved with it). No
+the budget runs on Autopilot without bursting, §2.3, and later to 2 CPU and 2Gi on Autopilot,
+where the quota preflight counts that pair; the footprint moved with it). No
 agent-visible behaviour: no eval case.
 
 The reconciler's and the stall watch's listing pools are the caller settings the change moved.
@@ -394,7 +403,14 @@ does not move with the limit.
 counts reclaimable page cache, eight threads can pass the check before any child has grown, and
 the behaviour cannot be asserted in a unit test. The reservation model is deterministic and
 testable; a live reading could be layered on later as a second check if the constants prove
-wrong. Since #4315 the broker exports the live reading without admitting on it: the cgroup's
+wrong. Since #4315 the broker exports the live reading, and since #4333 it admits on it beside
+this budget, as a watermark gate rather than a per-spawn check: one working-set read per
+admission (`memory.current` less `memory.stat`'s `inactive_file`, so the page cache the first
+sentence names is not counted), the scratch volumes summed against the operator-passed caps on
+the sampler's tick, a concurrency clamp from the soft watermark and an immediate 429 for
+background callers from the hard one. The budget's static
+reservation stays what it was; the gate is the backstop for the cases above where the estimate
+is wrong. Before that: the cgroup's
 `memory.current`, `memory.peak`, `memory.max`, `memory.stat` and `memory.events`, its own and
 Envoy's `VmRSS`/`VmHWM`, and the children's `ru_maxrss` after each reap, as series
 (`kubeagents_credential_proxy_cgroup_memory_bytes`, `…_cgroup_memory_events_total`,

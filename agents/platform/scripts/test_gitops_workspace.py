@@ -289,7 +289,7 @@ class TestEnsureWorkspace(WorkspaceTestCase):
 class TestEnsureScratchWorkspace(WorkspaceTestCase):
     """The same lease, with no clone in it.
 
-    What the content-passing path hands the agent. Two things have to hold at
+    What the broker paths hand the agent. Two things have to hold at
     once and they pull in opposite directions: there must be no `.git` here,
     and the lease bookkeeping — the path, the marker, the reaper — has to be
     the same as the clone path's, because `start` and `finish` find each other
@@ -1090,7 +1090,7 @@ class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
 
     def test_a_registered_entry_this_image_cannot_use_is_not_called_unregistered(self):
         (self.mount / "managed_repos").write_text(
-            json.dumps([{"type": "bitbucket", "url": "https://bitbucket.org/acme/fleet"}]), encoding="utf-8")
+            json.dumps([{"type": "gogs", "url": "https://gogs.example.com/acme/fleet"}]), encoding="utf-8")
         with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()

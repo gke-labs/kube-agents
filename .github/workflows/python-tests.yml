@@ -19,6 +19,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 permissions:
   contents: read
 
@@ -147,6 +154,37 @@ jobs:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
 
+      # The injector seam builds the watcher package with `go test`, which
+      # first fetches from the module proxy each module the package needs and
+      # the module cache lacks. One failed fetch fails the seam test with
+      # nothing but "[setup failed]" on stdout, as in the agent-image job on
+      # 2026-11-04 (#4800). Downloading the operator module's dependencies
+      # here takes that fetch out of the test, retries it, and fails this
+      # step, naming the download, when every attempt fails.
+      #
+      # Every job that sets Go up downloads, whether or not its files include
+      # the seam test: setup-go restores a cache keyed on go.sum and, only
+      # after a miss, saves one from the first job that passes. An entry saved
+      # by a job that downloaded nothing holds no modules, and every later run
+      # restores it and fetches them all again.
+      #
+      # Four attempts with a doubling delay from five seconds, the schedule
+      # k8s-operator/Makefile's go-install-tool uses for the same kind of
+      # fetch. A retry prints a warning, the record of a rescued attempt, for
+      # the reason the join's download steps give.
+      - name: Download the operator module's dependencies
+        working-directory: k8s-operator
+        run: |
+          attempts=4; delay=5; attempt=1
+          until go mod download; do
+            if [ "$attempt" -ge "$attempts" ]; then
+              echo "::error::go mod download in k8s-operator failed after $attempts attempts."
+              exit 1
+            fi
+            echo "::warning::go mod download in k8s-operator: attempt $attempt of $attempts failed; retrying in ${delay}s."
+            sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+          done
+
       # Same reason as Go above: chart-rendering suites in tests/
       # (test_quota_preflight.py, test_values_schema.py, test_helm_plugins.py,
       # test_litellm_redaction.py, and others) are decorated `skipUnless(helm)`,
@@ -194,11 +232,18 @@ jobs:
       # !cancelled() rather than success(): a shard with a red file still
       # hands its coverage and its failing-file list to the join, which is
       # where the required check decides.
+      #
+      # The run attempt is in the name so that a re-run shard's upload cannot
+      # hide behind its earlier attempt's. With one name per shard, the join's
+      # download keeps the artifact with the highest ID, and IDs do not follow
+      # upload order: on 2026-10-31 a join read a re-run shard's red first
+      # attempt instead of its green second one. The join keeps each shard's
+      # latest attempt with scripts/coverage_shard_attempts.py.
       - name: Upload this shard's coverage
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: python-coverage-shard-${{ matrix.shard }}
+          name: python-coverage-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             .coverage-data/.coverage
             .coverage-data/failed-files.txt
@@ -301,6 +346,11 @@ jobs:
         with:
           pattern: python-coverage-shard-*
           path: .coverage-data
+
+      # After "Re-run failed jobs" the download holds a re-run shard from two
+      # attempts. Keep the latest of each, under the name coverage-merge reads.
+      - name: Keep each shard's latest attempt
+        run: python3 scripts/coverage_shard_attempts.py .coverage-data
 
       # COVERAGE_STRICT=1: fail when any shard's sweep had a failing file. The
       # target also fails when a shard's directory, data or failing-file list
@@ -445,6 +495,20 @@ jobs:
         with:
           go-version-file: k8s-operator/go.mod
           cache-dependency-path: k8s-operator/go.sum
+
+      # The shard job's download, for the same seam test in this job's sweep.
+      - name: Download the operator module's dependencies
+        working-directory: k8s-operator
+        run: |
+          attempts=4; delay=5; attempt=1
+          until go mod download; do
+            if [ "$attempt" -ge "$attempts" ]; then
+              echo "::error::go mod download in k8s-operator failed after $attempts attempts."
+              exit 1
+            fi
+            echo "::warning::go mod download in k8s-operator: attempt $attempt of $attempts failed; retrying in ${delay}s."
+            sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+          done
 
       - name: Set up Helm
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1

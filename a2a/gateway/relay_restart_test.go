@@ -137,14 +137,15 @@ type fakeDelivery struct {
 	acks int
 }
 
-func (f *fakeDelivery) Envelope() *lib.Envelope { return f.env }
-func (f *fakeDelivery) Subject() string         { return f.subj }
-func (f *fakeDelivery) Received() time.Time     { return time.Time{} }
-func (f *fakeDelivery) NumDelivered() uint64    { return 1 }
-func (f *fakeDelivery) Sequence() uint64        { return f.seq }
-func (f *fakeDelivery) Ack() error              { f.acks++; return nil }
-func (f *fakeDelivery) Nak(time.Duration) error { return nil }
-func (f *fakeDelivery) Term() error             { return nil }
+func (f *fakeDelivery) Envelope() *lib.Envelope       { return f.env }
+func (f *fakeDelivery) Subject() string               { return f.subj }
+func (f *fakeDelivery) Received() time.Time           { return time.Time{} }
+func (f *fakeDelivery) NumDelivered() uint64          { return 1 }
+func (f *fakeDelivery) Sequence() uint64              { return f.seq }
+func (f *fakeDelivery) Ack() error                    { f.acks++; return nil }
+func (f *fakeDelivery) AckSync(context.Context) error { f.acks++; return nil }
+func (f *fakeDelivery) Nak(time.Duration) error       { return nil }
+func (f *fakeDelivery) Term() error                   { return nil }
 
 // TestTheRelayRendersADeliveryItAlreadyRenderedOnce: a question a task
 // posts while it runs, redelivered to the next gateway after the first one
@@ -370,5 +371,52 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 	}
 	if !strings.Contains(r.logs.String(), "left for the next gateway") {
 		t.Fatalf("no log line for the abandoned batch:\n%s", r.logs.String())
+	}
+}
+
+// TestATerminalOnAnotherAddresseesSubjectIsNotTheTasks: an executor that
+// learns a task id can publish a terminal for it on its own subjects; the
+// task went to platform, so the relay drops it and posts nothing, and the
+// task's own terminal still renders.
+func TestATerminalOnAnotherAddresseesSubjectIsNotTheTasks(t *testing.T) {
+	r := startRig(t)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/t-forged", Kind: "group",
+		AuthorID: "1001", MessageID: "d-forged", Text: "how is the fleet?",
+	}
+	origin := r.awaitTask(t, "platform")
+	publishFinal(t, r, origin, "intruder", lib.StateFailed, "forged result")
+	// The stream keeps publish order, so a forged terminal that rendered
+	// would land before the real one, which would then be a straggler.
+	publishFinal(t, r, origin, "platform", lib.StateFailed, "the real reason")
+	waitFor(t, "the task's own terminal", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "the real reason") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "forged result") {
+			t.Fatalf("the forged terminal was rendered: %q", p)
+		}
+	}
+}
+
+// TestACardStopsAnswerComesOnItsOwnAddressee: the card-stop control isn't on
+// the task history, and the conversation can move to another addressee
+// before its answer arrives; the answer on the control's own addressee is
+// still the task's, and one on the conversation's new addressee isn't.
+func TestACardStopsAnswerComesOnItsOwnAddressee(t *testing.T) {
+	rec := &SessionRecord{Addressee: "platform", CardStop: &CardStopRun{TaskID: "task-stop", Addressee: "chat-otter-1"}}
+	item := func(subject string) relayItem {
+		return relayItem{env: &lib.Envelope{TaskID: "task-stop"}, subject: subject}
+	}
+	if !eventFromTasksAddressee(rec, item(lib.TaskEventsSubject("chat-otter-1", "task-stop"))) {
+		t.Error("the card stop's answer on its own addressee was dropped")
+	}
+	if eventFromTasksAddressee(rec, item(lib.TaskEventsSubject("platform", "task-stop"))) {
+		t.Error("an event on the conversation's new addressee passed for the card stop's")
 	}
 }

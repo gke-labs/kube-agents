@@ -45,6 +45,14 @@ type InboundMessage struct {
 	// to the configured backend, which is every chat backend's case.
 	Backend string
 
+	// Profile, when set, addresses this turn to an AgentProfile, with
+	// Parameters its task parameters (the target cluster's project, location
+	// and cluster for cluster work). Only the console sets it today, whose
+	// clients name an agent; every chat backend leaves it empty and its
+	// turns go to the conversation's route.
+	Profile    string
+	Parameters map[string]string
+
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
 	Intent string
@@ -58,11 +66,12 @@ type InboundMessage struct {
 	TaskID string
 	// TopLevel marks a message that roots a conversation of its own in a
 	// space whose questions each get their own thread, rather than one
-	// typed inside a thread: today a top-level Slack DM, which the adapter
-	// keys on its own message id. Such a conversation has nothing running
-	// in it, so a stop or a status question there gets a reply saying
-	// where to send it instead of being read as an ask. False is every
-	// other message, and every other backend's case.
+	// typed inside a thread: a top-level Slack DM, or a top-level Google
+	// Chat DM whose message has a thread of its own, which the adapter keys
+	// on its own message id or thread. Such a conversation
+	// has nothing running in it, so a stop or a status question there gets
+	// a reply saying where to send it instead of being read as an ask.
+	// False is every other message, and every other backend's case.
 	TopLevel bool
 	// Click marks a message that is a click on a choice button rather than a
 	// message of its own: MessageID then names the click (the audit chain's
@@ -130,14 +139,16 @@ type Adapter interface {
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
 	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
-	// marks an answer a backend draws rating controls on (feedback.go).
+	// marks an answer a backend draws rating controls on (feedback.go), or
+	// m.Stop a task's live message a backend draws a Stop control on.
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
 	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
 	// message, which the gateway answers with Edit. With m.Chat nil a
 	// backend that laid the message out before replaces the layout with the
-	// text; any other backend makes it Edit.
+	// text; any other backend makes it Edit. m.Stop is read as on
+	// PostMessage, and an edit without it takes the Stop control off.
 	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
@@ -224,6 +235,12 @@ type OutMessage struct {
 	// feedback, feedback.go). A backend that draws rating controls draws
 	// them on this message; every other backend ignores it.
 	Feedback string
+	// Stop, when set, is the id of the running task whose live message
+	// this is: the status line the gateway posts for a task and edits as
+	// it moves (relay.go). A backend that draws a Stop control draws it on
+	// this message, naming that task, and an edit without Stop takes it
+	// off, which is the terminal edit; every other backend ignores it.
+	Stop string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message

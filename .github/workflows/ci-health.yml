@@ -29,8 +29,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #   A. Collect runs as github-actions@kube-agents-prow. It is the only
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
-#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
-#      and the watched periodics' gs://kube-agents-periodic-logs (both
+#      archive there, the smoke lanes' own bucket
+#      gs://kube-agents-evals-presubmit-logs, the nightly's own bucket
+#      gs://kube-agents-evals-nightly-logs and the watched periodics'
+#      gs://kube-agents-periodic-logs (all three
 #      kube-agents-owned; it holds objectViewer on each, and whichever
 #      account replaces it needs the same), the eval evidence store
 #      gs://kube-agents-evals-bench (objectViewer, for the Trend page;
@@ -120,15 +122,20 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
 # runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 11 AM
 # digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
-# the issues it filed that tick. The section turns owners' GitHub logins
-# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
-# object, login -> Chat user id); without it the logins print as text.
+# the issues it filed that tick. Armed, it counts the ticks it held for an
+# untrusted issue listing in nightly-bugs-state.json beside health.json, and
+# the digest says so once the hold has lasted about two hours. The section
+# turns owners' GitHub logins into Chat mentions through the
+# CI_HEALTH_CHAT_MENTIONS secret (a JSON object, login -> Chat user id);
+# without it the logins print as text.
 # A fourth, scripts/eval_dashboard/coverage_gaps.py, keeps one
 # `presubmit-gate` issue open per domain with no blocking roster seat,
 # assigned to the domain owner, and closes it when the domain is covered
 # again. It is armed by the same NIGHTLY_BUGS_LIVE / CI_HEALTH_MUTE switch
 # and needs no permission beyond issues: write. It opens no roster pull
-# request: this job holds no branch write path.
+# request: this job holds no branch write path. Before the render,
+# scripts/eval_dashboard/understudies.py writes the per-domain scorecard
+# the dashboard's domain view draws; it only reads GitHub.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -210,12 +217,18 @@ env:
   # stops the step before collect.py runs), and the freshness-badge
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
-  PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  # The archive the lane wrote before it moved buckets (2026-11), read
+  # alongside until its runs leave the SINCE_DAYS window; empty or delete it
+  # then (the collect step passes it only when it is set).
+  PR_GLOB_PREVIOUS: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   # The GitLab lane (kube-agents#2394): the forge-grading cases of the
   # catalogue against a pool project's GitLab repository, collected
   # as tier gitlab with a watermark
   # of its own and shown in the Brief's "GitLab lane" section only.
-  GITLAB_PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
+  GITLAB_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
+  # Its archive before the move, read alongside for the same window.
+  GITLAB_PR_GLOB_PREVIOUS: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*
   NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
   # The nightly's writers periodic, a job of a night split across jobs, in
   # the same bucket. Until it has run the prefix holds no objects,
@@ -228,6 +241,17 @@ env:
   # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
   # tier gitlab with no pull request, listed under the Brief's GitLab section.
   GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
+  # Its next-mode nightly, listed beside it under its own job; the job sets no
+  # gcs_configuration, so it logs to Prow's bucket.
+  GITLAB_NIGHTLY_NEXT_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/
+  # The self-managed forge lanes (kube-agents#3682), a tier each and one
+  # Brief section together: their presubmits log to the lanes' own bucket,
+  # their next-mode weekly jobs to Prow's. Until a job has run, its listing
+  # holds nothing, which collect.py notes and does not refuse on.
+  GHES_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/*
+  GHES_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/
+  GITLAB_CE_PR_GLOB: gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*
+  GITLAB_CE_WEEKLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -357,16 +381,28 @@ jobs:
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
           if ! gcloud storage cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
-            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-evals-presubmit-logs, gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
+          # The old archives ride only while their knobs are set, as in
+          # hack/ci-dashboard-refresh.sh: an empty glob would be a listing
+          # that fails, and the refusal below.
+          previous=()
+          [ -n "$PR_GLOB_PREVIOUS" ] && previous+=(--pr-glob "$PR_GLOB_PREVIOUS")
+          [ -n "$GITLAB_PR_GLOB_PREVIOUS" ] && previous+=(--gitlab-pr-glob "$GITLAB_PR_GLOB_PREVIOUS")
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
+            "${previous[@]}" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
+            --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
+            --lane-pr-glob "ghes=$GHES_PR_GLOB" \
+            --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \
+            --lane-pr-glob "gitlab-ce=$GITLAB_CE_PR_GLOB" \
+            --lane-nightly-prefix "gitlab-ce=$GITLAB_CE_WEEKLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
@@ -466,7 +502,8 @@ jobs:
           fi
 
       # The watched Prow periodics (scripts/eval_dashboard/periodics.py:
-      # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run): their latest
+      # the pull sweep, the daily seeded-fleet reconcile and its postsubmit run,
+      # and the certification lane's weekly slice, read from the nightlies' bucket): their latest
       # finished build each, for the note health.py carries and the poster
       # sends once when one fails or stops running. Best-effort like the
       # read above: a job that has never run writes nothing, a denied read
@@ -664,6 +701,22 @@ jobs:
             exit 1
           fi
 
+      # The per-domain scorecard the Cases page's domain view draws
+      # (scripts/eval_dashboard/understudies.py, docs/ci-health.md "The
+      # domain scorecard"): each domain's seat, days uncovered, open
+      # nightly-red issues and ranked understudies. It reads the
+      # nightly-red issues and writes nothing to GitHub. Best-effort: without
+      # work/scorecard.json the view says it was not computed.
+      - name: Rank each domain's understudies for the scorecard
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          store_args=()
+          [ -f work/store.json ] && store_args=(--store work/store.json)
+          python3 scripts/eval_dashboard/understudies.py --data work/data.json "${store_args[@]}" --out work/scorecard.json
+
       # Render with the verdict just taken and its history, the way
       # hack/ci-dashboard-refresh.sh does (`--health`, `--health-history`,
       # each passed only when the file exists). health.json is always there
@@ -682,6 +735,7 @@ jobs:
           # the Trend page says the store was not read this tick.
           [ -f work/store.json ] && render_args+=(--store work/store.json)
           [ -f work/store.json ] || echo "::warning::no store.json this tick; the Trend page renders as 'store not read'"
+          [ -f work/scorecard.json ] && render_args+=(--scorecard work/scorecard.json)
           # --public-url (bare) emits <base href> for the published site,
           # post_health.DASHBOARD_URL's directory, so the pages' links
           # resolve there whatever URL the console login lands on.
@@ -724,7 +778,9 @@ jobs:
         run: |
           mode=--dry-run
           if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+          # --state counts the live ticks held on an untrusted issue listing,
+          # for the digest's held-filing line (post step, --bugs-state).
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json --state "$DASHBOARD_BUCKET/nightly-bugs-state.json" "$mode"
 
       # One `presubmit-gate` issue per domain with no blocking roster seat,
       # assigned to the domain owner, kept current, closed when a roster case
@@ -781,6 +837,7 @@ jobs:
             --health work/health.json \
             --data work/data.json \
             "${store_args[@]}" \
+            --bugs-state "$DASHBOARD_BUCKET/nightly-bugs-state.json" \
             --state "$DASHBOARD_BUCKET/health-state.json"
 
       # One comment per pull request whose smoke run went red, or lost its

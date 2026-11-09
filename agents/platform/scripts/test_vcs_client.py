@@ -206,6 +206,27 @@ class ForgeCallTest(unittest.TestCase):
         self.assertEqual(caught.exception.revision, "a" * 40)
         self.assertEqual(caught.exception.as_json()["revision"], "a" * 40)
 
+    def test_a_snapshot_over_the_ceiling_keeps_its_entries_and_ceiling(self):
+        entries = [{"path": "clusters", "type": "tree", "manifests": 3, "bytes": 2048}]
+        error = vcs_client.credential_proxy_client.WorkspaceRequestError(
+            "refused",
+            payload={"error": "no", "code": "SNAPSHOT_TOO_LARGE", "entries": entries, "ceiling": 1024},
+        )
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:1"}), mock.patch.object(
+            vcs_client.credential_proxy_client, "vcs_call", side_effect=error
+        ):
+            with self.assertRaises(vcs_client.VcsError) as caught:
+                vcs_client.call("snapshot", {})
+        self.assertEqual((entries, 1024), (caught.exception.entries, caught.exception.ceiling))
+        # The listing is for the script that asked, not for the printed refusal.
+        self.assertEqual({"error": "no", "code": "SNAPSHOT_TOO_LARGE"}, caught.exception.as_json())
+
+    def test_a_refusal_without_a_listing_has_no_entries(self):
+        for payload in ({"error": "no"}, {"error": "no", "entries": "x", "ceiling": True}):
+            with self.subTest(payload=payload):
+                error = vcs_client.VcsError("no", entries=payload.get("entries"), ceiling=payload.get("ceiling"))
+                self.assertEqual((None, None), (error.entries, error.ceiling))
+
 
     def test_a_broker_too_old_for_a_verb_is_not_a_broker_that_is_down(self):
         """The shape an old credential-proxy actually answers with.
@@ -419,6 +440,68 @@ class ProposalOpenedRecordTest(unittest.TestCase):
         closed.close()
         with mock.patch.object(vcs_client, "_call", lambda v, p: self.OPENED), mock.patch("sys.stderr", closed):
             self.assertEqual(vcs_client.call("proposal-create", {}), self.OPENED)
+
+    CLAIM = "one-time-claim-token"
+    CLAIMED = {**OPENED, "forge": "gitlab", "repo": "acme/infra", "claim": CLAIM}
+
+    def test_the_record_line_carries_the_claim(self):
+        stderr = io.StringIO()
+        with mock.patch.object(vcs_client, "_call", lambda v, p: dict(self.CLAIMED)), \
+                mock.patch("sys.stderr", stderr):
+            vcs_client.call("proposal-create", {})
+        self.assertEqual(
+            [json.loads(line) for line in stderr.getvalue().splitlines()],
+            [{"kube-agents.event": "proposal-opened",
+              "proposal": {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM,
+                           "repo": "acme/infra"}}],
+        )
+
+    def test_the_record_line_carries_the_repository_the_broker_resolved(self):
+        for repo, expected in (("acme/infra", {"repo": "acme/infra"}), ("", {}), (None, {}), (7, {})):
+            with self.subTest(repo=repo):
+                answer = {**self.OPENED, "claim": self.CLAIM}
+                if repo is not None:
+                    answer["repo"] = repo
+                stderr = io.StringIO()
+                with mock.patch.object(vcs_client, "_call", lambda v, p: dict(answer)), \
+                        mock.patch("sys.stderr", stderr):
+                    vcs_client.call("proposal-create", {})
+                [record] = [json.loads(line) for line in stderr.getvalue().splitlines()]
+                self.assertEqual(
+                    record["proposal"],
+                    {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM, **expected},
+                )
+
+    def test_the_returned_answer_has_no_claim_field(self):
+        with mock.patch.object(vcs_client, "_call", lambda v, p: dict(self.CLAIMED)), \
+                mock.patch("sys.stderr", io.StringIO()):
+            answer = vcs_client.call("proposal-create", {})
+        self.assertNotIn("claim", answer)
+        self.assertNotIn("claim", answer["proposal"])
+        self.assertEqual(answer["proposal"], self.OPENED["proposal"])
+        self.assertEqual((answer["forge"], answer["repo"]), ("gitlab", "acme/infra"))
+
+    def test_vcs_py_stdout_has_no_claim(self):
+        scripts = Path(__file__).resolve().parent.parent / "skills" / "version-control" / "scripts"
+        sys.path.insert(0, str(scripts))
+        self.addCleanup(sys.path.remove, str(scripts))
+        import vcs  # noqa: E402
+
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(vcs_client, "ROOT", Path(root.name)), \
+                mock.patch.object(vcs_client, "_call", lambda v, p: dict(self.CLAIMED)), \
+                mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            code = vcs.main(["proposal", "create", "--title", "Raise replicas",
+                             "--source", "fix/replicas", "--target", "main", "--repo", "acme/infra"])
+        self.assertEqual(code, 0)
+        printed = json.loads(stdout.getvalue())
+        self.assertNotIn("claim", printed)
+        self.assertNotIn(self.CLAIM, stdout.getvalue())
+        self.assertEqual(printed["proposal"]["url"], self.URL)
+        [record] = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertEqual(record["proposal"]["claim"], self.CLAIM)
 
 
 class WorkingCopyTest(unittest.TestCase):
@@ -1178,6 +1261,17 @@ class SnapshotTest(unittest.TestCase):
         # Paired: at the ceiling it is unpacked.
         self.snapshot(tar, max_bytes=20)
         self.assertTrue((self.into / "b.txt").is_file())
+
+    def test_a_tree_over_the_file_limit_is_refused_with_its_count(self):
+        tar = build_tar(special("d", tarfile.DIRTYPE), regular("d/a.txt"), regular("b.txt"), regular("c.txt"))
+        with mock.patch.object(tarfile.TarFile, "extractall", side_effect=AssertionError("unpacked")):
+            refusal = self.refused(tar, code=vcs_client.SNAPSHOT_TOO_MANY_FILES, max_files=2)
+        self.assertIn("3 files", str(refusal))
+        # Paired: at the limit it is unpacked, and with no limit there is none.
+        self.snapshot(tar, max_files=3)
+        self.assertTrue((self.into / "c.txt").is_file())
+        shutil.rmtree(self.into)
+        self.assertEqual(3, self.snapshot(tar)["files"])
 
     def test_a_tar_that_does_not_parse_is_refused(self):
         self.refused(b"not a tar at all" * 64)

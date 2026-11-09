@@ -80,6 +80,13 @@ on:
         description: "Gemini API Key"
         required: true
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 jobs:
   deploy-environment:
     runs-on: ubuntu-latest
@@ -354,11 +361,11 @@ jobs:
           if ! describe_err="$(gcloud container clusters describe "${GKE_CLUSTER_NAME}" \
                 --location "${GCP_REGION}" --project "${GCP_PROJECT_ID}" \
                 --format='value(name)' 2>&1 >/dev/null)"; then
-            if printf '%s' "${describe_err}" | grep -Eq 'SERVICE_DISABLED|has not been used in project'; then
+            if grep -Eq 'SERVICE_DISABLED|has not been used in project' <<<"${describe_err}"; then
               echo "::error title=${TARGET}'s project has the Kubernetes Engine API disabled::gcloud could not describe '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}' because container.googleapis.com is not enabled there, so whether a cluster exists is unknown. Enable it first (scripts/dev/setup-gcp-github-wif.sh does, as part of the project setup) and re-run. ${describe_err}"
               exit 1
             fi
-            if ! printf '%s' "${describe_err}" | grep -Eq 'code=404|NOT_FOUND'; then
+            if ! grep -Eq 'code=404|NOT_FOUND' <<<"${describe_err}"; then
               echo "::error title=Could not read ${TARGET}'s cluster::gcloud could not describe '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and the answer was not NOT_FOUND, so whether the cluster exists is unknown. Refusing to tear down blind. ${describe_err}"
               exit 1
             fi
@@ -386,7 +393,7 @@ jobs:
             state_json="$(gcloud storage cat "${state_object}" 2>"${probe_err_file}")" || state_rc=$?
             if [ "${state_rc}" -ne 0 ]; then
               state_err="$(cat "${probe_err_file}")"
-              if ! printf '%s' "${state_err}" | grep -qiE 'matched no objects|NotFoundException|HTTPError 404|not found|does not exist'; then
+              if ! grep -qiE 'matched no objects|NotFoundException|HTTPError 404|not found|does not exist' <<<"${state_err}"; then
                 echo "::error title=Could not read ${TARGET}'s Terraform state::No cluster '${GKE_CLUSTER_NAME}' in '${GCP_PROJECT_ID}', and the state probe at ${state_object} failed for a reason other than absence, so whether an install exists is unknown. Refusing to tear down blind. ${state_err}"
                 exit 1
               fi
@@ -447,7 +454,7 @@ jobs:
           # could not be asked has not answered "no" — and refusing to grep for
           # "held" is what keeps a transient API-server error from reading as
           # an idle cluster and destroying somebody's live validation.
-          if ! printf '%s' "${status}" | grep -q '"state": "free"'; then
+          if ! grep -q '"state": "free"' <<<"${status}"; then
             echo "::error title=The live-test lease is held, or could not be read::Refusing to tear down '${TARGET}'. A held lease means somebody is live-testing against it and a teardown destroys their evidence mid-run; an unreadable one means this job cannot tell. Ask the holder to release it (scripts/live_test_lease.py release), wait for it to expire, or fix the cluster access this job reported above."
             exit 1
           fi
@@ -495,6 +502,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          HELM_UPGRADE_INSTALL: ${{ vars.HELM_UPGRADE_INSTALL }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}

@@ -67,6 +67,7 @@ NOT_STARTED_NOTICES = (
     "⚠️ not started: can't count the running session workers right now — try again in a moment",
     "⚠️ not started: could not mint this task's capability",
     "⚠️ not started: could not close the previous task on the bus; try again in a moment",
+    "⚠️ not started: a task is still running here; stop it or wait for it before asking an agent profile",
 )
 # Far above any timeout a test sets: a poll that passes it is unbounded.
 SLEEP_BUDGET_SECONDS = 10_000
@@ -1336,7 +1337,9 @@ class UnitTest(unittest.TestCase):
         relay = (REPO / "a2a" / "gateway" / "relay.go").read_text()
         # Since #2493 the placeholder carries a delegated child's line note;
         # a typed turn has none, so the live check sees the bare placeholder.
-        self.assertIn(f'g.adapter.Post(rec.Key, withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote))', gateway)
+        # The placeholder is a message value since the Google Chat Stop button:
+        # posted with Stop naming the task while it runs.
+        self.assertIn(f'g.adapter.PostMessage(rec.Key, OutMessage{{Text: withLineNote("{harness.STATUS_PLACEHOLDER}", ts.LineNote), Stop: taskID}})', gateway)
         self.assertIn(f'"{harness.STATUS_BUS_FAILURE}"', gateway)
         # Main moved the notice into a constant; pin the constant and its use.
         self.assertIn(f'const noticeSteerNotSent = "{harness.STEER_FAILED_NOTICE}"', gateway)
@@ -1370,10 +1373,22 @@ class UnitTest(unittest.TestCase):
         rendered = set()
         for fmt in formats:
             self.assertTrue(harness.NOT_STARTED_PATTERN.match(fmt), fmt)
+            if fmt.endswith(": "):
+                # A bare prefix constant renders nothing by itself (the
+                # gateway appends a notice, pinned below), and as a pattern
+                # it would match every rendering here.
+                continue
             literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
             matching = [n for n in NOT_STARTED_NOTICES if re.fullmatch(literal, n, re.DOTALL)]
             self.assertTrue(matching, f"no test rendering of {fmt!r}")
             rendered.update(matching)
+        # The profile route's notices are posted under that prefix: each
+        # rendering here is the prefix plus a notice the source spells out.
+        prefix = 'noticeTurnNotStarted       = "⚠️ not started: "'
+        self.assertIn(prefix, sources["profiles.go"])
+        profile_notice = "a task is still running here; stop it or wait for it before asking an agent profile"
+        self.assertIn(f'noticeProfileWhileRunning = "{profile_notice}"', sources["profiles.go"])
+        rendered.add("⚠️ not started: " + profile_notice)
         self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
         # The session cap's count phrase, both forms.
         self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])

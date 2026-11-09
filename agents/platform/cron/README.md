@@ -427,6 +427,46 @@ the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
 
+## `leeway-watch` sweeps topology skew and priority-rank findings daily
+
+The `topology-drift` skill reads a `leeway report` on request and attributes
+the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
+"chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
+--parallelism 2 --clusters <project>/<location>/<cluster>,…` in `agent-sandbox`
+across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
+`LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
+Agent profile's identity names; a project with no Cluster Agent profiles is
+enumerated with `gcloud container clusters list` first, since the sandbox
+relays that and not the GKE API route leeway's own `--clusters-from <project>`
+would take) and gates notifications through `<profile home>/leeway/ledger.json`.
+`unknown`-cause topology findings at their pigeonhole floor
+(`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
+balanced odd-replica workloads do not page, while `selector_confined` (`info`)
+findings bypass the drift floor so single-zone node-pool confinement still
+alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
+`LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
+runs started by hand in the pod with `--dry-run` (the operator's
+`spec.deployment.env` allowlist does not carry them). The report's
+topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
+`leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
+key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
+`leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
+by cluster, class, judging rule and kind. A finding earns a report under
+`<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
+`latest.md` and `latest.json` symlinks) and a chat summary line naming up to
+six due subjects with their cause and share when it first appears, when its
+`suspectedCause` (a rank finding's `rule`) changes or its `severity` escalates,
+or when its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes
+of slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
+clusters are retired with a single resolution line (and a clean `latest.*`
+refresh once all clusters scan cleanly), while clusters whose scan failed
+retain their ledger entries so transient errors do not erase state and re-page
+tomorrow. When `NATS_URL` is set, the watch also writes `latest.json` to the
+`topology-skew` (`a2a.topics.agent.platform.topology-skew`) blackboard topic;
+if that write fails, it warns once in chat and retries on subsequent clean
+ticks until the write recovers.
+
 ## `session-retention` gives every profile's history an end
 
 Hermes already prunes session history: `sessions.auto_prune` deletes ended
@@ -465,7 +505,15 @@ prune skips pinned rows, the prunes it runs at process start included. The job
 sets the flag on the one row (Hermes' own pin command pins the whole lineage and
 unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
 set by hand is never cleared. A chain unwinds one parent a day once its newest
-session is pruned. A store whose pins cannot be set is not pruned that day.
+session is pruned. A store whose pins cannot be set is not pruned by the job that
+day.
+
+The entrypoint runs the same pinning (`session_retention.py --pins-only`) before
+the gateway starts, because Hermes prunes at gateway start and, on the first start
+after an upgrade, that prune would otherwise come before the job's first tick. It
+is best-effort and gives each store a few seconds. A store it cannot pin is
+named in a `WARN`, and the gateway's prune at that start can still delete an aged
+parent there.
 
 A blocked kanban card needs no exemption: its worker starts a
 fresh session on every run and reads its context from the card. A chat thread
@@ -545,7 +593,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -558,9 +606,11 @@ and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
-agent turn. Google Chat, and a run that also reports the board's other
-findings, get the text.
+today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
+allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
+where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
+is never an agent turn. Google Chat under today, and a run that also reports
+the board's other findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -579,6 +629,17 @@ rare and still print on every run that finds them, under
 after the findings-queue nudge's daily reminder, for the same reason the
 reminder waits for 12:00: an earlier UTC hour is the middle of the night in the
 US, not a morning.
+
+When the agent's data volume is at or past the Session KV server's warn line
+(90% used), a run that prints other findings leads them with that server's
+warning line, as their likely cause: every board write fails on a full volume.
+Alone the line is not printed, because the server's warning posts once per
+crossing and a daily repeat would be noise, and because it would turn a
+stuck-cards report into text without its buttons. A board that cannot be read
+for "database or disk is full" while the volume is past the line, or for "disk
+I/O error" with no space left at all, is said as a full disk, with the line,
+not as a bare read error. Any other read error keeps the bare line, and the
+volume line follows it while the volume is past the warn line.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
@@ -974,15 +1035,24 @@ same numbers to go stale, and the test above checks the roster against the SOPs
 
 ## The `--scheduled` sentence in audit prompts
 
-Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`.
-Only a run with that flag can get `silent_ok: true`, so the sentence is what
-lets a quiet scheduled run answer `[SILENT]`. It is in the prompt and not in
-the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
-that passed the flag would let every on-demand run of its stream go silent.
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`,
+and every stream whose SOP runs `audit_report.py precheck` after its collector
+(every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run: `PRECHECK_STREAMS` in the test file below) tells it to pass the
+flag to `precheck` too. Only a run with that
+flag can get `silent_ok: true`, so the sentence is what lets a quiet scheduled
+run answer `[SILENT]`; and only a run with it is closed by `precheck` from the
+last scheduled run's stored document when the collector manifest digests the
+same, which is what spares a static fleet the by-hand drafting every day. It
+is in the prompt and not in the SOP, because a scheduled run and an on-demand
+run read the same SOP: an SOP that passed the flag would let every on-demand
+run of its stream go silent, or be closed from a stored document.
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
-prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
-flag. A prompt without it
+prompt has the phrase `pass --scheduled to precheck and finish` (`pass
+--scheduled to finish` on a stream without the step) and that no SOP passes
+the flag; `test_every_collector_sop_runs_precheck_after_its_collector` beside
+it holds the step to exactly those SOPs. A prompt without the sentence
 only makes its job noisier. The rule is in
 [ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 

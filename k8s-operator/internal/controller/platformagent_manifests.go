@@ -67,6 +67,14 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// incidentWorkloadDedupDefaultSeconds is the default INCIDENT_WORKLOAD_DEDUP_SECONDS:
+	// the seconds an admitted event folds its workload's later events into
+	// one incident (session_kv_server.py). Rendered into the platform
+	// container so the window is on for every install and visible on the
+	// Deployment; the daemon's own fallback is the same hour. A
+	// spec.deployment.env entry replaces it (mergeEnvVars), and "0" turns
+	// folding off.
+	incidentWorkloadDedupDefaultSeconds = "3600"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
 	// and what the broker keeps of it while the command runs;
 	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
@@ -104,6 +112,36 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
+	// fluentBitStateMount is where the fluent-bit sidecar keeps its two tail
+	// cursor databases (fluentBitLogsDBFile, fluentBitAuditDBFile): a per-agent
+	// directory on the namespace's system-metadata claim, mounted read-write at
+	// subPath fluentBitStateSubPathPrefix + agent.Name. On an emptyDir the cursors
+	// died with the pod, and with Read_from_Head On every replacement pod read
+	// both inputs from byte zero, replaying up to Mem_Buf_Limit of old lines per
+	// file into Cloud Logging. The metadata claim rather than the agent's data
+	// claim because the agent and the dashboard mount that one at its root: a
+	// cursor file they rewrite into something SQLite cannot open makes the sidecar
+	// exit at every start. Every other mount of system-metadata the operator
+	// renders uses subPath session (TestFluentBitKeepsItsCursorsOnTheMetadataClaim
+	// holds it there), so no rendered container that runs model-authored code can
+	// reach this directory; spec.deployment.extraVolumeMounts can still name the
+	// claim, and validateExtraVolumeMounts does not refuse it. Both databases are
+	// rendered with DB.journal_mode sqliteJournalModeDelete: the claim is the
+	// gofer-backed mount under a runtime class, where WAL mode corrupts
+	// (sqliteJournalModeDelete says why), and a corrupt cursor here outlives the
+	// pod where the emptyDir reset it.
+	fluentBitStateMount = "/var/lib/fluent-bit"
+	// fluentBitStateSubPathPrefix is the directory on the system-metadata claim
+	// under which each agent's cursor directory sits. The claim is one per
+	// namespace, so the agent's name keeps two agents' cursors apart. The kubelet
+	// creates a missing subPath directory with the volume root's mode, which
+	// fsGroup (agentFSGroup) has made group-writable, as it does for session.
+	fluentBitStateSubPathPrefix = "fluent-bit-state/"
+	// fluentBitLogsDBFile and fluentBitAuditDBFile are the two tail inputs' DB
+	// files under fluentBitStateMount, one per input; two inputs sharing one file
+	// would overwrite each other's positions.
+	fluentBitLogsDBFile  = "fluent-bit.db"
+	fluentBitAuditDBFile = "fluent-bit-audit.db"
 	// agentDataStorageSize is the default size of the agent's own /opt/data
 	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
 	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
@@ -142,6 +180,24 @@ const (
 	credentialProxyMetricsPort     int32 = 8766
 	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
 	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyHealthPort is Envoy's health listener in the broker
+	// container, where the readinessProbe goes. The credentialed listener
+	// sends every path, /healthz included, through one upstream cluster, and
+	// the fleet's open cluster watches hold that cluster's connections, so a
+	// probe through it is refused with the watches' 503 and three of those
+	// remove the pod from the Service. The health listener routes /healthz
+	// alone, through a cluster with a breaker of its own on the same socket,
+	// so ready still means the broker answers and no watch can mark it
+	// unready. The number is baked into the image's Envoy config
+	// (deploy/shared/envoy-credential-proxy.yaml); the operator declares the
+	// container port and the probe, and a test holds the two equal. Neither
+	// the Service nor the NetworkPolicy admits it: the kubelet probes the pod
+	// IP outside both. 8767 is left to the broker's own listener. A broker
+	// image older than this listener never becomes Ready under an operator
+	// that probes it, which is the standing rule that a pinned image is at
+	// least as new as the operator.
+	credentialProxyHealthPort     int32 = 8768
+	credentialProxyHealthPortName       = "cred-health" // #nosec G101 -- Container port name, not a credential
 	// credentialProxyPortEnv tells the runtime the credentialed port, so its
 	// refusal of a metrics port equal to it compares against the number the
 	// operator renders rather than the runtime's own default.
@@ -220,6 +276,9 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -1407,8 +1466,9 @@ var frontDoorPlugins = []string{
 // profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
 // back-fill never extends a list the live file already holds, so a plugin the image
 // enabled after that volume was first written stays off there. The front-door overlay
-// unions these in so the flag cannot hide one. pr_opened records each pull request a
-// worker opens on its card, which is what posts the thread's PR message.
+// unions these in so the flag cannot hide one. pr_opened claims each pull request record
+// through the broker, strips its token and writes the origin ledger; in a worker it also
+// records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
 }
@@ -2877,6 +2937,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "GITOPS_STATE_PATH",
 			Value: path.Join(gitopsStateDir, "managed_repos"),
 		},
+		{
+			Name:  "INCIDENT_WORKLOAD_DEDUP_SECONDS",
+			Value: incidentWorkloadDedupDefaultSeconds,
+		},
 	}
 
 	// Two of the three exceptions to "no credentials in the sandbox", and the
@@ -3395,21 +3459,29 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// so the agent-side callers that used to `hermes send` a proactive post
 	// route it to the gateway's chat.notify home channel instead. This names
 	// the platform they reroute; the bus identity above is what sends it.
-	// Only with a home channel the route posts to: otherwise every proactive
-	// post would be refused, and on a Chat-and-Slack install the agent would
-	// count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+	// With a home channel the route posts; without one it refuses and keeps
+	// the post for the digest, so the route is named whenever the backend
+	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
+	// Chat-and-Slack install with no Chat home the agent is not routed, so
+	// it does not count Chat as a platform to post to ahead of Slack.
+	if a2aAgentSurface(agent) && a2aGchatHomeRouted(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackHomeRouted(agent) {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed.
+		// the single-backend gateway, so at most one platform is routed. Only
+		// the CR's channel travels as env; a channel the gateway learned
+		// reaches the agent through the projection file mounted below
+		// (platformagent_home_channel_record.go), which the agent's readers
+		// take after a non-empty env, so a learn replaces no pod.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 		// The agent's own idea of the Slack home channel, as under today: the
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
+		}
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -3592,6 +3664,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	volumes = append(volumes, buildWatcherTokenVolume())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		// The home-channel projection (platformagent_home_channel_record.go):
+		// Optional and out of the pod-template hashes, so its content rolls
+		// no pod; the agent's readers follow the file within a kubelet sync.
+		volumes = append(volumes, homeChannelProjectionVolume(agent))
+	}
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
 		// Optional here and only here: a2aAgentSurface also holds on the skew
@@ -4198,22 +4276,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -4371,7 +4441,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4421,10 +4491,30 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// Managed, so reserved by the merge below, only when the list is set: an
+	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
+	// spec.deployment.env, which the watcher read before this field existed.
+	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -4548,6 +4638,10 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
+	// The scratch volumes' caps, for the broker's resource watermark gate. See
+	// credentialProxyStateLimitEnv for why they are values and why reserved;
+	// in the managed set, so the merge below reserves both names.
+	envVars = append(envVars, credentialProxyVolumeLimitEnv(agent)...)
 	// Set in both directions, deliberately. The broker's own default is off, so
 	// the "0" changes nothing on its own — what it buys is that the credential
 	// mode an install is in can be read off the Deployment rather than inferred
@@ -4575,12 +4669,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
 	// unset, so a broker rendered without these would crash-loop at boot rather
 	// than serve credentials to whoever reached the port.
-	//
-	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
-	// share no volume, so a working-tree clone in a directory the agent named is
-	// not something the broker can do at all — the fallback the flag guards
-	// elsewhere does not exist here, and an install that could switch it off
-	// would only be choosing to have the GitHub-writing skills fail.
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
@@ -4624,7 +4712,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
@@ -4827,6 +4914,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -5098,9 +5188,12 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 
 		// Seconds a workload's admitted event folds its later events into
 		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
-		// session_kv_server.py). Parsed as a whole number and capped at a
-		// day, and a value that does not parse means off, so it bounds a
-		// count of chat messages and triage turns and reaches nothing else.
+		// session_kv_server.py). The container carries the default
+		// (incidentWorkloadDedupDefaultSeconds); an entry here replaces it,
+		// and "0" turns folding off. Parsed as a whole number and capped at a
+		// day, and a value that does not parse means the default, so it
+		// bounds a count of chat messages and triage turns and reaches
+		// nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 
 		// "true" has an event triage also file a card that opens the
@@ -5110,6 +5203,43 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// changes which cards the front door files and nothing else: the pull
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
+
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
+
+		// How many Cluster Agent profiles one reconcile run scaffolds before it
+		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
+		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a
+		// positive integer reads as the default, so an arbitrary value bounds
+		// how many profiles a run creates and reaches nothing else.
+		"BOOTSTRAP_MAX_CREATES_PER_TICK": {},
+
+		// The group size above which the front door's injected roster counts
+		// a shared-role group (the Cluster Agents) by project and location
+		// instead of naming each (agents/chat/scripts/agent_roster.py,
+		// summary_threshold; default 20). Parsed as a whole number of zero
+		// or more, and any other value means the default, so it changes how
+		// many names one block of prompt text carries and reaches nothing
+		// else: the names it withholds come back through the same module's
+		// list_agents filter, and no value adds an agent, a path or a
+		// destination.
+		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
+
+		// The idle policy's two thresholds, in days
+		// (agents/chat/scripts/cron_idle_policy.py): after this many days
+		// without a chat message the dispatcher holds the Platform Agent's
+		// model-run cron jobs to once a window, and after the second it holds
+		// them until a message arrives. Each is parsed as a whole number; `0`
+		// turns its stage off and anything else means the default. A value
+		// changes only how often jobs already on the roster run, by moving
+		// their next_run_at in the profile's own store, and adds no job, path,
+		// destination or credential.
+		"CRON_IDLE_HIBERNATE_DAYS": {},
+		"CRON_IDLE_THROTTLE_DAYS":  {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5174,7 +5304,7 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
-		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		{Name: brokerMinterVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
@@ -5373,6 +5503,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
 	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
+	if a2aAgentSurface(agent) && a2aSlackArmed(agent) {
+		volumeMounts = append(volumeMounts, homeChannelProjectionMount(agentChatHomeDir))
+	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
@@ -5747,15 +5880,20 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				ReadOnly:  true,
 			},
 			{
-				Name:      "fluent-bit-state",
-				MountPath: "/fluent-bit/state",
+				Name:      "system-metadata",
+				MountPath: fluentBitStateMount,
+				SubPath:   fluentBitStateSubPathPrefix + agent.Name,
 			},
 		},
 		// Read-only root and no /tmp, the only container here with neither. The config
-		// above buffers in memory (Mem_Buf_Limit, no storage.path), keeps its tail DB on
-		// the fluent-bit-state volume and outputs to stdout, so it writes nothing to the
-		// root filesystem. Handing it the agent's tmp-scratch would only give an
-		// LLM-driven container a path into the log shipper.
+		// above buffers in memory (Mem_Buf_Limit, no storage.path) and outputs to
+		// stdout, so it writes nothing to the root filesystem. Its one writable path
+		// is the cursor directory on the system-metadata claim (fluentBitStateMount),
+		// which no other container the operator renders mounts: the agent and the
+		// dashboard reach that claim only through subPath session, and only a CR's
+		// spec.deployment.extraVolumeMounts could hand them its root. Handing it the
+		// agent's tmp-scratch would only give an LLM-driven container a path into the
+		// log shipper.
 		SecurityContext: hardenedSecurityContext(),
 	})
 
@@ -5840,12 +5978,6 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 					},
 					DefaultMode: ptr.To(int32(420)),
 				},
-			},
-		},
-		{
-			Name: "fluent-bit-state",
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(fluentBitStateSizeLimit))},
 			},
 		},
 		{
@@ -6132,7 +6264,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Name              tail
     Tag               agent.logs
     Path              ` + fluentBitDataMount + `/logs/*.log
-    DB                /fluent-bit/state/fluent-bit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitLogsDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
@@ -6145,7 +6279,9 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
     Tag               agent.audit
     Path              ` + fluentBitAuditTailPath + `
     Parser            audit_json
-    DB                /fluent-bit/state/fluent-bit-audit.db
+    DB                ` + fluentBitStateMount + `/` + fluentBitAuditDBFile + `
+    DB.locking        true
+    DB.journal_mode   ` + sqliteJournalModeDelete + `
     Refresh_Interval  5
     Rotate_Wait       30
     Mem_Buf_Limit     20MB
