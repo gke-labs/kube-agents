@@ -98,6 +98,9 @@ FAILURE_KEY = "failure_reported"
 # later is not one of the ids, so it does not hold anything back. A record an
 # older build wrote today has no "ids"; the key alone decides until the day ends.
 ANNOUNCED_KEY = "announced"
+ANNOUNCED_DAY = "day"
+ANNOUNCED_KEYS = "keys"
+ANNOUNCED_IDS = "ids"
 # The run id sent with an addition's marks: one per run, so the members of an
 # item marked one by one are one addition.
 RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -401,12 +404,13 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
         if why:
             sys.stderr.write(why + "\n")
         announced = state.get(ANNOUNCED_KEY) if isinstance(state.get(ANNOUNCED_KEY), dict) else {}
-        todays = announced if announced.get("day") == today else {}
-        announced_keys = todays.get("keys") or []
+        todays = announced if announced.get(ANNOUNCED_DAY) == today else {}
+        keys = todays.get(ANNOUNCED_KEYS)
+        announced_keys = keys if isinstance(keys, list) and all(isinstance(key, list) for key in keys) else []
         if not todays:
             announced_ids = []
-        elif isinstance(todays.get("ids"), list):
-            announced_ids = todays["ids"]
+        elif isinstance(todays.get(ANNOUNCED_IDS), list):
+            announced_ids = todays[ANNOUNCED_IDS]
         else:
             announced_ids = None
         plan = fq.pace(
@@ -427,9 +431,9 @@ def main(argv: list[str] | None = None, clock=_now) -> int:
     # Before the marks, so a mark that raises cannot cost the record that the
     # message went out.
     if plan.add:
-        record = {"day": today, "keys": announced_keys + [list(item.key) for item in plan.add]}
+        record = {ANNOUNCED_DAY: today, ANNOUNCED_KEYS: announced_keys + [list(item.key) for item in plan.add]}
         if announced_ids is not None:
-            record["ids"] = announced_ids + [str(member.get("id")) for item in plan.add for member in item.members]
+            record[ANNOUNCED_IDS] = announced_ids + [str(member.get("id")) for item in plan.add for member in item.members]
         state[ANNOUNCED_KEY] = record
     if daily:
         state[DAILY_KEY] = today

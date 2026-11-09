@@ -992,8 +992,9 @@ non-criticals back, and a non-critical one stops every addition, though the stop
 name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
 it has now: a decision on it the same day refunds its slot, and a re-score can move it between
 the two counts. It comes back as new the next day. A finding that joins an added line later, which
-a decision can leave open, was not named, so it is a new item of its own and holds nothing back. If the state file cannot be written either,
-the additions and the daily part repeat every hour.
+a decision can leave open, was not named: once no finding the addition named is still new, it is a
+new item of its own and holds nothing back. If the state file cannot be written either, the
+additions and the daily part repeat every hour.
 
 What this costs is the starvation §7.3 measured, brought back deliberately, from two sources. An
 ignored non-critical holds every new finding back until someone decides, and the daily notice is

@@ -391,6 +391,12 @@ class MainTests(NudgeHarness):
         self.assertNotIn("ids", record)
         self.assertEqual(len(record["keys"]), 2)
 
+    def test_malformed_announced_keys_are_ignored_not_fatal(self):
+        for keys in ("x", [1]):
+            (self.home / nudge.STATE_FILE).write_text(json.dumps({nudge.ANNOUNCED_KEY: {"day": "2026-10-06", "keys": keys}}))
+            self.assertEqual(self.run_at(at(6, 12), [finding(id="c", check_slug="c")]), 0, keys)
+            self.assertEqual([fid for fid, _ in self.marks], ["c"], keys)
+
     def test_a_mark_that_raises_skips_neither_the_other_marks_nor_the_daily_record(self):
         rows = [shown(at(5, 12), id="old"), finding(id="new", check_slug="x")]
         code = self.run_at(at(6, 12), rows, surfaced_error=http.client.IncompleteRead(b""))
