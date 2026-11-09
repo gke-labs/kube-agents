@@ -34,6 +34,7 @@ One root cause per loop. A classified cause with quoted evidence before any code
 Write a one-screen brief before reading anything else in depth:
 
 - Case id, domain, audit stream, the install model and release of the failing runs.
+- For a case that plants a fixture: the fields the lane's host type adds or changes on the planted objects, read with `kubectl -n default create -f - --dry-run=server -o yaml` over the manifest. A safeguard on a field admission writes is wrong, and a condition admission removes cannot be planted there (Autopilot writes `limits.ephemeral-storage` on every container).
 - Pass counts per model from the record (`bench/run-store/runs/` if present, else the run directories).
 - The failing checks by name, with their `reason` strings quoted verbatim from `results.json` `verification_report[]`.
 
@@ -64,6 +65,7 @@ Pick exactly one class, by the first rule that matches, and write the rule you u
 | Agent behaviour  | The procedure has the rule, the collector gave the facts, and the agent did not follow the rule (skipped a step, reworded a verdict, did not open the required tool)                                                                                                                                           | Move the rule out of prose: a script that prints the verdict line, a check, or a persona rule the persona loads on every run                                                                                                   |
 | Role set         | The agent lacked a permission or an API the scenario needs, and the report says so                                                                                                                                                                                                                             | A permission change proposed to the humans; never a Secret grant                                                                                                                                                               |
 | Infrastructure   | A 429, a timeout, a lost lease, a missing token, a forge-less install for a ledger check                                                                                                                                                                                                                       | Not a red; fix the environment and re-run                                                                                                                                                                                      |
+| Product miss     | The install was healthy and the agent answered in chat with the findings but published no ledger and named no issue URL (the shape of #5076)                                                                                                                                                                   | Neither red nor green: record the run with its issue in the body and re-run; the case is not changed                                                                                                                           |
 
 Write the class with three evidence quotes and one sentence on why the next-nearest class does not apply. If two classes apply to different checks of the same case, split: one loop per class.
 Then, for any class but Infrastructure, write the Step 3b card; no code and no run beyond the record before it. An Infrastructure red is fixed and re-run first, with no card.
@@ -119,7 +121,7 @@ On the final head: run the case three times; run every sibling case of the same 
 
 ## Step 7: ship
 
-Open the pull request from the template: the red (install, model, commit, failing check and reason, one line of the report), the three greens (run directories), the class and its evidence, the markers flipped (`expected_fail: true` removed for the cases the fix proves), the registration line, and the self-review from `/pr-preflight`.
+Open the pull request from the template: the red (install, model, commit, failing check and reason, one line of the report), the three greens (run directories), the class and its evidence, the markers flipped (`expected_fail: true` removed for the cases the fix proves), the registration line, and the self-review from `/pr-preflight`. A declared-gap case names its gap issue and never `Closes` it; a reviewer is never named by hand on any pull request (the review check's green assigns one).
 
 ## Step 8: record
 
