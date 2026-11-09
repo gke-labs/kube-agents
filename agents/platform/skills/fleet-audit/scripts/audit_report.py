@@ -16264,6 +16264,7 @@ def clean_close_banner(
     *,
     had_findings: bool = True,
     retired_ids: Iterable[str] = (),
+    named: bool = True,
 ) -> str:
     """The paragraph at the top of a ledger that a clean run closes.
 
@@ -16284,7 +16285,9 @@ def clean_close_banner(
     (`unlisted_previous_findings`): on a cluster the run listed nowhere, so
     nobody looked for them. The banner names them as not confirmed fixed
     rather than saying every finding below is resolved, which the closing
-    comment's note already takes back (#5229).
+    comment's note already takes back (#5229). With `named` False the banner
+    counts them and leaves the ids to the closing comment: the caller's
+    fallback for a body the named list would push past the forge's limit.
 
     The banner does not say that a later run reopens this issue. A later run
     with findings finds no open ledger (`find_existing_issue` lists open
@@ -16301,14 +16304,15 @@ def clean_close_banner(
         )
     retired = sorted({str(fid) for fid in retired_ids})
     if retired:
-        named = ", ".join(f"`{fid}`" for fid in retired[:MAX_DELTA_ROWS])
+        ids = ", ".join(f"`{fid}`" for fid in retired[:MAX_DELTA_ROWS])
         if len(retired) > MAX_DELTA_ROWS:
-            named += f", and {len(retired) - MAX_DELTA_ROWS} more"
+            ids += f", and {len(retired) - MAX_DELTA_ROWS} more"
         verb = "is" if len(retired) == 1 else "are"
         lead = (
             "found none of the findings below on the clusters it listed, so those "
-            f"are resolved. {len(retired)} of them {verb} not confirmed fixed: {named}. "
-            "This run listed their cluster in neither `scope.clusters` nor "
+            f"are resolved. {len(retired)} of them {verb} not confirmed fixed"
+            + (f": {ids}. " if named else ", and the closing comment names them. ")
+            + "This run listed their cluster in neither `scope.clusters` nor "
             "`scope.skipped`, so nobody looked for them; they are retired with the "
             "ledger, and the closing comment names their clusters."
         )
@@ -16344,19 +16348,23 @@ def close_ledger_reads_clean(
     `live_body` is the body that `find_existing_issue` read, so this needs no
     read of its own. When it is None, or when the banner would make the body
     too long for the forge, only the title changes. `retired_ids` are the
-    findings the close retired unread, for `clean_close_banner`.
+    findings the close retired unread, for `clean_close_banner`; when the
+    banner that names them does not fit, the one that counts them is tried
+    before the body is left as it was.
     """
     payload: dict = {"number": number, "title": issue_title(audit_id, [])}
     if live_body is not None:
-        body = (
-            live_body
-            if CLEAN_CLOSE_MARKER in live_body
-            else (
-                f"{clean_close_banner(audit_id, now, had_findings=bool(parse_delta_block(live_body)), retired_ids=retired_ids)}"
+        if CLEAN_CLOSE_MARKER in live_body:
+            candidates = [live_body]
+        else:
+            had_findings = bool(parse_delta_block(live_body))
+            candidates = [
+                f"{clean_close_banner(audit_id, now, had_findings=had_findings, retired_ids=retired_ids, named=named)}"
                 f"\n\n{live_body}"
-            )
-        )
-        if len(body) <= MAX_BODY_CHARS:
+                for named in ((True, False) if retired_ids else (True,))
+            ]
+        body = next((b for b in candidates if len(b) <= MAX_BODY_CHARS), None)
+        if body is not None:
             payload["body"] = body
     return try_forge("issue-update", repo, payload) is not None
 
@@ -17619,11 +17627,19 @@ def close_stale_remediation_prs(
             and scope_label_of(pr.get("labels")) is None
             and not set(covered) & known
         ):
+            # An old-scheme body names ids this ledger cannot be joined
+            # against, so "never listed" is not known of it; it is left open
+            # all the same, since the branch rule cannot say whose it is.
+            why = (
+                "they are written under another id scheme, which this install's ledger "
+                "cannot be joined against"
+                if covered and not joinable
+                else "this install's ledger never listed any of them"
+            )
             log(
                 f"PR #{number} carries no scope label and covers "
-                f"{', '.join(covered) or 'no readable finding id'}; this install's "
-                "ledger never listed any of them, so it is left to the install that "
-                "opened it."
+                f"{', '.join(covered) or 'no readable finding id'}; {why}, so it is "
+                "left to the install that opened it."
             )
             continue
         if not orphaned:
@@ -17692,7 +17708,6 @@ def close_stale_remediation_prs(
         # reads as a considered rejection and retires the finding permanently.
         # A labelled pull request that is still open, by contrast, costs one
         # line of noise and is fixed on the next run.
-        labelled_forge = forge_has_labels(repo)
         if not labelled_forge:
             # No labels here: the description records the close instead,
             # under the same rule -- written first, and no close without it.
