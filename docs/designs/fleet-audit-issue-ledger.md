@@ -891,6 +891,9 @@ its paragraph goes in `kcc_stalled_paragraph` and renders after the command bloc
 strip-and-rewrite pattern covers every form: an exact first sentence (`KCC_STALLED_NOTE_PATTERN`)
 followed by " When the audit ran, Config Connector reported " (`KCC_STALLED_CONTINUATION`), which
 every paragraph `finish` writes goes on with. A worker sentence that only starts the same way stays.
+An earlier release wrote "this file.**" and then "The declaration is `<path>`." for a fix of another
+file. A previous ledger can hold that form, and the carry copies it, so the pattern also accepts
+that sentence (`KCC_STALLED_OLD_DECLARATION_SENTENCE`) before the continuation.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say

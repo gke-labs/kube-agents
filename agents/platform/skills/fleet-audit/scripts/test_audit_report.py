@@ -23752,6 +23752,67 @@ metadata:
                 audit_report._strip_kcc_stalled_note(remediation)
                 self.assertEqual(remediation["note"], "Do it.")
 
+    # The paragraph that main wrote before the first sentence named the file:
+    # "this file" and then a second sentence that names it. A previous ledger
+    # can hold it, and the carry copies it.
+    MAIN_DECLARED_CORE = ("**Config Connector is not applying this file.** The declaration is {path}. "
+                          "When the audit ran, Config Connector reported {objects}.")
+    MAIN_DECLARED_TAIL = (" Config Connector does not apply the object until that reason is gone, so a change to the "
+                          "declaration does not take effect before then, and this finding comes back on each run until "
+                          "then. If the reason rejects the declaration, correct it there.")
+
+    def carried_main_paragraph(self, path, manifest, tail=True):
+        """Run the carry with a previous ledger whose manual fix has main's
+        paragraph, then the paragraph pass on this run's manifest."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        old = self.MAIN_DECLARED_CORE.format(path=path, objects=objects) + (self.MAIN_DECLARED_TAIL if tail else "")
+        before = self.pool_finding({"kind": "manual", "note": "Spread the pool by hand.\n\n" + old})
+        now = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [before]}), ["pool"])
+        audit_report.disclose_stalled_kcc_remediations([now], manifest, self.root, declarations)
+        return now["remediation"]["note"]
+
+    def main_paths(self):
+        return (f"`{self.PLANTED}`", f"`{self.PLANTED}` in the repository `acme/infra`")
+
+    def test_a_carried_paragraph_from_main_goes_when_the_stall_clears(self):
+        """Review finding: main's paragraph has a second sentence between
+        "this file.**" and the text that every paragraph goes on with, so the
+        strip pattern did not match it. The carry copied it, and the note
+        kept a stall that this run did not see."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, kcc_manifest(), tail)
+                    self.assertEqual(note, "Spread the pool by hand.")
+
+    def test_a_carried_paragraph_from_main_is_written_again_once_when_the_stall_continues(self):
+        """The same carry while the stall continues: the note holds one
+        paragraph, this run's, and not main's paragraph beside it."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, self.live_manifest(), tail)
+                    self.assertTrue(note.startswith("Spread the pool by hand.\n\n"), note[:120])
+                    self.assertEqual(note.count(audit_report.KCC_STALLED_MARK_PREFIX), 1, note)
+                    self.assertNotIn("The declaration is", note)
+                    self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+
+    def test_a_worker_sentence_like_mains_first_two_sentences_is_not_stripped(self):
+        """Main's two first sentences, without the text that every paragraph
+        goes on with, are a worker's sentences and stay."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying this file.** "
+                  "The declaration is `clusters/prod.yaml`. Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})

@@ -2265,10 +2265,18 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # writes goes on with (`KCC_STALLED_CONTINUATION`). So a worker sentence that
 # only starts the same way is not a copied paragraph. The rest of the
 # paragraph's line goes with it.
+# An earlier release wrote the paragraph for a fix of another file as "this
+# file.**" and then `KCC_STALLED_OLD_DECLARATION_SENTENCE`, which names the
+# file, before the continuation. A previous ledger can hold that form, and
+# `carry_unchanged_findings` copies it, so the pattern also accepts that
+# sentence between "this file.**" and the continuation.
+KCC_STALLED_OLD_DECLARATION_SENTENCE = r" The declaration is `[^`\n]+`(?: in the repository `[^`\n]+`)?\."
 KCC_STALLED_NOTE_PATTERN = re.compile(
     r"[ \t]*"
     + re.escape(KCC_STALLED_MARK_PREFIX)
-    + r"(?:this file\.\*\*|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
+    + r"(?:this file\.\*\*(?:"
+    + KCC_STALLED_OLD_DECLARATION_SENTENCE
+    + r")?|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
     + re.escape(KCC_STALLED_CONTINUATION)
     + r"[^\n]*"
 )
