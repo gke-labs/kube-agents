@@ -419,6 +419,25 @@ litellm:
     # the caller drops the stream and never sees the 429. The render refuses a
     # pair whose hold plus 60s for the first chunk crosses that bound.
     retryAfterSeconds: 0
+  # A spend ceiling at the gateway, off by default. budget.usd is the most the
+  # gateway spends, in US dollars as LiteLLM's cost map prices each response,
+  # in every window of budget.period (LiteLLM's duration syntax: a whole
+  # number and s, m, h, d, w or mo). Above 0 it renders
+  # router_settings.provider_budget_config for the model's provider, with the
+  # ceiling split evenly across replicaCount: LiteLLM counts spend per gateway
+  # process (the chart runs no Redis), so each replica holds one share and the
+  # install as a whole stays under the ceiling. A replica whose share is spent
+  # refuses every model call until its window ends ("No deployments available
+  # - crossed budget"), and its litellm_provider_remaining_budget_metric gauge
+  # (the share less the spend) reads 0; a gateway restart or rollout starts
+  # that pod's count over. A model LiteLLM's cost map does not price costs 0
+  # and never reaches the ceiling. 0 leaves the key out, so the rendered
+  # config and its rollout checksum are what they were. What the agent sees,
+  # and how to read the gauge: the site's inference-gateway page, "Setting a
+  # spend ceiling". Chart-only; the kustomize dev base carries no such key.
+  budget:
+    usd: 0
+    period: "1d"
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity by default (or a service-account key Secret when

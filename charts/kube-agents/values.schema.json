@@ -215,6 +215,20 @@
             }
           }
         },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usd": {
+              "type": "number",
+              "minimum": 0
+            },
+            "period": {
+              "type": "string",
+              "pattern": "^([1-9][0-9]*(s|m|h|d|w|mo))?$"
+            }
+          }
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,

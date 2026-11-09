@@ -910,6 +910,21 @@ is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+# LITELLM_BUDGET_USD: a non-negative amount in US dollars, digits with an
+# optional decimal part, 0 meaning no ceiling. The same shape the chart's
+# litellm.budget.usd schema (a number at or above 0) and the composition's
+# litellm_budget validation take; refused here first, for the MODEL_MAX_TOKENS
+# reason.
+is_non_negative_decimal() {
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# LITELLM_BUDGET_PERIOD: a LiteLLM duration, a whole number above zero and a
+# unit of s, m, h, d, w or mo, the chart's litellm.budget.period.
+is_valid_litellm_budget_period() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(s|m|h|d|w|mo)$ ]]
+}
+
 # LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
 # chart's litellm.redaction.ip.action.
 is_valid_redaction_ip_action() {
@@ -5162,6 +5177,25 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # The gateway's spend ceiling, checked for the MODEL_MAX_TOKENS reason. Empty
+  # takes the defaults (0, no ceiling), and the period is read only beside an
+  # amount above zero, as it is in the chart. The amount is compared as text:
+  # 0 and 0.0 both mean off, and the variable reaches terraform.tfvars only
+  # when it is on, so an install without a ceiling keeps the file it had.
+  local litellm_budget_usd="${LITELLM_BUDGET_USD:-$DEFAULT_LITELLM_BUDGET_USD}"
+  local litellm_budget_period="${LITELLM_BUDGET_PERIOD:-$DEFAULT_LITELLM_BUDGET_PERIOD}"
+  if ! is_non_negative_decimal "$litellm_budget_usd"; then
+    print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is not an amount in US dollars. Set a number at or above 0, such as 25 or 2.50, or leave it empty, in install.env."
+    return 1
+  fi
+  local litellm_budget_on="false"
+  if [[ ! "$litellm_budget_usd" =~ ^0+(\.0+)?$ ]]; then
+    litellm_budget_on="true"
+    if ! is_valid_litellm_budget_period "$litellm_budget_period"; then
+      print_error "LITELLM_BUDGET_PERIOD='${litellm_budget_period}' is not a LiteLLM duration. Set a whole number and s, m, h, d, w or mo, such as 1d, or leave it empty, in install.env."
+      return 1
+    fi
+  fi
   # The daily alert ceilings, checked for the MODEL_MAX_TOKENS reason. An
   # empty key is not written, so the agent image keeps its default for that
   # bucket. No install.defaults.env entry exists for these keys, because
@@ -5383,6 +5417,13 @@ write_tfvars_from_state() {
       echo "}"
     else
       echo "litellm_redaction = { enabled = false }"
+    fi
+    # Only while on, so an install without a ceiling keeps the file it had.
+    if [ "$litellm_budget_on" = "true" ]; then
+      echo ""
+      echo "# The gateway's spend ceiling (LITELLM_BUDGET_USD, LITELLM_BUDGET_PERIOD in"
+      echo "# install.env), split across the gateway's replicas by the chart."
+      echo "litellm_budget = { usd = ${litellm_budget_usd}, period = $(hcl_str "$litellm_budget_period") }"
     fi
     echo ""
     echo "# The scoped service account pool (SCOPED_SA_POOL_ENABLED,"

@@ -1291,6 +1291,60 @@ class InstallerCommonTest(unittest.TestCase):
                         self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
     # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _BUDGET_UNSET = {"LITELLM_BUDGET_USD": "", "LITELLM_BUDGET_PERIOD": ""}
+
+    def test_tfvars_carry_litellm_budget_only_while_it_is_on(self):
+        # Off (unset, empty, 0 or 0.0) writes no litellm_budget line at all, so
+        # an install without a ceiling keeps the file it had, whatever a
+        # leftover period says; on, the amount is a bare HCL number and the
+        # period a string, the default 1d when empty.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, None),
+                ({"LITELLM_BUDGET_USD": "0"}, None),
+                ({"LITELLM_BUDGET_USD": "0.0", "LITELLM_BUDGET_PERIOD": "not-a-duration"}, None),
+                ({"LITELLM_BUDGET_USD": "25"}, 'litellm_budget = { usd = 25, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "2.50", "LITELLM_BUDGET_PERIOD": "7d"}, 'litellm_budget = { usd = 2.50, period = "7d" }\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **self._BUDGET_UNSET, **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    text = dest.read_text()
+                    if expected is None:
+                        self.assertNotIn("litellm_budget", text)
+                    else:
+                        self.assertIn(expected, text)
+
+    def test_tfvars_refuse_litellm_budget_values_terraform_or_the_chart_would(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it. The period
+        # is checked only beside an amount above zero, as the chart reads it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, key in (
+                ({"LITELLM_BUDGET_USD": "-1"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "$25"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "25."}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "1x"}, "LITELLM_BUDGET_PERIOD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "0d"}, "LITELLM_BUDGET_PERIOD"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", **self._BUDGET_UNSET, **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(key, proc.stderr + proc.stdout)
+                    self.assertIn("install.env", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
     _REDACTION_UNSET = {
         "LITELLM_REDACTION_ENABLED": "",
         "LITELLM_REDACTION_IP_ACTION": "",
