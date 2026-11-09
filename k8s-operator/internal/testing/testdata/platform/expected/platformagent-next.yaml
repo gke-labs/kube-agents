@@ -4052,6 +4052,9 @@ spec:
             - mountPath: /etc/nats
               name: config
               readOnly: true
+            - mountPath: /etc/nats-tls
+              name: tls
+              readOnly: true
             - mountPath: /var/run/nats
               name: nats-pid
               readOnly: true

@@ -70,6 +70,11 @@ const (
 	a2aBusReloadFailedReason   = "BusConfigReloadFailed"
 )
 
+// a2aBusVarzClient reads the bus's monitoring endpoint directly: an
+// HTTP(S)_PROXY in the operator's environment is for its egress, and a
+// Service name sent through it would never be answered.
+var a2aBusVarzClient = &http.Client{Transport: &http.Transport{Proxy: nil}}
+
 func a2aNATSReloaderImage() string {
 	if override := os.Getenv(a2aNATSReloaderImageEnvVar); override != "" {
 		return override
@@ -77,11 +82,16 @@ func a2aNATSReloaderImage() string {
 	return defaultA2ANATSReloaderImage
 }
 
-// buildA2ANATSReloaderContainer is the bus pod's reloader. It holds nothing
-// but the config, read-only, and the PID file: no service account token (the
-// pod mounts none), a read-only root filesystem, and no capabilities. It runs
-// as the pod's user, the same as nats-server's, which is what lets it signal
-// that process without CAP_KILL.
+// buildA2ANATSReloaderContainer is the bus pod's reloader. It mounts the
+// config, the serving pair and the PID file, all read-only: no service
+// account token (the pod mounts none), a read-only root filesystem, and no
+// capabilities. The serving pair is there because the reloader refuses to
+// start unless every cert_file, key_file and ca_file the config names exists,
+// and it watches those too. It runs as the pod's user, the same as
+// nats-server's, which is what lets it signal that process without CAP_KILL.
+// Sharing that user and one PID namespace also means it could read what
+// nats-server holds through /proc, so the mounts don't narrow it further than
+// the pod already is.
 func buildA2ANATSReloaderContainer() corev1.Container {
 	return corev1.Container{
 		Name:  a2aNATSReloaderContainer,
@@ -89,6 +99,7 @@ func buildA2ANATSReloaderContainer() corev1.Container {
 		Args:  []string{"-pid", a2aNATSPIDFile, "-config", a2aNATSConfFile},
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "config", MountPath: a2aNATSConfMountDir, ReadOnly: true},
+			{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 			{Name: a2aNATSPIDVolume, MountPath: a2aNATSPIDMountDir, ReadOnly: true},
 		},
 		SecurityContext: hardenedSecurityContext(),
@@ -111,6 +122,8 @@ type a2aBusReload struct {
 	requeue time.Duration
 	// reloaded: the pending reload landed on this pass.
 	reloaded bool
+	// busUID is the live StatefulSet's, which a restarted pod must belong to.
+	busUID types.UID
 }
 
 // planA2ABusReload decides whether the config about to be applied reaches the
@@ -138,6 +151,7 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	if liveSts.Spec.Template.Annotations[a2aConfigHashAnnotation] != sts.Spec.Template.Annotations[a2aConfigHashAnnotation] {
 		return a2aBusReload{}, nil
 	}
+	busUID := liveSts.UID
 	if string(live.Data[a2aNATSConfKey]) != string(config.Data[a2aNATSConfKey]) {
 		// A new config for the running bus. A reload still pending from an
 		// earlier change is folded in: the reloader applies whatever file
@@ -149,7 +163,7 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 			baseline = ""
 		}
 		stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), baseline)
-		return a2aBusReload{requeue: a2aBusReloadRecheck}, nil
+		return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 	}
 	requestedAt, pending := live.Annotations[a2aBusReloadRequestedAnnotation]
 	if !pending {
@@ -157,15 +171,19 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	}
 	baseline := live.Annotations[a2aBusReloadBaselineAnnotation]
 	loaded, err := r.a2aBusConfigLoadTime(ctx, agent)
+	// A moved load time is taken as this config landing. When a second
+	// change was folded into a pending one before the first reached the
+	// pod, the first reload landing can clear both; the reloader still
+	// applies the second when the kubelet writes it.
 	if err == nil && baseline != "" && loaded != baseline {
-		return a2aBusReload{reloaded: true}, nil
+		return a2aBusReload{reloaded: true, busUID: busUID}, nil
 	}
 	since, perr := time.Parse(time.RFC3339Nano, requestedAt)
 	if perr != nil || now.Sub(since) >= a2aBusReloadBound {
-		return a2aBusReload{restartPod: true}, nil
+		return a2aBusReload{restartPod: true, busUID: busUID}, nil
 	}
 	stampA2ABusReload(config, requestedAt, baseline)
-	return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since))}, nil
+	return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID}, nil
 }
 
 func stampA2ABusReload(config *corev1.Secret, requestedAt, baseline string) {
@@ -176,12 +194,15 @@ func stampA2ABusReload(config *corev1.Secret, requestedAt, baseline string) {
 	config.Annotations[a2aBusReloadBaselineAnnotation] = baseline
 }
 
-// finishA2ABusReload acts on the plan once the config is applied: an Event
-// for a reload that landed, or the bus pod deleted, with a Warning, for one
-// that didn't. The StatefulSet recreates the pod on the config now in the
-// Secret. The delete names the pod's UID and only a pod the StatefulSet
+// actOnA2ABusReload acts on the plan before the config is applied, so the
+// pending record the apply drops is never gone while its action is still
+// owed: an Event for a reload that landed, or the bus pod deleted, with a
+// Warning, for one that didn't. The live config is already the desired one on
+// that path, and the StatefulSet recreates the pod on it. If the delete
+// fails, the pass returns before the apply and the record stays for the
+// next. The delete names the pod's UID, and only a pod the live StatefulSet
 // controls is deleted.
-func (r *PlatformAgentReconciler) finishA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, plan a2aBusReload) error {
+func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, stsName string, plan a2aBusReload) error {
 	if plan.reloaded {
 		r.recordEvent(agent, corev1.EventTypeNormal, a2aBusConfigReloadedReason,
 			"Reloaded the A2A bus's config in place.")
@@ -191,10 +212,10 @@ func (r *PlatformAgentReconciler) finishA2ABusReload(ctx context.Context, agent 
 		return nil
 	}
 	pod := &corev1.Pod{}
-	if err := r.podReader().Get(ctx, types.NamespacedName{Name: sts.Name + a2aNATSPodOrdinalSuffix, Namespace: sts.Namespace}, pod); err != nil {
+	if err := r.podReader().Get(ctx, types.NamespacedName{Name: stsName + a2aNATSPodOrdinalSuffix, Namespace: agent.Namespace}, pod); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil {
+	if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != plan.busUID || pod.DeletionTimestamp != nil {
 		return nil
 	}
 	uid := pod.UID
@@ -225,7 +246,7 @@ func (r *PlatformAgentReconciler) a2aBusConfigLoadTime(ctx context.Context, agen
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a2aBusVarzClient.Do(req)
 	if err != nil {
 		return "", err
 	}

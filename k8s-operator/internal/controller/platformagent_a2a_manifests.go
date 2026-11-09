@@ -2596,8 +2596,12 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // The serving certificate's fingerprint is the third input, for the same
 // reason as the conf: nats-server reads its certificate at boot, so a renewed
 // one that the kubelet has already written into the mounted directory is not
-// served until the pod restarts. Until a reloader sends the reload signal
-// instead, a renewal rolls the bus once a year.
+// served until the pod restarts. A renewal rolls the bus once a year; the
+// bus pod's reloader would also apply it in place, but the hash still rolls.
+//
+// The gateway's per-profile deny is left out (renderA2ANATSConf with no
+// profiles): the config Secret carries it, the reloader applies it, and
+// planA2ABusReload confirms it, so a profile change doesn't roll the bus.
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
@@ -6159,6 +6163,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err != nil {
 			return state, err
 		}
+		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 			return state, err
 		}
@@ -6170,9 +6177,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		if err := r.applyManaged(ctx, agent, sts); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
-		}
-		if err := r.finishA2ABusReload(ctx, agent, sts, reload); err != nil {
-			return state, err
 		}
 		state.busReloadRequeue = reload.requeue
 		// A pod that never became Ready on an earlier template blocks the

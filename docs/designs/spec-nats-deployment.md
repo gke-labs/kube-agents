@@ -342,7 +342,8 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest.
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash, since a reload applies it (below).
 
 Layout:
 

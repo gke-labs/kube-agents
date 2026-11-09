@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -120,7 +122,7 @@ func TestAReloadThatDoesntLandRestartsTheBusPod(t *testing.T) {
 	if !plan.restartPod || len(config.Annotations) != 0 {
 		t.Fatalf("at the bound: plan = %+v, annotations %v; want a restart and no pending record", plan, config.Annotations)
 	}
-	if err := r.finishA2ABusReload(ctx, agent, sts, plan); err != nil {
+	if err := r.actOnA2ABusReload(ctx, agent, sts.Name, plan); err != nil {
 		t.Fatal(err)
 	}
 	if a2aBusPodExists(t, r, sts) {
@@ -179,11 +181,12 @@ func TestAnUnreadableLoadTimeEndsInARestart(t *testing.T) {
 	}
 }
 
-// The reloader holds the config and the PID file, both read-only, runs with
+// The reloader holds the config, the serving pair and the PID file, all
+// read-only, runs with
 // no capabilities on a read-only root filesystem, and the pod mounts no
 // service account token. nats-server writes its PID where the reloader reads
 // it, and the two share a PID namespace.
-func TestTheReloaderHoldsOnlyTheConfigAndThePID(t *testing.T) {
+func TestTheReloaderHoldsOnlyWhatItReads(t *testing.T) {
 	agent := a2aTestAgent()
 	pod := buildA2ANATSStatefulSet(agent, "h").Spec.Template.Spec
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
@@ -214,13 +217,27 @@ func TestTheReloaderHoldsOnlyTheConfigAndThePID(t *testing.T) {
 	for _, m := range reloader.VolumeMounts {
 		mounts[m.Name] = m
 	}
-	if len(mounts) != 2 || !mounts["config"].ReadOnly || !mounts[a2aNATSPIDVolume].ReadOnly {
-		t.Fatalf("reloader mounts = %+v, want the config and the PID dir, read-only", reloader.VolumeMounts)
+	if len(mounts) != 3 || !mounts["config"].ReadOnly || !mounts[a2aNATSTLSVolume].ReadOnly || !mounts[a2aNATSPIDVolume].ReadOnly {
+		t.Fatalf("reloader mounts = %+v, want the config, the serving pair and the PID dir, read-only", reloader.VolumeMounts)
+	}
+	// The reloader refuses to start unless each file the config names is
+	// there for it.
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	for _, m := range regexp.MustCompile(`(?m)^\s*(?:cert_file|key_file|ca_file)\s*:\s*"?([^"\n]+)"?`).FindAllStringSubmatch(conf, -1) {
+		dir := filepath.Dir(m[1])
+		found := false
+		for _, mount := range reloader.VolumeMounts {
+			if mount.MountPath == dir {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the config names %s, which the reloader doesn't mount", m[1])
+		}
 	}
 	if len(reloader.Env) != 0 || len(reloader.EnvFrom) != 0 {
 		t.Fatal("the reloader carries environment")
 	}
-	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	if !strings.Contains(conf, `pid_file: "`+a2aNATSPIDFile+`"`) {
 		t.Fatal("nats.conf doesn't write the PID file the reloader reads")
 	}
