@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 const (
@@ -94,6 +95,20 @@ const (
 	kubeProxySpreadMaxSkew       = int32(1)
 	kubeProxySpreadMatchLabelKey = "pod-template-hash"
 )
+
+// GOMEMLIMIT, the Go runtime's soft heap limit, is set to
+// kubeProxyGoMemLimitPercent of kubeProxyMemoryLimit (kubeProxyGoMemLimit), so
+// the collector works harder as the response cache and in-flight bodies push
+// the heap toward the container's limit.
+const kubeProxyGoMemLimitPercent = 85
+
+// kubeProxyGoMemLimit is the kube-proxy container's GOMEMLIMIT:
+// kubeProxyGoMemLimitPercent of its memory limit, in bytes (912680550 for
+// 1Gi), derived from kubeProxyMemoryLimit so a change to the limit carries over.
+func kubeProxyGoMemLimit() string {
+	limit := resource.MustParse(kubeProxyMemoryLimit)
+	return strconv.FormatInt(limit.Value()*kubeProxyGoMemLimitPercent/100, 10)
+}
 
 func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-kube-proxy"
@@ -219,6 +234,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_TLS_KEY_FILE", Value: kubeProxyTLSMountPath + "/tls.key"},
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
+		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
 		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedCallers},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},

@@ -467,6 +467,14 @@ SOURCES: dict[str, Source] = {
     # file also holds one half of a contract neither module can import: the
     # operator renders an env var naming the agent's principal, and the `a2a`
     # CLI reads it back to pin its inbox prefix.
+    # The AgentProfile dispatcher's identity is built in its own file. It
+    # authenticates through the callout, so it is in no served config, and
+    # its publish list is appended to a per-profile slice that the identity
+    # reader above can't parse; the writer tests read its body directly.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
+    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -170,13 +171,24 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 // per warm pool, and the unattended tier's Job pods, which the dispatcher
 // holds to the ceiling. Interactive tasks run in the warm workers, so they
 // add no pods. Like the session quota, the key is `pods`, which counts
-// non-terminal pods only. It is the only key for now; requests.cpu and
+// non-terminal pods only, and a pod in its deletion grace period is not yet
+// terminal. Where Job mode can run (the chart's Job policy signal and a
+// profile allowing the unattended tier), a task's slot is free once its Job
+// is deleted, so the next Job's pod can start while the last one's still
+// terminates: a second ceiling's worth covers one terminating Job pod per
+// slot. It is the only key for now; requests.cpu and
 // requests.memory join the map once the sizing budget gives them values,
 // and adding one is a line here.
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
 	pools := interactiveProfileTiers(profiles)
+	jobs := resolveProfileCeiling(agent)
+	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
+		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
+	}) {
+		jobs *= 2
+	}
 	return map[corev1.ResourceName]int64{
-		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + resolveProfileCeiling(agent)),
+		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + jobs),
 	}
 }
 
@@ -206,11 +218,12 @@ func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
 // ingress, and egress to DNS, the bus, LiteLLM and the credential broker's
-// credentialed port only. The broker is where a worker's gcloud runs (#3889);
-// it admits the profile namespace, and confines each call to the task's
-// cluster, once a profile identity exists (credential_proxy_profiles.go).
-// The egress is unconditional: a namespace that exists only for profiles needs
-// no second gate, and TokenReview refuses any pod the identity map doesn't name.
+// credentialed port only. The broker is where a worker's kubectl and gcloud
+// run (#3889); its side admits the profile namespace, and confines each call
+// to the task's cluster, once a profile identity exists
+// (credential_proxy_profiles.go). The egress is unconditional: a namespace
+// that exists only for profiles needs no second gate, and the broker's
+// TokenReview refuses any pod the identity map doesn't name.
 func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -251,13 +264,21 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 				},
 				{
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-					To: []networkingv1.NetworkPolicyPeer{
-						namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
-					},
+					To:    profileBrokerPeers(agent),
 				},
 			},
 		},
 	}
+}
+
+// profileBrokerPeers is the broker in the agent's namespace, and the exec
+// tier while it renders: /v1/exec admits the profile role on both.
+func profileBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+	}
+	return peers
 }
 
 // profileNamespacePeer admits every pod in the profile namespace, for the

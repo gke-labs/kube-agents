@@ -25,7 +25,7 @@ CLUSTER_CREATION_SKILL = REPO_ROOT / "agents/platform/skills/gke-cluster-creatio
 TERRAFORM_SKILL = REPO_ROOT / "agents/platform/skills/gcp-terraform/SKILL.md"
 MIN_FILE_CHARS = 1000
 
-# §3 item 7, from its lead to the end of its line (it is the section's last item).
+# §3 item 7, from its lead to the end of its line (item 8 follows on the next line).
 ITEM_LEAD = "**A new cluster is a pull request in the repository's own format.**"
 NEXT_ITEM = "\n"
 SOUL_ROUTE = "Terraform HCL: write the `google_container_cluster` and its node pools with `gcp-terraform`"

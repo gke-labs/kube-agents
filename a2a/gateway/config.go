@@ -35,6 +35,11 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultScopeFile is where the operator projects the install's rendered
+// spec.scope into the gateway pod: the same scope.json, at the same path, the
+// platform agent reads.
+const defaultScopeFile = "/etc/kube-agents/scope.json"
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -534,12 +539,15 @@ type Config struct {
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
 	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
-	// New refuses the view without it.
-	SessionClusterView   bool
-	CredentialProxyURL   string
-	KubeProxyURL         string
-	KubeProxyCAConfigMap string
-	KubeProxyHostContext string
+	// New refuses the view without it. CredentialProxyExecURL is the
+	// broker's exec tier, empty while the operator renders none; the shim
+	// sends its commands there and falls back to CredentialProxyURL.
+	SessionClusterView     bool
+	CredentialProxyURL     string
+	CredentialProxyExecURL string
+	KubeProxyURL           string
+	KubeProxyCAConfigMap   string
+	KubeProxyHostContext   string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -611,6 +619,19 @@ type Config struct {
 	// it: 0 would be "delegation off", which is a different switch
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
+
+	// ScopeFile is the rendered spec.scope a profile task's target is
+	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
+	// routed task, so an edit reaches the gateway without a restart. A
+	// missing or unreadable file refuses every target.
+	ScopeFile string
+
+	// ManagementProject is the install's own project
+	// (A2A_MANAGEMENT_PROJECT, spec.harness.projectId). checkTargetScope
+	// admits it whatever the scope lists, and ignores an exclude.projects
+	// entry that matches it, as the reconcile does. Empty admits nothing
+	// extra.
+	ManagementProject string
 
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
@@ -696,16 +717,19 @@ func FromEnv() (*Config, error) {
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
-		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
-		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
-		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
-		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
-		KubeProxyURL:          os.Getenv("A2A_KUBE_PROXY_URL"),
-		KubeProxyCAConfigMap:  os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
-		KubeProxyHostContext:  os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
-		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
-		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		CapabilityOptional:    capability.OptionalFromEnv(),
+		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
+		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
+		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
+		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
+		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:     capability.OptionalFromEnv(),
+		ScopeFile:              envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:      os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)

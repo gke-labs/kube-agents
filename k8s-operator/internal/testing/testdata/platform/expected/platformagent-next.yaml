@@ -781,6 +781,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -3498,7 +3500,8 @@ stringData:
           # So no STREAM.DELETE, PURGE,
           # UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here
           # used to destroy every task's history and the five consumers on it -
-          # no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the
+          # no CONSUMER.DELETE on TASKS, nothing on DIRECTORY but its subject list
+          # and a direct get on the card subjects, and nothing at all on the
           # topic streams or the runtime-state, cap and PROFILE_LEASES buckets.
           {
             user: gateway
@@ -3508,6 +3511,8 @@ stringData:
                 allow = [
                   "a2a.tasks.*.*.in",
                   "a2a.tasks.*.*.supervisor",
+                  "a2a.submit.*.*.*.*",
+                  "a2a.stop.*.*",
                   "$KV.session-state.>",
                   "$KV.feedback.>",
                   "$KV.people.>",
@@ -3531,6 +3536,8 @@ stringData:
                   "$JS.API.DIRECT.GET.KV_people.>",
                   "$JS.API.CONSUMER.CREATE.KV_people.>",
                   "$JS.API.CONSUMER.DELETE.KV_people.*",
+                  "$JS.API.STREAM.INFO.DIRECTORY",
+                  "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
                   "$JS.ACK.TASKS.>",
                   "$JS.FC.>",
                   "_INBOX.gateway.>"
@@ -5477,6 +5484,10 @@ spec:
               value: platformagent-a2a-gateway
             - name: A2A_SESSION_SERVICE_ACCOUNT
               value: platformagent-a2a-session
+            - name: A2A_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: A2A_MANAGEMENT_PROJECT
+              value: example-project
             - name: A2A_PRINCIPAL_MAP
               value: /etc/a2a/principal-map
             - name: A2A_GCHAT_RELAY_URL
@@ -5527,6 +5538,9 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+            - mountPath: /etc/kube-agents
+              name: a2a-gateway-scope
+              readOnly: true
             - mountPath: /var/run/secrets/a2a-chat-relay
               name: a2a-chat-relay-token
               readOnly: true
@@ -5554,6 +5568,14 @@ spec:
         - configMap:
             name: platformagent-a2a-nats-ca-bundle
           name: a2a-nats-ca
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: a2a-gateway-scope
         - name: a2a-chat-relay-token
           projected:
             defaultMode: 256

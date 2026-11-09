@@ -104,6 +104,10 @@ RUN apt-get update \
          '    fi' \
          '    ;;' \
          '  esac' \
+         '  exec /usr/local/libexec/kubectl "$@"' \
+         'fi' \
+         'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then' \
+         '  exec /opt/credential-proxy/libexec/credential-proxy-exec kubectl "$@"' \
          'fi' \
          'exec /usr/local/libexec/kubectl "$@"' \
          >/usr/local/bin/kubectl \

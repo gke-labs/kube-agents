@@ -89,7 +89,10 @@ class CiDeployImageBuildTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, describe_sequence, cap_seconds=2, region_args="", max_errors=20):
+    # A test that reaches a terminal status never waits on the cap, so the
+    # default only has to outlast a slow runner: at 2 s, a loaded runner hit it
+    # after two ERR polls and failed "ERR ERR SUCCESS". The cap test passes 1.
+    def _run(self, describe_sequence, cap_seconds=60, region_args="", max_errors=20):
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -112,7 +115,8 @@ class CiDeployImageBuildTest(unittest.TestCase):
             "GCLOUD_CALLS": str(self.calls),
             "GCLOUD_DESCRIBE_SEQUENCE": describe_sequence,
             # The real values are 4200 s, 15 s and 60 s; the tests shrink the
-            # cap and the poll so a never-terminal build ends in seconds.
+            # poll to zero, and the cap test shrinks the cap, so a
+            # never-terminal build ends in seconds.
             "CI_BUILD_WAIT_CAP_SECONDS": str(cap_seconds),
             "CI_BUILD_POLL_INTERVAL_SECONDS": "0",
             "CI_BUILD_CALL_TIMEOUT_SECONDS": "5",

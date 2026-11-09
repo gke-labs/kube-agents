@@ -312,21 +312,17 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # the same -- are most of what a wide-scope install's container holds. So a
 # request that runs commands also reserves this much for its children when it
 # is admitted, and the sum of reservations has to fit what is left of the
-# limit after the broker's own resident set and the content workspace's one
-# process tree at a time. One size for every route, because every route can
-# end up running the heavy case (§2.1). The operator's sizing test declares
-# the same four figures under matching names (credential_proxy_manifests.go)
-# and asserts the arithmetic against the rendered limit; change them together.
+# limit after the broker's own resident set. One size for every route, because
+# every route can end up running the heavy case (§2.1). The operator's sizing
+# test declares the same three figures under matching names
+# (credential_proxy_manifests.go) and asserts the arithmetic against the
+# rendered limit; change them together.
 # They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
 # tests/test_credential_proxy_sizing_parity.py.
 MEBIBYTE = 1024 * 1024
 REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
 # The broker process and Envoy: 168 MiB measured, with margin.
 BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
-# The content workspace store serves one verb at a time under its own lock, so
-# at most one of its process trees exists at any moment; that is a fixed term
-# rather than a reservation per verb, and it is one request's worth.
-CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
 # What the broker itself holds per admitted request, as a multiple of the
 # output cap: the two capped stream buffers, their decoded text, the JSON body
 # and its encoding. Charged for the slots in use, not for the cap.
@@ -344,12 +340,12 @@ OUTPUT_COPIES_PER_COMMAND = 6
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
 # (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
-# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# deployed cap): 544 MiB. Declared as a literal so that the copies elsewhere can
 # be compared with it as text. test_credential_proxy.py holds it to the
 # function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
 # the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
 # kube-agents.credentialProxyMemoryFloorBytes.
-CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 570425344
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -2158,8 +2154,8 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
-# An AgentProfile worker pod (#3889). Exec route only, gcloud only (kubectl
-# routes through <agent>-kube-proxy), and every call held to the target
+# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
+# with the session's kubectl flag allowlist, and every call held to the target
 # cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
 # credential is mandatory for anything that reaches a cluster or a project: a
 # profile caller without a valid one runs local-only commands and nothing else.
@@ -2199,13 +2195,14 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the shell, session,
-# profile, and scope roles are narrowed to `gcloud` (all pods run stock
-# `kubectl` against `kube-proxy`, so `/v1/exec` never executes `kubectl`).
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the profile role keeps
+# the two CLIs that reach a cluster read-only under task-credential confinement,
+# while the shell, session, and scope roles are narrowed to `gcloud` (the
+# sandbox and session pods run stock `kubectl` against `<agent>-kube-proxy`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SHELL: frozenset({"gcloud"}),
     CALLER_ROLE_SESSION: frozenset({"gcloud"}),
-    CALLER_ROLE_PROFILE: frozenset({"gcloud"}),
+    CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
 }
 
@@ -3133,11 +3130,7 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
     """The smallest container limit at which the budget admits
     BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
     per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
-    return (
-        BROKER_RESIDENT_RESERVE_BYTES
-        + CONTENT_WORKSPACE_RESERVE_BYTES
-        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
-    )
+    return BROKER_RESIDENT_RESERVE_BYTES + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
 
 
 class CommandSlotUnavailable(RuntimeError):
@@ -8502,12 +8495,14 @@ def forge_registry() -> providers.Registry:
 
 # What `/v1/exec` runs for callers, enforced here because the client is
 # only a convenience: anything holding a caller token can post its own
-# argv. Neither `kubectl`, `git`, nor any forge CLI is on it: Kubernetes API
-# reads go through `<agent>-kube-proxy`, and a repository and a forge are
+# argv. `kubectl` stays on the route for AgentProfile workers (`CALLER_ROLE_PROFILE`),
+# while `ROLE_EXECUTABLES` narrows the sandbox, session, and scope roles to
+# `gcloud` alone (`kubectl` in the sandbox and session pods routes through
+# `<agent>-kube-proxy`). Neither `git` nor any forge CLI is on it: a repository and a forge are
 # reached through the verbs, which run them on the broker's own behalf. `git`
 # here would run under the broker's credential helper, and a read such as
 # `ls-remote` is no write for a lease to fence.
-EXEC_ROUTE_EXECUTABLES = ("gcloud",)
+EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
 
 
 def broker_executables() -> tuple[str, ...]:
@@ -8519,13 +8514,12 @@ def broker_executables() -> tuple[str, ...]:
     ask to have run on its behalf. They used to be the same four names, which
     read as one decision and was two.
 
-    `gcloud` is on `/v1/exec`: the agent names it and this process runs it
-    (while `kubectl` in the sandbox, session pods, and profile workers routes
+    `gcloud` and `kubectl` are on `/v1/exec` (`ROLE_EXECUTABLES` narrows `kubectl`
+    to `CALLER_ROLE_PROFILE`, while the sandbox and session pods route `kubectl`
     through `<agent>-kube-proxy`). `git` and any forge CLI are here for the
     broker's own use -- it issues them on its own behalf for the verbs.
-    `/v1/exec` refuses `kubectl`, `git`, and any forge CLI
-    (`EXEC_ROUTE_EXECUTABLES`), so a caller that composes its own `/v1/exec`
-    request reaches only `gcloud`. What this list
+    `/v1/exec` refuses both (`EXEC_ROUTE_EXECUTABLES`), so a caller that composes
+    its own request reaches neither. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary
@@ -8970,9 +8964,7 @@ class CommandExecutor:
         self.memory_limit_bytes = memory_limit_bytes
         self.children_budget_bytes: int | None = None
         if memory_limit_bytes is not None:
-            self.children_budget_bytes = (
-                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
-            )
+            self.children_budget_bytes = memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES
         # Bytes reserved by admitted requests right now; guarded by
         # `_slot_condition` like the slot count, because admission reads both.
         self._reserved_bytes = 0

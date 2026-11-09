@@ -193,6 +193,7 @@ func TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs(t *testing.T
 		{"buildA2ADispatcherConfigRoleBinding", buildA2ADispatcherConfigRoleBinding(agent).Subjects, dispatcher},
 		// In the profile namespace, naming the ServiceAccount in the agent's.
 		{"buildA2ADispatcherPodsRoleBinding", buildA2ADispatcherPodsRoleBinding(agent).Subjects, dispatcher},
+		{"buildA2ADispatcherJobsRoleBinding", buildA2ADispatcherJobsRoleBinding(agent).Subjects, dispatcher},
 	}
 
 	covered := map[string]bool{}

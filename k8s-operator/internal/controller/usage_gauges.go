@@ -76,11 +76,12 @@ const (
 	failedPhase  = "Failed"
 )
 
-// usagePhases is the closed vocabulary of status.phase the gauge carries: the
-// API's four phases and the controller's Degraded. A phase outside it leaves
-// every sample at 0; TestUsageGauges_PhasesAreConstantsTheVocabularyCarries
-// keeps the writers on these constants.
-var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degradedPhase, failedPhase}
+// usagePhases is the closed vocabulary of status.phase the gauge carries, the
+// API's list in its order: the four phases this controller writes, and the
+// Pending and Failed it never does. A phase outside it leaves every sample at
+// 0; TestUsageGauges_PhasesAreConstantsTheVocabularyCarries keeps the writers
+// on these constants.
+var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, pausedPhase, degradedPhase, failedPhase}
 
 type usageExportField struct {
 	name string
@@ -122,6 +123,7 @@ var usageExportFields = []usageExportField{
 	{name: "chatTurnsErroredTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatTurnsErroredTotal })},
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
+	{name: "positiveFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.PositiveFeedbackTotal })},
 	usageGaugeField(usageExportClustersRegistered, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersRegistered }),
 	usageGaugeField(usageExportClustersMonitored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersMonitored }),
 	usageGaugeField(usageExportRemediationsMerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsMergedTotal }),
@@ -178,7 +180,7 @@ func newUsageGauges(reg prometheus.Registerer) *usageGauges {
 	g := &usageGauges{
 		usage: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageGaugeName, Help: "A PlatformAgent's status.usage counters and cluster gauges, one sample per field, as the operator last wrote them."}, append(agentLabels, usageGaugeFieldLabel)),
 		times: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usageTimeGaugeName, Help: "A PlatformAgent's status.usage times, and its creation time, as unix seconds; a status time is absent while the status holds none."}, append(agentLabels, usageGaugeFieldLabel)),
-		phase: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usagePhaseGaugeName, Help: "A PlatformAgent's status.phase, one-hot over Pending, Provisioning, Ready, Degraded and Failed."}, append(agentLabels, usageGaugePhaseLabel)),
+		phase: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: usagePhaseGaugeName, Help: "A PlatformAgent's status.phase, one-hot over Pending, Provisioning, Ready, Paused, Degraded and Failed."}, append(agentLabels, usageGaugePhaseLabel)),
 	}
 	reg.MustRegister(g.usage, g.times, g.phase)
 	return g

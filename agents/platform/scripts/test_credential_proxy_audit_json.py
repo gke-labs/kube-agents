@@ -115,13 +115,6 @@ class _BrokerWithJsonLog(unittest.TestCase):
     """A real broker over TCP, logging through JsonLineFormatter into a buffer."""
 
     def setUp(self):
-        patcher = mock.patch.object(
-            credential_proxy,
-            "EXEC_ROUTE_EXECUTABLES",
-            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
         for attribute in (
             "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "metrics", "_request_slot",
         ):
@@ -617,13 +610,6 @@ class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
             return credential_proxy.ExecutionResult(exit_code=0, stdout="", stderr="", duration_ms=0, truncated=False, timed_out=False)
 
     def setUp(self):
-        patcher = mock.patch.object(
-            credential_proxy,
-            "EXEC_ROUTE_EXECUTABLES",
-            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
         previous = {name: CredentialProxyHandler.__dict__.get(name) for name in ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator")}
         for name, value in previous.items():
             self.addCleanup(setattr, CredentialProxyHandler, name, value)

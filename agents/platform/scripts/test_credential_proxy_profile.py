@@ -576,19 +576,6 @@ class ProfileRouteTest(unittest.TestCase):
     """The broker end to end: header in, binding, confinement, executor out."""
 
     def setUp(self):
-        exec_patcher = mock.patch.object(
-            credential_proxy,
-            "EXEC_ROUTE_EXECUTABLES",
-            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
-        )
-        exec_patcher.start()
-        self.addCleanup(exec_patcher.stop)
-        role_patcher = mock.patch.dict(
-            credential_proxy.ROLE_EXECUTABLES,
-            {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"})},
-        )
-        role_patcher.start()
-        self.addCleanup(role_patcher.stop)
         for attribute in (
             "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "profile_gate",
         ):
@@ -1001,19 +988,6 @@ print("context=" + context)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
-        exec_patcher = mock.patch.object(
-            credential_proxy,
-            "EXEC_ROUTE_EXECUTABLES",
-            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
-        )
-        exec_patcher.start()
-        self.addCleanup(exec_patcher.stop)
-        role_patcher = mock.patch.dict(
-            credential_proxy.ROLE_EXECUTABLES,
-            {credential_proxy.CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"})},
-        )
-        role_patcher.start()
-        self.addCleanup(role_patcher.stop)
         for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "profile_gate"):
             self.addCleanup(
                 ProfileRouteTest._restore, attribute, attribute in CredentialProxyHandler.__dict__,
@@ -1429,9 +1403,7 @@ class ProfileRouteTableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.TASK_CREDENTIAL_HEADER, credential_proxy_client.TASK_CREDENTIAL_HEADER)
 
     def test_kubectl_and_gcloud_only(self):
-        self.assertEqual(frozenset({"gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
-        self.assertEqual(("gcloud",), credential_proxy.EXEC_ROUTE_EXECUTABLES)
-        self.assertFalse(credential_proxy.executable_permitted(credential_proxy.CALLER_ROLE_PROFILE, "kubectl"))
+        self.assertEqual(frozenset({"kubectl", "gcloud"}), credential_proxy.ROLE_EXECUTABLES[credential_proxy.CALLER_ROLE_PROFILE])
 
 
 class ProfileAuthenticatorTest(unittest.TestCase):

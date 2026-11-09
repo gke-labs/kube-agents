@@ -45,6 +45,14 @@ type InboundMessage struct {
 	// to the configured backend, which is every chat backend's case.
 	Backend string
 
+	// Profile, when set, addresses this turn to an AgentProfile, with
+	// Parameters its task parameters (the target cluster's project, location
+	// and cluster for cluster work). Only the console sets it today, whose
+	// clients name an agent; every chat backend leaves it empty and its
+	// turns go to the conversation's route.
+	Profile    string
+	Parameters map[string]string
+
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
 	Intent string
@@ -509,6 +517,22 @@ type SessionLookup func(ctx context.Context, conversation string) (held bool, un
 // is never offered either.
 type SessionLookupSink interface {
 	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
+}
+
+// SenderAdmission reports whether the gateway would take a turn from author
+// on backend: the same gate verifySender applies, read ahead of the hand-over
+// by an adapter that has to decide on its own goroutine whether to post
+// anything in the sender's conversation before the gateway has seen them
+// (the Google Chat adapter's line on a quote it could not read). It decides
+// nothing about the turn: verifySender still rules on every message.
+type SenderAdmission func(backend, author string) bool
+
+// SenderAdmissionSink is the optional extension an Adapter implements to
+// receive the gateway's SenderAdmission. Wired in New the way
+// SessionLookupSink is; an adapter without it posts nothing ahead of the
+// gateway.
+type SenderAdmissionSink interface {
+	SetSenderAdmission(admits SenderAdmission)
 }
 
 // ConversationState is one read's answer: the record as it stands, plus the
