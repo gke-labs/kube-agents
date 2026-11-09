@@ -512,8 +512,9 @@ GEMINI_KEY_SERVICE_DISABLED = re.compile(
 )
 # The project a SERVICE_DISABLED refusal names, by number or id: gcloud's
 # message line and the ErrorInfo's consumer. A refusal that names another
-# project (the caller's quota project, such as kube-agents-prow, which has no
-# API Keys API) or none says nothing about the target, so it stays unread.
+# project (the caller's quota project, such as kube-agents-prow before its
+# API Keys API was enabled on 2026-11-06) or none says nothing about the
+# target, so it stays unread.
 GEMINI_KEY_DISABLED_IN = re.compile(
     r"API has not been used in project ([a-z0-9-]+) before or it is disabled|consumer: projects/([a-z0-9-]+)"
 )

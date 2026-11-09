@@ -45,6 +45,14 @@ type InboundMessage struct {
 	// to the configured backend, which is every chat backend's case.
 	Backend string
 
+	// Profile, when set, addresses this turn to an AgentProfile, with
+	// Parameters its task parameters (the target cluster's project, location
+	// and cluster for cluster work). Only the console sets it today, whose
+	// clients name an agent; every chat backend leaves it empty and its
+	// turns go to the conversation's route.
+	Profile    string
+	Parameters map[string]string
+
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
 	Intent string

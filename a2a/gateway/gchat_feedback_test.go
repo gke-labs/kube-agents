@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -392,7 +393,7 @@ func TestGchatRatingTapsTheGatewayCannotReadAreDropped(t *testing.T) {
 			ev := gchatRatingEvent(t, "up")
 			mutate(ev)
 			msg, reason := a.classify(ev)
-			if reason == "" || msg != (InboundMessage{}) {
+			if reason == "" || !reflect.DeepEqual(msg, InboundMessage{}) {
 				t.Errorf("classify = %+v %q, want a reason and no turn", msg, reason)
 			}
 			if got := recordedRatings(rec); len(got) != 0 {
@@ -408,7 +409,7 @@ func TestGchatRatingTapsTheGatewayCannotReadAreDropped(t *testing.T) {
 func TestGchatUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 	a, _, rec := newFeedbackGchatAdapter(t)
 	msg, reason := a.classify(gchatRatingEvent(t, "up"))
-	if msg != (InboundMessage{}) || reason == "" {
+	if !reflect.DeepEqual(msg, InboundMessage{}) || reason == "" {
 		t.Fatalf("classify = %+v %q, want no turn and a reason", msg, reason)
 	}
 	got := recordedRatings(rec)
@@ -1140,7 +1141,7 @@ func TestGchatFailedDownWritePostsNoCard(t *testing.T) {
 func TestGchatNoteJoinsTheRatingAndCollapsesTheCard(t *testing.T) {
 	a, f, rec := newFeedbackGchatAdapter(t)
 	msg, reason := a.classify(gchatNoteEvent(t, noteInputs(" the limit is 256Mi "), false))
-	if msg != (InboundMessage{}) || reason == "" {
+	if !reflect.DeepEqual(msg, InboundMessage{}) || reason == "" {
 		t.Fatalf("classify = %+v %q, want no turn", msg, reason)
 	}
 	want := "sender@example.com t-root  gchat:dm/spaces/_c2fixtureAA/threads/BOT1 the limit is 256Mi"

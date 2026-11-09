@@ -84,6 +84,12 @@ Two rules follow, and they are the whole rule:
   prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight
   from chat, do not pass it: `silent_ok` is then always `false`. Report the outcome and the ledger URL.
 
+A scheduled run that `precheck` closed, because the collector found the fleet as the last scheduled
+run left it, is decided by the same flag on the same line: `precheck` republishes that run's
+stored document through `finish --scheduled`, so `silent_ok` on its line is `finish`'s verdict on
+this run's manifest against the ledger, and the two rules above read it unchanged. `precheck:
+unchanged` on the line says the document was not drafted by hand; it does not say the run is silent.
+
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got

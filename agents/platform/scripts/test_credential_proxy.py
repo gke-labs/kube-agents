@@ -63,6 +63,12 @@ from slack_relay_patch import read_upload
 # padded for a loaded CI runner, and it is only ever waited out once.
 _RESET_SETTLE_SECONDS = 0.5
 
+# How often a test waiting for a server thread's work, such as the line a
+# handler writes as it returns, checks again. The wait ends at a deadline rather
+# than after a settle, since a loaded runner can stall that thread past any
+# fixed sleep.
+_POLL_SECONDS = 0.01
+
 # A request body that cannot sit entirely in the kernel's socket buffers, and so
 # is still being written when a handler that does not read it closes. Below that
 # threshold the write completes, the close is orderly, and the response arrives
@@ -15434,12 +15440,34 @@ class _CredentialedUnixServer(unittest.TestCase):
         )
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
+        self.addCleanup(self._join_handlers)
         self.addCleanup(self.server.shutdown)
         self.opened = []
         self.addCleanup(lambda: [sock.close() for sock in self.opened])
 
     def max_threads(self):
         return None
+
+    def _join_handlers(self):
+        """Wait for the server's handler threads; fail naming any still running.
+
+        server_close does not join daemon handlers, and one stalled past the
+        test would write its "thread cap released" line during a later test,
+        under the interval that test patched and into its capture. Runs after
+        the connections are closed and the accept loop has stopped. A running
+        handler's Thread still holds its target; Thread.run drops it on return.
+        """
+        handlers = [
+            thread for thread in threading.enumerate()
+            if getattr(thread, "_target", None) == self.server.process_request_thread
+        ]
+        deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+        for thread in handlers:
+            thread.join(max(0, deadline - time.monotonic()))
+        self.assertEqual(
+            [], [thread.name for thread in handlers if thread.is_alive()],
+            f"handler threads still running {_CLOSE_WAIT_SECONDS}s after their connections closed",
+        )
 
     @staticmethod
     def _restore(attribute, was_set, original):
@@ -15884,6 +15912,11 @@ class ThreadCapTest(_CredentialedUnixServer):
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
         return status, headers, body
 
+    def _wait_for_a_free_slot(self, slots):
+        """Block until a closed connection's thread has given one of ``slots`` back; fail at _CLOSE_WAIT_SECONDS."""
+        self.assertTrue(slots.acquire(timeout=_CLOSE_WAIT_SECONDS), f"no slot was given back within {_CLOSE_WAIT_SECONDS}s")
+        slots.release()
+
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
@@ -15912,12 +15945,18 @@ class ThreadCapTest(_CredentialedUnixServer):
             self.assertLess(time.monotonic() - started, _HEALTH_ANSWER_SECONDS)
 
         # A slot comes back when a holder goes; the episode is reported
-        # over only once an interval has passed with no refusal.
+        # over only once an interval has passed with no refusal. The closed
+        # holder's handler writes that line as it returns, so the test waits
+        # for the line, inside the shortened interval, rather than sleeping.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
-                time.sleep(_RESET_SETTLE_SECONDS)
+                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
+                while not any("thread cap released" in line for line in logs.output):
+                    if time.monotonic() > deadline:
+                        self.fail(f"the closed holder's handler did not report the release: {logs.output}")
+                    time.sleep(_POLL_SECONDS)
             released = [line for line in logs.output if "thread cap released" in line]
             self.assertEqual(1, len(released), logs.output)
             self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
@@ -15940,12 +15979,12 @@ class ThreadCapTest(_CredentialedUnixServer):
             # connection is served, inside the close wait, with every drain
             # still parked.
             holders[0].close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._cap_slots)
             served = self.connect()
             self.send(served, "GET", "/healthz")
             self.assertEqual(200, self.response(served)[0])
             served.close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._cap_slots)
             holders[0] = self.connect()  # the slot is held again
             time.sleep(_RESET_SETTLE_SECONDS)
             # Past THREAD_CAP_REFUSAL_THREADS parked drains, a refused
@@ -15958,7 +15997,7 @@ class ThreadCapTest(_CredentialedUnixServer):
             # A parked peer closing frees its refusal thread; the next refusal
             # is answered again.
             parked[0].close()
-            time.sleep(_RESET_SETTLE_SECONDS)
+            self._wait_for_a_free_slot(self.server._refusal_slots)
             self.assertEqual(503, self._refused()[0])
 
     def test_the_line_counts_the_refusals_closed_unanswered(self):
@@ -20834,6 +20873,500 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
         self.assertIsNotNone(CredentialProxyHandler.vcs)
         self.assertEqual("broker", CredentialProxyHandler.broker_role)
         metrics_listener.assert_called_once_with("127.0.0.1", 9466)
+
+
+class SessionToolBudgetTest(unittest.TestCase):
+    """The per-session ceiling and loop breaker (SessionToolBudget) on their own."""
+
+    LIST = credential_proxy.command_signature(["gcloud", "projects", "list"], None)
+    DELETE = credential_proxy.command_signature(["gcloud", "projects", "delete", "foo"], None)
+
+    def test_the_defaults_are_the_issues_and_the_1501st_call_is_refused(self):
+        self.assertEqual(1500, credential_proxy.DEFAULT_SESSION_MAX_TOOL_CALLS)
+        self.assertEqual(5, credential_proxy.DEFAULT_SESSION_MAX_IDENTICAL_FAILURES)
+        self.assertEqual(1024, credential_proxy.SESSION_TOOL_BUDGET_MAX_SESSIONS)
+        budget = credential_proxy.SessionToolBudget(max_calls=1500, max_identical_failures=5)
+        for _ in range(1500):
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+        refusal = budget.admit("run-a", self.LIST, ceiling=True)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", refusal.code)
+        self.assertEqual("session.tool-budget", refusal.rule)
+        self.assertEqual(
+            "BROKER_SESSION_BUDGET_EXCEEDED: session exceeded 1500 tool invocations; "
+            "summarize current findings and finish the turn.",
+            refusal.message,
+        )
+        # Another session is not the first's.
+        self.assertIsNone(budget.admit("run-b", self.LIST, ceiling=True))
+
+    def test_the_ceiling_is_off_for_a_role_without_it(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=2, max_identical_failures=5)
+        for _ in range(10):
+            self.assertIsNone(budget.admit("chat", self.LIST, ceiling=False))
+
+    def test_five_identical_failures_run_and_the_sixth_is_refused(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=5)
+        for status in (
+            credential_proxy.TOOL_STATUS_ERROR, credential_proxy.TOOL_STATUS_BLOCKED,
+            credential_proxy.TOOL_STATUS_ERROR, credential_proxy.TOOL_STATUS_BLOCKED,
+            credential_proxy.TOOL_STATUS_ERROR,
+        ):
+            self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+            budget.record("run-a", self.DELETE, status)
+        refusal = budget.admit("run-a", self.DELETE, ceiling=True)
+        self.assertEqual("BROKER_LOOP_BREAKER", refusal.code)
+        self.assertEqual("session.loop-breaker", refusal.rule)
+        self.assertEqual(
+            "BROKER_LOOP_BREAKER: identical command failed or was blocked 5 consecutive times in this "
+            "session; stop retrying this command and report the refusal/error.",
+            refusal.message,
+        )
+        self.assertEqual(5, budget.streak_of("run-a", self.DELETE))
+        # A different command in the same session, and the same command in
+        # another session, both run.
+        self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+        self.assertIsNone(budget.admit("run-b", self.DELETE, ceiling=True))
+
+    def test_the_context_is_part_of_the_signature(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        on_a = credential_proxy.command_signature(["kubectl", "get", "pods"], "gke_p_us-central1_a")
+        on_b = credential_proxy.command_signature(["kubectl", "get", "pods"], "gke_p_us-central1_b")
+        for _ in range(2):
+            budget.record("run-a", on_a, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertIsNotNone(budget.admit("run-a", on_a, ceiling=False))
+        self.assertIsNone(budget.admit("run-a", on_b, ceiling=False))
+
+    def test_a_success_clears_the_counts_and_a_different_failure_keeps_its_own(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=3)
+        for _ in range(2):
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_SUCCESS)
+        self.assertEqual(0, budget.streak_of("run-a", self.DELETE))
+        for _ in range(2):
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+        # A failure of another command is counted on its own and leaves the
+        # first command's run where it was: the third failure trips it.
+        budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertEqual(1, budget.streak_of("run-a", self.LIST))
+        self.assertEqual(2, budget.streak_of("run-a", self.DELETE))
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
+        self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+        # Any success of the session's clears every command's run.
+        budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_SUCCESS)
+        self.assertEqual((0, 0), (budget.streak_of("run-a", self.DELETE), budget.streak_of("run-a", self.LIST)))
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+
+    def test_two_alternating_failing_commands_each_trip_at_their_own_fifth_failure(self):
+        # `while true; do gcloud A; gcloud B; done` with both failing: neither
+        # command's failures reset the other's count, so the loop is refused
+        # both of them after five failures of each.
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=5)
+        for _ in range(5):
+            self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=False))
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=False))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-a", self.DELETE, ceiling=False).code)
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-a", self.LIST, ceiling=False).code)
+        budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_BLOCKED)
+        # The refusals themselves are recorded as blocked and keep both tripped.
+        self.assertEqual((6, 6), (budget.streak_of("run-a", self.DELETE), budget.streak_of("run-a", self.LIST)))
+        self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=False))
+
+    def test_the_breaker_keeps_a_sessions_last_eight_failing_commands(self):
+        # A session's entry stays bounded whatever it sends: past eight
+        # distinct failing commands the oldest-failed is forgotten, and its
+        # count starts again from one when it fails next.
+        self.assertEqual(8, credential_proxy.SESSION_LOOP_BREAKER_SIGNATURES)
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        others = [credential_proxy.command_signature(["gcloud", "projects", "describe", str(n)], None) for n in range(8)]
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        for signature in others:
+            budget.record("run-a", signature, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertEqual(8, len(budget._sessions["run-a"].failures))
+        self.assertEqual(0, budget.streak_of("run-a", self.DELETE))
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual(1, budget.streak_of("run-a", self.DELETE))
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=False))
+        # The most recent of the others is still counted: its second failure trips it.
+        budget.record("run-a", others[-1], credential_proxy.TOOL_STATUS_ERROR)
+        self.assertIsNotNone(budget.admit("run-a", others[-1], ceiling=False))
+        self.assertEqual(8, len(budget._sessions["run-a"].failures))
+
+    def test_the_signature_is_a_fixed_size_digest_whatever_the_argv_carried(self):
+        # The budget keeps the digest, never the argv: a body as large as the
+        # broker admits (1 MiB by default) costs an entry the same as a short
+        # one, so the LRU's cap bounds bytes and not only keys.
+        short = credential_proxy.command_signature(["gcloud", "projects", "list"], None)
+        huge = credential_proxy.command_signature(["gcloud", "projects", "list", "x" * (1 << 20)], None)
+        self.assertEqual(64, len(short))
+        self.assertEqual(len(short), len(huge))
+        self.assertNotEqual(short, huge)
+        self.assertEqual(short, credential_proxy.command_signature(["gcloud", "projects", "list"], None))
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        budget.record("run-a", huge, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual([huge], list(budget._sessions["run-a"].failures))
+        self.assertEqual(64, len(next(iter(budget._sessions["run-a"].failures))))
+        self.assertEqual(1, budget.streak_of("run-a", huge))
+
+    def test_busy_and_abandoned_say_nothing_about_the_command(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        for _ in range(2):
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_ERROR)
+        for status in (credential_proxy.TOOL_STATUS_BUSY, credential_proxy.TOOL_STATUS_ABANDONED):
+            budget.record("run-a", self.DELETE, status)
+            budget.record("run-a", self.LIST, status)
+        self.assertEqual(2, budget.streak_of("run-a", self.DELETE))
+        self.assertEqual(0, budget.streak_of("run-a", self.LIST))
+        self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
+
+    def test_a_busy_answer_gives_the_ceiling_its_unit_back_and_abandoned_keeps_it(self):
+        # The shim re-sends a busy request as the same invocation, up to its
+        # retry cap: five arrivals that all came back busy spend nothing.
+        budget = credential_proxy.SessionToolBudget(max_calls=3, max_identical_failures=0)
+        for _ in range(5):
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertEqual(0, budget._sessions["run-a"].total)
+        for _ in range(3):
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_SUCCESS)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-a", self.LIST, ceiling=True).code)
+        # Abandoned is charged: the shim never re-sends after a dropped connection.
+        budget = credential_proxy.SessionToolBudget(max_calls=2, max_identical_failures=0)
+        for _ in range(2):
+            self.assertIsNone(budget.admit("run-b", self.LIST, ceiling=True))
+            budget.record("run-b", self.LIST, credential_proxy.TOOL_STATUS_ABANDONED)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-b", self.LIST, ceiling=True).code)
+        # A refund for a session the LRU has dropped creates no entry and no
+        # negative count.
+        budget.record("run-gone", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertNotIn("run-gone", budget._sessions)
+        budget._sessions["run-b"].total = 0
+        budget.record("run-b", self.LIST, credential_proxy.TOOL_STATUS_BUSY)
+        self.assertEqual(0, budget._sessions["run-b"].total)
+
+    def test_zero_disables_each(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=0)
+        for _ in range(20):
+            self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        budget = credential_proxy.SessionToolBudget(max_calls=3, max_identical_failures=0)
+        for _ in range(3):
+            self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-a", self.DELETE, ceiling=True).code)
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=1)
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-a", self.DELETE, ceiling=True).code)
+
+    def test_the_oldest_session_is_evicted_past_the_cap(self):
+        budget = credential_proxy.SessionToolBudget(max_calls=1, max_identical_failures=1, max_sessions=1024)
+        for index in range(1024):
+            self.assertIsNone(budget.admit(f"run-{index}", self.DELETE, ceiling=True))
+            budget.record(f"run-{index}", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual(1024, len(budget))
+        # Touching run-0 makes run-1 the oldest; the 1025th key evicts it.
+        self.assertIsNotNone(budget.admit("run-0", self.DELETE, ceiling=True))
+        self.assertIsNone(budget.admit("run-1024", self.DELETE, ceiling=True))
+        self.assertEqual(1024, len(budget))
+        # run-1 starts fresh: its ceiling count and its streak are gone. Its
+        # return is a new key, which evicts run-2 in turn.
+        self.assertIsNone(budget.admit("run-1", self.DELETE, ceiling=True))
+        self.assertEqual(1024, len(budget))
+        # run-3 was kept, with both counts.
+        self.assertEqual("BROKER_SESSION_BUDGET_EXCEEDED", budget.admit("run-3", self.DELETE, ceiling=True).code)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-3", self.DELETE, ceiling=False).code)
+        self.assertEqual(1024, len(budget))
+
+    def test_the_env_reader_admits_zero_as_off(self):
+        # The slot limits' reader with minimum=0: 0 is a value here.
+        read = credential_proxy.session_slot_limit_from_env
+        name = credential_proxy.ENV_SESSION_MAX_TOOL_CALLS
+        with mock.patch.dict(os.environ, {name: ""}):
+            self.assertEqual(1500, read(name, 1500, minimum=0))
+        with mock.patch.dict(os.environ, {name: "0"}):
+            self.assertEqual(0, read(name, 1500, minimum=0))
+        with mock.patch.dict(os.environ, {name: " 7 "}):
+            self.assertEqual(7, read(name, 1500, minimum=0))
+        for raw in ("-1", "many", "1.5"):
+            with mock.patch.dict(os.environ, {name: raw}), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                self.assertEqual(1500, read(name, 1500, minimum=0))
+            self.assertIn("at least 0", logs.output[0])
+        # And the slot limits still refuse 0, in the phrase the thread-cap tests read.
+        with mock.patch.dict(os.environ, {name: "0"}), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            self.assertEqual(2, read(name, 2))
+        self.assertIn("not a positive integer", logs.output[0])
+        self.assertNotIn("at least", logs.output[0])
+        self.assertEqual("BROKER_SESSION_MAX_TOOL_CALLS", name)
+        self.assertEqual("BROKER_SESSION_MAX_IDENTICAL_FAILURES", credential_proxy.ENV_SESSION_MAX_IDENTICAL_FAILURES)
+
+    def test_the_ceiling_roles_are_the_background_running_ones(self):
+        self.assertEqual(
+            frozenset({credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE}),
+            credential_proxy.SESSION_BUDGET_CEILING_ROLES,
+        )
+        # A chat session is a conversation, and the scope publisher is a script
+        # whose Job sets no key: neither is the ceiling's.
+        self.assertNotIn(credential_proxy.CALLER_ROLE_SESSION, credential_proxy.SESSION_BUDGET_CEILING_ROLES)
+        self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, credential_proxy.SESSION_BUDGET_CEILING_ROLES)
+
+
+class SessionToolBudgetRouteTest(unittest.TestCase):
+    """The exec route's session gates: keyed on the body's sessionId, refused
+    as `blocked` with their own codes, and fed every terminal outcome once."""
+
+    LIST = ["gcloud", "projects", "list"]
+    DESCRIBE = ["gcloud", "projects", "describe", "foo"]
+    # The read-only gate refuses this one, so it is the `blocked` outcome.
+    DELETE = ["gcloud", "projects", "delete", "foo", "--quiet"]
+
+    class _Executor:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self):
+            self.calls = []
+            self.exit_codes = {}
+            # An exception the next execute raises instead of running: the
+            # queue's 503 or the watermark gate's 429, as the real executor
+            # raises them from inside the call.
+            self.busy = None
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False, caller=None):
+            self.calls.append(list(argv))
+            if self.busy is not None:
+                raise self.busy
+            return credential_proxy.ExecutionResult(
+                exit_code=self.exit_codes.get(tuple(argv), 0), stdout="", stderr="",
+                duration_ms=0, truncated=False, timed_out=False,
+            )
+
+    def setUp(self):
+        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "metrics"):
+            self.addCleanup(
+                self._restore, attribute,
+                attribute in CredentialProxyHandler.__dict__, CredentialProxyHandler.__dict__.get(attribute),
+            )
+        self.executor = self._Executor()
+        CredentialProxyHandler.executor = self.executor
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+        CredentialProxyHandler.metrics = credential_proxy.ProxyMetrics()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.endpoint = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    @staticmethod
+    def _restore(attribute, was_set, original):
+        if was_set:
+            setattr(CredentialProxyHandler, attribute, original)
+        elif attribute in CredentialProxyHandler.__dict__:
+            delattr(CredentialProxyHandler, attribute)
+
+    def _budget(self, max_calls, max_identical_failures):
+        budget = credential_proxy.SessionToolBudget(max_calls=max_calls, max_identical_failures=max_identical_failures)
+        patcher = mock.patch.object(credential_proxy, "_SESSION_TOOL_BUDGET", budget)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return budget
+
+    def _post(self, argv, session_id="run-a", role=credential_proxy.CALLER_ROLE_SHELL, **extra):
+        payload = {"requestId": "r", "argv": argv, **extra}
+        if session_id is not None:
+            payload["sessionId"] = session_id
+        principal = credential_proxy.Principal(workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role)
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec", data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with mock.patch.object(CredentialProxyHandler, "_authenticated", return_value=principal):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def _blocked_count(self, argv):
+        tool, subcommand = credential_proxy._tool_labels(argv)
+        return CredentialProxyHandler.metrics._tool_invocations.get((tool, subcommand, "blocked"), 0)
+
+    def test_five_identical_failures_run_and_the_sixth_is_short_circuited(self):
+        self._budget(max_calls=0, max_identical_failures=5)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        for _ in range(5):
+            status, body = self._post(self.LIST)
+            self.assertEqual((200, "completed", 1), (status, body["status"], body["exitCode"]))
+        self.assertEqual(0, self._blocked_count(self.LIST))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, body = self._post(self.LIST)
+        self.assertEqual(403, status)
+        self.assertEqual(
+            {"status": "blocked", "code": "BROKER_LOOP_BREAKER", "rule": "session.loop-breaker"},
+            {key: body[key] for key in ("status", "code", "rule")},
+        )
+        self.assertTrue(body["message"].startswith("BROKER_LOOP_BREAKER: identical command failed or was blocked 5 "))
+        self.assertEqual(5, len(self.executor.calls), "the sixth call must not reach the executor")
+        self.assertEqual(1, self._blocked_count(self.LIST))
+        self.assertTrue(any("loop broken" in line and "session=run-a" in line and "streak=5" in line for line in logs.output), logs.output)
+        self.assertEqual(credential_proxy.RULE_SESSION_LOOP_BREAKER, logs.records[0].audit["rule"])
+        self.assertEqual("blocked", logs.records[0].audit["status"])
+
+    def test_five_policy_blocks_trip_it_and_a_different_command_still_runs(self):
+        self._budget(max_calls=0, max_identical_failures=5)
+        for _ in range(5):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self._post(self.DELETE)
+            self.assertEqual((403, "SECURITY_POLICY_BLOCKED"), (status, body["code"]))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self._post(self.DELETE)
+        self.assertEqual((403, "BROKER_LOOP_BREAKER"), (status, body["code"]))
+        self.assertEqual(6, self._blocked_count(self.DELETE))
+        self.assertEqual((200, 0), self._post(self.DESCRIBE)[0:1] + (self._post(self.LIST)[1]["exitCode"],))
+        self.assertEqual([self.DESCRIBE, self.LIST], self.executor.calls)
+        # The same command from another session is that session's first.
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertEqual("SECURITY_POLICY_BLOCKED", self._post(self.DELETE, session_id="run-b")[1]["code"])
+
+    def test_two_alternating_failing_commands_are_each_short_circuited(self):
+        # The stuck-run shape the single streak let through: try X, try Y,
+        # try X, with both failing. Each is refused at its own sixth call.
+        self._budget(max_calls=0, max_identical_failures=5)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        self.executor.exit_codes[tuple(self.DESCRIBE)] = 1
+        for _ in range(5):
+            for argv in (self.LIST, self.DESCRIBE):
+                status, body = self._post(argv)
+                self.assertEqual((200, 1), (status, body["exitCode"]))
+        self.assertEqual(10, len(self.executor.calls))
+        for argv in (self.LIST, self.DESCRIBE):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, body = self._post(argv)
+            self.assertEqual((403, "BROKER_LOOP_BREAKER"), (status, body["code"]))
+            self.assertTrue(any("loop broken" in line and "streak=5" in line for line in logs.output), logs.output)
+        self.assertEqual(10, len(self.executor.calls), "neither sixth call may reach the executor")
+
+    def test_a_success_clears_the_streak(self):
+        self._budget(max_calls=0, max_identical_failures=5)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        for _ in range(4):
+            self._post(self.LIST)
+        self.executor.exit_codes[tuple(self.LIST)] = 0
+        self.assertEqual(0, self._post(self.LIST)[1]["exitCode"])
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        for _ in range(5):
+            self.assertEqual(200, self._post(self.LIST)[0])
+        self.assertEqual(10, len(self.executor.calls))
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertEqual("BROKER_LOOP_BREAKER", self._post(self.LIST)[1]["code"])
+
+    def test_the_ceiling_holds_the_shell_and_not_a_chat_session(self):
+        self._budget(max_calls=3, max_identical_failures=5)
+        for _ in range(3):
+            self.assertEqual(200, self._post(self.LIST)[0])
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, body = self._post(self.DESCRIBE)
+        self.assertEqual(403, status)
+        self.assertEqual(
+            {"status": "blocked", "code": "BROKER_SESSION_BUDGET_EXCEEDED", "rule": "session.tool-budget"},
+            {key: body[key] for key in ("status", "code", "rule")},
+        )
+        self.assertEqual(
+            "BROKER_SESSION_BUDGET_EXCEEDED: session exceeded 3 tool invocations; "
+            "summarize current findings and finish the turn.",
+            body["message"],
+        )
+        self.assertEqual(1, self._blocked_count(self.DESCRIBE))
+        self.assertTrue(any("ceiling reached" in line and "role=shell" in line for line in logs.output), logs.output)
+        self.assertEqual(credential_proxy.RULE_SESSION_TOOL_BUDGET, logs.records[0].audit["rule"])
+        # A second session starts fresh; a chat session is never held.
+        self.assertEqual(200, self._post(self.LIST, session_id="run-b")[0])
+        for _ in range(5):
+            self.assertEqual(200, self._post(self.LIST, session_id="chat-1", role=credential_proxy.CALLER_ROLE_SESSION)[0])
+        self.assertEqual(9, len(self.executor.calls))
+        # Nor is a scope caller that did send a key: whatever the scope policy
+        # then says of the command, the ceiling is not what refuses it.
+        for _ in range(5):
+            status, body = self._post(self.LIST, session_id="scope-1", role=credential_proxy.CALLER_ROLE_SCOPE)
+            self.assertNotEqual("BROKER_SESSION_BUDGET_EXCEEDED", body.get("code"), (status, body))
+
+    def test_the_loop_breaker_holds_a_chat_session_too(self):
+        self._budget(max_calls=3, max_identical_failures=2)
+        self.executor.exit_codes[tuple(self.LIST)] = 2
+        for _ in range(2):
+            self.assertEqual(200, self._post(self.LIST, session_id="chat-1", role=credential_proxy.CALLER_ROLE_SESSION)[0])
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, body = self._post(self.LIST, session_id="chat-1", role=credential_proxy.CALLER_ROLE_SESSION)
+        self.assertEqual((403, "BROKER_LOOP_BREAKER"), (status, body["code"]))
+
+    def test_a_busy_answer_is_not_charged_to_the_ceiling(self):
+        # A loaded broker answers 503 (the queue) or 429 (the watermark gate)
+        # and the shim re-sends the same body up to four more times; none of
+        # those arrivals is an invocation the ceiling counts.
+        self._budget(max_calls=2, max_identical_failures=0)
+        self.executor.busy = credential_proxy.CommandSlotUnavailable(
+            "no slot", bound=credential_proxy.ADMISSION_BOUND_SLOT, klass=credential_proxy.CLASS_BACKGROUND,
+        )
+        for _ in range(3):
+            status, body = self._post(self.LIST)
+            self.assertEqual((503, "busy"), (status, body["status"]), body)
+        self.executor.busy = credential_proxy.ResourcePressure("memory at 93%", 7, credential_proxy.CLASS_BACKGROUND)
+        for _ in range(3):
+            status, body = self._post(self.LIST)
+            self.assertEqual((429, "busy"), (status, body["status"]), body)
+        self.executor.busy = None
+        # Six busy arrivals later the run still has its two invocations.
+        self.assertEqual(200, self._post(self.LIST)[0])
+        self.assertEqual(200, self._post(self.DESCRIBE)[0])
+        status, body = self._post(self.LIST)
+        self.assertEqual((403, "BROKER_SESSION_BUDGET_EXCEEDED"), (status, body["code"]), body)
+        self.assertEqual(8, len(self.executor.calls), "six busy arrivals and two runs reached the executor")
+        self.assertEqual(1, self._blocked_count(self.LIST), "only the ceiling's refusal is `blocked`")
+
+    def test_a_request_without_a_session_id_is_never_counted(self):
+        self._budget(max_calls=1, max_identical_failures=1)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        for session_id in (None, None, None, "", ""):
+            status, body = self._post(self.LIST, session_id=session_id)
+            self.assertEqual((200, 1), (status, body["exitCode"]))
+        self.assertEqual(5, len(self.executor.calls))
+
+    def test_zero_disables_each_on_the_route(self):
+        self._budget(max_calls=0, max_identical_failures=0)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        for _ in range(12):
+            self.assertEqual(200, self._post(self.LIST)[0])
+        self.assertEqual(12, len(self.executor.calls))
+
+    def test_a_malformed_session_id_is_a_400(self):
+        self._budget(max_calls=0, max_identical_failures=5)
+        for bad in ("run a", "x" * 65, 7, ["run-a"], {"id": "run-a"}, "run/a"):
+            with self.subTest(session_id=bad):
+                status, body = self._post(self.LIST, session_id=bad)
+                self.assertEqual(400, status)
+                self.assertIn("sessionId", body["error"])
+        self.assertEqual([], self.executor.calls)
+        # The grammar is the shim's.
+        self.assertEqual(credential_proxy.SESSION_ID_RE.pattern, credential_proxy_client.CALLER_LABEL_RE.pattern)
+        self.assertEqual(credential_proxy.SESSION_ID_FIELD, credential_proxy_client.SESSION_ID_FIELD)
+
+    def test_the_shim_and_the_broker_agree_on_the_codes(self):
+        self.assertEqual(credential_proxy.SESSION_BUDGET_EXCEEDED_CODE, credential_proxy_client.SESSION_BUDGET_EXCEEDED_CODE)
+        self.assertEqual(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.LOOP_BREAKER_CODE)
+        self.assertIn(credential_proxy.SESSION_BUDGET_EXCEEDED_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
+        self.assertIn(credential_proxy.LOOP_BREAKER_CODE, credential_proxy_client.POLICY_BLOCKED_CODES)
 
 
 if __name__ == "__main__":

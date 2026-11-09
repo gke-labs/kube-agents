@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -218,5 +221,101 @@ func TestReadinessNamesABusOutage(t *testing.T) {
 	}
 	if ready, why := g.Readiness(); ready || !strings.Contains(why, "waiting for the bus") {
 		t.Fatalf("Readiness with the bus down = %v %q, want the bus named", ready, why)
+	}
+}
+
+// TestATermStartWaitsForTheSessionStateBucket: an elected gateway that wins
+// the lease before the provision Job has created session-state waits for
+// the bucket, reporting the wait through Readiness, rather than ending the
+// term before it starts.
+func TestATermStartWaitsForTheSessionStateBucket(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	js := r.bus.JetStream()
+	if err := js.DeleteKeyValue(ctx, lib.SessionStateBucket); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		term uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		term, err := r.g.BeginTerm(ctx)
+		done <- result{term, err}
+	}()
+	waitFor(t, "the term wait in Readiness", func() bool {
+		_, why := r.g.Readiness()
+		return strings.Contains(why, "waiting for bucket "+lib.SessionStateBucket)
+	})
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.term != 1 {
+			t.Fatalf("BeginTerm = %d, %v, want term 1", got.term, got.err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("BeginTerm didn't return once the bucket existed")
+	}
+	if _, why := r.g.Readiness(); strings.Contains(why, "waiting for bucket") {
+		t.Fatalf("Readiness still names the term wait: %q", why)
+	}
+}
+
+// TestATermStartWaitsOutAJetStreamOutage: with the connection up but
+// JetStream not answering (no responders, an API timeout, the meta leader
+// moving), a term start waits; any other error still ends it.
+func TestATermStartWaitsOutAJetStreamOutage(t *testing.T) {
+	g := &Gateway{}
+	for name, err := range map[string]error{
+		"no responders":           fmt.Errorf("stream info: %w", nats.ErrNoResponders),
+		"an api timeout":          fmt.Errorf("stream info: %w", context.DeadlineExceeded),
+		"a request timeout":       nats.ErrTimeout,
+		"meta leader moving":      &jetstream.APIError{Code: 503, ErrorCode: jetstreamTemporarilyUnavailable, Description: "JetStream system temporarily unavailable"},
+		"the bucket not there":    jetstream.ErrBucketNotFound,
+		"jetstream not available": jetstream.ErrJetStreamNotEnabled,
+	} {
+		if !g.termCanWait(err) {
+			t.Errorf("%s: a term start gave up on %v", name, err)
+		}
+	}
+	for name, err := range map[string]error{
+		"a wrong-type marker": errors.New("term marker: not a number"),
+		"another api error":   &jetstream.APIError{Code: 400, ErrorCode: 10052, Description: "invalid request"},
+	} {
+		if g.termCanWait(err) {
+			t.Errorf("%s: a term start waited on %v", name, err)
+		}
+	}
+}
+
+// TestATermStartGivesUpOnItsOwnBus: a term start that can't reach the bus
+// waits, naming the bus in Readiness, but only so long: a fault local to
+// this pod would otherwise hold the Lease while a standby with a working bus
+// stands idle.
+func TestATermStartGivesUpOnItsOwnBus(t *testing.T) {
+	old := termWaitBusMax
+	termWaitBusMax = 3 * time.Second
+	t.Cleanup(func() { termWaitBusMax = old })
+	r := startRig(t)
+	r.client.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.g.BeginTerm(context.Background())
+		done <- err
+	}()
+	waitFor(t, "the bus wait in Readiness", func() bool {
+		_, why := r.g.Readiness()
+		return strings.HasPrefix(why, "waiting for the bus: the gateway's term")
+	})
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a term start with no bus succeeded")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the term start never gave up on the bus")
 	}
 }

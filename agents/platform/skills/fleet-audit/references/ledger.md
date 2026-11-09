@@ -67,10 +67,12 @@ that cause in the ledger row and in the comment on the merged pull request inste
 
 Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
 table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and
-excerpt. Rows have no state and no id — nothing in that table is tracked between runs — and the
+excerpt, followed by the date the note stands until when it carries `expires`. A finding that only a
+lapsed note covers stays in the findings and carries a _Declared intent expired_ line naming the
+note and the date in its block. Rows have no state and no id — nothing in that table is tracked between runs — and the
 table is capped at 50 rows and says how many it left out. On a clean run the ledger closes without
 being rewritten, so the all-clear comment lists the declared postures instead, with the same
-`repo:path` pointers — and that comment is the last ledger record: a later clean run with nothing
+`repo:path` pointers and the same until-date — and that comment is the last ledger record: a later clean run with nothing
 but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
 standing declaration is the same every morning. From then on the declaration in the repository is
 the record, and `finish` reports the count as `declared`.
