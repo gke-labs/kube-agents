@@ -854,7 +854,7 @@ docs-generate: ## Regenerate the generated doc regions and files from their sour
 	@python3 scripts/generate_docs.py
 
 # Everything CI enforces about the docs, in one command.
-docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template ## Run every documentation check CI runs.
+docs-check: docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template docs-check-upgrade-releases ## Run every documentation check CI runs.
 
 docs-check-generated:
 	@python3 scripts/generate_sop_geography.py --check
@@ -874,6 +874,9 @@ docs-check-prose: ## Fail when a published site page's prose is out of step with
 
 docs-check-context-budget:
 	@python3 scripts/check_context_budget.py
+
+docs-check-upgrade-releases: ## Fail when an upgrade-table row names a tagged release that does not contain the commit that added it (needs the full history and the release tags).
+	@python3 scripts/check_upgrade_table_releases.py
 
 docs-check-pr-template: ## Fail when a section of .github/PULL_REQUEST_TEMPLATE.md tells the author to delete it, opens with a condition and names no one-line answer for the rest, or holds a comment the description readers split on (why: .agents/rules/pre_pr_review.md).
 	@python3 scripts/check_pr_template.py
