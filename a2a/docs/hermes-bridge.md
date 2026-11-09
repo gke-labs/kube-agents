@@ -673,37 +673,79 @@ The answer stays on `TASKS`, because the gateway delivers it from there, so the 
 shown and the copy the stream keeps are the same message. The bridge scrubs it once, before it is
 published (`scrubAnswer` in `answer_scrub.go`, #5280). That covers the `result` artifact and the
 chat message folded from it, each `turn` artifact, and the card reports a turn folds into its
-answer. There are two passes:
+answer. The same scrub runs over a failure's status tails, which can carry the answer's own bytes:
+a failed CLI run's stdout and stderr tails, and an API error's body or error tail. The rest of a
+status message is the bridge's own text. There are two passes:
 
-1. **Seen values.** The bridge keeps a per-task set of the secret values it saw in the task's tool
-   results, and exact-matches them out of the answer in both plain and base64 form. This catches a
-   secret with no shape of its own, such as a value decoded from a Secret and repeated, or a token
-   echoed verbatim in a card's report. The set holds every Kubernetes Secret `data` value (the
-   base64 as given, and the decoded value when it is text) and every `stringData` value. These are
-   read from JSON at any depth, including JSON text inside a result's strings (a terminal result is
-   JSON whose output is kubectl's JSON), from JSON cut short, and from YAML. It also holds every
-   value a shape rule catches in a result's text, up to the first 1 MiB of it. A value that is one
-   plain word is held only when the key, flag or prose noun in front of it is password,
-   passphrase, secret, token or api key, because the set redacts everywhere in the answer, not
-   just where the value stood. A plain word under a weak or ambiguous key is left out. A service account
-   token Secret's `namespace` is not tracked, and neither is a value under 8 bytes. The set holds
-   at most 512 entries and 1 MiB, and past either cap the oldest entry is evicted first. It is
-   cleared when the task finalizes, and none of it is logged or published.
+1. **Seen values.** The bridge keeps a per-task set of secret values from the task's tool results,
+   and exact-matches them out of the answer in both plain and base64 form. This catches a secret
+   with no shape of its own, such as a value decoded from a Secret and repeated in the answer or
+   in a card's report. The set has two pools:
+   - **Secret data.** Every `data` value (the base64 as given, and the decoded value when it is
+     text) and every `stringData` value of an object whose kind is `Secret`. It reads JSON at any
+     depth, including JSON text inside a result's strings (a terminal result is JSON whose output
+     is kubectl's JSON), and YAML documents and list items, each item for its own lines (a
+     `kubectl get secrets -o yaml` List), a comment on the kind line allowed. JSON cut short is
+     scanned object by object: a data block is read for its own object's kind, whatever other
+     kinds the text holds. kubectl prints a block before its object's kind, so an item cut inside
+     its data counts as a Secret only when every item of its list before it was one, and a single
+     Secret cut there is not read. YAML cut before a scope's kind line is not read either. The
+     connection settings `username`, `user`, `host`, `port` and `database` are skipped, and so
+     is a service account token Secret's `namespace`.
+   - **Shape-caught values.** A value a shape rule catches in a result's text, but only where the
+     key, flag or prose noun in front of it names a credential outright (password, passwd,
+     passphrase, token, api key, secret as a key's last component, with a digit or a value
+     qualifier allowed), or where the rule's own shape is a credential's (a token prefix, a URL's
+     password, a password flag, an `Authorization` header pair). A string under a JSON key that
+     names a credential outright counts too. The bare word secret, a plural (`Mountable secrets`)
+     and a key naming a Secret object (`existingSecret`, `imagePullSecret`) do not, so a Secret's
+     name is never tracked. Neither is a value with a space in it (`14 bytes` in
+     `kubectl describe secret`, a phrase after a label), nor what the auth-scheme, password-file
+     and YAML-block rules catch, so an image digest is not.
+
+   A value under 8 bytes is not tracked. Each pool has a fixed reserve: Secret data 384 entries
+   and 768 KiB, shape-caught values 128 entries and 256 KiB. Each tool result has an allowance in
+   each pool (Secret 128 entries and 256 KiB, shape-caught 64 entries and 96 KiB, charged with
+   what it actually added) and may evict only its own earlier entries, never an earlier
+   result's. Past its allowance a new value replaces that result's own oldest entry. When a pool
+   is full of earlier results' entries the value is refused, and at finalize the bridge logs how
+   many it refused, at debug and as a number only (`seen-set refused N values`). So a task whose
+   results hold more secret values than the pools keep tracks the earliest ones; the rest are
+   caught only by their shape. The set is cleared and closed when the task finalizes, after the
+   result and the terminal are published, so a delivery still on its way past the door adds
+   nothing. None of it is logged or published.
+
 2. **Shape rules.** `scrubInlineSecrets` runs over the answer (the classes are listed under
    "Activity" below).
 
 The bridge sees a tool's result only through the activity door. Hermes's `post_tool_call`
 delivery carries the tool's whole result (`extra.result`). Under `cli` that comes from the
 bridge's own child. Under `api` it comes from the pod-wide hook, so from the coordinator session
-and from the worker sessions of the cards the task tracks. Secret data reaches a result when a
-tool prints the object: `kubectl get secret -o json` or `-o yaml` in the shell sandbox, where
-kubectl talks to the k8s API proxy itself, or a file or MCP result holding the same manifest. A
-value printed bare, such as a jsonpath read piped through a base64 decode, has no structure to
-read, so only the shape rules see it. The door reads a delivery before its publish lock, so a
-delivery that arrives after the answer was published scrubs nothing. Hermes sends the hook from
-a background queue, which normally drains well before the model's next answer, but nothing
-orders the two. Status messages are not answers and are not scrubbed: a failed CLI run's stdout
-tail and an API error's body tail go out as they are.
+and from the worker sessions of the cards the task filed or tracks. A worker that runs while the
+coordinator's turn is still going, before the task waits on its cards, matches no task's trace,
+but its result still reaches that task's set (`cardWorkerRun`). Secret data reaches a result when
+a tool prints the object: `kubectl get secret -o json` or `-o yaml` in the shell sandbox, where
+kubectl talks to the k8s API proxy itself, or a file or MCP result holding the same manifest.
+
+What the set does not cover:
+
+- A value printed bare, such as a jsonpath read piped through a base64 decode, has no structure
+  to read, so only the shape rules see it, and only by its shape or the label the answer puts in
+  front of it.
+- An exact match misses a transformed copy of a tracked value: JSON-escaped (a value holding a
+  quote or a backslash, shown in a JSON block), HTML- or percent-encoded, base64 wrapped across
+  lines, or split across lines.
+- The door reads a delivery before its publish lock, so a delivery that arrives after the answer
+  was published scrubs nothing. Hermes sends the hook from a background queue, which normally
+  drains well before the model's next answer, but nothing orders the two.
+- The set is per task. A later task in the same conversation that repeats a value read in an
+  earlier one is caught only by the shape rules.
+
+A card that settles after its turn has ended reaches the conversation as the agent's own
+`chat.notify` post: the kanban notifier posts it with `a2a notify` through the gateway. The bridge
+does not publish it, so this scrub does not cover it. When the same report is also folded into a
+later turn's answer (the #4975 double delivery), the folded copy is scrubbed and the posted copy
+is not.
 
 ## Stopping a conversation's cards
 
@@ -864,7 +906,7 @@ nothing of it follows the final event. What of the input is published is the sam
   `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
   wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
   name, a wrapper's nested names). No string value rides the trace under any key, under either executor, and no tool results are included (the one exception is `BRIDGE_DEBUG_ERROR_TEXT`'s scrubbed error line, a maintainer's debugging switch, below).
-- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `scrubInlineSecrets` and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `scrubInlineSecrets` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, prose secrets and `key=value` secrets. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number. A credential after `Bearer` or `Basic` is redacted unless it is one plain word, while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
+- **Under `api` (attribution on the same entry):** the entry additionally carries a human-readable `title` (the step title the call was planned under, else one built from the tool's name and the short identifier it acts on: a cluster, a file's tail, a search query, a card's title), `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and `resultPreview` = `card_id=<id>` on a successful `kanban_create` only. Nothing else of a tool's result is published, and neither is a failed call's error text: a failure is its `status` and hermes's own `errorType` word. For debugging only, setting `BRIDGE_DEBUG_ERROR_TEXT=true` on the bridge container adds `errorMessage`: the first line of the error, scrubbed by `scrubInlineSecrets` and capped at 320 bytes. It applies under both executors and is off by default. An AgentPlugin's env reaches the agent container unfiltered, so the rendered bridge drops any copy it would inherit and sets it `false` itself, which also overrides an `envFrom` key. A maintainer turns it on by editing the Deployment while the operator is paused, since a reconcile reverts it. A bridge the CR declares as its own sidecar is the CR author's container and keeps whatever env it's given. The model's reasoning is read for the step boundary it marks and is not published. The identifier a title names is the one argument-derived value on the bus, and it passes through `scrubInlineSecrets` as a net rather than a contract. Its classes are credential tokens by prefix, a credential after an HTTP auth scheme word or in an `Authorization` header or header pair, CLI secret flags (long and single-dash names, attached and quoted short values, `user:password` arguments, a flag and its value as separate argument-list items), private-key blocks, YAML Secret `data`/`stringData` blocks, URL userinfo (the password by shape: everything up to the `@` a host follows), libpq password-file entries, a Kubernetes env entry's literal value under a credential name, prose secrets, markdown tables and `key=value` secrets. The prose and `key=value` rules read through the markdown around a key or a value (paired bold, italic and code-span marks, a short parenthetical before the colon, an arrow used as a separator) and redact the value where it stands, and prose may say "decodes to" or "the password in secret X is". A table's value cells are redacted in a row whose first cell is a credential key, unless its headers show a listing of resources or checks, and under a header that is one. After an explicit credential word (a prose credential noun and verb, or a key whose last component is the credential word, a digit suffix or a value qualifier such as `_hash`, `_value` or `Confirm` allowed) a value is redacted unless it is a short list of state words, a literal, a placeholder or a short number, so a passphrase is redacted. A credential after `Bearer` or `Basic` is redacted unless it is one of the dictionary words prose puts there ("Basic Authentication"), while after the scheme words that are also ordinary English, and under a key that carries the credential word elsewhere (a container or proxy name, a field path, a TTL), the value must be token-shaped. The ambiguous keys `pass`, `pwd` and `auth` keep a path or prose (#5032). The same function scrubs the answer ("What of an answer reaches TASKS" above).
 
 In both modes, values under keys with `token`, `secret`, `password`,
 `passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
