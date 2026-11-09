@@ -31,6 +31,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from generate_chart_footprint import parse_bytes, parse_cpu_millis
+
 REPO = Path(__file__).resolve().parent.parent
 CHART_DIR = REPO / "charts/kube-agents"
 HELM_BINARY = "helm"
@@ -301,21 +303,14 @@ def _session_pod() -> dict:
     def quantity(name: str) -> str:
         return _go_string_constant(source, name, SPAWN_GO)
 
-    def millis(q: str) -> int:
-        return int(q[:-1]) if q.endswith("m") else int(float(q) * 1000)
-
-    def size(q: str) -> int:
-        for unit, scale in (("Gi", GIB), ("Mi", MIB), ("Ki", 1024)):
-            if q.endswith(unit):
-                return int(q[: -len(unit)]) * scale
-        return int(q)
-
-    ephemeral = size(quantity("workerEphemeralStorageRequest"))
+    # The chart footprint generator's parsers, which read every quantity form the
+    # chart's template does, so the two footprint scripts cannot disagree.
+    ephemeral = parse_bytes(quantity("workerEphemeralStorageRequest"))
     return {
-        "cpuMillisRequest": millis(quantity("workerCPURequest")),
-        "memoryBytesRequest": size(quantity("workerMemoryRequest")),
-        "cpuMillisLimit": millis(quantity("workerCPULimit")),
-        "memoryBytesLimit": size(quantity("workerMemoryLimit")),
+        "cpuMillisRequest": parse_cpu_millis(quantity("workerCPURequest")),
+        "memoryBytesRequest": parse_bytes(quantity("workerMemoryRequest")),
+        "cpuMillisLimit": parse_cpu_millis(quantity("workerCPULimit")),
+        "memoryBytesLimit": parse_bytes(quantity("workerMemoryLimit")),
         # spawn.go limits ephemeral storage at its request.
         "ephemeralStorageBytesRequest": ephemeral,
         "ephemeralStorageBytesLimit": ephemeral,

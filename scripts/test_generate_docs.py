@@ -746,6 +746,24 @@ class FootprintBlocksTest(unittest.TestCase):
         self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
         self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
 
+    def test_the_session_pod_reads_every_quantity_form_kubernetes_accepts(self):
+        footprint = generate_docs.install_footprint
+        constants = {
+            "workerCPURequest": "1.5",
+            "workerMemoryRequest": "1.5Gi",
+            "workerCPULimit": "2500m",
+            "workerMemoryLimit": "2G",
+            "workerEphemeralStorageRequest": "1Ti",
+        }
+        source = "\n".join(f'\t{name} = "{value}"' for name, value in constants.items())
+        with mock.patch.object(Path, "read_text", return_value=source):
+            pod = footprint._session_pod()
+        self.assertEqual(pod["cpuMillisRequest"], 1500)
+        self.assertEqual(pod["memoryBytesRequest"], 1536 * 1024**2)
+        self.assertEqual(pod["cpuMillisLimit"], 2500)
+        self.assertEqual(pod["memoryBytesLimit"], 2 * 1000**3)
+        self.assertEqual(pod["ephemeralStorageBytesRequest"], 1024**4)
+
     def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
         footprint = generate_docs.install_footprint
         self.assertEqual(footprint._per_pod({"pods": 2, "cpuMillisRequest": 100, "surges": True}), {"cpuMillisRequest": 50})
