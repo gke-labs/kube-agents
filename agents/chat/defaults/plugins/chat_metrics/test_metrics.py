@@ -161,6 +161,16 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         now[0] += 1
         self.assertEqual([("live", "OperationalError", "2")], _DISPATCH_LINE.findall(registry.render()))
 
+    def test_failures_a_busy_timeout_apart_keep_counting(self):
+        # A locked board: each failed tick waits Hermes' 120 s busy timeout, then the 5 s interval.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(60):
+            registry.record_dispatch_tick("default", "OperationalError")
+            registry.render()
+            now[0] += 125
+        self.assertEqual([("default", "OperationalError", "60")], _DISPATCH_LINE.findall(registry.render()))
+
     def test_a_stale_streak_restarts_even_when_no_render_ran_in_between(self):
         now = [100.0]
         registry = metrics.ChatMetrics(clock=lambda: now[0])

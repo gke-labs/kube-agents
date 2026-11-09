@@ -38,9 +38,9 @@ import (
 const (
 	kanbanDispatcherFailingCondition = "KanbanDispatcherFailing"
 	// kanbanDispatcherFailingTicks is the streak that sets the condition: the
-	// ticks one poll interval holds at the configured dispatch interval. A tick
-	// takes that interval plus its own work, so the streak covers at least one
-	// poll; a failure the next tick undoes does not set it.
+	// ticks one poll interval holds at the configured dispatch interval, so the
+	// streak covers about one poll (a tick's own work lengthens it, the wake
+	// nudge can shorten it); a failure the next tick undoes does not set it.
 	kanbanDispatcherFailingTicks = int64(usageCountersPollInterval / (kanbanDispatchIntervalSeconds * time.Second))
 
 	kanbanDispatcherReasonTicksFailing = "TicksFailing"

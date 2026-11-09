@@ -133,8 +133,10 @@ ERROR_LABEL = "error"
 # A board whose last failure is older than this is dropped at render: the
 # dispatcher stopped ticking it (archived, quarantined as corrupt, or the
 # dispatcher paused), and no good tick will come to end its streak. A failing
-# board fails every tick, a few seconds apart, so a live streak is never this old.
-DISPATCH_FAILURE_STALE_SECONDS = 120.0
+# tick can take Hermes' whole SQLite busy timeout (120 s, kanban_db_connect's
+# DEFAULT_BUSY_TIMEOUT_MS) on a locked board, plus the interval, so the window is
+# five of those: a live streak is never this old.
+DISPATCH_FAILURE_STALE_SECONDS = 600.0
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 METRICS_PATH = "/metrics"
