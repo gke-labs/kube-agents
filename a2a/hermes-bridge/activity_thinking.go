@@ -1798,6 +1798,37 @@ func matchWorkerDeliveryRun(runs []*taskRun, d hookDelivery) *taskRun {
 	return nil
 }
 
+// cardWorkerRun is the API task whose card a worker session's delivery
+// belongs to, waiting on its cards or not: the session the task already
+// mapped to a card, else the card the delivery's workspace or kanban
+// arguments name, when the task filed or tracks it. A coordinator session
+// (a2a-*) is never a worker. It changes no task's card map.
+func cardWorkerRun(runs []*taskRun, d hookDelivery) *taskRun {
+	if strings.HasPrefix(d.SessionID, apiSessionIDPrefix) {
+		return nil
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID != "" && a.hasWorkerSession(d.SessionID) {
+			return r
+		}
+	}
+	cid := extractKanbanCardIDFromCwd(d.Cwd)
+	if cid == "" {
+		if tool, parsed := unwrapHermesToolCall(d.ToolName, d.ToolInput); strings.HasPrefix(tool, "kanban_") {
+			cid = extractArgStr(parsed, "card_id", "task_id", "id")
+		}
+	}
+	if cid == "" {
+		return nil
+	}
+	for _, r := range runs {
+		if a := r.act.Load(); a != nil && a.sessionID != "" && a.hasCardID(cid) {
+			return r
+		}
+	}
+	return nil
+}
+
 func workerSessionStartedBefore(sessionID string, startedAt time.Time) bool {
 	if len(sessionID) < sessionTimestampPrefixLen || sessionID[8] != '_' || startedAt.IsZero() {
 		return false

@@ -1364,8 +1364,10 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	run := b.runForSignature(r.Header.Get(hookSignatureHeader), body)
+	sig := r.Header.Get(hookSignatureHeader)
+	run := b.runForSignature(sig, body)
 	if run == nil {
+		b.collectCardWorkerSecrets(sig, body)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1444,6 +1446,32 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 		}
 	}
 	return matchWorkerDeliveryRun(runs, d)
+}
+
+// collectCardWorkerSecrets reads the Secret values of a post_tool_call
+// that matched no task's trace because its card's worker ran before the
+// task started waiting on its cards (a card runs as soon as it is filed,
+// while the coordinator's turn goes on), into the set of the task that
+// filed or tracks the card (cardWorkerRun), whose answer folds the card's
+// report in. Nothing else of the delivery is used: it stays out of the
+// trace, as before.
+func (b *Bridge) collectCardWorkerSecrets(sig string, body []byte) {
+	if sig == "" || !hookSigned(b.cfg.ActivitySecret, sig, body) {
+		return
+	}
+	var d hookDelivery
+	if err := json.Unmarshal(body, &d); err != nil || d.Event != hookPostToolCall || d.SessionID == "" {
+		return
+	}
+	b.mu.Lock()
+	runs := make([]*taskRun, 0, len(b.tasks))
+	for _, r := range b.tasks {
+		runs = append(runs, r)
+	}
+	b.mu.Unlock()
+	if run := cardWorkerRun(runs, d); run != nil {
+		run.act.Load().secrets.collectToolResult(d.Extra.Result)
+	}
 }
 
 // --- the heartbeat ---

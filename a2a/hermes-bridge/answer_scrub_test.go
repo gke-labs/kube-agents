@@ -9,9 +9,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -457,4 +459,45 @@ func TestAPI_SeenSecretValuesNeverLeaveTheBridge(t *testing.T) {
 		run := captured.Load()
 		return run != nil && run.act.Load() != nil && run.act.Load().secrets.size() == 0
 	})
+}
+
+// A card's worker can run its tool calls while the coordinator's turn
+// still goes on (a card runs as soon as it is filed), before the task waits
+// on its cards, so its deliveries match no task's trace. Their Secret
+// values still reach the set of the task that filed the card, whose answer
+// folds the card's report in; a card no task tracks feeds nothing.
+func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
+	const secret = "pod-wide-shared-secret"
+	b := &Bridge{cfg: Config{ActivitySecret: secret, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, tasks: make(map[string]*taskRun)}
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-in-turn"
+	a.inTurn.Store(true)
+	a.SyncKanbanCard("t_card42", "Check prod-a", "")
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-in-turn"}, state: stateRunning}
+	run.act.Store(a)
+	b.tasks["task-in-turn"] = run
+
+	deliver := func(cwd, value string) {
+		body, _ := json.Marshal(map[string]any{
+			"hook_event_name": hookPostToolCall, "tool_name": "terminal", "tool_input": map[string]any{"command": "kubectl get secret app-db -o json"},
+			"session_id": "20990101_120001_worker", "cwd": cwd, "delivery_id": nuid.Next(), "timestamp": "2026-11-09T12:00:00Z",
+			"extra": map[string]any{"tool_call_id": "w1", "status": "ok", "result": terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": value}))},
+		})
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(body)
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		req.Header.Set(hookSignatureHeader, hookSignaturePrefix+hex.EncodeToString(mac.Sum(nil)))
+		b.handleActivity(httptest.NewRecorder(), req)
+	}
+	deliver("/var/lib/hermes/kanban/workspaces/t_card99_other/repo", synthSecretPlain2)
+	if a.secrets.size() != 0 {
+		t.Fatal("a worker of a card no task tracks fed the set")
+	}
+	deliver("/var/lib/hermes/kanban/workspaces/t_card42/repo", synthSecretPlain)
+	if !a.secrets.has(synthSecretPlain) {
+		t.Error("the card's worker's Secret value did not reach the task's set before the wait")
+	}
+	if a.hasWorkerSession("20990101_120001_worker") {
+		t.Error("the secrets path changed the task's card map")
+	}
 }
