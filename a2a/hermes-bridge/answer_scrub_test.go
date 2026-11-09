@@ -137,7 +137,7 @@ func TestSeenSecrets_NamesSizesDigestsAndPhrasesAreNotTracked(t *testing.T) {
 		s.collectToolResult(terminalResult(t, r))
 	}
 	if n := s.size(); n != 0 {
-		t.Fatalf("set holds %d values from results with no credential in them: %q", n, s.order)
+		t.Fatalf("set holds %d values from results with no credential in them: %q", n, s.values())
 	}
 	answer := "Pull secret regcred-missing is absent; default-token-x7k2p is mounted. password (14 bytes). " +
 		"Postgres uses postgres-creds and TLS uses shop-tls-cert, image sha256:4f1c9a0b2e3d4c5f6a7b8c9d0e1f2a3b4c5d6e7f. " +
@@ -356,7 +356,7 @@ func TestSeenSecrets_TheCapEvictsTheOldestFirst(t *testing.T) {
 	first := fmt.Sprintf("synthetic-entry-%06d", 0)
 	s.mu.Lock()
 	for i := 0; i < seenSecretMaxEntries+10; i++ {
-		s.addLocked(fmt.Sprintf("synthetic-entry-%06d", i))
+		s.addLocked(fmt.Sprintf("synthetic-entry-%06d", i), true)
 	}
 	s.mu.Unlock()
 	if n := s.size(); n != seenSecretMaxEntries {
@@ -374,7 +374,7 @@ func TestSeenSecrets_TheCapEvictsTheOldestFirst(t *testing.T) {
 	big.mu.Lock()
 	n := seenSecretMaxBytes/seenSecretMaxValueBytes + 3
 	for i := 0; i < n; i++ {
-		big.addLocked(val(i))
+		big.addLocked(val(i), true)
 	}
 	bytesHeld := big.bytes
 	big.mu.Unlock()
@@ -567,5 +567,49 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 	if a.hasWorkerSession("20990101_120001_worker") {
 		t.Error("the secrets path changed the task's card map")
+	}
+}
+
+// Shape-caught values never evict a Secret object's: a stream of them past
+// the caps, after a Secret value is tracked, leaves it tracked and
+// redacted, and one tool result adds at most seenSecretMaxShapePerResult
+// of them.
+func TestSeenSecrets_ShapeCaughtValuesNeverEvictSecretData(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain})))
+	var lines strings.Builder
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&lines, "svc%d_token: synthetic-flood-%06d\n", i, i)
+	}
+	if got := func() int {
+		var one seenSecrets
+		one.collectToolResult(terminalResult(t, lines.String()))
+		return one.size()
+	}(); got != 2*seenSecretMaxShapePerResult {
+		t.Errorf("one result added %d entries, want %d (%d values, two forms each)", got, 2*seenSecretMaxShapePerResult, seenSecretMaxShapePerResult)
+	}
+	for i := 0; i < 2*seenSecretMaxEntries; i++ {
+		s.addShape(fmt.Sprintf("synthetic-flood-%06d", i))
+	}
+	if !s.has(synthSecretPlain) || !s.has(b64(synthSecretPlain)) {
+		t.Fatal("shape-caught values evicted the Secret's value")
+	}
+	if got := scrubAnswerText("It is "+synthSecretPlain+".", &s); got != "It is [redacted]." {
+		t.Errorf("answer = %q, want the Secret value redacted", got)
+	}
+	if n := s.size(); n > seenSecretMaxEntries {
+		t.Errorf("size = %d, over the cap %d", n, seenSecretMaxEntries)
+	}
+	// Secret data fills the set: a shape-caught value is then dropped,
+	// not let in by evicting one.
+	var full seenSecrets
+	full.mu.Lock()
+	for i := 0; i < seenSecretMaxEntries; i++ {
+		full.addLocked(fmt.Sprintf("synthetic-secret-%06d", i), true)
+	}
+	full.mu.Unlock()
+	full.addShape("synthetic-shape-000001")
+	if full.has("synthetic-shape-000001") || !full.has("synthetic-secret-000000") {
+		t.Error("a shape-caught value evicted a Secret's value")
 	}
 }
