@@ -49,6 +49,12 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
+# Deployment whose HorizontalPodAutoscaler scales down with no stabilization
+# window and whose containers have no preStop hook (the planted web-api-server
+# and web-api-server-hpa in seeded-autoscaling). A declared gap, expected_fail:
+# no obtainability check reads the scale-down behavior; the gap is #4941.
+./tasks/workload-hpa-scaledown-and-missing-prestop/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the compliance audit on a
 # Deployment that pulls an Artifact Registry image through the node identity
 # alone and is refused for lack of the registry reader role (the planted
