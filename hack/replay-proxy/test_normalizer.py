@@ -783,6 +783,12 @@ class EvalPoolProjectTest(unittest.TestCase):
         self.assertEqual(fp(body("kube-agents-evals-31")), fp(body("kube-agents-evals-29")))
         self.assertEqual(fp(body("kube-agents-evals-31")), fp(body("kube-agents-evals")))
 
+    def test_a_percent_escaped_project_in_a_url(self):
+        self.assertEqual(norm("project_id%3D%22kube-agents-evals-22%22"), "project_id%3D%22⟦EVALPROJECT_1⟧%22")
+        self.assertEqual(norm("gitlab.com%2Fgke-agentic%2Fkube-agents-evals-22-infra"),
+                         "gitlab.com%2Fgke-agentic%2F⟦EVALPROJECT_1⟧-infra")
+        self.assertEqual(norm("x%2Fkube-agents-evals-token-minter"), "x%2Fkube-agents-evals-token-minter")
+
     def test_two_projects_in_one_request_stay_apart(self):
         self.assertEqual(norm("kube-agents-evals-3 and kube-agents-evals-31"), "⟦EVALPROJECT_1⟧ and ⟦EVALPROJECT_2⟧")
 
@@ -800,6 +806,13 @@ class RunNameTest(unittest.TestCase):
                          "searched gke-agentic/⟦EVALPROJECT_1⟧-infra@⟦COMMIT_1⟧ (whole tree)")
         self.assertEqual(norm('["acme/fleet@3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b"]'), '["acme/fleet@⟦COMMIT_1⟧"]')
         self.assertEqual(norm("acme/infra@0ffe0cb"), norm("acme/infra@4f1e414"))
+
+    def test_a_commit_in_a_forge_url(self):
+        sha = "0045315ed5ba4ce8f1091c2dcbc7626fde7f2aaa"
+        self.assertEqual(norm(f"https://github.com/gke-agentic/x/blob/{sha}/README.md"),
+                         "https://github.com/gke-agentic/x/blob/⟦COMMIT_1⟧/README.md")
+        self.assertEqual(norm(f"x/tree/{sha} and x/commit/{sha[:7]}"), "x/tree/⟦COMMIT_1⟧ and x/commit/⟦COMMIT_2⟧")
+        self.assertEqual(norm("x/blob/main/README.md and x/blob/v1.2.3/a"), "x/blob/main/README.md and x/blob/v1.2.3/a")
 
     def test_what_is_not_a_repository_commit_stays(self):
         for raw in ("user@deadbee1.example", "acme/infra@v1.2.3", "acme/infra@abc12", "img@sha256:0ffe0cbd6b463ad4",

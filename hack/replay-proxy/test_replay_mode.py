@@ -449,6 +449,31 @@ class RunNameTest(AnalyzeCase):
         self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]),
                          {"command": "gcloud projects describe kube-agents-evals-12"})
 
+    def test_a_bound_commit_anywhere_in_the_answer_is_served_with_this_runs_commit(self):
+        # The request binds the commit after `@`; the answer quotes it inside a forge URL.
+        old, new = "0ffe0cbd6b463ad4509311e5ea7eaf34afd746f3", "4f1e4141f06dd20a6d36af538e51dab2f5af93a6"
+        shown = "searched gke-agentic/kube-agents-evals-29-infra@{}"
+        said = "[README.md](https://github.com/gke-agentic/kube-agents-evals-29-infra/blob/{}/README.md) is empty."
+        self.assertEqual(self.recorded(self.body(shown.format(old)),
+                                       {"role": "assistant", "content": said.format(old)})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new)), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new))
+        # After `=`, which no pattern and no whole-token swap reads as a boundary.
+        self.setUp()
+        said = "git fetch origin --negotiation-tip={}"
+        self.assertEqual(self.recorded(self.body(shown.format(old[:7])),
+                                       {"role": "assistant", "content": said.format(old[:7])})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new[:7])), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new[:7]))
+
+    def test_a_percent_escaped_project_is_served_with_this_runs_project(self):
+        shown = "project {}"
+        said = "[Logs](https://console.cloud.google.com/logs/query;query=project_id%3D%22{}%22?project={})"
+        self.assertEqual(self.recorded(self.body(shown.format("kube-agents-evals-22")), {
+            "role": "assistant", "content": said.format("kube-agents-evals-22", "kube-agents-evals-22")})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format("kube-agents-evals-5")), time.time())
+        self.assertEqual(hit[0]["content"], said.format("kube-agents-evals-5", "kube-agents-evals-5"))
+
     def test_a_pool_project_the_request_never_named_is_not_stored(self):
         line = self.recorded(self.body("list the clusters"),
                              {"role": "assistant", "content": "gcloud container clusters list --project=kube-agents-evals-31"})

@@ -229,14 +229,17 @@ The rules that keep this safe:
   wherever it starts. The bare name also starts names that are the same in every run and belong
   to no project (`kube-agents-evals-token-minter`, `kube-agents-evals-large-gitops`), so it
   counts only on its own or before `-infra`, `-seeded`, `-platform` or `-us`, the parts a pool
-  project adds to its own names; anything else stays literal. In a run in the bare project, an
+  project adds to its own names; anything else stays literal. A name inside a URL counts after a
+  percent-escape too (`project_id%3D%22kube-agents-evals-22%22`). In a run in the bare project, an
   answer that names one of those constant names still holds the project's name inside it and
   isn't saved.
-- **Other per-run names are identifiers too:** a repository's commit written as `owner/repo@<sha>`
-  (each pool project's repository has its own history), the fleet audit's `declared-intent-<8
-random characters>` clone directory, and a GKE operation ID (`operation-<epoch ms>-<uuid>`; its
-  type and status stay literal). An answer that shortens a commit the request holds in full
-  (`c99b1ab` for `c99b1ab1fee8…`) isn't saved, since nothing binds the short form.
+- **Other per-run names are identifiers too:** a repository's commit, written as
+  `owner/repo@<sha>` or in a forge URL (`/blob/<sha>/`), since each pool project's repository has
+  its own history; the fleet audit's clone directory, `declared-intent-` and eight random
+  characters; and a GKE operation ID (`operation-<epoch ms>-<uuid>`), whose type and status stay
+  literal. An answer that quotes a bound commit anywhere is served with this run's commit. One
+  that holds a longer or shorter form of it than the request does (`c99b1ab` for
+  `c99b1ab1fee8…`) isn't saved, since nothing binds that form.
 - **A time of day on its own is left as written.** A bare `13:44` is in 43% of requests, but
   without a date it can't be turned into how far from now it is: it may be yesterday's, another
   time zone's, or a duration (`ps` prints CPU time as `0:47`). Any token for it would give

@@ -100,7 +100,8 @@ HEARTBEAT_KIND = "heartbeat"
 # has one depends on what else was running at that moment. Dropped like a
 # heartbeat. A dropped event's values that cannot be put back in an answer (an
 # epoch `created_at`, a date) still count against one (Normalizer.dropped_guards).
-DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, "queued")
+QUEUED_KIND = "queued"
+DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, QUEUED_KIND)
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
 # came before its JSON in one run and after it in the next. Only that shape is
@@ -308,11 +309,13 @@ K8S_SAFE = "bcdfghjklmnpqrstvwxz2456789"
 # follows its number. The bare name is also the start of names that belong to
 # no project and are the same in every run (`kube-agents-evals-token-minter`,
 # `kube-agents-evals-large-gitops`), so it counts only on its own or before a
-# part that pool projects add to their own names.
+# part that pool projects add to their own names. A percent-escape before it is
+# a boundary too (`project_id%3D%22kube-agents-evals-22%22` in a console URL).
 EVAL_POOL_PROJECT = "kube-agents-evals"
 EVAL_POOL_NAME_PARTS = ("infra", "seeded", "platform", "us")
+PERCENT_ESCAPE_BEFORE = r"(?<=%[0-9A-Fa-f]{2})"
 EVAL_POOL_PROJECT_RE = re.compile(
-    r"(?<![A-Za-z0-9])" + re.escape(EVAL_POOL_PROJECT)
+    r"(?:(?<![A-Za-z0-9])|" + PERCENT_ESCAPE_BEFORE + r")" + re.escape(EVAL_POOL_PROJECT)
     + r"(?:-\d+(?![A-Za-z0-9])|(?![A-Za-z0-9-])|(?=-(?:" + "|".join(EVAL_POOL_NAME_PARTS) + r")(?![A-Za-z0-9])))"
 )
 EVAL_POOL_CLASS = "EVALPROJECT"
@@ -322,10 +325,12 @@ EVAL_POOL_CLASS = "EVALPROJECT"
 COMMIT_CLASS = "COMMIT"
 COMMIT_MIN_HEX = 7
 COMMIT_MAX_HEX = 40
-COMMIT_RE = re.compile(
-    r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
-)
-# A run of hex an answer may abbreviate a bound commit to (Mapping.identifier_left_literal).
+COMMIT_RE = re.compile(r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])")
+COMMIT_HEX = r"([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
+# The same commits in a forge URL: `…/blob/<sha>/README.md`, `…/tree/<sha>`, `…/commit/<sha>`.
+COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
+# A run of hex an answer may hold a bound commit as, anywhere, or abbreviate one to
+# (Mapping.apply_to_answer, Mapping.identifier_left_literal).
 HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
 
 # (class, pattern, group): identifier classes in the order they are applied.
@@ -336,6 +341,7 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("GKEOP", re.compile(
         r"\boperation-(1\d{12}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"), 1),
     (COMMIT_CLASS, COMMIT_RE, 1),
+    (COMMIT_CLASS, COMMIT_URL_RE, 1),
     (EVAL_POOL_CLASS, EVAL_POOL_PROJECT_RE, 0),
     # The fleet audit's declared-intent clone directory, a Python tempfile name:
     # `declared-intent-` (CLONE_TMP_PREFIX in audit_report.py) and 8 random characters.
@@ -620,6 +626,11 @@ class Mapping:
         """The placeholder a swappable value is bound to, if any."""
         return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
 
+    def bound_commit(self, value: str) -> Optional[str]:
+        """The placeholder a bound commit is bound to, if `value` is one: a commit is one wherever it is a whole run of hex."""
+        token = self.bound(value)
+        return token if token is not None and token_class(token) == COMMIT_CLASS else None
+
     def bound_time(self, literal: str) -> Optional[str]:
         """The placeholder for a timestamp's text: every position it held outside assistant messages, if any."""
         positions = [str(i + 1) for i, seen in enumerate(self.time_occurrences) if seen == literal]
@@ -658,6 +669,7 @@ class Mapping:
         for cls, pattern, group in ID_CLASSES:
             text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
         text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
+        text = HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
         for pattern in TIMESTAMP_PATTERNS:
             text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
