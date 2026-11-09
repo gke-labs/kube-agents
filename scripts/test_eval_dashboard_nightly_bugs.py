@@ -26,8 +26,9 @@ import yaml
 from eval_dashboard import nightly_bugs
 
 # What a public post must never carry: a pass ratio, a repetition count, a
-# failing-check reason. "every repetition" in a rule's wording is not a count.
-RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\bpassed\b|failed every|failed all|RESOURCE_EXHAUSTED|\b429\b")
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 JOB = "ci-kube-agents-eval-nightly"

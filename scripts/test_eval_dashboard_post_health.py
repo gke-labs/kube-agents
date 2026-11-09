@@ -27,8 +27,9 @@ from eval_dashboard import post_health
 from eval_dashboard.health import near_deadline_margin
 
 # What a public post must never carry: a pass ratio, a repetition count, a
-# failing-check reason. "every repetition" in a rule's wording is not a count.
-RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\bpassed\b|failed every|failed all|RESOURCE_EXHAUSTED|\b429\b")
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 SPACE = "spaces/AAAAtestspace"
 TOKEN = "ya29.super-secret-token-value"
@@ -1548,29 +1549,36 @@ class TrackingIssue(RunHarness):
         self.assertIn("Tracking #1279.", self.opener.texts[0])
 
     def test_the_infrastructure_issues_quote_no_per_case_grading_line(self):
-        """health.assess concatenates shared_break's per-case lines into
-        evidence whether or not the break fires; no public body quotes them."""
+        """health.assess concatenates shared_break's per-case lines and the
+        watched periodics' lines (a build log's last error line) into
+        evidence whatever the condition; each public body quotes only the
+        lines that start with its own condition's prefix."""
         gi = post_health.gate_issue
         graded = ["cluster-agent-crashloop-debug failed all graded reps on 4 runs from 3 PRs (#1, #2, #3)",
                   "these cases explain 4 of 5 red runs (5 of 6 concluded runs red) in the last 6h",
                   "PR-caused: upgrades-lagging-master-probe failing only on #7 (passing on 2 other PRs built on the same main commit)"]
+        periodic = "certification lane: build 2100000000000000001 failed at 2026-11-07T03:10:00Z (log `ERROR rca-remediation-pr: required phrases absent`)"
+        foreign = [*graded, periodic]
         lost_line = "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC"
         drift_line = f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
         kill_line = "deadline kills: 3 runs on 3 PRs killed at the 360-minute deadline with no verdict 19:40–20:00 UTC"
         pool_line = f"{FINDING} found on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"
         bodies = {
-            lost_line: gi.render_lost_pods_body(lost_pods(evidence=[*graded, lost_line]), "Fri 10:05 AM ET", "10:05–10:19 AM ET", "brief"),
-            drift_line: gi.render_fixture_drift_body(fixture_drift(evidence=[*graded, drift_line]), "Mon 9:00 AM ET", "brief"),
-            kill_line: gi.render_deadline_kill_body(deadline_kill(evidence=[*graded, kill_line]), "Tue 3:00 PM ET", "3:40–4:00 PM ET", "brief"),
-            pool_line: gi.render_pool_drift_body(pool_drift(evidence=[*graded, pool_line]), "Mon 9:00 AM ET", "brief"),
+            lost_line: gi.render_lost_pods_body(lost_pods(evidence=[*foreign, lost_line]), "Fri 10:05 AM ET", "10:05–10:19 AM ET", "brief"),
+            drift_line: gi.render_fixture_drift_body(fixture_drift(evidence=[*foreign, drift_line]), "Mon 9:00 AM ET", "brief"),
+            kill_line: gi.render_deadline_kill_body(deadline_kill(evidence=[*foreign, kill_line]), "Tue 3:00 PM ET", "3:40–4:00 PM ET", "brief"),
+            pool_line: gi.render_pool_drift_body(pool_drift(evidence=[*foreign, pool_line]), "Mon 9:00 AM ET", "brief"),
         }
         for own_line, body in bodies.items():
             self.assertIn(f"- {own_line}", body)
-            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused"):
+            for name in ("cluster-agent-crashloop-debug", "upgrades-lagging-master-probe", "these cases explain", "PR-caused", "certification lane", "rca-remediation-pr"):
                 self.assertNotIn(name, body, own_line)
             self.assertIsNone(RESULTS_RE.search(body), body)
-        self.assertEqual(gi.public_evidence({"evidence": graded}), [])
-        self.assertEqual(gi.public_evidence({"evidence": [kill_line, lost_line]}, prefix=gi.DEADLINE_EVIDENCE_PREFIX), [kill_line])
+        # The drop regex alone takes the graded lines; the prefix layer is what keeps a periodic's line out.
+        self.assertEqual(gi.public_evidence({"evidence": foreign}), [periodic])
+        self.assertEqual(gi.public_evidence({"evidence": [*foreign, kill_line, lost_line]}, (gi.DEADLINE_EVIDENCE_PREFIX,)), [kill_line])
+        self.assertEqual(gi.public_evidence({"evidence": [kill_line, lost_line]}, (gi.LOST_PODS_EVIDENCE_PREFIX,)), [lost_line])
+        self.assertEqual(gi.public_evidence({"evidence": [drift_line, lost_line]}, (gi.FIXTURE_DRIFT_EVIDENCE_PREFIX.format(role=DRIFT_ROLE),)), [drift_line])
 
     def test_a_human_filed_issue_naming_the_cases_is_adopted(self):
         human = {"number": 1278, "html_url": "https://github.com/gke-labs/kube-agents/issues/1278", "title": "Seeded fleet outage", "body": "cluster-agent-crashloop-debug, cluster-agent-crashloop-evidence-chain and cluster-agent-crashloop-misleading-symptom red every PR", "labels": [{"name": "presubmit-gate"}]}

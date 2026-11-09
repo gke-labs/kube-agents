@@ -81,10 +81,10 @@ import re
 import sys
 
 try:
-    from .health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_PR_CAUSED, parse_iso, pool_drift_split, public_cause
+    from .health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_PR_CAUSED, parse_iso, pool_drift_split, public_cause
+    from health import EVIDENCE_CASE_COLLAPSE, EVIDENCE_CASES_EXPLAIN, EVIDENCE_LOST_PODS, EVIDENCE_PR_CAUSED, FIXTURE_SCAN, parse_iso, pool_drift_split, public_cause
 
 LABEL = "presubmit-gate"
 # Who an infrastructure issue goes to: top-level keys of domains.yaml,
@@ -152,15 +152,21 @@ LOST_PODS_BODY_WORDS = ("notready", "not ready", "lost")
 # How a name is found in a title or body: not preceded by a letter, digit or
 # underscore ("kill" is not in "skill" nor in "deadline_kill").
 NAME_START_RE = r"(?<![a-z0-9_]){name}"
-# The other direction: the deadline body quotes only the deadline evidence
-# lines. health.py's evidence also carries per-case collapse lines whenever a
-# case clears the shared-break floors, and a body naming those cases would
-# be adopted as the tracker of a break that fires later.
+# The other direction: each body quotes only its own condition's evidence
+# lines, by their fixed start (public_evidence). health.py's evidence also
+# carries per-case collapse lines whenever a case clears the shared-break
+# floors (a body naming those cases would be adopted as the tracker of a
+# break that fires later) and the watched periodics' lines, which quote a
+# build log's last error line; the repository is public, and the incident
+# brief carries the rest. The fixture scan's lines start with the role
+# (health's scan loop: "<role> drifted on N pool project(s) …").
 DEADLINE_EVIDENCE_PREFIX = "deadline kills:"
-# Evidence lines that grade a case: health.shared_break's per-case collapse
-# line, its coverage line and the PR-caused lines, which health.assess
-# concatenates into health["evidence"] whether or not the break fires. No
-# public body quotes them (public_evidence); the incident brief carries them.
+LOST_PODS_EVIDENCE_PREFIX = EVIDENCE_LOST_PODS
+FIXTURE_DRIFT_EVIDENCE_PREFIX = "{role} " + FIXTURE_SCAN.verb + " "
+# A second layer under the prefixes: the lines that grade a case
+# (health.shared_break's per-case collapse line, its coverage line and the
+# PR-caused lines, which health.assess concatenates into health["evidence"]
+# whether or not the break fires) are dropped from every body.
 PUBLIC_EVIDENCE_DROP_RE = re.compile("|".join((re.escape(EVIDENCE_CASE_COLLAPSE), "^" + re.escape(EVIDENCE_CASES_EXPLAIN), "^" + re.escape(EVIDENCE_PR_CAUSED))))
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
@@ -183,7 +189,7 @@ OUTAGE_MARKER_RE = re.compile(r"<!-- kube-agents-bot:gate-outage cases=([^ >]*) 
 TITLE = "Smoke gate outage since {since}"
 BODY = """\
 {marker}
-The smoke gate (`{job}`) is in OUTAGE: a shared break fails every pull request's run, so a red on an open PR is not that PR's code.
+The smoke gate (`{job}`) is in OUTAGE: a shared break turns every pull request's run red, so a red on an open PR is not that PR's code.
 
 **Window:** since {since} ({since_iso}), {prs} PRs red so far.
 **Class:** {cause} (`{condition}`).
@@ -414,22 +420,21 @@ def render_lost_pods_title(health: dict, when_text: str) -> str:
     return title
 
 
-def public_evidence(health: dict, prefix: str | None = None) -> list[str]:
-    """``health["evidence"]`` as a public body may quote it: without the
-    lines that grade a case (PUBLIC_EVIDENCE_DROP_RE), and, given ``prefix``,
-    only the lines that start with it."""
+def public_evidence(health: dict, prefixes: tuple[str, ...] | None = None) -> list[str]:
+    """``health["evidence"]`` as a public body may quote it: given
+    ``prefixes``, only the lines that start with one of them (the condition's
+    own), and never a line that grades a case (PUBLIC_EVIDENCE_DROP_RE)."""
     lines = [str(line) for line in health.get("evidence") or []]
-    lines = [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
-    if prefix is not None:
-        lines = [line for line in lines if line.startswith(prefix)]
-    return lines
+    if prefixes is not None:
+        lines = [line for line in lines if line.startswith(prefixes)]
+    return [line for line in lines if not PUBLIC_EVIDENCE_DROP_RE.search(line)]
 
 
 def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     nodes = incident.get("nodes") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in public_evidence(health)]
+    evidence = [f"- {line}" for line in public_evidence(health, (LOST_PODS_EVIDENCE_PREFIX,))]
     return LOST_PODS_BODY.format(
         job=JOB_NAME,
         when=when_text,
@@ -452,7 +457,7 @@ def render_deadline_kill_title(health: dict, since_text: str) -> str:
 def render_deadline_kill_body(health: dict, since_text: str, window_text: str, brief_link: str) -> str:
     incident = health.get("incident") or {}
     prs = incident.get("prs") or []
-    evidence = [f"- {line}" for line in public_evidence(health, prefix=DEADLINE_EVIDENCE_PREFIX)]
+    evidence = [f"- {line}" for line in public_evidence(health, (DEADLINE_EVIDENCE_PREFIX,))]
     return DEADLINE_KILL_BODY.format(
         job=JOB_NAME,
         since=since_text,
@@ -487,7 +492,7 @@ def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) ->
     incident = health.get("incident") or {}
     roles = list(incident.get("roles") or [])
     drift = incident.get("drift") or {}
-    evidence = [f"- {line}" for line in public_evidence(health)]
+    evidence = [f"- {line}" for line in public_evidence(health, tuple(FIXTURE_DRIFT_EVIDENCE_PREFIX.format(role=role) for role in roles))]
     per_project = []
     for project in sorted(drift):
         per_project.append(f"- `{project}`")
@@ -698,8 +703,8 @@ class Tracker:
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
         bodies. `skip` is the numbers the episode already carries: the bot's
-        own fixture or node issue quotes the evidence (less the case lines,
-        public_evidence) and must not become the break's tracker as well, or
+        own fixture or node issue quotes its own evidence lines only
+        (public_evidence) and must not become the break's tracker as well, or
         its close under the live break takes the break's citation with it."""
         self._skip = {int(number) for number in skip}
         condition = health.get("condition")

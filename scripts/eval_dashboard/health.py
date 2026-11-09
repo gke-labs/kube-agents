@@ -608,6 +608,9 @@ CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
 EVIDENCE_CASE_COLLAPSE = " failed all graded reps on "
 EVIDENCE_CASES_EXPLAIN = "these cases explain "
 EVIDENCE_PR_CAUSED = "PR-caused: "
+# The fixed start of lost_pods' evidence line; the lost-pods issue body
+# keeps only the lines that start with it (gate_issue.public_evidence).
+EVIDENCE_LOST_PODS = "lost pods: "
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -1336,7 +1339,7 @@ def lost_pods(runs, now: datetime) -> dict:
     evidence = []
     if lost:
         line = (
-            f"lost pods: {len(lost)} runs on {len(prs)} PRs died with their build node"
+            f"{EVIDENCE_LOST_PODS}{len(lost)} runs on {len(prs)} PRs died with their build node"
             f" {hhmm(start)}–{hhmm(end)} UTC (nodes {node_list(nodes)}; {_pr_list(prs)})"
         )
         more = len(recent) - len(lost)
