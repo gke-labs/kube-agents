@@ -33,7 +33,7 @@ func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAndTheHash(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("a", "1")
 	keys := a2aTestCalloutKeys(t)
-	conf := string(buildA2ANATSConfigSecret(agent, creds, keys, "tse").Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, creds, keys, []string{"tse"}).Data["nats.conf"])
 	start := strings.Index(conf, "user: gateway\n")
 	if start < 0 {
 		t.Fatal("no gateway user block in nats.conf")
@@ -48,8 +48,8 @@ func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAndTheHash(t *testing.T) {
 	if strings.Count(conf, "a2a.tasks.tse.*.supervisor") != 1 {
 		t.Fatalf("the deny appears %d times in nats.conf, want once (the gateway's)", strings.Count(conf, "a2a.tasks.tse.*.supervisor"))
 	}
-	without := a2aConfigRolloutHash(agent, creds, keys, "fp")
-	with := a2aConfigRolloutHash(agent, creds, keys, "fp", "tse")
+	without := a2aConfigRolloutHash(agent, creds, keys, "fp", nil)
+	with := a2aConfigRolloutHash(agent, creds, keys, "fp", []string{"tse"})
 	if without == with {
 		t.Fatal("a bound profile doesn't move the config hash, so the bus wouldn't pick up its deny")
 	}
@@ -60,7 +60,7 @@ func TestTheProfilesSupervisorDenyRidesTheGatewayBlockAndTheHash(t *testing.T) {
 // dispatcher's subject stays its own.
 func TestTheGatewayIsRefusedAProfilesSupervisorOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), "tse").Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), []string{"tse"}).Data["nats.conf"])
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
 	_, gw := a2aConnectAs(t, s.ClientURL(), "gateway", string(creds.Data["gateway-password"]))
