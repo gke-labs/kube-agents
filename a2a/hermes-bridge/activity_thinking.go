@@ -1233,72 +1233,38 @@ func isAllDigits(s string) bool {
 	return s != ""
 }
 
-// secretSink receives each value a shape rule redacts, so a caller can
-// collect what a tool's result held (seenSecrets); nil drops them. named
-// says the text in front of the value named it a secret outright
-// (keyClearlyNamesSecret), or the rule's own shape did (a URL's password,
-// a password flag, a token prefix), rather than a weak or ambiguous key.
-type secretSink func(value string, named bool)
-
-func (sink secretSink) emit(v string, named bool) {
-	if sink != nil && v != "" && !strings.Contains(v, redactedValue) {
-		sink(v, named)
-	}
-}
-
-var (
-	clearSecretKeyEndPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:password|passwd|passphrase|secret|token|api[_-]?key|apikey)s?$`)
-	clearSecretCamelEndPattern = regexp.MustCompile(`[A-Za-z0-9](?:Password|Passwd|Passphrase|Secret|Token|Api[_-]?Key|APIKey)s?$`)
-	clearSecretUpperEndPattern = regexp.MustCompile(`[A-Z0-9](?:PASSWORD|PASSWD|PASSPHRASE|SECRET|TOKEN)S?$`)
-	clearSecretNounPattern     = regexp.MustCompile(`(?i)\b(?:password|passwd|passphrase|secret|token|api[ _-]?key)\b`)
-)
-
-// keyClearlyNamesSecret says whether a key's last component is password,
-// passwd, passphrase, secret, token or api key: the value under it is a
-// secret whatever it looks like. A *_KEY or *_ID name, a key carrying the
-// word elsewhere, or the ambiguous pass, pwd and auth do not.
-func keyClearlyNamesSecret(k string) bool {
-	return clearSecretKeyEndPattern.MatchString(k) || clearSecretCamelEndPattern.MatchString(k) || clearSecretUpperEndPattern.MatchString(k)
-}
-
 // inlineScrubRule is one step of scrubInlineSecrets, in order.
 type inlineScrubRule struct {
 	name string
-	fn   func(s string, sink secretSink) string
+	fn   func(s string) string
 }
 
 // inlineScrubRules are scrubInlineSecrets's steps, in the order they run.
 // The names are for tests and the evidence tooling, which attribute a
 // redaction to the step that made it.
 var inlineScrubRules = []inlineScrubRule{
-	{"pem-private-key", func(s string, sink secretSink) string {
-		s = redactSubmatch(pemPrivateKeyBlockPattern, s, 0, sink, nil)
-		return redactSubmatch(pemPrivateKeyOpenPattern, s, 0, sink, nil)
+	{"pem-private-key", func(s string) string {
+		s = redactSubmatch(pemPrivateKeyBlockPattern, s, 0, nil)
+		return redactSubmatch(pemPrivateKeyOpenPattern, s, 0, nil)
 	}},
 	{"yaml-secret-block", scrubYAMLSecretBlocks},
-	{"token-prefix", func(s string, sink secretSink) string {
-		return redactSubmatch(inlineTokenValuePattern, s, 0, sink, nil)
+	{"token-prefix", func(s string) string {
+		return redactSubmatch(inlineTokenValuePattern, s, 0, nil)
 	}},
-	{"auth-header-pair", func(s string, sink secretSink) string {
-		return redactSubmatch(authHeaderPairPattern, s, 1, sink, nil)
+	{"auth-header-pair", func(s string) string {
+		return redactSubmatch(authHeaderPairPattern, s, 1, nil)
 	}},
-	{"auth-scheme", func(s string, sink secretSink) string {
-		return redactSubmatch(authSchemeCredentialPattern, s, 2, sink, authSchemeCredentialRedacted)
+	{"auth-scheme", func(s string) string {
+		return redactSubmatch(authSchemeCredentialPattern, s, 2, authSchemeCredentialRedacted)
 	}},
-	{"url-userinfo", func(s string, sink secretSink) string {
-		return redactSubmatch(inlineURLCredPattern, s, 2, sink, nil)
+	{"url-userinfo", func(s string) string {
+		return redactSubmatch(inlineURLCredPattern, s, 2, nil)
 	}},
-	{"pgpass-entry", func(s string, sink secretSink) string {
-		return redactSubmatch(pgpassEntryPattern, s, 4, sink, pgpassEntryRedacted)
+	{"pgpass-entry", func(s string) string {
+		return redactSubmatch(pgpassEntryPattern, s, 4, pgpassEntryRedacted)
 	}},
 	{"cli-flag", scrubCLISecretFlags},
-	{"prose", func(s string, sink secretSink) string {
-		return redactSubmatchNamed(proseSecretPattern, s, 2, sink, func(s string, m []int) bool {
-			return proseValueRedacted(s[m[4]:m[5]])
-		}, func(s string, m []int) bool {
-			return clearSecretNounPattern.MatchString(s[m[2]:m[3]])
-		})
-	}},
+	{"prose", scrubProseSecrets},
 	{"key-value", scrubInlineKVSecrets},
 }
 
@@ -1310,31 +1276,18 @@ var inlineScrubRules = []inlineScrubRule{
 // not published at all (the executor note in activity.go); a scrubber is a
 // net, not a contract.
 func scrubInlineSecrets(s string) string {
-	return scrubInlineSecretsTo(s, nil)
-}
-
-// scrubInlineSecretsTo is scrubInlineSecrets, handing each value it redacts
-// to sink.
-func scrubInlineSecretsTo(s string, sink secretSink) string {
 	if s == "" || s == redactedValue {
 		return s
 	}
 	for _, r := range inlineScrubRules {
-		s = r.fn(s, sink)
+		s = r.fn(s)
 	}
 	return s
 }
 
 // redactSubmatch replaces group of each match of re in s with the marker,
-// where keep (nil for always) says so, handing the value to sink as named
-// by the rule's own shape.
-func redactSubmatch(re *regexp.Regexp, s string, group int, sink secretSink, keep func(s string, m []int) bool) string {
-	return redactSubmatchNamed(re, s, group, sink, keep, nil)
-}
-
-// redactSubmatchNamed is redactSubmatch with named (nil for always) saying
-// whether the text in front of the value named it a secret outright.
-func redactSubmatchNamed(re *regexp.Regexp, s string, group int, sink secretSink, keep, named func(s string, m []int) bool) string {
+// where keep (nil for always) says so.
+func redactSubmatch(re *regexp.Regexp, s string, group int, keep func(s string, m []int) bool) string {
 	ms := re.FindAllStringSubmatchIndex(s, -1)
 	if ms == nil {
 		return s
@@ -1348,7 +1301,6 @@ func redactSubmatchNamed(re *regexp.Regexp, s string, group int, sink secretSink
 		}
 		sb.WriteString(s[last:lo])
 		sb.WriteString(redactedValue)
-		sink.emit(s[lo:hi], named == nil || named(s, m))
 		last = hi
 	}
 	if last == 0 {
@@ -1415,28 +1367,26 @@ func pgpassEntryRedacted(s string, m []int) bool {
 	return false
 }
 
-func scrubCLISecretFlags(s string, sink secretSink) string {
+func scrubCLISecretFlags(s string) string {
 	notAFlag := func(group int) func(s string, m []int) bool {
 		return func(s string, m []int) bool { return !strings.HasPrefix(s[m[2*group]:m[2*group+1]], "-") }
 	}
-	s = redactSubmatch(cliUserPassPattern, s, 4, sink, nil)
-	s = redactSubmatch(cliSpacedPassPattern, s, 2, sink, notAFlag(2))
-	s = redactSubmatch(cliAttachedPassPattern, s, 2, sink, nil)
-	s = redactSubmatch(cliLDAPPassPattern, s, 2, sink, notAFlag(2))
-	s = redactSubmatch(cliPassphraseArgPattern, s, 2, sink, nil)
+	s = redactSubmatch(cliUserPassPattern, s, 4, nil)
+	s = redactSubmatch(cliSpacedPassPattern, s, 2, notAFlag(2))
+	s = redactSubmatch(cliAttachedPassPattern, s, 2, nil)
+	s = redactSubmatch(cliLDAPPassPattern, s, 2, notAFlag(2))
+	s = redactSubmatch(cliPassphraseArgPattern, s, 2, nil)
 	// A flag whose name is a credential key (flagValueRedacted).
 	flagValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
 	}
-	flagNamed := func(s string, m []int) bool { return keyClearlyNamesSecret(s[m[4]:m[5]]) }
-	s = redactSubmatchNamed(cliLongSecretFlagPattern, s, 4, sink, flagValue, flagNamed)
-	s = redactSubmatchNamed(cliSingleDashSecretFlagPattern, s, 4, sink, flagValue, flagNamed)
+	s = redactSubmatch(cliLongSecretFlagPattern, s, 4, flagValue)
+	s = redactSubmatch(cliSingleDashSecretFlagPattern, s, 4, flagValue)
 	argListValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
 	}
-	argListNamed := func(s string, m []int) bool { return keyClearlyNamesSecret(s[m[2]:m[3]]) }
-	s = redactSubmatchNamed(cliArgListJSONPattern, s, 2, sink, argListValue, argListNamed)
-	return redactSubmatchNamed(cliArgListYAMLPattern, s, 2, sink, argListValue, argListNamed)
+	s = redactSubmatch(cliArgListJSONPattern, s, 2, argListValue)
+	return redactSubmatch(cliArgListYAMLPattern, s, 2, argListValue)
 }
 
 // flagValueRedacted says whether a flag's value is redacted: the flag's
@@ -1453,7 +1403,7 @@ func flagValueRedacted(name, sep, value string) bool {
 	return keyedValueRedacted(name, value, false)
 }
 
-func scrubYAMLSecretBlocks(s string, sink secretSink) string {
+func scrubYAMLSecretBlocks(s string) string {
 	if !strings.Contains(s, "data:") && !strings.Contains(s, "stringData:") {
 		return s
 	}
@@ -1490,18 +1440,25 @@ func scrubYAMLSecretBlocks(s string, sink secretSink) string {
 					cr = "\r"
 				}
 				lines[i] = em[1] + redactedValue + em[3] + cr
-				sink.emit(val, false)
 			}
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
+// scrubProseSecrets redacts the value of prose that states a secret
+// (proseSecretPattern), as proseValueRedacted says.
+func scrubProseSecrets(s string) string {
+	return redactSubmatch(proseSecretPattern, s, 2, func(s string, m []int) bool {
+		return proseValueRedacted(s[m[4]:m[5]])
+	})
+}
+
 // scrubInlineKVSecrets redacts the value after a credential key and a = or
 // :, as keyedValueRedacted says. A bare lower-case key used as a label in
 // the middle of a sentence ("rotate the token: run ...") keeps a value that
 // is one plain word.
-func scrubInlineKVSecrets(s string, sink secretSink) string {
+func scrubInlineKVSecrets(s string) string {
 	var sb strings.Builder
 	pos := 0
 	for pos < len(s) {
@@ -1540,7 +1497,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 		}
 		lineLeading := isLineLeadingKVKey(s, matchStart)
 		class := secretKeyClassOf(key)
-		named := keyClearlyNamesSecret(key)
 		redacts := func(v, after string) bool {
 			return classValueRedacted(class, v, sep == ':' && runsOnAsSentence(after))
 		}
@@ -1553,7 +1509,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 			}
 			if closeIdx >= 0 && redacts(rest[:closeIdx], "") {
 				sb.WriteString(redactedValue)
-				sink.emit(rest[:closeIdx], named)
 				pos = matchEnd + closeIdx
 				continue
 			}
@@ -1577,7 +1532,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 				pos = matchEnd
 				continue
 			}
-			sink.emit(val, named)
 			if closeIdx >= 0 {
 				sb.WriteString(q + redactedValue + q)
 				pos = matchEnd + 2 + closeIdx + 2
@@ -1607,7 +1561,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 				pos = matchEnd
 				continue
 			}
-			sink.emit(val[schemeEnd:], named)
 			if closeIdx >= 0 {
 				inner := afterOpen[:closeIdx]
 				sb.WriteByte(q)
@@ -1639,7 +1592,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 						pos = matchEnd
 						continue
 					}
-					sink.emit(lineRest, named)
 					sb.WriteString(redactedValue)
 					pos = matchEnd + len(lineRest)
 					continue
@@ -1663,7 +1615,6 @@ func scrubInlineKVSecrets(s string, sink secretSink) string {
 				pos = matchEnd
 				continue
 			}
-			sink.emit(rest[:valLen], named)
 			sb.WriteString(redactedValue)
 			pos = matchEnd + valLen
 		}
