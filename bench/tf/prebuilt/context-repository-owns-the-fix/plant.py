@@ -319,6 +319,9 @@ class Stack:
         missing = [name for name, value in required if not value]
         if missing:
             raise RuntimeError(f"{', '.join(missing)} must be set: the GitOps repository and a file that holds a write token for it, the agent host and its install, the case's fixture directory, and the context repository")
+
+    def check_fixture(self) -> None:
+        """The plant reads the fixture tree; the teardown never does, so only the plant asks for it."""
         if not (Path(self.settings.fixture_dir) / FIXTURE_LIVE_MANIFEST).is_file():
             # main.tf resolves the directory relative to the stack, which a
             # copy of the tf root alone (devops-bench's isolated mode) loses;
@@ -588,14 +591,22 @@ class Stack:
         if code != 0:
             raise RuntimeError(f"cannot write {CONTEXT_REPOS_KEY} in {self.settings.state_configmap}: {err.strip()}")
 
-    def register(self) -> None:
+    def check_registration(self) -> list:
+        """The list as it is, after refusing an entry for the repository that is not the stack's.
+
+        Read before the first write, so a refusal costs no commit: an entry
+        someone registered by hand, with another ref or type, is neither
+        adopted nor removed, as for a file or a namespace that is not the
+        stack's.
+        """
         entries = self.context_repos() or []
         foreign = [entry for entry in entries if self.names_context_repository(entry) and not self.is_registration(entry)]
         if foreign:
-            # As for a file or a namespace that is not the stack's: an entry
-            # someone registered by hand, with another ref or type, is
-            # neither adopted nor removed.
             raise RuntimeError(f"{CONTEXT_REPOS_KEY} in {self.settings.state_configmap} already names {self.settings.context_url} with other fields ({json.dumps(foreign[0])}); this stack did not register it, so it does not write over it")
+        return entries
+
+    def register(self) -> None:
+        entries = self.check_registration()
         if any(self.is_registration(entry) for entry in entries):
             log(f"{self.settings.context_url} at {self.settings.context_ref} is already in {CONTEXT_REPOS_KEY}; the stack's own entry is kept")
         else:
@@ -644,6 +655,8 @@ class Stack:
 
     def plant(self) -> None:
         self.check_settings()
+        self.check_fixture()
+        self.check_registration()
         self.plant_gitops()
         self.plant_workload()
         self.register()

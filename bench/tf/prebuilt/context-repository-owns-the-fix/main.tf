@@ -105,7 +105,9 @@ resource "null_resource" "fixture" {
   # the default branch is removed by the repository reset
   # (hack/ci_reset_agent_pulls.py, PLANTED_STACK_FILES) at the next lease and
   # before each unit of a case that requests a pull request; a leftover
-  # namespace or registration is cleared by the next plant.
+  # namespace, or a registration at the stack's own ref, is cleared or kept
+  # by the next plant, and a registration at another ref stops it and is
+  # removed by hand.
   provisioner "local-exec" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]

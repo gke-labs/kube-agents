@@ -289,11 +289,13 @@ def test_an_entry_for_the_repository_with_another_ref_stops_the_plant_and_stays(
     stack = _stack(github, host)
     with pytest.raises(RuntimeError, match="already names"):
         stack.plant()
-    # main() runs the teardown next: the files and the namespace go, the entry stays.
+    # Read before the first write: no commit and no namespace to undo.
+    assert github.writes == []
+    assert host.namespace_labels is None
+    # main() runs the teardown next; the entry stays.
     assert stack.teardown()
     assert json.loads(host.configmap["context_repos"]) == [other_ref]
-    assert github.files == {}
-    assert host.namespace_labels is None
+    assert github.writes == []
 
 
 def test_the_plant_refuses_a_fixture_directory_without_the_fixture(tmp_path):
@@ -543,19 +545,50 @@ def test_the_install_names_the_stack_waits_on_are_the_operators():
     broker = (controller / "credential_proxy_manifests.go").read_text()
     shell = (controller / "shell_sandbox_manifests.go").read_text()
     agent_controller = (controller / "platformagent_controller.go").read_text()
-    assert f'gitopsStateDir        = "{plant.GITOPS_STATE_DIR}"' in manifests
-    assert f'const credentialProxyContainerName = "{plant.BROKER_CONTAINER}"' in broker
+    # `\s*=\s*` rather than the literal spacing: gofmt re-pads a const block
+    # when a longer name joins it, which changes no value.
+    def pinned(source, name, value):
+        return re.search(rf'\b{name}\s*=\s*"{re.escape(value)}"', source) is not None
+
+    assert pinned(manifests, "gitopsStateDir", plant.GITOPS_STATE_DIR)
+    assert pinned(broker, "credentialProxyContainerName", plant.BROKER_CONTAINER)
     assert f'agent.Name + "{plant.BROKER_DEPLOYMENT.format(agent="")}"' in broker
     assert f'agent.Name + "{plant.SHELL_STATEFULSET.format(agent="")}"' in shell
-    assert f'shellSandboxContainerName = "{plant.SHELL_CONTAINER}"' in shell
-    assert f'gitopsStateConfigMapSuffix = "{plant.STATE_CONFIGMAP.format(agent="")}"' in agent_controller
-    assert f'gitopsStateContextReposKey = "{plant.CONTEXT_REPOS_KEY}"' in agent_controller
+    assert pinned(shell, "shellSandboxContainerName", plant.SHELL_CONTAINER)
+    assert pinned(agent_controller, "gitopsStateConfigMapSuffix", plant.STATE_CONFIGMAP.format(agent=""))
+    assert pinned(agent_controller, "gitopsStateContextReposKey", plant.CONTEXT_REPOS_KEY)
 
 
-def test_the_publisher_lists_the_chart_tree_and_nothing_else():
+def _publisher():
     publisher_spec = importlib.util.spec_from_file_location("publish_context_repository", FIXTURE / "publish_context_repository.py")
     publisher = importlib.util.module_from_spec(publisher_spec)
     publisher_spec.loader.exec_module(publisher)
+    return publisher
+
+
+def test_the_publisher_reads_an_empty_repository_from_the_status_line(monkeypatch):
+    publisher = _publisher()
+    answers = {}
+
+    class Done:
+        def __init__(self, returncode, stdout):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, ""
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["gh", "api", "--include"], argv
+        return answers["done"]
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+    answers["done"] = Done(1, "HTTP/2.0 409 Conflict\r\ncontent-type: application/json\r\n\r\n{\"message\":\"Git Repository is empty.\"}")
+    assert publisher.repository_is_empty("owner/name")
+    answers["done"] = Done(0, "HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n[]")
+    assert not publisher.repository_is_empty("owner/name")
+    answers["done"] = Done(1, "")
+    assert not publisher.repository_is_empty("owner/name")
+
+
+def test_the_publisher_lists_the_chart_tree_and_nothing_else():
+    publisher = _publisher()
     paths = [path for path, _ in publisher.fixture_files()]
     assert "README.md" in paths
     assert "services/payments/chart/templates/deploy-api.yaml" in paths
