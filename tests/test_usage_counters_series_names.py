@@ -207,6 +207,17 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
 
+    def test_the_cluster_gauges_labels_are_the_ones_the_poller_reads_into_the_scope_condition(self):
+        # The watcher's GaugeVec declares its label names in order; the poller reads
+        # three of them by name for the ScopeUndeclared condition's cluster triples.
+        match = re.search(r'clusterUp:\s*prometheus\.NewGaugeVec\(prometheus\.GaugeOpts\{.*?\},\s*\[\]string\{([^}]*)\}\)', _WATCHER_METRICS_GO.read_text(), re.S)
+        assert match, f"clusterUp has no label slice in {_WATCHER_METRICS_GO}"
+        labels = set(_go_words(_WATCHER_METRICS_GO, match.group(1)))
+        self.assertEqual(
+            {_go_const(_SCRAPE_GO, "clusterUpClusterLabel"), _go_const(_SCRAPE_GO, "clusterUpProjectLabel"), _go_const(_SCRAPE_GO, "clusterUpLocationLabel")},
+            labels,
+        )
+
     def test_the_brokers_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("TOOL_INVOCATIONS_METRIC"), _go_const(_SCRAPE_GO, "toolInvocationsSeries"))
 

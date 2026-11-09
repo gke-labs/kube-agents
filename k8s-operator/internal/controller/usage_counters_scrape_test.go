@@ -181,6 +181,12 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
 		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
 	}
+	// The series' labels ride along as the triples, in body order, for the
+	// ScopeUndeclared condition.
+	wantRefs := []usageClusterRef{{Name: "a", Project: "p", Location: "l"}, {Name: "b", Project: "p", Location: "l"}, {Name: "c", Project: "p", Location: "l2"}}
+	if !slices.Equal(reading.Clusters.Refs, wantRefs) {
+		t.Fatalf("cluster refs = %+v, want %+v", reading.Clusters.Refs, wantRefs)
+	}
 
 	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), empty, []string{usageCounterEventsIngested}, nil)
