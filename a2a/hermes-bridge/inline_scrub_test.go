@@ -288,6 +288,15 @@ func TestScrubInlineSecretsMarkdownLayouts(t *testing.T) {
 		"Set `DB_PASSWORD_FILE` to `/etc/db/password` -> mounted read-only.",
 		"a*b and c_d_e stay; ptr->next is code.",
 		"| Field | Meaning |\n|---|---|\n| `password` | the DB user's password |",
+		// The nightly answers' shapes: a resource named after the
+		// credential word in a table's first column, a feature name ending
+		// in one, a note in parentheses before a label's colon, and a name
+		// ending in the word before "is" in prose.
+		"| Namespace | Status | Age |\n|---|---|---|\n| `seeded-token` | `Active` | `34d` |",
+		"| Check | Result | Notes |\n|---|---|---|\n| Binary Authorization | `WARN` | Disabled |",
+		"- **Binary Authorization (`WARN`):** `Binary Authorization is DISABLED`",
+		"**ServiceAccount tokens (`5` major, `25` minor):** Apply the patch.",
+		"`Deployment/token-reader` in `seeded-token` is declared intent.",
 	}
 	for _, in := range negatives {
 		if got := scrubInlineSecrets(in); got != in {
