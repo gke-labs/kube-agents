@@ -18,9 +18,9 @@ one moving without the others:
 An exec pod's chain is the same with its own links: the runtime drains for
 EXEC_SHUTDOWN_DRAIN_SECONDS, the longest command it admits (the command timeout
 plus COMMAND_SLOT_WAIT_SECONDS), the entrypoint waits EXEC_RUNTIME_DRAIN_SECONDS,
-and the operator (`credential_proxy_exec_tier.go`) gives the pod the timeout, the
-slot wait and credentialProxyExecTierStopMarginSeconds. The operator's copies of
-the timeout and the slot wait are held to the runtime's.
+and the operator (`credential_proxy_exec_tier.go`) gives the pod
+credentialProxyExecTierTerminationGraceSeconds. The operator's copies of the
+timeout and the slot wait are held to the runtime's.
 
 A drain longer than the entrypoint's wait is cut by its SIGKILL with the answers
 unwritten; an entrypoint wait as long as the grace period leaves Envoy no time to
@@ -66,14 +66,8 @@ def operator(name: str) -> float:
 
 
 def exec_tier(name: str) -> float:
-    return _number(rf"^const {name}\s+int64\s*=\s*(\d+)$", EXEC_TIER)
-
-
-def exec_tier_grace() -> float:
-    # credentialProxyExecTierTerminationGraceSeconds is the sum of these three.
-    return (exec_tier("credentialProxyCommandTimeoutSeconds")
-            + exec_tier("credentialProxyCommandSlotWaitSeconds")
-            + exec_tier("credentialProxyExecTierStopMarginSeconds"))
+    # Declared inside a const block there, one per line.
+    return _number(rf"^\t{name}\s+int64\s*=\s*(\d+)$", EXEC_TIER)
 
 
 class DrainBudgetTest(unittest.TestCase):
@@ -135,7 +129,7 @@ class ExecDrainBudgetTest(unittest.TestCase):
     def test_the_exec_entrypoint_wait_leaves_envoy_time_inside_the_grace_period(self):
         self.assertLess(
             entrypoint("EXEC_RUNTIME_DRAIN_SECONDS"),
-            exec_tier_grace(),
+            exec_tier("credentialProxyExecTierTerminationGraceSeconds"),
             "the kubelet's SIGKILL would land before the entrypoint stops Envoy",
         )
 

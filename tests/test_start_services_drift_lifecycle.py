@@ -106,9 +106,11 @@ _LONG_DRAIN_SECONDS = 20
 # two apart, and inside _DRAIN_CEILING_SECONDS.
 _BROKER_RUNTIME_DRAIN_SECONDS = 5
 
-# The exec role's runtime budget in the same test: longer than the broker's by
-# more than a poll, so the clock tells the two apart, and inside _run_bash's
-# timeout. Its ceiling allows the same slack past the budget as the others'.
+# The exec role's runtime budget in the same test: at _DRAIN_CEILING_SECONDS, so
+# a broker that waited it fails the broker row's ceiling, and its floor sits
+# above the broker's budget, so an exec pod that waited the broker's fails. Its
+# ceiling allows the broker row's slack past the budget, inside _run_bash's
+# timeout.
 _EXEC_RUNTIME_DRAIN_SECONDS = 8
 _EXEC_DRAIN_CEILING_SECONDS = 11.0
 
@@ -540,7 +542,7 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         roles keep RUNTIME_DRAIN_SECONDS, which their pods' grace periods hold.
         """
         for role, floor, ceiling in (
-            ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _EXEC_RUNTIME_DRAIN_SECONDS - 1),
+            ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
             ("exec", _EXEC_RUNTIME_DRAIN_SECONDS - 1, _EXEC_DRAIN_CEILING_SECONDS),
             ("combined", 0, _BROKER_RUNTIME_DRAIN_SECONDS - 1),
         ):

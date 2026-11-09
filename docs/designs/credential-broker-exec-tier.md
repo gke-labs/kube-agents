@@ -878,9 +878,11 @@ cache contract.
        pod's `terminationGracePeriodSeconds` is 380 s, which holds the 360 s drain, the end wait
        and the exit. An idle pod still stops after the 3 s settle. A stopping pod keeps its CPU
        and quota until it exits, so a rollout step whose replacement has no room waits up to that
-       long. At 1 replica, callers get `draining` refusals while the pod drains, not a fallback to
-       the stateful broker. A PodDisruptionBudget with `maxUnavailable: 1` applies only when
-       replicas are 2 or more; at 1 replica it protects nothing.
+       long. At 1 replica, callers get `draining` refusals until the replacement is Ready (for the
+       whole drain when the replacement has no room), not a fallback to the stateful broker. A
+       PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1
+       replica it protects nothing. This half is implemented (`EXEC_SHUTDOWN_DRAIN_SECONDS` in
+       `credential_proxy.py`, `credentialProxyExecTierTerminationGraceSeconds` in the operator).
 1. **Off by default.** New CR field `spec.deployment.credentialProxy.exec.replicas`. The value 0
    (the default) means no exec tier and no `CREDENTIAL_PROXY_EXEC_URL`, so every install behaves
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling

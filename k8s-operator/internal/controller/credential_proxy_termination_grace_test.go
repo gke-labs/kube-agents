@@ -68,6 +68,10 @@ func TestTheExecTierHoldsItsLongestCommand(t *testing.T) {
 	if *grace != credentialProxyExecTierTerminationGraceSeconds {
 		t.Errorf("exec terminationGracePeriodSeconds = %d, want credentialProxyExecTierTerminationGraceSeconds (%d)", *grace, credentialProxyExecTierTerminationGraceSeconds)
 	}
+	longest := credentialProxyCommandTimeoutSeconds + credentialProxyCommandSlotWaitSeconds
+	if want := longest + credentialProxyExecTierStopMarginSeconds; credentialProxyExecTierTerminationGraceSeconds != want {
+		t.Errorf("credentialProxyExecTierTerminationGraceSeconds = %d, want the command timeout, the slot wait and the stop margin (%d)", credentialProxyExecTierTerminationGraceSeconds, want)
+	}
 	if got := broker.Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != credentialProxyTerminationGraceSeconds {
 		t.Errorf("broker terminationGracePeriodSeconds = %v, want credentialProxyTerminationGraceSeconds (%d) left as it was", got, credentialProxyTerminationGraceSeconds)
 	}

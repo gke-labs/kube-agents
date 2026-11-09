@@ -39,6 +39,33 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// How long an exec pod may take to stop (credential-broker-exec-tier.md §9
+// step 0). RollingUpdate keeps another replica serving while one rolls, so the
+// exec role drains for as long as the longest command it admits
+// (EXEC_SHUTDOWN_DRAIN_SECONDS, 360s, in credential_proxy.py), not for the
+// broker's bounded drain. tests/test_credential_proxy_drain_budget.py holds
+// these against the runtime's and the entrypoint's figures.
+const (
+	// The longest a command may run: credential_proxy.py's --timeout-seconds
+	// default, which no install can change, because the operator reserves
+	// CREDENTIAL_PROXY_TIMEOUT_SECONDS.
+	credentialProxyCommandTimeoutSeconds int64 = 300
+	// How long a request may wait for a command slot (credential_proxy.py's
+	// COMMAND_SLOT_WAIT_SECONDS). The drain does not refuse a request already
+	// waiting, so one queued at SIGTERM can be admitted and run for the whole
+	// timeout.
+	credentialProxyCommandSlotWaitSeconds int64 = 60
+	// What the stop does after the drain: the runtime's 5s end wait for the
+	// commands it ended, the entrypoint's poll, and its kill of Envoy
+	// (EXEC_RUNTIME_DRAIN_SECONDS, 370s, in deploy/shared/start-services.sh).
+	credentialProxyExecTierStopMarginSeconds int64 = 20
+	// The kubelet's wait between SIGTERM and SIGKILL for an exec pod: the
+	// timeout, the slot wait and the margin. A literal, so the drain-budget
+	// test reads the value that ships; TestTheExecTierHoldsItsLongestCommand
+	// holds it to the sum. An idle exec pod still exits after its 3s settle.
+	credentialProxyExecTierTerminationGraceSeconds int64 = 380
+)
+
 // The exec tier (docs/designs/credential-broker-exec-tier.md §3.3, names in
 // §12): stateless broker replicas beside the stateful broker, serving /v1/exec
 // and /v1/gcp/ only. Every name the tier renders is derived here.
@@ -157,32 +184,6 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 	return out
 }
 
-// credentialProxyCommandTimeoutSeconds is the longest a command may run on
-// the credential runtime: credential_proxy.py's --timeout-seconds default,
-// which no install can change, because the operator reserves
-// CREDENTIAL_PROXY_TIMEOUT_SECONDS.
-const credentialProxyCommandTimeoutSeconds int64 = 300
-
-// credentialProxyCommandSlotWaitSeconds is how long a request may wait for a
-// command slot (credential_proxy.py's COMMAND_SLOT_WAIT_SECONDS). The drain
-// does not refuse a request that is already waiting, so one queued at SIGTERM
-// can still be admitted and run for the whole timeout.
-const credentialProxyCommandSlotWaitSeconds int64 = 60
-
-// credentialProxyExecTierStopMarginSeconds holds what the stop does after the
-// drain: the runtime's 5s end wait for the commands it ended, the entrypoint's
-// poll, and its kill of Envoy (EXEC_RUNTIME_DRAIN_SECONDS, 370s, in
-// deploy/shared/start-services.sh).
-const credentialProxyExecTierStopMarginSeconds int64 = 20
-
-// credentialProxyExecTierTerminationGraceSeconds is how long the kubelet waits
-// between SIGTERM and SIGKILL for an exec pod: the exec role drains for as long
-// as the longest command it admits (EXEC_SHUTDOWN_DRAIN_SECONDS, 360s), since
-// RollingUpdate keeps another replica serving while it rolls. An idle exec pod
-// still exits after its 3s settle window.
-const credentialProxyExecTierTerminationGraceSeconds = credentialProxyCommandTimeoutSeconds +
-	credentialProxyCommandSlotWaitSeconds + credentialProxyExecTierStopMarginSeconds
-
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
 // stateful broker's, as rendered for this reconcile, so the image, the policy,
 // the caller authentication and the profile identities stay the same on both.
@@ -193,9 +194,10 @@ const credentialProxyExecTierTerminationGraceSeconds = credentialProxyCommandTim
 //     0: no exec call keeps state across calls, a second replica serves while
 //     one rolls, and a rollout needs no surge Pod. A stopping pod keeps its cpu
 //     and quota until it exits, so a step whose replacement has no room waits
-//     for it. At one replica a stopping pod refuses new requests as draining;
-//     the callers fall back to the stateful broker only once it stops
-//     accepting connections;
+//     for it. At one replica a stopping pod refuses new requests as draining
+//     until its replacement is Ready (for the whole drain when the replacement
+//     has no room); the callers fall back to the stateful broker only once it
+//     stops accepting connections;
 //   - the grace period (credentialProxyExecTierTerminationGraceSeconds): the
 //     exec role drains on SIGTERM for as long as the longest command it
 //     admits, not for the broker's bounded drain;
