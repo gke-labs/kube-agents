@@ -1806,7 +1806,7 @@ so a second tap asks again, and so does one whose patch Chat refused. One tap pe
 and the edits of one message in turn under its rewrite lock, each from the layout the adapter last
 sent it; a message posted before a restart is edited from the event's copy of it, text and buttons
 (`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
-found through the text's rows block instead, for one release. The report caps its rows at
+found through the text's rows block instead, for one release (#5235). The report caps its rows at
 `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on buttons in
 one list is not documented in a form this spec can cite and has not been measured, and a layout
 Chat refuses falls back to the text as any does.

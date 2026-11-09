@@ -411,9 +411,43 @@ func TestGchatBoardLineAndRowText(t *testing.T) {
 			t.Errorf("row text of %q = %q, want %q", tc.line, got, tc.want)
 		}
 	}
-	for _, row := range []gchatBoardRow{{n: 1, line: 0}, {n: 1, line: 1}, {n: 1, line: gchatBoardNoLine}} {
-		if _, err := gchatBoardRowLayout(gchatChatLayout{Text: "10. x"}, row, "l", true); !errors.Is(err, errGchatBoardRowGone) {
-			t.Errorf("row %+v found in %q: %v", row, "10. x", err)
+}
+
+// gchatBoardRowOf resolves the line a tap edits, once, and refuses a row
+// the text does not show at it: a line that does not start with the row's
+// marker, from the button or from the finder, is no row; the finder's
+// index is the one returned for a button that carries none; and the
+// remembered card's button line wins over the tap's only when the card is
+// remembered.
+func TestGchatBoardRowOfResolvesTheLineOnce(t *testing.T) {
+	rows := []chatmsg.Row{{Text: "x", Tasks: []string{"t_1"}, Actions: []string{"retry"}}}
+	tasks := []string{"t_1"}
+	withLine := gchatChatLayout{Text: "h\n\n1. x", Widgets: gchatButtonList(gchatBoardButtons(rows, 2))}
+	legacy := gchatWithoutLines(gchatChatLayout{Text: "h\n\n1. x", Widgets: gchatButtonList(gchatBoardButtons(rows, 2))})
+	for _, tc := range []struct {
+		name       string
+		layout     gchatChatLayout
+		remembered bool
+		tap        gchatBoardRow
+		want       int
+		ok         bool
+	}{
+		{"the tap's line, no record", withLine, false, gchatBoardRow{n: 1, line: 2}, 2, true},
+		{"the card's line over the tap's, remembered", withLine, true, gchatBoardRow{n: 1, line: 0}, 2, true},
+		{"the tap's line checked when not remembered", withLine, false, gchatBoardRow{n: 1, line: 0}, 0, false},
+		{"the tap's line over the finder on a legacy card", legacy, true, gchatBoardRow{n: 1, line: 2}, 2, true},
+		{"the finder's index for a legacy tap", legacy, true, gchatBoardRow{n: 1, line: gchatBoardNoLine}, 2, true},
+		{"a line past the text", withLine, false, gchatBoardRow{n: 1, line: 9}, 0, false},
+		{"a row the layout does not hold", withLine, true, gchatBoardRow{n: 2, line: 2}, 0, false},
+	} {
+		row, ok := gchatBoardRowOf(tc.layout, tc.remembered, tc.tap, tasks)
+		if ok != tc.ok || (ok && row.line != tc.want) {
+			t.Errorf("%s: row %+v, %v; want line %d, %v", tc.name, row, ok, tc.want, tc.ok)
+		}
+	}
+	for _, text := range []string{"10. x", "h\n\n10. x"} {
+		if row, ok := gchatBoardRowOf(gchatChatLayout{Text: text, Widgets: legacy.Widgets}, true, gchatBoardRow{n: 1, line: gchatBoardNoLine}, tasks); ok {
+			t.Errorf("row 1 found in %q at %+v", text, row)
 		}
 	}
 }
@@ -1010,8 +1044,8 @@ func TestGchatBoardTapLineIsCheckedAgainstTheCardItEdits(t *testing.T) {
 // and cards but shifts its line (a detail line added above the rows)
 // refreshes the record, and the remembered card's own button carries the
 // row's new line: the outcome is drawn on the row where it is now, not on
-// the line the tap's button named, and the row's buttons go with it. The
-// tap's line still rules out a row the re-layout moved to another number.
+// the line the tap's button named, and the row's buttons go with it, so a
+// later tap on the row from either card's button is stale.
 func TestGchatBoardReLayoutDuringTheRoundTripDrawsOnTheRowsNewLine(t *testing.T) {
 	a, f, _ := newBoardGchatAdapter(t)
 	postBoardCard(t, a)
@@ -1048,7 +1082,8 @@ func TestGchatBoardReLayoutDuringTheRoundTripDrawsOnTheRowsNewLine(t *testing.T)
 	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 2,Drop 2" {
 		t.Errorf("buttons = %v", texts)
 	}
-	// The row is settled: a tap on either card's button for it is stale.
+	// The row has settled and its buttons are gone, so a tap from either
+	// card's button for it finds no row to hold.
 	for _, line := range []string{"2", "4"} {
 		if _, reason := a.classify(gchatBoardTapAt(t, "drop", 1, "t_1,t_2", line)); reason != gchatBoardStale {
 			t.Errorf("a tap on the settled row at line %s: %q", line, reason)

@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -126,9 +125,6 @@ var (
 	}, "|") + ")" + gchatBoardSettledShape)
 	gchatBoardFailedLines = []string{slackBoardRetryFailed, slackBoardDropFailed}
 )
-
-// errGchatBoardRowGone is a tapped row no longer in the message's text.
-var errGchatBoardRowGone = errors.New("the tapped row is not in the message")
 
 // BoardAdmits answers whether the gateway would take a turn from author on
 // backend: the rule a board tap is admitted by on a backend with no Home tab
@@ -319,8 +315,9 @@ func gchatBoardLineOf(raw string) (line int, ok bool) {
 }
 
 // gchatBoardRow is a row by its number as drawn and its line in the text:
-// the one a tap's button names, or the one a tap edits (gchatBoardRowOf).
-// line is gchatBoardNoLine for a button that carries none.
+// the one a tap's button names (line gchatBoardNoLine for a button that
+// carries none), or the one a tap edits, its line resolved
+// (gchatBoardRowOf).
 type gchatBoardRow struct {
 	n, line int
 }
@@ -377,15 +374,8 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
 		return
 	}
-	layout, err := gchatBoardRowLayout(base, row, line, settled)
-	if errors.Is(err, errGchatBoardRowGone) {
-		a.releaseBoardTap(claim)
-		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
-		return
-	}
-	if err == nil {
-		err = a.patchLayout(message, layout)
-	}
+	layout := gchatBoardRowLayout(base, row, line, settled)
+	err = a.patchLayout(message, layout)
 	if err != nil || !settled {
 		a.releaseBoardTap(claim)
 	}
@@ -451,27 +441,24 @@ func gchatBoardLine(verb, outcome, name string, now time.Time) string {
 }
 
 // gchatBoardRowLayout is layout with the row's line put in: after the row's
-// text on its line (gchatBoardRowIndex), in place of the line an earlier
-// tap left, and the row's buttons gone when settled. errGchatBoardRowGone
-// when the text no longer shows the row where the tap's button put it.
-func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string, settled bool) (gchatChatLayout, error) {
+// text on its line, in place of the line an earlier tap left, and the row's
+// buttons gone when settled. row is as gchatBoardRowOf resolved it against
+// this layout, its line an index the text has.
+func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string, settled bool) gchatChatLayout {
 	lines := strings.Split(layout.Text, "\n")
-	i, ok := gchatBoardRowIndex(lines, row)
-	if !ok {
-		return gchatChatLayout{}, errGchatBoardRowGone
-	}
-	lines[i] = gchatBoardRowText(lines[i]) + gchatBoardNoteSep + line
+	lines[row.line] = gchatBoardRowText(lines[row.line]) + gchatBoardNoteSep + line
 	widgets := layout.Widgets
 	if settled {
 		widgets = gchatWithoutButtons(widgets, func(b map[string]any) bool {
 			return gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == strconv.Itoa(row.n)
 		})
 	}
-	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}, nil
+	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}
 }
 
-// gchatBoardRowOf is the row a tap on tap's row edits in layout, and
-// whether layout holds it: row n with those cards still drawing its buttons
+// gchatBoardRowOf is the row a tap on tap's row edits in layout, its line
+// resolved to the index of the row's line in the text, and whether layout
+// holds it: row n with those cards still drawing its buttons
 // (gchatBoardRowHolds), on a line that starts with its marker
 // (gchatBoardRowIndex). The line is taken in this order: the one layout's
 // own button for the row carries when the layout is remembered, since that
@@ -479,7 +466,8 @@ func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string,
 // shifted it moved the button's line with it; the tap's own line otherwise
 // (a copy read back from the click, after a restart, whose buttons are the
 // tap's); and, when neither carries one, the line the text's rows block
-// gives (gchatBoardRowsBlock, for buttons drawn before the parameter).
+// gives (gchatBoardRowsBlock, for buttons drawn before the parameter). The
+// marker is checked here once; gchatBoardRowLayout edits the index as is.
 func gchatBoardRowOf(layout gchatChatLayout, remembered bool, tap gchatBoardRow, tasks []string) (gchatBoardRow, bool) {
 	held, holds := gchatBoardRowHolds(layout, tap.n, tasks)
 	if !holds {
@@ -489,9 +477,11 @@ func gchatBoardRowOf(layout gchatChatLayout, remembered bool, tap gchatBoardRow,
 	if remembered && held != gchatBoardNoLine {
 		row.line = held
 	}
-	if _, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), row); !ok {
+	i, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), row)
+	if !ok {
 		return gchatBoardRow{}, false
 	}
+	row.line = i
 	return row, true
 }
 
@@ -550,7 +540,7 @@ func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) (line int
 // This is the path for cards posted before gchatBoardParamLine existed,
 // whose buttons name no line; a daily card lives up to a day, so a deploy
 // in the middle of one would otherwise leave its buttons dead. Remove it,
-// and gchatBoardNoLine, one release after the parameter shipped.
+// and gchatBoardNoLine, one release after the parameter shipped (#5235).
 func gchatBoardRowsBlock(lines []string) (start, count int) {
 	first := fmt.Sprintf(gchatBoardRowMarker, 1)
 	for i := range lines {
