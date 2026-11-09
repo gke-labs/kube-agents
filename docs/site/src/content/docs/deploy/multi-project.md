@@ -95,7 +95,9 @@ them before they followed the scope, and on an installer-made install, which
 always carries a `spec.scope` block, it no longer does. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
 same way, and an excluded cluster is left out of fleet answers and the per-cluster audits as well as getting no
-Cluster Agent; a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
+Cluster Agent (an excluded cluster's project keeps its read roles, so the exclusion
+is not yet enforced against a worker that fetches the cluster's credentials itself;
+see [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope)); a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
 matches, gets no drift sink. To keep a project in the scope and out of the
 export, add
 `TF_VAR_drift_pubsub_source_exclude_projects=<project id>` to `install.env`: the
@@ -303,7 +305,9 @@ On an install you manage with Helm or `kubectl` directly:
    (`projectId`, `location`, `clusterName`). A profile the scope never
    produced is kept (listed under `unmanaged` in `fleet_scope.json`), so
    dropping the project alone leaves it in place; an excluded cluster loses its
-   profile on the next run.
+   profile on the next run. Excluding the cluster is not yet enforced against a
+   worker that fetches its credentials itself, so it stays readable until the
+   next step revokes the project's roles.
 3. Revoke the IAM bindings on the target project so the Platform Agent stops
    querying it. The scheduled audits stopped when the project left `spec.scope`;
    on a `PlatformAgent` with no `scope` block they stop here. A folder-level

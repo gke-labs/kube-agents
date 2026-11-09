@@ -1627,6 +1627,10 @@ platformAgent:
   #         - projectId: payments-staging
   #           location: us-central1
   #           clusterName: scratch-cluster
+  # An excluded cluster is left out of what the agents look at, but that is not
+  # yet enforced: the agent's read roles still reach it, so a worker that
+  # fetches its credentials itself can read it. A project the agent holds no
+  # roles in is what keeps it off a cluster.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the

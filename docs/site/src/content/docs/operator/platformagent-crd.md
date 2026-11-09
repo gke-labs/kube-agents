@@ -1061,6 +1061,12 @@ spec:
   subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
   third-party `gke` MCP server's `list_clusters`.
 
+  Excluding a cluster narrows what the agents look at, but it is not yet enforced. The credential
+  proxy still issues a kubeconfig for an excluded cluster. So a worker that fetches the cluster's
+  credentials itself (`gcloud container clusters get-credentials`) can still read it with the
+  agent's read roles. Those are granted per project and reach every cluster in it. To keep the agent
+  off a cluster, put the cluster in a project the agent holds no roles in.
+
 ### Project outcomes
 
 Each project the reconcile resolves reads one outcome in the run's snapshot:

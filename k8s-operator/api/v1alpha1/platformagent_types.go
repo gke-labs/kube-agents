@@ -201,6 +201,11 @@ type ScopeExcludeSpec struct {
 	// it out. Still covering it: the daily upgrade-readiness watch, the
 	// networking audit's subnet usage, the GCE audit's instance listing, and
 	// the third-party gke MCP server's list_clusters.
+	// Excluding a cluster narrows what the agents look at, but it is not yet
+	// enforced: the credential proxy still issues a kubeconfig for an excluded
+	// cluster, so a worker that fetches the cluster's credentials itself can
+	// still read it with the agent's read roles. To keep the agent off a
+	// cluster, put it in a project the agent holds no roles in.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId
