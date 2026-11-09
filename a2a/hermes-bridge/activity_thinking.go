@@ -972,7 +972,42 @@ func extractLeadingCommand(cmd string) (bin, sub string) {
 // rule, the extra spellings text uses (pass, pwd, auth, a key file's
 // extension), and the all-caps env-style suffixes.
 func inlineSecretKey(k string) bool {
-	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
+	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k) || qualifiedSecretKey(k)
+}
+
+// qualifiedSecretKey says whether a key's credential word is followed only
+// by a digit suffix (password_2, PASSWORD2, password1) or by qualifiers
+// that still name the credential's own value (password_hash,
+// DB_PASSWORD_VALUE, tokenValue, passwordConfirm, db_password_b64): the
+// value under it is the credential, or a form of it. An _id, _name, _file,
+// _ttl or _ref after the word names something else and is not one.
+func qualifiedSecretKey(k string) bool {
+	return qualifiedSecretKeyPattern.MatchString(snakeKey(k))
+}
+
+var qualifiedSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|_)(?:token|secret|password|passwd|passphrase|api_?key|private_?key|access_?key|secret_?key|credential)s?(?:_?[0-9]+|_(?:value|val|hash|hashed|confirm|confirmation|b64|base64|enc|encoded|plain|plaintext|raw|hex|str|string|text|bytes|data|old|new|current|prev|previous|literal))+$`)
+
+// snakeKey spells a key with underscores between its components: a dot or
+// hyphen becomes one, and one goes between a camelCase key's words
+// (tokenValue, APIKeyHash). A digit stays joined to the word before it.
+func snakeKey(k string) string {
+	var sb strings.Builder
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		if c == '.' || c == '-' {
+			sb.WriteByte('_')
+			continue
+		}
+		if i > 0 && c >= 'A' && c <= 'Z' {
+			p := k[i-1]
+			nextLower := i+1 < len(k) && k[i+1] >= 'a' && k[i+1] <= 'z'
+			if p >= 'a' && p <= 'z' || p >= '0' && p <= '9' || (p >= 'A' && p <= 'Z' && nextLower) {
+				sb.WriteByte('_')
+			}
+		}
+		sb.WriteByte(c)
+	}
+	return sb.String()
 }
 
 // The value policy under a key inlineSecretKey accepts depends on what the
@@ -980,8 +1015,11 @@ func inlineSecretKey(k string) bool {
 //
 //   - a strong key names the credential itself: its last component is the
 //     credential word (db_password, accessToken, X-Api-Key, Authorization,
-//     PGPASSWORD, AWS_CREDS, tls.key). Its value is redacted unless it is
-//     plainly not a value (valueNotASecret);
+//     PGPASSWORD, AWS_CREDS, tls.key), or the word is followed only by a
+//     digit suffix or a qualifier naming its value (qualifiedSecretKey:
+//     password_2, passwordConfirm, DB_PASSWORD_VALUE). Its value is redacted
+//     unless it is plainly not a value (valueNotASecret), a passphrase or
+//     any other plain word included;
 //   - an ambiguous key is one of the short words ordinary text also uses as
 //     a label (pass, pwd, auth). Its value is redacted unless it is plainly
 //     not a value, a path, prose (more than one word, or a lower-case word
@@ -1014,7 +1052,7 @@ func secretKeyClassOf(k string) secretKeyClass {
 // word (secretKeyClass).
 func strongSecretKey(k string) bool {
 	return strongSecretKeyEndPattern.MatchString(k) || strongSecretCamelEndPattern.MatchString(k) ||
-		redactedUpperSuffixPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
+		redactedUpperSuffixPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k) || qualifiedSecretKey(k)
 }
 
 var (
@@ -1265,14 +1303,16 @@ var (
 // keyClearlyNamesSecret says whether a key's last component is password,
 // passwd, passphrase, secret, token or api key, singular: the value under
 // it is a credential whatever it looks like. A *_KEY or *_ID name, a key
-// carrying the word elsewhere, the ambiguous pass, pwd and auth, a plural
+// carrying the word elsewhere (but for qualifiedSecretKey's digit and value
+// qualifiers), the ambiguous pass, pwd and auth, a plural
 // (Mountable secrets, Tokens), the bare word secret and a key naming a
 // Secret object (existingSecret) do not.
 func keyClearlyNamesSecret(k string) bool {
 	if strings.EqualFold(k, "secret") || secretReferenceKeyPattern.MatchString(k) {
 		return false
 	}
-	return clearSecretKeyEndPattern.MatchString(k) || clearSecretCamelEndPattern.MatchString(k) || clearSecretUpperEndPattern.MatchString(k)
+	return clearSecretKeyEndPattern.MatchString(k) || clearSecretCamelEndPattern.MatchString(k) || clearSecretUpperEndPattern.MatchString(k) ||
+		qualifiedSecretKey(k)
 }
 
 // inlineScrubRule is one step of scrubInlineSecrets, in order.
@@ -1381,11 +1421,13 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 // authSchemeCredentialRedacted says whether a credential after a scheme
 // word is redacted here: not where an Authorization key leads it on its
 // line (the key=value rule takes the whole value there, a Digest's
-// parameters included). After Bearer or Basic, which prose uses only as an
-// adjective, any credential of 8 bytes or more is redacted unless it is one
-// word in lower case or capitalised ("basic monitoring", "Basic
-// Authentication"). After the other scheme words, which are ordinary
-// English too (a token, a digest), only a token-shaped one.
+// parameters included). After Bearer or Basic, as before this rule had
+// value shapes, any credential of 8 bytes or more is redacted unless it is
+// one of the dictionary words prose puts after either, in lower case or
+// capitalised ("basic monitoring", "Basic Authentication",
+// authSchemeProseWords): an all-letter credential is redacted. After the
+// other scheme words, which are ordinary English too (a token, a digest),
+// only a token-shaped one.
 func authSchemeCredentialRedacted(s string, m []int) bool {
 	lineStart := strings.LastIndexByte(s[:m[0]], '\n') + 1
 	if authHeaderKVLeadPattern.MatchString(s[lineStart:m[0]]) {
@@ -1394,9 +1436,32 @@ func authSchemeCredentialRedacted(s string, m []int) bool {
 	cred := trimValueEdges(s[m[4]:m[5]])
 	switch strings.ToLower(s[m[2]:m[3]]) {
 	case "bearer", "basic":
-		return len(cred) >= 8 && !isPlainWord(cred)
+		return len(cred) >= 8 && !(isPlainWord(cred) && authSchemeProseWords[strings.ToLower(cred)])
 	}
 	return valueTokenShaped(cred)
+}
+
+// authSchemeProseWords are the dictionary words of eight letters or more
+// that prose puts after Bearer or Basic as an adjective. A shorter word is
+// never redacted there (the eight-byte floor).
+var authSchemeProseWords = map[string]bool{
+	"authentication": true, "authenticated": true, "authenticating": true, "authorization": true,
+	"authorisation": true, "authorized": true, "credential": true, "credentials": true, "password": true,
+	"passwords": true, "username": true, "usernames": true, "security": true, "protocol": true,
+	"protocols": true, "challenge": true, "challenges": true, "settings": true, "configuration": true,
+	"configured": true, "information": true, "knowledge": true, "understanding": true,
+	"troubleshooting": true, "monitoring": true, "networking": true, "functionality": true,
+	"connectivity": true, "operations": true, "operation": true, "commands": true, "workloads": true,
+	"workflow": true, "workflows": true, "validation": true, "verification": true, "scheduling": true,
+	"observability": true, "permissions": true, "principal": true, "principals": true, "requests": true,
+	"response": true, "responses": true, "required": true, "optional": true, "enabled": true,
+	"disabled": true, "supported": true, "features": true, "endpoint": true, "endpoints": true,
+	"mechanism": true, "mechanisms": true, "strategy": true, "approach": true, "examples": true,
+	"scenario": true, "scenarios": true, "guidance": true, "overview": true, "concepts": true,
+	"metrics": true, "logging": true, "alerting": true, "policies": true, "template": true,
+	"templates": true, "structure": true, "standard": true, "requirements": true, "properties": true,
+	"principle": true, "principles": true, "checklist": true, "constraints": true, "privileges": true,
+	"identity": true, "identities": true, "accounts": true, "resources": true, "services": true,
 }
 
 // isPlainWord says whether w is letters only, in lower case after an

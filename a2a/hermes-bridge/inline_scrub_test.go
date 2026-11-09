@@ -295,3 +295,48 @@ func TestScrubInlineSecretsMarkdownLayouts(t *testing.T) {
 		}
 	}
 }
+
+// The strictness the scrubber had before value shapes, on every surface
+// (titles, card reports, the debug error line, answers): a key whose
+// credential word is followed by a digit suffix or a value qualifier is a
+// strong key; a passphrase or other plain word under a strong key is
+// redacted; an all-letter credential after Bearer or Basic is redacted
+// unless it is a dictionary word prose puts there. Every value is
+// synthetic.
+func TestScrubInlineSecretsKeepsTheStrictnessOfBefore(t *testing.T) {
+	positives := []struct{ in, want string }{
+		{"password_hash=lanternmeadowx", "password_hash=[redacted]"},
+		{"DB_PASSWORD_VALUE=lanternmeadowfield", "DB_PASSWORD_VALUE=[redacted]"},
+		{"db_password_b64: bGFudGVybm1lYWRvdw", "db_password_b64: [redacted]"},
+		{"tokenValue: lanternmeadow", "tokenValue: [redacted]"},
+		{"passwordConfirm: lanternmeadow", "passwordConfirm: [redacted]"},
+		{"password_2: lanternmeadow", "password_2: [redacted]"},
+		{"REDIS_PASSWORD_2=lantern-meadow-field", "REDIS_PASSWORD_2=[redacted]"},
+		{"password1: lanternmeadow", "password1: [redacted]"},
+		{"PASSWORD2=lanternmeadow", "PASSWORD2=[redacted]"},
+		{"DB_PASSWORD=lanternmeadowfield", "DB_PASSWORD=[redacted]"},
+		{"password: lantern-meadow-field", "password: [redacted]"},
+		{"api_key: lanternmeadow1", "api_key: [redacted]"},
+		{"Bearer lanternmeadowfield", "Bearer [redacted]"},
+		{"BEARER lanternmeadowfield", "BEARER [redacted]"},
+		{"Bearer\tLanternmeadow", "Bearer\t[redacted]"},
+		{"Basic lanternmeadowfield", "Basic [redacted]"},
+		{"authorization:\n  Bearer lanternmeadowfield", "authorization:\n  Bearer [redacted]"},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	negatives := []string{
+		"Enable Basic Authentication and bearer credentials on the ingress.",
+		"Run basic troubleshooting, then basic connectivity checks.",
+		"token_count: 1234, token_ttl: 30m, password_file: /etc/app/db-pass, private_key_id_ref: x",
+		"Bearer tokens are short-lived.",
+	}
+	for _, in := range negatives {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
