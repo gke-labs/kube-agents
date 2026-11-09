@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -154,7 +155,7 @@ func TestGchatQuotedSpaceMessageWithWordsPutsTheWordsFirst(t *testing.T) {
 		t.Errorf("a member who typed words does not get the bare opening: %q", msg.Text)
 	}
 	msg.Text, msg.MessageID = plainMsg.Text, plainMsg.MessageID
-	if msg != plainMsg {
+	if !reflect.DeepEqual(msg, plainMsg) {
 		t.Errorf("a quoted ask = %+v differs from the plain message %+v beyond its text", msg, plainMsg)
 	}
 }
@@ -837,7 +838,7 @@ func TestGchatQuotedAskCutShortByShutdownPostsNothing(t *testing.T) {
 				t.Fatal("quotedAsk did not return after its context ended")
 			}
 			once.Do(func() { close(release) })
-			if reason != gchatShuttingDownReason || msg != (InboundMessage{}) {
+			if reason != gchatShuttingDownReason || !reflect.DeepEqual(msg, InboundMessage{}) {
 				t.Errorf("turn = %+v (%q), want no turn with the shutdown reason", msg, reason)
 			}
 			if got := postedTexts(f); len(got) != 0 {
