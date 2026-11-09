@@ -1,0 +1,25 @@
+# Pods the operator starts in the release namespace on a schedule, under
+# platformAgent.mode: next, that no golden renders, so footprint.yaml has no
+# entry for them. The quota preflight adds each one here when the chart can
+# tell it will run.
+#
+# Hand-kept, and held to the operator by
+# TestTheChartCountsTheScopePublishersJobPod (k8s-operator/internal/controller):
+# the pod's summed requests and limits, how many run at once, and which scope
+# fields give it something to resolve. A change to one side alone fails that
+# test.
+#
+# scopePublisher: the Job that resolves the declared folders, organizations,
+# Shared VPC hosts and Metrics Scopes into projects, every 15 minutes, never
+# two at once (#4816). It runs only where the chart renders the gateway pod
+# admission policy (or operator.extraEnv sets A2A_GATEWAY_POD_POLICY) and
+# platformAgent.scope names at least one entry in a scopeMembers list.
+scopePublisher:
+  pods: 1
+  scopeMembers: [folders, organizations, sharedVpcHosts, metricsScopes]
+  cpuMillisRequest: 50
+  cpuMillisLimit: 500
+  memoryBytesRequest: 201326592
+  memoryBytesLimit: 536870912
+  ephemeralStorageBytesRequest: 0
+  ephemeralStorageBytesLimit: 0

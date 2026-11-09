@@ -53,6 +53,7 @@ that ships.
 
 import json
 import pathlib
+import tempfile
 import re
 import shlex
 import subprocess
@@ -1870,6 +1871,42 @@ class BridgeImageBuildTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("built FROM this run's platform image", result.stderr)
         self.assertEqual(result.stdout, "")
+
+
+
+class CrStatusReportTest(unittest.TestCase):
+    """report_cr_status: the agent's full status, which names the model the
+    install serves, goes to the job's artifacts; the job log, which Prow
+    streams to anyone while a run is in progress, gets the phase and the
+    Ready condition only."""
+
+    def test_the_log_line_names_no_model_and_the_artifact_holds_the_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_bash(
+                "\n".join(
+                    [
+                        f'export ARTIFACTS="{tmp}/artifacts"',
+                        'export NAMESPACE="kubeagents-system"',
+                        'PLATFORM_AGENT_CR_NAME="platform-agent"',
+                        "kubectl() {",
+                        '  case "$*" in',
+                        '    *"-o yaml"*) printf "status:\\n  phase: Running\\n  inference:\\n    model: secret-model-name\\n    provider: vertex_ai\\n" ;;',
+                        '    *jsonpath*) printf "Running\\tAgentReady: the agent is up" ;;',
+                        "  esac",
+                        "}",
+                        lifted_block("readonly DEPLOY_ARTIFACT_DIR=", "readonly CR_PHASE_READY_JSONPATH", "the artifact dir and status constants"),
+                        shell_function("report_cr_status"),
+                        'report_cr_status "probe"',
+                    ]
+                )
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("secret-model-name", result.stdout + result.stderr)
+            self.assertIn("Running", result.stdout)
+            self.assertIn("AgentReady", result.stdout)
+            artifact = pathlib.Path(tmp) / "artifacts" / "platformagent-status-probe.yaml"
+            self.assertTrue(artifact.exists(), result.stdout)
+            self.assertIn("secret-model-name", artifact.read_text())
 
 
 if __name__ == "__main__":

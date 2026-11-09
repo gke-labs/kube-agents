@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -689,4 +690,111 @@ func pollUntilWithin(d time.Duration, cond func() bool) bool {
 		time.Sleep(50 * time.Millisecond)
 	}
 	return false
+}
+
+// giveUpLeader gives up on the bus at its first n term starts, then starts
+// terms as fakeLeader does.
+type giveUpLeader struct {
+	fakeLeader
+	giveUps int
+	tries   int
+}
+
+func (g *giveUpLeader) BeginTerm(ctx context.Context) (uint64, error) {
+	g.mu.Lock()
+	g.tries++
+	if g.tries <= g.giveUps {
+		g.mu.Unlock()
+		return 0, fmt.Errorf("%w for 60s: nats: timeout", errTermBusGaveUp)
+	}
+	g.mu.Unlock()
+	return g.fakeLeader.BeginTerm(ctx)
+}
+
+func (g *giveUpLeader) attempts() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.tries
+}
+
+// TestABusGiveUpCampaignsAgainInProcess: alone, a gateway whose term start
+// gave up on the bus releases the lease, stands back, and retakes it without
+// Run returning (a return is the process exiting, and a restart loop under
+// the kubelet's backoff).
+func TestABusGiveUpCampaignsAgainInProcess(t *testing.T) {
+	cs := fake.NewClientset(heldLease("", 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	leader := &giveUpLeader{giveUps: 1}
+	e := Election{
+		Client: cs, Namespace: testNamespace, Lease: testLease, Identity: "pod-a",
+		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+	}
+	leading := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- e.Run(ctx, leader, func(ctx context.Context, _ RunOptions) error {
+			leading <- struct{}{}
+			<-ctx.Done()
+			return nil
+		})
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned after a bus give-up: %v", err)
+	case <-leading:
+	case <-time.After(4 * testLeaseDuration):
+		t.Fatal("never led again after the bus give-up")
+	}
+	if leader.started() != 1 {
+		t.Fatalf("terms started = %d, want 1 after one give-up", leader.started())
+	}
+	cancel()
+	if err := receive(t, done, 5*time.Second, "Run to return"); err != nil {
+		t.Fatalf("Run after SIGTERM = %v, want nil", err)
+	}
+}
+
+// TestABusGiveUpHandsTheLeaseToTheStandby: the standing back is what lets a
+// standby whose bus works take the lease, rather than the replica that gave
+// up winning it straight back.
+func TestABusGiveUpHandsTheLeaseToTheStandby(t *testing.T) {
+	cs := fake.NewClientset(heldLease("", 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// One give-up: a pod-a that campaigned again at once would win the
+	// lease it just released and lead.
+	leader := &giveUpLeader{giveUps: 1}
+	e := Election{
+		Client: cs, Namespace: testNamespace, Lease: testLease, Identity: "pod-a",
+		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+	}
+	aLed := make(chan struct{}, 1)
+	go func() {
+		_ = e.Run(ctx, leader, func(ctx context.Context, _ RunOptions) error {
+			aLed <- struct{}{}
+			<-ctx.Done()
+			return nil
+		})
+	}()
+	// pod-a takes the released lease first and gives up on its bus.
+	deadline := time.Now().Add(5 * time.Second)
+	for leader.attempts() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("pod-a never tried a term")
+		}
+		time.Sleep(testRetryPeriod / 4)
+	}
+	b := runCampaign(t, cs, "pod-b")
+	select {
+	case <-aLed:
+		t.Fatal("pod-a won back the lease it gave up, ahead of the standby")
+	case <-b.leading:
+	case <-time.After(3 * testLeaseDuration):
+		t.Fatal("pod-b never led after pod-a's give-up")
+	}
+	never(t, aLed, 2*testLeaseDuration, "pod-a led while pod-b held the lease")
+	if h := leaseHolder(t, cs); h != "pod-b" {
+		t.Fatalf("lease holder = %q, want pod-b", h)
+	}
 }

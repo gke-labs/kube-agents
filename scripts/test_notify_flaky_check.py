@@ -420,7 +420,7 @@ class FingerprintTest(unittest.TestCase):
 class OccurrenceTest(unittest.TestCase):
     def test_the_row_names_the_re_runner_not_the_actor(self):
         """`actor` on a dependabot pull request is dependabot, and on `main`
-        it is Tide. The person who clicked re-run is `triggering_actor` of the
+        it is the merge queue's bot. The person who clicked re-run is `triggering_actor` of the
         green attempt, and is who a reader would want to ask."""
         record = reporter.occurrence(attempt(2, "success"), attempt(1, "failure"), 1321)
         self.assertEqual(record["rerun_by"], "bradhoekstra")

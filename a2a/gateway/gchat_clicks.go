@@ -347,6 +347,8 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		return InboundMessage{}, "a click event with no click"
 	}
 	switch click.Function {
+	case gchatStopFunction:
+		return a.classifyStop(ev)
 	case gchatFeedbackFunction:
 		// A rating tap is never a turn (gchat_feedback.go).
 		return InboundMessage{}, a.feedbackClick(ev)
@@ -445,6 +447,13 @@ func gchatClickID(message, eventTime string) string {
 		return message
 	}
 	return message + gchatClickIDSep + eventTime
+}
+
+// gchatClickMessage is the message a click id names (gchatClickID): the
+// message a stale Stop press is answered on (chatStopStale).
+func gchatClickMessage(id string) string {
+	message, _, _ := strings.Cut(id, gchatClickIDSep)
+	return message
 }
 
 // gchatMessageButtons reads a clicked message's own buttons, told apart by

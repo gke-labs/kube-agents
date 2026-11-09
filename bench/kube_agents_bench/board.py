@@ -79,7 +79,7 @@ ids = [a for a in sys.argv[4:] if a]
 # Seconds a read waits on a locked store before giving up. A hermes writer
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"statuses": {}, "summaries": {}, "errors": {}, "error": None}
+out = {"statuses": {}, "summaries": {}, "errors": {}, "kinds": {}, "error": None}
 
 
 def has_table(conn, name):
@@ -97,13 +97,22 @@ try:
     marks = ",".join("?" for _ in ids)
     cols = columns(conn, "tasks")
     has_lfe = "last_failure_error" in cols
-    query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (", last_failure_error" if has_lfe else "", marks)
+    has_kind = "block_kind" in cols
+    extra = (", last_failure_error" if has_lfe else "") + (", block_kind" if has_kind else "")
+    query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (extra, marks)
     rows = conn.execute(query, ids).fetchall()
     for row in rows:
         tid, status = row[0], row[1]
         out["statuses"][str(tid)] = str(status)
-        if has_lfe and len(row) > 2 and row[2]:
-            out["errors"][str(tid)] = str(row[2])
+        rest = list(row[2:])
+        if has_lfe:
+            lfe = rest.pop(0)
+            if lfe:
+                out["errors"][str(tid)] = str(lfe)
+        if has_kind:
+            kind = rest.pop(0)
+            if kind:
+                out["kinds"][str(tid)] = str(kind)
     if has_table(conn, "task_runs"):
         run_cols = columns(conn, "task_runs")
         if "summary" in run_cols:
@@ -379,6 +388,35 @@ def command(task_ids: list[str]) -> str:
     )
 
 
+@dataclass(frozen=True)
+class BoardCard:
+    """One awaited card as the board's own tables hold it: ``status`` and
+    ``block_kind`` from ``tasks``, ``summary`` from the newest ``task_runs``
+    row, ``error`` from ``tasks.last_failure_error`` or that row. Read from
+    the store, never from a tool result, so a scorer keyed on it reads what
+    hermes wrote and not what a model said."""
+
+    status: str
+    summary: str | None = None
+    error: str | None = None
+    block_kind: str | None = None
+
+
+def read_board_cards(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> dict[str, BoardCard] | None:
+    """Each of ``task_ids`` the board has a row for, as a :class:`BoardCard`;
+    ``None`` when the read failed."""
+    state = _read_board(shell, task_ids, timeout)
+    if state is None:
+        return None
+    statuses, summaries, errors, kinds = state
+    return {
+        tid: BoardCard(status, summaries.get(tid), errors.get(tid), kinds.get(tid))
+        for tid, status in statuses.items()
+    }
+
+
 def read_board_state(
     shell: Callable[[str, float], str], task_ids: list[str], timeout: float
 ) -> tuple[dict[str, str], dict[str, str], dict[str, str]] | None:
@@ -386,6 +424,13 @@ def read_board_state(
 
     Returns a 3-tuple of (statuses, summaries, errors), or None if the read failed.
     """
+    state = _read_board(shell, task_ids, timeout)
+    return state[:3] if state is not None else None
+
+
+def _read_board(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]] | None:
     if not task_ids:
         return None
     reply = shell(command(task_ids), timeout)
@@ -412,7 +457,9 @@ def read_board_state(
     matched_summaries = {str(k): str(v) for k, v in summaries.items() if k in task_ids}
     errors = payload.get("errors") or {}
     matched_errors = {str(k): str(v) for k, v in errors.items() if k in task_ids}
-    return matched_statuses, matched_summaries, matched_errors
+    kinds = payload.get("kinds") or {}
+    matched_kinds = {str(k): str(v) for k, v in kinds.items() if k in task_ids}
+    return matched_statuses, matched_summaries, matched_errors, matched_kinds
 
 
 def read_statuses(

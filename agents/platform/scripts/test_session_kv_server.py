@@ -13386,11 +13386,46 @@ class TestDataVolumeWarning(unittest.TestCase):
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
             self._check_at(80)
         self.assertTrue(any("all-clear was not accepted by any enabled chat platform" in line for line in logs.output))
-        self.assertTrue(session_kv_server._data_volume_warned())
+        self.assertNotEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
         self.post.return_value = "thread-2"
         self._check_at(80)
         self.assertEqual(self.post.call_count, 3)
-        self.assertFalse(session_kv_server._data_volume_warned())
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
+
+    def test_a_refill_after_a_refused_all_clear_is_a_new_crossing(self):
+        self._check_at(95)
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self._check_at(80)
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_CLEAR_PENDING)
+        # Between the lines the pending all-clear neither retries nor warns.
+        self._check_at(87)
+        self.assertEqual(self.post.call_count, 2)
+        self.post.return_value = "thread-2"
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertEqual(self.post.call_count, 3)
+        self.assertTrue(self.post.call_args.args[1].startswith("The agent's data volume is 95% full"))
+        self.assertTrue(any("data volume is 95% full" in line for line in logs.output))
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_WARNED)
+        self._check_at(96)
+        self.assertEqual(self.post.call_count, 3)
+
+    def test_a_refused_refill_warning_is_tried_again_and_the_all_clear_still_follows(self):
+        self._check_at(95)
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self._check_at(80)
+            self._check_at(95)
+        self.assertEqual(self.post.call_count, 3, "the refill's warning was not tried")
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self._check_at(95)
+        self.assertEqual(self.post.call_count, 4, "a refused refill warning was not tried again")
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_CLEAR_PENDING)
+        self.post.return_value = "thread-2"
+        self._check_at(80)
+        self.assertEqual(self.post.call_args.args[1], "The agent's data volume is back to 80% full (8.0 of 10.0 GiB).")
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
 
     def test_no_chat_platform_logs_the_all_clear_and_rearms(self):
         self._check_at(95)
@@ -13401,13 +13436,13 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.assertEqual(self.post.call_count, 1)
         self.assertTrue(any("data volume is back to 80% full" in line for line in logs.output))
         self.assertTrue(any("all-clear is in this log and nowhere else" in line for line in logs.output))
-        self.assertFalse(session_kv_server._data_volume_warned())
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
 
     def test_a_restart_above_the_line_does_not_post_again(self):
         self._check_at(95)
         self.assertEqual(self.post.call_count, 1)
         # The warned flag is on the session database, not in this process.
-        self.assertTrue(session_kv_server._data_volume_warned())
+        self.assertNotEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
         self._check_at(95)
         self.assertEqual(self.post.call_count, 1)
 
@@ -13416,11 +13451,11 @@ class TestDataVolumeWarning(unittest.TestCase):
         with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
             self._check_at(95)
         self.assertTrue(any("not accepted by any enabled chat platform" in line for line in logs.output))
-        self.assertFalse(session_kv_server._data_volume_warned())
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
         self.post.return_value = "thread-2"
         self._check_at(95)
         self.assertEqual(self.post.call_count, 2)
-        self.assertTrue(session_kv_server._data_volume_warned())
+        self.assertNotEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
 
     def test_a_post_cut_off_before_it_returns_does_not_silence_the_crossing(self):
         # A pod roll can kill the process during the send. An exception out of
@@ -13428,11 +13463,11 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.post.side_effect = RuntimeError("killed during the send")
         with self.assertRaises(RuntimeError):
             self._check_at(95)
-        self.assertFalse(session_kv_server._data_volume_warned())
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
         self.post.side_effect = None
         self._check_at(95)
         self.assertEqual(self.post.call_count, 2)
-        self.assertTrue(session_kv_server._data_volume_warned())
+        self.assertNotEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
 
     def test_no_chat_platform_logs_the_warning_and_stops(self):
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \
@@ -13448,7 +13483,7 @@ class TestDataVolumeWarning(unittest.TestCase):
         with patch.object(session_kv_server.kanban_board_health, "data_volume_usage", return_value=None):
             session_kv_server.check_data_volume()
         self.post.assert_not_called()
-        self.assertFalse(session_kv_server._data_volume_warned())
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
 
     def test_an_empty_agent_home_measures_the_default_volume(self):
         # As the entrypoint and gitops_workspace read it: an empty value is
