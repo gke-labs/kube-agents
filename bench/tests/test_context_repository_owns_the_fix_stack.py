@@ -282,6 +282,24 @@ def test_the_registration_joins_other_entries_and_is_not_added_twice():
     assert not any("patch" in c for c in host2.calls)
 
 
+def test_a_stale_mount_with_the_repository_at_another_ref_does_not_end_the_wait():
+    # The ConfigMap is clean, but kubelet has not yet refreshed the mounts,
+    # which still carry an earlier run's entry at another ref (or a URL that
+    # extends the stack's). The wait ends only when the mounts carry the
+    # stack's own entry.
+    stale = json.dumps([{**CONTEXT_ENTRY, "ref": "v0.4.2"}, {**CONTEXT_ENTRY, "url": CONTEXT_URL + "-canary"}])
+    host = FakeHost(mount_lag=10_000)
+    host.mount_value_at_lag_start = stale
+    with pytest.raises(RuntimeError, match="did not see"):
+        _stack(FakeGitHub(), host).plant()
+    synced = FakeHost(mount_lag=3)
+    synced.mount_value_at_lag_start = stale
+    clock = FakeClock()
+    _stack(FakeGitHub(), synced, clock=clock).plant()
+    assert plant.MOUNT_POLL_S in clock.sleeps
+    assert clock.sleeps[-1] == plant.BROKER_CACHE_S
+
+
 def test_an_entry_for_the_repository_with_another_ref_stops_the_plant_and_stays():
     other_ref = {**CONTEXT_ENTRY, "ref": "v0.4.2"}
     host = FakeHost(configmap={"context_repos": json.dumps([other_ref])})

@@ -625,11 +625,23 @@ class Stack:
         log(f"removed {self.settings.context_url} from {CONTEXT_REPOS_KEY}")
 
     def mount_carries_entry(self, target: str, container: str) -> bool:
+        """The mounted list holds the stack's own entry (type, URL and ref).
+
+        Parsed, not searched: a stale mount from an earlier run, or an entry
+        whose URL extends the stack's, carries the URL as text before kubelet
+        has synced the registration.
+        """
         code, out, _ = self.kubectl(
             "-n", self.settings.agent_namespace, "exec", target, "-c", container, "--",
             "cat", f"{GITOPS_STATE_DIR}/{CONTEXT_REPOS_KEY}",
         )
-        return code == 0 and self.settings.context_url in out
+        if code != 0 or not out.strip():
+            return False
+        try:
+            entries = json.loads(out)
+        except ValueError:
+            return False
+        return isinstance(entries, list) and any(self.is_registration(entry) for entry in entries)
 
     def wait_for_mounts(self) -> None:
         """Until the broker and the shell sandbox see the entry, then the broker's cache window."""
