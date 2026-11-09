@@ -466,7 +466,7 @@ class LiteLLMAccounting(unittest.TestCase):
         self.assertEqual((total["unpriced_requests"], total["unpriced"]), (1, {"mystery": 1}))
 
     def test_no_litellm_cost_means_no_ratio(self):
-        total = report([line("a", 1, group="m2")])["scopes"]["total"]
+        total = report([line("a", 1, group="m2", litellm_cost_usd=None)])["scopes"]["total"]
         self.assertIsNone(total["table_to_litellm_cost_ratio"])
         self.assertEqual(total["litellm_costed_requests"], 0)
 
@@ -535,8 +535,11 @@ class LiteLLMAccounting(unittest.TestCase):
 
     def test_a_line_written_before_the_fields_existed_reads_as_before(self):
         total = report([line("a", 1, group="m2", prompt=1_000_000, completion=0)])["scopes"]["total"]
-        self.assertEqual((total["reasoning_tokens"], total["cache_write_tokens"], total["litellm_retries"]), (0, 0, 0))
-        self.assertIsNone(total["reasoning_token_share"])
+        # The fields are missing, not zero: their figures are unknown.
+        for name in ("reasoning_tokens", "reasoning_token_share", "cache_write_tokens", "litellm_retries",
+                     "retried_requests", "litellm_cost_usd", "litellm_costed_requests"):
+            self.assertIsNone(total[name], name)
+        self.assertEqual(total["coverage"]["reasoning_tokens"], {"carried": 0, "lines": 1, "fraction": 0.0})
         self.assertAlmostEqual(total["cost_usd"], 1.0)
 
 
@@ -909,6 +912,71 @@ class ServedLines(unittest.TestCase):
         self.assertAlmostEqual(total["cost_usd"], 0.5)
         self.assertEqual(total["model_time_s"], 1.0)
         self.assertEqual(r["data_quality"]["skipped_lines"], {"served": 2})
+
+
+class Coverage(unittest.TestCase):
+    NEW_FIELDS = {"reasoning_tokens": 40, "cache_write_tokens": 0, "litellm_cost_usd": 0.01,
+                  "litellm_model_name": "vertex_ai/m2", "litellm_attempted_retries": 0}
+
+    def old(self):
+        """Lines from before the proxy logged the newer fields."""
+        return report([line("a", 1, completion=100), line("b", 2, completion=100)])
+
+    def new(self, share=1.0):
+        count = 2
+        logged = int(count * share)
+        return report([line(str(i), i + 1, completion=100, **(self.NEW_FIELDS if i < logged else {}))
+                       for i in range(count)])
+
+    def test_a_baseline_without_the_fields_is_not_zero_and_the_compare_says_why(self):
+        baseline, current = self.old(), self.new()
+        self.assertIsNone(baseline["scopes"]["total"]["reasoning_tokens"])
+        self.assertIsNone(baseline["scopes"]["total"]["retried_requests"])
+        self.assertEqual(baseline["scopes"]["total"]["coverage"]["reasoning_tokens"]["fraction"], 0.0)
+        text = br.render(baseline)
+        self.assertRegex(text, r"reasoning_tokens +not logged")
+        self.assertEqual(current["scopes"]["total"]["reasoning_tokens"], 80)
+        notes = br.compare(baseline, current)["notes"]
+        self.assertIn("total: reasoning_tokens: 0.0% of baseline lines carry it, 100.0% now; the change in figures"
+                      " built from it is not replay's", notes)
+        self.assertTrue(any(note.startswith("total: litellm_attempted_retries: 0.0%") for note in notes), notes)
+        self.assertIn("note: total: reasoning_tokens: 0.0% of baseline lines carry it",
+                      br.render_compare(br.compare(baseline, current)))
+
+    def test_full_coverage_on_both_sides_has_no_note(self):
+        notes = br.compare(self.new(), self.new())["notes"]
+        self.assertFalse([note for note in notes if "lines carry it" in note], notes)
+
+    def test_a_scope_one_side_never_ran_has_no_coverage_note(self):
+        current = report([line("a", 1, **self.NEW_FIELDS),
+                          line("b", 2, kind="presubmit", build="p1", pr="3", **self.NEW_FIELDS)])
+        notes = br.compare(self.new(), current)["notes"]
+        self.assertFalse([note for note in notes if note.startswith("presubmit:") and "lines carry it" in note], notes)
+
+    def test_partial_coverage_is_reported(self):
+        r = self.new(share=0.5)
+        total = r["scopes"]["total"]
+        self.assertEqual(total["coverage"]["reasoning_tokens"], {"carried": 1, "lines": 2, "fraction": 0.5})
+        self.assertEqual(total["reasoning_tokens"], 40)
+        text = br.render(r)
+        self.assertRegex(text, r"reasoning_tokens +40 \(50%\)")
+        self.assertRegex(text, r"  reasoning_tokens +1/2 \(50.0%\)")
+        notes = br.compare(r, self.new())["notes"]
+        self.assertIn("total: reasoning_tokens: 50.0% of baseline lines carry it, 100.0% now; the change in figures"
+                      " built from it is not replay's", notes)
+
+    def test_a_line_whose_analysis_was_lost_does_not_lower_coverage(self):
+        r = report([line("a", 1, **self.NEW_FIELDS), error_line(2, "analysis_dropped")])
+        self.assertEqual(r["scopes"]["total"]["coverage"]["litellm_cost_usd"], {"carried": 1, "lines": 1, "fraction": 1.0})
+
+    def test_a_report_from_before_coverage_is_an_unknown_share(self):
+        baseline = self.new()
+        for values in baseline["scopes"].values():
+            values.pop("coverage")
+        notes = br.compare(baseline, self.new())["notes"]
+        self.assertIn("total: reasoning_tokens: an unknown share of baseline lines carry it, 100.0% now; the change"
+                      " in figures built from it is not replay's", notes)
+        self.assertFalse([note for note in notes if note.startswith("presubmit:")], notes)
 
 
 class MalformedInput(unittest.TestCase):

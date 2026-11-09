@@ -749,10 +749,13 @@ before stage 3 of the rollout (turning replay on):
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
-   The first two weeks of shadow data also freeze the baseline that replay is measured against:
-   tokens, cache hits, estimated cost, model time, 429s and fallbacks, and pass rates, per job kind
-   and per build, from `hack/replay-proxy/baseline_report.py`. Replay is not switched on anywhere
-   until that report is saved, and every report after it comes from the same script with
+   Two weeks of shadow data also freeze the baseline that replay is measured against: tokens,
+   cache hits, estimated cost, model time, 429s, retries and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. The window starts on the first full
+   UTC day after the proxy began logging LiteLLM's cost, retries, model name and reasoning and
+   cache-write tokens, so that nightlies and presubmits log every field the report compares from
+   its first line; days before that would show those figures as missing. Replay is not switched on
+   anywhere until that report is saved, and every report after it comes from the same script with
    `--compare`, so before and after are measured the same way.
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly

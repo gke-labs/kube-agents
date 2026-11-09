@@ -107,13 +107,16 @@ It reads its inputs the way `analyze_shadow.py` does (see [In CI](#in-ci)): each
 
 The eval join matches a line's `job.build` to a dashboard run's `build_id`. Lines carry no case, so tokens, cost and model time stop at the build; the case table comes from the eval data's repetitions. Model time includes every agent on the install and every request a repetition never waited on, so its ratio to agent time can pass 100%.
 
-To freeze a baseline, download the window's days with the recipe in [In CI](#in-ci), which lists the keys first and keeps each kind's folder, then keep the report and its inputs together:
+The baseline window is two weeks starting on the first full UTC day after the proxy began logging `litellm_cost_usd`, `litellm_model_name`, `litellm_attempted_retries`, `reasoning_tokens` and `cache_write_tokens`, so that every nightly and presubmit line in it carries them. To freeze it, download the window's days with the recipe in [In CI](#in-ci), which lists the keys first and keeps each kind's folder, then keep the report and its inputs together:
 
 ```bash
 gcloud storage cp gs://kube-agents-dashboards/evals/data.json data.json
 python3 hack/replay-proxy/baseline_report.py week/nightly week/nightly-untrusted week/presubmit \
-  --eval-data data.json --price-as model-default=<model> --since 2026-11-05 --until 2026-11-18 --json > baseline.json
+  --eval-data data.json --price-as model-default=<model> \
+  --since <first full day after those fields reached main> --until <thirteen days later> --json > baseline.json
 ```
+
+Each of those fields has a coverage: the share of analysed lines that carry it, printed under the metrics and given per field as `coverage` in `--json`. A field missing from older lines is never counted as zero: a figure built from a field no line carries reads `not logged` (null in `--json`), one built from a field only some lines carry is shown with that share, and `--compare` notes every field whose coverage differs between the two reports, since the change in its figures is then not replay's.
 
 `--since` and `--until` take epoch seconds (a plain run of at least nine digits, up to the end of year 9999), a `YYYY-MM-DD` date (`--until` includes that day) or an ISO time that starts with one, and refuse anything else. They keep whole builds by their first request, and the manifests of the builds they keep; a line without a build id is kept or left out by its own time, and counts in every sum but in no per-build figure. A line's value outside its bound (a time past year 9999, a latency over a day, a count over a trillion, a cost over a million dollars) is a bad field value, not a number. Read the data-quality block before freezing: skipped lines, bad field values, estimated token lines and unpriced requests each mean a number above is short. Later, download the new window the same way, into its own directory with the same `<kind>/` folders, and run the same command over it with `--compare baseline.json` (add `--json` for the deltas as JSON), or compare two saved reports with `--report current.json --compare baseline.json`. The deltas are current minus baseline, absolutely (percentage points for rates) and as a percent of the baseline; a note says when the price tables, `--price-as` or the report schema differ, or when either side's cost is partial. Compare per-build metrics: two windows rarely hold the same number of builds.
 
@@ -133,20 +136,20 @@ The metrics, as `baseline_report.py` defines them:
 | `cached_prompt_tokens` | tokens |  | Sum of cached_tokens over status-200 lines (missing counts as 0). |
 | `uncached_prompt_tokens` | tokens | yes | Sum over status-200 lines of max(prompt_tokens - cached_tokens, 0). |
 | `completion_tokens` | tokens | yes | Sum of completion_tokens over status-200 lines; reasoning tokens are part of it. |
-| `reasoning_tokens` | tokens | yes | Sum of reasoning_tokens (usage.completion_tokens_details.reasoning_tokens) over status-200 lines. |
-| `reasoning_token_share` | fraction |  | reasoning_tokens / completion_tokens, both over the status-200 lines that log reasoning_tokens (a line written before the field existed would read as no reasoning). |
-| `cache_write_tokens` | tokens |  | Sum of cache_write_tokens (usage.cache_creation_input_tokens, Anthropic-style cache writes) over status-200 lines. |
+| `reasoning_tokens` | tokens | yes | Sum of reasoning_tokens (usage.completion_tokens_details.reasoning_tokens) over status-200 lines. Null when no analysed line in scope carries the field it is built from (see coverage). |
+| `reasoning_token_share` | fraction |  | reasoning_tokens / completion_tokens, both over the status-200 lines that log reasoning_tokens (a line written before the field existed would read as no reasoning). Null when no analysed line in scope carries the field it is built from (see coverage). |
+| `cache_write_tokens` | tokens |  | Sum of cache_write_tokens (usage.cache_creation_input_tokens, Anthropic-style cache writes) over status-200 lines. Null when no analysed line in scope carries the field it is built from (see coverage). |
 | `prompt_tokens_per_build` | tokens | yes | prompt_tokens from lines with a build id / builds. |
 | `cache_hit_rate` | fraction | yes | cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not estimated): an estimated line has no cached count and would read as a miss. |
 | `estimated_prompt_token_share` | fraction |  | Prompt tokens on status-200 lines with tokens_estimated, over prompt_tokens. |
 | `cost_usd` | usd | yes | Sum over status-200 lines of LiteLLM's own cost (litellm_cost_usd) where the line has it, else the price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the table. Lines with neither are left out, and so are lines with estimated tokens and no LiteLLM cost: a partial figure when unpriced_requests or estimated_unpriced_requests &gt; 0. |
 | `cost_per_build_usd` | usd | yes | cost_usd from lines with a build id / builds. |
-| `litellm_cost_usd` | usd |  | Sum of litellm_cost_usd over the status-200 lines that carry it. |
-| `litellm_costed_requests` | count |  | Status-200 lines that carry litellm_cost_usd. |
+| `litellm_cost_usd` | usd |  | Sum of litellm_cost_usd over the status-200 lines that carry it. Null when no analysed line in scope carries the field it is built from (see coverage). |
+| `litellm_costed_requests` | count |  | Status-200 lines that carry litellm_cost_usd. Null when no analysed line in scope carries the field it is built from (see coverage). |
 | `table_cost_usd` | usd |  | Sum over status-200 lines with reported (not estimated) tokens that the price table prices (with or without a LiteLLM cost) of (uncached x input + cached x cached_input + completion x output) per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's above_prompt_tokens. Cache writes are not priced. |
 | `table_priced_requests` | count |  | Status-200 lines with reported tokens that the price table prices. |
 | `cost_from_table_requests` | count |  | Status-200 lines whose cost_usd came from the price table (no LiteLLM cost). |
-| `table_to_litellm_cost_ratio` | fraction |  | The table estimate over LiteLLM's cost, both over the status-200 lines that have both: the cross-check of the price table (1.0 is agreement). |
+| `table_to_litellm_cost_ratio` | fraction |  | The table estimate over LiteLLM's cost, both over the status-200 lines that have both: the cross-check of the price table (1.0 is agreement). Null when no analysed line in scope carries the field it is built from (see coverage). |
 | `unpriced_requests` | count |  | Status-200 lines with reported tokens but neither a LiteLLM cost nor a price-table price. |
 | `estimated_token_requests` | count |  | Status-200 lines with tokens_estimated. |
 | `estimated_unpriced_requests` | count |  | Status-200 lines with tokens_estimated and no LiteLLM cost: an estimate of the prompt size and no completion count cannot be priced, so they are left out of cost_usd and table_cost_usd. |
@@ -157,8 +160,8 @@ The metrics, as `baseline_report.py` defines them:
 | `non_200_requests` | count | yes | Lines whose status is not 200 (status_counts breaks them down). |
 | `rate_limited_requests` | count | yes | Lines with status 429. |
 | `rate_limited_rate` | fraction | yes | rate_limited_requests / requests. |
-| `retried_requests` | count | yes | Lines, any status, whose litellm_attempted_retries (x-litellm-attempted-retries) is above 0: retries LiteLLM made inside one request, apart from the client's own retries, which are lines of their own. |
-| `litellm_retries` | count | yes | Sum of litellm_attempted_retries over lines that carry it. |
+| `retried_requests` | count | yes | Lines, any status, whose litellm_attempted_retries (x-litellm-attempted-retries) is above 0: retries LiteLLM made inside one request, apart from the client's own retries, which are lines of their own. Null when no analysed line in scope carries the field it is built from (see coverage). |
+| `litellm_retries` | count | yes | Sum of litellm_attempted_retries over lines that carry it. Null when no analysed line in scope carries the field it is built from (see coverage). |
 | `fallback_attempted_requests` | count | yes | Lines whose x-litellm-attempted-fallbacks header was present and not 0. |
 | `upstream_incomplete_requests` | count |  | Lines with upstream_incomplete true (the answer broke off). |
 | `eval_builds_joined` | count |  | Builds in scope whose build id is a run in the eval data. |

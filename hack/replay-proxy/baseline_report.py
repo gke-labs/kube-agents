@@ -47,7 +47,7 @@ import math
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import analyze_shadow
@@ -190,6 +190,10 @@ COMPARE_COLUMN_WIDTH = 16
 PERCENT_COLUMN_WIDTH = 10
 KIND_COLUMN_WIDTH = 9
 HASH_DISPLAY_CHARS = 12
+NO_VALUE = "-"
+# A metric whose field no analysed line in scope carries: unknown, not zero.
+NOT_LOGGED = "not logged"
+UNKNOWN_COVERAGE = "an unknown share"
 PRICES_CONFIRMED_LABEL = "confirmed"
 PRICES_UNCONFIRMED_LABEL = "not confirmed"
 
@@ -304,6 +308,35 @@ METRICS: Tuple[Metric, ...] = (
            "Cases with at least one joined build whose graded repetitions include both a pass and a fail.", True),
 )
 METRIC_NAMES = tuple(m.name for m in METRICS)
+
+# Fields the proxy began logging after shadow logging started: a line written
+# before then lacks them, and a missing field is no zero. Each scope counts the
+# analysed lines (no `error`) that carry each one, its coverage; a metric built
+# from a field no line in scope carries is null, not 0, and one built from a
+# field only some lines carry is shown with its coverage.
+COVERAGE_FIELDS = (
+    F.REASONING_TOKENS, F.CACHE_WRITE_TOKENS, F.LITELLM_COST_USD, F.LITELLM_MODEL_NAME, F.LITELLM_ATTEMPTED_RETRIES,
+)
+METRIC_COVERAGE = {
+    "reasoning_tokens": F.REASONING_TOKENS,
+    "reasoning_token_share": F.REASONING_TOKENS,
+    "cache_write_tokens": F.CACHE_WRITE_TOKENS,
+    "litellm_cost_usd": F.LITELLM_COST_USD,
+    "litellm_costed_requests": F.LITELLM_COST_USD,
+    "table_to_litellm_cost_ratio": F.LITELLM_COST_USD,
+    "retried_requests": F.LITELLM_ATTEMPTED_RETRIES,
+    "litellm_retries": F.LITELLM_ATTEMPTED_RETRIES,
+}
+# Every metric built from such a field says so in its definition.
+COVERAGE_DEFINITION = " Null when no analysed line in scope carries the field it is built from (see coverage)."
+METRICS = tuple(
+    replace(metric, definition=metric.definition + COVERAGE_DEFINITION) if metric.name in METRIC_COVERAGE else metric
+    for metric in METRICS
+)
+COVERAGE = "coverage"
+COVERAGE_CARRIED = "carried"
+COVERAGE_LINES = "lines"
+COVERAGE_FRACTION = "fraction"
 METRIC_UNITS = {m.name: m.unit for m in METRICS}
 HEADLINE_METRICS = tuple(m.name for m in METRICS if m.headline)
 
@@ -346,6 +379,8 @@ class Line:
     model_name: Optional[str] = None
     attempted_retries: Optional[int] = None
     litellm_cost_usd: Optional[float] = None
+    # Which of COVERAGE_FIELDS the line carries (present, even as null).
+    carries: frozenset = frozenset()
 
     @property
     def key(self) -> Tuple[str, str]:
@@ -579,6 +614,7 @@ def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[L
         model_name=model_name if isinstance(model_name, str) and model_name else None,
         attempted_retries=_field(entry, F.LITELLM_ATTEMPTED_RETRIES, quality),
         litellm_cost_usd=litellm_cost_usd,
+        carries=frozenset(name for name in COVERAGE_FIELDS if name in entry),
     )
 
 
@@ -921,8 +957,18 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     }
     values["rate_limited_rate"] = ratio(values["rate_limited_requests"], len(lines))
     assert tuple(values) == METRIC_NAMES, "aggregate() and METRICS disagree"
+    analysed = [line for line in lines if line.error is None]
+    coverage = {}
+    for name in COVERAGE_FIELDS:
+        carried = sum(1 for line in analysed if name in line.carries)
+        coverage[name] = {COVERAGE_CARRIED: carried, COVERAGE_LINES: len(analysed),
+                          COVERAGE_FRACTION: ratio(carried, len(analysed))}
+    for metric, name in METRIC_COVERAGE.items():
+        if analysed and not coverage[name][COVERAGE_CARRIED]:
+            values[metric] = None
     values[STATUS_COUNTS] = dict(sorted(statuses.items()))
     values[UNPRICED_BY_MODEL] = dict(sorted(unpriced.items()))
+    values[COVERAGE] = coverage
     return values
 
 
@@ -1021,9 +1067,32 @@ def build_report(
     }
 
 
+def _coverage_label(coverage: Optional[Dict[str, Any]]) -> str:
+    """`carried/lines (pct)` for a field's coverage; `-` when the report has none or no line was analysed."""
+    if not coverage or coverage.get(COVERAGE_FRACTION) is None:
+        return NO_VALUE
+    return (f"{coverage[COVERAGE_CARRIED]}/{coverage[COVERAGE_LINES]}"
+            f" ({coverage[COVERAGE_FRACTION] * PERCENT:.{DELTA_DECIMALS}f}%)")
+
+
+def _cell(name: str, values: Dict[str, Any]) -> str:
+    """A metric's value, `not logged` when no analysed line carries its field, and its coverage beside it when
+    only some do."""
+    value = values.get(name)
+    field_name = METRIC_COVERAGE.get(name)
+    coverage = values.get(COVERAGE, {}).get(field_name) if field_name else None
+    if value is None and coverage and coverage.get(COVERAGE_LINES) and not coverage.get(COVERAGE_CARRIED):
+        return NOT_LOGGED
+    shown = _fmt(name, value)
+    fraction = coverage.get(COVERAGE_FRACTION) if coverage else None
+    if value is not None and fraction is not None and fraction < 1:
+        shown += f" ({fraction * PERCENT:.0f}%)"
+    return shown
+
+
 def _fmt(name: str, value: Any) -> str:
     if value is None:
-        return "-"
+        return NO_VALUE
     unit = METRIC_UNITS.get(name)
     if unit == FRACTION:
         return f"{value * PERCENT:.{DELTA_DECIMALS}f}%"
@@ -1064,7 +1133,13 @@ def render(report: Dict[str, Any]) -> str:
         f"{'metric':<{METRIC_COLUMN_WIDTH}}" + "".join(f"{scope:>{SCOPE_COLUMN_WIDTH}}" for scope in SCOPES),
     ]
     for name in METRIC_NAMES:
-        lines.append(f"{name:<{METRIC_COLUMN_WIDTH}}" + "".join(f"{_fmt(name, report[REPORT_SCOPES][s][name]):>{SCOPE_COLUMN_WIDTH}}" for s in SCOPES))
+        lines.append(f"{name:<{METRIC_COLUMN_WIDTH}}" + "".join(
+            f"{_cell(name, report[REPORT_SCOPES][s]):>{SCOPE_COLUMN_WIDTH}}" for s in SCOPES))
+    lines.append("coverage (analysed lines that carry the field):")
+    for field_name in COVERAGE_FIELDS:
+        lines.append(f"  {field_name:<{METRIC_COLUMN_WIDTH - 2}}" + "".join(
+            f"{_coverage_label(report[REPORT_SCOPES][s].get(COVERAGE, {}).get(field_name)):>{SCOPE_COLUMN_WIDTH}}"
+            for s in SCOPES))
     for scope in SCOPES:
         values = report[REPORT_SCOPES][scope]
         if values[STATUS_COUNTS] or values[UNPRICED_BY_MODEL]:
@@ -1105,6 +1180,16 @@ def cost_source(values: Dict[str, Any]) -> Optional[str]:
     return COST_SOURCE_TABLE if table else None
 
 
+def _coverage_fraction(values: Dict[str, Any], field_name: str) -> Optional[float]:
+    """A field's coverage in a scope; None when the scope analysed no line, or the report predates coverage."""
+    coverage = values.get(COVERAGE, {}).get(field_name)
+    return coverage.get(COVERAGE_FRACTION) if coverage else None
+
+
+def _percent_or_unknown(fraction: Optional[float]) -> str:
+    return UNKNOWN_COVERAGE if fraction is None else f"{fraction * PERCENT:.{DELTA_DECIMALS}f}%"
+
+
 def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     """Headline deltas per scope: current - baseline, and that as a percent of the baseline."""
     notes = []
@@ -1125,6 +1210,17 @@ def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]
             if cost_source(values) == COST_SOURCE_MIXED:
                 notes.append(f"{side} {scope}: cost_usd takes LiteLLM's cost for {values['litellm_costed_requests']}"
                              f" requests and the price table for {values['cost_from_table_requests']}")
+    for scope in SCOPES:
+        for field_name in COVERAGE_FIELDS:
+            before = _coverage_fraction(baseline[REPORT_SCOPES].get(scope, {}), field_name)
+            after = _coverage_fraction(current[REPORT_SCOPES].get(scope, {}), field_name)
+            # A side with no requests in this scope has nothing to compare; one with
+            # requests but no coverage counts is a report from before coverage.
+            sides_with_requests = [values.get("requests") for values in
+                                   (baseline[REPORT_SCOPES].get(scope, {}), current[REPORT_SCOPES].get(scope, {}))]
+            if before != after and all(sides_with_requests):
+                notes.append(f"{scope}: {field_name}: {_percent_or_unknown(before)} of baseline lines carry it,"
+                             f" {_percent_or_unknown(after)} now; the change in figures built from it is not replay's")
     for scope in SCOPES:
         sources = (cost_source(baseline[REPORT_SCOPES][scope]), cost_source(current[REPORT_SCOPES][scope]))
         if None not in sources and sources[0] != sources[1]:
