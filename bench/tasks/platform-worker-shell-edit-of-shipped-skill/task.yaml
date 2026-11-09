@@ -83,6 +83,20 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_create"]
       require_success: true
+  # The card's end, read from the worker's own calls: the delegated card
+  # ends in kanban_complete or kanban_block (agents/platform/SOUL.md: a
+  # blocked card "is the successful end of it"). A worker that never ran,
+  # or one whose calls all failed, leaves no such call. scope: workers reads
+  # the platform worker's tagged calls; the scorer grades it on an inject
+  # record that carries them (#5236) and sets it aside on one that does not.
+  - name: the-worker-ended-its-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      scope: workers
+      tool_names: ["kanban_complete", "kanban_block"]
+      require_success: true
   - name: the-shipped-skill-tree-is-the-image-tree
     role: objective
     mode: assert
