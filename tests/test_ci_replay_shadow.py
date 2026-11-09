@@ -930,11 +930,53 @@ class EvalWiringTest(unittest.TestCase):
         fan_out = next(i for i, l in enumerate(self.lines) if l.startswith("launch_units() {"))
         self.assertLess(prepare, fan_out)
 
-    def test_the_lane_records_nothing_and_publishes_no_dashboard(self):
+    # The script's decision on whether the run records, run as written: from
+    # the JOB_TYPE case to the commit stamp that follows it.
+    _MAIN_RUN_START = 'case "${JOB_TYPE:-}" in\n  postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;'
+    _MAIN_RUN_END = "# The commit each line is stamped with."
+
+    def _main_run(self, **env):
         text = _CI_EVAL.read_text()
-        self.assertIn('if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then\n  EVAL_IS_MAIN_RUN="false"\nfi', text)
-        publish = lift_function("publish_eval_dashboard", text, _CI_EVAL)
-        self.assertIn('"${EVAL_REPLAY_LANE:-}" = "true"', publish)
+        start = text.index(self._MAIN_RUN_START)
+        block = text[start:text.index(self._MAIN_RUN_END, start)]
+        base = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "JOB_TYPE": "periodic", "EVAL_TIER": "presubmit"}
+        base.update(env)
+        proc = subprocess.run([shutil.which("bash"), "-c", "set -euo pipefail\n" + block + 'echo "MAIN=${EVAL_IS_MAIN_RUN}"'],
+                              env=base, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip().split("=", 1)[1], text, start
+
+    def test_the_lane_records_nothing(self):
+        self.assertEqual(self._main_run()[0], "true", "a GitHub periodic records")
+        main_run, text, start = self._main_run(EVAL_REPLAY_LANE="true")
+        self.assertEqual(main_run, "false")
+        # Nothing after the decision may turn it back on.
+        assigned = [m.start() for m in re.finditer(r'^\s*EVAL_IS_MAIN_RUN=', text, re.MULTILINE)]
+        end = text.index(self._MAIN_RUN_END, start)
+        self.assertTrue(assigned and all(start <= at < end for at in assigned),
+                        "EVAL_IS_MAIN_RUN is set only in the decision block")
+
+    def test_the_lane_publishes_no_dashboard(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "hack").mkdir()
+        dash = tmp / "scripts" / "eval_dashboard"
+        dash.mkdir(parents=True)
+        for name in ("collect.py", "render.py", "publish.py"):
+            (dash / name).write_text(f"import pathlib, sys\npathlib.Path(sys.path[0], '{name}.ran').touch()\n")
+        script = ("set -euo pipefail\n" + f'SCRIPT_DIR={str(tmp / "hack")!r}\n'
+                  + lift_function("publish_eval_dashboard", _CI_EVAL.read_text(), _CI_EVAL) + "publish_eval_dashboard\n")
+        env = {"PATH": f"{os.path.dirname(sys.executable)}:/usr/bin:/bin", "JOB_TYPE": "periodic", "PULL_NUMBER": "",
+               "EVAL_DASHBOARD_TARGET": "gs://dashboards/evals/", "ARTIFACTS": str(tmp / "artifacts")}
+        for lane, ran in (("true", False), ("", True)):
+            with self.subTest(lane=lane):
+                for marker in dash.glob("*.ran"):
+                    marker.unlink()
+                proc = subprocess.run([shutil.which("bash"), "-c", script], env=dict(env, EVAL_REPLAY_LANE=lane),
+                                      capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=_WAIT_SECONDS * 3)
+                self.assertEqual(bool(list(dash.glob("*.ran"))), ran, proc.stdout + proc.stderr)
+                if lane:
+                    self.assertIn("eval-dashboard publish skipped: EVAL_REPLAY_LANE=true", proc.stdout)
 
     def test_the_lane_runs_its_own_roster_and_arms_no_roster_case(self):
         text = _CI_EVAL.read_text()
