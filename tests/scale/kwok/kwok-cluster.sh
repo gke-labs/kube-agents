@@ -84,7 +84,7 @@ need() {
 kubeconfig_path() { echo "$KWOK_STATE_DIR/$1.kubeconfig"; }
 cluster_dir() { echo "$KWOK_WORKDIR/clusters/$1"; }
 ca_path() { echo "$(cluster_dir "$1")/pki/ca.crt"; }
-cluster_exists() { kwokctl get clusters 2>/dev/null | grep -qx "$1"; }
+cluster_exists() { grep -qx "$1" <<<"$(kwokctl get clusters 2>/dev/null)"; }
 
 # fetch_tool NAME SHA256: download NAME-linux-amd64 for KWOK_VERSION into
 # KWOK_TOOLS_DIR unless the binary there already matches the pinned checksum

@@ -1856,6 +1856,24 @@ layout too; both fall back to the text. The golden layouts of the shared cases a
 `a2a/gateway/testdata/gchat-chat/`, beside Slack's. An edit without a chat message replaces the layout, the widgets patched empty, unless it is a running task's line (The Stop button, below). A `mark` draws
 nothing: Chat's reaction API takes user credentials, and the relay holds the app's.
 
+A row that carries `tasks` and `actions` (the board-health card's; "The board-health card's
+buttons" under the Slack adapter) gets its Retry and Drop in the same button list, after the
+choices and links. The list sits under the whole message rather than under each row, so when any
+row carries buttons the renderer numbers every row in the bullet's place ("1. ", "2. ") and labels
+each row's buttons with its number ("Retry 1", "Drop 1"); the button's `kage.board` action carries
+the action, the row's number and the row's ids. A tap is never a turn: it is admitted by the rule
+an inbound message is (`resolvePrincipal`; Chat has no Home tab), then sent over the board route
+as a `lib.BoardAction` like a Slack tap, and the row's line is edited in place, "✓ Retrying.
+<name>, <time>", "Dropped. <name>, <time>" or "No longer stuck. <name>, <time>" set after its text
+on the same line, the time in UTC since Chat has no date token, and the row's two buttons gone; a
+tap that did not land keeps them under a line saying so, so a second tap asks again, and so does
+one whose patch Chat refused. One tap per row at a time, and the edits of one message in turn under
+its rewrite lock, each from the layout the adapter last sent it; a message posted before a restart
+is edited from the event's copy of it, text and buttons (`gchat_board.go`). The report caps its
+rows at `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on
+buttons in one list is not documented in a form this spec can cite and has not been measured, and
+a layout Chat refuses falls back to the text as any does.
+
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
 with the clicked message and its space, `chat.user` the clicker, `commonEventObject` the
@@ -2367,7 +2385,8 @@ A board that cannot be read draws Fleet with a line saying so, never an empty fl
 that moves it (`slack_home_pick.go`; the record paragraph above says what a pick writes).
 
 **The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
-chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
+chat message (and Google Chat under `next` as the same message; "The Google Chat adapter" above has
+that renderer's form of the buttons) whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it
 (`actions`, `retry` and `drop`; spec-a2a-payloads.md, "Chat messages"). The renderer lays such a
 row out as its text over an actions block keyed by the row (`kage_board.row.<n>`), labels the
 buttons Retry and Drop itself, and puts the row's ids, joined by commas, in their value
@@ -2451,8 +2470,9 @@ without one), looking again every minute for 30 minutes so that a provision Job 
 upgraded gateway started still turns it on, then stopping, so a NATS server that never grants the
 gateway the bucket does not log a refused request every minute; and the gateway's user is the only reader and writer of its
 records by grant (provision and seed hold STREAM.INFO on it, which can list the keys: task id and rater). It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
-conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
-the rating.
+conversation and the rating, never the text; `answer_feedback_total` carries only the platform, the
+rating and what kind of message was rated (`answer`: `reply` for the chain's own answer, `card` for a
+card's report that settled the ask, `other` when no session record names the rated task).
 
 An answer whose layout is already at Slack's 50-block cap posts laid out without the controls. The
 answered line a click or typed reply leaves on an answer's question goes above the controls, which
@@ -2579,8 +2599,8 @@ task that handed work to kanban cards and left them unsettled at turn end (the b
 artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
 `waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
 via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; on console and MCP origins
-(`!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`), the bridge's `api` executor instead
+true`, so a client waits for the cards' notify frames; on console and MCP origins only
+(`waitsForCardsInTurn`), the bridge's `api` executor instead
 holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
 turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`
 so no `handoff` or `"cardsPending": true` is emitted once the cards settle in turn. Without
@@ -2867,7 +2887,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                                   |
-| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`                                                | Each rating a verified sender gave an answer ("Answer feedback" under the Slack adapter), counted before the 👎's record is written, so a rating the bucket could not keep still counts; a rating changed counts again.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`            | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
