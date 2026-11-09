@@ -297,11 +297,10 @@ readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
 # The variable the chart stamps the mode into, read back the same way: the
 # deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
-# A postsubmit records only on this branch; a periodic checks out main by its
-# job's extra_refs and carries no PULL_BASE_REF.
-readonly REPLAY_RECORD_BRANCH="main"
-# Prow's JOB_TYPE for a run after a merge, the one job type the branch check applies to.
-readonly REPLAY_SHADOW_JOB_TYPE_POSTSUBMIT="postsubmit"
+# The one Prow JOB_TYPE that records: the nightly periodics, which check out
+# main by their extra_refs. A postsubmit is filed nightly but never records:
+# no recorder postsubmit exists, and one on a release branch must not write.
+readonly REPLAY_RECORD_JOB_TYPE="periodic"
 # What prepare_replay_lane_cache reports for a Deployment it could not read.
 readonly REPLAY_SHADOW_MODE_UNREADABLE="(unreadable)"
 readonly REPLAY_SHADOW_PULL_REFS=(PULL_NUMBER PULL_BASE_REF PULL_BASE_SHA PULL_PULL_SHA PULL_REFS)
@@ -553,11 +552,11 @@ collect_credential_proxy_evidence() {
 #   main's (eval-design.md, "The proxy can't come from the pull request").
 #   Filed as replay-lane. Asked for by name, so every refusal is an error;
 #   there is no default to fall back to.
-# - record, on a periodic or a postsubmit of REPLAY_RECORD_BRANCH whose uploads
-#   run as REPLAY_SHADOW_NIGHTLY_RECORDER with no impersonation or token
-#   override, unless EVAL_REPLAY_RECORD=false. Anything else stays in shadow
-#   mode with a note; EVAL_REPLAY_RECORD=true makes that an error instead. A
-#   presubmit never records, and a batch run gets no proxy at all.
+# - record, on a periodic (REPLAY_RECORD_JOB_TYPE) whose uploads run as
+#   REPLAY_SHADOW_NIGHTLY_RECORDER with no impersonation or token override,
+#   unless EVAL_REPLAY_RECORD=false. Anything else stays in shadow mode with a
+#   note; EVAL_REPLAY_RECORD=true makes that an error instead. A postsubmit or
+#   a presubmit never records, and a batch run gets no proxy at all.
 # - shadow, otherwise.
 _replay_shadow_unusable() {
   if [ "${REPLAY_SHADOW_EXPLICIT}" = "true" ]; then
@@ -804,12 +803,12 @@ resolve_replay_shadow() {
   # Record only on a trusted nightly: the account check above has already filed
   # anything else as nightly-untrusted.
   if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
-    if [ "${JOB_TYPE:-}" = "${REPLAY_SHADOW_JOB_TYPE_POSTSUBMIT}" ] && [ "${PULL_BASE_REF:-}" != "${REPLAY_RECORD_BRANCH}" ]; then
+    if [ "${JOB_TYPE:-}" != "${REPLAY_RECORD_JOB_TYPE}" ]; then
       if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
-        echo "ERROR: EVAL_REPLAY_RECORD=true on a postsubmit of '${PULL_BASE_REF:-}': only ${REPLAY_RECORD_BRANCH} records into the shared replay cache." >&2
+        echo "ERROR: EVAL_REPLAY_RECORD=true on JOB_TYPE='${JOB_TYPE:-}': only a ${REPLAY_RECORD_JOB_TYPE} records into the shared replay cache." >&2
         return 1
       fi
-      echo "Replay proxy: shadow mode, not record: a postsubmit of '${PULL_BASE_REF:-}' is not ${REPLAY_RECORD_BRANCH}." >&2
+      echo "Replay proxy: shadow mode, not record: only a ${REPLAY_RECORD_JOB_TYPE} records into the shared replay cache, not JOB_TYPE='${JOB_TYPE:-}'." >&2
     else
       cache_bucket="$(_replay_cache_bucket)" || return 1
       mode="${REPLAY_MODE_RECORD}"

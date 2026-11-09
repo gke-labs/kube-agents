@@ -195,10 +195,12 @@ class ResolveTest(unittest.TestCase):
     def test_periodic_and_postsubmit_are_nightly(self):
         for job_type in ("periodic", "postsubmit"):
             with self.subTest(job_type=job_type):
-                values, _ = _resolve(JOB_TYPE=job_type, PULL_NUMBER=None, PULL_BASE_REF="main")
+                values, _ = _resolve(JOB_TYPE=job_type, PULL_NUMBER=None)
+                record = job_type == "periodic"
                 self.assertEqual(values, {"rc": "0", "active": "true", "bucket": _BUCKET, "kind": "nightly",
-                                          "project": _PROJECT, "build": _BUILD, "pr": "", "mode": "record",
-                                          "cache": "kube-agents-replay-cache"})
+                                          "project": _PROJECT, "build": _BUILD, "pr": "",
+                                          "mode": "record" if record else "shadow",
+                                          "cache": "kube-agents-replay-cache" if record else ""})
 
     def test_a_scheduled_run_as_any_other_account_is_nightly_untrusted(self):
         # Only the nightly runner may write nightly/; every presubmit runs as prowjob-default-sa.
@@ -318,12 +320,10 @@ class RecordModeResolveTest(unittest.TestCase):
     """Record mode: a nightly uploading as the recorder, and nothing else, ever."""
 
     def test_a_nightly_uploading_as_the_recorder_records_into_the_cache_bucket(self):
-        for job_type in ("periodic", "postsubmit"):
-            with self.subTest(job_type=job_type):
-                values, err = _resolve(JOB_TYPE=job_type, FAKE_GCLOUD_ACCOUNT=_RECORDER, PULL_BASE_REF="main")
-                self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]),
-                                 ("0", "nightly", "record", "kube-agents-replay-cache"))
-                self.assertEqual(err, "")
+        values, err = _resolve(JOB_TYPE="periodic", FAKE_GCLOUD_ACCOUNT=_RECORDER)
+        self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]),
+                         ("0", "nightly", "record", "kube-agents-replay-cache"))
+        self.assertEqual(err, "")
 
     def test_a_nightly_uploading_as_anyone_else_stays_in_shadow_and_says_why(self):
         for account in (_PROW_DEFAULT, ""):
@@ -338,16 +338,14 @@ class RecordModeResolveTest(unittest.TestCase):
         self.assertEqual(values["mode"], "shadow")
         self.assertIn("is set, so gcloud does not upload as its active account", err)
 
-    def test_a_postsubmit_records_only_on_main(self):
-        values, _ = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="main", FAKE_GCLOUD_ACCOUNT=_RECORDER)
-        self.assertEqual(values["mode"], "record")
-        for ref in ("release-0.21", "", None):
+    def test_a_postsubmit_never_records(self):
+        for ref in ("main", "release-0.21", None):
             with self.subTest(ref=ref):
                 values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF=ref, FAKE_GCLOUD_ACCOUNT=_RECORDER)
-                self.assertEqual((values["rc"], values["mode"]), ("0", "shadow"))
-                self.assertIn("is not main", err)
-        values, err = _resolve(JOB_TYPE="postsubmit", PULL_BASE_REF="release-0.21", FAKE_GCLOUD_ACCOUNT=_RECORDER,
-                               EVAL_REPLAY_RECORD="true")
+                self.assertEqual((values["rc"], values["kind"], values["mode"], values["cache"]),
+                                 ("0", "nightly", "shadow", ""))
+                self.assertIn("only a periodic records", err)
+        values, err = _resolve(JOB_TYPE="postsubmit", FAKE_GCLOUD_ACCOUNT=_RECORDER, EVAL_REPLAY_RECORD="true")
         self.assertEqual(values["rc"], "1")
 
     def test_the_build_id_shape_is_the_publishers(self):
@@ -375,7 +373,7 @@ class RecordModeResolveTest(unittest.TestCase):
     def test_an_untrusted_nightly_never_resolves_to_record(self):
         for job_type in ("periodic", "postsubmit"):
             with self.subTest(job_type=job_type):
-                values, err = _resolve(JOB_TYPE=job_type, PULL_BASE_REF="main", FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
+                values, err = _resolve(JOB_TYPE=job_type, FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
                 self.assertEqual((values["kind"], values["mode"], values["cache"]), ("nightly-untrusted", "shadow", ""))
                 self.assertIn("an untrusted nightly never records", err)
         _, args = HelmArgsTest()._args(FAKE_GCLOUD_ACCOUNT=_PROW_DEFAULT)
