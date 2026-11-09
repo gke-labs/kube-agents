@@ -1340,8 +1340,11 @@ deadline").
 pool"): `{since, verdict, breach_seen, measured_at}` always, plus `{day,
 window_hours, p50_s, p95_s, waiting_longest_s, waiting_now, waiting_since, over_threshold,
 threshold_p50_s, threshold_p95_s, free, total, lease_failures, lease_failures_hours,
-no_build_id, cause, max_concurrency}` when
-`verdict` is `BREACH` or `UNMEASURED`. `lease_failures` is how many runs Boskos
+no_build_id, cause, max_concurrency, breached_days, worst_s, waiting}` when
+`verdict` is `BREACH` or `UNMEASURED`. `breached_days` are the periodic's ISO days
+that breached, `worst_s` the longest wait among them (the window's when none is a
+day's), and `waiting` the live queue count (`null` when Deck was not read); the
+cap message quotes the three. `lease_failures` is how many runs Boskos
 refused a project in the periodic's recent window of `lease_failures_hours`
 hours, and `no_build_id` how many projects are leased under an owner that is
 neither a Prow run nor a known job's fixed owner; `lease_failures` and

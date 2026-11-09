@@ -428,7 +428,7 @@ causes have four different remedies and one of them spends money:
 ⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
 Consider onboarding a project.
 Last 3h: median wait 24 min against a 15 min limit; p95 157 min against 45.
-2 runs waiting right now, past the 45 min p95 limit.
+2 of 4 waiting runs are past the 45 min p95 limit.
 Runs still pass; /retest makes the queue longer.
 ```
 
@@ -479,10 +479,12 @@ a jam from its own oldest queued run rather than from the episode, for the same
 reason: the episode can have opened days before the backlog being described.
 
 `queue` at the presubmit's cap (runs waited while the presubmit sat at its
-`max_concurrency`; the message says how long, on which days, and the cap, and
-gives no remedy, because the pool is shared and the gap below it is the other
-jobs' share), `runs not starting` (projects were free, so the delay is Prow's;
-the message names the build cluster) and `queue backed up` (the job could not
+`max_concurrency`; while Deck sees a backlog the message says how many wait
+and the longest wait, otherwise how long runs waited on which days and
+whether the queue was read, and the cap either way; it gives no remedy,
+because the pool is shared and the gap below the cap is the other jobs'
+share), `runs not starting` (projects were free, so the delay is Prow's; the
+message names the build cluster) and `queue backed up` (the job could not
 read how many projects were in use) carry the same lines under a different
 first one.
 
