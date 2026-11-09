@@ -6113,17 +6113,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		state.calloutStalled = stalled.Name
 	}
 	// The profiles the dispatcher writes .supervisor for, for the gateway's
-	// deny on those subjects (gatewayProfileSupervisorDeny): the bound ones
-	// and the ones still draining, which keep the dispatcher's grant as long
-	// as the identity map does. In the config and its hash, so a profile
-	// bound, unbound or done draining rolls the bus.
-	profileNames := make([]string, 0, len(profiles)+len(draining))
-	for i := range profiles {
-		profileNames = append(profileNames, profiles[i].Name)
-	}
-	for _, d := range draining {
-		profileNames = append(profileNames, d.Name)
-	}
+	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
+	// ones and the ones still draining, the same names as the dispatcher's
+	// grant. A profile the controller refuses gets neither. In the config
+	// and its hash, so a profile admitted, removed or done draining rolls
+	// the bus.
+	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {

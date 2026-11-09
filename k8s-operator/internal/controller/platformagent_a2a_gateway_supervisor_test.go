@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -177,5 +178,56 @@ func TestBindingAProfileRollsTheBus(t *testing.T) {
 	}
 	if st := pass(); !st.busHeld {
 		t.Fatal("a bound profile left the bus's desired config hash where it was, so the bus wouldn't roll onto its deny")
+	}
+}
+
+// A profile the controller refuses has no dispatcher grant, so it gets no
+// gateway deny: the supervisor grants, the one part of the config a profile
+// changes, stay as they were.
+func TestARefusedProfileLeavesTheSupervisorGrantsAlone(t *testing.T) {
+	agent := a2aTestAgent()
+	live := testAgentProfile(agent.Namespace, "tse")
+	refused := testAgentProfile(agent.Namespace, "rogue")
+	refused.Spec.Bus.PublishTopics = []string{"agent.tse.findings"}
+	confFor := func(objs ...client.Object) string {
+		t.Helper()
+		cl := fake.NewClientBuilder().
+			WithScheme(setupScheme()).
+			WithObjects(append([]client.Object{agent.DeepCopy(), chartProfileNamespace(agent)}, objs...)...).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+			Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+		ctx := context.Background()
+		if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
+		var secret corev1.Secret
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}, &secret); err != nil {
+			t.Fatal(err)
+		}
+		return string(secret.Data["nats.conf"])
+	}
+	without := confFor(live.DeepCopy())
+	with := confFor(live.DeepCopy(), refused.DeepCopy())
+	if !strings.Contains(with, "a2a.tasks.tse.*.supervisor") {
+		t.Fatal("the admitted profile lost its deny")
+	}
+	if strings.Contains(with, "a2a.tasks.rogue.*.supervisor") {
+		t.Fatal("a refused profile got a gateway deny")
+	}
+	// Each fresh client mints its own credentials and callout keys, so only
+	// the supervisor grants are compared.
+	supervisorLines := func(conf string) []string {
+		var out []string
+		for _, l := range strings.Split(conf, "\n") {
+			if strings.Contains(l, "supervisor") {
+				out = append(out, strings.TrimSpace(l))
+			}
+		}
+		return out
+	}
+	if !reflect.DeepEqual(supervisorLines(with), supervisorLines(without)) {
+		t.Fatalf("a refused profile changed the bus's supervisor grants:\n%v\nvs\n%v", supervisorLines(with), supervisorLines(without))
 	}
 }
