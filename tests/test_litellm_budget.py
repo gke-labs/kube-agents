@@ -176,5 +176,36 @@ class BudgetRenderTest(unittest.TestCase):
         self.assertEqual(set(self._config(unset_cm)), set(base))
 
 
+class BudgetPeriodGrammarParityTest(unittest.TestCase):
+    """The period's duration grammar is read by four machines: the chart's
+    schema, the template's own check (for a values file that skips the
+    schema), the tfvars generator and the Terraform example's validation.
+    The schema's pattern is the source; the other three must spell the same
+    grammar, or a period one front door accepts is refused by the next."""
+
+    _SCHEMA = _CHART / "values.schema.json"
+    _HELPERS = _CHART / "templates" / "_helpers.tpl"
+    _INSTALLER = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+    _VARIABLES = _REPO_ROOT / "terraform" / "examples" / "full-install" / "variables.tf"
+
+    def _grammar(self) -> str:
+        import json
+
+        schema = json.loads(self._SCHEMA.read_text())
+        pattern = schema["properties"]["litellm"]["properties"]["budget"]["properties"]["period"]["pattern"]
+        # The schema also admits the empty string, the inert default; the
+        # other copies see a period only beside an amount, so they take the
+        # grammar without that alternative.
+        prefix, suffix = "^(", ")?$"
+        self.assertTrue(pattern.startswith(prefix) and pattern.endswith(suffix), pattern)
+        return "^" + pattern[len(prefix) : -len(suffix)] + "$"
+
+    def test_the_template_the_installer_and_terraform_spell_the_schemas_grammar(self) -> None:
+        grammar = self._grammar()
+        self.assertIn(f"$budgetPeriodPattern := `{grammar}`", self._HELPERS.read_text())
+        self.assertIn(f'[[ "${{1:-}}" =~ {grammar} ]]', self._INSTALLER.read_text())
+        self.assertIn(f'can(regex("{grammar}", var.litellm_budget.period))', self._VARIABLES.read_text())
+
+
 if __name__ == "__main__":
     unittest.main()

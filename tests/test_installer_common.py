@@ -1290,9 +1290,8 @@ class InstallerCommonTest(unittest.TestCase):
                         self.assertIn("install.env", proc.stderr + proc.stdout)
                         self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
-    # Empty reads as unset, so a developer's own exported value cannot stand in.
-    _BUDGET_UNSET = {"LITELLM_BUDGET_USD": "", "LITELLM_BUDGET_PERIOD": ""}
-
+    # LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD are in SEEDED_INSTALLER_ENV_KEYS,
+    # so a developer's own exported value never reaches these runs.
     def test_tfvars_carry_litellm_budget_only_while_it_is_on(self):
         # Off (unset, empty, 0 or 0.0) writes no litellm_budget line at all, so
         # an install without a ceiling keeps the file it had, whatever a
@@ -1310,7 +1309,7 @@ class InstallerCommonTest(unittest.TestCase):
                 with self.subTest(env=env):
                     proc = self._run(
                         f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                        env={"API_SERVER_KEY": "k", **self._BUDGET_UNSET, **env},
+                        env={"API_SERVER_KEY": "k", **env},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -1336,7 +1335,7 @@ class InstallerCommonTest(unittest.TestCase):
                 with self.subTest(env=env):
                     proc = self._run(
                         f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                        env={"API_SERVER_KEY": "k", **self._BUDGET_UNSET, **env},
+                        env={"API_SERVER_KEY": "k", **env},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=1", proc.stdout, proc.stderr)

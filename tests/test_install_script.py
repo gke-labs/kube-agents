@@ -6488,11 +6488,9 @@ class LitellmBudgetPersistsThroughInstallEnvTest(unittest.TestCase):
 
     @staticmethod
     def _env(overrides):
-        env = get_isolated_test_env(overrides=overrides)
-        env.pop("LITELLM_BUDGET_USD", None)
-        env.pop("LITELLM_BUDGET_PERIOD", None)
-        env.update(overrides)
-        return env
+        # Both keys are in SEEDED_INSTALLER_ENV_KEYS, so a developer's own
+        # exported value never stands in for the file.
+        return get_isolated_test_env(overrides=overrides)
 
     def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
         with tempfile.TemporaryDirectory() as tmp:

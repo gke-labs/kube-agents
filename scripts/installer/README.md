@@ -754,6 +754,21 @@ recorded. But each `upgrade.sh` run calls the generator before it selects the mo
 stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
 gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
+### The gateway's spend ceiling
+
+`LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` set the gateway's spend ceiling. Empty takes
+`DEFAULT_LITELLM_BUDGET_USD` (`0`, no ceiling) and `DEFAULT_LITELLM_BUDGET_PERIOD` (`1d`).
+`write_tfvars_from_state` writes `litellm_budget` only while the amount is above `0`, so an install
+without a ceiling keeps the file it had; the period is read, and checked, only then. The generator
+refuses an amount that is not a number of `0` or more, or a period that is not a LiteLLM duration
+(a whole number and `s`, `m`, `h`, `d`, `w` or `mo`), and names the key. `install.sh` records both
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys; the operator and harness modes of `upgrade.sh` use the values that the release
+recorded, but each run calls the generator before it selects the mode, so a bad value stops the run
+in every mode. The [inference-gateway page](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)
+says how the chart splits the amount and what the gateway does when it is spent.
+
 ### Cluster adoption and component toggles
 
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a

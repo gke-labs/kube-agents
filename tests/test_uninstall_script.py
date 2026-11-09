@@ -1157,6 +1157,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         self.assertNotEqual(redaction_at, -1, "uninstall.sh must blank the LITELLM_REDACTION_* keys")
         self.assertLess(redaction_at, call_at)
+        # The spend ceiling too: the generator refuses an amount or a period it
+        # cannot read, and a teardown must not stop on either.
+        budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
+        self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
+        self.assertLess(budget_at, call_at)
         # And the mode: the generator refuses a value outside the CRD's enum,
         # and a teardown must not stop on a typo in install.env.
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')

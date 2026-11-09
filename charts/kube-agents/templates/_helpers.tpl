@@ -963,14 +963,18 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
   cost to a per-provider counter in the router's cache, filters the provider's
   deployments out once the counter reaches budget_limit, and lets the counter
-  expire time_period after the first spend; its spend comes from the standard
-  logging payload, so streamed calls count. Chosen over
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
   litellm_settings.max_budget, which without a database counts only
   non-streamed calls, from the completion text alone, and exports nothing.
   The cache is in-process (the chart runs no Redis), so the ceiling is split
-  evenly across the gateway's replicas: the install as a whole stays under
-  .budget.usd, each replica refusing on its share, and a restarted pod starts
-  its count over. The share is rendered with four decimals, always with a
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
   dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
   LiteLLM treats a budget_limit of 0 as no limit.
 */}}
