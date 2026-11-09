@@ -26,8 +26,8 @@ from its registration. The one standing piece is the public chart repository of 
    The registration goes in the `context_repos` key of the `<agent>-gitops-state` ConfigMap,
    which the operator seeds from the PlatformAgent and keeps administrator-added entries of (the
    CR's `spec.integration.repositories[]` carries no `ref`). An existing entry for the repository
-   with another `ref` or `type` stops the plant and is left as it is; the teardown removes only
-   the entry the stack wrote. The ConfigMap reaches the broker and
+   (in any spelling of its URL) that is not the stack's whole entry stops the plant and is left as
+   it is; the teardown removes only the entry the stack wrote. The ConfigMap reaches the broker and
    the shell sandbox as a mounted directory that kubelet refreshes about once a minute, so the
    stack waits until both mounts carry the entry, then the broker's cache window, before the
    prompt is sent. A private repository would have to be in the same GitHub organization as the
