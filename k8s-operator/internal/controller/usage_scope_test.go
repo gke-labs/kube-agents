@@ -196,10 +196,6 @@ func TestScopeUndeclared_UnknownHostWritesNothing(t *testing.T) {
 		"no location":       func(h *agentv1alpha1.HarnessSpec) { h.Location = "" },
 		"no project":        func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" },
 		"no harness at all": nil,
-		// An ID spec.scope.projects cannot carry: the remedy names that field, so
-		// the operator names nothing rather than a value the API server refuses.
-		"legacy domain-scoped project": func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "example.com:proj" },
-		"too short an ID":              func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "ab" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
@@ -299,6 +295,38 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 		if again := scopeCondition(t, h); again != nil {
 			t.Fatalf("condition under project label %q = %+v, want none", label, again)
 		}
+	}
+}
+
+// A harness project ID that spec.scope.projects cannot carry (a legacy
+// domain-scoped project, or one shorter than the field allows) writes nothing,
+// even when the watcher's series carry that same label, so it is the gate and
+// not the project filter that keeps the operator quiet: the same fixture under
+// an ID the field accepts writes the condition.
+func TestScopeUndeclared_HarnessProjectOutsideTheScopeGrammarWritesNothing(t *testing.T) {
+	for name, project := range map[string]string{
+		"legacy domain-scoped project": "example.com:proj",
+		"too short an ID":              "ab",
+		"control: an accepted ID":      "accepted-proj",
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := scopeUndeclaredTestAgent(usageClock(0).Add(-time.Hour))
+			agent.Spec.Harness.ProjectID = project
+			host := usageClusterRef{Name: "c", Project: project, Location: "l"}
+			neighbour := usageClusterRef{Name: "analytics-dev", Project: project, Location: "europe-west4"}
+			h := scopeHarness(t, agent, host, neighbour)
+			h.poll(5)
+			cond := scopeCondition(t, h)
+			if scopeProjectIDPattern.MatchString(project) {
+				if cond == nil || !strings.Contains(cond.Message, "management project "+project+".") {
+					t.Fatalf("condition under an accepted ID = %+v, want it written and naming %s", cond, project)
+				}
+				return
+			}
+			if cond != nil {
+				t.Fatalf("condition under project ID %q = %+v, want none", project, cond)
+			}
+		})
 	}
 }
 

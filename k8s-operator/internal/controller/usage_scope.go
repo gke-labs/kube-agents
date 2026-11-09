@@ -55,7 +55,9 @@ const (
 	// like a GKE identifier: the labels are a pod listener's text, and the CR
 	// is not where it gets printed as written.
 	scopeUndeclaredInvalidName = "?"
-	scopeUndeclaredHint        = "Declare the scope on spec.scope: name the management project in spec.scope.projects to keep them, or list each one under spec.scope.exclude.clusters to leave it unmanaged."
+	scopeUndeclaredHint        = "Declare the scope on spec.scope: name the management project in spec.scope.projects to keep them, or list each one under spec.scope.exclude.clusters to leave it unmanaged. " +
+		"The management project stays in scope under any declaration, so a scope that names other projects silences this condition without retiring them. " +
+		"On an install made with install.sh, set SCOPE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env and run upgrade.sh instead of editing the CR."
 )
 
 // scopeUndeclaredNamePattern is the shape a cluster name, project ID or location
