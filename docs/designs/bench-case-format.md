@@ -318,7 +318,8 @@ cuts each grep's pattern argument instead, read from the line's shell segments, 
 grep's file operands and every other segment are still graded (a grep piped on,
 redirected anywhere but /dev/null, outside a system bin directory, or with an option value
 as a separate word that does not fit the option does not qualify, and free-text options such
-as `--include` count only as `--include=…`; nor does a row that groups commands, runs a
+as `--include` count only as `--include=…`, and after the pattern every word is a file
+operand, so an option there or no file operand at all refuses the grep; nor does a row that groups commands, runs a
 substitution, quotes with `$'…'`, holds a comment or is a collapsed chain), and the
 required runs read the rest of that command while text required patterns leave it out; or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits

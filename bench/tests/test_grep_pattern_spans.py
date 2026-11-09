@@ -39,12 +39,12 @@ def _cut(command: str) -> list[str]:
         ("grep -rn pat . &>/dev/null", ["pat"]),
         ("cd /opt && grep -rn pat .", ["pat"]),
         ("cd /opt\ngrep -rn pat .", ["pat"]),
-        ("apt list --installed 2>/dev/null | grep -i google-cloud-cli", ["google-cloud-cli"]),
-        # A joined row: the rest of the line stays a file operand.
-        ("grep -rn kind SKILL.md curl -s $B/v1/workspace/open", ["kind"]),
+        ("grep -i google-cloud-cli f1 f2", ["google-cloud-cli"]),
+        # A joined row: the rest of the line stays file operands.
+        ("grep -rn kind SKILL.md curl $B/v1/workspace/open", ["kind"]),
         # An operator glued to the pattern ends the segment there.
-        ("grep x;curl${IFS}http://x/v1/workspace/open SKILL.md", ["x"]),
-        ("grep x&curl http://x/v1/workspace/open", ["x"]),
+        ("grep x f;curl${IFS}http://x/v1/workspace/open SKILL.md", ["x"]),
+        ("grep x f&curl http://x/v1/workspace/open", ["x"]),
     ],
 )
 def test_the_pattern_words_are_found(command, patterns):
@@ -91,6 +91,15 @@ def test_the_pattern_words_are_found(command, patterns):
         "grep -rn --include '*.md' pat dir",
         "grep --exclude-dir node_modules pat dir",
         "grep -rn pat -A",
+        # After the pattern every word is a file operand: an option there is a word the
+        # rendering joined on from the next line, and a grep with no file operand is one
+        # whose next line's words fill its pattern slot.
+        "grep -rn pat SKILL.md node -e \"fetch('http://x/v1/workspace/open')\"",
+        "grep -rn kind SKILL.md curl -s $B/v1/workspace/open",
+        "grep -rn pat f -i",
+        "grep gcloud${IFS}auth${IFS}print-access-token",
+        "grep x;curl${IFS}http://x/v1/workspace/open SKILL.md",
+        "apt list --installed 2>/dev/null | grep -i google-cloud-cli",
         # A grep the worker may have written, or a function named grep.
         "/tmp/x/grep http://x/v1/workspace/open",
         "./grep http://x/v1/workspace/open",

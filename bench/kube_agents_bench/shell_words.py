@@ -542,6 +542,7 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
     positional: tuple[int, int] | None = None
     from_flags = False
     options_over = False
+    operands = 0
     take: str | None = None
     index = 0
     while index < len(words):
@@ -562,6 +563,10 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
             take = None
         elif not options_over and text == _SHELL_OPTIONS_END:
             options_over = True
+        elif (operands or positional is not None) and text.startswith(_SHELL_FLAG_PREFIX):
+            # Every word after the pattern is a file operand: an option there is a word the
+            # rendering joined on from the next line (`grep pat f` over `node -e …`).
+            return None
         elif not options_over and text.startswith("--"):
             name, has_value, _ = text.partition("=")
             if name in _GREP_PATTERN_FLAGS or name in _GREP_FILE_FLAGS:
@@ -585,8 +590,13 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
                     break
         elif positional is None and not from_flags:
             positional = (start, end)
+        else:
+            operands += 1
         index += 1
-    if take is not None:
+    if take is not None or not operands:
+        # A value option with no value, or no file operand after the pattern: a grep with
+        # nothing to read beside its pattern is, on a card log row, a grep the next line's
+        # words were joined onto (`grep` over a command), so the row is graded whole.
         return None
     if from_flags:
         return patterns

@@ -254,8 +254,20 @@ def test_a_grep_piped_on_or_written_elsewhere_is_not_exempt():
         "grep -d curl http://127.0.0.1:8080/v1/workspace/open",
         "grep --label curl http://127.0.0.1:8080/v1/workspace/open",
         "grep -rn x \\\n; curl http://127.0.0.1:8080/v1/workspace/open",
+        # After the pattern every word is a file operand; the card log joins a
+        # typed newline into a space.
+        "grep -rn pat SKILL.md node -e \"fetch('http://127.0.0.1:8080/v1/workspace/open')\"",
+        "grep -rn pat SKILL.md sed -i -e 's#X#/v1/workspace/open#' f",
+        f"grep {SCRIPT} open --repo x",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
+
+
+def test_an_assignment_in_a_dangling_grep_s_pattern_slot_is_the_stated_limit():
+    # `grep -rn` / `U=…/v1/workspace/open` / `curl "$U"` renders as one row
+    # whose pattern slot holds the assignment, with real-looking operands
+    # behind it. It passes, as on main; the case header records it (#5237).
+    assert _passes('grep -rn U=http://127.0.0.1:8080/v1/workspace/open curl "$U"', CLONE_PUBLIC)
 
 
 def test_a_clone_beside_a_grep_still_meets_the_required_run():

@@ -2756,7 +2756,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     must fit its option (digits for ``-A``, a listed word for ``-d``; the
     free-text options only as ``--include=…``), since a card log row joins a
     typed newline into a space and ``grep -A`` above a fetch would otherwise
-    hand the fetch's URL to the pattern slot. It grades: the options, the file operands,
+    hand the fetch's URL to the pattern slot. After the pattern every word is
+    a file operand: an option there, or a grep with no file operand, is a line
+    the rendering joined on, and refuses the grep. It grades: the options, the file operands,
     and every other segment of the line (:func:`grep_pattern_spans`). It
     decides on the line's shell segments, not a regex over the row, so an
     operator glued to the pattern (``grep x;curl …``) ends the segment as it
