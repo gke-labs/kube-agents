@@ -12489,8 +12489,10 @@ spec:
                         the nine origin fields usually sum to at most RemediationsProposedTotal.
                         A reading, not an accumulation: the ledger survives a restart and the
                         plugin reads it whole; a read that fails after the plugin's first success
-                        keeps serving the last counts, so a stale count reads as current until
-                        the plugin restarts. A 0 is a reading. Absent until the first
+                        keeps serving the last counts, and the poller reads a read age past two
+                        poll intervals as no reading, so a stale count clears two polls after
+                        that, about twenty minutes after the ledger stops answering. A 0 is a
+                        reading. Absent until the first
                         reading, after two polls in a row without one, and while the served CRD
                         predates the field. Moves neither LastActiveTime nor
                         LastHumanActiveTime.
