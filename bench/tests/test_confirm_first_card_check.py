@@ -233,7 +233,7 @@ def test_the_expected_output_carries_the_three_judged_requirements():
     assert "first post" in ack and "asks the user nothing" in ack
     assert "first acceptance criterion" in criterion and "confirms invoice-relay exists" in criterion
     assert "not negated" in criterion
-    assert "could not find invoice-relay" in answer and "changed nothing" in answer
+    assert "could not find invoice-relay" in answer and "rather than reporting a fix" in answer
 
 
 def test_the_report_names_no_workload_the_fleet_has():
