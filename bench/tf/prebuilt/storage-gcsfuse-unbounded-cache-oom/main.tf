@@ -16,8 +16,9 @@
 #
 # It plants a one-replica Deployment that asks for the gcsfuse CSI sidecar
 # (`gke-gcsfuse/volumes: "true"`) and mounts a bucket through the driver with
-# no sidecar memory-limit annotation and no file-cache capacity on the
-# volume: the shape no obtainability check names today. A declared gap: the
+# no sidecar memory-limit annotation, so the injected sidecar has no memory
+# limit: the shape no obtainability check names today. The volume carries no
+# `fileCacheCapacity`, which leaves the file cache off. A declared gap: the
 # case expects its ledger objective to fail.
 #
 # Isolation class: namespace-scoped. The namespace, its labels, the leftover
