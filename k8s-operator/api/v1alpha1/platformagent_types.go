@@ -203,9 +203,11 @@ type ScopeExcludeSpec struct {
 	// the third-party gke MCP server's list_clusters.
 	// Excluding a cluster narrows what the agents look at, but it is not yet
 	// enforced: the credential proxy still issues a kubeconfig for an excluded
-	// cluster, so a worker that fetches the cluster's credentials itself can
-	// still read it with the agent's read roles. To keep the agent off a
-	// cluster, put it in a project the agent holds no roles in.
+	// cluster, so a worker that fetches the cluster's credentials itself, or
+	// names it as a kubectl context, can still read it with the agent's read
+	// roles. Only a project where the agent holds no roles, granted there or
+	// inherited from a folder or organization above it, keeps the agent off a
+	// cluster; a cluster in the management project can't be fenced off yet.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId
