@@ -236,20 +236,20 @@ PARKED_AFTER_THE_MOVE: list[str] = []
 # (case, the roster line it follows): the file keeps the presubmit file's
 # reporting order.
 ADMITTED_AFTER_THE_SPLIT = [
-    # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
+    # 2026-09-22 (#1023): above the bar on the presubmit since #1626, no collapse.
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
-    # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
+    # 2026-09-22 (#1023): above the bar on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
-    # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
-    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the agent-model key of 10-19, 9/9 since #3145, the store at collecting.
+    # 2026-10-14 (#2016): clean on the three writers nightlies 10-12 to 10-14, the store at would-admit, the presubmit above the bar since #2263 (10-03).
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: clean on the writers nightlies since the model change of 10-19, the nights since #3145 included, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
-    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the agent-model key of 10-19), the store at collecting.
+    # 2026-10-23: clean on the fourteen writers nightlies 10-09 to 10-22, the four since the model change of 10-19 included, the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
-    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the agent-model key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    # 2026-10-26: one miss on the twelve graded main nightlies 10-13 to 10-26, clean since the model change of 10-19 and under spec.mode next, the store at collecting.
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
-    # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
+    # 2026-11-02 (#2013 step 4, #4094): clean on the twelve graded main nightlies 10-20 to 11-02 and at the current next key (the store at collecting), the presubmit above the bar 10-27 to 11-02 with no all-reps collapse.
     ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
-    # 2026-11-02 (#4095): 21/21 on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next (15/15 at the gemini-4-argon key of 10-29), the store at collecting.
+    # 2026-11-02 (#4095): clean on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next, on both sides of the model change of 10-29, the store at collecting.
     ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
@@ -321,7 +321,7 @@ DEMOTED_AFTER_THE_SPLIT = [
     # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
     # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
     # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
-    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (the agent model of the day read seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the

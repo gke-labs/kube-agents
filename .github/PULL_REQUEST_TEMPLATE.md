@@ -148,9 +148,11 @@ are checked by scripts/test_eval_rosters.py; these two are yours to show.
 - (a) The red run: the case failing for the right reason against `main` without the fix it
   guards. Link the build or artifact and name the check that failed
   (.agents/rules/public_surfaces.md).
-- (b) The misses: every failed repetition in the case's last 20 runs at the current version
-  key, each classified as an agent regression (with its issue) or an infra class the harness
-  excludes. "None" is a complete answer when there were none.
+- (b) The misses: the runs in the case's last 20 at the current version key that failed,
+  each by build id, each classified as an agent regression (with its issue) or an infra
+  class the harness excludes (`rep_kind` in scripts/eval_dashboard/classify.py). No
+  repetition counts or ratios (.agents/rules/public_surfaces.md). "None" is a complete
+  answer when there were none.
 -->
 
 - Red run:

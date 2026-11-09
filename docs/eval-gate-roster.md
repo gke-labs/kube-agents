@@ -595,13 +595,15 @@ with "Not a roster admission."
   build or artifact, and names the check that failed
   ([`public_surfaces.md`](../.agents/rules/public_surfaces.md)). For an
   `expected_fail` case, the run that recorded it red counts.
-- **(b) Every miss explained.** In the case's last 20 runs at the current version key, every
-  failed repetition is classified. Either it is an agent regression with an issue, or it is an
-  infra class the harness already sets aside (`rep_kind` in
+- **(b) Every miss explained.** The pull request lists the runs in the case's last 20 at the
+  current version key that failed, each by build id, each classified: either an agent
+  regression with its issue, or an infra class the harness already sets aside (`rep_kind` in
   [`scripts/eval_dashboard/classify.py`](../scripts/eval_dashboard/classify.py)). This is on
-  top of the `would-admit` reading at 90 % or better. The pull request lists each miss with its
-  class and, for a regression, its issue. "None" is a complete answer when the window has no
-  miss.
+  top of the `would-admit` reading at 90 % or better. No repetition counts or ratios: those
+  stay on the dashboard (`cases.html#view=domains`) and in the baselines bucket
+  ([`bench/baselines/README.md`](../bench/baselines/README.md));
+  [`public_surfaces.md`](../.agents/rules/public_surfaces.md) is the rule. "None" is a
+  complete answer when the window has no miss.
 - **(c) A guarded fixture.** The seeded fleet stays, because it saves the presubmit from
   building clusters. But a case that reads it qualifies only when the precondition it grades is
   asserted by the hourly seeded-fleet scan (`scripts/eval_dashboard/fixture_state.py` running
@@ -1058,10 +1060,12 @@ card (0/3 that way on 2026-10-26), not the case and not the agent.
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
 window for the case, the verdict's **Record says** column reads `would-demote` and the
-case's `admission_reason` carries the numbers (`screened at 12/21 …, below the bar`) — cite
-them in the demotion pull request. A case whose record still says `would-admit` when it
-redded an unrelated pull request is the other thing to look at before demoting: three
-correlated failures against a 21/21 window point at the environment, not the case. (Under
+case's `admission_reason` carries the numbers — the demotion pull request cites the reading
+and the build it was read on, not the numbers
+([`public_surfaces.md`](../.agents/rules/public_surfaces.md)). A case whose record still says
+`would-admit` when it redded an unrelated pull request is the other thing to look at before
+demoting: three correlated failures against a 21/21 window point at the environment, not the
+case. (Under
 `EVAL_ADMISSION_MODE=record` the record decides once it holds a full window and the edit
 changes nothing for that case: one night of three failures on `main` against a 21/21 window
 reads 18/21, below the bar, and the case is turned away on the next presubmit — a one-night

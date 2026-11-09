@@ -28,8 +28,8 @@
 # named workloads names the dependency each cut would change (the seeded fleet's
 # HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
 # ledger-writer in seeded-qos; no stack). A baseline: no gap declared; moved in
-# from the nightly file on its record there: 43 of 45 repetitions pass,
-# 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
+# from the nightly file on its record there: above the bar on the nightlies
+# of 2026-10-23 to 2026-11-09 (the case of #3507, for #3199).
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
 # Capability row: networking fabric, load balancers and Gateway; the
 # obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort

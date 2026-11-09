@@ -30,5 +30,4 @@ asks, off GitHub.
 This holds for a person and for a bot alike, for a reply that quotes someone else's post, and for
 a file committed to the repository. A pull request's **Live validation** section names the failing
 check and cites the red and green runs ([`eval_driven_development.md`](eval_driven_development.md),
-"What the pull request records"). One exception, for now: the roster admission records in
-`hack/eval/*.txt` keep their counts until the admission process cites runs instead.
+"What the pull request records").

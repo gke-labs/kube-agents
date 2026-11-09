@@ -70,7 +70,7 @@
 # grows is this file's own share, from twenty-three cases (69 units) to
 # thirty (90), +21 units: at their hints (178s, 200s x4, 700s x2) about
 # 120 serial minutes, at their measured presubmit medians (the canary's is
-# 1002s, p90 2074s, over 903 repetitions 2026-09-04 to 09-15) nearer 150.
+# 1002s, p90 2074s, over the repetitions of 2026-09-04 to 09-15) nearer 150.
 # 2026-09-29: the canary returned to the presubmit file held out (#2013) and
 # pdb-remediation-pr moved there held out beside it (#2016, seat opened
 # 2026-09-28; roster line 2026-10-14), so this file's share was thirty-eight cases (114 units) of the
