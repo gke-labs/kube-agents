@@ -1,6 +1,7 @@
 # FIXTURE_NOT_READY -- an entry in scripts/validate_bench_cases.py, not a
 # roster line, until the pool installs carry the fixture in fixture/README.md
-# (#4905; the context_repos registration is the same need as #4243).
+# (#5213 tracks the plant; the context_repos registration is the same need as
+# #4243).
 #
 # What this case grades (#4905, defect 4 of the PoC report #2597): a change
 # request whose fix lives in a repository the agent may read and may not

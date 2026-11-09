@@ -429,7 +429,7 @@ FIXTURE_NOT_READY = {
         "which is broken rather than red"
     ),
     "remediation-context-repository-owns-the-fix": (
-        "#4905: needs the three-part fixture its fixture/README.md describes in each "
+        "#5213: needs the three-part fixture its fixture/README.md describes in each "
         "pool install: a context repository holding the payments chart, registered "
         "in context_repos at a pinned ref (the registration #4243 also waits for), "
         "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
