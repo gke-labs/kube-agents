@@ -30,6 +30,14 @@
 # seeded-networking, route unattached, no load balancer). A declared gap,
 # expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
 ./tasks/networking-gateway-ingress-port-mismatch/task.yaml
+# Capability row: networking fabric, load balancers and Gateway; the
+# obtainability audit on a node-networking DaemonSet with no toleration for a
+# tainted node pool (the fleet's cni-shaped-agent in seeded-shapes on slot a,
+# which covers the default pool alone while idle-batch-pool and
+# pinned-inference-pool run without it). A declared gap, expected_fail: no
+# audit reads a DaemonSet's coverage of a tainted pool; the gap is #2576
+# (item 2).
+./tasks/networking-ip-masq-agent-missing-ccc-toleration/task.yaml
 # Capability row: observability, logging and Managed Prometheus; the
 # obtainability audit on a Deployment whose container is OOM-killed in a loop
 # (the planted kube-state-metrics in seeded-observability, busybox under a 64Mi
