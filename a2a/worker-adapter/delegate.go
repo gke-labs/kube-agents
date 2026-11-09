@@ -119,10 +119,11 @@ func validateDelegate(req lib.DelegateRequest) string {
 	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
 	}
-	// No gateway reads a delegate request's parameters yet, so a child
-	// would be minted without the target its parent asked for; refuse
-	// rather than drop them. The gateway's delegation to profiles lifts
-	// this, validating with lib.ValidateTaskParameters.
+	// The delegate tool offers no parameters yet (offering them is text
+	// the model reads, and lands with its own eval case), so a request
+	// carrying some reached the adapter some other way; refuse it rather
+	// than pass on a target the tool never asked for. The gateway reads
+	// them, validating with lib.ValidateTaskParameters.
 	if len(req.Parameters) > 0 {
 		return delegateParametersNotYet
 	}

@@ -550,9 +550,9 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
-	// a2aChartPodsWarned records, per CR, the spec generation and discarded
-	// chart-pods annotation value last reported (a2aChartPodsDiscard), so each
-	// generation and value warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarned records, per CR, the spec generation and the
+	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
+	// reason warns once. Keyed by ObjectKey, value
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
@@ -658,6 +658,10 @@ type PlatformAgentReconciler struct {
 	// under `make run` off the cluster, renders no such rule.
 	OperatorNamespace string
 
+	// calloutStatus reads an auth callout pod's /status for the
+	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
+	calloutStatus calloutStatusReader
+
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -696,6 +700,23 @@ type PlatformAgentReconciler struct {
 // `WaitForCacheSync` when `list`/`watch` is trimmed.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// `dispatchjobtemplates` are the dispatcher Job admission policy's params in
+// <ns>-profiles (agentprofile_job_template.go), which the operator alone
+// writes; no Role it renders grants the kind, and the built-in admin and edit
+// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// run that defaults a Job template (defaultedJobTemplate), which stores
+// nothing. ClusterRole rules, not Roles: the profile namespace is created at
+// runtime, and RBAC escalation prevention stops the operator granting itself
+// a Role there with verbs it does not already hold. No watch: every read goes
+// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
+// 2026-10-31 (#3655 PR 6).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// `get` on the dispatcher Job admission policy and its binding: before the
+// dispatcher gets its Jobs Role, the operator checks both are in the cluster
+// as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
+// watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
@@ -1195,6 +1216,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		// No callout, so no claim about its map: the condition goes.
+		removed := a2aIdentityMapRemoved
+		a2aState.calloutMap = &removed
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
@@ -1295,7 +1319,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// depend on the Deployment's status event alone.
 	// busHeld shares it for the gateway's reason: the bus waits on the
 	// callout's rollout, and the pass that sees it finish has to happen.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking || a2aState.busHeld) {
+	// calloutMap shares it too: a map the callouts are still loading, or
+	// pods that didn't answer, changes nothing the operator watches when it
+	// settles, so the pass that sees it settle has to be scheduled.
+	if a2aNext && a2aState.wantsRequeue() {
 		requeue := a2aPendingRequeue
 		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
@@ -1312,6 +1339,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// A held-back Lease recreate is due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
+		if a2aState.busPodRequeue > 0 {
+			requeue = min(requeue, a2aState.busPodRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1361,6 +1392,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// else wakes the pass that creates it.
 	if a2aNext && a2aState.leaseRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
+	}
+	// A bus pod stuck on an old revision inside its grace period: the pass
+	// that replaces it has to be asked for, since pods are not watched.
+	if a2aNext && a2aState.busPodRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -4411,6 +4447,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
+		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
 		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
@@ -4423,6 +4460,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
+			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
 			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
@@ -4437,6 +4475,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	return r.Status().Update(ctx, agent)
@@ -4788,6 +4827,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
 	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
 	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
@@ -4856,7 +4896,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
@@ -4941,6 +4981,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
@@ -5503,8 +5544,10 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the usage poll (its four groups share three distinct selectors, every
 // usageCountersPollInterval), one per reconcile while the CR has plugins, and
 // three more per reconcile while the agent is not Ready — five of those where
-// the A2A stack renders — and one per reconcile while the exec tier is short
-// of its count (credentialProxyExecUnschedulablePod). Each is namespace-scoped and label-selected
+// the A2A stack renders — one per reconcile while the exec tier is short
+// of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
+// pod per reconcile while a bus replica is not on the StatefulSet's update
+// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.

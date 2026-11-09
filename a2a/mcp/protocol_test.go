@@ -361,3 +361,34 @@ func TestTrailingDataAfterABatchIsAParseError(t *testing.T) {
 		}
 	}
 }
+
+func TestANonObjectMetaIsIgnoredNotARefusal(t *testing.T) {
+	var gotMeta map[string]any
+	metaTool := Tool{
+		Definition: ToolDefinition{Name: "meta", InputSchema: map[string]any{"type": "object"}},
+		Call: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			gotMeta = CallMetaFromContext(ctx)
+			return "ran", nil
+		},
+	}
+	s := mustServer(t, metaTool)
+	for _, meta := range []string{`"conv-1"`, `["a"]`, `7`, `true`, `null`} {
+		gotMeta = map[string]any{"stale": true}
+		out := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"meta","_meta":`+meta+`}}`)
+		if out["error"] != nil {
+			t.Errorf("_meta %s: error = %v, want the tool to run", meta, out["error"])
+			continue
+		}
+		text := out["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]
+		if text != "ran" {
+			t.Errorf("_meta %s: text = %v, want ran", meta, text)
+		}
+		if gotMeta != nil {
+			t.Errorf("_meta %s: tool saw meta %v, want none", meta, gotMeta)
+		}
+	}
+	out := rpc(t, s, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"meta","_meta":{"conversation_id":"c"}}}`)
+	if out["error"] != nil || gotMeta["conversation_id"] != "c" {
+		t.Errorf("object _meta: error = %v, meta = %v, want conversation_id c", out["error"], gotMeta)
+	}
+}
