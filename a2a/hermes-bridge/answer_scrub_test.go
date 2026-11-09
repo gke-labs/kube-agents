@@ -694,3 +694,14 @@ func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 		t.Error("a forged Secret evicted the earlier Secret value")
 	}
 }
+
+// An env entry's literal credential in a tool result (kubectl get deploy
+// -o yaml) is tracked, so the answer's bare echo of it is redacted.
+func TestSeenSecrets_AnEnvEntrysCredentialIsTracked(t *testing.T) {
+	const value = "harborlantern-synthetic"
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "spec:\n  containers:\n  - name: app\n    env:\n    - name: DB_PASSWORD\n      value: "+value+"\n"))
+	if got := scrubAnswerText("The app connects with "+value+".", &s); got != "The app connects with [redacted]." {
+		t.Errorf("answer = %q, want the env value redacted", got)
+	}
+}

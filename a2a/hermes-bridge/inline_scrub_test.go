@@ -426,3 +426,38 @@ func TestScrubInlineSecretsAllValueColumnsAndWholeStatusValue(t *testing.T) {
 		}
 	}
 }
+
+// A Kubernetes env entry whose name is a credential key and whose value is
+// a literal sibling, in YAML, JSON (compact, indented, value first) or a
+// flow mapping, loses the value; a non-credential name, a valueFrom
+// reference, a path under a *_FILE name and a TTL under a token setting
+// stay. Synthetic values.
+func TestScrubInlineSecretsEnvNameValuePairs(t *testing.T) {
+	const word, tok = "quietpasture", "Synth3tic-Pass-0001"
+	positives := []struct{ in, want string }{
+		{"env:\n- name: DB_PASSWORD\n  value: " + word + "\n- name: LOG_LEVEL\n  value: debug",
+			"env:\n- name: DB_PASSWORD\n  value: [redacted]\n- name: LOG_LEVEL\n  value: debug"},
+		{"        - name: API_TOKEN\n          value: \"" + tok + "\"", "        - name: API_TOKEN\n          value: \"[redacted]\""},
+		{`{"name":"DB_PASSWORD","value":"` + word + `"}`, `{"name":"DB_PASSWORD","value":"[redacted]"}`},
+		{"{\n  \"name\": \"REDIS_PASSWORD\",\n  \"value\": \"" + word + "\"\n}", "{\n  \"name\": \"REDIS_PASSWORD\",\n  \"value\": \"[redacted]\"\n}"},
+		{`{"value":"` + tok + `","name":"CLIENT_SECRET"}`, `{"value":"[redacted]","name":"CLIENT_SECRET"}`},
+		{"env: [{name: DB_PASSWORD, value: " + word + "}]", "env: [{name: DB_PASSWORD, value: [redacted]}]"},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	negatives := []string{
+		"- name: LOG_LEVEL\n  value: debug",
+		"- name: DB_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: db-creds\n      key: password",
+		"- name: DB_PASSWORD_FILE\n  value: /etc/secret/db-password",
+		`{"name":"TOKEN_TTL","value":"30m"}`,
+		"- name: DB_PASSWORD\n  value: \"\"",
+	}
+	for _, in := range negatives {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}

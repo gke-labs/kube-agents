@@ -1348,6 +1348,7 @@ var inlineScrubRules = []inlineScrubRule{
 	}},
 	{"cli-flag", scrubCLISecretFlags},
 	{"prose", scrubProseSecrets},
+	{"env-name-value", scrubEnvNameValuePairs},
 	{"markdown-table", scrubMarkdownTables},
 	{"key-value", scrubInlineKVSecrets},
 }
@@ -1740,6 +1741,49 @@ func kvSecretSpans(s string, rec func(lo, hi int, named bool)) {
 			pos = matchEnd + valLen
 		}
 	}
+}
+
+var (
+	// envNameValuePattern is a Kubernetes env entry, a name followed by a
+	// literal value sibling, in YAML (- name: X, then value: y on the next
+	// line), JSON or a flow mapping; envValueNamePattern is the same with
+	// the value first (JSON or a flow mapping). valueFrom is not a value.
+	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:,[ \t]*(?:\r?\n[ \t]*)?|\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
+	envValueNamePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
+)
+
+// scrubEnvNameValuePairs redacts the literal value of a Kubernetes env
+// entry whose name is a credential key (DB_PASSWORD), as the name's class
+// says (classValueRedacted): the name and the value are separate fields,
+// so the key-value rule never links them.
+func scrubEnvNameValuePairs(s string, sink secretSink) string {
+	if !strings.Contains(s, "name") || !strings.Contains(s, "value") {
+		return s
+	}
+	var spans [][2]int
+	pair := func(re *regexp.Regexp, nameG, valueG int) {
+		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+			name := s[m[2*nameG]:m[2*nameG+1]]
+			lo, hi := m[2*valueG], m[2*valueG+1]
+			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
+				lo, hi = lo+1, hi-1
+			}
+			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
+				lo += sloc[1] // the scheme word stays, as under a key
+			}
+			v := s[lo:hi]
+			if !inlineSecretKey(name) || strings.Contains(v, redactedValue[:len(redactedValue)-1]) || !classValueRedacted(secretKeyClassOf(name), v, false) {
+				continue
+			}
+			spans = append(spans, [2]int{lo, hi})
+			if keyClearlyNamesSecret(name) {
+				sink.emit(v)
+			}
+		}
+	}
+	pair(envNameValuePattern, 1, 2)
+	pair(envValueNamePattern, 2, 1)
+	return redactSpans(s, spans)
 }
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
