@@ -638,6 +638,11 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(BoardActSink); ok {
 		sink.SetBoardActor(busBoardActor(o.Client))
 	}
+	// On a backend with no Home tab (Google Chat), a tap is admitted by the
+	// rule an inbound message is (gchat_board.go).
+	if sink, ok := o.Adapter.(BoardAdmitSink); ok {
+		sink.SetBoardAdmits(func(backend, author string) bool { return g.resolvePrincipal(backend, author) != "" })
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
