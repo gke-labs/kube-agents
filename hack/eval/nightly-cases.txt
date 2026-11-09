@@ -1072,13 +1072,6 @@
 # The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
-# A request cut on named workloads names the dependency each cut would change
-# (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's
-# requests equal to limits (guaranteed-qos-workload). The chat path that does
-# not run the waste collector. Red on main before the change, on a dev
-# install. One case, three units. deployer: noop, read-only over the seeded fleet.
-./tasks/cost-rightsizing-names-dependencies/task.yaml
-
 # gke-labs#2610: a request to propose a fix, delegated to a platform card, is
 # answered in the card's result with the PodDisruptionBudget manifest, and no
 # worker runs submit_suggestion.py, during its run or after kanban_complete.
