@@ -14,6 +14,16 @@ The Platform Agent's `SOUL.md` forbids direct infrastructure mutations. When the
 - **Compatibility with your existing GitOps.** ArgoCD, Flux, RootSync — whichever reconciler you already run applies the merged change. The agent doesn't compete with your reconciler.
 - **Least privilege on the cluster.** The agent's Kubernetes identity cannot mutate workloads or cluster state — its only write grant is a leader-election housekeeping Role confined to its own namespace — so even a misled persona cannot change a cluster through the Kubernetes API. Its GCP identity is a separate question, governed by the install-time permission set (`read-only` by default; `custom`, where you name every role, is the only way to widen it). See [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do).
 
+## Write scope shapes a diagnosis
+
+The repositories in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration) set two boundaries, and they are not the same. A `gitops` or `managed` repository is where a pull request can go. A `context` repository is where the agent may read to find out where a value comes from. So is a public repository that a managed declaration points at: a Flux `GitRepository`, an Argo CD `source.repoURL`, a Terraform module `source`. The agent reads such a repository with the `inspect-repository` skill, through the credential broker, with a context repository's read-only credential or none. Nothing writes there: the broker [refuses a context repository every write](/kube-agents/operator/platformagent-crd/#specintegrationrepositories).
+
+What you declare therefore decides which faults the agent can fix and which it can only locate. A tenant workload is often declared in a repository the install does not manage. A Helm release's values and templates live in the chart's repository. A shared default lives in a module. The agent traces the value to the file that defines it. When that file is outside its write scope, it reports the repository, file, line and change, and opens no pull request.
+
+It does not substitute an edit it can make for the one that is needed: an override of a shared default, a post-render patch, a second copy of the object. That edit reaches a different layer, or none. Declare the repository that holds the fix as `context` if it is private, so the agent can read it. Declare it as `managed` only if you want pull requests there.
+
+Two more rules follow from the same boundary. A pull request that changes a value every environment inherits names the consumers the agent checked and why each wants the new value. Otherwise it scopes the change to the affected cluster's overlay. And a credential the agent lacks is treated differently from one it must never hold. A repository that is not registered is reported as a gap to close. A SOPS, GPG, age or KMS decryption key is never requested, imported or waited for. The agent reads an encrypted file as metadata, and the decrypted edit stays with a person who holds the key.
+
 ## The `submit-suggestion` skill
 
 Source: [`agents/platform/skills/submit-suggestion/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/submit-suggestion).
@@ -102,7 +112,7 @@ Unless the run could not see the whole fleet. A cluster that was skipped, or one
 
 A `manual` finding from the obtainability, compliance and AI security audits and the fleet-wide cost analysis gets notes that say where to make the fix. A `manifest` or `gcloud` finding gets no such note (the [Config Connector paragraph](#when-config-connector-is-not-applying-a-file) is a different note). Neither does a finding whose fix an open remediation pull request carries: a pull request whose delta block names the finding, or one on the branch the audit promised for the fix. A pull request opened by hand, outside the audit, does not count, and the row keeps its notes.
 
-The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. Context repositories are not read. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker sends one revision of the repository and keeps no copy of it.
+The notes come from the audit's collector, which reads the GitOps repository and the live object. You configure nothing beyond the GitOps repository. The collector does not read context repositories. A standard install reads the repository in content mode: the shell sandbox has no clone, so the collector copies the repository's `.yaml` and `.yml` files, and the files named `Kustomization`, through the [credential broker](/kube-agents/reference/credential-isolation/). The broker sends one revision of the repository and keeps no copy of it.
 
 The collector writes no location note when:
 
