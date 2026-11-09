@@ -264,7 +264,7 @@ def test_the_plant_registers_the_context_repository_with_its_ref_and_waits_for_b
     assert json.loads(host.configmap["context_repos"]) == [CONTEXT_ENTRY]
     execs = [c for c in host.calls if "exec" in c]
     targets = {(c[c.index("exec") + 1], c[c.index("-c") + 1]) for c in execs}
-    assert targets == {("deployment/platform-agent-gateway", "envoy-credential-proxy"), ("statefulset/platform-agent-shell", "shell")}
+    assert targets == {("deployment/platform-agent-credential-proxy", "envoy-credential-proxy"), ("statefulset/platform-agent-shell", "shell")}
     assert all(c[-1] == "/etc/gitops/context_repos" for c in execs)
     # Polled while the mounts lagged, then the broker's cache window.
     assert clock.sleeps[-1] == plant.BROKER_CACHE_S

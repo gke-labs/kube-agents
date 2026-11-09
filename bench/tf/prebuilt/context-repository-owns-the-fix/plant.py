@@ -148,9 +148,11 @@ STATE_CONFIGMAP = "{agent}-gitops-state"
 CONTEXT_REPOS_KEY = "context_repos"
 CONTEXT_REPO_TYPE = "github"
 # Where the ConfigMap is mounted in the broker and the shell sandbox
-# (gitops_workspace.GITOPS_STATE_DIR), and the containers that read it.
+# (gitops_workspace.GITOPS_STATE_DIR), and the workloads and containers that
+# read it: the credential broker's own Deployment
+# (credential_proxy_manifests.go) and the shell StatefulSet.
 GITOPS_STATE_DIR = "/etc/gitops"
-GATEWAY_DEPLOYMENT = "{agent}-gateway"
+BROKER_DEPLOYMENT = "{agent}-credential-proxy"
 BROKER_CONTAINER = "envoy-credential-proxy"
 SHELL_STATEFULSET = "{agent}-shell"
 SHELL_CONTAINER = "shell"
@@ -601,7 +603,7 @@ class Stack:
         """Until the broker and the shell sandbox see the entry, then the broker's cache window."""
         agent = self.settings.agent_name
         targets = [
-            (f"deployment/{GATEWAY_DEPLOYMENT.format(agent=agent)}", BROKER_CONTAINER),
+            (f"deployment/{BROKER_DEPLOYMENT.format(agent=agent)}", BROKER_CONTAINER),
             (f"statefulset/{SHELL_STATEFULSET.format(agent=agent)}", SHELL_CONTAINER),
         ]
         deadline = self.now() + MOUNT_WAIT_S

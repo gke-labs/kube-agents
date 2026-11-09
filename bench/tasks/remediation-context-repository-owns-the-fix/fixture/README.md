@@ -40,7 +40,8 @@ from its registration. The one standing piece is the public chart repository of 
    owner, name and branch. Each file carries `managed-by: kube-agents-bench` in its labels; that
    line is how the stack's teardown, a later plant and the repository reset
    (`hack/ci_reset_agent_pulls.py`, `PLANTED_STACK_FILES`) know a file is the stack's, and a
-   file without it is never written over or deleted. `values.enc.yaml` is SOPS-shaped filler: no
+   file without it is never written over or deleted. The reset knows the pool's paths only (host
+   cluster `platform-agent-host`); on a dev install the teardown is the one remover. `values.enc.yaml` is SOPS-shaped filler: no
    key decrypts it, which is the point. `legacy-env.yaml` is the decoy: a ConfigMap that carries
    the variable's name and that nothing consumes, so a text search in the writable repository
    finds a file whose edit changes nothing.

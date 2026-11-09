@@ -41,7 +41,7 @@ variable "agent_namespace" {
 
 variable "agent_name" {
   type        = string
-  description = "Name of the PlatformAgent, which names its GitOps state ConfigMap, gateway Deployment and shell StatefulSet"
+  description = "Name of the PlatformAgent, which names its GitOps state ConfigMap, credential broker Deployment and shell StatefulSet"
   default     = "platform-agent"
 }
 
