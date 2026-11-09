@@ -647,6 +647,46 @@ It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
 under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
 
+## `kanban-block-recheck` retries a blocked card when its condition has cleared
+
+A blocked card stays blocked until a person acts, and nothing re-reads the condition the block
+described: cards have sat blocked for days on a condition that had cleared, re-reported by the
+digest above. `kanban_block_recheck.py` (`no_agent: true`, four times an hour at :07, :22, :37
+and :52) is the re-check. It keeps one record per blocked card in the board's
+`kanban_block_rechecks` table: the condition, when to check it, when to stop, and what the last
+check found. A condition that has cleared retries the card through Hermes' `unblock_task`, the
+call Retry makes, writes a `block_rechecked` event on the card, and prints one line, which
+`deliver: "chat"` posts ("Retried **Investigate web**: it blocked 1 hour ago and the wait has
+passed."). A condition that holds leaves the card blocked and refreshes the record, which the
+digest's row reads ("Re-checked 2 hours ago, still blocked."). No comment is written: the
+digest's rule goes quiet after a comment, and the daily report is deliberate.
+
+Two condition kinds. A **time** condition is derived with no record from anyone, for the blocks
+the harness files itself: a circuit-breaker trip (`gave_up`) retries an hour after the trip, and a
+`transient` block (the rate-limit exit, or a worker's `kanban_block(kind="transient")`) thirty
+minutes after the block; cards blocked before this job existed are covered on its first run. A
+`needs_input`, `capability` or untyped block is a question for a person and gets no record. A
+**Kubernetes** condition names a pod or a deployment on a cluster and clears when the pod is
+`Ready` or the deployment `Available`, read with one `kubectl get -o json` through the shell
+sandbox on the per-cluster kubeconfig `stall-watch` keeps there. Record one on the pod:
+
+```bash
+PLATFORM_AGENT_HOME=/opt/data python3 /opt/data/scripts/kanban_block_recheck.py \
+  --watch t_1234abcd \
+  --project <project> --location <location> --cluster <cluster> \
+  --namespace shop --resource deployment/web \
+  --expires-in-hours 48
+```
+
+Without `--expires-in-hours` the checks stop after a week; after the expiry the digest says
+"Re-checks ended 3 days ago, still blocked." Bounds: one automatic retry per card for its life (a
+second cleared condition is recorded as `retry_limit` and waits for a person), at most three
+retries per run so the first run after an upgrade does not start every old breaker trip at once,
+and upstream's own unblock-loop breaker, which routes a second same-kind `kanban_block` to
+`triage`. A cluster the job cannot read is recorded as `unknown` and read again on the next run.
+A worker cannot record a Kubernetes condition when it blocks; that is a tool-text change and a
+follow-up. Design: [`docs/designs/kanban-block-recheck.md`](../../../docs/designs/kanban-block-recheck.md).
+
 ## `feedback-prompt` asks once, a week after it first runs
 
 The one entry here whose product is a question to the operator rather than a

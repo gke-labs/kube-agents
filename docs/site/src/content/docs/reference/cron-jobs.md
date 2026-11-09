@@ -105,6 +105,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `kanban-workspace-gc` | Platform Agent | `40 5 * * *` | Daily 05:40 | yes | `kanban_workspace_gc.py` |
 | `session-retention` | Platform Agent | `50 5 * * *` | Daily 05:50 | yes | `session_retention.py` |
 | `kanban-board-health` | Platform Agent | `35 12 * * *` | Daily 12:35 | yes | `kanban_board_health.py` |
+| `kanban-block-recheck` | Platform Agent | `7,22,37,52 * * * *` | — | yes | `kanban_block_recheck.py` |
 | `feedback-prompt` | Platform Agent | `0 13 * * *` | Daily 13:00 | yes | `feedback_prompt.py` |
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 | `stall-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `stall_watch.py` |

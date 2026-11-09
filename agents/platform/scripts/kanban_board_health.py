@@ -116,7 +116,10 @@ it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
 for a block waiting on a person's answer). No task ids, block reasons or
 commands: those stay behind ``hermes kanban list`` and ``hermes kanban show``.
 Tasks sharing a title and whether they wait on a person are one row with
-their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted.
+their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted. A card
+the re-check job (``kanban_block_recheck.py``) has a record for says what
+that job found, so a repeat is not bare: "Re-checked 2 hours ago, still
+blocked.", or "Retries automatically in 40 minutes." before its first check.
 
 They are said when a task first gets stuck, then once a week while any stays
 stuck (``stuck_due``); a run in between says nothing about them. The record of
@@ -154,6 +157,9 @@ import gitops_workspace
 # Grades `last_delivery_error` the way the delivery ledger does, so a note on a
 # post that landed is not read as a lost post.
 from chat_delivery_watch import GRADE_HARD, grade_error, is_delivered_note
+# The re-check job's record of a blocked card's condition (#5260): the table it
+# keeps, and the age words it shares with this report.
+import kanban_block_recheck as _recheck
 
 # Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
 # purpose: the engine's warning-tier rules are useful to pull on demand but too
@@ -340,6 +346,29 @@ BLOCKED_CHILDREN_SQL = """
      WHERE c.status = 'todo'
      ORDER BY c.id
 """
+# What the re-check job last found about a blocked card's condition
+# (`kanban_block_recheck.py`): when it next looks, when it last looked, and
+# what it saw. Absent on a board the job has never run on.
+RECHECK_SQL = f"""
+    SELECT task_id, check_after, expires_at, last_checked_at, last_outcome
+      FROM {_recheck.TABLE}
+"""
+# The row's second sentence when the card has a re-check record: what the
+# re-check found instead of a bare repeat. A record not yet due says when the
+# automatic retry comes; one due and not yet run says nothing more.
+RECHECKED_LINE = "Re-checked {age} ago, still blocked."
+RECHECK_PENDING_LINE = "Retries automatically in {age}."
+RECHECK_ENDED_LINE = "Re-checks ended {age} ago, still blocked."
+RECHECK_UNREAD_LINE = "Re-check {age} ago could not read the cluster."
+RECHECK_LIMIT_LINE = "Condition cleared {age} ago; already retried once, so it waits for someone."
+RECHECK_LINES = {
+    _recheck.OUTCOME_STILL_BLOCKED: RECHECKED_LINE,
+    _recheck.OUTCOME_EXPIRED: RECHECK_ENDED_LINE,
+    _recheck.OUTCOME_UNKNOWN: RECHECK_UNREAD_LINE,
+    _recheck.OUTCOME_RETRY_LIMIT: RECHECK_LIMIT_LINE,
+}
+RECHECK_FIELDS = ("check_after", "expires_at", "last_checked_at", "last_outcome")
+STATUS_SENTENCE_SEPARATOR = " "
 # The words `session_kv_server._triage_authorize_clauses(True)` puts in a
 # triage report's `To authorize:` bullet when the install opens the Pull
 # Request itself (`TRIAGE_OPEN_PR_MARKER` there). The Slack notifier
@@ -445,6 +474,12 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
                 })
         except sqlite3.OperationalError:
             pass
+        try:
+            for row in conn.execute(RECHECK_SQL):
+                if row["task_id"] in tasks:
+                    tasks[row["task_id"]]["recheck"] = {field: row[field] for field in RECHECK_FIELDS}
+        except sqlite3.OperationalError:
+            pass  # the re-check job has not run on this board
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -485,13 +520,15 @@ def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=Non
     return taken
 
 
-def stuck_tasks(stuck_items: list, context: dict) -> list:
-    """One dict per stuck card: id, title, whether it waits on a person, and its age.
+def stuck_tasks(stuck_items: list, context: dict, now: float | None = None) -> list:
+    """One dict per stuck card: id, title, whether it waits on a person, its age, and its re-check line.
 
     The board's title and kind first (``blocked_context``), the CLI's title as
     the fallback, and the titles of the todo cards it holds back; the reason is
-    not carried, since chat never shows it.
+    not carried, since chat never shows it. ``now`` is epoch seconds, for the
+    re-check line's ages.
     """
+    now = time.time() if now is None else now
     tasks = []
     for task_id, diag, entry in stuck_items:
         task_id = str(task_id)
@@ -503,8 +540,24 @@ def stuck_tasks(stuck_items: list, context: dict) -> list:
             "person": info.get("kind") in PERSON_BLOCK_KINDS,
             "age_hours": _card_age_hours(diag),
             "held": [str(child.get("title") or "") for child in info.get("waiting_children") or ()],
+            "recheck": recheck_line(info.get("recheck"), now),
         })
     return tasks
+
+
+def recheck_line(recheck: dict | None, now: float) -> str | None:
+    """What the re-check job found about the card (``RECHECK_LINES``), when the
+    automatic retry comes for a record not yet due, or None: no record, or one
+    due that the job has not run on yet."""
+    if not recheck:
+        return None
+    outcome, checked_at = recheck.get("last_outcome"), recheck.get("last_checked_at")
+    if outcome in RECHECK_LINES and isinstance(checked_at, (int, float)):
+        return RECHECK_LINES[outcome].format(age=_recheck.plain_age(now - checked_at))
+    check_after = recheck.get("check_after")
+    if checked_at is None and isinstance(check_after, (int, float)) and check_after > now:
+        return RECHECK_PENDING_LINE.format(age=_recheck.plain_age(check_after - now))
+    return None
 
 
 def plain_age(age_hours: float) -> str | None:
@@ -563,16 +616,21 @@ def stuck_rows(tasks: list) -> tuple[str, list, int]:
         groups.values(),
         key=lambda group: (min(t["age_hours"] for t in group), group[0]["title"]),
     )
-    rows = [
-        {
+    rows = []
+    for group in ordered[:MAX_STUCK_ROWS]:
+        # The row is aged by its longest-waiting card, and that card's re-check
+        # line is the one it carries.
+        oldest = max(group, key=lambda t: t["age_hours"])
+        status = status_line(group[0]["person"], oldest["age_hours"])
+        if oldest.get("recheck"):
+            status += STATUS_SENTENCE_SEPARATOR + oldest["recheck"]
+        rows.append({
             "title": plain_title(group[0]["title"]),
             "count": len(group),
-            "status": status_line(group[0]["person"], max(t["age_hours"] for t in group)),
+            "status": status,
             "held": held_line(group) or "",
             "tasks": [t["task_id"] for t in group],
-        }
-        for group in ordered[:MAX_STUCK_ROWS]
-    ]
+        })
     noun = STUCK_HEADLINE[0] if len(tasks) == 1 else STUCK_HEADLINE[1]
     return noun.format(count=len(tasks)), rows, sum(len(group) for group in ordered[MAX_STUCK_ROWS:])
 
@@ -923,7 +981,7 @@ def is_disk_full_error(exc: BaseException, home: Path) -> bool:
     return SQLITE_IOERR_MARKER in text and usage is not None and usage[1] == 0
 
 
-def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
+def report(home: Path, *, env=None, max_chars: int | None = None, now: float | None = None, **kwargs) -> tuple[list | None, list]:
     """The whole check: ``(stuck tasks, other lines)``. Both empty means healthy, which means silent.
 
     The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
@@ -986,7 +1044,7 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
         lines = []
     if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
         return None, lines
-    return stuck_tasks(stuck, context), lines
+    return stuck_tasks(stuck, context, now), lines
 
 
 def main(argv=None, *, env=None, now=None) -> int:
@@ -1000,7 +1058,7 @@ def main(argv=None, *, env=None, now=None) -> int:
     if last_post_undelivered(home, recorded[STATE_SAID_AT_KEY], env):
         state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     try:
-        tasks, lines = report(home, env=env)
+        tasks, lines = report(home, env=env, now=now)
     except sqlite3.Error as exc:
         if state != recorded:
             save_state(path, state)
