@@ -14864,6 +14864,30 @@ class TestCoverageGaps(unittest.TestCase):
         self.assertNotIn("notes", clusters["b"])
         self.assertEqual(audit_report.adopt_collector_notes(doc, None), [])
 
+    def test_a_stale_note_is_cleared_when_the_collector_has_none(self):
+        """A precheck replays a stored document, so its note can be from an
+        earlier collection. A collected target with no note in this manifest
+        loses it; a target with no collected entry keeps its own."""
+        doc = make_doc(
+            clusters=[
+                {"name": "a", "location": "l", "project": "p", "notes": "an earlier collection's note"},
+                {"name": "b", "location": "l", "project": "p", "notes": "kept: gate-failed"},
+                {"name": "c", "location": "l", "project": "p", "notes": "kept: no entry"},
+            ]
+        )
+        manifest = {
+            "clusters": [
+                {"name": "a", "outcome": audit_report.MANIFEST_OUTCOME_COLLECTED},
+                {"name": "b", "outcome": "gate-failed"},
+            ]
+        }
+        self.assertEqual(audit_report.adopt_collector_notes(doc, manifest), ["a"])
+        clusters = {c["name"]: c for c in doc["scope"]["clusters"]}
+        self.assertNotIn("notes", clusters["a"])
+        self.assertEqual(clusters["b"]["notes"], "kept: gate-failed")
+        self.assertEqual(clusters["c"]["notes"], "kept: no entry")
+        self.assertEqual(audit_report.scope_notes(doc), ["b: kept: gate-failed", "c: kept: no entry"])
+
     def test_an_unrun_check_is_a_gap_even_with_no_limitations(self):
         """The gap prose cannot catch a run that never admits to one."""
         gaps = audit_report.coverage_gaps(

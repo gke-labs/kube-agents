@@ -7563,6 +7563,11 @@ def adopt_collector_notes(data: dict, manifest: dict | None) -> list[str]:
     show, so it is taken from the collector, as the evidence is, rather than
     left to the model to copy. It is information, not a gap: `coverage_gaps`
     never reads it.
+
+    A collected target whose manifest entry has no note loses the note the
+    document carries: a precheck replays a stored document, and its note
+    can be from an earlier collection. A target with no collected entry
+    keeps its note.
     """
     if not isinstance(manifest, dict):
         return []
@@ -7575,10 +7580,16 @@ def adopt_collector_notes(data: dict, manifest: dict | None) -> list[str]:
     for cluster in (data.get("scope") or {}).get("clusters") or []:
         if not isinstance(cluster, dict):
             continue
-        note = by_name.get(str(cluster.get("name")))
+        name = str(cluster.get("name"))
+        if name not in by_name:
+            continue
+        note = by_name[name]
         if note:
             cluster[SCOPE_NOTES_KEY] = note[:MAX_NOTE_CHARS]
-            changed.append(str(cluster.get("name")))
+            changed.append(name)
+        elif SCOPE_NOTES_KEY in cluster:
+            del cluster[SCOPE_NOTES_KEY]
+            changed.append(name)
     return changed
 
 
