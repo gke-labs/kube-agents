@@ -493,6 +493,26 @@ class RunNameTest(AnalyzeCase):
         hit, _ = self.proxy().lookup(self.body("project kube-agents-evals-29"), time.time())
         self.assertEqual(hit[0]["content"], said)
 
+    def test_a_node_name_that_holds_the_pool_project_is_served_with_this_runs_node(self):
+        shown = "node {} is NotReady"
+        old, new = "gke-kube-agents-evals-31-default-pool-abcdef12-x1y2", "gke-kube-agents-evals-7-default-pool-98765432-q9r8"
+        said = "kubectl drain {} --ignore-daemonsets"
+        self.assertEqual(self.recorded(self.body(shown.format(old)),
+                                       {"role": "assistant", "content": said.format(old)})["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(shown.format(new)), time.time())
+        self.assertEqual(hit[0]["content"], said.format(new))
+
+    def test_an_answer_quoting_a_queued_events_count_is_not_stored(self):
+        card = json.dumps({"task": {"id": "t_bbbbbbbb"}, "events": [
+            {"kind": "queued", "payload": {"note": "Queued: the system is busy.", "running": 5, "limit": 5, "ahead": 6}}]})
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "It waited behind 6 other tasks."})
+        self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+    def test_an_answer_quoting_a_commit_only_the_digest_names_is_not_stored(self):
+        card = "card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at 0ffe0cb: done"
+        line = self.recorded(self.body(card), {"role": "assistant", "content": "The repository is at 0ffe0cb."})
+        self.assertEqual(line["unstorable"], ["unbound_identifier"])
+
     def test_an_answer_repeating_a_dropped_queued_events_time_is_not_stored(self):
         card = json.dumps({"task": {"id": "t_bbbbbbbb"}, "events": [
             {"kind": "queued", "created_at": 1793700100, "payload": {"note": "Queued: the system is busy."}}]})

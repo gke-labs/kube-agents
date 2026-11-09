@@ -102,6 +102,14 @@ HEARTBEAT_KIND = "heartbeat"
 # epoch `created_at`, a date) still count against one (Normalizer.dropped_guards).
 QUEUED_KIND = "queued"
 DROPPED_EVENT_KINDS = (HEARTBEAT_KIND, QUEUED_KIND)
+EVENT_PAYLOAD_KEY = "payload"
+# A dropped event's payload counts (`running`, `limit`, `ahead`) are plain
+# numbers no placeholder can restore. An answer repeating one counts as
+# repeating a swapped number when it repeats it next to its key, or anywhere in
+# an answer that talks about the queue: no answer quotes the queue without one
+# of these words, and refusing every answer holding a small number would refuse
+# about one answer in five that follows a queued card (Nov 7 shadow data).
+QUEUE_WORDS_RE = re.compile(r"\bqueue[ds]?\b|\bqueu(?:e)?ing\b|\bahead\b|\bbehind\b|system is busy|frees up", re.I)
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
 # came before its JSON in one run and after it in the next. Only that shape is
@@ -305,8 +313,8 @@ K8S_SAFE = "bcdfghjklmnpqrstvwxz2456789"
 # is in the Cluster Agent's profile (`cluster-kube-agents-evals-31-seeded-a-…`),
 # the front door's specialist list, the GitOps repository
 # (`gke-agentic/kube-agents-evals-31-infra`) and tool results, so it is an
-# identifier. A numbered name is one wherever it starts and no letter or digit
-# follows its number. The bare name is also the start of names that belong to
+# identifier. A numbered name is one wherever no letter or digit comes before
+# it and none follows its number (`xkube-agents-evals-31` stays). The bare name is also the start of names that belong to
 # no project and are the same in every run (`kube-agents-evals-token-minter`,
 # `kube-agents-evals-large-gitops`), so it counts only on its own or before a
 # part that pool projects add to their own names. A percent-escape before it is
@@ -325,13 +333,15 @@ EVAL_POOL_CLASS = "EVALPROJECT"
 COMMIT_CLASS = "COMMIT"
 COMMIT_MIN_HEX = 7
 COMMIT_MAX_HEX = 40
-COMMIT_RE = re.compile(r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])")
 COMMIT_HEX = r"([0-9a-f]{" + str(COMMIT_MIN_HEX) + "," + str(COMMIT_MAX_HEX) + r"})(?![0-9A-Za-z])"
+COMMIT_RE = re.compile(r"[\w.⟦⟧-]+/[\w.⟦⟧-]+@" + COMMIT_HEX)
 # The same commits in a forge URL: `…/blob/<sha>/README.md`, `…/tree/<sha>`, `…/commit/<sha>`.
 COMMIT_URL_RE = re.compile(r"/(?:blob|tree|commit|commits)/" + COMMIT_HEX)
 # A run of hex an answer may hold a bound commit as, anywhere, or abbreviate one to
 # (Mapping.apply_to_answer, Mapping.identifier_left_literal).
 HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{" + str(COMMIT_MIN_HEX) + r",}(?![0-9A-Za-z])")
+# A run of hex with a letter in it: one with digits only is a number, not a commit.
+HEX_LETTER_RE = re.compile(r"[a-f]")
 
 # (class, pattern, group): identifier classes in the order they are applied.
 # Longer, more specific shapes go first. `group` is the part replaced; the
@@ -356,8 +366,10 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("TASK", re.compile(r"\bt_[0-9a-f]{8}\b"), 0),
     ("A2ATASK", re.compile(r"\btask-[0-9a-f]{16}\b"), 0),
     ("INJ", re.compile(r"\binj-\d+\b"), 0),
-    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay.
-    ("NODE", re.compile(r"\bgke-[a-z0-9-]+?-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
+    # GKE node: gke-<cluster>-<pool>-<8 hex>-<4>; the cluster and pool stay. The
+    # name may hold a placeholder already (`gke-⟦EVALPROJECT_1⟧-default-pool-…`).
+    ("NODE", re.compile(r"\bgke-(?:[a-z0-9-]|" + re.escape(OPEN) + r"[A-Za-z0-9_]+" + re.escape(CLOSE) + r")+?"
+                        r"-([0-9a-f]{8}-[a-z0-9]{4})\b"), 1),
     # Pod of a ReplicaSet: <workload>-<template hash>-<5>; the workload stays.
     ("POD", re.compile(r"\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-([" + K8S_SAFE + r"]{6,10}-[" + K8S_SAFE + r"]{5})\b"), 1),
 ]
@@ -586,6 +598,12 @@ class Mapping:
     # reading of the clock, and a served `--since 5m` must not become this
     # run's `--since 3m`; an answer repeating one is not saved instead.
     ages: set = field(default_factory=set)
+    # What text the key drops held that an answer must not repeat: a dropped
+    # event's payload counts and their keys (QUEUE_WORDS_RE), and the runs of
+    # hex a dropped recent-work digest held outside any identifier (a commit).
+    dropped_counts: set = field(default_factory=set)
+    dropped_count_keys: set = field(default_factory=set)
+    dropped_hex: set = field(default_factory=set)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -610,7 +628,8 @@ class Mapping:
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages))
+                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
+                       set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -734,15 +753,18 @@ class Mapping:
                 return True
         return False
 
-    @staticmethod
-    def has_identifier(text: str) -> bool:
-        """Whether a normalized answer still holds an identifier shape (ID_CLASSES).
+    def has_identifier(self, text: str) -> bool:
+        """Whether a normalized answer still holds an identifier shape (ID_CLASSES), or a dropped digest's hex.
 
         After apply_to_answer, any left is one the key never bound (it sat in
         text the key drops, like the recent-work digest, or the model made it),
-        so no placeholder can bring it up to date.
+        so no placeholder can bring it up to date. A commit the digest names as
+        plain hex has no identifier shape, so its runs of hex are kept to check
+        (dropped_hex).
         """
-        return any(pattern.search(text) for _, pattern, _ in ID_CLASSES)
+        if any(pattern.search(text) for _, pattern, _ in ID_CLASSES):
+            return True
+        return bool(self.dropped_hex) and any(run in self.dropped_hex for run in HEX_RUN_RE.findall(text))
 
     @staticmethod
     def has_timestamp(text: str) -> bool:
@@ -783,6 +805,21 @@ class Mapping:
             else:
                 pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
             if re.search(pattern, text):
+                return True
+        return self.answer_repeats_dropped_count(text)
+
+    def answer_repeats_dropped_count(self, text: str) -> bool:
+        """Whether an answer repeats a dropped event's payload count next to its key, or with the queue (QUEUE_WORDS_RE)."""
+        if not self.dropped_counts:
+            return False
+        queue = QUEUE_WORDS_RE.search(text) is not None
+        keys = "|".join(re.escape(k) for k in sorted(self.dropped_count_keys))
+        for value in self.dropped_counts:
+            token = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
+            if queue and re.search(token, text):
+                return True
+            if keys and re.search(r"(?<![A-Za-z0-9_])(?:" + keys + r")" + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER,
+                                  text):
                 return True
         return False
 
@@ -881,10 +918,46 @@ class Normalizer:
                 continue
             scratch = Normalizer(self.now, self.keep_ips)
             scratch.walk(event)
-            self.mapping.bare_numbers |= scratch.mapping.bare_numbers
-            self.mapping.ages |= scratch.mapping.ages
-            self.mapping.dates |= scratch.mapping.dates
-            self.mapping.today_dates |= scratch.mapping.today_dates
+            self.merge_unrestorable(scratch.mapping)
+            self.note_counts(event.get(EVENT_PAYLOAD_KEY))
+
+    def merge_unrestorable(self, other: "Mapping") -> None:
+        """Add what another (throwaway) mapping noted as unrestorable to this request's."""
+        self.mapping.bare_numbers |= other.bare_numbers
+        self.mapping.ages |= other.ages
+        self.mapping.dates |= other.dates
+        self.mapping.today_dates |= other.today_dates
+
+    def note_counts(self, payload: Any, key: Optional[str] = None) -> None:
+        """Every integer in a dropped event's payload, with the key it sat under (Mapping.answer_repeats_dropped_count)."""
+        if isinstance(payload, bool):
+            return
+        if isinstance(payload, int):
+            self.mapping.dropped_counts.add(str(payload))
+            if key is not None:
+                self.mapping.dropped_count_keys.add(key)
+        elif isinstance(payload, dict):
+            for k, v in payload.items():
+                self.note_counts(v, k if isinstance(k, str) else None)
+        elif isinstance(payload, list):
+            for v in payload:
+                self.note_counts(v, key)
+
+    def digest_guards(self, text: str) -> None:
+        """Note what an answer must not repeat from the recent-work digests strip_recent_work drops from `text`.
+
+        Each digest is read by a throwaway normalizer, as a dropped event is
+        (dropped_guards): its keyed numbers, epochs, ages and day-counted dates
+        join this request's. Its identifiers are unbound, which has_identifier
+        refuses; a run of hex outside them (a commit) is kept for it too.
+        """
+        for pattern in (RECENT_WORK_RE, RECENT_WORK_ESCAPED_RE):
+            for m in pattern.finditer(text):
+                scratch = Normalizer(self.now, self.keep_ips)
+                digest = scratch.text(m.group(0), strip=False)
+                self.merge_unrestorable(scratch.mapping)
+                self.mapping.dropped_hex.update(run for run in HEX_RUN_RE.findall(PLACEHOLDER_RE.sub(" ", digest))
+                                                if HEX_LETTER_RE.search(run))
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
@@ -972,12 +1045,15 @@ class Normalizer:
             return self.timed_containers[cache_key]
         return False
 
-    def text(self, text: str) -> str:
+    def text(self, text: str, strip: bool = True) -> str:
+        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so)."""
         text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
             return json.dumps(self.walk(nested), sort_keys=True, ensure_ascii=False)
-        text = strip_recent_work(text)
+        if strip:
+            self.digest_guards(text)
+            text = strip_recent_work(text)
         text = self.age_columns(text)
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)

@@ -105,12 +105,29 @@ class IdentifierTest(unittest.TestCase):
 
     def test_a_dropped_events_unrestorable_values_still_count_against_an_answer(self):
         walker = normalizer.Normalizer(NOW, False)
-        walker.walk({"events": [{"kind": "queued", "created_at": 1793700100, "payload": {"note": "busy"}},
+        walker.walk({"events": [{"kind": "queued", "created_at": 1793700100, "payload": {"note": "busy since 2026-11-05"}},
                                 {"kind": "heartbeat", "payload": {"note": "pod up 5m ago"}}]})
         self.assertTrue(walker.mapping.answer_repeats_bare_number("waited since 1793700100"))
         self.assertTrue(walker.mapping.answer_repeats_age("logs --since 5m"))
+        self.assertTrue(walker.mapping.answer_repeats_date("busy since 2026-11-05"))
         # A throwaway walk numbers nothing: the next placeholder is still the first.
         self.assertEqual(walker.mapping.counts, {})
+
+    def test_a_queued_events_counts_count_against_an_answer_about_the_queue(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.walk({"events": [{"kind": "queued", "payload": {
+            "note": "Queued: the system is busy.", "running": 4, "limit": 5, "ahead": 6, "background_running": False}}]})
+        mapping = walker.mapping
+        for answer in ("It waited behind 6 other tasks.", "The card was queued with 4 running.", "running: 4 of limit=5",
+                       "6 tasks ahead of it"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+        # The same small numbers anywhere else are not the queue's.
+        for answer in ("replicas: 4", "All 5 clusters are healthy.", "pool-6 has 6 nodes", "1 minor version"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_repeats_bare_number(answer))
+        # A boolean is no count.
+        self.assertFalse(mapping.answer_repeats_bare_number("background_running: 0 in the queue"))
 
     def test_expires_is_a_time_key(self):
         self.assertEqual(norm('"expires": 1793759016'), norm('"expires": 1793759100'))
@@ -800,6 +817,25 @@ class EvalPoolProjectTest(unittest.TestCase):
                 self.assertEqual(norm(raw), raw)
 
 
+class RecentWorkGuardTest(unittest.TestCase):
+    CARD = "card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at 0ffe0cb (2026-11-02 10:00, 18m ago): done"
+
+    def test_a_commit_only_the_digest_names_counts_against_an_answer(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.has_identifier("git checkout 0ffe0cb"))
+        self.assertFalse(walker.mapping.has_identifier("git checkout 0ffe0cc"))
+        # Digits alone are a number, not a commit.
+        walker.text("x\n\n## Recent work by @platform\n- t_deadbeef — wrote 1234567 rows")
+        self.assertFalse(walker.mapping.has_identifier("wrote 1234567 rows"))
+
+    def test_the_digests_unrestorable_values_count_against_an_answer(self):
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.answer_repeats_age("logs --since 18m"))
+        self.assertEqual(walker.mapping.counts, {"TASK": 1})
+
+
 class RunNameTest(unittest.TestCase):
     def test_a_repository_commit(self):
         self.assertEqual(norm("searched gke-agentic/kube-agents-evals-31-infra@c99b1ab (whole tree)"),
@@ -828,6 +864,22 @@ class RunNameTest(unittest.TestCase):
                     "declared-intent-abcdefghi", "xdeclared-intent-a2_elobt"):
             with self.subTest(raw=raw):
                 self.assertEqual(norm(raw), raw)
+
+    def test_a_node_name_that_holds_the_pool_project(self):
+        self.assertEqual(norm("drained gke-kube-agents-evals-31-default-pool-abcdef12-x1y2"),
+                         "drained gke-⟦EVALPROJECT_1⟧-default-pool-⟦NODE_1⟧")
+        self.assertEqual(norm("gke-kube-agents-evals-31-default-pool-abcdef12-x1y2 gke-seeded-a-pool-1-12345678-wxyz"),
+                         "gke-⟦EVALPROJECT_1⟧-default-pool-⟦NODE_1⟧ gke-seeded-a-pool-1-⟦NODE_2⟧")
+        self.assertTrue(normalizer.Mapping().has_identifier("gke-⟦EVALPROJECT_1⟧-default-pool-abcdef12-x1y2"))
+
+    def test_a_tempfile_name_or_operation_after_a_dash_or_underscore_in_an_answer(self):
+        # No pattern finds these shapes in the answer; the whole-token swap does,
+        # because a suffix class may follow `-` or `_` (SUFFIX_CLASSES).
+        op = "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
+        mapping = normalizer.normalize_request(
+            request(f"cloned into /opt/data/scratch/declared-intent-j77z8q6q; newest operation-{op}"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("mv clone-j77z8q6q old_" + op),
+                         "mv clone-⟦TMPNAME_1⟧ old_⟦GKEOP_1⟧")
 
     def test_a_gke_operation_id(self):
         op = "operation-1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
