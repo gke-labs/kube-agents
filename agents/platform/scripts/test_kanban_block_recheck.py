@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import kanban_block_recheck as kbr  # noqa: E402
+import stall_watch  # noqa: E402  — the fake below carries its freshness and refetch rules
 
 NOW = 1_800_000_000
 HOUR = 3600
@@ -417,7 +418,7 @@ class RecheckTests(Board):
         self.assertEqual(list(stamps), [kbr.cluster_key(K8S)])
         kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW + HOUR)
         self.assertEqual([r[0] for r in runs], ["creds", "run", "run"])
-        kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW + 2 * kbr.CREDENTIALS_REFRESH_SECONDS)
+        kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW + 2 * FakeStall.CREDENTIALS_REFRESH_SECONDS)
         self.assertEqual([r[0] for r in runs], ["creds", "run", "run", "creds", "run"])
 
     def test_a_read_the_kubeconfig_could_not_serve_fetches_once_and_retries(self):
@@ -438,6 +439,34 @@ class RecheckTests(Board):
 
         self.assertEqual(kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW), deployment(True))
         self.assertEqual(runs, ["run", "creds", "run"])
+
+    def test_a_fetch_whose_read_fails_leaves_no_stamp(self):
+        """As stall_watch keeps its record: a fetch counts once a read on it worked,
+        so the next run fetches first instead of failing the same read again."""
+        class Stall(FakeStall):
+            @staticmethod
+            def fetch_credentials(project, cluster, location):
+                return "k"
+
+            @staticmethod
+            def run_sandbox(argv, *, timeout, kubeconfig=None, stdin=None):
+                return type("P", (), {"returncode": 1, "stdout": "", "stderr": "credential proxy: kubeconfig stub missing"})()
+
+        stamps = {}
+        with self.assertRaises(RuntimeError):
+            kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW)
+        self.assertEqual(stamps, {})
+        # A reused stamp whose read fails for the kubeconfig, and whose refetch
+        # read fails too, is dropped rather than kept for the day.
+        stamps = {kbr.cluster_key(K8S): kbr.stamp(NOW - HOUR)}
+        with self.assertRaises(RuntimeError):
+            kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW)
+        self.assertEqual(stamps, {})
+        # A read the cluster answers, even with "not found", is a kubeconfig that works.
+        Stall.run_sandbox = staticmethod(lambda argv, *, timeout, kubeconfig=None, stdin=None: type(
+            "P", (), {"returncode": 1, "stdout": "", "stderr": 'Error from server (NotFound): pods "x" not found'})())
+        self.assertIs(kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW), kbr.NOT_FOUND)
+        self.assertEqual(list(stamps), [kbr.cluster_key(K8S)])
 
     def test_a_not_found_read_is_the_sentinel_and_another_failure_raises(self):
         class Stall(FakeStall):
@@ -468,27 +497,16 @@ class RecheckTests(Board):
 
 
 class FakeStall:
-    """The two stall_watch helpers the policy reads, as the real module spells them."""
+    """stall_watch as the policy reads it: its own freshness and refetch rules,
+    with the two sandbox hops stood in by each test."""
 
-    CREDENTIALS_REFRESH_SECONDS = 24 * 3600
-    REFETCH_SIGNALS = ("credential proxy: kubeconfig",)
+    CREDENTIALS_REFRESH_SECONDS = stall_watch.CREDENTIALS_REFRESH_SECONDS
+    credentials_current = staticmethod(stall_watch.credentials_current)
+    refetch_repairs = staticmethod(stall_watch.refetch_repairs)
 
     @staticmethod
     def kubeconfig_path(project, cluster, location):
         return "k"
-
-    @staticmethod
-    def credentials_current(record, now):
-        import datetime as _dt
-
-        if not record:
-            return False
-        age = _dt.datetime.fromisoformat(now) - _dt.datetime.fromisoformat(record)
-        return _dt.timedelta(0) <= age < _dt.timedelta(seconds=FakeStall.CREDENTIALS_REFRESH_SECONDS)
-
-    @staticmethod
-    def refetch_repairs(exc):
-        return any(signal in str(exc) for signal in FakeStall.REFETCH_SIGNALS)
 
 
 class MainTests(Board):

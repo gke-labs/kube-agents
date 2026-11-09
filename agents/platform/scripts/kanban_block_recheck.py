@@ -111,14 +111,13 @@ K8S_FIELDS = ("project", "location", "cluster", "namespace", "resource")
 CONDITION_TRUE = "True"
 KUBECTL_TIMEOUT_SECONDS = 60
 KUBECTL_GET_ARGV = ("kubectl", "get")
-#: Credentials follow ``stall_watch``'s rule: the per-cluster kubeconfig it keeps
-#: in the sandbox is reused while this job's own stamp of the last fetch is
-#: younger than a day (``stall_watch.CREDENTIALS_REFRESH_SECONDS``, mirrored
-#: here), or until a read says the kubeconfig itself is the problem
+#: Credentials follow ``stall_watch``'s rule, with its helpers: the per-cluster
+#: kubeconfig it keeps in the sandbox is reused while this job's own stamp of
+#: the last fetch is young enough for ``stall_watch.credentials_current`` (a
+#: day), or until a read says the kubeconfig itself is the problem
 #: (``stall_watch.refetch_repairs``), after which one fetch and one retry. A
 #: ``get-credentials`` is a real gcloud run at the credential proxy every time
 #: and buys nothing after the first. The stamps live beside the digest's record.
-CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 PROFILES_DIR = "profiles"
 PLATFORM_PROFILE = "platform"
 CRON_DIR = "cron"
@@ -423,7 +422,10 @@ def kube_get(condition: dict, *, stall=None, stamps: dict | None = None, now: in
     One ``kubectl get`` on the cluster's kubeconfig. Credentials are fetched
     first only when ``stamps`` holds no fetch within the day for the cluster,
     and once more when the read fails for a reason ``stall_watch`` knows a
-    fetch repairs; ``stamps`` is updated in place.
+    fetch repairs. As in ``stall_watch``, a fetch is stamped only once a read
+    on it has worked (an answer of "not found" included), and a stamp whose
+    read failed for the kubeconfig is dropped, so the next run fetches first
+    rather than failing the same read again; ``stamps`` is updated in place.
     """
     stall = stall or _stall_watch()
     stamps = {} if stamps is None else stamps
@@ -432,8 +434,8 @@ def kube_get(condition: dict, *, stall=None, stamps: dict | None = None, now: in
     where = (condition["project"], condition["cluster"], condition["location"])
     fetched = False
     if not stall.credentials_current(stamps.get(key), stamp(now)):
+        stamps.pop(key, None)
         kubeconfig = stall.fetch_credentials(*where)
-        stamps[key] = stamp(now)
         fetched = True
     else:
         kubeconfig = stall.kubeconfig_path(*where)
@@ -441,15 +443,16 @@ def kube_get(condition: dict, *, stall=None, stamps: dict | None = None, now: in
     if proc.returncode != 0 and not fetched:
         failure = RuntimeError((proc.stderr or "").strip())
         if NOT_FOUND_MARKER not in str(failure) and stall.refetch_repairs(failure):
+            stamps.pop(key, None)
             kubeconfig = stall.fetch_credentials(*where)
-            stamps[key] = stamp(now)
+            fetched = True
             proc = _kubectl_get(stall, condition, kubeconfig)
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        if NOT_FOUND_MARKER in stderr:
-            return NOT_FOUND
-        raise RuntimeError(f"kubectl get exited {proc.returncode}: {stderr[:DETAIL_MAX_CHARS]}")
-    return json.loads(proc.stdout)
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode == 0 or NOT_FOUND_MARKER in stderr:
+        if fetched:
+            stamps[key] = stamp(now)
+        return NOT_FOUND if proc.returncode != 0 else json.loads(proc.stdout)
+    raise RuntimeError(f"kubectl get exited {proc.returncode}: {stderr[:DETAIL_MAX_CHARS]}")
 
 
 def evaluate(condition: dict, *, kube) -> tuple[bool, str]:
