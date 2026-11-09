@@ -120,6 +120,15 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('the row "change b" is labelled 1.0.0, but 1.0.0 does not contain', err)
 
+    def test_the_failure_names_the_release_to_relabel_with(self):
+        self.repo.mislabel()
+        _, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertIn("Relabel it as the next release, which will contain it.", err)
+        self.repo.tag("1.1.0")
+        self.repo.tag("1.2.0")
+        _, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertIn("Relabel it as 1.1.0, the first release that contains it.", err)
+
     def test_a_code_change_after_the_cut_labelled_with_that_release_fails(self):
         self.repo.tag("1.0.0")
         self.repo.commit("fix: c", row=row("1.0.0", "change c"))
@@ -132,7 +141,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.commit("fix: b", row=row("1.0.0", "change b"))
         self.repo.tag("1.0.0", base)
         self.repo.relabel("change b", "1.1.0")
-        self.assertEqual(self.repo.check(), (0, ""))
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
 
     def test_a_row_cherry_picked_to_the_release_branch_passes(self):
         base = self.repo.commit("feat: before the branch point")
@@ -240,7 +249,26 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
 
     def test_a_row_for_a_release_with_no_tag_is_not_checked(self):
         self.repo.commit("feat: g", row=row("2.0.0", "change g"))
-        self.assertEqual(self.repo.check(), (0, ""))
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_local_run_notes_the_releases_it_has_no_tag_for(self):
+        self.repo.commit("feat: g", row=row("2.0.0", "change g"))
+        code, err = self.repo.check()
+        self.assertEqual(code, 0)
+        self.assertIn("note: rows labelled 2.0.0 are not checked", err)
+        self.assertNotIn("note:", self.repo.check(GITHUB_EVENT_NAME="push")[1])
+
+    def test_the_real_page_has_rows_the_check_reads(self):
+        page = (SCRIPT.parents[1] / PAGE).read_text(encoding="utf-8")
+        sys.path.insert(0, str(SCRIPT.parent))
+        try:
+            import check_upgrade_table_releases as check
+        finally:
+            sys.path.remove(str(SCRIPT.parent))
+        table = page.split(HEADING.strip(), 1)[1].split("\n#", 1)[0]
+        lines = [line for line in table.splitlines() if line.startswith("| ") and "---" not in line][1:]
+        self.assertTrue(lines, "the breaking-changes table has rows")
+        self.assertEqual(len(check.rows(table)), len(lines), "every row of the real table is read")
 
     def test_a_row_no_commit_adds_is_reported(self):
         self.repo.tag("1.0.0")
@@ -256,13 +284,38 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("no release tag", err)
 
-    def test_a_pull_request_that_changes_the_page_fails_on_a_wrong_label(self):
-        self.repo.mislabel()
-        self.repo.pull_request(page=True)
+    def test_a_pull_request_that_adds_a_wrong_label_fails(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.tag("1.0.0", base)
+        self.repo.git("checkout", "-q", "-b", "feature")
+        self.repo.commit("fix: b", row=row("1.0.0", "change b"))
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("checkout", "-q", "-b", "merge")
+        self.repo.git("merge", "-q", "--no-ff", "-m", "merge", "feature", at=self.repo.tick())
         code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
         self.assertEqual(code, 1)
         self.assertIn('"change b"', err)
         self.assertNotIn("warning:", err)
+
+    def test_a_pull_request_that_relabels_a_row_wrongly_fails(self):
+        self.repo.mislabel()
+        self.repo.git("checkout", "-q", "-b", "feature")
+        self.repo.relabel("change b", "0.9.0")
+        self.repo.commit("docs: relabel b", code=False)
+        self.repo.git("checkout", "-q", "main")
+        self.repo.git("checkout", "-q", "-b", "merge")
+        self.repo.git("merge", "-q", "--no-ff", "-m", "merge", "feature", at=self.repo.tick())
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 1)
+        self.assertIn('"change b" is labelled 0.9.0', err)
+
+    def test_a_pull_request_that_changes_another_part_of_the_page_only_warns(self):
+        self.repo.mislabel()
+        self.repo.pull_request(page=True)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="pull_request")
+        self.assertEqual(code, 0)
+        self.assertIn('warning: docs/site/src/content/docs/install/upgrade.md', err)
+        self.assertIn("does not add or relabel these rows", err)
 
     def test_a_pull_request_that_leaves_the_page_alone_only_warns(self):
         self.repo.mislabel()
@@ -294,7 +347,7 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.commit("feat: a local change")
         code, err = self.repo.check()
         self.assertEqual((code, "warning:" in err), (0, True))
-        self.repo.relabel("change b", "1.0.0 ")  # an edit to the page: the label fails again
+        self.repo.relabel("change b", "0.9.0")  # a relabel this change makes: the label fails
         code, _ = self.repo.check()
         self.assertEqual(code, 1)
 

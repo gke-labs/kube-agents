@@ -18,11 +18,13 @@ first commit, and a cell reworded after its release traces to the rewording comm
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
 release tag rather than pass with nothing to compare.
 
-A wrong label fails only where it can be fixed: a push to main, and a pull request or merge-queue
-group that changes the page. Elsewhere it is printed as a warning and the check passes, so a release
-cut that leaves out a labelled row does not turn every open pull request red; main's push run stays
-red until a pull request relabels the row. Run locally, the check compares the page with
-upstream/main or origin/main, whichever exists, and fails outright when neither does.
+A wrong label fails only where it can be fixed: on a push to main, and on a pull request or
+merge-queue group that adds the row or changes its label or change text. A wrong label on a row the
+change did not touch is printed as a warning and the check passes, so a release cut that leaves out a
+labelled row does not turn every open pull request red, nor one that edits another part of the page;
+main's push run stays red until a pull request relabels the row. Run locally, the check compares the
+page with upstream/main or origin/main, whichever exists, and fails outright when neither does. A
+local run also notes the releases its rows name that have no local tag, which it cannot check.
 """
 
 from __future__ import annotations
@@ -61,8 +63,10 @@ PUSH_EVENT = "push"
 # Run outside CI, the page is compared with the first of these that exists.
 LOCAL_BASE_REFS = ("upstream/main", "origin/main")
 WARNING_PREFIX = "warning: "
-WARNING_NOTE = ("warning: this change does not touch the upgrade page, so these rows do not fail it; "
+WARNING_NOTE = ("warning: this change does not add or relabel these rows, so they do not fail it; "
                 "main's push run fails until a pull request relabels them.")
+UNTAGGED_NOTE = ("note: rows labelled {releases} are not checked: no such tag is here. If a release is out, "
+                 "run `git fetch --tags` and check again.")
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,11 @@ def row_commit(change: str) -> str | None:
     return origin
 
 
+def first_release_containing(commit: str) -> str | None:
+    tags = [tag for tag in git("tag", "--contains", commit).split() if RELEASE_TAG.match(tag)]
+    return min(tags, key=lambda tag: tuple(int(part) for part in tag.split("."))) if tags else None
+
+
 def commit_time(commit: str) -> int:
     return int(git("log", "-1", "--format=%ct", commit).strip())
 
@@ -150,30 +159,36 @@ def clone_problem() -> str | None:
     return None
 
 
-def problems() -> list[str]:
+def page_rows() -> list[Row]:
+    # The page as it is in the working tree, so the check reads an edit before it is committed.
+    page = Path(git("rev-parse", "--show-toplevel").strip()) / UPGRADE_PAGE
+    return rows(page.read_text(encoding="utf-8"))
+
+
+def problems() -> list[tuple[Row, str]]:
     tags = release_tags()
     found = []
     table_added = oldest_adding(TABLE_HEADING)
     table_time = commit_time(table_added) if table_added else 0
-    # The page as it is in the working tree, so the check reads an edit before it is committed.
-    page = Path(git("rev-parse", "--show-toplevel").strip()) / UPGRADE_PAGE
-    for row in rows(page.read_text(encoding="utf-8")):
+    for row in page_rows():
         if row.release not in tags or tag_time(row.release) < table_time:
             continue
         where = f"{UPGRADE_PAGE}:{row.line}"
         commit = row_commit(row.change)
         if commit is None:
-            found.append(f"{where}: no commit in this history adds the row \"{row.change}\", so its "
-                         f"{row.release} label cannot be checked")
+            found.append((row, f"{where}: no commit in this history adds the row \"{row.change}\", so its "
+                               f"{row.release} label cannot be checked"))
             continue
         if git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{row.release}"):
             continue
         if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
             continue
-        found.append(f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} does "
-                     f"not contain {commit[:12]}, the commit that added it. Relabel it with the first "
-                     "release that contains that commit. (If that commit only reworded the change cell "
-                     "of a row that shipped earlier, keep the cell's released wording.)")
+        first = first_release_containing(commit)
+        label = f"{first}, the first release that contains it" if first else "the next release, which will contain it"
+        found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
+                           f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}. "
+                           "(If that commit only reworded the change cell of a row that shipped earlier, keep "
+                           "the cell's released wording.)"))
     return found
 
 
@@ -196,29 +211,28 @@ def comparison_base() -> str | None:
     return None
 
 
-def page_changed_since(base: str) -> bool:
-    page = Path(git("rev-parse", "--show-toplevel").strip()) / UPGRADE_PAGE
-    before = subprocess.run(["git", "show", f"{base}:{UPGRADE_PAGE}"], capture_output=True, text=True)
-    return before.returncode != 0 or before.stdout != page.read_text(encoding="utf-8")
-
-
 def main() -> int:
     unusable = clone_problem()
     if unusable:
         print(unusable, file=sys.stderr)
         return EXIT_FAILED
+    if not os.environ.get(EVENT_NAME_ENV):
+        untagged = sorted({row.release for row in page_rows()} - release_tags())
+        if untagged:
+            print(UNTAGGED_NOTE.format(releases=", ".join(untagged)), file=sys.stderr)
     found = problems()
-    if not found:
-        return EXIT_OK
     base = comparison_base()
-    if base is not None and not page_changed_since(base):
-        for problem in found:
-            print(WARNING_PREFIX + problem, file=sys.stderr)
+    # The rows the base already had, with the same label and change text: this change did not touch them.
+    untouched = {(row.release, row.change) for row in rows(page_at(base))} if base is not None else set()
+    warned = [problem for row, problem in found if (row.release, row.change) in untouched]
+    failed = [problem for row, problem in found if (row.release, row.change) not in untouched]
+    for problem in warned:
+        print(WARNING_PREFIX + problem, file=sys.stderr)
+    if warned:
         print(WARNING_NOTE, file=sys.stderr)
-        return EXIT_OK
-    for problem in found:
+    for problem in failed:
         print(problem, file=sys.stderr)
-    return EXIT_FAILED
+    return EXIT_FAILED if failed else EXIT_OK
 
 
 if __name__ == "__main__":
