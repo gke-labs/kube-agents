@@ -236,3 +236,62 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		}
 	}
 }
+
+// Markdown around a credential key (bold or italic, a code span, a table
+// row or column, a parenthetical before the colon, an arrow) and the
+// "decodes to" and "in secret X is" phrasings: the layouts an answer uses
+// for "here is the credential". Each value is synthetic, one token-shaped
+// and one a plain word under a key that names the credential.
+func TestScrubInlineSecretsMarkdownLayouts(t *testing.T) {
+	const tok, word = "Synth3tic-Pass-0001", "quietpasture"
+	positives := []struct{ in, want string }{
+		{"**Password:** `" + tok + "`", "**Password:** `[redacted]`"},
+		{"**Password**: `" + word + "`", "**Password**: `[redacted]`"},
+		{"- **password**: " + tok, "- **password**: [redacted]"},
+		{"- __password__: " + word, "- __password__: [redacted]"},
+		{"*password*: " + word, "*password*: [redacted]"},
+		{"- `password`: `" + tok + "`", "- `password`: `[redacted]`"},
+		{"- `password` → `" + word + "`", "- `password` → `[redacted]`"},
+		{"password -> " + word, "password -> [redacted]"},
+		{"'password' => '" + word + "'", "'password' => '[redacted]'"},
+		{"Decoded `password`: `" + tok + "`", "Decoded `password`: `[redacted]`"},
+		{"Password (decoded): " + word, "Password (decoded): [redacted]"},
+		{"password (base64-decoded): " + tok, "password (base64-decoded): [redacted]"},
+		{"The password decodes to " + tok + ".", "The password decodes to [redacted]."},
+		{"The `password` key decodes to `" + word + "`.", "The `password` key decodes to `[redacted]`."},
+		{"The password in secret `app-db` is `" + word + "`.", "The password in secret `app-db` is `[redacted]`."},
+		{"The **password** in the secret app-db is **" + word + "**.", "The **password** in the secret app-db is **[redacted]**."},
+		{"| password | " + tok + " |", "| password | [redacted] |"},
+		{"| `password` | `" + word + "` |", "| `password` | `[redacted]` |"},
+		{"| Key | Value |\n|---|---|\n| username | app |\n| **password** | " + word + " |",
+			"| Key | Value |\n|---|---|\n| username | app |\n| **password** | [redacted] |"},
+		{"| User | Password |\n| --- | --- |\n| app | " + word + " |\n| admin | `" + tok + "` |",
+			"| User | Password |\n| --- | --- |\n| app | [redacted] |\n| admin | `[redacted]` |"},
+		{"| Name | Token |\n|:--|:--|\n| ci | " + tok + " |", "| Name | Token |\n|:--|:--|\n| ci | [redacted] |"},
+	}
+	for _, tc := range positives {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	// Markdown with no credential value in it, and a lone mark that may be
+	// part of a value, stay as they are.
+	negatives := []string{
+		"| Secret | Namespace | Age |\n|---|---|---|\n| app-tls | prod | 3d |\n| regcred | shop | 1d |",
+		"| Name | Type |\n|---|---|\n| db-creds | Opaque |",
+		"| Secret | db-credentials |",
+		"| Token TTL | 1h |",
+		"- **Secret name**: `db-credentials`",
+		"**Status:** `Running` (the token is valid)",
+		"Use `kubectl get secret app-db -o yaml` to read it.",
+		"The **token** is expired and the `secret` is mounted.",
+		"Set `DB_PASSWORD_FILE` to `/etc/db/password` -> mounted read-only.",
+		"a*b and c_d_e stay; ptr->next is code.",
+		"| Field | Meaning |\n|---|---|\n| `password` | the DB user's password |",
+	}
+	for _, in := range negatives {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -65,12 +66,13 @@ var (
 	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*["']([^"'\r\n]*)["']`)
 	cliArgListYAMLPattern = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+["']?--?([A-Za-z][A-Za-z0-9_.-]*)["']?[ \t]*\r?\n[ \t]*-[ \t]+["']?([^"'\r\n#]*[^"'\r\n#\s])`)
 	// Prose that states a secret: "the password is hunter2", "password for
-	// admin is hunter2", "the token was abc", "the password is now hunter2",
-	// "the secret is set to abc". The verb may be followed by a qualifier
-	// (now, currently, still, just, simply, set to, equal to) or a colon,
-	// none of which is the value. The value must be token-shaped
-	// (valueTokenShaped): "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:for\s+[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	// admin is hunter2", "the password in secret app-db is hunter2", "the
+	// password key decodes to hunter2", "the token was abc", "the password
+	// is now hunter2", "the secret is set to abc". The verb may be followed
+	// by a qualifier (now, currently, still, just, simply, set to, equal
+	// to) or a colon, none of which is the value. proseValueRedacted keeps
+	// a state word: "the token is expired" states no secret.
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -1265,6 +1267,7 @@ var inlineScrubRules = []inlineScrubRule{
 	}},
 	{"cli-flag", scrubCLISecretFlags},
 	{"prose", scrubProseSecrets},
+	{"markdown-table", scrubMarkdownTables},
 	{"key-value", scrubInlineKVSecrets},
 }
 
@@ -1447,25 +1450,39 @@ func scrubYAMLSecretBlocks(s string) string {
 }
 
 // scrubProseSecrets redacts the value of prose that states a secret
-// (proseSecretPattern), as proseValueRedacted says.
+// (proseSecretPattern), as proseValueRedacted says, matched with the
+// markdown around the noun and the value normalised away ("the
+// **password** is `x`").
 func scrubProseSecrets(s string) string {
-	return redactSubmatch(proseSecretPattern, s, 2, func(s string, m []int) bool {
-		return proseValueRedacted(s[m[4]:m[5]])
+	return scrubNormalized(s, func(n string, rec func(lo, hi int)) {
+		for _, m := range proseSecretPattern.FindAllStringSubmatchIndex(n, -1) {
+			if n[m[4]:m[5]] != redactedValue && proseValueRedacted(n[m[4]:m[5]]) {
+				rec(m[4], m[5])
+			}
+		}
 	})
 }
 
 // scrubInlineKVSecrets redacts the value after a credential key and a = or
-// :, as keyedValueRedacted says. A bare lower-case key used as a label in
-// the middle of a sentence ("rotate the token: run ...") keeps a value that
-// is one plain word.
+// :, as keyedValueRedacted says. It matches on the text with the markdown
+// around keys and values normalised away (normalizeMarkdown), so a bold or
+// code-spanned key, a code-spanned value, a parenthetical before the colon
+// or an arrow for a separator reads as the plain pair, and it redacts the
+// value where it stands in s. A bare lower-case key used as a label in the
+// middle of a sentence ("rotate the token: run ...") keeps a value that is
+// one plain word.
 func scrubInlineKVSecrets(s string) string {
-	var sb strings.Builder
+	return scrubNormalized(s, kvSecretSpans)
+}
+
+// kvSecretSpans reports, through rec, the span of each value
+// scrubInlineKVSecrets redacts in s.
+func kvSecretSpans(s string, rec func(lo, hi int)) {
 	pos := 0
 	for pos < len(s) {
 		loc := inlineKVSecretPattern.FindStringSubmatchIndex(s[pos:])
 		if loc == nil {
-			sb.WriteString(s[pos:])
-			break
+			return
 		}
 		matchStart := pos + loc[0]
 		matchEnd := pos + loc[1]
@@ -1475,25 +1492,21 @@ func scrubInlineKVSecrets(s string) string {
 		sep := s[pos+loc[10]]
 		hadPreSepSpace := loc[10] > loc[8]
 		hadPostSepSpace := loc[9] > loc[11]
+		pos = matchEnd
 		if !inlineSecretKey(key) {
-			sb.WriteString(s[pos:matchEnd])
-			pos = matchEnd
 			continue
 		}
-		sb.WriteString(s[pos:matchEnd])
 		rest := s[matchEnd:]
 		if rest == "" || rest[0] == '\r' || rest[0] == '\n' {
-			pos = matchEnd
 			continue
 		}
 		if sep == '=' && !hadPreSepSpace && hadPostSepSpace && isFollowingKVAssignment(rest) {
-			pos = matchEnd
 			continue
 		}
 		if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(rest); sloc != nil {
-			sb.WriteString(rest[:sloc[1]])
 			matchEnd += sloc[1]
 			rest = rest[sloc[1]:]
+			pos = matchEnd
 		}
 		lineLeading := isLineLeadingKVKey(s, matchStart)
 		class := secretKeyClassOf(key)
@@ -1507,93 +1520,68 @@ func scrubInlineKVSecrets(s string) string {
 			} else {
 				closeIdx = findUnescapedQuote(rest, openQuote[0])
 			}
-			if closeIdx >= 0 && redacts(rest[:closeIdx], "") {
-				sb.WriteString(redactedValue)
-				pos = matchEnd + closeIdx
-				continue
-			}
 			if closeIdx >= 0 {
-				pos = matchEnd
+				if redacts(rest[:closeIdx], "") {
+					rec(matchEnd, matchEnd+closeIdx)
+					pos = matchEnd + closeIdx
+				}
 				continue
 			}
+		}
+		lineEndIn := func(t string) int {
+			if nl := strings.IndexAny(t, "\r\n"); nl >= 0 {
+				return nl
+			}
+			return len(t)
 		}
 		switch {
 		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
 			q := rest[:2]
 			afterOpen := rest[2:]
 			closeIdx := findUnescapedEscapedQuote(afterOpen, q[1])
-			val := afterOpen
-			if closeIdx >= 0 {
-				val = afterOpen[:closeIdx]
-			} else if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-				val = afterOpen[:nl]
+			end := closeIdx
+			if closeIdx < 0 {
+				end = lineEndIn(afterOpen)
 			}
-			if !redacts(val, "") {
-				pos = matchEnd
+			if !redacts(afterOpen[:end], "") {
 				continue
 			}
+			rec(matchEnd+2, matchEnd+2+end)
+			pos = matchEnd + 2 + end
 			if closeIdx >= 0 {
-				sb.WriteString(q + redactedValue + q)
-				pos = matchEnd + 2 + closeIdx + 2
-			} else {
-				lineEnd := len(afterOpen)
-				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				sb.WriteString(q + redactedValue)
-				pos = matchEnd + 2 + lineEnd
+				pos += 2
 			}
 		case strings.HasPrefix(rest, `"`), strings.HasPrefix(rest, `'`):
 			q := rest[0]
 			afterOpen := rest[1:]
 			closeIdx := findUnescapedQuote(afterOpen, q)
-			val := afterOpen
-			if closeIdx >= 0 {
-				val = afterOpen[:closeIdx]
-			} else if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-				val = afterOpen[:nl]
+			end := closeIdx
+			if closeIdx < 0 {
+				end = lineEndIn(afterOpen)
 			}
+			val := afterOpen[:end]
 			schemeEnd := 0
 			if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(val); sloc != nil && closeIdx >= 0 {
 				schemeEnd = sloc[1]
 			}
 			if !redacts(val[schemeEnd:], "") {
-				pos = matchEnd
 				continue
 			}
+			rec(matchEnd+1+schemeEnd, matchEnd+1+end)
+			pos = matchEnd + 1 + end
 			if closeIdx >= 0 {
-				inner := afterOpen[:closeIdx]
-				sb.WriteByte(q)
-				sb.WriteString(inner[:schemeEnd])
-				sb.WriteString(redactedValue)
-				sb.WriteByte(q)
-				pos = matchEnd + 1 + closeIdx + 1
-			} else {
-				lineEnd := len(afterOpen)
-				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				sb.WriteByte(q)
-				sb.WriteString(redactedValue)
-				pos = matchEnd + 1 + lineEnd
+				pos++
 			}
 		case strings.HasPrefix(rest, redactedValue):
-			sb.WriteString(redactedValue)
 			pos = matchEnd + len(redactedValue)
 		default:
 			if sep == ':' && openQuote == "" && closeQuote == "" && lineLeading {
-				lineEnd := len(rest)
-				if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
-					lineEnd = nl
-				}
-				lineRest := strings.TrimRight(rest[:lineEnd], " \t")
+				lineRest := strings.TrimRight(rest[:lineEndIn(rest)], " \t")
 				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
-					if !redacts(lineRest, "") {
-						pos = matchEnd
-						continue
+					if redacts(lineRest, "") {
+						rec(matchEnd, matchEnd+len(lineRest))
+						pos = matchEnd + len(lineRest)
 					}
-					sb.WriteString(redactedValue)
-					pos = matchEnd + len(lineRest)
 					continue
 				}
 			}
@@ -1612,13 +1600,332 @@ func scrubInlineKVSecrets(s string) string {
 				valLen++
 			}
 			if valLen == 0 || !redacts(rest[:valLen], rest[valLen:]) {
-				pos = matchEnd
 				continue
 			}
-			sb.WriteString(redactedValue)
+			rec(matchEnd, matchEnd+valLen)
 			pos = matchEnd + valLen
 		}
 	}
+}
+
+// scrubMarkdownTables redacts the value cells of a markdown table that
+// names a credential key: in a row whose first cell is one, the second
+// cell; under a header cell that is one, that column's cells in every row
+// below the delimiter row. A cell is read with its markdown normalised away
+// and redacted where it stands. Only a key whose class is strong counts
+// (tableSecretKeyClass); a bare credential noun heads a column of names as
+// often as of values, so under one a value must be token-shaped.
+func scrubMarkdownTables(s string) string {
+	if !strings.Contains(s, "|") {
+		return s
+	}
+	var spans [][2]int
+	type row struct{ cells [][2]int }
+	var block []row
+	flush := func() {
+		if len(block) == 0 {
+			return
+		}
+		cols := map[int]secretKeyClass{}
+		start, firstCellKeys := 0, true
+		if len(block) >= 2 && markdownDelimiterRow(s, block[1].cells) {
+			for c, cell := range block[0].cells {
+				if class, ok := tableSecretKeyClass(s[cell[0]:cell[1]]); ok {
+					cols[c] = class
+				}
+			}
+			if h := block[0].cells; len(h) >= 2 {
+				n, _ := normalizeMarkdown(s[h[1][0]:h[1][1]])
+				firstCellKeys = !tableDescriptionHeaders[strings.ToLower(strings.TrimSpace(n))]
+			}
+			start = 2
+		}
+		for _, r := range block[start:] {
+			if markdownDelimiterRow(s, r.cells) {
+				continue
+			}
+			if len(r.cells) >= 2 && firstCellKeys {
+				if class, ok := tableSecretKeyClass(s[r.cells[0][0]:r.cells[0][1]]); ok {
+					spans = append(spans, tableCellSpans(s, r.cells[1], class)...)
+				}
+			}
+			for c, class := range cols {
+				if c < len(r.cells) {
+					spans = append(spans, tableCellSpans(s, r.cells[c], class)...)
+				}
+			}
+		}
+		block = block[:0]
+	}
+	for lineStart := 0; lineStart < len(s); {
+		lineEnd := strings.IndexByte(s[lineStart:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(s)
+		} else {
+			lineEnd += lineStart
+		}
+		if cells := markdownTableCells(s, lineStart, lineEnd); cells != nil {
+			block = append(block, row{cells})
+		} else {
+			flush()
+		}
+		lineStart = lineEnd + 1
+	}
+	flush()
+	return redactSpans(s, spans)
+}
+
+// markdownTableCells is the content span of each cell of a table row (a
+// line that opens with a pipe and holds another), trimmed of spaces, or nil
+// for a line that is not one. A pipe escaped with a backslash is content.
+func markdownTableCells(s string, lo, hi int) [][2]int {
+	line := strings.TrimRight(s[lo:hi], "\r")
+	trimmed := strings.TrimLeft(line, " \t")
+	if !strings.HasPrefix(trimmed, "|") || strings.Count(trimmed, "|") < 2 {
+		return nil
+	}
+	var pipes []int
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\\' {
+			i++
+			continue
+		}
+		if line[i] == '|' {
+			pipes = append(pipes, lo+i)
+		}
+	}
+	end := lo + len(line)
+	if strings.TrimSpace(s[pipes[len(pipes)-1]+1:end]) != "" {
+		pipes = append(pipes, end)
+	}
+	var cells [][2]int
+	for k := 0; k+1 < len(pipes); k++ {
+		a, b := pipes[k]+1, pipes[k+1]
+		for a < b && (s[a] == ' ' || s[a] == '\t') {
+			a++
+		}
+		for b > a && (s[b-1] == ' ' || s[b-1] == '\t') {
+			b--
+		}
+		cells = append(cells, [2]int{a, b})
+	}
+	return cells
+}
+
+var markdownDelimiterCellPattern = regexp.MustCompile(`^:?-+:?$`)
+
+func markdownDelimiterRow(s string, cells [][2]int) bool {
+	for _, c := range cells {
+		if !markdownDelimiterCellPattern.MatchString(s[c[0]:c[1]]) {
+			return false
+		}
+	}
+	return len(cells) > 0
+}
+
+var (
+	// tableDescriptionHeaders head a column that describes the key in the
+	// first, not its value (| Field | Meaning |).
+	tableDescriptionHeaders = map[string]bool{
+		"description": true, "meaning": true, "purpose": true, "notes": true, "note": true, "usage": true,
+		"explanation": true, "details": true, "comment": true, "comments": true, "what it is": true, "used for": true,
+	}
+	tableKeyCellPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*(?: [A-Za-z0-9_.-]+){0,3}$`)
+	// bareCredentialNouns head a table column of names as often as one of
+	// values (| Secret | Namespace |).
+	bareCredentialNouns = map[string]bool{
+		"secret": true, "secrets": true, "token": true, "tokens": true, "credential": true,
+		"credentials": true, "key": true, "keys": true, "cookie": true, "authorization": true,
+	}
+)
+
+// tableSecretKeyClass says whether a table cell (a header or a row's first
+// cell) names a credential key, and the value policy under it: a key of
+// the strong class (Password, DB password, api_key), but a bare credential
+// noun only as the other class. Words joined by spaces read as one key.
+func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
+	n, _ := normalizeMarkdown(cell)
+	n = strings.TrimSpace(strings.TrimRight(strings.TrimSpace(n), ":"))
+	if !tableKeyCellPattern.MatchString(n) {
+		return 0, false
+	}
+	key := strings.ReplaceAll(n, " ", "_")
+	if !inlineSecretKey(key) || secretKeyClassOf(key) != strongSecretKeyClass {
+		return 0, false
+	}
+	if bareCredentialNouns[strings.ToLower(key)] {
+		return otherSecretKey, true
+	}
+	return strongSecretKeyClass, true
+}
+
+// tableCellSpans is the span to redact in one value cell, its markdown
+// normalised away for the test and kept around the marker, or none.
+func tableCellSpans(s string, cell [2]int, class secretKeyClass) [][2]int {
+	text := s[cell[0]:cell[1]]
+	n, idx := normalizeMarkdown(text)
+	lo := len(n) - len(strings.TrimLeft(n, " \t"))
+	hi := len(strings.TrimRight(n, " \t"))
+	if hi <= lo || strings.Contains(n, redactedValue) || !classValueRedacted(class, n[lo:hi], false) {
+		return nil
+	}
+	if idx != nil {
+		lo, hi = idx[lo], idx[hi-1]+1
+	}
+	return [][2]int{{cell[0] + lo, cell[0] + hi}}
+}
+
+// normalizeMarkdown is s with the markdown that wraps a key or a value in
+// an answer taken out, for matching only: emphasis runs (* or _, not inside
+// a word) and code-span backticks, each only where a run of the same mark
+// and length pairs with it on the line, a short parenthetical between a
+// word and its colon ("Password (decoded):"), and an arrow used as a
+// separator, read as a colon. A lone mark stays, since it may be part of a
+// value. idx maps each byte of the result to its byte in s; it is nil when
+// nothing changed.
+func normalizeMarkdown(s string) (string, []int) {
+	if !strings.ContainsAny(s, "*_`(\u2192\u21d2") && !strings.Contains(s, "->") && !strings.Contains(s, "=>") {
+		return s, nil
+	}
+	drop := make([]bool, len(s))
+	colon := make([]bool, len(s))
+	for lineStart := 0; lineStart <= len(s); {
+		lineEnd := strings.IndexByte(s[lineStart:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(s)
+		} else {
+			lineEnd += lineStart
+		}
+		markPairedMarkdownRuns(s, lineStart, lineEnd, drop)
+		lineStart = lineEnd + 1
+	}
+	for _, m := range markdownKeyParenPattern.FindAllStringSubmatchIndex(s, -1) {
+		if m[2] > 0 && (isWordByte(s[m[2]-1]) || strings.IndexByte("*_`", s[m[2]-1]) >= 0) {
+			for i := m[2]; i < m[3]; i++ {
+				drop[i] = true
+			}
+		}
+	}
+	for _, m := range markdownArrowPattern.FindAllStringSubmatchIndex(s, -1) {
+		colon[m[2]] = true
+		for i := m[2] + 1; i < m[3]; i++ {
+			drop[i] = true
+		}
+	}
+	var sb strings.Builder
+	idx := make([]int, 0, len(s))
+	changed := false
+	for i := 0; i < len(s); i++ {
+		switch {
+		case drop[i]:
+			changed = true
+			continue
+		case colon[i]:
+			changed = true
+			sb.WriteByte(':')
+		default:
+			sb.WriteByte(s[i])
+		}
+		idx = append(idx, i)
+	}
+	if !changed {
+		return s, nil
+	}
+	return sb.String(), idx
+}
+
+var (
+	// markdownKeyParenPattern is a short parenthetical before a colon,
+	// emphasis or a code span allowed between ("Password (decoded):",
+	// "**password** (base64-decoded):").
+	markdownKeyParenPattern = regexp.MustCompile(`([ \t]*\([^()\r\n:]{1,40}\))[*_\x60 \t]*:`)
+	// markdownArrowPattern is an arrow used as a key's separator, spaced or
+	// after a closing quote, code span or emphasis.
+	markdownArrowPattern = regexp.MustCompile("[ \\t\"'`*](\u2192|\u21d2|->|=>)[ \\t]")
+)
+
+// markPairedMarkdownRuns marks in drop the emphasis and code-span runs of
+// s[lo:hi] (one line) that pair: a run of *, _ or ` (an emphasis run not
+// inside a word) is dropped when a later run of the same mark and length
+// closes it.
+func markPairedMarkdownRuns(s string, lo, hi int, drop []bool) {
+	type run struct {
+		at, n int
+		c     byte
+	}
+	var open []run
+	for i := lo; i < hi; {
+		c := s[i]
+		if c != '*' && c != '_' && c != '`' {
+			i++
+			continue
+		}
+		j := i
+		for j < hi && s[j] == c {
+			j++
+		}
+		r := run{i, j - i, c}
+		i = j
+		if c != '`' && r.at > lo && j < hi && isWordByte(s[r.at-1]) && isWordByte(s[j]) {
+			continue // inside a word: DB_PASSWORD, a*b
+		}
+		k := len(open) - 1
+		for k >= 0 && (open[k].c != r.c || open[k].n != r.n) {
+			k--
+		}
+		if k < 0 {
+			open = append(open, r)
+			continue
+		}
+		for _, p := range []run{open[k], r} {
+			for x := p.at; x < p.at+p.n; x++ {
+				drop[x] = true
+			}
+		}
+		open = open[:k]
+	}
+}
+
+func isWordByte(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+}
+
+// scrubNormalized runs find over s with its markdown normalised away
+// (normalizeMarkdown) and redacts each span find reports in s itself, so
+// the markdown around a redacted value stays.
+func scrubNormalized(s string, find func(n string, rec func(lo, hi int))) string {
+	n, idx := normalizeMarkdown(s)
+	var spans [][2]int
+	find(n, func(lo, hi int) {
+		if hi <= lo {
+			return
+		}
+		if idx != nil {
+			lo, hi = idx[lo], idx[hi-1]+1
+		}
+		spans = append(spans, [2]int{lo, hi})
+	})
+	return redactSpans(s, spans)
+}
+
+// redactSpans replaces each span of s with the marker, a span that
+// overlaps an earlier one skipped.
+func redactSpans(s string, spans [][2]int) string {
+	if len(spans) == 0 {
+		return s
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	var sb strings.Builder
+	last := 0
+	for _, sp := range spans {
+		if sp[0] < last || s[sp[0]:sp[1]] == redactedValue {
+			continue
+		}
+		sb.WriteString(s[last:sp[0]])
+		sb.WriteString(redactedValue)
+		last = sp[1]
+	}
+	sb.WriteString(s[last:])
 	return sb.String()
 }
 
