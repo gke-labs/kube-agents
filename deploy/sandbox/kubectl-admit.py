@@ -41,12 +41,14 @@ from __future__ import annotations
 import fcntl
 import importlib.machinery
 import importlib.util
-import json
 import os
 import signal
-import subprocess
 import sys
 import time
+
+# json and subprocess each import re, about 40 ms together under gVisor, and a command that
+# passes through needs neither: load_slow_path() binds them once the command is slotted.
+json = subprocess = None
 
 KUBECTL_NEXT = "/usr/local/libexec/kubectl"
 GUARD_PATH = "/usr/local/libexec/shell-memory-guard"
@@ -585,12 +587,19 @@ def refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, 
     return REFUSED_BUSY
 
 
+def load_slow_path() -> None:
+    global json, subprocess
+    import json
+    import subprocess
+
+
 def main(argv: list[str]) -> int:
     try:
         # Decide a pass-through before loading the guard and the table: most calls are one.
         cmd = parse(argv)
         if unslotted(cmd, argv):
             pass_through(argv)
+        load_slow_path()
         global GUARD
         guard = GUARD = load_guard()
         with open(COST_TABLE, encoding="utf-8") as f:
@@ -606,3 +615,5 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+else:
+    load_slow_path()  # imported as a module (the profiler, the tests): every path is available
