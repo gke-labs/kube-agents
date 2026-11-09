@@ -3037,42 +3037,53 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_minter_derived_names_follow_the_cluster(self):
         proc = self._run('minter_derived_names ka-today-1')
-        self.assertEqual(proc.stdout.strip().split("\t"),
+        self.assertEqual(proc.stdout.strip().split("|"),
                          ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter"])
 
     def test_a_long_cluster_name_still_gives_a_valid_distinct_gsa_id(self):
         """A GSA id is 6-30 characters; two long names sharing a prefix stay apart."""
         ids = []
         for cluster in ("production-europe-west4-primary", "production-europe-west4-standby"):
-            gsa = self._run(f"minter_derived_names {cluster}").stdout.strip().split("\t")[2]
+            gsa = self._run(f"minter_derived_names {cluster}").stdout.strip().split("|")[2]
             self.assertRegex(gsa, r"^[a-z][-a-z0-9]{4,28}[a-z0-9]$")
             ids.append(gsa)
         self.assertNotEqual(ids[0], ids[1])
 
     def test_tf_state_minter_names_reads_the_three_names(self):
         proc = self._run('tf_state_minter_names; echo "rc=$?"', gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertIn("github-token-minter-keyring\tgithub-token-minter-key\tkubeagents-github-minter-gsa", proc.stdout)
+        self.assertIn("github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa", proc.stdout)
         self.assertIn("rc=0", proc.stdout)
 
     def test_an_install_with_a_minter_in_state_keeps_its_names(self):
         """The existing install: the names its state holds, whatever the cluster is called."""
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertEqual(proc.stdout.strip().split("\t"),
+        self.assertEqual(proc.stdout.strip().split("|"),
                          ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+
+    def test_a_state_holding_only_some_minter_names_keeps_each_in_its_place(self):
+        """An interrupted destroy leaves only the GSA: the empty ring and key fields stay empty."""
+        proc = self._run("minter_name_defaults test-project ka-today-1",
+                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:]))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        custom_gsa = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "my-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(custom_gsa))
+        self.assertEqual(proc.stdout.strip().split("|"),
+                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter"])
 
     def test_an_install_without_a_minter_in_state_derives_its_names(self):
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
-        self.assertEqual(proc.stdout.strip().split("\t")[0], "ka-today-1-minter-keyring")
+        self.assertEqual(proc.stdout.strip().split("|")[0], "ka-today-1-minter-keyring")
 
     def test_a_first_install_with_no_state_derives_its_names(self):
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_exit=1)
-        self.assertEqual(proc.stdout.strip().split("\t")[1], "ka-today-1-minter-key")
+        self.assertEqual(proc.stdout.strip().split("|")[1], "ka-today-1-minter-key")
 
     def test_unreadable_state_keeps_the_project_wide_names_and_says_so(self):
         """Not knowing whether this install has a minter, it must not rename one."""
         proc = self._run('print_warning() { echo "WARN: $*"; }; minter_name_defaults test-project ka-today-1',
                          gcloud_exit=1, gcloud_stderr="ERROR: 503 Service Unavailable")
-        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("\t"),
+        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"),
                          ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
         self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
 

@@ -106,7 +106,7 @@ In interactive mode, `install.sh` prompts for the path to the `.pem` file if the
 For automated CI/CD pipelines, release automation, or production environments where runners do not handle raw private keys, pre-provision the Cloud KMS key upfront following the official [GitHub Token Minter documentation](https://github.com/abcxyz/github-token-minter) and the [Google Cloud KMS key import guide](https://cloud.google.com/kms/docs/importing-a-key):
 
 1. **Pre-provision Cloud KMS Key & Import Private Key:**
-   Follow the upstream [GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to configure your Cloud KMS keyring and key, and import your GitHub App's private key. By default, `kube-agents` expects the key ring `github-token-minter-keyring` and key `github-token-minter-key` in your cluster's region (or custom names passed via `--kms-keyring` and `--kms-key`).
+   Follow the upstream [GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to configure your Cloud KMS keyring and key, and import your GitHub App's private key. On a new install, `kube-agents` expects the key ring `<cluster>-minter-keyring` and key `<cluster>-minter-key` in your cluster's region, so pass the names you pre-provisioned with `--kms-keyring` and `--kms-key`. A key you pre-provision yourself carries no owner labels, so also set `MINTER_SHARED_KEY=<keyring>/<key>` in `install.env` to tell the installer to adopt it.
 
 2. **Deploy `kube-agents` without `.pem`:**
    Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:

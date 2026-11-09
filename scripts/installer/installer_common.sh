@@ -98,6 +98,12 @@ readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 # The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
 # disk, which the admission webhook and the chart also take as the limit.
 readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+# A GSA account id is 6-30 characters. A cluster name too long for
+# "<cluster>-minter" keeps this many of its characters, plus this many hex
+# characters of its hash (minter_derived_names).
+readonly MINTER_GSA_ID_MAX_LEN=30
+readonly MINTER_GSA_CLUSTER_PREFIX_LEN=18
+readonly MINTER_GSA_HASH_LEN=4
 
 # ─── Release footprint summary ────────────────────
 # What install.sh's pre-flight summary prints about the cluster footprint and
@@ -4129,24 +4135,24 @@ sys.exit(0)
 # KMS key ring or key cannot be deleted, and renaming one plans a replacement
 # that would leave the old key and its versions behind.
 
-# The names a new install derives from its cluster, tab-separated: key ring,
+# The names a new install derives from its cluster, separated by |: key ring,
 # key, GSA. A GSA id is 6-30 characters, so a cluster name too long for
 # "<cluster>-minter" keeps its first 18 characters and gains four hex
 # characters of its hash, which keeps two long names that share a prefix apart.
 minter_derived_names() {
   local cluster=$1 gsa prefix hash
   gsa="${cluster}-minter"
-  if [ "${#gsa}" -gt 30 ]; then
-    hash="$(printf '%s' "$cluster" | shasum -a 256 | cut -c1-4)"
-    prefix="${cluster:0:18}"
+  if [ "${#gsa}" -gt "$MINTER_GSA_ID_MAX_LEN" ]; then
+    hash="$(printf '%s' "$cluster" | shasum -a 256 | cut -c1-"$MINTER_GSA_HASH_LEN")"
+    prefix="${cluster:0:$MINTER_GSA_CLUSTER_PREFIX_LEN}"
     prefix="${prefix%-}"
     gsa="${prefix}-${hash}-minter"
   fi
-  printf '%s\t%s\t%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
+  printf '%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
 }
 
 # The minter's key ring, key and GSA names as this install's state records
-# them (module.github_minter[0]), tab-separated; a field the state doesn't
+# them (module.github_minter[0]), separated by |; a field the state doesn't
 # hold is empty, and all three are when there is no minter in state or no
 # state. tf_state_read's return code when the state could not be read.
 # shellcheck disable=SC2120
@@ -4172,7 +4178,7 @@ for r in doc.get("resources", []):
         value = (i.get("attributes") or {}).get(attr)
         if value:
             found[r["type"]] = value
-print("\t".join(found.get(t, "") for t in want))
+print("|".join(found.get(t, "") for t in want))
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
@@ -4200,7 +4206,7 @@ minter_key_owner() {
   fi
 }
 
-# This install's default minter names, tab-separated: key ring, key, GSA. An
+# This install's default minter names, separated by |: key ring, key, GSA. An
 # install with a minter in its state gets the names it holds (a field the
 # state lacks falls back to the project-wide default it was created under). An
 # install with none gets the names derived from its cluster. When the state
@@ -4212,12 +4218,12 @@ minter_name_defaults() {
   names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
   if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
     print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME to names of its own." >&2
-    printf '%s\t%s\t%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    printf '%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
     return 0
   fi
-  IFS=$'\t' read -r ring key gsa <<<"$names"
+  IFS='|' read -r ring key gsa <<<"$names"
   if [ -n "${ring}${key}${gsa}" ]; then
-    printf '%s\t%s\t%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+    printf '%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
     return 0
   fi
   minter_derived_names "$cluster"
@@ -5609,7 +5615,7 @@ write_tfvars_from_state() {
     # outside any install, as <keyring>/<key> (#3504). Unset adopts only this
     # install's own.
     if [ -n "${MINTER_SHARED_KEY:-}" ]; then
-      echo "github_minter_shared_key = $(hcl_str "${MINTER_SHARED_KEY}")"
+      echo "github_minter_shared_kms_key = $(hcl_str "${MINTER_SHARED_KEY}")"
     fi
     echo ""
     echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"

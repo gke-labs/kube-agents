@@ -813,14 +813,14 @@ variable "github_minter_kms_key" {
   default     = "github-token-minter-key"
 }
 
-variable "github_minter_shared_key" {
-  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. Terraform itself reads nothing from it."
+variable "github_minter_shared_kms_key" {
+  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. When it names the key this install uses, the composition sets no owner labels on that key, so they stay its owner's."
   type        = string
   default     = ""
 
   validation {
-    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_key))
-    error_message = "github_minter_shared_key must be empty or <keyring>/<key>."
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_kms_key))
+    error_message = "github_minter_shared_kms_key must be empty or <keyring>/<key>."
   }
 }
 

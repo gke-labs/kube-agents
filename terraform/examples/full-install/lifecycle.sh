@@ -660,7 +660,7 @@ readonly MINTER_OWNER_NAMESPACE_LABEL="kube-agents-namespace"
 
 # Refuses the apply before adopt_kms imports a minter key ring or key that this
 # state doesn't hold, unless the key is this install's own (its owner labels
-# name this cluster and namespace) or the one github_minter_shared_key names.
+# name this cluster and namespace) or the one github_minter_shared_kms_key names.
 # Importing another install's key would put it in this state, so a destroy or a
 # GitOps-off run here would schedule its versions for destruction, and this
 # install's minter would be granted signing rights on it. A key with no owner
@@ -673,9 +673,9 @@ guard_minter_adoption() {
   [[ "${MINTER_ADOPTION_CHECKED:-}" == "true" ]] && return 0
   MINTER_ADOPTION_CHECKED=true
   local shared cluster namespace labels owner_cluster="" owner_namespace="" pair
-  shared=$(tfvar github_minter_shared_key)
+  shared=$(tfvar github_minter_shared_kms_key)
   if [[ -n "$shared" && "$shared" == "$keyring/$key" ]]; then
-    log "adopting the minter key $keyring/$key: github_minter_shared_key names it as shared on purpose"
+    log "adopting the minter key $keyring/$key: github_minter_shared_kms_key names it as shared on purpose"
     return 0
   fi
   if ! adoption_target_exists key "projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"; then
@@ -708,7 +708,7 @@ guard_minter_adoption() {
   fi
   warn "Refusing to adopt it: this state would then own that install's App key, and a destroy here would schedule its versions for destruction."
   warn "Choose other names (github_minter_kms_keyring and github_minter_kms_key), or, to share this key on purpose,"
-  warn "set github_minter_shared_key = \"$keyring/$key\" in terraform.tfvars (MINTER_SHARED_KEY in install.env)."
+  warn "set github_minter_shared_kms_key = \"$keyring/$key\" in terraform.tfvars (MINTER_SHARED_KEY in install.env)."
   exit 1
 }
 

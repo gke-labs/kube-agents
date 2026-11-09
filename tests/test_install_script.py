@@ -128,7 +128,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     # apply_minter_name_defaults (#3504): a name the operator gave wins; the
     # rest come from minter_name_defaults, stubbed here to known values.
-    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring\\tderived-key\\tderived-gsa\\n'; }"
+    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa\\n'; }"
     _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME"'
 
     def _apply_minter_names(self, env=None):
@@ -192,8 +192,16 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertIn("rc=1 shared=", proc.stdout, proc.stderr)
 
     def test_a_key_already_in_this_state_needs_no_question(self):
-        proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring\\tkey\\tgsa")
+        proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring|key|gsa")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_both_interview_arms_check_the_key_owner(self):
+        """A -y run takes the non-interactive arm, which must refuse another install's key too."""
+        text = _INSTALL_SH.read_text()
+        start = text.index('validate_non_interactive_minter_config "$github_app_id"')
+        arm = text[start:text.index("# 9. Agent Permissions", start)]
+        self.assertIn("confirm_minter_key_owner ", arm)
+        self.assertEqual(text.count("confirm_minter_key_owner \"$kms_keyring\" \"$kms_key\""), 2)
 
     def test_a_key_already_named_as_shared_needs_no_question(self):
         proc = self._confirm_owner("cluster-a/kubeagents-system", env={"MINTER_SHARED_KEY": "ring/key"})
@@ -5249,7 +5257,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     """
 
     def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
-             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None):
+             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
+             cluster=""):
         """import_github_pem against a stub gcloud that records every call.
 
         By default the stub reports no ENABLED key version, so the import is
@@ -5351,7 +5360,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f'source "{_INSTALLER_COMMON}"\n'
                 "GITOPS_ORG=an-org GITOPS_REPO=a-repo GITHUB_APP_ID=12345 "
-                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a\n'
+                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a {cluster}\n'
             )
             merged_env = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
             if env_overrides:
@@ -5370,6 +5379,14 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_key_is_created_with_this_installs_owner_labels(self):
+        """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""
+        proc, calls = self._run(cluster="ka-today-1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        creates = [c for c in calls if "kms keys create" in c]
+        self.assertEqual(len(creates), 1, calls)
+        self.assertIn("--labels=kube-agents-cluster=ka-today-1,kube-agents-namespace=kubeagents-system", creates[0])
 
     def test_the_import_only_key_is_created_skipping_the_initial_version(self):
         proc, calls = self._run()
@@ -5635,7 +5652,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         """
         body = _INSTALL_SH.read_text()
         self.assertIn(
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             body,
             "a failed PEM import must stop the run before terraform apply",
         )
@@ -7211,7 +7228,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             'ensure_existing_cluster_network_policy "$project_id"',
             'ensure_existing_cluster_workload_identity "$project_id"',
             'ensure_existing_cluster_cmek "$project_id"',
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'minter_enabled_version="$(kms_key_enabled_version',
             "or unset GITHUB_APP_ID to install without the minter.\"\n    exit 1\n",
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
@@ -9886,7 +9903,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         )
         step_12 = text.index('print_step "12. Applying the Install', main_start)
         for gate in (
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
             'apply_crd_upgrades "$repo_dir"',
         ):

@@ -36,7 +36,7 @@ defaults mirror them: the GSA `kubeagents-github-minter-gsa` and the namespace
 through `install.env`), the KSA `kubeagents-github-minter` as a constant in
 `scripts/installer/common.sh` for the dev tooling. `install.sh` gives a new install its
 own GSA, key ring and key names, derived from the cluster, and keeps the names an
-existing install's state holds (#3504); these defaults are what an existing install was
+existing install's state holds; these defaults are what an existing install was
 created with. `owner_labels` and `owner_description` record the owning install on the
 crypto key and the GSA, for the full-install composition's adoption check.
 

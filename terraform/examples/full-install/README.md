@@ -201,8 +201,8 @@ Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
 bare `terraform apply` fails on. For the minter's key ring and key it adopts only
 this install's own, by the owner labels on the key, or the one
-`github_minter_shared_key` names; another install's, or one with no owner labels,
-refuses the apply (#3504). The table under
+`github_minter_shared_kms_key` names; another install's, or one with no owner labels,
+refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state

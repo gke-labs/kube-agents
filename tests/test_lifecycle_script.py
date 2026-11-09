@@ -281,7 +281,7 @@ elif [[ "$cmd" == "console" ]]; then
     elif [[ "$expr" == *"create_cluster"* ]]; then
         echo '{tfvar_create_cluster}'
         exit 0
-    elif [[ "$expr" == *"github_minter_shared_key"* ]]; then
+    elif [[ "$expr" == *"github_minter_shared_kms_key"* ]]; then
         echo '{tfvar_minter_shared_key}'
         exit 0
     elif [[ "$expr" == *"namespace"* ]]; then
@@ -1721,7 +1721,7 @@ resource "google_service_account" "agent" {
 
     # The minter's ownership check (#3504): adopt_kms imports a minter key ring
     # or key this state doesn't hold only when it is this install's own, or the
-    # one github_minter_shared_key names.
+    # one github_minter_shared_kms_key names.
     _MINTER_KEYRING = "module.github_minter[0].google_kms_key_ring.minter"
     _MINTER_KEY = "module.github_minter[0].google_kms_crypto_key.minter"
 
@@ -1758,7 +1758,7 @@ resource "google_service_account" "agent" {
         proc, log = self._adopt_minter("kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stderr)
-        self.assertIn("github_minter_shared_key", proc.stderr)
+        self.assertIn("github_minter_shared_kms_key", proc.stderr)
         self.assertNotIn("import ", log)
 
     def test_an_unlabelled_minter_key_is_refused(self):

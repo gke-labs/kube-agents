@@ -2245,7 +2245,10 @@ warn_flag_beats_unrecorded_file_value() {
 # appends a chat flag's key. upgrade.sh renders from the file alone, so GitOps
 # configured with --gitops-org, --gitops-repo and --github-app-id and never
 # recorded was rendered off by the next full upgrade, which planned to
-# destroy the token minter (#3075). A key the file lacks is appended, and one
+# destroy the token minter (#3075). The minter's key ring, key and GSA names go
+# the same way, and the minter key the install shares on purpose: a new
+# install's names are derived from its cluster, not defaulted (#3504). A key
+# the file lacks is appended, and one
 # it records with a different value is replaced (that line only), since this
 # apply is about to use the new value and the next upgrade would otherwise put
 # the old one back. --github-pem-path never is (the key lives in Cloud KMS once
@@ -2259,8 +2262,15 @@ record_github_gitops_keys() {
   [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
   [ "${GITOPS_FORGE:-github}" = "github" ] || return 0
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
-  local tmp
-  for key in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
+  local tmp keys=(GITOPS_ORG GITOPS_REPO GITHUB_APP_ID)
+  # The minter's names too (#3504): a new install's are derived from its
+  # cluster rather than defaulted, so a file that doesn't record them would
+  # send the next upgrade.sh back to the project-wide names. And the key it
+  # shares on purpose, when it does.
+  for key in KMS_KEYRING KMS_KEY GITHUB_MINTER_GSA_NAME MINTER_SHARED_KEY; do
+    [ -n "${!key:-}" ] && keys+=("$key")
+  done
+  for key in "${keys[@]}"; do
     value="${!key}"
     # Read afresh for each key: a rewrite below drops a whole line, and a line
     # that assigned two of these keys takes both with it.
@@ -2280,7 +2290,7 @@ record_github_gitops_keys() {
         printf '\n' >> "$file"
       fi
       write_env_var "$file" "$key" "$value"
-      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps GitOps on."
+      print_info "Recorded ${key}=$(printf '%q' "$value") in ${file}, which assigned no ${key}, so upgrade.sh keeps it."
     fi
   done
   # The cache read_recorded_install_env_values keeps is keyed by path, and the
@@ -2334,7 +2344,7 @@ record_gitops_forge_keys() {
   # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
   # switch of host names the new App's key (--kms-key), and the next
   # upgrade.sh must render that key and not the old App's.
-  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY)
+  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY MINTER_SHARED_KEY)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
@@ -3356,7 +3366,7 @@ source_provisioning_helpers() {
 apply_minter_name_defaults() {
   local project=$1 cluster=$2 names ring key gsa
   names="$(minter_name_defaults "$project" "$cluster")"
-  IFS=$'\t' read -r ring key gsa <<<"$names"
+  IFS='|' read -r ring key gsa <<<"$names"
   [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] || PARAM_KMS_KEYRING="$ring"
   [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ] || PARAM_KMS_KEY="$key"
   if [ "${GITHUB_MINTER_GSA_NAME_GIVEN:-false}" != "true" ]; then
@@ -3375,7 +3385,7 @@ confirm_minter_key_owner() {
   local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}" names state_ring="" state_key="" owner rc=0 answer=""
   [ "${MINTER_SHARED_KEY:-}" = "${ring}/${key}" ] && return 0
   names="$(tf_state_minter_names "$project" "$cluster" 2>/dev/null)" || names=""
-  IFS=$'\t' read -r state_ring state_key _ <<<"$names"
+  IFS='|' read -r state_ring state_key _ <<<"$names"
   [ "${state_ring}/${state_key}" = "${ring}/${key}" ] && return 0
   owner="$(minter_key_owner "$ring" "$key" "$location" "$project")" || rc=$?
   case "$rc" in
@@ -6168,7 +6178,7 @@ apply_managed_otel_scope() {
 # ENABLED (the import happened on an earlier run), downgraded to printed
 # instructions when no PEM is provided, and auto-installs Go if missing.
 import_github_pem() {
-  local project_id="$1" region="$2"
+  local project_id="$1" region="$2" cluster="${3:-}"
   [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ] || return 0
   local pem_path="${GITHUB_PEM_PATH:-}"
   pem_path="$(expand_tilde_path "$pem_path")"
@@ -6247,10 +6257,16 @@ import_github_pem() {
   if grep -Eq "$KMS_API_PROPAGATION_PATTERN" <<<"$kms_ring_err"; then
     kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
   else
+    # Labelled with this install as the composition's owner_labels would
+    # label it (#3504): the apply's adoption step refuses an unlabelled key
+    # it doesn't hold, and this one is about to be imported into this
+    # install's state.
+    local owner_labels=()
+    [ -n "$cluster" ] && owner_labels=(--labels="kube-agents-cluster=${cluster},kube-agents-namespace=${NAMESPACE:-$DEFAULT_NAMESPACE}")
     kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
       --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
       --import-only --skip-initial-version-creation \
-      --protection-level=software --project="$project_id")" || true
+      --protection-level=software ${owner_labels[@]+"${owner_labels[@]}"} --project="$project_id")" || true
   fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
@@ -6279,7 +6295,7 @@ import_github_pem() {
     # easy to lose and the one KMS refuses an import-only key without.
     print_info "Create them by hand with:"
     print_info "  gcloud kms keyrings create ${keyring} --location=${kms_location} --project=${project_id}"
-    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+    print_info "  gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_location} --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 --import-only --skip-initial-version-creation --protection-level=software ${owner_labels[*]+${owner_labels[*]}} --project=${project_id}"
     print_info "Then import the PEM following: https://github.com/abcxyz/github-token-minter"
     return 0
   fi
@@ -7954,6 +7970,11 @@ main() {
     fi
 
     validate_non_interactive_minter_config "$github_app_id" "$github_pem_path" "$kms_keyring" "$kms_key" "$region" "$project_id" "$github_org" || exit 1
+    # The same owner check as the interactive arm, which refuses here with no
+    # one to ask (#3504).
+    if [ -n "$github_app_id" ]; then
+      confirm_minter_key_owner "$kms_keyring" "$kms_key" "$(derive_kms_location "$region")" "$project_id" "$cluster_name" || exit 1
+    fi
 
     if [ -n "$github_app_id" ] && [ -n "$github_pem_path" ]; then
       local kms_loc existing_kms_ver=""
@@ -8820,7 +8841,7 @@ main() {
   # pass readiness once the key is imported. The generator enabled the
   # minter on the promise of this import, so a failed one stops the run
   # here rather than wedging the apply.
-  import_github_pem "$project_id" "$region" || exit 1
+  import_github_pem "$project_id" "$region" "$cluster_name" || exit 1
   local minter_enabled_version=""
   minter_enabled_version="$(kms_key_enabled_version "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"
