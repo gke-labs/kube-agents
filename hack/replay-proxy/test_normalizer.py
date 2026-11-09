@@ -829,6 +829,28 @@ class RecentWorkGuardTest(unittest.TestCase):
         walker.text("x\n\n## Recent work by @platform\n- t_deadbeef — wrote 1234567 rows")
         self.assertFalse(walker.mapping.has_identifier("wrote 1234567 rows"))
 
+    def test_a_digest_commit_at_another_length_counts_against_an_answer(self):
+        # The answer may shorten the digest's full SHA, or lengthen its short one.
+        full = "0ffe0cbd6b463ad4c3d2e1f0a9b8c7d6e5f4a3b2"
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(f"x\n\n## Recent work by @platform\n- t_deadbeef — synced the repo at {full}: done")
+        self.assertTrue(walker.mapping.has_identifier("git checkout 0ffe0cb"))
+        self.assertFalse(walker.mapping.has_identifier("git checkout 0ffe0cc"))
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(self.CARD)
+        self.assertTrue(walker.mapping.has_identifier(f"git checkout {full}"))
+
+    def test_a_digest_commit_in_an_identifier_shape_counts_as_bare_hex(self):
+        # The throwaway normalizer binds these, so the hex never reaches the run scan.
+        sha = "3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b"
+        for written in (f"acme/fleet@{sha}", f"https://github.com/acme/fleet/commit/{sha}"):
+            with self.subTest(written=written):
+                walker = normalizer.Normalizer(NOW, False)
+                walker.text(f"x\n\n## Recent work by @platform\n- t_deadbeef — merged {written}: done")
+                self.assertTrue(walker.mapping.has_identifier(f"reset to {sha}"))
+                self.assertTrue(walker.mapping.has_identifier(f"reset to {sha[:7]}"))
+                self.assertFalse(walker.mapping.has_identifier("reset to 4f1e4140"))
+
     def test_the_digests_unrestorable_values_count_against_an_answer(self):
         walker = normalizer.Normalizer(NOW, False)
         walker.text(self.CARD)

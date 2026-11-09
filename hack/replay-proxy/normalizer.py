@@ -758,13 +758,18 @@ class Mapping:
 
         After apply_to_answer, any left is one the key never bound (it sat in
         text the key drops, like the recent-work digest, or the model made it),
-        so no placeholder can bring it up to date. A commit the digest names as
-        plain hex has no identifier shape, so its runs of hex are kept to check
-        (dropped_hex).
+        so no placeholder can bring it up to date. A commit the digest names has
+        no identifier shape once an answer writes it as plain hex, so the
+        digest's commits are kept to check (dropped_hex). As in
+        identifier_left_literal, a run counts when it starts a kept commit or a
+        kept commit starts it: an answer may shorten or lengthen a SHA.
         """
         if any(pattern.search(text) for _, pattern, _ in ID_CLASSES):
             return True
-        return bool(self.dropped_hex) and any(run in self.dropped_hex for run in HEX_RUN_RE.findall(text))
+        if not self.dropped_hex:
+            return False
+        return any(run.startswith(kept) or kept.startswith(run)
+                   for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
 
     @staticmethod
     def has_timestamp(text: str) -> bool:
@@ -949,7 +954,10 @@ class Normalizer:
         Each digest is read by a throwaway normalizer, as a dropped event is
         (dropped_guards): its keyed numbers, epochs, ages and day-counted dates
         join this request's. Its identifiers are unbound, which has_identifier
-        refuses; a run of hex outside them (a commit) is kept for it too.
+        refuses while they keep their shape. Its commits are kept for it as
+        plain hex too: a run of hex outside any identifier, and every commit the
+        throwaway normalizer bound (`owner/repo@<sha>`, a `/commit/<sha>` URL),
+        since an answer may repeat either as a bare SHA.
         """
         for pattern in (RECENT_WORK_RE, RECENT_WORK_ESCAPED_RE):
             for m in pattern.finditer(text):
@@ -958,6 +966,9 @@ class Normalizer:
                 self.merge_unrestorable(scratch.mapping)
                 self.mapping.dropped_hex.update(run for run in HEX_RUN_RE.findall(PLACEHOLDER_RE.sub(" ", digest))
                                                 if HEX_LETTER_RE.search(run))
+                self.mapping.dropped_hex.update(scratch.mapping.to_value[token]
+                                                for token in scratch.mapping.to_value
+                                                if token_class(token) == COMMIT_CLASS)
 
     def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
         """Run `walk` with time_beside also set when `flag` is, then restore the enclosing value.
