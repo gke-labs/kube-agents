@@ -1830,7 +1830,8 @@ unchanged. As shipped it is **346**. New cases:
 - Idempotency markers: a merged PR already carrying `audit-persists` gets no second comment; a ledger
   already carrying `audit-refused` for a comment node id does not re-refuse it; a different node id
   for the same finding does.
-- Clean run closes the issue and every open remediation PR.
+- Clean run closes the issue and every open remediation PR of this install's; on a scoped install an
+  unlabelled one whose ids this ledger never carried stays open.
 - `--dry-run` issues no command through the harness runner at all (assert the recorder is empty),
   prints every pull request body it would open, separated from the ledger body by a machine-findable
   line so a size check can measure each one against the limit rather than the concatenation, and
