@@ -561,7 +561,7 @@ says which arm fired (§3.2), and on `single-zone-nodepool`, `public-control-pla
 be closed with the previous arm's title and remediation under this arm's sentence.
 Everything else is in it — every cluster's `outcome`, candidates by identity, severity and their
 route and triage fields,
-`checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config
+`checks_not_applicable`, `checks_unevaluated`, `limitations`, `notes`, `noted_objects`, `clusters_listed`, the Config
 Connector keys, and the top-level `checks_revision`, so a new collector build is a changed fleet — as a
 drop-list rather than a keep-list, so a key a collector adds later counts as a change until this
 module names it volatile. Cluster and command order do not count. `manifest_delta.should_run_llm_synthesis(audit_id,

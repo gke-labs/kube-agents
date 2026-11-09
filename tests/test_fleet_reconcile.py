@@ -2143,11 +2143,23 @@ class FixtureRefreshTest(unittest.TestCase):
                 self.assertEqual(calls, [])
                 self.assertIn("startup-fail VM not reset", outcomes[P7][1])
 
-    def test_no_reset_on_a_dry_run_a_refusal_a_failure_or_with_refresh_off(self):
+    def test_a_refusal_or_a_failure_still_resets_the_vm(self):
+        """The plan outcome does not decide the reset: a refused or failed
+        plan leaves the VM as it was, and its console still rotates."""
+        for tofu, expected in (
+            (_Tofu({P7: REPLACE}, states={P7: STARTUP_FAIL_STATE}), reconcile.OUTCOME_REFUSED),
+            (_Tofu({P7: UPDATE_ONLY}, fail={"apply": "boom"}, states={P7: STARTUP_FAIL_STATE}), reconcile.OUTCOME_FAILED),
+        ):
+            with self.subTest(expected):
+                calls = []
+                outcomes, run = self._reconcile(tofu, self._gcloud(calls))
+                self.assertEqual(outcomes[P7][0], expected)
+                self.assertEqual(calls, [["gcloud", "compute", "instances", "reset", "startup-fail-seeded", "--zone=us-central1-a", "--project=%s" % P7, "--quiet"]])
+                self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH]["result"], "reset")
+
+    def test_no_reset_on_a_dry_run_or_with_refresh_off(self):
         for tofu, dry, refresh in (
             (_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), True, True),
-            (_Tofu({P7: REPLACE}, states={P7: STARTUP_FAIL_STATE}), False, True),
-            (_Tofu({P7: UPDATE_ONLY}, fail={"apply": "boom"}, states={P7: STARTUP_FAIL_STATE}), False, True),
             (_Tofu({P7: UPDATE_ONLY}, states={P7: STARTUP_FAIL_STATE}), False, False),
         ):
             with self.subTest(dry=dry, refresh=refresh):
@@ -2181,7 +2193,7 @@ class FixtureRefreshTest(unittest.TestCase):
         with mock.patch.object(reconcile, "terminating", lambda: True), mock.patch.object(reconcile, "_tofu", lambda args, *a, **k: subprocess.CompletedProcess(args, 0, STARTUP_FAIL_STATE, "")):
             run = reconcile.Run(commit="c", fleet_tree="t", refresh_fixtures=True)
             outcomes = {}
-            extras = {"startup_fail_instance": ("startup-fail-seeded", "us-central1-a")}
+            extras = {reconcile.EXTRA_STARTUP_FAIL_INSTANCE: ("startup-fail-seeded", "us-central1-a")}
             with mock.patch.object(reconcile, "gcloud_runner", self._gcloud(calls)), mock.patch.object(
                 reconcile, "reconcile_project", lambda *a, **k: (k["extras"].update(extras), (reconcile.OUTCOME_APPLIED, "summary"))[1]
             ), mock.patch("sys.stdout", io.StringIO()):

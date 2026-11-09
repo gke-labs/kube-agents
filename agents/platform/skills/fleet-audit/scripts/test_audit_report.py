@@ -26045,6 +26045,59 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertEqual((payload["status"], payload["new"], payload["resolved"]), ("UPDATED", 0, 0))
 
 
+    def run_omitting_a(self, noted_objects):
+        """A run that reports `b` and omits the previous `a`, which a pull
+        request carries. Returns the JSON line."""
+        self.harness = Recorder()
+        self.harness.listed_body = self.stored_ledger_body
+        self.patch_attr("run_cmd", self.harness)
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a", title="Alpha finding"), make_finding(fid="b", title="Bravo finding")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+            "proposal-list": proposals_view(
+                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+            ),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects))])
+        self.assertEqual(rc, 0, self.err)
+        return self.stdout_json()
+
+    def test_an_omitted_finding_on_a_noted_object_is_held_not_resolved(self):
+        """The collector could not see `a`, so a run with other findings does
+        not announce it as resolved, and its pull request stays open."""
+        payload = self.run_omitting_a(noted_objects=True)
+        self.assertEqual((payload["status"], payload["resolved"]), ("UPDATED", 0))
+        self.assertEqual(payload["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        body = self.harness.bodies_for("issue-update")[0]
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
+        # The control: with no noted object, `a` is resolved and its pull
+        # request is closed.
+        payload = self.run_omitting_a(noted_objects=False)
+        self.assertEqual(payload["resolved"], 1)
+        self.assertTrue(self.harness.forge_calls("proposal-close"))
+
+
+    def test_a_clean_run_keeps_the_pull_request_of_a_noted_object(self):
+        """The clean branch's stale-close pass reads the same held set."""
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "proposal-list": proposals_view(
+                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+            ),
+        }
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+
+
 class TestScopeNotesFitTheBody(unittest.TestCase):
     def test_sixty_projects_with_long_notes_fit_the_body(self):
         """The Notes cell is clipped as the Limitations cell is. A cell of

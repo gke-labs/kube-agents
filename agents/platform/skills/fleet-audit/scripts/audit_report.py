@@ -7640,6 +7640,33 @@ def _comment_scope_notes(data: dict) -> list[str]:
     return out
 
 
+def _noted_objects(manifest: dict | None):
+    """`(entry, identity)` for every object a collected target lists under
+    `noted_objects`. `identity` has the four identity fields of a finding."""
+    for entry in _manifest_clusters(manifest):
+        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
+            continue
+        for item in entry.get(NOTED_OBJECTS_KEY) or []:
+            if isinstance(item, dict) and item.get("check") and item.get("object"):
+                yield entry, {
+                    "check": str(item["check"]),
+                    "cluster": str(entry.get("name") or ""),
+                    "namespace": str(item.get("namespace") or ""),
+                    "object": str(item["object"]),
+                }
+
+
+def noted_ids(manifest: dict | None) -> set[str]:
+    """The ledger ids (`published_id`) of the objects the targets' notes name.
+
+    The collector ran the check on each one but could not see the result, so
+    a previous finding on one did not go away in this run's sight.
+    `still_flagged_ids` holds it as it holds a candidate the collector still
+    emits: it is not resolved, and its pull request is not closed.
+    """
+    return {published_id(identity) for _entry, identity in _noted_objects(manifest)}
+
+
 def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
     """Refuse a `resolved_because` entry for an object a target's note names.
 
@@ -7650,26 +7677,11 @@ def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
     there. The worker carries it forward: it reports the finding again from
     the previous finding.
     """
-    noted = set()
-    for entry in _manifest_clusters(manifest):
-        if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
-            continue
-        for item in entry.get(NOTED_OBJECTS_KEY) or []:
-            if isinstance(item, dict) and item.get("check") and item.get("object"):
-                noted.add(
-                    derive_finding_id(
-                        {
-                            "check": str(item["check"]),
-                            "cluster": str(entry.get("name") or ""),
-                            "namespace": str(item.get("namespace") or ""),
-                            "object": str(item["object"]),
-                        }
-                    )
-                )
+    noted = noted_ids(manifest)
     if not noted:
         return
     for i, entry in enumerate(data.get("resolved_because") or []):
-        if isinstance(entry, dict) and derive_finding_id(entry) in noted:
+        if isinstance(entry, dict) and published_id(entry) in noted:
             raise ValidationError(
                 f"resolved_because[{i}]: {entry.get('object')!r} on {entry.get('cluster')!r} "
                 f"is named in that target's `{SCOPE_NOTES_KEY}`: the collector ran "
@@ -7971,7 +7983,9 @@ def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
     release a still-flagged finding: that entry claims the object is gone, and
     the collector says it is not.
     """
-    return collector_flagged_ids(manifest) - _declared_ids(data)
+    # A noted object is held the same way: the collector could not see it,
+    # so the run cannot say that its finding went away (`noted_ids`).
+    return (collector_flagged_ids(manifest) | noted_ids(manifest)) - _declared_ids(data)
 
 
 def collector_held_entries(
@@ -8070,6 +8084,18 @@ def collector_held_entries(
             "object": str(candidate.get("object") or ""),
             "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
         }
+    # A noted object has no candidate. Its identity is the note's, and its
+    # command is the read the collector recorded for the check.
+    for entry, identity in _noted_objects(manifest):
+        commands = [
+            str(command.get("command") or "")
+            for command in entry.get("commands") or []
+            if isinstance(command, dict) and command.get("rc") == 0 and command.get("check") == identity["check"]
+        ]
+        by_ledger_id.setdefault(
+            published_id(identity),
+            {**identity, "commands": [(commands[0] if commands else "").strip() or COLLECTOR_COMMAND_UNRECORDED]},
+        )
     held: list[dict] = []
     for fid in held_ids:
         identity = by_ledger_id.get(fid)

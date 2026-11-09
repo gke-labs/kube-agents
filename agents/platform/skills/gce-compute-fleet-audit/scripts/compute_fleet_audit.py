@@ -486,6 +486,8 @@ ROTATED_SERIAL_NOTE = (
 )
 ROTATED_NOTE_NAMES = 10
 ROTATED_NOTE_MORE = ", and {more} more"
+# The manifest key that holds the target's notes.
+NOTES_KEY = "notes"
 # The manifest key that lists every instance the note covers, with no limit,
 # as `{check, object}`. `finish` refuses a `resolved_because` for one of
 # them: the audit did not see that finding go away.
@@ -1528,7 +1530,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
     if limitations:
         entry["limitations"] = "; ".join(limitations)
     if notes:
-        entry["notes"] = "; ".join(notes)
+        entry[NOTES_KEY] = "; ".join(notes)
     if noted_objects:
         entry[NOTED_OBJECTS_KEY] = noted_objects
     return entry

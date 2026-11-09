@@ -85,7 +85,7 @@ target has one: a list of `{target, note}`, each one a sentence from the collect
 read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
 and it does not change `silent_ok`. Relay each note in your report on every status, and do not
 report the objects it names as clean. A scheduled run that is otherwise silent (`silent_ok: true`)
-does not post the notes, which stay in the stored report; an on-demand run relays them. A previous finding on such an object did not go away in this run's
+does not report the notes in chat, which stay in the stored report; an on-demand run relays them. A previous finding on such an object did not go away in this run's
 sight: report it again from the previous finding, because `finish` refuses a `resolved_because`
 entry for it. A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report

@@ -273,6 +273,11 @@ REFRESH_SKIPPED = "skipped"
 WARNING_REFRESH = "startup-fail VM not reset: %s"
 REASON_REFRESH_NOT_IN_STATE = "the state records no %s" % STARTUP_FAIL_ADDRESS
 REASON_REFRESH_TERMINATING = "the run is terminating"
+REASON_REFRESH_TERMINATED = "terminated during the reset"
+# The `extras` keys the state read writes for the reset: the VM's (name,
+# zone), None when the state records none, or why the read failed.
+EXTRA_STARTUP_FAIL_INSTANCE = "startup_fail_instance"
+EXTRA_STARTUP_FAIL_LOOKUP_ERROR = "startup_fail_lookup_error"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -702,9 +707,9 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
             if refresh and extras is not None and not dry_run:
                 try:
                     state = _tofu(["show", "-json", "-no-color"], runner, deadline, env=env)
-                    extras["startup_fail_instance"] = startup_fail_instance(state.stdout)
+                    extras[EXTRA_STARTUP_FAIL_INSTANCE] = startup_fail_instance(state.stdout)
                 except ReconcileError as exc:
-                    extras["startup_fail_lookup_error"] = str(exc)
+                    extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR] = str(exc)
             planned = _tofu(
                 [
                     "plan",
@@ -1012,10 +1017,10 @@ def reset_startup_fail(project, extras):
     if terminating():
         # The drain waits for this worker to release its project.
         return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_TERMINATING}, None
-    if "startup_fail_lookup_error" in extras:
-        why = extras["startup_fail_lookup_error"]
+    if EXTRA_STARTUP_FAIL_LOOKUP_ERROR in extras:
+        why = extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR]
         return {"result": REFRESH_FAILED, "detail": why}, WARNING_REFRESH % why
-    instance = extras.get("startup_fail_instance")
+    instance = extras.get(EXTRA_STARTUP_FAIL_INSTANCE)
     if not instance:
         return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_NOT_IN_STATE}, None
     name, zone = instance
@@ -1073,14 +1078,17 @@ def _record(project, outcomes, runner, dry_run, run=None):
             raise
         if warning:
             outcomes[project] = (outcome[0], "%s; %s" % (outcome[1], warning))
-    if outcome[0] in AT_TREE_OUTCOMES and not dry_run and run.refresh_fixtures:
+    state_read = EXTRA_STARTUP_FAIL_INSTANCE in extras or EXTRA_STARTUP_FAIL_LOOKUP_ERROR in extras
+    if state_read and not dry_run and run.refresh_fixtures:
         # After the marker: the reset is a fixture's refresh, not part of
         # being at the tree, so it neither gates the marker nor the outcome.
+        # Whatever the plan outcome: a refused or failed plan leaves the VM
+        # as it was, and its serial console still rotates.
         try:
             field, warning = reset_startup_fail(project, extras)
         except boskos_pool.Terminated:
-            run.mark(project, **{REPORT_KEY_REFRESH: {"result": REFRESH_FAILED, "detail": "terminated during the reset"}})
-            outcomes[project] = (outcomes[project][0], "%s; %s" % (outcomes[project][1], WARNING_REFRESH % "terminated during the reset"))
+            run.mark(project, **{REPORT_KEY_REFRESH: {"result": REFRESH_FAILED, "detail": REASON_REFRESH_TERMINATED}})
+            outcomes[project] = (outcomes[project][0], "%s; %s" % (outcomes[project][1], WARNING_REFRESH % REASON_REFRESH_TERMINATED))
             _line(project, outcomes[project])
             raise
         run.mark(project, **{REPORT_KEY_REFRESH: field})
