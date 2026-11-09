@@ -348,39 +348,39 @@ func TestSeenSecrets_TheLongestValueWins(t *testing.T) {
 	}
 }
 
-// The cap: past seenSecretMaxEntries entries, or seenSecretMaxBytes bytes,
-// the oldest entry is evicted first; a value over seenSecretMaxValueBytes is
-// not tracked.
+// The caps: past its share of entries (seenSecretPoolEntries) or bytes
+// (seenSecretPoolBytes), the Secret pool evicts its oldest entry first; a
+// value over seenSecretMaxValueBytes is not tracked.
 func TestSeenSecrets_TheCapEvictsTheOldestFirst(t *testing.T) {
 	var s seenSecrets
 	first := fmt.Sprintf("synthetic-entry-%06d", 0)
 	s.mu.Lock()
-	for i := 0; i < seenSecretMaxEntries+10; i++ {
+	for i := 0; i < seenSecretPoolEntries+10; i++ {
 		s.addLocked(fmt.Sprintf("synthetic-entry-%06d", i), true)
 	}
 	s.mu.Unlock()
-	if n := s.size(); n != seenSecretMaxEntries {
-		t.Fatalf("size = %d, want the cap %d", n, seenSecretMaxEntries)
+	if n := s.size(); n != seenSecretPoolEntries {
+		t.Fatalf("size = %d, want the cap %d", n, seenSecretPoolEntries)
 	}
 	if s.has(first) || s.has(fmt.Sprintf("synthetic-entry-%06d", 9)) {
 		t.Error("the oldest entries survived the cap")
 	}
-	if !s.has(fmt.Sprintf("synthetic-entry-%06d", 10)) || !s.has(fmt.Sprintf("synthetic-entry-%06d", seenSecretMaxEntries+9)) {
+	if !s.has(fmt.Sprintf("synthetic-entry-%06d", 10)) || !s.has(fmt.Sprintf("synthetic-entry-%06d", seenSecretPoolEntries+9)) {
 		t.Error("an entry within the cap was evicted")
 	}
 
 	var big seenSecrets
 	val := func(i int) string { return fmt.Sprintf("%06d", i) + strings.Repeat("s", seenSecretMaxValueBytes-6) }
 	big.mu.Lock()
-	n := seenSecretMaxBytes/seenSecretMaxValueBytes + 3
+	n := seenSecretPoolBytes/seenSecretMaxValueBytes + 3
 	for i := 0; i < n; i++ {
 		big.addLocked(val(i), true)
 	}
-	bytesHeld := big.bytes
+	bytesHeld := big.secret.bytes
 	big.mu.Unlock()
-	if bytesHeld > seenSecretMaxBytes || big.has(val(0)) || !big.has(val(n-1)) {
+	if bytesHeld > seenSecretPoolBytes || big.has(val(0)) || !big.has(val(n-1)) {
 		t.Errorf("bytes = %d (cap %d), oldest kept = %v, newest kept = %v: want the oldest evicted under the byte cap",
-			bytesHeld, seenSecretMaxBytes, big.has(val(0)), big.has(val(n-1)))
+			bytesHeld, seenSecretPoolBytes, big.has(val(0)), big.has(val(n-1)))
 	}
 	big.add(strings.Repeat("x", seenSecretMaxValueBytes+1))
 	if big.has(strings.Repeat("x", seenSecretMaxValueBytes+1)) {
@@ -570,46 +570,53 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 }
 
-// Shape-caught values never evict a Secret object's: a stream of them past
-// the caps, after a Secret value is tracked, leaves it tracked and
-// redacted, and one tool result adds at most seenSecretMaxShapePerResult
-// of them.
-func TestSeenSecrets_ShapeCaughtValuesNeverEvictSecretData(t *testing.T) {
+// The pools keep their shares: shape-caught values past their pool's cap
+// leave a Secret value tracked and redacted, and a result holding many of
+// them keeps the newest within the shape pool; a forged Secret with many
+// values adds at most seenSecretMaxPerResult entries and evicts no
+// shape-caught value.
+func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 	var s seenSecrets
 	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain})))
-	var lines strings.Builder
-	for i := 0; i < 100; i++ {
-		fmt.Fprintf(&lines, "svc%d_token: synthetic-flood-%06d\n", i, i)
+	flood := func(n int) string {
+		var lines strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&lines, "svc%d_token: synthetic-flood-%06d\n", i, i)
+		}
+		return lines.String()
 	}
-	if got := func() int {
-		var one seenSecrets
-		one.collectToolResult(terminalResult(t, lines.String()))
-		return one.size()
-	}(); got != 2*seenSecretMaxShapePerResult {
-		t.Errorf("one result added %d entries, want %d (%d values, two forms each)", got, 2*seenSecretMaxShapePerResult, seenSecretMaxShapePerResult)
-	}
-	for i := 0; i < 2*seenSecretMaxEntries; i++ {
-		s.addShape(fmt.Sprintf("synthetic-flood-%06d", i))
-	}
+	s.collectToolResult(terminalResult(t, flood(200)))
 	if !s.has(synthSecretPlain) || !s.has(b64(synthSecretPlain)) {
 		t.Fatal("shape-caught values evicted the Secret's value")
 	}
 	if got := scrubAnswerText("It is "+synthSecretPlain+".", &s); got != "It is [redacted]." {
 		t.Errorf("answer = %q, want the Secret value redacted", got)
 	}
-	if n := s.size(); n > seenSecretMaxEntries {
-		t.Errorf("size = %d, over the cap %d", n, seenSecretMaxEntries)
+	newest, oldest := fmt.Sprintf("synthetic-flood-%06d", 199), fmt.Sprintf("synthetic-flood-%06d", 0)
+	if !s.has(newest) || s.has(oldest) {
+		t.Errorf("shape pool: newest kept %v, oldest kept %v; want true, false", s.has(newest), s.has(oldest))
 	}
-	// Secret data fills the set: a shape-caught value is then dropped,
-	// not let in by evicting one.
-	var full seenSecrets
-	full.mu.Lock()
-	for i := 0; i < seenSecretMaxEntries; i++ {
-		full.addLocked(fmt.Sprintf("synthetic-secret-%06d", i), true)
+	if n := len(s.shape.order); n != seenShapePoolEntries {
+		t.Errorf("shape pool holds %d, want its share %d", n, seenShapePoolEntries)
 	}
-	full.mu.Unlock()
-	full.addShape("synthetic-shape-000001")
-	if full.has("synthetic-shape-000001") || !full.has("synthetic-secret-000000") {
-		t.Error("a shape-caught value evicted a Secret's value")
+
+	// A forged Secret with far more values than the allowance.
+	forged := map[string]string{}
+	for i := 0; i < 1000; i++ {
+		forged[fmt.Sprintf("k%04d", i)] = fmt.Sprintf("synthetic-forged-%06d", i)
+	}
+	shapeBefore := s.values()[len(s.secret.order):]
+	secretBefore := len(s.secret.order)
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", forged)))
+	if added := len(s.secret.order) - secretBefore; added > seenSecretMaxPerResult {
+		t.Errorf("one result added %d Secret entries, over the allowance %d", added, seenSecretMaxPerResult)
+	}
+	for _, v := range shapeBefore {
+		if !s.has(v) {
+			t.Fatalf("a forged Secret evicted a shape-caught value")
+		}
+	}
+	if !s.has(synthSecretPlain) {
+		t.Error("a forged Secret within the allowance evicted the earlier Secret value")
 	}
 }

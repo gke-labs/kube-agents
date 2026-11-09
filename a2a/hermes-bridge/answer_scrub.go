@@ -51,11 +51,20 @@ const (
 	// seenSecretMaxValueBytes is the longest value tracked; a longer one
 	// (a bundle, a kubeconfig) is left to the shape rules.
 	seenSecretMaxValueBytes = 16 << 10
-	// seenSecretMaxEntries and seenSecretMaxBytes cap the set: past either,
-	// the oldest entry is evicted first, so a task that reads many Secrets
-	// keeps the most recent ones.
-	seenSecretMaxEntries = 512
-	seenSecretMaxBytes   = 1 << 20
+	// The set's two pools (seenSecrets) each have their own share, and past
+	// either of its caps a pool evicts its own oldest entry: Secret object
+	// data 384 entries and 768 KiB, shape-caught values 128 entries and
+	// 256 KiB. seenSecretMaxEntries and seenSecretMaxBytes are the totals.
+	seenSecretPoolEntries = 384
+	seenSecretPoolBytes   = 768 << 10
+	seenShapePoolEntries  = 128
+	seenShapePoolBytes    = 256 << 10
+	seenSecretMaxEntries  = seenSecretPoolEntries + seenShapePoolEntries
+	seenSecretMaxBytes    = seenSecretPoolBytes + seenShapePoolBytes
+	// seenSecretMaxPerResult is how many Secret object entries one tool
+	// result may add, so a result holding a forged or huge Secret cannot
+	// flush the Secret values earlier results carried.
+	seenSecretMaxPerResult = 128
 	// toolResultScanCap bounds how much of one result's text the regex
 	// readers (the shape rules, the YAML reader) scan.
 	toolResultScanCap = 1 << 20
@@ -91,103 +100,102 @@ func seenSecretKeySkipped(key string, saToken bool) bool {
 // cleared, and closed to further values, when the task finalizes. No value
 // in it is logged or published: it is read only to redact (redact).
 //
-// The caps (seenSecretMaxEntries, seenSecretMaxBytes) hold for both pools
-// together. Past either, a shape-caught entry is evicted first, the oldest
-// first; a Secret object's entry goes only when no shape-caught entry is
-// left, and a shape-caught value never evicts one: added to a set full of
-// Secret data it is dropped. One tool result adds at most
-// seenSecretMaxShapePerResult shape-caught values, so a result full of
-// them, or one written to be, cannot flush the set.
+// Each pool has a fixed share of the caps and evicts only its own oldest
+// entry, so neither pool can flush the other: shape-caught values, however
+// many a result holds (or is written to hold), never evict Secret data,
+// and a large or forged Secret never evicts shape-caught values. One tool
+// result adds at most seenSecretMaxPerResult Secret entries. A value both
+// pools would hold is kept in the Secret pool.
 type seenSecrets struct {
-	mu          sync.Mutex
-	set         map[string]bool // value -> from a Secret object
-	secretOrder []string        // a pool's insertion order, the oldest first
-	shapeOrder  []string
-	bytes       int
-	closed      bool // the task has finalized: a late delivery adds nothing
+	mu     sync.Mutex
+	set    map[string]bool // value -> held in the Secret pool
+	secret seenPool
+	shape  seenPool
+	closed bool // the task has finalized: a late delivery adds nothing
 }
 
-// seenSecretMaxShapePerResult is how many shape-caught values one tool
-// result may add (each in two forms).
-const seenSecretMaxShapePerResult = 32
+// seenPool is one pool's entries in insertion order, the oldest first.
+type seenPool struct {
+	order []string
+	bytes int
+}
+
+func (s *seenSecrets) pool(fromSecret bool) (*seenPool, int, int) {
+	if fromSecret {
+		return &s.secret, seenSecretPoolEntries, seenSecretPoolBytes
+	}
+	return &s.shape, seenShapePoolEntries, seenShapePoolBytes
+}
 
 // add tracks a Secret's plain value (a stringData value) and its base64
-// form.
-func (s *seenSecrets) add(v string) { s.addPlain(v, true) }
+// form, and says how many entries it added.
+func (s *seenSecrets) add(v string) int { return s.addPlain(v, true) }
 
 // addShape tracks a value a shape rule caught, and its base64 form, in the
 // shape-caught pool.
 func (s *seenSecrets) addShape(v string) { s.addPlain(v, false) }
 
-func (s *seenSecrets) addPlain(v string, fromSecret bool) {
+func (s *seenSecrets) addPlain(v string, fromSecret bool) int {
 	v = strings.TrimSpace(v)
 	if !seenSecretSized(v) {
-		return
+		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.addLocked(v, fromSecret)
-	s.addLocked(base64.StdEncoding.EncodeToString([]byte(v)), fromSecret)
+	return s.addLocked(v, fromSecret) + s.addLocked(base64.StdEncoding.EncodeToString([]byte(v)), fromSecret)
 }
 
 // addEncoded tracks a Secret data value: the base64 form as given, and the
-// decoded value when it decodes to text. A value that decodes to fewer
-// than seenSecretMinBytes is not tracked in either form.
-func (s *seenSecrets) addEncoded(b64 string) {
+// decoded value when it decodes to text, and says how many entries it
+// added. A value that decodes to fewer than seenSecretMinBytes is not
+// tracked in either form.
+func (s *seenSecrets) addEncoded(b64 string) int {
 	b64 = strings.TrimSpace(b64)
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err == nil && len(strings.TrimSpace(string(raw))) < seenSecretMinBytes {
-		return
+		return 0
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.addLocked(b64, true)
+	n := s.addLocked(b64, true)
 	if err != nil || !utf8.Valid(raw) {
-		return
+		return n
 	}
-	s.addLocked(strings.TrimSpace(string(raw)), true)
+	return n + s.addLocked(strings.TrimSpace(string(raw)), true)
 }
 
 func seenSecretSized(v string) bool {
 	return len(v) >= seenSecretMinBytes && len(v) <= seenSecretMaxValueBytes
 }
 
-func (s *seenSecrets) addLocked(v string, fromSecret bool) {
+// addLocked tracks v in its pool and says whether that added an entry to
+// the pool (1) or not (0), evicting the pool's own oldest past its caps.
+func (s *seenSecrets) addLocked(v string, fromSecret bool) int {
 	if s.closed || !seenSecretSized(v) || strings.Contains(v, redactedValue) {
-		return
+		return 0
 	}
 	if s.set == nil {
 		s.set = make(map[string]bool)
 	}
-	if was, ok := s.set[v]; ok {
-		if fromSecret && !was { // a shape-caught value a Secret also holds
-			s.shapeOrder = slices.DeleteFunc(s.shapeOrder, func(x string) bool { return x == v })
-			s.secretOrder = append(s.secretOrder, v)
-			s.set[v] = true
+	if inSecret, ok := s.set[v]; ok {
+		if !fromSecret || inSecret {
+			return 0
 		}
-		return
-	}
-	full := len(s.set)+1 > seenSecretMaxEntries || s.bytes+len(v) > seenSecretMaxBytes
-	if !fromSecret && full && len(s.shapeOrder) == 0 {
-		return // a shape-caught value never evicts a Secret's
+		// A shape-caught value a Secret also holds moves to the Secret pool.
+		s.shape.order = slices.DeleteFunc(s.shape.order, func(x string) bool { return x == v })
+		s.shape.bytes -= len(v)
 	}
 	s.set[v] = fromSecret
-	if fromSecret {
-		s.secretOrder = append(s.secretOrder, v)
-	} else {
-		s.shapeOrder = append(s.shapeOrder, v)
-	}
-	s.bytes += len(v)
-	for len(s.set) > seenSecretMaxEntries || s.bytes > seenSecretMaxBytes {
-		var old string
-		if len(s.shapeOrder) > 0 {
-			old, s.shapeOrder = s.shapeOrder[0], s.shapeOrder[1:]
-		} else {
-			old, s.secretOrder = s.secretOrder[0], s.secretOrder[1:]
-		}
+	p, maxEntries, maxBytes := s.pool(fromSecret)
+	p.order = append(p.order, v)
+	p.bytes += len(v)
+	for len(p.order) > maxEntries || p.bytes > maxBytes {
+		old := p.order[0]
+		p.order = p.order[1:]
+		p.bytes -= len(old)
 		delete(s.set, old)
-		s.bytes -= len(old)
 	}
+	return 1
 }
 
 // size is how many values the set holds.
@@ -212,7 +220,7 @@ func (s *seenSecrets) has(v string) bool {
 func (s *seenSecrets) values() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append(append([]string(nil), s.secretOrder...), s.shapeOrder...)
+	return append(append([]string(nil), s.secret.order...), s.shape.order...)
 }
 
 // clear forgets every value and takes no more: the task has finalized, so
@@ -223,7 +231,7 @@ func (s *seenSecrets) clear() {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.set, s.secretOrder, s.shapeOrder, s.bytes, s.closed = nil, nil, nil, 0, true
+	s.set, s.secret, s.shape, s.closed = nil, seenPool{}, seenPool{}, true
 }
 
 // redact replaces every tracked value in text with the marker, the longest
@@ -284,7 +292,7 @@ func (s *seenSecrets) collectToolResult(raw json.RawMessage) {
 	if s == nil || len(raw) == 0 {
 		return
 	}
-	c := toolResultCollector{set: s, budget: toolResultScanCap, shapeLeft: seenSecretMaxShapePerResult}
+	c := toolResultCollector{set: s, budget: toolResultScanCap, secretLeft: seenSecretMaxPerResult}
 	var v any
 	if json.Unmarshal(raw, &v) != nil {
 		c.text(string(raw), 0)
@@ -294,9 +302,23 @@ func (s *seenSecrets) collectToolResult(raw json.RawMessage) {
 }
 
 type toolResultCollector struct {
-	set       *seenSecrets
-	budget    int // bytes of text the shape rules may still read
-	shapeLeft int // shape-caught values this result may still add
+	set        *seenSecrets
+	budget     int // bytes of text the shape rules may still read
+	secretLeft int // Secret entries this result may still add
+}
+
+// addSecret and addSecretEncoded track a Secret's value within the
+// result's allowance (seenSecretMaxPerResult).
+func (c *toolResultCollector) addSecret(v string) {
+	if c.secretLeft > 0 {
+		c.secretLeft -= c.set.add(v)
+	}
+}
+
+func (c *toolResultCollector) addSecretEncoded(b64 string) {
+	if c.secretLeft > 0 {
+		c.secretLeft -= c.set.addEncoded(b64)
+	}
 }
 
 func (c *toolResultCollector) value(v any, depth int) {
@@ -327,14 +349,14 @@ func (c *toolResultCollector) secretObject(m map[string]any) {
 	if data, ok := m["data"].(map[string]any); ok {
 		for k, v := range data {
 			if sv, ok := v.(string); ok && !seenSecretKeySkipped(k, saToken) {
-				c.set.addEncoded(sv)
+				c.addSecretEncoded(sv)
 			}
 		}
 	}
 	if sd, ok := m["stringData"].(map[string]any); ok {
 		for k, v := range sd {
 			if sv, ok := v.(string); ok && !seenSecretKeySkipped(k, saToken) {
-				c.set.add(sv)
+				c.addSecret(sv)
 			}
 		}
 	}
@@ -376,14 +398,12 @@ func (c *toolResultCollector) text(t string, depth int) {
 // shapeCaught tracks a value secretSink hands on, its quotes and trailing
 // punctuation taken off, in the shape-caught pool, unless it holds a space
 // (a phrase, "14 bytes" or "denied for user ...", is not a credential to
-// match everywhere) or the result has added its
-// seenSecretMaxShapePerResult already.
+// match everywhere).
 func (c *toolResultCollector) shapeCaught(v string) {
 	v = trimValueEdges(v)
-	if strings.ContainsAny(v, " \t\r\n") || !seenSecretSized(v) || c.shapeLeft <= 0 {
+	if strings.ContainsAny(v, " \t\r\n") {
 		return
 	}
-	c.shapeLeft--
 	c.set.addShape(v)
 }
 
@@ -438,9 +458,9 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 			switch {
 			case seenSecretKeySkipped(p.key, f.saToken):
 			case p.stringData:
-				c.set.add(p.value)
+				c.addSecret(p.value)
 			default:
-				c.set.addEncoded(p.value)
+				c.addSecretEncoded(p.value)
 			}
 		}
 	}
@@ -597,9 +617,9 @@ func (c *toolResultCollector) yamlScope(lines []string) {
 		}
 		v := yamlScalar(em[2])
 		if block == "data" {
-			c.set.addEncoded(v)
+			c.addSecretEncoded(v)
 		} else {
-			c.set.add(v)
+			c.addSecret(v)
 		}
 	}
 }
