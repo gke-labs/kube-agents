@@ -59,7 +59,8 @@ const (
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
 	// answerFeedbackName counts the ratings chat users gave answers, by
-	// platform and rating (feedback.go): the dashboard's 👍/👎 series.
+	// platform, rating and answer (feedback.go): the dashboard's 👍/👎
+	// series.
 	answerFeedbackName = "answer_feedback_total"
 	// sessionsName counts the conversations the gateway minted a session
 	// record for, by platform: the next-mode chat half of status.usage's
@@ -89,6 +90,7 @@ const (
 	labelOutcome  = "outcome"
 	labelPlatform = "platform"
 	labelRating   = "rating"
+	labelAnswer   = "answer"
 	labelWindow   = "window"
 	// The platform label's values: the chat backends, under the names the
 	// operator's activeInterfaces vocabulary and the chat_metrics plugin use
@@ -99,6 +101,12 @@ const (
 	platformSlack      = "slack"
 	platformDiscord    = "discord"
 	platformConsole    = "console"
+	// The answer label's values: what the rated message answered with, the
+	// chain's own reply or a card's report that settled the ask (TaskRef.CardsAnswer).
+	// A rating no session record names the rated task for (unreadable, reaped,
+	// or the root aged out of its history) is counted as other.
+	answerReply = "reply"
+	answerCard  = "card"
 	// The window label's values: peopleWindowShort and peopleWindowLong.
 	peopleWindowShortLabel = "7d"
 	peopleWindowLongLabel  = "30d"
@@ -168,8 +176,9 @@ var (
 	metricsChatOutcomes    = []string{chatRendered, chatTextOnly, chatRefused, chatInvalid}
 	metricsPlatforms       = []string{platformGoogleChat, platformSlack, platformDiscord, platformConsole}
 	metricsRatings         = []string{FeedbackUp, FeedbackDown}
+	metricsAnswers         = []string{answerReply, answerCard}
 	// metricsRatedPlatforms are the backends that draw rating controls, each
-	// given a zero answer_feedback_total series per rating.
+	// given a zero answer_feedback_total series per rating and answer.
 	metricsRatedPlatforms = []string{platformGoogleChat, platformSlack}
 	// metricsBackendPlatforms maps each chat backend to its platform label; a
 	// backend outside it is a door and is not counted.
@@ -279,8 +288,8 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other) and rating (up, down, other); a rating changed is counted again.",
-		}, []string{labelPlatform, labelRating}),
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); counted once per rating change, so a repeated rating and one the gateway did not keep are not counted.",
+		}, []string{labelPlatform, labelRating, labelAnswer}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -315,7 +324,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, platform := range metricsRatedPlatforms {
 		for _, rating := range metricsRatings {
-			m.answerFeedback.WithLabelValues(platform, rating)
+			for _, answer := range metricsAnswers {
+				m.answerFeedback.WithLabelValues(platform, rating, answer)
+			}
 		}
 	}
 	return m
@@ -528,9 +539,9 @@ func (s *MetricsServer) Run(ctx context.Context) error {
 	}
 }
 
-// answerRated counts one rating. Both labels come from closed lists: a
-// platform or rating outside them is counted as other.
-func (m *Metrics) answerRated(platform, rating string) {
+// answerRated counts one rating. Every label comes from a closed list: a
+// platform, rating or answer outside them is counted as other.
+func (m *Metrics) answerRated(platform, rating, answer string) {
 	if m == nil {
 		return
 	}
@@ -540,5 +551,8 @@ func (m *Metrics) answerRated(platform, rating string) {
 	if !slices.Contains(metricsRatings, rating) {
 		rating = metricsLabelOther
 	}
-	m.answerFeedback.WithLabelValues(platform, rating).Inc()
+	if !slices.Contains(metricsAnswers, answer) {
+		answer = metricsLabelOther
+	}
+	m.answerFeedback.WithLabelValues(platform, rating, answer).Inc()
 }
