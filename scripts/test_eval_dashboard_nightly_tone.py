@@ -121,5 +121,23 @@ class FocusLineTest(unittest.TestCase):
         self.assertIsNone(nt.focus_line([last] + steady(3)))
 
 
+
+class OneRunPerDateTest(unittest.TestCase):
+    """A same-date re-run counts once in the reply-shape typicals, as in the
+    latency line's (nightly.one_per_date)."""
+
+    def test_a_same_date_re_run_is_one_earlier_night(self):
+        # Seven earlier dates: the 27th (run twice), 26th and 25th at 90%
+        # opening on the answer, the 24th to the 21st at 50%. Counted per
+        # date the typical is the median of three 90s and four 50s, 50%;
+        # counted per run, the 27th's second run pushes the 21st out and it
+        # reads 90%.
+        def at(day, hour, **fields):
+            return {**night(**fields), "started": f"2026-10-{day:02d}T{hour:02d}:00:00+00:00"}
+        earlier = [at(27, 9, verdict=36), at(27, 2, verdict=36), at(26, 2, verdict=36), at(25, 2, verdict=36)]
+        earlier += [at(24 - i, 2, verdict=20) for i in range(4)]
+        line = nt.night_line([at(28, 2, verdict=20)] + earlier)
+        self.assertIn("(typical 50%)", line)
+
 if __name__ == "__main__":
     unittest.main()

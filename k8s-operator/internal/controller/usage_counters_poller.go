@@ -52,6 +52,9 @@ const (
 	// usageNewerFieldPeople names the two people readings' shared pruning
 	// record: they arrived in one release and a CRD serves both or neither.
 	usageNewerFieldPeople = "the two people readings"
+	// usageNewerFieldOrigins names the nine origin readings' shared pruning
+	// record: they arrived in one release and a CRD serves all nine or none.
+	usageNewerFieldOrigins = "the nine origin readings"
 	// usageNewerFieldLastHumanActive is lastHumanActiveTime's pruning record
 	// key, the status field's name.
 	usageNewerFieldLastHumanActive = "lastHumanActiveTime"
@@ -137,10 +140,11 @@ const (
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
 // negativeFeedbackTotal, positiveFeedbackTotal, lastActiveTime and
 // lastHumanActiveTime on every PlatformAgent, the two cluster gauges, the six
-// proposal readings, the two people readings (peopleSeen7d, peopleSeen30d)
-// and the broker's top tools (topTools), from the broker's, the watcher's,
-// the chat plugin's and the A2A gateway's metrics listeners, as a manager
-// Runnable on the leader, off the reconcile path.
+// proposal readings, the two people readings (peopleSeen7d, peopleSeen30d),
+// the broker's top tools (topTools) and the nine origin readings
+// (proposalsFromChat to proposalsFromOther), from the broker's, the
+// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
+// manager Runnable on the leader, off the reconcile path.
 // docs/designs/usage-counters-producer.md is the design; the rules the
 // counters follow are in usage_counters_fold.go, the scrape in
 // usage_counters_scrape.go. This file is the loop and the two
@@ -681,8 +685,9 @@ func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usa
 // fields to absent: no body has carried it for the event streak, or, for the
 // people reading, peopleReadingEnabled is false. known true with values is
 // the largest of each field across the bodies that carried the reading: the
-// broker is one pod by design, and every A2A gateway replica counts from the
-// one shared bucket. A zero is a reading, and is written as one.
+// broker is one pod by design, every A2A gateway replica counts from the
+// one shared bucket, and the chat listener is read on the gateway leader
+// alone. A zero is a reading, and is written as one.
 func usageReadingsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, misses map[usageReadingKind]int) (values map[string]*int64, known map[usageReadingKind]bool) {
 	values = map[string]*int64{}
 	known = map[usageReadingKind]bool{}
@@ -797,8 +802,9 @@ func usageTopToolsEqual(a, b []agentv1alpha1.ToolUsageSummary) bool {
 }
 
 // usageReadingStatusField is the status field a reading spec's field names, nil
-// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings and
-// the poller's tests reach every spec.
+// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings,
+// TestUsageGauges_PointerRowsForTheNineOriginReadings and the poller's tests
+// reach every spec.
 func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **int64 {
 	switch field {
 	case usageExportRemediationsMerged:
@@ -817,16 +823,38 @@ func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **
 		return &u.PeopleSeen7d
 	case usageExportPeopleSeen30d:
 		return &u.PeopleSeen30d
+	case usageExportProposalsFromChat:
+		return &u.ProposalsFromChat
+	case usageExportProposalsFromConsole:
+		return &u.ProposalsFromConsole
+	case usageExportProposalsFromApi:
+		return &u.ProposalsFromApi
+	case usageExportProposalsFromEvent:
+		return &u.ProposalsFromEvent
+	case usageExportProposalsFromDrift:
+		return &u.ProposalsFromDrift
+	case usageExportProposalsFromAudit:
+		return &u.ProposalsFromAudit
+	case usageExportProposalsFromScheduled:
+		return &u.ProposalsFromScheduled
+	case usageExportProposalsFromIssue:
+		return &u.ProposalsFromIssue
+	case usageExportProposalsFromOther:
+		return &u.ProposalsFromOther
 	}
 	return nil
 }
 
 // usageReadingRecord is the newer-fields record a reading's fields share: the
 // people readings arrived at a later release than the six proposal readings,
-// so a served CRD can carry the six and prune the pair.
+// and the origin readings later again, so a served CRD can carry the six and
+// prune the pair, or carry both and prune the nine.
 func usageReadingRecord(kind usageReadingKind) string {
-	if kind == usageReadingPeople {
+	switch kind {
+	case usageReadingPeople:
 		return usageNewerFieldPeople
+	case usageReadingOrigins:
+		return usageNewerFieldOrigins
 	}
 	return usageNewerFieldReadings
 }
@@ -903,7 +931,9 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		podRead func(*corev1.Pod) bool
 	}{
 		{gatewayPodSelector(agent), usageGatewayCounters, nil, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent), everyPod},
-		{gatewayPodSelector(agent), usageChatCounters, nil, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
+		// The chat listener also serves the origins reading, from the proposals
+		// ledger, on the same gate as its counters.
+		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway},
 		// The A2A gateway, a pod a next-mode install runs and a today install
 		// does not: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
@@ -1347,13 +1377,14 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 // carries everything accumulated since. A difference in a newer field alone, a
 // gauge or a later counter, is likewise skipped while the newer-fields record
 // is fresh, the served CRD at a previous schema, so the first counters that
-// CRD serves keep landing every poll. The proposal readings and the people
-// readings, each under its own record, follow the gauges' rule, per reading:
-// a field of a reading readingsKnown names is written as readings holds it,
-// nil included, and differs in either direction; a reading readingsKnown does
-// not name leaves its fields as they are. topTools follows the same rule under
-// its own record: written as topTools holds it, nil included, when
-// topToolsKnown. No reading moves lastActiveTime or lastHumanActiveTime.
+// CRD serves keep landing every poll. The proposal readings, the people
+// readings and the origin readings, each under its own record, follow the
+// gauges' rule, per reading: a field of a reading readingsKnown names is
+// written as readings holds it, nil included, and differs in either
+// direction; a reading readingsKnown does not name leaves its fields as they
+// are. topTools follows the same rule under its own record: written as
+// topTools holds it, nil included, when topToolsKnown. No reading moves
+// lastActiveTime or lastHumanActiveTime.
 func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool, readings map[string]*int64, readingsKnown map[usageReadingKind]bool, topTools []agentv1alpha1.ToolUsageSummary, topToolsKnown bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
@@ -1372,15 +1403,16 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
 	// counter, the errored counter, the background-tasks counter, the two
-	// feedback counters, the chat sessions, the proposal readings and the
-	// people readings arrived later, each at its own release, and a CRD at a
-	// previous schema prunes some or all of them, so a difference in one of
-	// them alone waits while that field's record is fresh rather than
-	// re-patching every poll, and the others keep landing.
+	// feedback counters, the chat sessions, the proposal readings, the people
+	// readings and the origin readings arrived later, each at its own
+	// release, and a CRD at a previous schema prunes some or all of them, so
+	// a difference in one of them alone waits while that field's record is
+	// fresh rather than re-patching every poll, and the others keep landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	readingRecordPruned := map[string]bool{
 		usageNewerFieldReadings: p.newerFieldPruned(agent, usageNewerFieldReadings),
 		usageNewerFieldPeople:   p.newerFieldPruned(agent, usageNewerFieldPeople),
+		usageNewerFieldOrigins:  p.newerFieldPruned(agent, usageNewerFieldOrigins),
 	}
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
@@ -1481,7 +1513,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if gauges != nil {
 		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
 	}
-	for _, record := range []string{usageNewerFieldReadings, usageNewerFieldPeople} {
+	for _, record := range []string{usageNewerFieldReadings, usageNewerFieldPeople, usageNewerFieldOrigins} {
 		if len(written[record]) == 0 {
 			continue
 		}

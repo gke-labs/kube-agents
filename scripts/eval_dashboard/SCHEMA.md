@@ -92,7 +92,7 @@ layout and are collected from the moment they start running.
   in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
-  red comment's "runs from other PRs" count (`gate_comment.py`), the
+  red comment's gate-versus-this-PR call (`gate_comment.py`), the
   Brief's runs list, the Grid's columns, the Cases page's strips and
   presubmit rates — reads presubmit runs only. A nightly run appears where
   the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
@@ -215,9 +215,9 @@ layout and are collected from the moment they start running.
       repetition whose `reason` is shown, so the quote and the check beside
       it come from the same run of the agent; nothing is quoted when that
       rep has none (when no rep carries a reason, the first rep with an
-      excerpt is the one the row is about, link included). The PR gate comment carries neither the
-      `reason` nor the excerpt: the pull request is public, and both stay
-      behind the run link.
+      excerpt is the one the row is about, link included). The PR gate comment names no case and
+      carries neither the `reason` nor the excerpt: the pull request is
+      public, and all of it stays behind the run link.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
@@ -625,7 +625,8 @@ what the renderer does with them.
   list, else the admitted cases that graded nothing) and a retest-when-
   healthy `do`, and never the "absolute rule tripped" text; `gate_comment.py`
   answers `is_red` false for it and leaves the one-line ⚪ "run not
-  evaluated" comment naming those cases; `render.py` passes the verdict
+  evaluated" comment, which names no case (the pull request is public);
+  `render.py` passes the verdict
   and the list through to `brief.json`, where the run page and the Brief's
   run rows label the run and the Reds tile says how many of the gate's reds
   were not evaluated. A gate case that failed every graded repetition

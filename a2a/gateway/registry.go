@@ -63,6 +63,14 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineClosed marks a live message a Google Chat stop closed, a Stop
+	// press or a typed stop (chat_stop_press.go): it reads "cancel sent"
+	// with no Stop control, and the relay leaves it so until the terminal
+	// edit (updateRollingLine, showBusy). False for every other stop: one
+	// typed on another backend, or on Google Chat on a task with no line
+	// or when the armed card stop answers it (cardStopWanted); such a line
+	// keeps moving until the terminal.
+	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
 	// and the revision the mint returned. Every envelope the gateway sends
 	// toward this task carries it, and it is on the record rather than in
@@ -298,9 +306,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
-	// QuietCancel marks a cancel the Slack Stop button sent
-	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
-	// relay posts no "canceled" line for the task's terminal.
+	// QuietCancel marks a cancel that answers for itself (cancelTaskVoiced):
+	// Slack's Stop button with one reply of its own, Google Chat's button
+	// and typed stop on the task's line (chat_stop_press.go), so the relay
+	// posts no "canceled" line for the task's terminal.
 	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
@@ -506,8 +515,9 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	}
 }
 
-// markQuietCancel records that taskID's cancel came from the Slack Stop
-// button (TaskRef.QuietCancel).
+// markQuietCancel records that taskID's cancel answers for itself: a Stop
+// button on Slack or Google Chat, or a stop typed on Google Chat
+// (TaskRef.QuietCancel).
 func (rec *SessionRecord) markQuietCancel(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
@@ -880,10 +890,15 @@ func (r *Registry) Get(ctx context.Context, sessionKey string) (*SessionRecord, 
 	}
 	var rec SessionRecord
 	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-		return nil, fmt.Errorf("session %s: %w", sessionKey, err)
+		return nil, fmt.Errorf("session %s: %w: %w", sessionKey, errRecordUndecodable, err)
 	}
 	return &rec, nil
 }
+
+// errRecordUndecodable marks a session record that exists and doesn't decode:
+// a fault in one key, unlike an unreachable bucket or a timeout, which no
+// retry fixes.
+var errRecordUndecodable = errors.New("session record doesn't decode")
 
 // ErrSessionExists reports a Create that lost the first-contact race: a
 // record for the key already exists, and the caller adopts it.

@@ -23,7 +23,14 @@ the reason. The install's own switch (`KUBEAGENTS_AUDIT_AUTO_PROMOTE`) is not ch
 Pass `--scheduled` only when the cron prompt tells you to: it says that the run is a scheduled run,
 and only a scheduled run can get `silent_ok: true` (see [The clean run](clean-run.md#the-clean-run)). Do not
 pass it on a run that a person asked for. A fleet-audit cron job that you create on request must
-carry the same sentence as the shipped jobs in its prompt.
+carry the same sentence as the shipped jobs in its prompt. The same flag goes to `precheck`, which
+runs this `finish` itself on a scheduled run whose collector manifest digests the same as the last
+scheduled run's ([`draft` and `precheck`](lifecycle.md#between-the-collector-and-finish-draft-and-precheck)): the
+document is that run's stored one, the manifest is this run's, and every rule below applies as it
+is. The line such a run prints is this command's, plus `precheck: unchanged`; a `finish` you run
+yourself never carries that key. A scheduled `finish` with a manifest also records the manifest's
+digest for the next run's `precheck`; one that waived the manifest removes the record, so the next
+run drafts in full.
 
 The last pair belongs to a stream whose SOP runs a collector (the repository's collector-manifest
 design says what the manifest holds), and on such a stream one of the two is **required**:
@@ -67,7 +74,7 @@ for this stream, rewrites (or opens) the ledger issue, comments the delta, opens
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
 JSON line — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_still_open` (remediation
 pull requests already open on findings this run still carries; empty on a clean run), `prs_closed`,
-`partial`, `coverage_gaps`, `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; absent when every id that moved left under a coverage gap; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
+`partial`, `coverage_gaps`, `precheck` (only on a run `precheck` closed from the stored document; its value is `unchanged`), `unreported_under_gap` (only when not empty), `since_last_scheduled` (only on a scheduled run whose findings changed since the last scheduled run while `new` and `resolved` do not say it, or `null` when that is not known; absent when every id that moved left under a coverage gap; see [The clean run](clean-run.md#the-clean-run)), `silent_ok`, `declared`, the number of postures a repository
 declaration kept off the ledger (it never decides silence), `postures_withheld`, the ids of the
 posture findings `finish` held back because the document recorded no complete declared-intent
 search (empty everywhere but on a declaring stream that skipped the step; see

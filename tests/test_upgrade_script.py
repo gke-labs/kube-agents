@@ -3911,6 +3911,132 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
 
 
 
+class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
+    """#3615. A full upgrade applies the chat keys from install.env, so its
+    end prints the chat setup checklist for the mode the CR is left on, as
+    install.sh does after each of its applies. The tail of main(), lifted as
+    written over the real installer_common.sh with gcloud stubbed, calls the
+    helper on the full arm only, under a declare -F guard an older target's
+    installer_common.sh fails, with the project number read only when Google
+    Chat is on and the rendered topic, before the home-channel summary. One
+    run uses the real helper and printers, so the checklist is on record."""
+
+    _STUB_HELPER = (
+        'print_chat_setup_checklists() { echo "CHECKLIST mode=$1 number=${PROJECT_NUMBER:-} '
+        'env=${INSTALL_ENV_FILE:-} topic=${CHAT_TOPIC_NAME:-}"; }\n'
+    )
+
+    def _tail(self):
+        source = _UPGRADE_SH.read_text()
+        start = source.index('  print_step "🎉 Upgrade Complete!"\n')
+        return source[start:source.index("\n}\n", start)]
+
+    def _run(self, mode, keys, helper=_STUB_HELPER, install_env_file="/x/install.env", env=None):
+        """Runs the tail; returns the process and the gcloud calls it made."""
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = pathlib.Path(tmp) / "gcloud.log"
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                f"{helper}"
+                f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
+                "print_step() { :; }\n"
+                'print_next_home_channel_unset_summary() { echo "SUMMARY"; }\n'
+                "set -Eeuo pipefail\n"
+                f"{exports}"
+                f"PARAM_UPGRADE_MODE={mode}; PROJECT_ID=proj; DEFAULT_PLATFORM_AGENT_MODE=today\n"
+                f"_tail() {{\nlocal install_env_file={shlex.quote(install_env_file)}\n{self._tail()}\n}}\n"
+                "_tail\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
+                env=get_isolated_test_env(env, absent=("PLATFORM_AGENT_MODE", "CHAT_TOPIC_NAME")),
+            )
+            calls = gcloud_log.read_text() if gcloud_log.exists() else ""
+        return proc, calls
+
+    def test_a_full_upgrade_prints_the_checklist_for_the_mode_after_the_apply(self):
+        proc, calls = self._run("full", {"GOOGLE_CHAT_ENABLED": "true", "PLATFORM_AGENT_MODE": "today",
+                                         "PLATFORM_AGENT_MODE_AFTER_APPLY": "next", "CHAT_TOPIC_NAME": "t"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["CHECKLIST mode=next number=123456 env=/x/install.env topic=t", "SUMMARY"])
+        self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
+
+    def test_the_mode_falls_back_to_the_key_and_the_number_is_read_for_google_chat_only(self):
+        # A file that names no topic rendered the default, which the helper is
+        # handed, since the generator keeps its default local.
+        proc, calls = self._run("full", {"SLACK_ENABLED": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["CHECKLIST mode=today number= env=/x/install.env topic=platform-agent-chat-events", "SUMMARY"])
+        self.assertEqual(calls, "")
+
+    def test_the_retag_arms_and_an_older_target_print_no_checklist(self):
+        for mode, helper in (("harness", self._STUB_HELPER), ("operator", self._STUB_HELPER),
+                             ("full", "unset -f print_chat_setup_checklists\n")):
+            with self.subTest(mode=mode, older_common=helper.startswith("unset")):
+                proc, calls = self._run(mode, {"GOOGLE_CHAT_ENABLED": "true"}, helper=helper)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout.splitlines(), ["SUMMARY"])
+                self.assertEqual(calls, "")
+                self.assertNotIn("command not found", proc.stderr)
+
+    def test_the_real_checklist_prints_from_a_file_that_names_no_topic(self):
+        """The real helper and the real Google Chat printer, under --dry-run,
+        from an install.env rendered off install.env.example (the topic
+        commented out): the checklist names the default topic and the DM link
+        the project number, and the summary follows it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            install_env = pathlib.Path(tmp) / "install.env"
+            install_env.write_text("PROJECT_ID=proj\nGOOGLE_CHAT_ENABLED=true\n")
+            proc, calls = self._run(
+                "full", {"GOOGLE_CHAT_ENABLED": "true", "NAMESPACE": "kubeagents-system"}, helper="",
+                install_env_file=str(install_env), env={"HOME": tmp, "TERM": "dumb"},
+            )
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Pub/Sub Topic Name:", out)
+        self.assertIn("projects/proj/topics/platform-agent-chat-events", out)
+        self.assertNotIn("topics/\x1b", out)
+        self.assertNotIn("is missing", out)
+        self.assertIn("https://chat.google.com/dm/123456", out)
+        self.assertLess(out.index("Pub/Sub Topic Name:"), out.index("SUMMARY"))
+        self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
+
+
+class UpgradeMakesTheInstallEnvPathAbsoluteTest(unittest.TestCase):
+    """#3615. The chat checklist's re-run command names the run's install.env,
+    for a paste from any directory, so a relative KUBE_AGENTS_INSTALL_ENV is
+    made absolute where upgrade.sh resolves it, as install.sh does; an
+    absolute one is left alone."""
+
+    def _resolve(self, pointer, cwd):
+        source = _UPGRADE_SH.read_text()
+        start = source.index('  install_env_file="$(resolve_install_env_file "$repo_dir" "$install_checkout")"\n')
+        block = source[start:source.index("  esac\n", start) + len("  esac\n")]
+        script = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            "set -Eeuo pipefail\n"
+            f"repo_dir={shlex.quote(cwd)}; install_checkout=''\n"
+            f"{block}"
+            'echo "FILE=[$install_env_file]"\n'
+        )
+        env = get_isolated_test_env({"KUBE_AGENTS_INSTALL_ENV": pointer})
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, cwd=cwd)
+
+    def test_a_relative_pointer_is_made_absolute_and_the_others_are_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = str(pathlib.Path(tmp).resolve())
+            for pointer, expected in (("prod/install.env", f"{cwd}/prod/install.env"),
+                                      ("/abs/install.env", "/abs/install.env")):
+                with self.subTest(pointer=pointer):
+                    proc = self._resolve(pointer, cwd)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(f"FILE=[{expected}]", proc.stdout)
+
+
 class DowngradeCheckTest(unittest.TestCase):
     """check_downgrade: a move that leaves behind a commit marked as a breaking
     change is refused, naming it, and completes when nothing it leaves is marked."""
@@ -3983,6 +4109,7 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, out)
         self.assertIn(f"{self._short('bang')} feat(operator)!: drop the old field", out)
         self.assertIn("--allow-breaking-downgrade", out)
+        self.assertIn("https://gke-labs.github.io/kube-agents/deploy/rollback/", out)
         self.assertNotIn("CONTINUED", out)
 
     def test_a_breaking_change_footer_is_refused_and_named(self):

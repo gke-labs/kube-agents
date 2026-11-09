@@ -2,6 +2,8 @@ module github.com/gke-labs/kube-agents/k8s-api-proxy
 
 go 1.27.0
 
+toolchain go1.27.3
+
 require (
 	github.com/prometheus/client_golang v1.25.0
 	go.opentelemetry.io/otel v1.47.0

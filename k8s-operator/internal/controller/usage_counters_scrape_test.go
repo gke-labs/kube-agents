@@ -1165,3 +1165,102 @@ func TestToolInvocationsVocabularyIsClosed(t *testing.T) {
 		}
 	}
 }
+
+// usageOriginsBody is the chat metrics listener's text exposition: the chat
+// counters' families and the start time, with the proposals ledger's rows
+// appended.
+func usageOriginsBody(rows ...string) string {
+	lines := []string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 9`,
+		"# TYPE kubeagents_chat_sessions_total counter",
+		`kubeagents_chat_sessions_total{platform="googlechat"} 2`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+	}
+	if len(rows) > 0 {
+		lines = append(lines, "# TYPE kubeagents_proposals_opened gauge")
+		lines = append(lines, rows...)
+	}
+	return strings.Join(append(lines, ""), "\n")
+}
+
+// usageOriginsRows is one ledger row per origin, chat split over two
+// platforms, every other origin under the empty platform, and a row for an
+// origin outside the nine, which resolves no field.
+var usageOriginsRows = []string{
+	`kubeagents_proposals_opened{origin="chat",platform="googlechat"} 4`,
+	`kubeagents_proposals_opened{origin="chat",platform="slack"} 3`,
+	`kubeagents_proposals_opened{origin="console",platform=""} 1`,
+	`kubeagents_proposals_opened{origin="robot",platform=""} 40`,
+	`kubeagents_proposals_opened{origin="api",platform=""} 0`,
+	`kubeagents_proposals_opened{origin="event",platform=""} 5`,
+	`kubeagents_proposals_opened{origin="drift",platform=""} 2`,
+	`kubeagents_proposals_opened{origin="audit",platform=""} 6`,
+	`kubeagents_proposals_opened{origin="scheduled",platform=""} 8`,
+	`kubeagents_proposals_opened{origin="issue",platform=""} 9`,
+	`kubeagents_proposals_opened{origin="other",platform=""} 10`,
+}
+
+// The chat listener's ledger series lands in the nine origin fields, chat
+// summed over its platforms, a zero as a zero, an unknown origin ignored, and
+// marks the origins reading present, with no age series. The chat counters
+// read beside it are the body's, as without it.
+func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) {
+	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsRows...))
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := map[string]int64{
+		"proposalsFromChat": 7, "proposalsFromConsole": 1, "proposalsFromApi": 0,
+		"proposalsFromEvent": 5, "proposalsFromDrift": 2, "proposalsFromAudit": 6,
+		"proposalsFromScheduled": 8, "proposalsFromIssue": 9, "proposalsFromOther": 10,
+	}
+	if len(reading.Readings) != len(want) {
+		t.Fatalf("readings = %v, want %v", reading.Readings, want)
+	}
+	for field, value := range want {
+		if got, ok := reading.Readings[field]; !ok || got != value {
+			t.Errorf("%s = %d (present %v), want %d", field, got, ok, value)
+		}
+	}
+	if !reading.ReadingsPresent[usageReadingOrigins] || len(reading.ReadingsPresent) != 1 {
+		t.Errorf("present = %v, want the origins reading alone", reading.ReadingsPresent)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 2 {
+		t.Errorf("chat samples = %v, want 9 messages and 2 sessions", reading.Samples)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
+		t.Errorf("start time = %v, want the listener's", reading.StartTime)
+	}
+}
+
+// The listener serves no ledger family before its first ledger read, and a
+// row per origin after; a body missing an origin, or without the family, is
+// no origins reading, and an origin outside the nine resolves no field.
+func TestPodUsageSource_AMissingOriginIsNotPresent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []string
+	}{
+		{"no ledger family", nil},
+		{"the other origin missing", usageOriginsRows[:len(usageOriginsRows)-1]},
+		{"the chat origin missing", usageOriginsRows[2:]},
+		{"an unknown origin in place of other", append(slices.Clone(usageOriginsRows[:len(usageOriginsRows)-1]), `kubeagents_proposals_opened{origin="robot",platform=""} 10`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if reading.ReadingsPresent[usageReadingOrigins] || len(reading.Readings) != 0 {
+				t.Errorf("present %v, readings %v; want no origins reading", reading.ReadingsPresent, reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
+	}
+}

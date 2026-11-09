@@ -157,6 +157,15 @@ _NO_TIME_WINDOW_REASON = (
 )
 # report_times_in_window, when a stated time matches no output it could read.
 _NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+# The Coverage row cell the capped check reads, as onboarding.parse_raw_coverage
+# keys it (the last column's header lowercased): the count of workloads an audit listed.
+COVERAGE_WORKLOADS_COLUMN = onboarding.COVERAGE_WORKLOADS_HEADER.lower()
+COVERAGE_IN_FULL_COLUMN = onboarding.COVERAGE_IN_FULL_HEADER.lower()
+# compose writes "yes" or "no — see Gaps" in that cell.
+COVERAGE_IN_FULL_YES = "yes"
+# A count is ASCII digits only; int() would also accept fullwidth digits and
+# other Unicode decimals.
+_DIGITS_RE = re.compile(r"[0-9]+")
 _UNSOURCED_WITH_GAPS_REASON = (
     "observation time(s) {times} match no tool output this check could read, but the read "
     "was not whole ({gaps}), so the output that shows them may be in the part it missed"
@@ -1520,6 +1529,10 @@ _BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|
 _ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
 _UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+# A ``[next: ...]`` step line (``slack_moments.NEXT_STEP_LINE``): plumbing the presenters draw
+# as a button and no surface shows as text, so the step lines that end a result are taken off
+# before it is measured, as ``slack_moments.visible_text`` takes them off.
+_STEP_LINE = re.compile(r"\[next:[^\]\n]*\]", re.IGNORECASE)
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -1532,6 +1545,15 @@ def _delivered_results(final_message: str) -> list[str]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
         results.append(final_message[header.end() : end].strip())
     return results
+
+
+def _visible(result: str) -> str:
+    """``result`` as chat shows it: every step-shaped line at its end taken off."""
+    lines = result.rstrip().split("\n")
+    end = len(lines)
+    while end and (not lines[end - 1].strip() or _STEP_LINE.fullmatch(lines[end - 1].strip())):
+        end -= 1
+    return "\n".join(lines[:end]).rstrip()
 
 
 def _unabbreviate(text: str) -> str:
@@ -1559,7 +1581,9 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    its text, bold and code markers not at all, and the ``[next: ...]`` step
+    lines that end the result not at all (the presenters draw them as a
+    button), and ``max_sentences`` sentences, a bullet counting as one and a
     soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
@@ -1593,6 +1617,7 @@ class AnswerFirstVerifier(BaseVerifier):
         """The result's defects, and its lead's normalized text (``""`` without one)."""
         defects = []
         lead_text = ""
+        result = _visible(result)
         lead = _BOLD_LEAD.match(result)
         if lead is None:
             defects.append("does not open with a bold sentence")
@@ -3783,10 +3808,16 @@ class BootstrapFanoutVerifier(BaseVerifier):
       carded set is in ``INVENTORY.raw.md`` on the shell sandbox as audited by the sweep
       itself: a Coverage row whose card is the sweep (or the hand-off's "the
       sweep audited it itself" gap line), not a row from a card of its own and
-      not the gap line for a fleet cluster no audit reported on. The cap's
-      risk is a cluster nobody audits, which reads as clean; this is the half
-      that catches it. It reads a second pod, so it is a requirement of its own
-      and a broken report does not hide behind, or get blamed on, the cards.
+      not the gap line for a fleet cluster no audit reported on, and the audit
+      reached the report: the row lists at least one workload, or the findings
+      block carries at least one line for the cluster on a row scanned in full
+      (a cluster whose kubectl reads failed still carries describe-level
+      findings). The cap's risk is a
+      cluster nobody audits, which reads as clean; this is the half that
+      catches it, and the second leg catches an audit the worker relayed empty
+      (a row saying 0 workloads under the sweep's card, #4115). It reads a
+      second pod, so it is a requirement of its own and a broken report does
+      not hide behind, or get blamed on, the cards.
 
     Fails closed: an unreadable pod, no sweep marker, a board that cannot be
     queried, a sweep card the board does not know, or an empty roster is
@@ -3967,18 +3998,39 @@ class BootstrapFanoutVerifier(BaseVerifier):
             return "fail", f"{where}: there is no {raw_file} on {pod}, so no cluster past the cap is shown audited", raw
         if read.get("rows") is None:
             return "fail", f"{where}: {raw_file} on {pod}: {read.get('error')}", raw
+        if read.get("findings_block") == onboarding.FINDINGS_BLOCK_CUT:
+            return "error", f"{where}: the read of {raw_file} stopped before its findings block ended", raw
         sweep_id = str((payload.get("sweep") or {}).get("id") or "")
         audited_by_line = {tuple(p) for p in read.get("sweep_audited") or []}
         unreported = {tuple(p) for p in read.get("unreported") or []}
+        finding_counts = {tuple(entry[:-1]): entry[-1] for entry in read.get("finding_counts") or []}
         problems = []
         for r in rest:
-            ident = (r.get("cluster"), r.get("project"))
-            label = f"{r['profile']} ({ident[0]} in {ident[1]})"
-            rows = [row for row in read["rows"] if (row.get("cluster"), row.get("project")) == ident]
+            # The triple is the identity: a cluster of one name in another
+            # location of the same project has its own rows and finding lines.
+            ident = onboarding.cluster_identity(r)
+            label = f"{r['profile']} ({ident[2]} in {ident[0]})"
+            rows = [row for row in read["rows"] if onboarding.cluster_identity(row) == ident]
+            sweep_rows = [row for row in rows if row.get("card") == sweep_id]
             if ident in unreported:
                 problems.append(f"{label} is listed in the fleet but no audit reported on it")
-            elif any(row.get("card") == sweep_id for row in rows) or ident in audited_by_line:
-                continue
+            elif sweep_rows or ident in audited_by_line:
+                # The cap's second risk: a row that says the sweep audited the
+                # cluster while nothing was read from it (an object the worker
+                # relayed empty). One workload listed or one finding line is
+                # the proof that the audit reached the report.
+                cells = [row.get(COVERAGE_WORKLOADS_COLUMN, "") for row in sweep_rows]
+                workloads = max((int(c) for c in cells if _DIGITS_RE.fullmatch(str(c))), default=0)
+                # A finding line proves the audit only on a row scanned in full: a
+                # cluster whose kubectl reads failed still carries describe-level
+                # findings, and its row says "no, see Gaps".
+                in_full = any(str(row.get(COVERAGE_IN_FULL_COLUMN, "")).strip().lower() == COVERAGE_IN_FULL_YES for row in sweep_rows)
+                findings = finding_counts.get(ident, 0) if in_full or not sweep_rows else 0
+                if workloads == 0 and findings == 0:
+                    problems.append(
+                        f"{label} is in the report as the sweep's with 0 workloads audited and no finding line "
+                        "on a row scanned in full, so nothing was read from it"
+                    )
             elif rows:
                 problems.append(f"{label} was audited on card(s) {[row.get('card') for row in rows]}, not by the sweep")
             else:
@@ -8437,14 +8489,16 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str) -> str:
+def report_store_command(audit: str, keys: tuple[str, ...] = ()) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
-    the envelope's ``status``, ``repo`` and ``finished_at``, and the ids of the
-    findings in its ``document`` (this run's own, never ids it only carried),
-    or the ``error`` that kept it unread. The rest stays in the pod.
+    the envelope's ``status``, ``repo`` and ``finished_at``, each further top-level
+    key named in ``keys`` (a ``required_envelope`` key; absent reads ``null``),
+    and the ids of the findings in its ``document`` (this run's own, never ids it
+    only carried), or the ``error`` that kept it unread. The rest stays in the pod.
     """
+    wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
 import glob, json, os
 out = []
@@ -8452,7 +8506,7 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
     try:
         with open(path, encoding="utf-8") as handle:
             envelope = json.load(handle)
-        entry = {{key: envelope.get(key) for key in ("status", "repo", "finished_at")}}
+        entry = {{key: envelope.get(key) for key in {wanted!r}}}
         findings = (envelope.get("document") or {{}}).get("findings") or []
         entry["finding_ids"] = [str(f.get("id", "")) for f in findings if isinstance(f, dict)]
         out.append(entry)
@@ -8463,11 +8517,28 @@ print({_REPORT_STORE_READ!r} + json.dumps(out))
     return f"python3 -c {shlex.quote(script)}"
 
 
+def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float) -> datetime | None:
+    """The ``fired_at`` a stack's arm recorded at ``path`` in the pod ``shell`` reaches, or None.
+
+    Missing file, not JSON, no ``fired_at``, or one that is not an aware
+    ISO-8601 stamp all read as None: the stack did not fire the run.
+    """
+    reply = shell(f"cat {shlex.quote(path)}", timeout)
+    try:
+        state = json.loads(reply.strip().splitlines()[-1])
+        fired = datetime.fromisoformat(str(state["fired_at"]))
+    except (IndexError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if fired.tzinfo is None:
+        return None
+    return fired
+
+
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float
+    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = ()
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit), timeout)
+    reply = shell(report_store_command(audit, keys), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -8486,10 +8557,15 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     store, in the shell sandbox first and then in the agent container: the
     store is on whichever pod ran the audit's shell. Passes when one envelope
     finished at or after the run started (``TranscriptSnapshot.started_at``
-    less ``max_clock_skew_sec``), has ``status`` when the check names one, and
-    has, for each ``required_finding_phrases`` entry, a finding in its
-    ``document`` whose id contains it. ``current_ids`` is not read: it also
-    carries ids a run held without finding them.
+    less ``max_clock_skew_sec``; or, with ``since_state_file``, at or after the
+    ``fired_at`` a case's stack recorded in that file in the agent container,
+    for a scheduled run the stack fired and waited out before the turn), has
+    ``status`` when the check names one, has
+    each ``required_envelope`` key equal to the value given (a top-level key of
+    the envelope, such as ``precheck``; a key the envelope lacks reads ``null``
+    and fails), and has, for each ``required_finding_phrases`` entry, a finding
+    in its ``document`` whose id contains it. ``current_ids`` is not read: it
+    also carries ids a run held without finding them.
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -8500,6 +8576,13 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     audit: AuditId
     status: AuditStatus | None = None
     required_finding_phrases: list[str] = Field(default_factory=list)
+    # Top-level envelope keys and the value each must hold on this run's envelope.
+    required_envelope: dict[str, Any] = Field(default_factory=dict)
+    # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
+    # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
+    # replaces the run's start as the lower bound, with no skew allowance: the
+    # fire and the envelope are stamped by the same pod. Unreadable is an error.
+    since_state_file: str | None = None
     # LedgerIssueContainsVerifier's tolerance, for its reason: the runner and
     # the agent pod are two clocks.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
@@ -8513,10 +8596,16 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         since = datetime.fromtimestamp(snap.started_at, tz=timezone.utc) - timedelta(
             seconds=self.max_clock_skew_sec
         )
+        if self.since_state_file:
+            fired = read_fired_at(onboarding.agent_shell, self.since_state_file, read_timeout)
+            if fired is None:
+                return "error", f"there is no fired run in {self.since_state_file}: the stack did not fire the audit", None
+            # No skew: the fire and the envelope are stamped by the same pod.
+            since = fired
         envelopes: list[dict[str, Any]] = []
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
-            listing = read_report_store(shell, self.audit, read_timeout)
+            listing = read_report_store(shell, self.audit, read_timeout, tuple(self.required_envelope))
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
@@ -8530,11 +8619,12 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 continue
             if finished.tzinfo is not None and finished >= since:
                 fresh.append(envelope)
-        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at")} for e in envelopes]}
+        raw = {"stored": [{k: e.get(k) for k in ("repo", "status", "finished_at", *self.required_envelope)} for e in envelopes]}
         if not fresh:
             return (
                 "fail",
-                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since the run started "
+                f"no {self.audit} report in {REPORT_STORE_ROOT} finished since "
+                f"{'the stack fired the audit' if self.since_state_file else 'the run started'} "
                 f"({len(envelopes)} older or unreadable)",
                 raw,
             )
@@ -8542,8 +8632,14 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         for envelope in fresh:
             ids = [str(fid) for fid in envelope.get("finding_ids") or []]
             missing = [p for p in self.required_finding_phrases if not any(p in fid for fid in ids)]
+            wrong = {key: envelope.get(key) for key, value in self.required_envelope.items() if envelope.get(key) != value}
             if self.status is not None and envelope.get("status") != self.status:
                 failures.append(f"{envelope.get('repo')}: status {envelope.get('status')!r}, not {self.status!r}")
+            elif wrong:
+                failures.append(
+                    f"{envelope.get('repo')}: "
+                    + ", ".join(f"{key} is {actual!r}, not {self.required_envelope[key]!r}" for key, actual in wrong.items())
+                )
             elif missing:
                 failures.append(f"{envelope.get('repo')}: no finding in its document has an id containing {missing}")
             else:

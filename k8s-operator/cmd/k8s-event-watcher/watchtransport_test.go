@@ -169,9 +169,9 @@ func eventsListerWatcher(list, watchWith kubernetes.Interface) cache.ListerWatch
 // twin) or one pooled client for both, as the watcher was before #4825. The
 // fake throttles the first request, the reflector syncs, the fake expires its
 // watch with a 410, and the reflector must stream the state again within 20 s.
-// Under -race on Go 1.27 the pooled client fails that a few times in a hundred:
-// the re-stream lands on the connection the stopped watch left a reader parked
-// on, and hangs until the connection closes.
+// Under -race on Go 1.27.0 or 1.27.1 (golang/go#81404) the pooled client fails
+// that a few times in a hundred: the re-stream lands on the connection the
+// stopped watch left a reader parked on, and hangs until the connection closes.
 func reflectorRecoversThroughBroker(t *testing.T, split bool) {
 	t.Helper()
 	s := fakeapiserver.Start(fakeapiserver.Options{Seed: 5, Sizes: fakeapiserver.Sizes{Nodes: 7, Pods: 23, Events: 61}})
@@ -216,10 +216,12 @@ func TestBrokerReflectorRecoversFromExpiry(t *testing.T) {
 }
 
 // The baseline the fix is measured against: one pooled client for list and
-// watch, as before #4825. Opt-in, because on Go 1.27 under -race it is expected
-// to fail a few runs in a hundred, and that failure is the point:
+// watch, as before #4825. Opt-in, because on Go 1.27.0 or 1.27.1 under -race it
+// is expected to fail a few runs in a hundred, and that failure is the point.
+// go.mod's toolchain line selects a Go with the fix, so the command names one
+// without it:
 //
-//	KUBE_AGENTS_REPRO_POOLED=1 go test -race -run TestBrokerReflectorPooledBaseline -count=200 ./cmd/k8s-event-watcher/
+//	GOTOOLCHAIN=go1.27.1 KUBE_AGENTS_REPRO_POOLED=1 go test -race -run TestBrokerReflectorPooledBaseline -count=200 ./cmd/k8s-event-watcher/
 func TestBrokerReflectorPooledBaseline(t *testing.T) {
 	if os.Getenv("KUBE_AGENTS_REPRO_POOLED") != "1" {
 		t.Skip("set KUBE_AGENTS_REPRO_POOLED=1 to run the pooled baseline")

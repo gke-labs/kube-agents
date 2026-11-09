@@ -52,6 +52,17 @@ const (
 	// (usageNewerFieldPeople).
 	usageExportPeopleSeen7d  = "peopleSeen7d"
 	usageExportPeopleSeen30d = "peopleSeen30d"
+	// The nine origin readings' field names, which share one pruning record
+	// (usageNewerFieldOrigins).
+	usageExportProposalsFromChat      = "proposalsFromChat"
+	usageExportProposalsFromConsole   = "proposalsFromConsole"
+	usageExportProposalsFromApi       = "proposalsFromApi"
+	usageExportProposalsFromEvent     = "proposalsFromEvent"
+	usageExportProposalsFromDrift     = "proposalsFromDrift"
+	usageExportProposalsFromAudit     = "proposalsFromAudit"
+	usageExportProposalsFromScheduled = "proposalsFromScheduled"
+	usageExportProposalsFromIssue     = "proposalsFromIssue"
+	usageExportProposalsFromOther     = "proposalsFromOther"
 	// usageCreatedTimeField is the one time sample that is not status.usage's:
 	// the CR's creation timestamp, so a rule can read an install's age before
 	// anyone has spoken to it. Published beside the phase, outside every hold.
@@ -122,6 +133,15 @@ var usageExportFields = []usageExportField{
 	usageGaugeField(usageExportProposalsMergedUntouched, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsMergedUntouched }),
 	usageGaugeField(usageExportPeopleSeen7d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen7d }),
 	usageGaugeField(usageExportPeopleSeen30d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen30d }),
+	usageGaugeField(usageExportProposalsFromChat, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromChat }),
+	usageGaugeField(usageExportProposalsFromConsole, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromConsole }),
+	usageGaugeField(usageExportProposalsFromApi, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromApi }),
+	usageGaugeField(usageExportProposalsFromEvent, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromEvent }),
+	usageGaugeField(usageExportProposalsFromDrift, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromDrift }),
+	usageGaugeField(usageExportProposalsFromAudit, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromAudit }),
+	usageGaugeField(usageExportProposalsFromScheduled, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromScheduled }),
+	usageGaugeField(usageExportProposalsFromIssue, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromIssue }),
+	usageGaugeField(usageExportProposalsFromOther, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsFromOther }),
 }
 
 type usageExportTimeField struct {
@@ -247,8 +267,8 @@ func usageExportFieldSet(extra []string) map[string]bool {
 
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
 // to the exported fields it covers: the cluster gauges share one record, the
-// six proposal readings another, the two people readings a third, and every
-// other record is named for its field.
+// six proposal readings another, the two people readings a third, the nine
+// origin readings a fourth, and every other record is named for its field.
 func usageExportFieldsOfRecord(record string) []string {
 	switch record {
 	case usageNewerFieldGauges:
@@ -260,6 +280,12 @@ func usageExportFieldsOfRecord(record string) []string {
 		}
 	case usageNewerFieldPeople:
 		return []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d}
+	case usageNewerFieldOrigins:
+		return []string{
+			usageExportProposalsFromChat, usageExportProposalsFromConsole, usageExportProposalsFromApi,
+			usageExportProposalsFromEvent, usageExportProposalsFromDrift, usageExportProposalsFromAudit,
+			usageExportProposalsFromScheduled, usageExportProposalsFromIssue, usageExportProposalsFromOther,
+		}
 	}
 	return []string{record}
 }

@@ -43,6 +43,15 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 		ProposalsMergedUntouched:        ptr.To(int64(0)),
 		PeopleSeen7d:                    ptr.To(int64(6)),
 		PeopleSeen30d:                   ptr.To(int64(8)),
+		ProposalsFromChat:               ptr.To(int64(7)),
+		ProposalsFromConsole:            ptr.To(int64(1)),
+		ProposalsFromApi:                ptr.To(int64(0)),
+		ProposalsFromEvent:              ptr.To(int64(5)),
+		ProposalsFromDrift:              ptr.To(int64(2)),
+		ProposalsFromAudit:              ptr.To(int64(6)),
+		ProposalsFromScheduled:          ptr.To(int64(8)),
+		ProposalsFromIssue:              ptr.To(int64(9)),
+		ProposalsFromOther:              ptr.To(int64(10)),
 		LastActiveTime:                  &metav1.Time{Time: usageClock(10)},
 	}
 	return agent
@@ -82,10 +91,10 @@ func TestUsageGauges_PointerRowsForTheSixReadings(t *testing.T) {
 	g.usage.Reset()
 	g.publishUsage(agent)
 	// One pointer row present: the counters' int rows always publish, the
-	// other nine pointer rows (two gauges, five readings, two people
-	// readings) publish nothing.
-	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-9 {
-		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-9)
+	// other eighteen pointer rows (two gauges, five readings, two people
+	// readings, nine origin readings) publish nothing.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-18 {
+		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-18)
 	}
 }
 
@@ -120,17 +129,69 @@ func TestUsageGauges_PointerRowsForTheTwoPeopleReadings(t *testing.T) {
 	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "peopleSeen30d")); got != 0 {
 		t.Errorf("peopleSeen30d = %v, want 0", got)
 	}
-	// Both people rows present, the other eight pointer rows absent.
-	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-8 {
-		t.Errorf("%d usage samples, want %d: a people reading at 0 is a sample", n, len(usageExportFields)-8)
+	// Both people rows present, the other seventeen pointer rows absent.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-17 {
+		t.Errorf("%d usage samples, want %d: a people reading at 0 is a sample", n, len(usageExportFields)-17)
 	}
 
 	g.usage.Reset()
 	agent.Status.Usage.PeopleSeen7d = nil
 	agent.Status.Usage.PeopleSeen30d = nil
 	g.publishUsage(agent)
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-19 {
+		t.Errorf("%d usage samples, want %d: an absent people reading has no sample", n, len(usageExportFields)-19)
+	}
+}
+
+// The nine origin readings are pointer rows under one pruning record of
+// their own: a reading at zero is a sample, an absent one publishes none.
+func TestUsageGauges_PointerRowsForTheNineOriginReadings(t *testing.T) {
+	origins := []string{
+		"proposalsFromChat", "proposalsFromConsole", "proposalsFromApi", "proposalsFromEvent", "proposalsFromDrift",
+		"proposalsFromAudit", "proposalsFromScheduled", "proposalsFromIssue", "proposalsFromOther",
+	}
+	if got := usageExportFieldsOfRecord(usageNewerFieldOrigins); !slices.Equal(got, origins) {
+		t.Fatalf("the origins record covers %v, want %v", got, origins)
+	}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range origins {
+		if f, ok := rows[name]; !ok || !f.pointer {
+			t.Errorf("%s: row %+v, want a pointer row", name, f)
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	for i, name := range origins {
+		*usageReadingStatusField(&agent.Status.Usage, name) = ptr.To(int64(i))
+	}
+	if usageBlockEmpty(&agent.Status.Usage) {
+		t.Error("a block holding the origin readings reads as empty")
+	}
+	g.publishUsage(agent)
+	for i, name := range origins {
+		if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", name)); got != float64(i) {
+			t.Errorf("%s = %v, want %d", name, got, i)
+		}
+	}
+	// The nine origin rows present, the other ten pointer rows absent.
 	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-10 {
-		t.Errorf("%d usage samples, want %d: an absent people reading has no sample", n, len(usageExportFields)-10)
+		t.Errorf("%d usage samples, want %d: an origin reading at 0 is a sample", n, len(usageExportFields)-10)
+	}
+
+	g.usage.Reset()
+	for _, name := range origins {
+		*usageReadingStatusField(&agent.Status.Usage, name) = nil
+	}
+	g.publishUsage(agent)
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-19 {
+		t.Errorf("%d usage samples, want %d: an absent origin reading has no sample", n, len(usageExportFields)-19)
 	}
 }
 

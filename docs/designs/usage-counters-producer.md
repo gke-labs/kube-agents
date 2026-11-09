@@ -1,6 +1,6 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema. [`human-interaction-readings.md`](human-interaction-readings.md) (Workstream 4 of the epic that produced the proposal readings) added `chatSessionsTotal`, the A2A gateway's `people` bucket and its `kubeagents_a2a_gateway_people_seen` series in its first pull request, and the operator's `people` reading (`peopleSeen7d`, `peopleSeen30d`) in its second. It also records how a maintainer reads these across installs, which the section of that name below carries. [`install-model-reading.md`](install-model-reading.md) (implemented 2026-11-02; Workstream 6 of the same epic) added `status.inference` (the install's provider and default model) beside this block, with an info gauge and a summary line. [`proposal-origin.md`](proposal-origin.md) (proposed; Workstream 3 of the same epic) would add nine `proposalsFrom<Origin>` readings beside `remediationsProposedTotal`, counted in the agent pod per trusted origin and read through the readings slot, with one summary line.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships. [`proposal-outcome-readings.md`](proposal-outcome-readings.md) replaced the event-counted `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` rows below on 2026-10-29: both fields are now readings the broker's sweep takes from the forge, outside the counter fold, and they no longer move `lastActiveTime`. The rows here point at that design, which owns them. The same change removed `remediationsAppliedTotal` from the schema. [`human-interaction-readings.md`](human-interaction-readings.md) (Workstream 4 of the epic that produced the proposal readings) added `chatSessionsTotal`, the A2A gateway's `people` bucket and its `kubeagents_a2a_gateway_people_seen` series in its first pull request, and the operator's `people` reading (`peopleSeen7d`, `peopleSeen30d`) in its second. It also records how a maintainer reads these across installs, which the section of that name below carries. [`install-model-reading.md`](install-model-reading.md) (implemented 2026-11-02; Workstream 6 of the same epic) added `status.inference` (the install's provider and default model) beside this block, with an info gauge and a summary line. [`proposal-origin.md`](proposal-origin.md) (implemented 2026-11-04; Workstream 3 of the same epic) added nine `proposalsFrom<Origin>` readings beside `remediationsProposedTotal`: the agent pod counts its proposals per trusted origin in a durable ledger, the chat plugin serves the ledger as `kubeagents_proposals_opened`, and the poller reads that gauge through the readings slot as the `origins` reading, with one summary line.
 
 ## Summary
 
@@ -12,10 +12,9 @@ event or tool call. All of those now have an in-cluster source, the watcher's pe
 serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 `kubeagents_broker_execution_failures_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` and `k8s_event_watcher_triage_sessions_total` on the gateway
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
-`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge on the `platform-agent` container, all for the
-managed-Prometheus collector. The poller this document describes does not read the
-`kubeagents_proposals_opened` gauge yet: the next pull request of
-[`proposal-origin.md`](proposal-origin.md) turns it into status readings (§2.3 there).
+`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
+managed-Prometheus collector. The poller reads the `kubeagents_proposals_opened` gauge into the nine
+`proposalsFrom<Origin>` readings, which [`proposal-origin.md`](proposal-origin.md) owns (§2.3 there).
 
 This document settles how the operator turns the other series into the status fields: a poller
 that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
@@ -27,7 +26,8 @@ status is behind. `toolExecutionsTotal`, `toolExecutionsBlockedTotal`, `eventsIn
 broker's version-control series, and `clustersRegistered` and `clustersMonitored` ride the same
 poll as gauges: the watcher's `k8s_event_watcher_cluster_up` series counted and projected as the
 latest reading, outside the ConfigMap. The six proposal readings ride the same poll on the gauges'
-terms, from the broker's body, with a miss streak per reading.
+terms, from the broker's body, with a miss streak per reading; the two people readings and the nine origin readings do the same
+from the A2A gateway's and the chat plugin's bodies.
 
 ## What was verified
 
@@ -600,7 +600,7 @@ the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
 The fields added after `status.usage`'s first schema, the two cluster gauges (one record between them),
-the six proposal readings (one record among them), the two people readings (one record between them), `topTools`, `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
+the six proposal readings (one record among them), the two people readings (one record between them), `topTools`, the nine origin readings (one record among them), `chatMessagesInboundTotal`, `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`, have a record each, in the poller, because a CRD at a previous
 schema prunes some or all of those and serves the first-schema counters (every CRD with
 `status.usage` has carried `remediationsProposedTotal` and `sessionsTotal`, so `sessionsTotal` shares the first three counters' treatment and has no record of its own; `chatSessionsTotal`, the chat half alone, arrived later and has its record, named for the field), the shared record would hold those back
 for the interval too, and one record for all the newer fields would hold the gauges back on the CRD

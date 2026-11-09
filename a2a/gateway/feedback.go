@@ -20,11 +20,12 @@ import (
 // The gateway marks the one message of a chain that is its answer
 // (OutMessage.Feedback, set by the relay where the DeliverableObserver is
 // handed the same result), and a backend that draws rating controls draws
-// them there; today that is Slack, with its own feedback buttons. A rating
-// from a sender the gateway would not take a turn from changes nothing.
+// them there: Slack with its feedback buttons, Google Chat with rating
+// buttons among the text message's accessory widgets (only its 👎 note box
+// is a card). A rating from a sender the gateway would not take a turn from
+// changes nothing.
 //
-// Each rating is counted (answer_feedback_total) and kept in the feedback
-// bucket: the ask that started the rated chain, the answer and the ids, and
+// Each rating is kept in the feedback bucket: the ask that started the rated chain, the answer and the ids, and
 // for a 👎 an optional note from the rater, and nothing else of the thread.
 // A rater has one rating per answer, so a 👍 after a 👎 replaces it (and its
 // note, which said what went wrong), and the reverse. The
@@ -34,8 +35,9 @@ import (
 // provision Job and the seed tooling can see its keys); an operator reads
 // it through the gateway binary (`/gateway feedback export`, feedback_export.go),
 // which writes each rating as a draft eval case: a 👎 as a case to fix, a
-// 👍 as a good answer to keep. Logs and the metric carry ids and the
-// rating, never the text.
+// 👍 as a good answer to keep. Logs carry ids and the rating, and the metric
+// the platform, the rating and what kind of answer was rated, one count per
+// rating change; neither carries the text.
 const (
 	// FeedbackUp and FeedbackDown are the two ratings, as the metric's
 	// rating label and the record carry them.
@@ -211,7 +213,7 @@ func (d *feedbackDesk) lockKey(key string) func() {
 // calls retryFeedback after the bind when it did not.
 func (g *Gateway) startFeedback(ctx context.Context) bool {
 	if g.cfg.AnswerFeedbackOff {
-		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback)")
+		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback or googleChat.answerFeedback)")
 		return true
 	}
 	return g.tryFeedback(ctx, false)
@@ -367,22 +369,19 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 			"backend", r.Backend, "author", r.Rater, "conversation", r.Conversation)
 		return false, errFeedbackUnverified
 	}
-	g.metrics.answerRated(r.Platform, r.Rating)
 	key := feedbackKey(r.TaskID, r.Rater)
 	// Locked before the deadline starts, so waiting on the rater's previous
 	// tap does not spend this one's budget.
 	defer d.lockKey(key)()
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
 	defer cancel()
-	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
-	if err != nil {
-		return false, fmt.Errorf("feedback bucket: %w", err)
-	}
 	// The ask is the human message that started the rated chain, as the
 	// session record holds it (TaskRef.Request, until AskTTL clears it),
 	// and the context id joins the rating to the stream's copy of the
 	// conversation; both best effort, since a reaped session has neither.
-	contextID, ask := "", ""
+	// The same root says what answered the ask, for the metric's answer
+	// label; without one it is other.
+	contextID, ask, answer := "", "", metricsLabelOther
 	if session, err := g.reg.Get(ctx, r.Conversation); err != nil {
 		g.log.Warn("answer feedback: the session record could not be read; the rating is kept without its ask", "conversation", r.Conversation, "err", err)
 	} else if session != nil {
@@ -390,7 +389,15 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 		if root, ok := session.TaskRefFor(r.TaskID); ok {
 			// As written, line breaks kept: a pasted manifest stays one.
 			ask = root.Request
+			answer = answerReply
+			if root.CardsAnswer {
+				answer = answerCard
+			}
 		}
+	}
+	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
+	if err != nil {
+		return false, fmt.Errorf("feedback bucket: %w", err)
 	}
 	rating := FeedbackDown
 	if r.Rating != FeedbackDown {
@@ -398,8 +405,9 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	}
 	// Merged, not replaced: a 👎 tapped again keeps the note already there.
 	// A 👍 drops it, since the note said what went wrong.
-	askKept := false
+	askKept, prior := false, ""
 	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) bool {
+		prior = rec.Rating
 		note := rec.Note
 		if rating != FeedbackDown {
 			note = ""
@@ -430,6 +438,12 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 		return true
 	}); err != nil {
 		return false, err
+	}
+	// Counted once the record is kept, and only when the rater's rating
+	// changed: a first rating, or a 👍 after a 👎 and the reverse. A repeat
+	// tap of the same rating, or a rating the bucket did not keep, is not.
+	if prior != rating {
+		g.metrics.answerRated(r.Platform, rating, answer)
 	}
 	g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
 		"conversation", r.Conversation, "kept", true)
