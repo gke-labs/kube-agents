@@ -28,6 +28,16 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
   promotion, which `finish` does on a scheduled run, never this skill. A pull
   request nobody asked for is a write on their repository they now have to
   triage.
+- **A fix that belongs in a repository this agent does not write.** When
+  reading the managed repository shows the value is defined somewhere else —
+  the chart a `HelmRelease` or `Application` installs, a Terraform module, a
+  tenant's own repository, a `context` repository — `SOUL.md` §3, item 8
+  applies: follow the reference read-only with **inspect-repository**, name
+  the repository, file and line in the reply with the change as a diff, and
+  open no pull request. Never stand in an edit here (an override, a
+  post-render patch, a second copy of the object) for the fix there. A
+  SOPS-encrypted file in the workspace is read for its metadata only: never
+  decrypt it, and never ask for or offer to wait for its key.
 - **Fixing a fleet-audit finding.** The bullets above match audit fixes too — a
   security patch, a policy update — which is exactly why this warning exists. If
   the change addresses a fleet-audit finding (it carries a finding id, or an

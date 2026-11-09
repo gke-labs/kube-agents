@@ -519,6 +519,22 @@ type SessionLookupSink interface {
 	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
+// SenderAdmission reports whether the gateway would take a turn from author
+// on backend: the same gate verifySender applies, read ahead of the hand-over
+// by an adapter that has to decide on its own goroutine whether to post
+// anything in the sender's conversation before the gateway has seen them
+// (the Google Chat adapter's line on a quote it could not read). It decides
+// nothing about the turn: verifySender still rules on every message.
+type SenderAdmission func(backend, author string) bool
+
+// SenderAdmissionSink is the optional extension an Adapter implements to
+// receive the gateway's SenderAdmission. Wired in New the way
+// SessionLookupSink is; an adapter without it posts nothing ahead of the
+// gateway.
+type SenderAdmissionSink interface {
+	SetSenderAdmission(admits SenderAdmission)
+}
+
 // ConversationState is one read's answer: the record as it stands, plus the
 // two gateway-wide facts a caller needs beside it.
 type ConversationState struct {

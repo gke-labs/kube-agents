@@ -56,6 +56,11 @@
 # obtainability check reads a gcsfuse volume's cache or sidecar limits; the gap
 # is item 3 of #2577.
 ./tasks/storage-gcsfuse-unbounded-cache-oom/task.yaml
+# Capability row: storage, CSI drivers and PVCs; the obtainability audit names a
+# one-replica Deployment under the default RollingUpdate strategy that mounts a
+# ReadWriteOnce claim (the planted single-writer-app and single-writer-data in
+# seeded-storage). A baseline: no gap declared.
+./tasks/storage-rwo-pvc-rollingupdate-multiattach-deadlock/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
 # Deployment whose HorizontalPodAutoscaler scales down with no stabilization
 # window and whose containers have no preStop hook (the planted web-api-server
