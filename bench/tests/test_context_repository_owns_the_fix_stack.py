@@ -148,9 +148,13 @@ class FakeHost:
             return 0, f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {NAMESPACE}\n", ""
         if verb == "apply":
             assert stdin
-            if stdin.startswith("apiVersion: v1\nkind: Namespace"):
+            docs = [doc for doc in yaml.safe_load_all(stdin) if doc]
+            if len(docs) == 1 and docs[0]["kind"] == "Namespace":
+                labels = (docs[0].get("metadata") or {}).get("labels") or {}
                 if self.namespace_labels is None:
-                    self.namespace_labels = {}
+                    self.namespace_labels = dict(labels)
+                else:
+                    self.namespace_labels.update(labels)
             else:
                 assert self.namespace_labels is not None, "the manifest went on before the namespace"
                 self.applied.append(stdin)
@@ -256,7 +260,12 @@ def test_the_plant_labels_the_namespace_before_the_workload_and_applies_the_live
     env = {e["name"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert "PAYMENTS_LEGACY_LEDGER_URL" in env
     verbs = [c[3] if c[3] != "-n" else c[5] for c in host.calls if c[0] == "kubectl"]
-    assert verbs.index("label") < verbs.index("rollout")
+    # One labelled manifest in one apply: no window between a create and a
+    # label in which a failure leaves a namespace the teardown may not delete.
+    assert "label" not in verbs
+    applies = [c for c in host.calls if c[0] == "kubectl" and c[3] == "apply"]
+    assert len(applies) == 2
+    assert verbs.index("apply") < verbs.index("rollout")
 
 
 def test_the_plant_registers_the_context_repository_with_its_ref_and_waits_for_both_mounts():
@@ -314,6 +323,48 @@ def test_an_entry_for_the_repository_with_another_ref_stops_the_plant_and_stays(
     assert stack.teardown()
     assert json.loads(host.configmap["context_repos"]) == [other_ref]
     assert github.writes == []
+
+
+def test_an_entry_with_more_fields_than_the_stack_writes_is_not_the_stacks():
+    # An administrator's entry that carries the stack's three fields and one
+    # more is neither adopted (the plant stops) nor removed (the teardown
+    # keeps it): the match is the whole entry.
+    annotated = {**CONTEXT_ENTRY, "note": "registered by hand"}
+    host = FakeHost(configmap={"context_repos": json.dumps([annotated])})
+    github = FakeGitHub()
+    stack = _stack(github, host)
+    with pytest.raises(RuntimeError, match="already names"):
+        stack.plant()
+    assert github.writes == []
+    assert stack.teardown()
+    assert json.loads(host.configmap["context_repos"]) == [annotated]
+    assert not any("patch" in c for c in host.calls)
+
+
+@pytest.mark.parametrize("spelling", [
+    CONTEXT_URL + ".git",
+    "github.com/gke-agentic/kube-agents-evals-platform-charts",
+    "gke-agentic/kube-agents-evals-platform-charts",
+    "https://www.github.com/GKE-Agentic/Kube-Agents-Evals-Platform-Charts/",
+    "git@github.com:gke-agentic/kube-agents-evals-platform-charts.git",
+])
+def test_every_spelling_of_the_repository_the_workspace_resolves_names_it(spelling):
+    # gitops_workspace resolves each of these to the same GitHub slug, so an
+    # entry in any of them is an entry for the repository: at another ref it
+    # stops the plant, and the stack never writes a second entry beside it.
+    other = {"type": "github", "url": spelling, "ref": "v0.4.2"}
+    host = FakeHost(configmap={"context_repos": json.dumps([other])})
+    github = FakeGitHub()
+    with pytest.raises(RuntimeError, match="already names"):
+        _stack(github, host).plant()
+    assert github.writes == []
+    assert json.loads(host.configmap["context_repos"]) == [other]
+
+
+def test_a_repository_that_only_extends_the_name_is_not_the_repository():
+    for spelling in (CONTEXT_URL + "-canary", "https://gitlab.com/gke-agentic/kube-agents-evals-platform-charts", "https://github.com/gke-agentic/kube-agents-evals-platform-charts/sub"):
+        entry = {"type": "github", "url": spelling, "ref": "main"}
+        assert not _stack(FakeGitHub(), FakeHost()).names_context_repository(entry), spelling
 
 
 def test_the_plant_refuses_a_fixture_directory_without_the_fixture(tmp_path):

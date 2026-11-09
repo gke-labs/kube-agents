@@ -60,9 +60,10 @@ Terraform skips the destroy provisioner of a resource whose create failed.
 
 teardown, each step independent of the others:
 
-1. Removes the stack's entry (the same type, URL and ref it writes) from
-   `context_repos`; an entry that names the repository with other fields
-   stops the plant and is never removed. The key goes when the list is then
+1. Removes the stack's entry (the whole entry it writes: type, URL, ref
+   and no other field) from `context_repos`; an entry that names the
+   repository in any spelling and is not that entry stops the plant and is
+   never removed. The key goes when the list is then
    empty, so the ConfigMap reads as it did before the plant.
 2. Deletes the `demo-shop` namespace when it carries the stack's label.
 3. Closes every open pull request that a `[bot]` login opened from a
@@ -131,6 +132,15 @@ STALE_CLOSED_LABEL = "audit:stale-closed"
 BOT_LOGIN_SUFFIX = "[bot]"
 GITHUB_API = "https://api.github.com"
 GITHUB_HOST = "https://github.com"
+# The spellings of GitHub's host the agent's repo_ref.GITHUB_HOSTS accepts, the
+# depth of a repository path (owner/name) and the suffix it drops, mirrored
+# here so an entry in any of those spellings is read as the same repository.
+GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+GITHUB_PATH_DEPTH = 2
+GIT_SUFFIX = ".git"
+# The namespace manifest the plant applies, labels included, in one apply.
+NAMESPACE_API_VERSION = "v1"
+NAMESPACE_KIND = "Namespace"
 HTTP_TIMEOUT_S = 30
 HTTP_OK = 200
 HTTP_CREATED = 201
@@ -281,6 +291,33 @@ def subprocess_run(argv: list[str], stdin: str | None = None) -> tuple[int, str,
 def is_ours(text: str) -> bool:
     """The file carries the stack's label, on a line of its own."""
     return any(line.strip() == f"{MANAGED_BY_KEY}: {MANAGED_BY}" for line in text.splitlines())
+
+
+def github_slug(value: object) -> str | None:
+    """`owner/name`, lowercased, for a GitHub repository in any spelling the
+    agent's `repo_ref.github_slug` accepts: an http(s)/ssh URL or scp remote on
+    a GitHub host, a schemeless host and path, or the bare `owner/name`, with
+    surrounding slashes and a trailing `.git` dropped. None for anything else
+    (another host, another depth), which is never the context repository.
+    """
+    text = str(value or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    if "@" in text.split("/", 1)[0]:
+        # `git@github.com:owner/name`, or a user in an authority.
+        user_and_host, _, rest = text.partition("@")
+        text = rest.replace(":", "/", 1) if ":" in rest.split("/", 1)[0] else rest
+    host, _, path = text.partition("/")
+    if host.lower() in GITHUB_HOSTS:
+        text = path
+    elif "." in host:
+        return None
+    segments = [segment for segment in text.strip("/").split("/") if segment]
+    if len(segments) != GITHUB_PATH_DEPTH:
+        return None
+    if segments[-1].lower().endswith(GIT_SUFFIX):
+        segments[-1] = segments[-1][: -len(GIT_SUFFIX)]
+    return "/".join(segments).lower()
 
 
 def planted_text(fixture_text: str, settings: Settings) -> str:
@@ -497,6 +534,21 @@ class Stack:
             shutil.rmtree(self._kubeconfig_dir, ignore_errors=True)
             self._kubeconfig_dir = None
 
+    def namespace_manifest(self) -> str:
+        """The namespace with the stack's labels, as one document."""
+        return json.dumps({
+            "apiVersion": NAMESPACE_API_VERSION,
+            "kind": NAMESPACE_KIND,
+            "metadata": {
+                "name": WORKLOAD_NAMESPACE,
+                "labels": {
+                    MANAGED_BY_KEY: MANAGED_BY,
+                    BUILD_ID_LABEL_KEY: self.settings.build_id,
+                    PULL_NUMBER_LABEL_KEY: self.settings.pull_number,
+                },
+            },
+        })
+
     def namespace_owner(self) -> str | None:
         """The namespace's managed-by label, "" when unlabelled, None when absent."""
         # --ignore-not-found: an absent namespace is an empty answer with exit
@@ -518,23 +570,13 @@ class Stack:
             code, _, err = self.kubectl("delete", "namespace", WORKLOAD_NAMESPACE, "--ignore-not-found", "--wait=true", f"--timeout={NAMESPACE_DELETE_WAIT_S}s")
             if code != 0:
                 raise RuntimeError(f"cannot clear the leftover {WORKLOAD_NAMESPACE} within {NAMESPACE_DELETE_WAIT_S}s: {err.strip()}")
-        # The namespace is created and labelled before the manifest goes on,
-        # so a manifest that half-applies still leaves a namespace the
-        # teardown may delete.
-        code, out, err = self.kubectl("create", "namespace", WORKLOAD_NAMESPACE, "--dry-run=client", "-o", "yaml")
-        if code != 0:
-            raise RuntimeError(f"cannot render namespace {WORKLOAD_NAMESPACE}: {err.strip()}")
-        code, _, err = self.kubectl("apply", "-f", "-", stdin=out)
+        # The namespace is created with its labels in one apply, before the
+        # manifest goes on: there is no moment at which it exists unlabelled,
+        # so a failure anywhere after this leaves a namespace the teardown
+        # may delete.
+        code, _, err = self.kubectl("apply", "-f", "-", stdin=self.namespace_manifest())
         if code != 0:
             raise RuntimeError(f"cannot create namespace {WORKLOAD_NAMESPACE}: {err.strip()}")
-        code, _, err = self.kubectl(
-            "label", "namespace", WORKLOAD_NAMESPACE, "--overwrite",
-            f"{MANAGED_BY_KEY}={MANAGED_BY}",
-            f"{BUILD_ID_LABEL_KEY}={self.settings.build_id}",
-            f"{PULL_NUMBER_LABEL_KEY}={self.settings.pull_number}",
-        )
-        if code != 0:
-            raise RuntimeError(f"cannot label namespace {WORKLOAD_NAMESPACE}: {err.strip()}")
         code, _, err = self.kubectl("apply", "-f", "-", stdin=self.fixture_file(FIXTURE_LIVE_MANIFEST))
         if code != 0:
             raise RuntimeError(f"cannot apply the live workload to {self.settings.cluster}: {err.strip()}")
@@ -574,12 +616,12 @@ class Stack:
         return entries
 
     def names_context_repository(self, entry: object) -> bool:
-        """The entry is for the context repository's URL, whatever else it says."""
-        return isinstance(entry, dict) and str(entry.get("url") or "").rstrip("/").lower() == self.settings.context_url.lower()
+        """The entry is for the context repository, in any spelling the workspace resolves to its slug."""
+        return isinstance(entry, dict) and github_slug(entry.get("url")) == github_slug(self.settings.context_url)
 
     def is_registration(self, entry: object) -> bool:
-        """The entry is the stack's: the same type, URL and ref it writes."""
-        return self.names_context_repository(entry) and {k: entry.get(k) for k in self.settings.context_entry} == self.settings.context_entry
+        """The entry is the stack's: the whole entry it writes, its three fields and no other."""
+        return entry == self.settings.context_entry
 
     def write_context_repos(self, entries: list | None) -> None:
         if entries is None:
