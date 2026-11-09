@@ -1040,11 +1040,16 @@ read has run for tens of seconds. The kubectl admission refuses such a read befo
 charges a `get` across the cluster (`-A`, or a cluster-scoped kind) the peak memory that
 [`kubectl-costs.json`](../../deploy/sandbox/kubectl-costs.json) lists for it. The table's key is
 `get <kinds> cluster <json|table>`; every output that decodes full objects, `-o name` included, is
-`json`, and only the table the API server builds is `table`. A command whose key is not listed is
-charged the sum of its kinds' entries (`get all`, `get po,svc`, `deployments.apps`), and the tier's
-`other` figure only when none of its kinds is listed. One namespace, named objects, other verbs,
-watches and `--raw` reads run unchanged: their cost does not grow with the fleet, and the guard
-bounds them.
+`json`, and only the table the API server builds is `table`. A `--sort-by` read is `json` too: the
+Table request then carries every object. A `describe` across the cluster is charged as the `json`
+read of its kinds, because it reads the list as `get` does before it describes each object. A
+command whose key is not listed is charged the sum of its kinds' entries (`get all`, `get po,svc`,
+`deployments.apps`); a `table` read of a kind with no `table` entry is charged the kind's `json`
+entry, its upper bound; and the tier's `other` figure applies only when none of its kinds is listed.
+One namespace, named objects, other verbs, watches and `--raw` reads run unchanged: their cost does
+not grow with the fleet, and the guard bounds them. `top pods -A` is the exception: it holds one
+metrics object per Pod and is left to the guard, so a stopped one exits 137 with no `capacity:`
+reason.
 
 Nothing is estimated at run time. The table is measured ahead of time by
 [`scripts/dev/profile_kubectl_costs.py`](../../scripts/dev/profile_kubectl_costs.py), which runs
@@ -1093,8 +1098,7 @@ The admission is advisory. A session can run `/usr/local/libexec/kubectl` direct
 directory is writable by every session user, so the guard is the boundary that holds either way. The
 admission reads the guard's memory figure and watermark from the guard's own module, so the two
 agree. When it cannot read them, or fails in any other way, it runs the command unchanged. A command
-that cannot take the lock waits in the kernel, 5 s at a time, inside the same 30 s, and is then
-refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
+that cannot take the lock waits for it in the kernel for up to 5 s, once, and is then refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
 timeout outgrew the shell.
 
 ### Running the sandbox under gVisor

@@ -84,6 +84,8 @@ WAITER_BYTES = 16 * MIB
 # Only verbs that decode objects take a slot. Local verbs read none, and a session holds a
 # stream (`exec`, `attach`, `logs -f`, `rollout status`, `wait`) open as long as it likes, so a
 # slot there would let a few open streams refuse every other session's reads.
+# The verbs whose list the cost table charges.
+LISTING_VERBS = ("get", "describe")
 SLOTTED_VERBS = ("get", "describe", "events", "top", "logs", "diff", "apply", "delete", "api-resources")
 FOLLOW_FLAGS = ("-f", "--follow")
 ADMIT_WAIT_SECONDS = 30.0
@@ -153,7 +155,9 @@ VALUE_FLAGS = {"-n", "--namespace", "--context", "--kubeconfig", "-l", "--select
                "--certificate-authority", "--client-certificate", "--client-key", "--tls-server-name",
                "--username", "--password", "-v", "--v", "--raw", "--subresource", "--timeout", "--cache-dir",
                "--profile", "--profile-output", "-f", "--filename", "-c", "--container", "-k", "--kustomize",
-               "--log-flush-frequency", "--vmodule", "--kuberc"}
+               "--log-flush-frequency", "--vmodule", "--kuberc", "--since", "--since-time", "--tail",
+               "--limit-bytes", "--max-log-requests", "--pod-running-timeout", "--grace-period", "--for",
+               "--field-manager", "--cascade", "--replicas", "--image", "--port", "--type"}
 SLOT_ALTERNATIVES = "Options: wait for the commands already running to finish and retry, or run fewer at once."
 ALTERNATIVES = ("Options: to count, ask the API server for one item and read the rest from its metadata: "
                 "`kubectl get --raw '{collection}?limit=1'` returns one item, and the total is that 1 plus "
@@ -209,6 +213,7 @@ def parse(argv: list[str]) -> dict:
         "raw": last("--raw") is not None,
         "watch": on("-w", "--watch", "--watch-only"),
         "files": last("-f", "--filename", "-k", "--kustomize") is not None,
+        "sort_by": last("--sort-by") or "",
         "help": on("-h", "--help"),
     }
 
@@ -231,8 +236,8 @@ def canonical(kind: str) -> str:
 
 
 def kinds_of(cmd: dict) -> list[str] | None:
-    """The canonical kinds a `get` lists, or None when the call is not a list."""
-    if cmd["verb"] != "get" or cmd["raw"] or cmd["watch"] or cmd["files"] or not cmd["args"]:
+    """The canonical kinds a `get` or a `describe` lists, or None when the call is not a list."""
+    if cmd["verb"] not in LISTING_VERBS or cmd["raw"] or cmd["watch"] or cmd["files"] or not cmd["args"]:
         return None
     out: list[str] = []
     for k in cmd["args"][0].split(","):
@@ -253,25 +258,38 @@ def scope_of(cmd: dict, kinds: list[str]) -> str:
     return NAMESPACE_SCOPE
 
 
+def full_objects(cmd: dict) -> bool:
+    """Whether kubectl holds every object: an object output, a `describe` (it reads the list as
+    `get` does, then describes each), or `--sort-by` (the Table request then carries each object)."""
+    return cmd["verb"] == "describe" or bool(cmd["sort_by"]) or heavy(cmd["output"])
+
+
 def command_key(cmd: dict) -> str | None:
-    """The cost table's key: `get <kinds> <cluster|namespace|object> <json|table>`, or None if not a list."""
+    """The cost table's key: `get <kinds> <cluster|namespace|object> <json|table>`, or None if not a list.
+    A `describe` is keyed as the `get` of the same kinds in full objects."""
     kinds = kinds_of(cmd)
     if not kinds:
         return None
-    return f"get {','.join(kinds)} {scope_of(cmd, kinds)} {'json' if heavy(cmd['output']) else 'table'}"
+    return f"get {','.join(kinds)} {scope_of(cmd, kinds)} {'json' if full_objects(cmd) else 'table'}"
 
 
 def cost(table: dict, tier: str, cmd: dict) -> tuple[int, bool]:
-    """(bytes, listed) for a list: its key's entry, else the sum of its kinds' entries, else `other`."""
+    """(bytes, listed) for a list: its key's entry, else the sum of its kinds' entries, else `other`.
+    A table read of a kind with no table entry is charged that kind's full-object entry, its
+    upper bound, rather than `other`."""
     column = table.get("tiers", {}).get(tier) or table.get("tiers", {}).get(DEFAULT_TIER, {})
     commands = column.get("commands", {})
     key = command_key(cmd)
-    entry = commands.get(key)
+    entry = commands.get(key) or commands.get(key.rsplit(" ", 1)[0] + " json")
     if entry is not None:
         return int(entry["peak_mib"]) * MIB, True
     kinds = kinds_of(cmd) or []
     suffix = " ".join(key.rsplit(" ", 2)[1:])  # scope and format
-    listed = sum(int(commands[f"get {k} {suffix}"]["peak_mib"]) for k in kinds if f"get {k} {suffix}" in commands)
+    scope = suffix.split(" ", 1)[0]
+    listed = 0
+    for k in kinds:
+        entry = commands.get(f"get {k} {suffix}") or commands.get(f"get {k} {scope} json")
+        listed += int(entry["peak_mib"]) if entry else 0
     if listed:
         return listed * MIB, True
     return int(column.get("other", {}).get("peak_mib", 0)) * MIB, False
@@ -418,7 +436,7 @@ def take_lock(lock) -> bool:
     """Wait for the ledger lock in the kernel, not by polling, for at most LOCK_WAIT_SECONDS.
 
     An alarm that lands after flock returns reads as a timeout; the caller closes the file,
-    which releases the lock, and tries again."""
+    which releases the lock, and refuses the command."""
     previous = signal.signal(signal.SIGALRM, _lock_timeout)
     try:
         try:
@@ -462,13 +480,17 @@ def refuse_flood(running: int, waiting: int, tier: str, key) -> int:
     return REFUSED_BUSY
 
 
+def unslotted(cmd: dict, argv: list[str]) -> bool:
+    """A command that takes no slot and no charge: a local verb, a watch, a stream, a help request."""
+    follows = cmd["verb"] == "logs" and any(a in FOLLOW_FLAGS or a.startswith("--follow=t") for a in argv)
+    return cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or cmd["help"] or follows
+
+
 def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> int:
     """Run the command if a slot is free and its charge fits, else refuse with a capacity reason."""
     cmd = parse(argv)
     used = guard.memory_in_use()
-    follows = cmd["verb"] == "logs" and any(a in FOLLOW_FLAGS or a.startswith("--follow=t") for a in argv)
-    if (cmd["verb"] not in SLOTTED_VERBS or cmd["watch"] or cmd["help"] or follows
-            or limit is None or used is None):
+    if unslotted(cmd, argv) or limit is None or used is None:
         pass_through(argv)
     kinds = kinds_of(cmd)
     charged = bool(kinds) and scope_of(cmd, kinds) == CLUSTER_SCOPE
@@ -483,7 +505,7 @@ def admit(argv: list[str], guard, table: dict, tier: str, limit: int | None) -> 
         if not listed:
             log({"event": "other", "tier": tier, "key": key})
         if need > cap and not cmd["selector"]:
-            sys.stderr.write(f"capacity: `kubectl get {cmd['args'][0]}` across this fleet is measured at about "
+            sys.stderr.write(f"capacity: `kubectl {cmd['verb']} {cmd['args'][0]}` across this fleet is measured at about "
                              f"{need // MIB} MiB, and the shell can give one read at most {cap // MIB} MiB; "
                              f"the install cannot take this read. {advice(cmd)}\n")
             log({"event": "refused-size", "tier": tier, "key": key, "need": need, "cap": cap})
@@ -565,6 +587,10 @@ def refuse_full(cmd, slots, slots_max, charged, need, free, reservations, tier, 
 
 def main(argv: list[str]) -> int:
     try:
+        # Decide a pass-through before loading the guard and the table: most calls are one.
+        cmd = parse(argv)
+        if unslotted(cmd, argv):
+            pass_through(argv)
         global GUARD
         guard = GUARD = load_guard()
         with open(COST_TABLE, encoding="utf-8") as f:

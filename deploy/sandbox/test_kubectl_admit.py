@@ -67,6 +67,11 @@ class KeyTest(unittest.TestCase):
             (("get", "pods", "-A", "--watch=false"), "get pods cluster table"),    # not a watch
             (("get", "pods", "-A=false", "-nteam"), "get pods namespace table"),   # glued -n, -A off
             (("get", "pods", "-Ao", "json"), "get pods cluster json"),             # a stacked shorthand
+            (("describe", "pods", "-A"), "get pods cluster json"),                 # describe holds every object
+            (("describe", "nodes"), "get nodes cluster json"),
+            (("describe", "pod", "x", "-n", "y"), "get pods object json"),          # one object: passes through
+            (("get", "pods", "-A", "--sort-by=.status.startTime"), "get pods cluster json"),  # carries each object
+            (("get", "pods", "-A", "--sort-by", ".metadata.name"), "get pods cluster json"),
             (("get", "pods", "-Aojson"), "get pods cluster json"),
             (("get", "pods", "-Ao", "wide"), "get pods cluster table"),
             (("get", "pods", "-Alapp=x", "-o", "json"), "get pods cluster json"),
@@ -84,7 +89,7 @@ class KeyTest(unittest.TestCase):
                          "get cronjobs,daemonsets,deployments,jobs,pods,replicasets,services,statefulsets cluster json")
 
     def test_non_lists_are_not_keyed(self):
-        for argv in [("logs", "x"), ("describe", "pod", "x"), ("get", "--raw", "/api/v1/pods"), ("get", "pods", "-w"),
+        for argv in [("logs", "x"), ("top", "pods", "-A"), ("get", "--raw", "/api/v1/pods"), ("get", "pods", "-w"),
                      ("get", "-k", "dir"), ("get", "-f", "x.yaml"), ("get",), ()]:
             with self.subTest(argv=argv):
                 self.assertIsNone(key(*argv))
@@ -113,6 +118,13 @@ class CostTest(unittest.TestCase):
         self.assertEqual(self.charge("fleet", "get", "po,svc", "-A", "-o", "json"), ((14307 + 101) * MIB, True))
         self.assertEqual(self.charge("fleet", "get", "pods.v1", "-A", "-o", "json"), (14307 * MIB, True))
 
+    def test_a_table_read_with_no_table_entry_is_charged_its_full_object_entry(self):
+        self.assertEqual(self.charge("fleet", "get", "rs", "-A"), (205 * MIB, True))
+        self.assertEqual(self.charge("fleet", "get", "rs,svc", "-A"), ((205 + 101) * MIB, True))
+
+    def test_logs_value_flags_take_their_values(self):
+        self.assertEqual(parsed("logs", "--since", "1h", "--tail", "50", "pod")["args"], ["pod"])
+
     def test_a_key_with_no_listed_kind_is_charged_other(self):
         self.assertEqual(self.charge("fleet", "get", "widgets.example.com", "-A", "-o", "json"), (256 * MIB, False))
 
@@ -129,6 +141,20 @@ class CostTest(unittest.TestCase):
                     self.assertTrue(name.startswith("get ") and " cluster " in name, name)  # only cluster reads are charged
                     self.assertGreater(entry["peak_mib"], 0)
                     self.assertEqual(key(*entry["example"].split()[1:]), name)  # the example keys to its entry
+                # Every kind with a full-object figure has a table charge below `other`.
+                for name in column["commands"]:
+                    verb, kinds, scope, fmt = name.split(" ")
+                    if fmt == "json" and scope == "cluster":
+                        need, listed = admit.cost(table, tier, parsed("get", kinds, "-A"))
+                        self.assertTrue(listed, name)
+
+    def test_the_table_is_measured_with_the_kubectl_the_image_pins(self):
+        dockerfile = Path(__file__).with_name("Dockerfile").read_text()
+        pin = next(l.split("=", 1)[1] for l in dockerfile.splitlines() if l.startswith("ARG KUBECTL_VERSION="))
+        for tier, column in json.loads(TABLE_PATH.read_text())["tiers"].items():
+            with self.subTest(tier=tier):
+                # A kubectl bump re-profiles every tier (.agents/skills/update-kubectl-cost-table).
+                self.assertTrue(column["kubectl"].startswith(f"v{pin} "), column["kubectl"])
 
 
 class CollectionTest(unittest.TestCase):
@@ -379,6 +405,16 @@ class LockTest(unittest.TestCase):
                 mock.patch.object(admit.fcntl, "flock", side_effect=lambda *_: admit._lock_timeout(0, None)):
             self.assertFalse(admit.take_lock(held))
         self.assertIs(admit.signal.getsignal(admit.signal.SIGALRM), before)
+
+
+class FastPathTest(unittest.TestCase):
+    def test_an_unslotted_command_passes_through_before_the_guard_or_the_table_loads(self):
+        for argv in (["version"], ["config", "view"], ["logs", "-f", "x"], ["get", "pods", "-w"]):
+            with self.subTest(argv=argv), \
+                    mock.patch.object(admit, "load_guard", side_effect=AssertionError("loaded the guard")), \
+                    mock.patch.object(admit, "pass_through", side_effect=SystemExit("pass_through")):
+                with self.assertRaisesRegex(SystemExit, "pass_through"):
+                    admit.main(argv)
 
 
 class PassThroughTest(unittest.TestCase):

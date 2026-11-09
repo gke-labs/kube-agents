@@ -794,7 +794,8 @@ fi
 # session user can book and release its own reservations and nobody else's.
 tier="${KUBEAGENTS_KUBECTL_COST_TIER:-$SANDBOX_KUBECTL_COST_TIER_DEFAULT}"
 case "$tier" in
-  [a-z]*) case "$tier" in *[!a-z0-9-]*) tier="$SANDBOX_KUBECTL_COST_TIER_DEFAULT" ;; esac ;;
+  # Character classes, not ranges: in some locales [a-z] also matches capitals.
+  [[:lower:]]*) case "$tier" in *[![:lower:][:digit:]-]*) tier="$SANDBOX_KUBECTL_COST_TIER_DEFAULT" ;; esac ;;
   *) tier="$SANDBOX_KUBECTL_COST_TIER_DEFAULT" ;;
 esac
 printf '%s\n' "$tier" >"$SANDBOX_KUBECTL_COST_TIER_FILE"

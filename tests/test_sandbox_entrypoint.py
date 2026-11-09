@@ -30,6 +30,7 @@ import pathlib
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -811,3 +812,54 @@ class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SandboxEntrypointKubectlAdmissionTest(unittest.TestCase):
+    """The block that writes the kubectl admission's inputs and state, lifted out of the shipped
+    entrypoint and run with its /run paths pointed at a temporary directory. It sits past the
+    authorized_keys step the harness above stops at."""
+
+    START = 'tier="${KUBEAGENTS_KUBECTL_COST_TIER:-$SANDBOX_KUBECTL_COST_TIER_DEFAULT}"'
+    END = "done"
+
+    def _block(self) -> str:
+        lines = _ENTRYPOINT.read_text().splitlines()
+        start = lines.index(self.START)
+        end = next(i for i in range(start, len(lines)) if lines[i] == self.END)
+        return "\n".join(lines[start : end + 1])
+
+    def _run_block(self, env: dict[str, str]) -> pathlib.Path:
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        prelude = (
+            f'SANDBOX_KUBECTL_COST_TIER_FILE="{tmp}/kubectl-cost-tier"\n'
+            f'SANDBOX_MEMORY_LIMIT_FILE="{tmp}/memory-limit-bytes"\n'
+            f'SANDBOX_KUBECTL_ADMISSION_DIR="{tmp}/kubectl-admission"\n'
+            'SANDBOX_KUBECTL_COST_TIER_DEFAULT="default"\n'
+        )
+        clean = {k: v for k, v in os.environ.items() if k not in ("KUBEAGENTS_KUBECTL_COST_TIER", "SANDBOX_MEMORY_LIMIT_BYTES")}
+        subprocess.run(["bash", "-euc", prelude + self._block()], env={**clean, **env}, check=True, timeout=30)
+        return tmp
+
+    def test_the_tier_file_holds_a_valid_word_and_an_invalid_one_falls_back_to_default(self) -> None:
+        for given, written in (("fleet", "fleet"), ("", "default"), ("Fleet", "default"), ("a b", "default"),
+                               ("../x", "default"), ("fleet-2", "fleet-2")):
+            with self.subTest(given=given):
+                tmp = self._run_block({"KUBEAGENTS_KUBECTL_COST_TIER": given})
+                self.assertEqual((tmp / "kubectl-cost-tier").read_text(), f"{written}\n")
+
+    def test_the_limit_file_holds_digits_only(self) -> None:
+        for given, written in (("2147483648", "2147483648\n"), ("", ""), ("2Gi", "")):
+            with self.subTest(given=given):
+                tmp = self._run_block({"SANDBOX_MEMORY_LIMIT_BYTES": given})
+                self.assertEqual((tmp / "memory-limit-bytes").read_text(), written)
+
+    def test_the_state_directories_are_sticky_and_world_writable_and_the_state_files_shared(self) -> None:
+        tmp = self._run_block({})
+        state = tmp / "kubectl-admission"
+        for directory in (state, state / "reservations", state / "slots", state / "waiting"):
+            with self.subTest(directory=directory.name):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o1777)
+        for name in ("ledger.lock", "events.log"):
+            with self.subTest(file=name):
+                self.assertEqual(stat.S_IMODE((state / name).stat().st_mode), 0o666)
