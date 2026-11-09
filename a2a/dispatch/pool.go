@@ -69,7 +69,7 @@ func (p *PodPool) Pods(profile, tier string) []string {
 		if !ok || pod.Labels[lib.ProfileNameLabel] != profile || pod.Labels[lib.ProfileTierLabel] != tier {
 			continue
 		}
-		if pod.DeletionTimestamp == nil && podReady(pod) && lib.ValidSubjectToken(pod.Name) {
+		if pod.DeletionTimestamp == nil && podReady(pod) && lib.ValidSubjectToken(pod.Name) && !jobPod(pod) {
 			out = append(out, pod.Name)
 		}
 	}
@@ -91,6 +91,21 @@ func (p *PodPool) PodUID(profile, tier, pod string) string {
 		return ""
 	}
 	return string(po.UID)
+}
+
+// jobPod reports whether p is a Job's pod. A dispatcher Job's pod carries
+// the warm pool's labels, but it is one task's, offered only by runJob: the
+// pool never offers it another, even once Job mode is revoked under it.
+func jobPod(p *corev1.Pod) bool {
+	if _, ok := p.Labels[jobNameLabel]; ok {
+		return true
+	}
+	for _, o := range p.OwnerReferences {
+		if o.Kind == "Job" {
+			return true
+		}
+	}
+	return false
 }
 
 func podReady(p *corev1.Pod) bool {

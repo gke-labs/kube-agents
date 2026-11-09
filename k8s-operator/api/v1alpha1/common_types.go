@@ -818,18 +818,22 @@ type StallWatchSpec struct {
 	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
 
 	// Kinds replaces the watch's default list of resources to scan (Deployments,
-	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
-	// cert-manager Certificates). Each item is a kubectl resource name such as
-	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
-	// scans every namespaced kind the cluster serves, one read per kind per
-	// namespace, which is slow on a large fleet. Absent or empty keeps the
-	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes,
+	// cert-manager Certificates, and `*.cnrm.cloud.google.com`, every Config
+	// Connector kind the cluster serves). Each item is a kubectl resource name
+	// such as `deployments` or `gateways.gateway.networking.k8s.io`, or a group
+	// wildcard `*.<suffix>` for every namespaced kind whose API group ends in
+	// the suffix; the watch reads a wildcard's kinds only in the namespaces
+	// where it found their objects. The single item `all` scans every
+	// namespaced kind the cluster serves, one read per kind per namespace,
+	// which is slow on a large fleet. Absent or empty keeps the default list.
+	// Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
 	// ControllerRevisions and Leases are refused: the scan reports nothing from
 	// them, and a Secret listing would carry every body.
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=20
 	// +kubebuilder:validation:items:MaxLength=253
-	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\*(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$`
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
 	// +optional
@@ -1118,10 +1122,11 @@ type AgentLimits struct {
 	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
 
 	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-	// a run that does cannot even produce a closing summary. Repository exploration is
-	// the main consumer, so size this against how much the agent has to read, not
-	// against how complex the request is.
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+	// kanban worker that does ends with its closing summary saved on its card for the
+	// retry, not with the result it was asked for. Repository exploration is the main
+	// consumer, so size this against how much the agent has to read, not against how
+	// complex the request is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -1291,6 +1296,8 @@ type DeploymentSpec struct {
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+	// condition False with reason ScaledToZero; clearing it restores the normal phases.
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 
@@ -2565,7 +2572,9 @@ type NetworkPolicyStatus struct {
 
 // AgentStatus defines the observed state of an agent.
 type AgentStatus struct {
-	// Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed).
+	// Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+	// Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+	// Ready condition then reads False with reason ScaledToZero.
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
@@ -2950,8 +2959,10 @@ type AgentUsageStatus struct {
 	// the nine origin fields usually sum to at most RemediationsProposedTotal.
 	// A reading, not an accumulation: the ledger survives a restart and the
 	// plugin reads it whole; a read that fails after the plugin's first success
-	// keeps serving the last counts, so a stale count reads as current until
-	// the plugin restarts. A 0 is a reading. Absent until the first
+	// keeps serving the last counts, and the poller reads a read age past two
+	// poll intervals as no reading, so a stale count clears two polls after
+	// that, about twenty minutes after the ledger stops answering. A 0 is a
+	// reading. Absent until the first
 	// reading, after two polls in a row without one, and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.

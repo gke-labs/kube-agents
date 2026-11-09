@@ -278,7 +278,7 @@ resource "null_resource" "load_bearing_change" {
       while :; do
         reasons="$(kubectl get pods -n "${local.ns}" \
           -o jsonpath='{range .items[*]}{.status.containerStatuses[*].state.waiting.reason}{"\n"}{end}' 2>/dev/null || true)"
-        if printf '%s\n' "$reasons" | grep -qxF 'CreateContainerConfigError'; then
+        if grep -qxF 'CreateContainerConfigError' <<<"$reasons"; then
           break
         fi
         if [ "$elapsed" -ge ${local.failure_observe_timeout} ]; then
@@ -320,7 +320,7 @@ resource "null_resource" "load_bearing_change" {
       # missing kubelet event when nothing about the kubelet was read.
       event_messages="$(kubectl get events -n "${local.ns}" \
         -o jsonpath='{range .items[*]}{.message}{"\n"}{end}')"
-      if ! printf '%s\n' "$event_messages" | grep -qi 'runasnonroot'; then
+      if ! grep -qi 'runasnonroot' <<<"$event_messages"; then
         echo "ERROR: no event in ${local.ns} mentions runAsNonRoot, so the kubelet did not report the reason it refused the container and the richest evidence this scenario offers is missing. Events follow." >&2
         kubectl get events -n "${local.ns}" --sort-by=.metadata.creationTimestamp >&2 || true
         exit 1
@@ -358,8 +358,8 @@ resource "null_resource" "load_bearing_change" {
         # Either signal will do, and they arrive in either order: the non-zero
         # exit is recorded the moment the container dies, the back-off reason
         # only once the kubelet declines to restart it immediately.
-        if printf '%s\n' "$waiting" | grep -qxF 'CrashLoopBackOff' \
-          || printf '%s\n' "$exits" | grep -qE '^[1-9][0-9]*$'; then
+        if grep -qxF 'CrashLoopBackOff' <<<"$waiting" \
+          || grep -qE '^[1-9][0-9]*$' <<<"$exits"; then
           break
         fi
         if [ "$elapsed" -ge ${local.crashloop_observe_timeout} ]; then
@@ -411,7 +411,7 @@ resource "null_resource" "load_bearing_change" {
       managers="$(kubectl get deployment "${local.workload}" -n "${local.ns}" \
         -o jsonpath='{range .metadata.managedFields[*]}{.manager}{"\n"}{end}')"
       for expected in "${var.gitops_field_manager}" "${var.drift_field_manager}"; do
-        if ! printf '%s\n' "$managers" | grep -qxF "$expected"; then
+        if ! grep -qxF "$expected" <<<"$managers"; then
           echo "ERROR: ${local.workload} does not record field manager '$expected' after the plant, so the ownership the drift record claims is not on the live object. Managers found:" >&2
           printf '%s\n' "$managers" >&2
           exit 1
@@ -440,7 +440,7 @@ resource "null_resource" "load_bearing_change" {
       revisions="$(kubectl get replicasets -n "${local.ns}" \
         -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.template.spec.securityContext.runAsNonRoot}{"|"}{.spec.template.spec.securityContext.runAsUser}{"\n"}{end}')"
 
-      if ! printf '%s\n' "$revisions" | grep -qE '\|true\|$'; then
+      if ! grep -qE '\|true\|$' <<<"$revisions"; then
         echo "ERROR: no ReplicaSet in ${local.ns} carries runAsNonRoot: true with no runAsUser, so the rollout history holds no record of what git declares and the only evidence left is the events, which expire. revisionHistoryLimit may have been lowered, or step 1 did not cut a ReplicaSet of its own. Revisions found:" >&2
         printf '%s\n' "$revisions" >&2
         exit 1
@@ -450,7 +450,7 @@ resource "null_resource" "load_bearing_change" {
       # false binary: without this revision on the board, a reader proposing
       # runAsUser 1000 is proposing something untried and arguably better than
       # either option the card offers (#3102).
-      if ! printf '%s\n' "$revisions" | grep -qF '|true|1000'; then
+      if ! grep -qF '|true|1000' <<<"$revisions"; then
         echo "ERROR: no ReplicaSet in ${local.ns} carries runAsNonRoot: true with runAsUser: 1000, so the rollout history does not show the non-root repair having been tried, and an agent proposing it is proposing something this scenario has not ruled out. Revisions found:" >&2
         printf '%s\n' "$revisions" >&2
         exit 1

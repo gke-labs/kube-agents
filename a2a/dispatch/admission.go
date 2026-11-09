@@ -58,12 +58,30 @@ var errStopped = errors.New("stopped before it started")
 // or a half-open one trying the oldest held task first).
 var errHeldBack = errors.New("held back at admission")
 
-// admit runs the admission checks in order, cheapest first: the tier, the
-// queue age, the parameters, then the verifier. A nil refusal admits, and
-// then cluster is the cluster the verifier permitted the task on (nil when
-// the task names none and was checked against the namespace): the target a
-// task credential for the credential proxy confines it to (#3889). An error
-// is no verdict (errStopping, or a verifier that could not be reached,
+// noRunner reports whether a task of prof's at tier has nothing to run on,
+// so admission refuses it at once rather than leave it queued until its
+// queue timeout: an unattended tier without Job mode for the profile (no
+// JobRunner, or no Job template, which the operator renders only where the
+// chart installed the Job admission policy) and with no pod in the tier's
+// pool, which the operator builds for the read tier only. A pool that hasn't
+// listed its pods yet says nothing, so a dispatcher just started refuses
+// nothing on it.
+func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
+	if !d.cfg.unattended(tier) || (d.jobs != nil && len(prof.JobTemplate) > 0) {
+		return false
+	}
+	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
+		return false
+	}
+	return len(d.pool.Pods(prof.Name, tier)) == 0
+}
+
+// admit runs the admission checks in order, cheapest first: the tier, a runner
+// for it, the queue age, the parameters, then the verifier. A nil refusal
+// admits, and then cluster is the cluster the verifier permitted the task on
+// (nil when the task names none and was checked against the namespace): the
+// target a task credential for the credential proxy confines it to (#3889). An
+// error is no verdict (errStopping, or a verifier that could not be reached,
 // ErrVerifierUnreachable), and the submission is not refused for it. The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
@@ -74,6 +92,9 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	tier := hk.tier
 	if !allowsTier(prof, tier) {
 		return nil, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+	}
+	if d.noRunner(prof, tier) {
+		return nil, &refusal{ReasonNoWorker, fmt.Sprintf("no runner for %s on this install: Job mode is off for profile %s, and no %s worker pool serves it", tier, prof.Name, tier)}, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
