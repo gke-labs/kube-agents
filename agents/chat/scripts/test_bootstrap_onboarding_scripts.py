@@ -2226,6 +2226,38 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists(), "filed")
         self.assertNotEqual(marker.read_text(encoding="utf-8"), "dead\n", "the marker is this run's")
 
+    def test_a_marker_whose_write_fails_is_taken_back(self):
+        """A marker created but never written would hold every later run for STALE_CLAIM_SECONDS and make a
+        human's claim in that window read as a stale one of this path's."""
+        broken = mock.MagicMock()
+        broken.__enter__.return_value.write.side_effect = OSError("no space")
+        with mock.patch.object(bootstrap_delivery.os, "fdopen", return_value=broken):
+            self.assertFalse(bootstrap_delivery._mark_claiming(self.d))
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+
+    def test_a_filed_record_that_does_not_land_keeps_the_report_and_the_claim(self):
+        """The issue is open but nothing on disk says so: archiving the report would leave the next run
+        nothing to read, so the issue is never found again and day seven retires a filed report."""
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.object(bootstrap_delivery, "_record_filed", return_value=False):
+            self.assertEqual(self._main(), 0)
+        self.assertIn("issue-create", [c[0] for c in self.forge_calls])
+        self.assertTrue((self.d / INVENTORY).exists(), "the report stays for the next run")
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+        self.assertTrue((self.d / COMPLETED).exists(), "the claim stays until the stale rule releases it")
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self.runs, [], "no home line until the filing is on record")
+
+    def test_a_retire_record_that_does_not_land_keeps_the_report_and_the_claim(self):
+        self._filed(8 * self.DAY)
+        with mock.patch.object(bootstrap_delivery, "_record_retired", return_value=False):
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+
     def test_a_stale_no_human_claim_is_counted_in_its_own_record(self):
         self._filed(self.DAY + self.HOUR)
         (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()

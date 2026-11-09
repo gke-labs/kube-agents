@@ -581,6 +581,10 @@ REPORT_RETIRED_NOTE = (
     "the scheduled audits stand in for it"
 )
 REPORT_FILED_NOTE = "the first-run report went to {ref}: no chat thread took it"
+REPORT_RECORD_FAILED_NOTE = (
+    "the first-run report went to {ref}, but its record could not be written; the report stays until a later"
+    " run records the filing"
+)
 REPORT_UNLABELLED_NOTE = (
     "the first-run report issue {ref} carries no " + REPORT_ISSUE_LABEL + " label (the repository refused it); "
     "the issue resolver will not skip it"
@@ -742,8 +746,18 @@ def _mark_claiming(data_dir: Path) -> bool:
         except OSError as e:
             sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
             return False
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(f"{time.time()}\n")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{time.time()}\n")
+        except OSError as e:
+            # The marker exists but its write failed: take it back, or it holds every later run for
+            # STALE_CLAIM_SECONDS and makes a human's claim in that window read as a stale one of ours.
+            sys.stderr.write(f"bootstrap_delivery: could not write the claim's path marker, not claiming: {e}\n")
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            return False
         return True
     return False
 
@@ -2004,7 +2018,10 @@ def _filed_record(data_dir: Path) -> dict:
     return record if isinstance(record, dict) else {}
 
 
-def _record_filed(data_dir: Path, repo: str, number: int, url: str) -> None:
+def _record_filed(data_dir: Path, repo: str, number: int, url: str) -> bool:
+    """True once the record is on disk. Without it the caller must leave the report where it is:
+    ``delivery_settled`` waits for this record, the stale-claim rule then releases the claim, and the
+    next run finds the issue already open only by reading the report again."""
     target = data_dir / REPORT_FILED_FILE
     tmp = target.with_name(target.name + ".tmp")
     try:
@@ -2016,6 +2033,18 @@ def _record_filed(data_dir: Path, repo: str, number: int, url: str) -> None:
         tmp.replace(target)
     except OSError as e:
         sys.stderr.write(f"bootstrap_delivery: could not record the filed report: {e}\n")
+        return False
+    return True
+
+
+def _record_retired(data_dir: Path) -> bool:
+    """True once the retire is on disk; same contract as ``_record_filed``."""
+    try:
+        (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the retire: {e}\n")
+        return False
+    return True
 
 
 def _utc(stamp: float) -> str:
@@ -2164,10 +2193,10 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
         # thread takes the report, late as it is.
         _release_claim(data_dir)
         return 0
-    try:
-        (data_dir / REPORT_RETIRED_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not record the retire: {e}\n")
+    if not _record_retired(data_dir):
+        # Same as a filed record that did not land: the report stays, the stale-claim rule releases
+        # the claim, and the next run retires it with its record.
+        return 0
     _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // SECONDS_PER_DAY))
     _cleanup(data_dir, in_sandbox)
     return 0
@@ -2255,7 +2284,12 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
         _release_claim(data_dir)
         return 0
     ref = f"{repo}#{number}"
-    _record_filed(data_dir, repo, number, url)
+    if not _record_filed(data_dir, repo, number, url):
+        # The issue is open but nothing on disk says so: keep the report and the claim. The stale-claim
+        # rule releases the claim, and the next run reads the report, finds the issue by its sweep
+        # marker, records it and posts the home line once.
+        _stage_note(data_dir, REPORT_RECORD_FAILED_NOTE.format(ref=ref))
+        return 0
     _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
     if not _issue_labelled(labels):
         _stage_note(data_dir, REPORT_UNLABELLED_NOTE.format(ref=ref))
