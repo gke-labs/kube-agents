@@ -46,7 +46,6 @@ _QUANTITY_SUFFIX_BYTES = {"Mi": _MEBIBYTE, "Gi": 1024 * _MEBIBYTE}
 # and the chart's by tests/test_credential_proxy_sizing_parity.py).
 _BROKER_MEBIBYTE_TERMS = (
     "BROKER_RESIDENT_RESERVE_BYTES",
-    "CONTENT_WORKSPACE_RESERVE_BYTES",
     "REQUEST_CHILD_MEMORY_RESERVE_BYTES",
 )
 _BROKER_COUNT_TERMS = ("OUTPUT_COPIES_PER_COMMAND",)
@@ -86,11 +85,11 @@ def broker_terms() -> dict[str, int]:
 
 def requests_the_budget_admits(limit_bytes: int) -> int:
     """`requests_the_budget_admits` as the broker computes it for a slot-taking
-    request at the operator's output cap: the limit less the two fixed reserves,
+    request at the operator's output cap: the limit less the resident reserve,
     over one request's child reserve plus its output allowance."""
     terms = broker_terms()
     output_cap = int(_declared(_OPERATOR_OUTPUT_CAP_RE, _OPERATOR_MANIFESTS).group(1))
-    budget = limit_bytes - terms["BROKER_RESIDENT_RESERVE_BYTES"] - terms["CONTENT_WORKSPACE_RESERVE_BYTES"]
+    budget = limit_bytes - terms["BROKER_RESIDENT_RESERVE_BYTES"]
     per_request = terms["REQUEST_CHILD_MEMORY_RESERVE_BYTES"] + terms["OUTPUT_COPIES_PER_COMMAND"] * output_cap
     return max(0, budget // per_request)
 

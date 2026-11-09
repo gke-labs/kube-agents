@@ -9,7 +9,7 @@ than that only queues the rest at the broker, where a check still waiting at its
 admitted count, read from `GET /v1/exec/admission`, rather than a constant.
 
 The count differs by install. At the operator's default 2Gi limit the budget
-fits 9 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
+fits 10 and the slot cap of 8 binds. On GKE Autopilot without bursting the limit
 is the memory request, 2Gi by default, so the same holds; an override with a
 smaller request fits fewer. Only the broker sees the effective limit, so only
 the broker can say.

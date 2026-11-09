@@ -192,6 +192,29 @@ class NextOccurrenceTest(unittest.TestCase):
     def test_bad_expression_is_none(self):
         self.assertIsNone(cip.next_occurrence("not cron", NOW, inclusive=False))
 
+    def test_walks_the_wall_clock_across_a_dst_change(self):
+        # Hermes walks the naive wall clock and puts the zone back; a
+        # zone-aware croniter start keeps Saturday's offset into Sunday.
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo("America/New_York")
+        spring = datetime(2026, 3, 7, 14, 25, 30, tzinfo=timezone.utc)  # Sat 09:25:30 EST
+        self.assertEqual(
+            cip.next_occurrence("20 6 * * *", spring, inclusive=False, zone=zone),
+            datetime(2026, 3, 8, 10, 20, tzinfo=timezone.utc),  # 06:20 EDT
+        )
+        autumn = datetime(2026, 10, 31, 13, 25, 30, tzinfo=timezone.utc)  # Sat 09:25:30 EDT
+        self.assertEqual(
+            cip.next_occurrence("20 6 * * *", autumn, inclusive=False, zone=zone),
+            datetime(2026, 11, 1, 11, 20, tzinfo=timezone.utc),  # 06:20 EST
+        )
+        # The hour the clocks skip has no instant: a 02:30 slot on the spring
+        # day resolves to the first instant after it rather than to nothing.
+        self.assertEqual(
+            cip.next_occurrence("30 2 * * *", spring, inclusive=False, zone=zone),
+            datetime(2026, 3, 8, 7, 30, tzinfo=timezone.utc),
+        )
+
 
 class ActiveInstallTest(PolicyCase):
     def test_active_install_is_left_alone(self):

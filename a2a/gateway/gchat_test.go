@@ -1260,9 +1260,17 @@ func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
 // (2026-09-09), and legacy-dm-button-click.json from the one in
 // bhoekstra-gkedemos (2026-10-30), scrubbed only of identity fields and the
 // one-time redirect token; field set, key order and every other byte are as
-// Chat published them. addon-dm-button-click.json is the exception: a click
-// composed in the add-on layout from Google's documented shape, since the
-// measured app delivers clicks in the legacy layout.
+// Chat published them. Two are composed rather than captured:
+// addon-dm-button-click.json, a click in the add-on layout from Google's
+// documented shape, since the measured app delivers clicks in the legacy
+// layout; and addon-dm-quoted-reply.json, addon-dm-plain.json with the
+// quotedMessageMetadata the Chat API documents on a message forwarded into
+// the DM from a space (name, lastUpdateTime, quoteType FORWARD, the
+// quotedMessageSnapshot and forwardedMetadata). legacy-dm-quoted-reply.json
+// is captured, not composed: a quote-in-reply of one of the app's own DM
+// posts from the one in bhoekstra-gkedemos (2026-11-08), which Chat
+// published in the legacy layout with quoteType REPLY and the snapshot's
+// sender and text, no formattedText.
 func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))
