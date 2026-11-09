@@ -1087,14 +1087,16 @@ class CatchUpPolicyThroughMainTest(ThroughMainCase):
         code, out = self.run_main()
         self.assertEqual(code, 0)
         self.assertIn("skipped the catch-up of compliance-audit: 3 occurrence(s) missed since 2026-08-03T06:20:00+00:00, 2d 3h overdue on a 1d period; next run 2026-08-06T06:20:00+00:00", out)
-        self.assertIn("skipped the catch-up of ai-security-audit", out)
+        # Its newest slot, today's 08:50, came inside Hermes' grace: that run
+        # stays and fires on this tick; the two before it are the skip.
+        self.assertIn("skipped the catch-up of ai-security-audit: 2 occurrence(s) missed since 2026-08-03T08:50:00+00:00, 2d overdue on a 1d period; next run 2026-08-05T08:50:00+00:00", out)
         self.assertIn("deferred the catch-up of fleet-wide-cost-analysis to 2026-08-05T09:55:30+00:00 (1 occurrence(s) missed since 2026-08-03T07:50:00+00:00); held at 2026-08-10T07:50:00+00:00 until then", out)
         # The tick spawned for what is still due: the oldest weekly and the script.
-        self.assertIn("ticked 2 due job(s) — security-patch-orchestrator, stall-watch", out)
+        self.assertIn("ticked 3 due job(s) — ai-security-audit, security-patch-orchestrator, stall-watch", out)
         self.assertEqual(len(self.invocations()), 1)
         jobs = self.jobs()
         self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-06T06:20:00+00:00")
-        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-06T08:50:00+00:00")
+        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-05T08:50:00+00:00")
         self.assertEqual(jobs["security-patch-orchestrator"]["next_run_at"], "2026-08-03T07:20:00+00:00")
         self.assertEqual(jobs["fleet-wide-cost-analysis"]["next_run_at"], "2026-08-10T07:50:00+00:00")
         state = json.loads((self.platform / "cron" / ccp.STATE_FILE_NAME).read_text())
@@ -1107,6 +1109,7 @@ class CatchUpPolicyThroughMainTest(ThroughMainCase):
         jobs = self.jobs()
         jobs["security-patch-orchestrator"]["next_run_at"] = "2026-08-10T07:20:00+00:00"
         jobs["stall-watch"]["next_run_at"] = "2026-08-05T10:00:00+00:00"
+        jobs["ai-security-audit"]["next_run_at"] = "2026-08-06T08:50:00+00:00"
         self.write(*jobs.values())
 
         self.now = self.RESUME + timedelta(minutes=29)

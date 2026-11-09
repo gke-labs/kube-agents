@@ -21,7 +21,10 @@ scans the store:
   run it would do now is the run tomorrow's slot does anyway. ``next_run_at``
   moves to the job's next slot after now and a ``skipped`` row with reason
   :data:`SKIP_REASON_STALE` goes into the job's history, since Hermes never
-  sees the occurrence and so never writes its own.
+  sees the occurrence and so never writes its own. One slot is not skipped:
+  the newest, when it came inside Hermes' grace. That run is on time, not a
+  catch-up (the same job with only that slot missed would fire), so the slot
+  stays and Hermes fires it on this tick; the older ones are the skip.
 * **space** the catch-ups that remain, the ones inside their period. The
   oldest miss fires on this tick as Hermes has it; each later one is held
   back a further :data:`DEFAULT_STAGGER_MINUTES`, about the spacing the
@@ -63,7 +66,7 @@ import json
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 from cron_idle_policy import (
@@ -165,6 +168,16 @@ def period_after(job: dict, stale: datetime, zone: tzinfo) -> timedelta | None:
     return _interval(job)
 
 
+def _wall_clock_slot(expr: str, base: datetime, zone: tzinfo, *, forward: bool) -> datetime:
+    """One croniter step from ``base`` on the zone's naive wall clock, with the
+    zone put back on the result, as :func:`next_occurrence` walks it."""
+    from croniter import croniter
+
+    steps = croniter(expr, base.astimezone(zone).replace(tzinfo=None))
+    wall = steps.get_next(datetime) if forward else steps.get_prev(datetime)
+    return wall.replace(tzinfo=zone).astimezone(timezone.utc)
+
+
 def missed_occurrences(job: dict, stale: datetime, now: datetime, zone: tzinfo) -> int:
     """How many of the job's slots fell in ``[stale, now]``: the stale one
     and every one after it that has also passed."""
@@ -174,18 +187,34 @@ def missed_occurrences(job: dict, stale: datetime, now: datetime, zone: tzinfo) 
     expr = _cron_expr(job)
     if expr is None:
         return 1
-    from croniter import croniter
-
     try:
-        steps = croniter(expr, stale.astimezone(zone))
         count = 1
+        cursor = stale
         while count < MISSED_COUNT_CAP:
-            if steps.get_next(datetime) > now:
+            cursor = _wall_clock_slot(expr, cursor, zone, forward=True)
+            if cursor > now:
                 break
             count += 1
         return count
     except Exception:
         return 1
+
+
+def newest_slot(job: dict, stale: datetime, now: datetime, zone: tzinfo) -> datetime | None:
+    """The job's latest slot at or before ``now``; None when it cannot be read."""
+    period = _interval(job)
+    if period is not None:
+        try:
+            return stale + period * int((now - stale) // period)
+        except OverflowError:
+            return None
+    expr = _cron_expr(job)
+    if expr is None:
+        return None
+    try:
+        return _wall_clock_slot(expr, now + timedelta(seconds=1), zone, forward=False)
+    except Exception:
+        return None
 
 
 def _stamp(when: datetime, zone: tzinfo) -> str:
@@ -395,12 +424,19 @@ def _apply_locked(
         if target is None or target <= now:
             continue  # nowhere to put it; Hermes fires it as before
         stale_text = str(job["next_run_at"])
-        target_text = _stamp(target, zone)
         missed = missed_occurrences(job, stale, now, zone)
-        how = f"{missed} occurrence(s) missed since {stale_text}"
         if overdue >= period:
+            # The newest slot may have come inside Hermes' grace: that run is
+            # on time, not a catch-up, so it stays and fires on this tick;
+            # only the slots before it are skipped.
+            newest = newest_slot(job, stale, now, zone)
+            if newest is not None and stale < newest <= now and now - newest <= grace_for(period):
+                target = newest
+                missed -= 1
+            how = f"{missed} occurrence(s) missed since {stale_text}"
             why = f"{how}, {_fmt(overdue)} overdue on a {_fmt(period)} period"
         else:
+            how = f"{missed} occurrence(s) missed since {stale_text}"
             try:
                 release_at = now + step * fired
             except OverflowError:  # a step past the calendar's end: no turn to wait for
@@ -409,6 +445,7 @@ def _apply_locked(
             if release_at == now:
                 continue  # the oldest miss fires on this tick, as Hermes has it
             if release_at < target:
+                target_text = _stamp(target, zone)
                 job["next_run_at"] = target_text
                 deferred[job_id] = {
                     "next_run_at": target_text,
@@ -422,6 +459,7 @@ def _apply_locked(
                 )
                 continue
             why = f"{how}, a catch-up {_fmt(release_at - now)} later would run at or after its next slot"
+        target_text = _stamp(target, zone)
         job["next_run_at"] = target_text
         changed = True
         lines.append(f"{label}: skipped the catch-up of {job_id}: {why}; next run {target_text}")

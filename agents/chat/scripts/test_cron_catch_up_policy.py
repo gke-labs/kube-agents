@@ -251,7 +251,9 @@ class TwoDayPauseTest(PolicyCase):
         # Two days late on a daily schedule: the next slot is tomorrow's.
         self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-06T06:20:00+00:00")
         self.assertEqual(jobs["obtainability-audit"]["next_run_at"], "2026-08-06T06:20:00+00:00")
-        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-06T08:50:00+00:00")
+        # Its newest slot, today's 08:50, came 35 minutes ago, inside Hermes'
+        # grace: that run is on time and stays; the two before it are the skip.
+        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-05T08:50:00+00:00")
         # Monday's weekly audit, two days late on a seven-day period: the one
         # catch-up on this roster, left for Hermes to fire now.
         self.assertEqual(jobs["security-patch-orchestrator"]["next_run_at"], "2026-08-03T07:20:00+00:00")
@@ -266,8 +268,8 @@ class TwoDayPauseTest(PolicyCase):
                 "2026-08-03T06:20:00+00:00, 2d 3h overdue on a 1d period; next run 2026-08-06T06:20:00+00:00",
                 "platform: skipped the catch-up of obtainability-audit: 3 occurrence(s) missed since "
                 "2026-08-03T06:20:00+00:00, 2d 3h overdue on a 1d period; next run 2026-08-06T06:20:00+00:00",
-                "platform: skipped the catch-up of ai-security-audit: 3 occurrence(s) missed since "
-                "2026-08-03T08:50:00+00:00, 2d overdue on a 1d period; next run 2026-08-06T08:50:00+00:00",
+                "platform: skipped the catch-up of ai-security-audit: 2 occurrence(s) missed since "
+                "2026-08-03T08:50:00+00:00, 2d overdue on a 1d period; next run 2026-08-05T08:50:00+00:00",
                 "platform: skipped the catch-up of github-issue-resolver: 97 occurrence(s) missed since "
                 "2026-08-03T09:00:00+00:00, 2d overdue on a 30m period; next run 2026-08-05T09:30:00+00:00",
             ],
@@ -294,6 +296,26 @@ class TwoDayPauseTest(PolicyCase):
         self.assertEqual(compliance["scheduled_instant"], "2026-08-03T06:20:00+00:00")
         self.assertIn("3 occurrence(s) missed", compliance["error"])
         self.assertIn("next run 2026-08-06T06:20:00+00:00", compliance["error"])
+
+    def test_the_newest_slot_inside_grace_fires(self):
+        # One day stale on a daily schedule. At 06:20:30 today's slot is thirty
+        # seconds old: Hermes alone would fire it on time, so the policy
+        # leaves it as the slot and skips only yesterday's.
+        stale = datetime(2026, 8, 4, 6, 20, tzinfo=timezone.utc)
+        for now, expect_next, expect_missed in (
+            (datetime(2026, 8, 5, 6, 20, 30, tzinfo=timezone.utc), "2026-08-05T06:20:00+00:00", 1),
+            (datetime(2026, 8, 5, 7, 0, tzinfo=timezone.utc), "2026-08-05T06:20:00+00:00", 1),
+            # Past the two-hour grace the newest slot is a catch-up too.
+            (datetime(2026, 8, 5, 8, 21, tzinfo=timezone.utc), "2026-08-06T06:20:00+00:00", 2),
+        ):
+            self.make_ledger(migrated=True)
+            self.write(prompt_job("compliance-audit", "20 6 * * *", stale))
+            lines = self.run_policy(now=now)
+            self.assertEqual(self.next_run("compliance-audit"), expect_next, now)
+            self.assertIn(f"skipped the catch-up of compliance-audit: {expect_missed} occurrence(s) missed since 2026-08-04T06:20:00+00:00", lines[0])
+            self.assertIn(f"next run {expect_next}", lines[0])
+            rows = self.ledger_rows()
+            self.assertEqual([(r["job_id"], r["scheduled_instant"]) for r in rows], [("compliance-audit", iso(stale))], now)
 
     def test_the_next_tick_finds_nothing_to_do(self):
         self.write(*self.roster())
@@ -566,9 +588,14 @@ class ExemptionsTest(PolicyCase):
         last = NOW - timedelta(days=2)
         self.write(interval_job("two-hourly", 120, last + timedelta(hours=2), last))
         lines = self.run_policy()
-        self.assertIn("skipped the catch-up of two-hourly: 24 occurrence(s) missed", lines[0])
-        # Hermes anchors an interval on last_run_at: the first multiple of the
-        # period past now.
+        # The newest slot is now itself, inside grace: it stays and fires; the
+        # 23 before it are the skip.
+        self.assertIn("skipped the catch-up of two-hourly: 23 occurrence(s) missed", lines[0])
+        self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(hours=48)))
+        # A tick past the grace moves it to the first multiple of the period
+        # past now, as Hermes anchors an interval on last_run_at.
+        self.write(interval_job("two-hourly", 120, last + timedelta(hours=2), last))
+        self.run_policy(now=NOW + timedelta(minutes=61))
         self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(hours=50)))
 
     def test_turning_the_policy_off_releases_what_it_deferred(self):
@@ -645,11 +672,46 @@ class ZoneTest(PolicyCase):
         self.run_policy(now=now)
         self.assertEqual(self.next_run("compliance-audit"), iso(stale))
         self.assertEqual(self.next_run("obtainability-audit"), "2026-08-06T06:20:00-04:00")
-        self.assertEqual(self.next_run("stockout-prevention"), "2026-08-06T09:20:00-04:00")
+        self.assertEqual(self.next_run("stockout-prevention"), "2026-08-05T09:20:00-04:00")
         self.assertEqual(self.state()["deferred"]["obtainability-audit"]["next_run_at"], "2026-08-06T06:20:00-04:00")
         # The history keys the missed slot in UTC, as Hermes does.
         rows = self.ledger_rows()
         self.assertEqual([(r["job_id"], r["scheduled_instant"]) for r in rows], [("stockout-prevention", "2026-08-03T13:20:00+00:00")])
+
+
+class DaylightSavingTest(PolicyCase):
+    """Slots are walked on the zone's wall clock, as Hermes walks them: a
+    zone-aware croniter start keeps its offset across a DST change and lands
+    an hour off the lattice Hermes writes, which Hermes then re-anchors as an
+    expression edit without firing."""
+
+    def test_a_skip_across_the_spring_change_lands_on_hermes_slot(self):
+        (self.profile / "config.yaml").write_text("timezone: America/New_York\n", encoding="utf-8")
+        # Two days stale on Saturday 2026-03-07 09:25:30 EST; clocks go forward on the 8th.
+        stale = datetime(2026, 3, 5, 11, 20, tzinfo=timezone.utc)  # 06:20 EST
+        now = datetime(2026, 3, 7, 14, 25, 30, tzinfo=timezone.utc)
+        self.write(prompt_job("compliance-audit", "20 6 * * *", stale))
+        lines = self.run_policy(now=now)
+        self.assertEqual(self.next_run("compliance-audit"), "2026-03-08T06:20:00-04:00")
+        self.assertIn("3 occurrence(s) missed", lines[0])
+
+    def test_a_skip_across_the_autumn_change_lands_on_hermes_slot(self):
+        (self.profile / "config.yaml").write_text("timezone: America/New_York\n", encoding="utf-8")
+        # Saturday 2026-10-31 09:25:30 EDT; clocks go back on 11-01.
+        stale = datetime(2026, 10, 29, 10, 20, tzinfo=timezone.utc)  # 06:20 EDT
+        now = datetime(2026, 10, 31, 13, 25, 30, tzinfo=timezone.utc)
+        self.write(prompt_job("compliance-audit", "20 6 * * *", stale))
+        self.run_policy(now=now)
+        self.assertEqual(self.next_run("compliance-audit"), "2026-11-01T06:20:00-05:00")
+
+    def test_a_hold_across_the_spring_change_lands_on_hermes_slot(self):
+        (self.profile / "config.yaml").write_text("timezone: America/New_York\n", encoding="utf-8")
+        now = datetime(2026, 3, 7, 14, 25, 30, tzinfo=timezone.utc)
+        today = datetime(2026, 3, 7, 11, 20, tzinfo=timezone.utc)  # 06:20 EST, three hours ago
+        self.write(prompt_job("compliance-audit", "20 6 * * *", today), prompt_job("obtainability-audit", "20 6 * * *", today))
+        self.run_policy(now=now)
+        self.assertEqual(self.next_run("compliance-audit"), iso(today))
+        self.assertEqual(self.next_run("obtainability-audit"), "2026-03-08T06:20:00-04:00")
 
 
 class CroniterMissingTest(PolicyCase):
