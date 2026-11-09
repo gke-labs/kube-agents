@@ -1284,11 +1284,37 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                 preset=ca_refusal_preset,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            ca_first_prompt = f"PROMPT: PEM CA file that signed the instance's certificate default=[{ca}]"
+            ca_first_prompt = f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]"
             ca_second_prompt = "PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[]"
             self.assertIn(ca_first_prompt, proc.stdout)
             self.assertIn(ca_second_prompt, proc.stdout)
             self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=2 READS=4 SECRET=[]", proc.stdout)
+            # An operator-named Secret exported alongside a CA file is restored
+            # if a subsequent attempt clears the default and is refused again.
+            operator_ca_preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="my-ca"\n'
+            )
+            proc = self._ask_gitops_forge(
+                ["2", "2", "2"],
+                ["https://ghe.example.com", "", "https://ghe.example.com", "", "ghe.example.com", str(ca)],
+                preset=operator_ca_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=3 READS=6 SECRET=[my-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # Typing github.com at option 2 drops an exported CA file and Secret name
+            # even when the CA prompt default accepted the exported file.
+            proc = self._ask_gitops_forge(
+                ["2"],
+                ["github.com", ""],
+                preset=ca_refusal_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DECLINED=false FORGE=github HOST=[] CA=[] MENUS=1 READS=2 SECRET=[]", proc.stdout)
             # On a first install with GITOPS_HOST exported and --gitops-ca-file
             # given, the early flag check derives the CA Secret's name before
             # the menu. No repository drops the name with the file: nothing
@@ -1354,7 +1380,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc = self._ask_gitops_forge(["2"], ["", ""], preset=preset)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(
-                f"PROMPT: PEM CA file that signed the instance's certificate default=[{ca}]",
+                f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]",
                 proc.stdout,
             )
             self.assertIn(
@@ -1363,7 +1389,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                 proc.stdout + proc.stderr,
             )
             # When only GITOPS_HOST is exported (no CA file), the CA prompt has an
-            # empty default and "(empty if a public CA signed it)". Enter clears CA and secret.
+            # empty default and "(empty if a public CA signed it)". Enter leaves CA and Secret empty.
             host_only_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\n'
             proc = self._ask_gitops_forge(["2"], ["", ""], preset=host_only_preset)
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1380,6 +1406,10 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             operator_secret_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_SECRET="operator-ca-secret"\n'
             proc = self._ask_gitops_forge(["2"], ["", ""], preset=operator_secret_preset)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "PROMPT: PEM CA file that signed the instance's certificate (empty keeps Secret 'operator-ca-secret'; a path replaces it) default=[]",
+                proc.stdout,
+            )
             self.assertIn(
                 "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[operator-ca-secret]",
                 proc.stdout,
