@@ -2,6 +2,8 @@ module github.com/gke-labs/kube-agents/a2a
 
 go 1.27.0
 
+toolchain go1.27.3
+
 require (
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/nats-io/jwt/v2 v2.8.2

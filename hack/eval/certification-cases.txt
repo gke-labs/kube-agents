@@ -24,6 +24,12 @@
 # pull request.
 
 # part 1
+# Capability row: networking fabric, load balancers and Gateway; the
+# obtainability audit on an HTTPRoute whose Service maps to a numeric targetPort
+# no backing container declares or serves (the planted backend-api-svc in
+# seeded-networking, route unattached, no load balancer). A declared gap,
+# expected_fail: no audit reads the mismatch; the gap is #2576 (item 3).
+./tasks/networking-gateway-ingress-port-mismatch/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on an admission webhook whose CA bundle certificate has expired (the
 # planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
@@ -37,6 +43,13 @@
 # gap, expected_fail: no compliance check reads the binding behind an
 # annotation; the gap is #5027.
 ./tasks/security-wi-ksa-gsa-iam-binding-missing/task.yaml
+# Capability row: workloads, OOM, probes and HPA; the compliance audit on a
+# Deployment that pulls an Artifact Registry image through the node identity
+# alone and is refused for lack of the registry reader role (the planted
+# streamed-image-service in seeded-streaming, its pods in ErrImagePull). A
+# declared gap, expected_fail: no compliance check reads the pattern; the gap
+# is #5028.
+./tasks/workload-image-streaming-token-iam-expiry/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the obtainability audit names a
 # Deployment whose containers set no memory limit (the planted
 # memory-unbounded-worker in seeded-workloads). A baseline: no gap declared.

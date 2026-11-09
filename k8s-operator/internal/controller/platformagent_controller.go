@@ -571,9 +571,9 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
-	// a2aChartPodsWarned records, per CR, the spec generation and discarded
-	// chart-pods annotation value last reported (a2aChartPodsDiscard), so each
-	// generation and value warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarned records, per CR, the spec generation and the
+	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
+	// reason warns once. Keyed by ObjectKey, value
 	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
@@ -678,6 +678,10 @@ type PlatformAgentReconciler struct {
 	// for the usage counters poller (usage_counters_poller.go); empty, as
 	// under `make run` off the cluster, renders no such rule.
 	OperatorNamespace string
+
+	// calloutStatus reads an auth callout pod's /status for the
+	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
+	calloutStatus calloutStatusReader
 
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
@@ -1224,6 +1228,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// lets them write the cleared field once, and then find it current.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
 		instance.Status.BusReplicas = 0
+		// No callout, so no claim about its map: the condition goes.
+		removed := a2aIdentityMapRemoved
+		a2aState.calloutMap = &removed
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
@@ -1322,10 +1329,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that darkened its gateway, the A2AGateway condition is kept until the
 	// scaled-up replica is ready, and the pass that clears it should not
 	// depend on the Deployment's status event alone.
+	// busHeld shares it for the gateway's reason: the bus waits on the
+	// callout's rollout, and the pass that sees it finish has to happen.
+	// calloutMap shares it too: a map the callouts are still loading, or
+	// pods that didn't answer, changes nothing the operator watches when it
+	// settles, so the pass that sees it settle has to be scheduled.
 	// a2aBusNeedsRecheck adds a bus server short of the count while a
-	// quorum serves, for the same reason, and a bus held on its config
-	// while the callout rolls (busHeld): the pass that sees the rollout
-	// finish has to happen.
+	// quorum serves, for the same reason.
 	if a2aNext && r.a2aBusNeedsRecheck(ctx, instance, a2aState) {
 		requeue := a2aPendingRequeue
 		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
@@ -4414,6 +4424,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
+		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
 		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
@@ -4428,6 +4439,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
+			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
 			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
 			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas) &&
@@ -4444,6 +4456,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
@@ -4846,6 +4859,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
 	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
 	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
@@ -4916,7 +4930,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
@@ -5002,6 +5016,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)

@@ -416,10 +416,13 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 	// ack, or a connection outage outlasted AckWait while the ack was being
 	// retried. Its sequence is on the record then, and it is acked without
 	// rendering twice.
-	// In stream order: a stop gives deliveries back in order, but redelivery
-	// can still interleave with new events, and the stream sequence is the
-	// order they were written in. Items without one (not off the durable)
-	// keep the order they were queued in.
+	// In stream order: a stop's give-back keeps that order only for a relay
+	// already bound when it falls due, so a relay that binds later can get
+	// the oldest given-back event behind later ones, and redelivery can
+	// interleave with new events. The stream sequence is the order they were
+	// written in, and sorting by it restores that order only among the
+	// events in one batch. Items without one (not off the durable) keep the
+	// order they were queued in.
 	if !slices.ContainsFunc(batch, func(it relayItem) bool { return it.sequence() == 0 }) {
 		slices.SortStableFunc(batch, func(a, b relayItem) int { return cmp.Compare(a.sequence(), b.sequence()) })
 	}
@@ -810,7 +813,8 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
 		// A Stop button answers for itself: Slack's with one reply
-		// (slack_stop.go), Google Chat's on the line (chat_stop_press.go).
+		// (slack_stop.go), Google Chat's on the line, as does a stop typed
+		// on Google Chat with a line (chat_stop_press.go).
 		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
@@ -1129,7 +1133,8 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	// would never be retried and the line would sit at the previous state
 	// until the terminal.
 	// A detached task (a typed stop, its terminal pending) keeps its line
-	// moving, with no Stop control: the stop is sent.
+	// moving, with no Stop control: the stop is sent. One whose stop closed
+	// the line (LineClosed) returned above and keeps it.
 	stop := taskID
 	if active.Detached {
 		stop = ""

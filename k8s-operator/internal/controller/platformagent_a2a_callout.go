@@ -810,7 +810,11 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 							}}},
 						},
 						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
-						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
+						// The operator GETs /status on this port by pod IP, from
+						// every Ready replica, for A2AIdentityMapApplied (#4487):
+						// a NetworkPolicy added here later must admit the
+						// operator, or the condition turns StatusUnreadable.
+						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aCalloutStatusPort),

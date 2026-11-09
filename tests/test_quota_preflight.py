@@ -34,6 +34,7 @@ _CHART = _ROOT / "charts" / "kube-agents"
 _VALUES = _CHART / "values.yaml"
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
 _FLAGGED_PODS = _CHART / "files" / "flagged-pods.yaml"
+_TRANSIENT_PODS = _CHART / "files" / "transient-pods.yaml"
 _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
@@ -1102,6 +1103,87 @@ class PreflightDecisionTest(unittest.TestCase):
                {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
         self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
 
+    def _scope_publisher(self) -> dict:
+        """files/transient-pods.yaml's entry; TestTheChartCountsTheScopePublishersJobPod holds it to the operator."""
+        sp = yaml.safe_load(_TRANSIENT_PODS.read_text())["scopePublisher"]
+        return {**sp, "replicas": sp["pods"]}  # the shape _assert_counts reads
+
+    def _scope_delta(self, values: dict, extra_args: list[str] | None = None) -> dict:
+        base = self._requirements(["platformAgent.mode=next"], extra_args=extra_args)
+        req = self._requirements(["platformAgent.mode=next"], values=values, extra_args=extra_args)
+        return {key: req[key] - base[key] for key in base}
+
+    def test_mode_next_counts_the_scope_publishers_job_pod_for_a_scope_with_members(self) -> None:
+        """The operator starts the scope publisher's Job, one pod at a time, where the gateway
+        pod policy is on and the scope names something to resolve (#4816)."""
+        sp = self._scope_publisher()
+        self.assertEqual(sp["scopeMembers"], ["folders", "organizations", "sharedVpcHosts", "metricsScopes"])
+        self.assertGreater(sp["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        for field in sp["scopeMembers"]:
+            with self.subTest(field):
+                self._assert_counts(self._scope_delta({"platformAgent": {"scope": {field: ["x"]}}}), sp)
+        for name, env in (
+            ("true", {"value": "true"}),
+            ("by valueFrom", {"valueFrom": {"configMapKeyRef": {"name": "x", "key": "p"}}}),
+            ("a $(VAR) reference", {"value": "$(P)"}),
+        ):
+            with self.subTest(f"policy off in the chart, on by operator.extraEnv: {name}"):
+                values = {"admissionPolicy": {"enabled": False},
+                          "operator": {"extraEnv": [{"name": "A2A_GATEWAY_POD_POLICY", **env}]},
+                          "platformAgent": {"scope": {"folders": ["x"]}}}
+                self._assert_counts(self._scope_delta(values), sp)
+
+    def test_the_scope_publishers_job_pod_is_not_counted_when_it_cannot_run(self) -> None:
+        for name, values, extra in (
+            ("projects only", {"platformAgent": {"scope": {"projects": ["p"]}}}, None),
+            ("empty member lists", {"platformAgent": {"scope": {"folders": [], "metricsScopes": []}}}, None),
+            ("policy off", {"admissionPolicy": {"enabled": False},
+                            "platformAgent": {"scope": {"folders": ["x"]}}}, None),
+            ("policy off, extraEnv false", {"admissionPolicy": {"enabled": False},
+                                            "operator": {"extraEnv": [{"name": "A2A_GATEWAY_POD_POLICY", "value": "false"}]},
+                                            "platformAgent": {"scope": {"folders": ["x"]}}}, None),
+            ("Kubernetes 1.29, where the policy doesn't render",
+             {"platformAgent": {"scope": {"folders": ["x"]}}}, ["--kube-version", "1.29.0"]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(set(self._scope_delta(values, extra).values()), {0})
+        # And never under today, where the operator runs no publisher.
+        scope = {"platformAgent": {"scope": {"folders": ["x"]}}}
+        self.assertEqual(self._requirements(values=scope), self._requirements())
+
+    @unittest.skipUnless(_HELM, "helm is not installed")
+    def test_a_missing_or_unreadable_transient_pods_file_fails_a_next_render(self) -> None:
+        """Like footprint.yaml: without transient-pods.yaml the publisher would count as nothing."""
+        for name, damage in (
+            ("missing", lambda f: f.unlink()),
+            ("unreadable", lambda f: f.write_text("scopePublisher: [unclosed\n")),
+            ("no scopeMembers list", lambda f: f.write_text("scopePublisher: {pods: 1}\n")),
+            ("a scopeMembers entry that isn't a field name", lambda f: f.write_text(
+                f.read_text().replace("[folders, organizations, sharedVpcHosts, metricsScopes]", "[folders, 42]"))),
+            ("cut short after scopeMembers", lambda f: f.write_text(
+                f.read_text().split("  cpuMillisRequest")[0])),
+        ):
+            with self.subTest(name):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                chart = pathlib.Path(tmp.name) / "kube-agents"
+                shutil.copytree(_CHART, chart)
+                (chart / "values.schema.json").unlink(missing_ok=True)
+                (chart / "templates" / "zz-probe.yaml").write_text(_PROBE_TEMPLATE)
+                damage(chart / "files" / "transient-pods.yaml")
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as fh:
+                    yaml.safe_dump({"probe": {"emitRequirements": True}}, fh)
+                    values_path = fh.name
+                self.addCleanup(lambda p=values_path: pathlib.Path(p).unlink(missing_ok=True))
+                res = subprocess.run(
+                    [_HELM, "template", "test-release", str(chart), "-f", values_path,
+                     "--set", "platformAgent.mode=next"] + _REQUIRED_HARNESS,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(res.returncode, 0, "a damaged transient-pods.yaml must fail the render")
+                self.assertIn("transient-pods.yaml is missing or unreadable", res.stderr)
+
     def _mcp_server_delta(self, env: list) -> dict:
         base = self._requirements(["platformAgent.mode=next"])
         req = self._requirements(["platformAgent.mode=next"],
@@ -1208,13 +1290,15 @@ class PreflightDecisionTest(unittest.TestCase):
         allows; a StatefulSet sizes none."""
         res = self._render({"probe": {}}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
-        chart_pods, pods, surges, names = None, 0, 0, []
+        chart_pods, config_map, pods, surges, names = None, None, 0, 0, []
         for doc in yaml.safe_load_all(res.stdout):
             if not doc:
                 continue
             meta = doc.get("metadata", {})
             if doc.get("kind") == "PlatformAgent":
                 chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+            if doc.get("kind") == "ConfigMap" and meta.get("name") == "a2a-quota-chart-pods":
+                config_map = int(doc["data"]["pods"])
             if "helm.sh/hook" in (meta.get("annotations") or {}):
                 continue
             # A pod-running kind neither list models would pass both unseen, so it fails here.
@@ -1236,7 +1320,15 @@ class PreflightDecisionTest(unittest.TestCase):
                     n = math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
                     # The controller never scales the new ReplicaSet past the desired count.
                     surges += min(n, replicas)
-        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        # The count reaches the operator one way per release (#4883): the annotation on the
+        # PlatformAgent the chart renders, or, with platformAgent.enabled=false, the ConfigMap.
+        if "platformAgent.enabled=false" in sets:
+            self.assertIsNone(chart_pods, "a PlatformAgent rendered with platformAgent.enabled=false")
+            self.assertIsNotNone(config_map, "no a2a-quota-chart-pods ConfigMap without a PlatformAgent")
+            chart_pods = config_map
+        else:
+            self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+            self.assertIsNone(config_map, "the ConfigMap rendered beside a PlatformAgent, whose annotation wins")
         return chart_pods, pods + surges, names
 
     def test_the_operator_is_told_the_pods_the_chart_renders_and_their_surges(self) -> None:
@@ -1262,6 +1354,9 @@ class PreflightDecisionTest(unittest.TestCase):
              "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
              "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
+            # An operator-only release (#4883): no PlatformAgent, so the ConfigMap is the count.
+            ["platformAgent.enabled=false", "hindsight.enabled=true", "githubMinter.enabled=true",
+             "githubMinter.org=o", "githubMinter.repo=r"],
             # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
             # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
             ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
@@ -1285,6 +1380,17 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
+
+    def test_an_operator_only_release_refuses_a_count_past_the_cap(self) -> None:
+        """The ConfigMap carries the annotation's 64-pod cap check (#4883): an operator-only
+        next-mode release past it fails the render rather than stamp a count the operator
+        discards."""
+        sets = ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=61"]
+        res = self._render({"probe": {}}, sets)
+        self.assertNotEqual(res.returncode, 0, "a count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", res.stderr)
+        ok = self._render({"probe": {}}, ["platformAgent.enabled=false", "platformAgent.mode=next", "operator.replicaCount=60"])
+        self.assertEqual(ok.returncode, 0, ok.stderr)
 
     def test_the_session_quota_counts_every_surge_pod_and_the_patch_room_stays_one(self) -> None:
         """chartSurgePods totals each rollout's surge pods (#4876), and the patch's surge room
@@ -2462,16 +2568,30 @@ class DocumentedFootprintTest(unittest.TestCase):
         # The quota's headroom is derived (#3848): the operator's standing pods,
         # summed here from the footprint for both modes, plus the chart's pods (the
         # operator's default stands in for a chart that says nothing) and the margin.
-        # Written as its named parts (surges + Job + overshoot), so sum them.
-        margin = sum(
-            int(part)
+        # Written as its parts (surges + provisioning Job + the scope publisher's Job pods
+        # + overshoot), each a number or a named constant; resolve the names and sum them.
+        parts = [
+            part.strip()
             for part in self._extract_match(
-                r'a2aQuotaTransientMargin\s*=\s*(\d+(?:\s*\+\s*\d+)*)\s*$',
+                r'a2aQuotaTransientMargin\s*=\s*(\w+(?:\s*\+\s*\w+)*)\s*$',
                 manifests_src,
                 "a2aQuotaTransientMargin",
                 flags=re.MULTILINE,
             ).split("+")
+        ]
+        named = {
+            part: int(self._extract_match(rf'\b{part}\s*=\s*(\d+)\s*$', manifests_src, part, flags=re.MULTILINE))
+            for part in parts
+            if not part.isdigit()
+        }
+        # The scope publisher's term (#4816): the chart counts that pod from
+        # files/transient-pods.yaml, and the margin may not count fewer.
+        self.assertIn("a2aScopePublisherJobPods", named, "the margin no longer counts the scope publisher's Job pods")
+        self.assertGreaterEqual(
+            named["a2aScopePublisherJobPods"],
+            yaml.safe_load(_TRANSIENT_PODS.read_text())["scopePublisher"]["pods"],
         )
+        margin = sum(int(part) if part.isdigit() else named[part] for part in parts)
         # Hindsight's two pods and the minter at its default replicas, plus a surge pod each
         # for Hindsight's API and the minter (kube-agents.chartQuotaPods).
         values = yaml.safe_load(_VALUES.read_text())

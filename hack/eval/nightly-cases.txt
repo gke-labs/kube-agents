@@ -1010,6 +1010,12 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
+# normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
+# documentation/web search loops (#3141). deployer: noop, read-only, no fixture,
+# 200s default until it has a record.
+./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
+
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
 # one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
 # seeded-c) finish without polling, exploring system namespaces, or re-scanning,
@@ -1018,6 +1024,13 @@
 # crashloop-workload role. `validated: false` until its first observed nightly
 # runs; presubmit admission awaits its nightly pass record.
 ./tasks/cluster-agent-fleet-health-triage/task.yaml
+
+# A Cluster Agent answers a Config Connector audit with the batched KCC
+# collector SOUL.md names (#3142): graded on a Cluster Agent doing the work,
+# running /opt/data/scripts/kcc_fleet_audit.py, no later turn's result showing
+# the script missing, and a report naming Config Connector status. deployer:
+# noop, read-only, no fixture, 200s default until it has a record.
+./tasks/cluster-agent-kcc-audit-collector/task.yaml
 
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
@@ -1041,7 +1054,7 @@
 # in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
-# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# named the wrong facet, or (once) a tool error. The nightlies on the 2026-10-19 agent model pass
 # it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
 # 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
 # reverted (#4116), so a presubmit seat could not fail when the fix is undone:
@@ -1105,6 +1118,18 @@
 # and safeguards. deployer: noop, read-only, no fixture; three units at the
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
+
+# A scheduled audit over a fleet that did not change since the last scheduled
+# run is closed by `audit_report.py precheck` from that run's stored findings
+# document, with no document drafted by hand (gke-labs/kube-agents#4724).
+# prebuilt/unchanged-manifest-digest runs the previous scheduled run of the
+# fleet-consistency-drift stream itself (collector, draft, finish --scheduled),
+# then fires the stream's real cron job and waits for it, so the turn is a
+# one-line answer and the grade reads the store. Fixture: drift-outlier. A
+# tofu case, so it holds the infra lock; its stack carries a full drift audit
+# on main (red) and a collector plus precheck on the gate (green), priced at
+# the 900s audit band plus the plant.
+./tasks/fleet-audit-unchanged-manifest-skips-synthesis/task.yaml
 
 # A drift run over a coverage gap keeps the previous finding on the cluster it
 # did not compare as a held row, with its id in the ledger's hidden block.

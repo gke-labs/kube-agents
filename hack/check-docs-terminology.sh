@@ -92,6 +92,15 @@ forbid 'kubeagents-platform-agent-gsa' \
 forbid 'platform-agent-ksa' \
   "Wrong Kubernetes service account name. common.sh sets PLATFORM_AGENT_KSA_NAME=kubeagents-platform-agent (no -ksa suffix)."
 
+# --- Eval results tied to a third-party model ------------------------------
+# The evidence store keys each case's record by the agent model (<model>-kubeagents-mcp).
+# A third-party model's key in a document is a pass count or timing attributed to that
+# model in public; the records cite the date of the model change instead
+# (docs/eval-gate-roster.md). Product docs that list a model as a BYOM option name the
+# bare model, never the key, so this matches results only.
+forbid 'claude-[a-z0-9.-]*-kubeagents(-mcp)?' \
+  "An eval evidence-store key names a third-party model in public documentation. Cite the date of the model change instead (docs/eval-gate-roster.md does)."
+
 # --- Namespace ------------------------------------------------------------
 forbid 'platform-agent-system' \
   "Stale namespace. install.defaults.env sets DEFAULT_NAMESPACE=kubeagents-system."
