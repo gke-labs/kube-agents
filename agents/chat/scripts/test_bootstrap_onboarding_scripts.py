@@ -2063,7 +2063,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             "issues": [{"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\n" + bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="someone-elses") + "\nold"}]
         }
         self.assertEqual(self._main(), 0)
-        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
         _, create, _ = self.forge_calls[-1]
         self.assertIn(bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="t1"), create["body"])
         self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 42)
@@ -2129,7 +2129,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             "issues": [{"number": None, "body": bootstrap_delivery.REPORT_ISSUE_MARKER}, {"body": bootstrap_delivery.REPORT_ISSUE_MARKER}]
         }
         self.assertEqual(self._main(), 0)
-        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "issue-list", "label-ensure", "issue-create"])
         self.assertTrue((self.d / COMPLETED).exists())
 
     def test_an_unexpected_error_after_the_claim_releases_it(self):
@@ -2302,6 +2302,26 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             self.assertEqual(self._main(), 0)
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual([v for v, _, _ in self.forge_calls], [])
+
+    def test_a_sweep_marker_that_does_not_decode_holds_this_path_not_the_tick(self):
+        (self.d / SCAN_FILED).write_bytes(b"\xff\xfe not utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_an_unlabelled_issue_is_found_beside_another_installs_labelled_one(self):
+        """A shared repository: another install's labelled issue is open, this sweep's issue carries
+        no label; the fallback listing must still run, or a second issue is opened for this sweep."""
+        self._filed(self.DAY + self.HOUR)
+        other = {"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep="other-sweep"),
+                 "labels": [{"name": bootstrap_delivery.REPORT_ISSUE_LABEL}]}
+        sweep = bootstrap_delivery.oobe.scan_filed(self.d)[0]
+        mine = {"number": 9, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep), "labels": []}
+        self.forge_answers["issue-list"] = {"issues": [other]}
+        self.forge_answers["issue-list-unlabelled"] = {"issues": [mine, other]}
+        self.assertEqual(self._main(), 0)
+        self.assertNotIn("issue-create", [c[0] for c in self.forge_calls], "no second issue for this sweep")
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 9)
 
     def test_an_unlabelled_issue_is_found_again_and_noted(self):
         """The repository refused the label: a dying run's issue is still found by its sweep marker, and the gap is logged."""

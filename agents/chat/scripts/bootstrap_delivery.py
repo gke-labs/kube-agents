@@ -2077,20 +2077,25 @@ def _existing_report_issue(repo: str, sweep: str) -> tuple[int, str, object] | N
         "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
     )
     marker = REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep)
-    issues = list(answer.get("issues") or [])
-    if not issues:
-        # An earlier run's issue may carry no label (the repository refused it): one more
-        # listing without the label filter, by the sweep marker alone.
+
+    def _matching(rows: list) -> list[tuple[int, dict]]:
+        matched: list[tuple[int, dict]] = []
+        for issue in rows:
+            if not isinstance(issue, dict) or marker not in str(issue.get("body") or ""):
+                continue
+            try:
+                matched.append((int(issue.get("number")), issue))
+            except (TypeError, ValueError):
+                continue
+        return matched
+
+    found = _matching(list(answer.get("issues") or []))
+    if not found:
+        # An earlier run's issue may carry no label (the repository refused it), while another
+        # install's labelled issue is open in a shared repository: one more listing without the
+        # label filter, by the sweep marker alone.
         answer = forge.call("issue-list", {"state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo)
-        issues = list(answer.get("issues") or [])
-    found: list[tuple[int, dict]] = []
-    for issue in issues:
-        if not isinstance(issue, dict) or marker not in str(issue.get("body") or ""):
-            continue
-        try:
-            found.append((int(issue.get("number")), issue))
-        except (TypeError, ValueError):
-            continue
+        found = _matching(list(answer.get("issues") or []))
     if not found:
         return None
     number, issue = max(found, key=lambda pair: pair[0])
@@ -2324,7 +2329,11 @@ def _deliver_without_thread(data_dir: Path) -> int:
     """
     if _someone_is_here(data_dir):
         return 0  # a human's thread takes the report once the greeting is out
-    filed = oobe.scan_filed(data_dir)
+    try:
+        filed = oobe.scan_filed(data_dir)
+    except (OSError, ValueError):
+        # A marker whose bytes do not decode (hand-edited): hold this path, not the whole tick.
+        return 0
     if filed is None:
         return 0  # the scan has not started
     now = time.time()
