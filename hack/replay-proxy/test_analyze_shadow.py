@@ -142,6 +142,15 @@ class EstimateTest(unittest.TestCase):
         r, _ = report(lines)
         self.assertEqual(r["estimates"]["low"]["hits"], 1)
 
+    def test_schema_2_and_schema_3_lines_read_together(self):
+        # Schema 2 named the LiteLLM config checksum model_behaviour_checksum;
+        # lines group by fingerprint, so either name reads.
+        lines = [dict(line("n1", 1, "nightly", "b0", "fp", ["m"]), schema=2, model_behaviour_checksum="c2"),
+                 dict(presubmit("p1", 10, "7", "b1", "fp", ["m"]), schema=3, litellm_config_checksum="c3")]
+        r, skipped = report(lines)
+        self.assertEqual(sum(skipped.values()), 0)
+        self.assertEqual(r["estimates"]["low"]["hits"], 1)
+
     def test_presubmit_lines_without_a_pr_are_counted(self):
         rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
                          line("n1", 3, "nightly", "n", "A", ["a"])])
