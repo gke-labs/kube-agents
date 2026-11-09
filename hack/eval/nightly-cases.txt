@@ -1265,6 +1265,19 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# A change request whose fix lives in a repository the agent reads and does
+# not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
+# into the platform charts context repository, names the chart template
+# there and completes the card; no pull request, no decryption attempt.
+# prebuilt/context-repository-owns-the-fix plants the three-part fixture
+# for each run (the HelmRelease directory with the stack write token, the
+# payments-api workload on the agent host, the context_repos registration)
+# and removes it at destroy (#5213), so the case has no pool fixture: its
+# first nightly run is the pool proof of the plant and the teardown. The
+# chart repository is public and read with no credential. writes_alone, so
+# it runs alone in the writers part.
+./tasks/remediation-context-repository-owns-the-fix/task.yaml
+
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
 # seeded-b (#3081, #3100). The runner excludes slot b for this case's
