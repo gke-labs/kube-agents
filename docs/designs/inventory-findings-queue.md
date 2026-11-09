@@ -984,14 +984,15 @@ or, failing that, its mtime: a report still undelivered by then means onboarding
 holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
 which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
 which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
-state (the daily part sent, the items added today, the failure reported) is a file in the platform
-profile home, written before the rows are marked. An addition whose mark fails is not announced
+state (the daily part sent, the items added today and the ids of the findings they named, the
+failure reported) is a file in the platform profile home, written before the rows are marked. An addition whose mark fails is not announced
 again that day and still counts against that day's limit, though `findings_additions` has no row
 for it. It also holds additions back as a pending item of its class would: a critical one holds
 non-criticals back, and a non-critical one stops every addition, though the stop-add notice does not
 name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
 it has now: a decision on it the same day refunds its slot, and a re-score can move it between
-the two counts. It comes back as new the next day. If the state file cannot be written either,
+the two counts. It comes back as new the next day. A finding that joins an added line later, which
+a decision can leave open, was not named, so it is a new item of its own and holds nothing back. If the state file cannot be written either,
 the additions and the daily part repeat every hour.
 
 What this costs is the starvation §7.3 measured, brought back deliberately, from two sources. An
