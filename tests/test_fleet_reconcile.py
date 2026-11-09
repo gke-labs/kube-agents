@@ -2174,6 +2174,30 @@ class FixtureRefreshTest(unittest.TestCase):
         self.assertIn("terminated during the reset", outcomes[P7][1])
         self.assertEqual(boskos.released, [P7])
 
+    def test_no_reset_starts_once_a_termination_is_under_way(self):
+        """A worker that finishes its apply after the main thread forwarded a
+        termination releases its project; a reset would only hold the drain."""
+        calls = []
+        with mock.patch.object(reconcile, "terminating", lambda: True), mock.patch.object(reconcile, "_tofu", lambda args, *a, **k: subprocess.CompletedProcess(args, 0, STARTUP_FAIL_STATE, "")):
+            run = reconcile.Run(commit="c", fleet_tree="t", refresh_fixtures=True)
+            outcomes = {}
+            extras = {"startup_fail_instance": ("startup-fail-seeded", "us-central1-a")}
+            with mock.patch.object(reconcile, "gcloud_runner", self._gcloud(calls)), mock.patch.object(
+                reconcile, "reconcile_project", lambda *a, **k: (k["extras"].update(extras), (reconcile.OUTCOME_APPLIED, "summary"))[1]
+            ), mock.patch("sys.stdout", io.StringIO()):
+                reconcile._record(P7, outcomes, None, False, run)
+        self.assertEqual(calls, [])
+        self.assertEqual(run.extras[P7][reconcile.REPORT_KEY_REFRESH]["result"], "skipped")
+        self.assertEqual(outcomes[P7][0], reconcile.OUTCOME_APPLIED)
+
+    def test_a_reset_in_flight_fits_inside_the_drain(self):
+        """A reset started just before a termination runs to its timeout; the
+        drain must outlast it with room left for the release."""
+        self.assertLessEqual(
+            reconcile.RESET_TIMEOUT_SECONDS + reconcile.WORKER_DRAIN_MARGIN_SECONDS,
+            reconcile.WORKER_DRAIN_SECONDS,
+        )
+
     def test_main_refreshes_by_default_and_the_flag_turns_it_off(self):
         captured = []
         real_run = reconcile.Run

@@ -153,7 +153,10 @@ MAIN_CHECK_INTERVAL_SECONDS = 60
 DEFAULT_WORKERS = 1
 # How long the threads get to return their projects after a termination
 # interrupted their applies, before the children are killed outright.
-WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + 30
+# The margin past the grace is the time a worker has to release its
+# project once its child has stopped.
+WORKER_DRAIN_MARGIN_SECONDS = 30
+WORKER_DRAIN_SECONDS = INTERRUPT_GRACE_SECONDS + WORKER_DRAIN_MARGIN_SECONDS
 WORKER_JOIN_STEP_SECONDS = 0.2
 FLEET_SUBDIR = "bench/tf/fleet"
 # The files that change what a run applies: the stack and its lock file, the
@@ -259,15 +262,17 @@ WARNING_MARKER = "applied.json not written: %s"
 STARTUP_FAIL_ADDRESS = "google_compute_instance.startup_fail"
 STARTUP_FAIL_NAME_RE = re.compile(r"^startup-fail-[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 ZONE_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-[a-z]$")
-# A reset waits for its zone operation, which takes seconds; the ceiling is
-# generous so a slow API is a warning, not a kill mid-call.
-RESET_TIMEOUT_SECONDS = 180
+# A reset waits for its zone operation, which takes seconds. No reset starts
+# once a termination is under way, but one already in flight runs to this
+# ceiling, so it ends inside the drain with the release margin left over.
+RESET_TIMEOUT_SECONDS = WORKER_DRAIN_SECONDS - WORKER_DRAIN_MARGIN_SECONDS
 REPORT_KEY_REFRESH = "startup_fail_reset"
 REFRESH_RESET = "reset"
 REFRESH_FAILED = "failed"
 REFRESH_SKIPPED = "skipped"
 WARNING_REFRESH = "startup-fail VM not reset: %s"
 REASON_REFRESH_NOT_IN_STATE = "the state records no %s" % STARTUP_FAIL_ADDRESS
+REASON_REFRESH_TERMINATING = "the run is terminating"
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -1004,6 +1009,9 @@ def publish_applied(project, outcome, run):
 def reset_startup_fail(project, extras):
     """Reset the startup-fail VM `extras` names. Returns (report field, warning
     or None). Only the one instance the state recorded, by name and zone."""
+    if terminating():
+        # The drain waits for this worker to release its project.
+        return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_TERMINATING}, None
     if "startup_fail_lookup_error" in extras:
         why = extras["startup_fail_lookup_error"]
         return {"result": REFRESH_FAILED, "detail": why}, WARNING_REFRESH % why
