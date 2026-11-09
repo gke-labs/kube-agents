@@ -1832,6 +1832,19 @@ func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, res
 	b.finalizeResult(run, state, msg, &resultCopy, nil, true)
 }
 
+// clearSeenSecrets empties and closes the task's seen-values set, and
+// says at debug how many values the set refused because a pool was full of
+// earlier results' entries: a count only, never a value.
+func (b *Bridge) clearSeenSecrets(run *taskRun) {
+	a := run.act.Load()
+	if a == nil {
+		return
+	}
+	if n := a.secrets.clear(); n > 0 {
+		b.cfg.Logger.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", run.origin.TaskID, "refused", n)
+	}
+}
+
 func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) {
 	// The answer as it goes on TASKS, the chat message folded from it
 	// included: scrubbed (scrubAnswer), before any lock, as the fold is.
@@ -1894,9 +1907,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
 	// The task's answers are out: the values seen for their scrub go.
-	if a := run.act.Load(); a != nil {
-		a.secrets.clear()
-	}
+	b.clearSeenSecrets(run)
 	run.mu.Unlock()
 	b.waitActivity(run)
 	if err != nil {

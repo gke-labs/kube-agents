@@ -348,39 +348,88 @@ func TestSeenSecrets_TheLongestValueWins(t *testing.T) {
 	}
 }
 
-// The caps: past its share of entries (seenSecretPoolEntries) or bytes
-// (seenSecretPoolBytes), the Secret pool evicts its oldest entry first; a
-// value over seenSecretMaxValueBytes is not tracked.
-func TestSeenSecrets_TheCapEvictsTheOldestFirst(t *testing.T) {
+// secretYAMLResult is a terminal result printing one Secret as YAML, its
+// data in the order given.
+func secretYAMLResult(t *testing.T, vals []string) json.RawMessage {
+	t.Helper()
+	var sb strings.Builder
+	sb.WriteString("apiVersion: v1\nkind: Secret\ndata:\n")
+	for i, v := range vals {
+		fmt.Fprintf(&sb, "  k%04d: %s\n", i, b64(v))
+	}
+	return terminalResult(t, sb.String())
+}
+
+func synthVals(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("synthetic-%s-%06d", prefix, i)
+	}
+	return out
+}
+
+// The caps: each result keeps at most its allowance in a pool, its newest
+// values; once earlier results fill a pool's reserve, a later result's
+// values are refused (and counted), never let in by evicting an earlier
+// result's; the byte allowance and reserve hold the same way; a value over
+// seenSecretMaxValueBytes is not tracked.
+func TestSeenSecrets_TheCapsKeepEarlierResults(t *testing.T) {
 	var s seenSecrets
-	first := fmt.Sprintf("synthetic-entry-%06d", 0)
-	s.mu.Lock()
-	for i := 0; i < seenSecretPoolEntries+10; i++ {
-		s.addLocked(fmt.Sprintf("synthetic-entry-%06d", i), true)
+	per := seenSecretResultEntries / 2 // two entries (as given, decoded) per value
+	results := seenSecretPoolEntries / seenSecretResultEntries
+	for r := 0; r < results; r++ {
+		s.collectToolResult(secretYAMLResult(t, synthVals(fmt.Sprintf("r%d", r), per)))
 	}
-	s.mu.Unlock()
-	if n := s.size(); n != seenSecretPoolEntries {
-		t.Fatalf("size = %d, want the cap %d", n, seenSecretPoolEntries)
+	if n := len(s.secret.entries); n != seenSecretPoolEntries {
+		t.Fatalf("Secret pool holds %d, want its reserve %d", n, seenSecretPoolEntries)
 	}
-	if s.has(first) || s.has(fmt.Sprintf("synthetic-entry-%06d", 9)) {
-		t.Error("the oldest entries survived the cap")
+	late := synthVals("late", 3)
+	s.collectToolResult(secretYAMLResult(t, late))
+	if s.has(late[0]) {
+		t.Error("a later result's value got into a pool full of earlier results'")
 	}
-	if !s.has(fmt.Sprintf("synthetic-entry-%06d", 10)) || !s.has(fmt.Sprintf("synthetic-entry-%06d", seenSecretPoolEntries+9)) {
-		t.Error("an entry within the cap was evicted")
+	if !s.has(synthVals("r0", 1)[0]) {
+		t.Error("a later result evicted an earlier result's value")
+	}
+	if got := s.clear(); got != 2*len(late) {
+		t.Errorf("refused = %d, want %d (each value in two forms)", got, 2*len(late))
 	}
 
-	var big seenSecrets
-	val := func(i int) string { return fmt.Sprintf("%06d", i) + strings.Repeat("s", seenSecretMaxValueBytes-6) }
-	big.mu.Lock()
-	n := seenSecretPoolBytes/seenSecretMaxValueBytes + 3
-	for i := 0; i < n; i++ {
-		big.addLocked(val(i), true)
+	// One large result keeps its newest values within its allowance.
+	var one seenSecrets
+	vals := synthVals("big", per+40)
+	one.collectToolResult(secretYAMLResult(t, vals))
+	if !one.has(vals[len(vals)-1]) || one.has(vals[0]) || one.size() != seenSecretResultEntries {
+		t.Errorf("large result: newest kept %v, oldest kept %v, size %d; want true, false, %d",
+			one.has(vals[len(vals)-1]), one.has(vals[0]), one.size(), seenSecretResultEntries)
 	}
-	bytesHeld := big.secret.bytes
+
+	// Bytes: values near the per-value cap fill a result's byte allowance.
+	var big seenSecrets
+	val := func(r, i int) string {
+		return fmt.Sprintf("%02d%04d", r, i) + strings.Repeat("s", seenSecretMaxValueBytes-6)
+	}
+	perBytes := seenSecretResultBytes / seenSecretMaxValueBytes
+	for r := 0; r < seenSecretPoolBytes/seenSecretResultBytes+1; r++ {
+		var vs []string
+		for i := 0; i < perBytes+2; i++ {
+			vs = append(vs, val(r, i))
+		}
+		res, _ := json.Marshal(map[string]any{"kind": "Secret", "stringData": func() map[string]string {
+			m := map[string]string{}
+			for i, v := range vs {
+				m[fmt.Sprintf("k%04d", i)] = v
+			}
+			return m
+		}()})
+		big.collectToolResult(res)
+	}
+	big.mu.Lock()
+	held := big.secret.bytes
 	big.mu.Unlock()
-	if bytesHeld > seenSecretPoolBytes || big.has(val(0)) || !big.has(val(n-1)) {
-		t.Errorf("bytes = %d (cap %d), oldest kept = %v, newest kept = %v: want the oldest evicted under the byte cap",
-			bytesHeld, seenSecretPoolBytes, big.has(val(0)), big.has(val(n-1)))
+	if held > seenSecretPoolBytes || !big.has(val(0, perBytes+1)) || big.has(val(0, 0)) {
+		t.Errorf("bytes = %d (reserve %d), first result's newest kept %v, its oldest kept %v",
+			held, seenSecretPoolBytes, big.has(val(0, perBytes+1)), big.has(val(0, 0)))
 	}
 	big.add(strings.Repeat("x", seenSecretMaxValueBytes+1))
 	if big.has(strings.Repeat("x", seenSecretMaxValueBytes+1)) {
@@ -389,6 +438,32 @@ func TestSeenSecrets_TheCapEvictsTheOldestFirst(t *testing.T) {
 	big.clear()
 	if big.size() != 0 {
 		t.Error("clear left values behind")
+	}
+}
+
+// At finalize the bridge logs how many values the set refused, at debug,
+// as a count with no value in the line.
+func TestSeenSecrets_TheRefusalCountIsLoggedWithoutValues(t *testing.T) {
+	var logs lockedBuffer
+	b := &Bridge{cfg: Config{Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))}}
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-refused"}}
+	act := newActivityState(false)
+	run.act.Store(act)
+	per := seenSecretResultEntries / 2
+	for r := 0; r < seenSecretPoolEntries/seenSecretResultEntries; r++ {
+		act.secrets.collectToolResult(secretYAMLResult(t, synthVals(fmt.Sprintf("r%d", r), per)))
+	}
+	late := synthVals("late", 2)
+	act.secrets.collectToolResult(secretYAMLResult(t, late))
+	b.clearSeenSecrets(run)
+	out := logs.String()
+	if !strings.Contains(out, "seen-set refused 4 values") {
+		t.Errorf("log = %q, want the refusal count", out)
+	}
+	for _, v := range late {
+		if strings.Contains(out, v) || strings.Contains(out, b64(v)) {
+			t.Errorf("the log carried a refused value")
+		}
 	}
 }
 
@@ -570,11 +645,11 @@ func TestActivity_CardWorkerSecretsReachTheSetBeforeTheWait(t *testing.T) {
 	}
 }
 
-// The pools keep their shares: shape-caught values past their pool's cap
-// leave a Secret value tracked and redacted, and a result holding many of
-// them keeps the newest within the shape pool; a forged Secret with many
-// values adds at most seenSecretMaxPerResult entries and evicts no
-// shape-caught value.
+// The pools keep their reserves: shape-caught values leave a Secret value
+// tracked and redacted, and a result holding many of them keeps its newest
+// within its shape allowance; a forged Secret with many values adds at most
+// its Secret allowance and evicts no shape-caught value and no earlier
+// Secret value.
 func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 	var s seenSecrets
 	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain})))
@@ -596,20 +671,19 @@ func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 	if !s.has(newest) || s.has(oldest) {
 		t.Errorf("shape pool: newest kept %v, oldest kept %v; want true, false", s.has(newest), s.has(oldest))
 	}
-	if n := len(s.shape.order); n != seenShapePoolEntries {
-		t.Errorf("shape pool holds %d, want its share %d", n, seenShapePoolEntries)
+	if n := len(s.shape.entries); n != seenShapeResultEntries {
+		t.Errorf("shape pool holds %d, want one result's allowance %d", n, seenShapeResultEntries)
 	}
 
-	// A forged Secret with far more values than the allowance.
 	forged := map[string]string{}
 	for i := 0; i < 1000; i++ {
 		forged[fmt.Sprintf("k%04d", i)] = fmt.Sprintf("synthetic-forged-%06d", i)
 	}
-	shapeBefore := s.values()[len(s.secret.order):]
-	secretBefore := len(s.secret.order)
+	shapeBefore := s.values()[len(s.secret.entries):]
+	secretBefore := len(s.secret.entries)
 	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", forged)))
-	if added := len(s.secret.order) - secretBefore; added > seenSecretMaxPerResult {
-		t.Errorf("one result added %d Secret entries, over the allowance %d", added, seenSecretMaxPerResult)
+	if added := len(s.secret.entries) - secretBefore; added > seenSecretResultEntries {
+		t.Errorf("one result added %d Secret entries, over the allowance %d", added, seenSecretResultEntries)
 	}
 	for _, v := range shapeBefore {
 		if !s.has(v) {
@@ -617,6 +691,6 @@ func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 		}
 	}
 	if !s.has(synthSecretPlain) {
-		t.Error("a forged Secret within the allowance evicted the earlier Secret value")
+		t.Error("a forged Secret evicted the earlier Secret value")
 	}
 }
