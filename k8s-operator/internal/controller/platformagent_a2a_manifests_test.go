@@ -848,6 +848,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -1680,8 +1682,16 @@ func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
 	if len(names) == 0 {
 		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
 	}
-	if got := a2aStandingPods(agent); got != rendered {
-		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
+	// The golden runs the gateway at the one replica it starts with: no pod
+	// holds the election's Lease there, so the scale-out to its standby (and a
+	// rollout's surge pod) never renders, and a2aGatewayStandbyPods counts them.
+	standby := a2aGatewayStandbyPods(agent)
+	if standby == 0 {
+		t.Fatal("the next-mode golden's CR runs no gateway standby, so this proves nothing about it")
+	}
+	if got := a2aStandingPods(agent); got != rendered+standby {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v, plus %d for the gateway's standby",
+			got, rendered, names, standby)
 	}
 
 }
@@ -2318,6 +2328,17 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.
@@ -8550,6 +8571,119 @@ func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
 		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
 			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
 		}
+	}
+}
+
+// A PlatformAgent without the chart-pods annotation takes the chart's count
+// from the a2a-quota-chart-pods ConfigMap in its namespace (#4883): an
+// operator-only release still runs chart pods there. The annotation wins, a
+// missing ConfigMap leaves the default, a value past the cap is discarded and
+// named as the ConfigMap's, and the CR itself is not changed.
+func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
+	cm := func(v string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: "test-ns"},
+			Data:       map[string]string{a2aChartPodsConfigMapKey: v},
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		configMap  *corev1.ConfigMap
+		operatorNS string
+		want       int64
+		why        string
+	}{
+		{"the ConfigMap, without an annotation", nil, cm("11"), "test-ns", 11, ""},
+		{"the annotation wins over the ConfigMap", ptr.To("7"), cm("11"), "test-ns", 7, ""},
+		{"neither: the default", nil, nil, "test-ns", a2aDefaultChartPods, ""},
+		{"a ConfigMap past the cap: the default, named", nil, cm("70"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		// The operator reads the ConfigMap from its own namespace only.
+		{"a ConfigMap outside the operator's namespace: the default, said", nil, cm("11"), "kubeagents-system", a2aDefaultChartPods, "only from its own namespace"},
+		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "own namespace is unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			objs := []client.Object{agent}
+			if tc.configMap != nil {
+				objs = append(objs, tc.configMap)
+			}
+			cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
+			r := &PlatformAgentReconciler{Client: cl, OperatorNamespace: tc.operatorNS}
+			sized, why, err := r.a2aQuotaAgent(context.Background(), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := a2aChartPods(sized); got != tc.want {
+				t.Errorf("chart pods = %d, want %d", got, tc.want)
+			}
+			if (why == "") != (tc.why == "") || !strings.Contains(why, tc.why) {
+				t.Errorf("why = %q, want it to name %q", why, tc.why)
+			}
+			if tc.annotation == nil && len(agent.Annotations) != 0 {
+				t.Errorf("the CR itself gained annotations %v", agent.Annotations)
+			}
+		})
+	}
+}
+
+// The reconcile sizes the applied session quota from the ConfigMap's count
+// when the CR has no annotation and the ConfigMap is in the operator's own
+// namespace, and warns, naming the ConfigMap, when it discards one or does
+// not read one from another namespace (#4883).
+func TestA2ASessionQuotaFollowsTheChartConfigMap(t *testing.T) {
+	for _, tc := range []struct {
+		value      string
+		operatorNS string
+		pods       int64
+		warns      bool
+	}{
+		{"11", "test-ns", 11, false},
+		{"70", "test-ns", a2aDefaultChartPods, true},
+		{"11", "kubeagents-system", a2aDefaultChartPods, true},
+	} {
+		t.Run(tc.value+"/"+tc.operatorNS, func(t *testing.T) {
+			agent := a2aTestAgent()
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: agent.Namespace},
+				Data:       map[string]string{a2aChartPodsConfigMapKey: tc.value},
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent), cm).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: tc.operatorNS}
+			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			quota := &corev1.ResourceQuota{}
+			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: a2aSessionQuotaName(agent)}, quota); err != nil {
+				t.Fatal(err)
+			}
+			want := int64(resolveA2AMaxSessions(agent)) + a2aStandingPods(agent) + tc.pods + a2aQuotaTransientMargin
+			if got := quota.Spec.Hard[corev1.ResourcePods]; got.Value() != want {
+				t.Errorf("quota pods = %d, want %d (chart pods %d)", got.Value(), want, tc.pods)
+			}
+			warned := false
+			for done := false; !done; {
+				select {
+				case e := <-rec.Events:
+					if strings.Contains(e, a2aChartPodsDiscardedReason) && strings.Contains(e, "ConfigMap "+a2aChartPodsConfigMapName) {
+						warned = true
+					}
+				default:
+					done = true
+				}
+			}
+			if warned != tc.warns {
+				t.Errorf("warned naming the ConfigMap = %v, want %v", warned, tc.warns)
+			}
+		})
 	}
 }
 

@@ -15,11 +15,12 @@ import (
 // (clusterprofiles.Broker.ClientConfig), for which client-go hands back
 // http.DefaultTransport (k8s.io/client-go/transport/cache.go). So every
 // profile cluster's lists and watches share the process's one pool of
-// HTTP/1.1 connections to the broker. On Go 1.27, net/http can leave a
-// response's reader parked on a pooled connection: when client-go stops a
-// watch the server ended with a 410, its Close races the reader's EOF, the
-// transport's post-close drain returns the connection to the pool, and the
-// reader stays parked on the connection's end-of-body channel. The next
+// HTTP/1.1 connections to the broker. On Go 1.27.0 and 1.27.1
+// (golang/go#81404), net/http can leave a response's reader parked on a
+// pooled connection: when client-go stops a watch the server ended with a
+// 410, its Close races the reader's EOF, the transport's post-close drain
+// returns the connection to the pool, and the reader stays parked on the
+// connection's end-of-body channel. The next
 // response on that connection, which may be another cluster's relist, wakes
 // the parked reader instead of its own and hangs until the connection closes,
 // up to the pool's 90-second idle timeout. Only a watch can be closed early
@@ -45,8 +46,11 @@ import (
 // 10), so the watch no longer queues behind the cluster's list pages. A
 // reflector opens a watch every 5-10 minutes, so it never comes near it.
 //
-// It can go once net/http hands each end-of-body signal to the reader of the
-// response it belongs to.
+// Go 1.27.2 fixes the race, and go.mod's toolchain line puts CI on a Go with
+// the fix, but the image builds set GOTOOLCHAIN=local, which ignores that
+// line: a golang builder image mirrored before Go 1.27.2 still builds the
+// watcher with the race. The twin can go once go.mod's go line is 1.27.2 or
+// later, since an older Go then refuses to build the module.
 func watchConfig(cfg *rest.Config) (*rest.Config, bool) {
 	if cfg.Transport != nil || cfg.WrapTransport != nil || cfg.Dial != nil || cfg.Proxy != nil {
 		return cfg, false
