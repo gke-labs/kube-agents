@@ -2095,7 +2095,7 @@ def render(summary: dict) -> str:
     if pool["stranded"] > 0:
         out.append(
             f"\n[!] The cap ({concurrency}) is below the pool ({pool['total']}): "
-            f"{pool['stranded']} project(s) can never be leased."
+            f"{pool['stranded']} project(s) are out of the presubmit's reach, the other jobs' room."
         )
 
     releasing = summary["releasing_leases"]

@@ -202,7 +202,6 @@ CAUSE_UNKNOWN = "UNKNOWN"
 # different (no build cluster; no live count). See `pool_cause_key`.
 QUEUE_UNREAD_KEY_SUFFIX = ":queue-unread"
 QUEUE_UNREAD_CAUSES = (CAUSE_CONTROL_PLANE, CAUSE_CONCURRENCY_CAP)
-CAUSE_CONTROL_PLANE_UNREAD = CAUSE_CONTROL_PLANE + QUEUE_UNREAD_KEY_SUFFIX
 # The cap message names the days the periodic breached on as month-day,
 # "11-05 and 11-06": the digit span after the year in the artifact's ISO day.
 DAY_MONTH_DAY = slice(5, None)
@@ -1054,9 +1053,16 @@ def pool_cause_text(pool: dict) -> str:
             )
         worst = pool.get("worst_s")
         waited = f"waited up to {wait_text(worst)}" if worst is not None else "waited past the limit"
-        # False is a queue Deck saw drained; None is a queue Deck did not see,
-        # and "nothing waits" would assert what nothing measured.
-        now = " Nothing waits now." if live is False else " The job could not read the queue, so this bot cannot say whether runs still wait."
+        # False is "no run past the p50 limit", not an empty queue: the live
+        # count says which. None is a queue Deck did not see, and "nothing
+        # waits" would assert what nothing measured.
+        waiting = pool.get("waiting")
+        if live is None or not isinstance(waiting, int):
+            now = " The job could not read the queue, so this bot cannot say whether runs still wait."
+        elif waiting:
+            now = f" {waiting} {plural(waiting, 'run waits', 'runs wait')} now, none past the limit."
+        else:
+            now = " Nothing waits now."
         return (
             f"*Smoke gate: queue* — presubmit runs {waited} on {days_text(pool.get('breached_days'))};"
             f" the presubmit was at its cap of {cap} slots.{now}"

@@ -1988,7 +1988,7 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
 
 def _worst_breached_minutes(trend: dict):
     """The longest wait among the days that breached, else the window's."""
-    days = [d for d in (trend.get("days") or []) if isinstance(d, dict) and d.get("breached")]
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
     worst = [d.get("worst_minutes") for d in days if isinstance(d.get("worst_minutes"), (int, float))]
     return max(worst) if worst else trend.get("worst_minutes")
 

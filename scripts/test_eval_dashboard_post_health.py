@@ -1017,9 +1017,11 @@ class PoolNote(RunHarness):
         # queue; decide() withholds a breach whose queue was seen drained.
         note = pool_note(cause="CONCURRENCY_CAP", free=5, max_concurrency=35, total=40, waiting=None, waiting_longest_s=None, over_threshold=0, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
         self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. The job could not read the queue, so this bot cannot say whether runs still wait.")
-        # Deck saw the queue drained: the same, and that nothing waits.
-        note = pool_note(cause="CONCURRENCY_CAP", free=35, max_concurrency=35, total=40, waiting_now=False, waiting_longest_s=None, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
+        # Deck saw no run past the limit: the live count says whether the
+        # queue is empty or merely short.
+        note = pool_note(cause="CONCURRENCY_CAP", free=35, max_concurrency=35, total=40, waiting_now=False, waiting=0, over_threshold=0, waiting_longest_s=None, worst_s=110 * 60, breached_days=["2026-11-05", "2026-11-06"])
         self.assertEqual(post_health.pool_cause_text(note), "*Smoke gate: queue* — presubmit runs waited up to 110 min on 11-05 and 11-06; the presubmit was at its cap of 35 slots. Nothing waits now.")
+        self.assertTrue(post_health.pool_cause_text(dict(note, waiting=3)).endswith("at its cap of 35 slots. 3 runs wait now, none past the limit."))
         self.assertEqual(post_health.days_text(["2026-11-05"]), "11-05")
         self.assertEqual(post_health.days_text(["2026-11-04", "2026-11-05", "2026-11-06"]), "11-04, 11-05 and 11-06")
         self.assertEqual(post_health.days_text([]), "recent days")
@@ -1117,10 +1119,11 @@ class PoolNote(RunHarness):
         self.assertEqual(self.recorded()["pool_verdict"], "STALE")
 
     def test_a_cause_that_changes_inside_an_episode_is_told_again(self):
-        # The cause picks the remedy and is recomputed from live occupancy every
-        # hour, so a week-long breach switches from "onboard a project" to
-        # "raise the cap" with the verdict unchanged. Only this message carries
-        # a remedy; the digest line and the Brief sentence are cause-free.
+        # The cause picks the message and is recomputed from live occupancy
+        # every hour, so a week-long breach switches from "onboard a project"
+        # to the cap's wait-and-cap line with the verdict unchanged. Only this
+        # message names a cause; the digest line and the Brief sentence are
+        # cause-free.
         self.tick(pooled(), self.at(10))
         self.tick(pooled(cause="CONCURRENCY_CAP"), self.at(11))
         self.assertEqual(len(self.opener.requests), 2)
