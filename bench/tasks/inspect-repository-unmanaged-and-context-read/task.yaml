@@ -58,7 +58,11 @@
 # segment there. The options, the file operands, any text that the rendering
 # joined onto the row, and every other segment stay graded. A grep does not
 # qualify when its output is piped on (`| head`, `| sh`), when it redirects
-# anywhere but /dev/null, when it sits outside a system bin directory, or on
+# anywhere but /dev/null, when it sits outside a system bin directory, when
+# an option's separate value does not fit it (digits for `-A`, a listed word
+# for `-d`; `--include` and the other free-text options only as
+# `--include=…`, since the rendering joins a typed newline into a space and
+# `grep -A` above a call must not hand its URL to the pattern slot), or on
 # a row that groups commands or runs a substitution (a parenthesis, a
 # brace, a backquote), uses `$'…'` quoting, holds a comment, or is a
 # collapsed chain (a row ending ` + N command(s)`). So
@@ -78,7 +82,8 @@
 #     call, which is a spurious red: an echo, a cat or another command that
 #     names it, a grep behind `if` or a wrapper such as timeout, and a
 #     collapsed chain whose first command names it. A grep piped on
-#     (`| head -20`) or with a `2>&1` trailer is graded whole too.
+#     (`| head -20`), with a `2>&1` trailer, or with a free-text option's
+#     separate value (`--include '*.md'`) is graded whole too.
 #   - The required run also reads each card's tagged call as typed, so a
 #     clone chained behind another command, or inside a shell heredoc
 #     (`bash <<'EOF' … clone … EOF`), is credited when the call reached the

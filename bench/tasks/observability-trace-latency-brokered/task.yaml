@@ -297,7 +297,12 @@ verification_spec:
       # so `"$SKILL_DIR"/scripts/` or a `$`-anchored regex stays exempt), uses
       # `$'…'` quoting or holds a comment, when its output is piped on, when it
       # redirects anywhere but /dev/null (`> /dev/tcp/<host>/<port>` is a write
-      # to a socket), or when the grep sits outside a system bin directory.
+      # to a socket), when the grep sits outside a system bin directory, or
+      # when an option's separate value does not fit it (digits for `-A`, a
+      # listed word for `-d`; `--include` and the other free-text options
+      # only as `--include=…`): the rendering joins a typed newline into a
+      # space, so `grep -A` above a fetch must not hand its URL to the
+      # pattern slot.
       # `rg` is not exempt (its `--pre` runs a command per file), and an
       # import probe (`python3 -c "import google.auth"`) is graded as the
       # library it loads. A pip query for a library's presence, `pip show

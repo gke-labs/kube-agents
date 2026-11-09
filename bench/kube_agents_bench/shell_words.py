@@ -370,6 +370,29 @@ _GREP_LONG_VALUE_FLAGS = frozenset((
     "--include", "--exclude", "--exclude-dir", "--exclude-from", "--directories", "--devices",
     "--label", "--binary-files",
 ))
+# The shape a value given as a separate word must have. A card log row joins a typed newline
+# into a space, so `grep -A` above a fetch reads as `grep -A curl <url>`: a value option that
+# took any word would hand the fetch's URL to the pattern slot, and the cut would remove it.
+_GREP_NUMBER_RE = re.compile(r"^\d+$")
+_GREP_SEPARATE_VALUE_SHAPES = {
+    "A": _GREP_NUMBER_RE,
+    "B": _GREP_NUMBER_RE,
+    "C": _GREP_NUMBER_RE,
+    "m": _GREP_NUMBER_RE,
+    "--after-context": _GREP_NUMBER_RE,
+    "--before-context": _GREP_NUMBER_RE,
+    "--context": _GREP_NUMBER_RE,
+    "--max-count": _GREP_NUMBER_RE,
+    "d": re.compile(r"^(?:read|skip|recurse)$"),
+    "--directories": re.compile(r"^(?:read|skip|recurse)$"),
+    "D": re.compile(r"^(?:read|skip)$"),
+    "--devices": re.compile(r"^(?:read|skip)$"),
+    "--binary-files": re.compile(r"^(?:binary|text|without-match)$"),
+}
+# Options whose value is free text: only the `--name=value` form, which takes no other word.
+_GREP_GLUED_ONLY_FLAGS = frozenset(("--include", "--exclude", "--exclude-dir", "--exclude-from", "--label"))
+_GREP_PATTERN_FLAGS = frozenset(("e", "--regexp"))
+_GREP_FILE_FLAGS = frozenset(("f", "--file"))
 _GREP_QUIET_REDIRECT_RE = re.compile(r"^(?:[12]?>|&>)$")
 _GREP_QUIET_TARGET = "/dev/null"
 _COLLAPSED_ROW_RE = re.compile(r"\s\+\s\d+\scommands?\s*$")
@@ -393,6 +416,10 @@ def _raw_words(command: str) -> list[tuple[str | None, int, int, bool]] | None:
     i, n = 0, len(command)
     while i < n:
         char = command[i]
+        if command.startswith(_SHELL_ESCAPE_CHAR + _SHELL_LINE_END, i):
+            # A line continuation: bash removes the pair before it reads a word.
+            i += 2
+            continue
         if char in " \t\r\f\v":
             i += 1
             continue
@@ -412,6 +439,8 @@ def _raw_words(command: str) -> list[tuple[str | None, int, int, bool]] | None:
                     runs = True
                 break
             if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+                # An escaped character, or a line continuation inside the word, which bash
+                # removes and so joins the word across it.
                 i += 2
                 continue
             if char == quote:
@@ -526,34 +555,39 @@ def _grep_patterns(words: list[tuple[str | None, int, int, bool]]) -> list[tuple
             index += 2
             continue
         if take is not None:
-            if take == "pattern":
+            if take in _GREP_PATTERN_FLAGS:
                 patterns.append((start, end))
+            elif take in _GREP_SEPARATE_VALUE_SHAPES and not _GREP_SEPARATE_VALUE_SHAPES[take].match(text.strip("'\"")):
+                return None
             take = None
         elif not options_over and text == _SHELL_OPTIONS_END:
             options_over = True
         elif not options_over and text.startswith("--"):
-            name, has_value, value = text.partition("=")
-            if name in ("--regexp", "--file"):
+            name, has_value, _ = text.partition("=")
+            if name in _GREP_PATTERN_FLAGS or name in _GREP_FILE_FLAGS:
                 from_flags = True
-                if name == "--regexp" and has_value:
+                if name in _GREP_PATTERN_FLAGS and has_value:
                     patterns.append((start + len(name) + 1, end))
             if name in _GREP_LONG_VALUE_FLAGS and not has_value:
-                take = "pattern" if name == "--regexp" else "value"
+                if name in _GREP_GLUED_ONLY_FLAGS:
+                    return None
+                take = name
         elif not options_over and text.startswith("-") and len(text) > 1:
             for offset, flag in enumerate(text[1:], start=1):
                 if flag in _GREP_SHORT_VALUE_FLAGS:
-                    if flag in "ef":
+                    if flag in _GREP_PATTERN_FLAGS or flag in _GREP_FILE_FLAGS:
                         from_flags = True
-                    rest = text[offset + 1:]
-                    if rest:
-                        if flag == "e":
+                    if text[offset + 1:]:
+                        if flag in _GREP_PATTERN_FLAGS:
                             patterns.append((start + offset + 1, end))
                     else:
-                        take = "pattern" if flag == "e" else "value"
+                        take = flag
                     break
         elif positional is None and not from_flags:
             positional = (start, end)
         index += 1
+    if take is not None:
+        return None
     if from_flags:
         return patterns
     return [positional] if positional else []

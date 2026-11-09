@@ -2752,7 +2752,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     holds no token may ``grep`` for the word before running it. With this set,
     the verifier cuts each grep's pattern argument (each ``-e``/``--regexp``
     value, or else the first word after the options) out of the text the
-    forbidden list reads, and grades the rest: the options, the file operands,
+    forbidden list reads, and grades the rest. A value given as a separate word
+    must fit its option (digits for ``-A``, a listed word for ``-d``; the
+    free-text options only as ``--include=…``), since a card log row joins a
+    typed newline into a space and ``grep -A`` above a fetch would otherwise
+    hand the fetch's URL to the pattern slot. It grades: the options, the file operands,
     and every other segment of the line (:func:`grep_pattern_spans`). It
     decides on the line's shell segments, not a regex over the row, so an
     operator glued to the pattern (``grep x;curl …``) ends the segment as it
@@ -2762,8 +2766,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     nor does any grep on a row that groups commands, runs a substitution,
     quotes with ``$'…'``, holds a comment or is a collapsed chain. The pattern
     exemptions read the row first, and the grep cut reads what they left. The
-    required list reads the rest of a grep-cut command (a clone beside a grep
-    still runs the clone), and the reason counts the command as exempted.
+    required runs read the rest of a grep-cut command (a clone beside a grep
+    still runs the clone); the required patterns, which read text, leave the
+    command out, as they leave out one a pattern exemption touched. The reason
+    counts the command as exempted.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2772,8 +2778,10 @@ class WorkerCommandsVerifier(BaseVerifier):
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
-    A command an exemption touched is out of the required runs as it is out
-    of the required patterns; the forbidden runs read every command as typed.
+    A command a pattern exemption touched is out of the required runs as it is
+    out of the required patterns; a grep-cut command is read by the runs with
+    its pattern arguments removed. The forbidden runs read every command as
+    typed.
 
     ``after_result_pattern`` makes the forbidden set order-aware, for a
     retry-after-refusal check (#2173): the defect is a write after the policy
@@ -3056,15 +3064,18 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         # The grep exemption removes only grep's pattern arguments, so the
-        # required list reads the rest of that command (a clone piped into a
-        # grep still runs the clone); a command a pattern exemption touched is
-        # out of it.
+        # required runs read the rest of that command (a clone piped into a
+        # grep still runs the clone); the required patterns, which read text,
+        # leave out any command an exemption touched, so a grep's file operand
+        # is never credited as a run, and the runs leave out a command a
+        # pattern exemption touched.
         with_calls = typed + beside_rows
         commands = [self._without_grep_patterns(c) for c in with_calls if self._without_pattern_exemptions(c) == c]
-        touched = sum(1 for c in with_calls if self._without_exempt_text(c) != c)
+        untouched = [c for c in with_calls if self._without_exempt_text(c) == c]
+        touched = len(with_calls) - len(untouched)
         exempted = f" ({touched} exempted)" if touched else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
-        missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
+        missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in untouched)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]

@@ -892,6 +892,24 @@ def test_worker_commands_exempt_command_does_not_satisfy_a_required_pattern():
     assert "across 0 command(s) (1 exempted)" in res.reason
 
 
+def test_worker_commands_grep_cut_command_satisfies_runs_but_not_text_patterns():
+    # The grep exemption cuts only the pattern argument. The required runs
+    # read the rest (a helper run piped into a grep still ran), but a text
+    # required pattern leaves the command out, so a grep's file operand is
+    # never credited as the helper.
+    _stash_commands(["grep -rn foo /opt/defaults/skills/scripts/helper.py"])
+    v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"helper\.py"], exempt_grep_patterns=True)
+    res = v.verify(5.0)
+    assert res.status == "fail" and not res.success, res.reason
+    assert "(1 exempted)" in res.reason
+    _stash_commands(["python3 /opt/defaults/skills/scripts/helper.py --check | grep -c ok"])
+    v = WorkerCommandsVerifier(
+        type="worker_commands", required_runs=[{"script": "helper.py", "flags": ["--check"]}], exempt_grep_patterns=True
+    )
+    res = v.verify(5.0)
+    assert res.status == "pass" and res.success, res.reason
+
+
 def test_worker_commands_is_registered_under_its_type():
     assert "worker_commands" in VERIFIERS
 

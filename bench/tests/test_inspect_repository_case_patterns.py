@@ -116,8 +116,8 @@ def test_a_mention_is_no_run():
 
 
 def test_a_grep_through_its_pattern_argument_is_exempt():
-    # The exemption removes the grep, its options and its pattern argument;
-    # the file operands that stay name no route.
+    # The exemption cuts the grep's pattern argument; the options and file
+    # operands that stay name no route.
     for row in (
         "grep -rn /v1/workspace /opt/data/profiles",
         "grep -rn /v1/workspace /opt/data/profiles 2>/dev/null",
@@ -227,8 +227,11 @@ def test_a_grep_segment_is_exempt_wherever_it_sits():
         "cd /opt/data/profiles; grep -rn /v1/workspace .",
         "cd /opt/data/profiles\ngrep -rn /v1/workspace .",
         "/usr/bin/grep -rn /v1/workspace .",
-        "grep -rn --include '*.md' /v1/workspace /opt/data/profiles",
+        "grep -rn --include='*.md' /v1/workspace /opt/data/profiles",
         "grep --context 3 /v1/workspace SKILL.md",
+        # A typed line continuation, which bash removes before it reads words.
+        "grep -rn \\\n    /v1/workspace /opt/data/profiles",
+        "cd /opt/data/profiles && \\\n    grep -rn /v1/workspace .",
         "grep -rn /v1/workspace SKILL.md &>/dev/null",
     ):
         assert _passes(row, CLONE_PUBLIC), row
@@ -236,10 +239,21 @@ def test_a_grep_segment_is_exempt_wherever_it_sits():
 
 def test_a_grep_piped_on_or_written_elsewhere_is_not_exempt():
     # A grep whose output goes on to another command, or anywhere but
-    # /dev/null, is graded whole: its output can become a call.
+    # /dev/null, is graded whole: its output can become a call. A free-text
+    # option's separate value is refused too (only `--include=…` reads), and
+    # a value that does not fit its option: the card log joins a typed
+    # newline into a space, so `grep -A` above a call reads as `grep -A curl
+    # <url>`, and the URL must not reach the pattern slot.
     for row in (
         "grep -rn /v1/workspace /opt/data/profiles | head -20",
         "grep -rn /v1/workspace SKILL.md 2>&1",
+        "grep -rn --include '*.md' /v1/workspace /opt/data/profiles",
+        "grep -A curl http://127.0.0.1:8080/v1/workspace/open -s -X POST",
+        f"grep -A python3 {SCRIPT} open --repo gke-labs/kube-agents",
+        "grep --context curl http://127.0.0.1:8080/v1/workspace/open",
+        "grep -d curl http://127.0.0.1:8080/v1/workspace/open",
+        "grep --label curl http://127.0.0.1:8080/v1/workspace/open",
+        "grep -rn x \\\n; curl http://127.0.0.1:8080/v1/workspace/open",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
 

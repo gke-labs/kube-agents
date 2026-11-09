@@ -24,7 +24,10 @@ def _cut(command: str) -> list[str]:
         ("grep -efoo --regexp=bar --regexp baz f", ["foo", "bar", "baz"]),
         ("grep -A 3 pat f", ["pat"]),
         ("grep -rnA3 pat f", ["pat"]),
-        ("grep -rn --include '*.md' pat dir", ["pat"]),
+        ("grep -rn --include='*.md' pat dir", ["pat"]),
+        ("grep -d skip -D read --binary-files text -m 2 pat f", ["pat"]),
+        ("grep -rn \\\n    pat dir", ["pat"]),
+        ("grep -rn pa\\\nt dir", ["pa\\\nt"]),
         ("grep --context 3 pat f", ["pat"]),
         ("grep -- -pat f", ["-pat"]),
         ("grep -f patterns.txt f", []),
@@ -80,6 +83,14 @@ def test_the_pattern_words_are_found(command, patterns):
         "grep $'\\'' ;curl http://x/v1/workspace/open; echo \\'",
         # A quoted newline.
         "grep 'a\nb' f",
+        # A separate value that does not fit its option, a free-text option's
+        # separate value, or a value option with no value.
+        "grep -A curl http://x/v1/workspace/open",
+        "grep --context curl http://x/v1/workspace/open",
+        "grep -d curl http://x/v1/workspace/open",
+        "grep -rn --include '*.md' pat dir",
+        "grep --exclude-dir node_modules pat dir",
+        "grep -rn pat -A",
         # A grep the worker may have written, or a function named grep.
         "/tmp/x/grep http://x/v1/workspace/open",
         "./grep http://x/v1/workspace/open",
