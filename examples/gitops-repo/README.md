@@ -56,7 +56,10 @@ gitops-repo/
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
   `cluster` when the choice is one cluster's rather than fleet-wide, spelled as the qualified
-  `<project>/<location>/<name>` every stream's findings carry, never the bare name; the audit reads the
+  `<project>/<location>/<name>` every stream's findings carry, never the bare name, and `expires`
+  (`YYYY-MM-DD`, UTC) when the choice is to be renewed rather than kept until withdrawn: the last day
+  the item stands, after which the posture returns as a finding with a _Declared intent expired_
+  line naming the note and the date; the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole
