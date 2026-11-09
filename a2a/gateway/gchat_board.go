@@ -51,8 +51,11 @@ const (
 	// message's text. The line is the row's place when the message was laid
 	// out, and holds while edits keep the line count, which the adapter's
 	// own do (a tap's line goes on the row's line; an answer's line goes
-	// after the text), so a tap checks that its line still starts with the
-	// row's marker before it acts.
+	// after the text). A tap edits by the line of the card the adapter
+	// remembers, whose own button for the row is current through a
+	// re-layout that kept the row but shifted it, and by its own line when
+	// there is no record; either way the line must still start with the
+	// row's marker before the tap acts (gchatBoardRowOf).
 	gchatBoardFunction      = "kage.board"
 	gchatBoardParamAction   = "action"
 	gchatBoardParamRow      = "row"
@@ -282,7 +285,7 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	if !remembered {
 		layout = gchatEventLayout(ev.Message)
 	}
-	if ux.boardMoved[message] || !gchatBoardRowHolds(layout, n, tasks) || !gchatBoardRowShown(layout, n, line) {
+	if _, ok := gchatBoardRowOf(layout, remembered, gchatBoardRow{n: n, line: line}, tasks); ux.boardMoved[message] || !ok {
 		a.mu.Unlock()
 		return gchatBoardStale
 	}
@@ -315,8 +318,9 @@ func gchatBoardLineOf(raw string) (line int, ok bool) {
 	return line, err == nil && line >= 0
 }
 
-// gchatBoardRow is the row a tap names: its number as drawn, and its line
-// in the text as the button carries it (gchatBoardNoLine for none).
+// gchatBoardRow is a row by its number as drawn and its line in the text:
+// the one a tap's button names, or the one a tap edits (gchatBoardRowOf).
+// line is gchatBoardNoLine for a button that carries none.
 type gchatBoardRow struct {
 	n, line int
 }
@@ -333,8 +337,8 @@ type gchatBoardClaim struct {
 // again. The release comes after the edit, under the message's rewrite lock,
 // so a second tap cannot edit the row before the first has drawn its line
 // and then have that line drawn over it.
-func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, row gchatBoardRow, tasks []string, name string, actor BoardActor) {
-	message, n := ev.Message.Name, row.n
+func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, verb string, tap gchatBoardRow, tasks []string, name string, actor BoardActor) {
+	message, n := ev.Message.Name, tap.n
 	ctx, cancel := context.WithTimeout(context.Background(), slackBoardTimeout)
 	defer cancel()
 	res, err := actor(ctx, lib.BoardAction{Action: verb, Tasks: tasks, By: name})
@@ -351,11 +355,14 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	// again in it (trackBoard frees the claims and replaces or drops the
 	// record): the outcome belongs to the row the tap named, not to
 	// whatever is row n now, so it is drawn only where that row, with those
-	// cards, still is, on the line the tap's button named. A message marked
-	// as laid out without rows is such a message, and the tap's own copy of
-	// it (the click's) is stale. A message with no record, never remembered
-	// (posted before a restart) or forgotten since the tap was taken (an
-	// edit that failed, below), is read from that copy.
+	// cards, still is: on the line the remembered card's own button gives
+	// it, which a re-layout that kept the row but shifted it has moved, or
+	// the line the tap's button named when there is no record
+	// (gchatBoardRowOf). A message marked as laid out without rows is such a
+	// message, and the tap's own copy of it (the click's) is stale. A
+	// message with no record, never remembered (posted before a restart) or
+	// forgotten since the tap was taken (an edit that failed, below), is
+	// read from that copy.
 	if moved {
 		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
@@ -364,7 +371,8 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	if !remembered {
 		base = gchatEventLayout(ev.Message)
 	}
-	if !gchatBoardRowHolds(base, n, tasks) {
+	row, ok := gchatBoardRowOf(base, remembered, tap, tasks)
+	if !ok {
 		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
 		return
@@ -462,11 +470,29 @@ func gchatBoardRowLayout(layout gchatChatLayout, row gchatBoardRow, line string,
 	return gchatChatLayout{Text: strings.Join(lines, "\n"), Widgets: widgets}, nil
 }
 
-// gchatBoardRowShown reports whether layout's text shows the row where the
-// tap's button put it (gchatBoardRowIndex).
-func gchatBoardRowShown(layout gchatChatLayout, n, line int) bool {
-	_, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), gchatBoardRow{n: n, line: line})
-	return ok
+// gchatBoardRowOf is the row a tap on tap's row edits in layout, and
+// whether layout holds it: row n with those cards still drawing its buttons
+// (gchatBoardRowHolds), on a line that starts with its marker
+// (gchatBoardRowIndex). The line is taken in this order: the one layout's
+// own button for the row carries when the layout is remembered, since that
+// is the card this process last sent and a re-layout that kept the row but
+// shifted it moved the button's line with it; the tap's own line otherwise
+// (a copy read back from the click, after a restart, whose buttons are the
+// tap's); and, when neither carries one, the line the text's rows block
+// gives (gchatBoardRowsBlock, for buttons drawn before the parameter).
+func gchatBoardRowOf(layout gchatChatLayout, remembered bool, tap gchatBoardRow, tasks []string) (gchatBoardRow, bool) {
+	held, holds := gchatBoardRowHolds(layout, tap.n, tasks)
+	if !holds {
+		return gchatBoardRow{}, false
+	}
+	row := tap
+	if remembered && held != gchatBoardNoLine {
+		row.line = held
+	}
+	if _, ok := gchatBoardRowIndex(strings.Split(layout.Text, "\n"), row); !ok {
+		return gchatBoardRow{}, false
+	}
+	return row, true
 }
 
 // gchatBoardRowIndex is the index in lines of the row's line: the one its
@@ -493,9 +519,10 @@ func gchatBoardRowIndex(lines []string, row gchatBoardRow) (int, bool) {
 
 // gchatBoardRowHolds reports whether layout still draws row n's buttons for
 // tasks: a kage.board button whose row is n and whose cards are tasks, in
-// order. A settled row has none, and a message laid out again has other
-// rows or other cards.
-func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) bool {
+// order; and the line that button carries, gchatBoardNoLine when it carries
+// none or one that is no index. A settled row has none, and a message laid
+// out again has other rows or other cards.
+func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) (line int, holds bool) {
 	row, joined := strconv.Itoa(n), strings.Join(tasks, gchatBoardTaskSeparator)
 	for _, w := range layout.Widgets {
 		list, _ := w[gchatButtonListKey].(map[string]any)
@@ -503,11 +530,14 @@ func gchatBoardRowHolds(layout gchatChatLayout, n int, tasks []string) bool {
 		for _, b := range buttons {
 			if gchatButtonFunction(b) == gchatBoardFunction && gchatButtonParam(b, gchatBoardParamRow) == row &&
 				gchatButtonParam(b, gchatBoardParamTasks) == joined {
-				return true
+				if line, ok := gchatBoardLineOf(gchatButtonParam(b, gchatBoardParamLine)); ok {
+					return line, true
+				}
+				return gchatBoardNoLine, true
 			}
 		}
 	}
-	return false
+	return gchatBoardNoLine, false
 }
 
 // gchatBoardRowsBlock finds the rows in a laid-out text for a button that
