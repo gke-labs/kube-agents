@@ -6,20 +6,26 @@
 # static cluster & GCP IAM setup for fast re-use across PR runs. The agent's
 # pull requests are swept elsewhere; see below.
 #
-# One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
-# created) plus a CRD delete, since the chart leaves CRDs behind by Helm's own
-# design, plus an unconditional label sweep of every cluster-scoped and
-# namespaced kind the chart or the operator can create *with the part-of label*
+# First a sweep of what a bench case's stack planted on the host and a killed
+# run left behind (hack/ci_sweep_bench_plants.sh: the kinds a stack labels
+# managed-by=kube-agents-bench, and the node pools whose resource labels
+# carry the pair), which depends on nothing the release owns and runs ahead
+# of the uninstall so a planted admission hook cannot refuse the steps after
+# it. Then one `helm uninstall` (the release owns every Kubernetes object
+# ci-deploy.sh created) plus a CRD delete, since the chart leaves CRDs behind
+# by Helm's own design, plus an unconditional label sweep of every
+# cluster-scoped and namespaced kind the chart or the operator can create
+# *with the part-of label*
 # — because a run killed mid-install leaves objects with no Helm release record
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
-# project's next lease (#1006). Step 4 names the kinds the label cannot reach.
+# project's next lease (#1006). Step 5 names the kinds the label cannot reach.
 #
 # Step 0 asks Boskos whether the project is still this run's before any of
 # it: a run that outlived its lease finds its project free or leased to
 # another run, and whatever is installed there is not its to remove (#3129).
 #
 # One step is conditional. The CRD delete runs when a release record outlives
-# Step 1, which needs its CRDs or the next lease can neither uninstall nor
+# Step 2, which needs its CRDs or the next lease can neither uninstall nor
 # upgrade over it (#1172). The agent's leftover pull requests are not this
 # script's to close: that takes a write credential, and a presubmit runs the
 # pull request's own code, so the sweep runs from a periodic that executes only
@@ -30,7 +36,7 @@
 
 set -uo pipefail
 
-# The release ci-deploy.sh installs; Step 1 uninstalls it and, when that
+# The release ci-deploy.sh installs; Step 2 uninstalls it and, when that
 # fails, falls back on deleting its record Secrets by the label pair Helm
 # stamps on every record it writes (`owner=helm` plus `name=<release>`) —
 # selecting every revision's record of this release and nothing else in the
@@ -50,11 +56,16 @@ readonly SECRET_NAME_PREFIX_RE='^secret/'
 # defaults to waiting forever, and deleting a CRD blocks on
 # customresourcecleanup.apiextensions.k8s.io until every CR of that kind is
 # gone — which a PlatformAgent finalizer no live operator can clear never is.
-# Unbounded, that hangs teardown until Prow's job timeout and Steps 3 and 4
+# Unbounded, that hangs teardown until Prow's job timeout and Steps 4 and 5
 # never run, leaving exactly the orphans they exist to sweep. Five minutes is
 # well clear of the 206s a healthy-but-slow delete has been observed to take.
 readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 readonly CRD_DELETE_TIMEOUT="5m"
+# The bench plant sweep Step 1 runs, relative to the checkout like
+# CHART_CRD_DIR. The override exists for the lifted-step tests, which run the
+# steps under stub kubectl and helm on the developer's PATH: pointed at a
+# recording stub, the real script never reaches a real gcloud from a test.
+readonly BENCH_PLANT_SWEEP_SCRIPT="${CI_TEARDOWN_BENCH_SWEEP_SCRIPT:-hack/ci_sweep_bench_plants.sh}"
 
 # Exit nonzero when any step failed; default off so the Prow wrapper still
 # reaches its Boskos release — the honest signal is the ✗ lines and the final
@@ -62,7 +73,7 @@ readonly CRD_DELETE_TIMEOUT="5m"
 # overrides, and the step tests lift `readonly ` head lines along.
 readonly CI_TEARDOWN_STRICT="${CI_TEARDOWN_STRICT:-0}"
 
-# Bounds for the sweep deletes in Steps 3 and 4 (Steps 1 and 2 carry their
+# Bounds for the sweep deletes in Steps 4 and 5 (Steps 2 and 3 carry their
 # own budgets above). --timeout bounds the wait-for-deletion phase; the
 # request timeout bounds each API call, the phase an unreachable control
 # plane hangs — where the 2026-09-01 incident spent 546s.
@@ -205,7 +216,25 @@ finish_step() { # <name> <exit-status>
 }
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agents release ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Sweeping bench plants ==="
+# What a bench case's stack planted on the host cluster and a killed run left
+# behind: webhook configurations, node readiness rules, compute classes and
+# node pools labelled managed-by=kube-agents-bench (bench/README.md,
+# "Certification suite", fixture rule 5). A run killed between its stack's
+# apply and destroy runs no destroy; a leftover class or hook is read by the
+# next lease's audits and a leftover pool bills. First, because nothing here
+# belongs to the release and a planted admission hook must not refuse the
+# deletes after it. The script is dry-run by default; --delete acts. Its exit
+# is 1 when a leg failed after every leg ran, which finish_step counts. Not
+# the namespaces a stack plants: each stack's own pre-clear removes its
+# leftover by name, and a namespace leg would reach every nightly stack.
+BENCH_SWEEP_STATUS=0
+"${BENCH_PLANT_SWEEP_SCRIPT}" --project "${PROJECT_ID}" --cluster "${CLUSTER_NAME}" \
+  --location "${REGION}" --delete || BENCH_SWEEP_STATUS=$?
+finish_step "Bench plant sweep" "${BENCH_SWEEP_STATUS}"
+
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Uninstalling the kube-agents release ==="
 # The chart's pre-delete hook removes the PlatformAgent CR and waits for the
 # operator to clear its finalizer, so one uninstall replaces the old
 # per-step teardown scripts (09 LiteLLM, 08 CR, 07 secrets, 03 operator).
@@ -255,9 +284,9 @@ fi
 finish_step "Release uninstall" "${UNINSTALL_STATUS}"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Deleting CRDs ==="
 # Helm leaves crds/ objects behind by design; a PR evaluation cluster should
-# not accumulate them. Only when no release record survived Step 1, though.
+# not accumulate them. Only when no release record survived Step 2, though.
 # Both of Helm's routes over a surviving record need the CRDs: `uninstall`
 # resolves a REST mapping for every object in the stored manifest, which
 # contains a PlatformAgent, and `upgrade` never reinstalls crds/. Delete them
@@ -275,14 +304,14 @@ PROBE_ERROR_LOG="$(mktemp)"
 if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
   -l "${HELM_RELEASE_SECRET_SELECTOR}" -o name 2>"${PROBE_ERROR_LOG}")"; then
   if [ -n "${RELEASE_RECORD_NAMES}" ]; then
-    echo "WARNING: a ${HELM_RELEASE_NAME} release record survived Step 1; keeping the CRDs so the next lease's Helm can read its own manifest (#1172)"
-    CRD_STEP_RESULT="skipped, release record survived Step 1"
+    echo "WARNING: a ${HELM_RELEASE_NAME} release record survived Step 2; keeping the CRDs so the next lease's Helm can read its own manifest (#1172)"
+    CRD_STEP_RESULT="skipped, release record survived Step 2"
   elif kubectl delete -f "${CHART_CRD_DIR}" --ignore-not-found --timeout "${CRD_DELETE_TIMEOUT}" \
     --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"; then
     CRD_STEP_RESULT="deleted"
   else
     # Bounded rather than hung: the CRDs may be left Terminating, which the
-    # next lease's fresh install can still collide with, but Steps 3 and 4
+    # next lease's fresh install can still collide with, but Steps 4 and 5
     # now run and the log says which happened.
     echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; continuing so the sweeps still run (#1172)"
     CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}"
@@ -300,10 +329,10 @@ rm -f "${PROBE_ERROR_LOG}"
 finish_step "CRD step (${CRD_STEP_RESULT})" "${CRD_STEP_STATUS}"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kube-agents resources ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Sweeping cluster-scoped kube-agents resources ==="
 # Belt-and-braces sweep, independent of Helm release state (#1006). A run
 # killed mid-install or mid-teardown can leave cluster-scoped objects behind
-# with no release record for Step 1's `helm uninstall` to act on — and Helm
+# with no release record for Step 2's `helm uninstall` to act on, and Helm
 # then refuses to adopt them on the project's next lease ("invalid ownership
 # metadata"), failing every subsequent PR that Boskos hands this project.
 # Namespace deletion never catches these: they are cluster-scoped by
@@ -315,7 +344,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kub
 # credential-broker TokenReview pair in platformagent_controller.go). All of
 # them carry app.kubernetes.io/part-of=kube-agents — the label contract in
 # docs/site/src/content/docs/reference/resource-labels.md — except the CRDs,
-# which Step 2 already deletes by file because Helm's crds/ convention installs
+# which Step 3 already deletes by file because Helm's crds/ convention installs
 # them unlabelled.
 #
 # One kind per call, failures counted but never fatal: an API group missing
@@ -366,20 +395,20 @@ sweep_kinds() { # <label> <namespace-or-""> <kind...>
 sweep_kinds "Cluster-scoped sweep" "" "${SWEEP_KINDS[@]}"
 
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Sweeping namespaced kube-agents resources ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Sweeping namespaced kube-agents resources ==="
 # The same sweep, one scope down, for the same reason: once the release stops
 # accounting for a namespaced object, nothing else deletes it. Teardown never
 # deletes the kubeagents-system namespace, and the operator's children are
-# reaped by owner-reference GC, which stops resolving owners as soon as Step 2
+# reaped by owner-reference GC, which stops resolving owners as soon as Step 3
 # removes the PlatformAgent CRD.
 #
-# Same selector as Step 3: every object the operator creates is stamped with
+# Same selector as Step 4: every object the operator creates is stamped with
 # app.kubernetes.io/part-of=kube-agents — through applyManaged, or, on the two
 # paths that bypass it, through withCommonLabels on the PVC and commonLabels
 # handed to ReconcileServiceAccount. Helm's release records are Secrets
 # labelled owner=helm carrying none of the chart's labels, so this sweep cannot
-# delete one — whether a record survives stays Step 1's decision. The chart's
-# own CRs are absent for the same reason: on the delete path Step 2 takes them
+# delete one; whether a record survives stays Step 2's decision. The chart's
+# own CRs are absent for the same reason: on the delete path Step 3 takes them
 # with their CRDs, and on the keep path they are what the next lease upgrades
 # over.
 #

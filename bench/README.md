@@ -188,7 +188,7 @@ block. The lane's record is its logs bucket, read by the page per case, release 
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Four rules hold for every fixture a certification case plants, enforced in review until a
+Five rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -205,6 +205,19 @@ validator check lands with the first stack that needs it:
 4. A declared-gap fixture plants a signal the agent's read role reaches (a webhook configuration's
    CA bundle, an object's condition, an event), never a Secret: agents hold no Secret access, so a
    gap recorded on one could never close.
+5. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
+   labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
+   only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
+   labels (a network, a subnetwork, a backend service, a health check, a service attachment)
+   carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
+   on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
+   start and end against the host cluster's webhook configurations, node readiness rules,
+   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes addresses, subnets,
+   networks and alert policies today; forwarding rules, service attachments, backend services,
+   health checks and clusters wait on a sibling change to that script and its sweeper role.
+   `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
+   the sweeps never read it. A plant without its mark survives a killed run until someone
+   deletes it by hand.
 
 ## Portal CUJ evaluations
 

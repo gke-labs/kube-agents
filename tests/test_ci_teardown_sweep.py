@@ -22,7 +22,7 @@ object the release stops accounting for: teardown never deletes the namespace,
 and owner-reference GC stops resolving owners once the PlatformAgent CRD goes.
 The three properties above apply to it, plus one — it must select by the
 part-of label and leave Helm's release-record Secrets, labelled owner=helm,
-alone. Whether a record survives is Step 1's decision.
+alone. Whether a record survives is Step 2's decision.
 
 The steps are lifted from the script's own text and executed under bash with
 stubbed kubectl/helm, so the assertions are against the code that ships
@@ -96,9 +96,16 @@ _SWEPT_NAMESPACED_KINDS = (
 
 _NAMESPACE = "kubeagents-system"
 _SELECTOR = "app.kubernetes.io/part-of=kube-agents"
-# Step 1's fallback selects release records by Helm's own labels. Named here so
+# Step 2's fallback selects release records by Helm's own labels. Named here so
 # the sweep test can assert the two selectors never converge.
 _RECORD_SELECTOR = "owner=helm,name=kube-agents"
+
+# The lane values Step 1 hands the bench plant sweep, and the recording stub
+# that stands in for the sweep script under the lift.
+_PROJECT = "kube-agents-evals-7"
+_CLUSTER = "platform-agent-host"
+_REGION = "us-east4"
+_BENCH_SWEEP_STUB = "bench-sweep"
 
 
 def _teardown_steps():
@@ -132,7 +139,15 @@ class CiTeardownSweepTest(unittest.TestCase):
             bin_dir.mkdir()
             log = tmp_path / "kubectl.log"
             log.touch()
-            for tool, code in (("kubectl", kubectl_exit), ("helm", helm_exit)):
+            # The bench plant sweep (Step 1) is a sibling script that calls
+            # gcloud; lifted, it runs as a recording stub, so the real script
+            # never reaches the developer's gcloud from here. Its own tests
+            # are tests/test_ci_sweep_bench_plants.py.
+            for tool, code in (
+                ("kubectl", kubectl_exit),
+                ("helm", helm_exit),
+                (_BENCH_SWEEP_STUB, 0),
+            ):
                 stub = bin_dir / tool
                 stub.write_text(
                     "#!/usr/bin/env bash\n"
@@ -141,15 +156,23 @@ class CiTeardownSweepTest(unittest.TestCase):
                     encoding="utf-8",
                 )
                 stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
-            # set -uo pipefail mirrors the script's own header; NAMESPACE is
-            # the one variable the lifted steps read that the head sets.
+            # set -uo pipefail mirrors the script's own header; NAMESPACE and
+            # the three lane variables Step 1 passes on are what the lifted
+            # steps read that the head sets.
             proc = subprocess.run(
                 ["bash", "-c", "set -uo pipefail\n" + _teardown_steps()],
                 capture_output=True,
                 text=True,
                 cwd=_REPO_ROOT,
                 env=get_isolated_test_env(
-                    bin_dir=bin_dir, overrides={"NAMESPACE": "kubeagents-system"}
+                    bin_dir=bin_dir,
+                    overrides={
+                        "NAMESPACE": "kubeagents-system",
+                        "PROJECT_ID": _PROJECT,
+                        "CLUSTER_NAME": _CLUSTER,
+                        "REGION": _REGION,
+                        "CI_TEARDOWN_BENCH_SWEEP_SCRIPT": str(bin_dir / _BENCH_SWEEP_STUB),
+                    },
                 ),
             )
             calls = log.read_text(encoding="utf-8").splitlines()
@@ -184,6 +207,26 @@ class CiTeardownSweepTest(unittest.TestCase):
                 argv = call.split()
                 self.assertIn("-l", argv, f"unselectored delete of {kind}: {call}")
                 self.assertIn(_SELECTOR, argv)
+
+    # --- (a') the bench plant sweep runs first, armed, whatever follows ------
+
+    def test_bench_plant_sweep_runs_first_with_delete_and_the_lane_values(self):
+        """Step 1 hands the sibling script the lease's project, cluster and
+        location with --delete, before the uninstall, and still when every
+        kubectl and helm call after it fails: a planted admission hook or a
+        leftover pool must not wait on the release's own state."""
+        rc, calls, err = self._run_steps(kubectl_exit=1, helm_exit=1)
+        self.assertEqual(rc, 0, err)
+        sweeps = [c for c in calls if c.startswith(f"{_BENCH_SWEEP_STUB} ")]
+        self.assertEqual(len(sweeps), 1, calls)
+        argv = sweeps[0].split()
+        for flag, value in (("--project", _PROJECT), ("--cluster", _CLUSTER), ("--location", _REGION)):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, argv)
+                self.assertEqual(argv[argv.index(flag) + 1], value)
+        self.assertIn("--delete", argv)
+        first_helm = next(i for i, c in enumerate(calls) if c.startswith("helm "))
+        self.assertLess(calls.index(sweeps[0]), first_helm, calls)
 
     # --- (b) reachability after earlier failures ---------------------------
 
@@ -256,7 +299,7 @@ class CiTeardownSweepTest(unittest.TestCase):
         """Helm's records are Secrets, and the sweep deletes Secrets. It must
         select them by the chart's part-of label — which no record carries —
         and never by owner=helm, which every record carries. Whether a record
-        survives is Step 1's decision (#1180), not this sweep's.
+        survives is Step 2's decision (#1180), not this sweep's.
 
         Run with a red helm deliberately. That is the only path on which Step
         1's fallback issues its own `kubectl delete secret -l owner=helm,...`,
@@ -264,7 +307,7 @@ class CiTeardownSweepTest(unittest.TestCase):
         assertion has two things to tell apart. An earlier version of this test
         ran the green path and filtered on `"secrets" in call.split()`, which
         the fallback's singular `secret` could not match either way: it
-        inspected nothing and passed against a script with no Step 4 at all.
+        inspected nothing and passed against a script with no Step 5 at all.
         """
         rc, calls, err = self._run_steps(helm_exit=1)
         self.assertEqual(rc, 0, err)
@@ -277,10 +320,10 @@ class CiTeardownSweepTest(unittest.TestCase):
         by_part_of = [c for c in secret_deletes if _SELECTOR in c.split()]
         # Both must be present, or this is again asserting over an empty list.
         self.assertEqual(
-            len(by_owner), 1, f"expected Step 1's record delete: {secret_deletes}"
+            len(by_owner), 1, f"expected Step 2's record delete: {secret_deletes}"
         )
         self.assertEqual(
-            len(by_part_of), 1, f"expected Step 4's Secret sweep: {secret_deletes}"
+            len(by_part_of), 1, f"expected Step 5's Secret sweep: {secret_deletes}"
         )
         self.assertNotIn(_RECORD_SELECTOR, by_part_of[0].split(), by_part_of[0])
         self.assertNotIn(_SELECTOR, by_owner[0].split(), by_owner[0])
