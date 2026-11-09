@@ -112,6 +112,10 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
   all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out (on
   the JSON line, in the stored envelope, on the since-last-scheduled line and in the whole-run
   count), the JSON line lists it under `retired_unlisted`, and the run is never silent over one.
+  The lead of that all-clear and the banner `close_ledger_reads_clean` puts at the top of the
+  closed ledger say the same: with a retired finding, neither claims that every finding is gone
+  or that all of them are resolved; both count the retired ones as not confirmed fixed, and the
+  banner names their ids.
   The store ledger applies the same rule; the no-forge record keeps ids with no places, so a run
   with no repository cannot tell such a finding apart and counts it resolved as before. After the
   close, the run changes the title to `0 findings` and puts a
@@ -197,7 +201,15 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   name (`foreign_proposal_on`), a scoped install lands its fix on the primary name plus its scope
   digest (`scoped_group_branch_for`), and the mapping from a group to its pull request reads the
   primary name first and the scoped name second. The primary name stays for every install with no
-  such neighbour and for every pull request open today, so nothing is renamed on upgrade.
+  such neighbour and for every pull request open today, so nothing is renamed on upgrade. A pull
+  request with no scope label is from before scopes, and the listing keeps it, since the install
+  that opened it cannot be read off it. The stale close on a scoped install therefore leaves an
+  unlabelled open pull request alone when none of the ids it covers was ever on this install's
+  ledger (`previous_ids`) or is current: in the mixed-version window of an upgrade, every install
+  that shares the repository reads such a pull request as its own, and closing it as stale or as
+  "no longer reproduces" would retire another install's fix over a fleet this run never read. The
+  run logs the pull request it leaves. This install's own pre-scope fix whose ids the shared ledger
+  happened not to carry is left open the same way, for a person to close.
 
 ## 3. Decisions
 
