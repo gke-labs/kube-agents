@@ -162,6 +162,14 @@ sets it deliberately wins. Both are inputs to the capability check below rather 
 deployment preferences - see "What scope the check runs at" for why the render has to
 supply `POD_NAMESPACE` at all, and for what a default install did before it did.
 
+**One more on a declared bridge.** `BRIDGE_DURABLE_PRECREATED=true` goes onto a sidecar
+recognised as the bridge, as the override. The provision Job creates the bridge's intake
+durable on `TASKS`, and the `bridge` principal is refused creating, updating or deleting
+it, so a bridge has to bind it rather than create it. A bridge on an image older than the
+operator ignores the flag, tries to create the durable, and is refused. That holds for the
+rendered bridge too, whose image follows the agent's tag, and for a gateway image pinned
+older than the operator: roll the agent, bridge and gateway images with the operator.
+
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
 spawning the same kind of one-shot `hermes chat -q` process), so the bridge inherits a

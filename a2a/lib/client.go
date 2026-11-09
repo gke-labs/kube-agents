@@ -666,7 +666,6 @@ type SubscribeConfig struct {
 	Precreated bool
 }
 
-// filterSubjects is the consumer's filter set, however it was spelled.
 // ErrPrecreatedBindRefused is a Precreated bind refused because the durable
 // under the name is not the one this subscriber reads: retrying cannot
 // change it, so the bind fails at once.
@@ -674,9 +673,11 @@ var ErrPrecreatedBindRefused = errors.New("pre-created durable refused")
 
 // checkPrecreated refuses a pre-created durable whose stored config is not
 // the one this subscriber would have created: its filters, explicit acks,
-// pull delivery, and the MaxAckPending cap when one is set. The provision
-// Job creates it create-only, so a durable someone made differently before
-// it would otherwise be bound as found, and read with the wrong filter.
+// pull delivery, the MaxAckPending cap when one is set, and no inactivity
+// threshold, which would have the server delete a durable this subscriber
+// never re-creates. The provision Job brings a durable an older reader made
+// to these settings, so one that still differs was made some other way, and
+// would otherwise be bound as found and read with the wrong filter.
 func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
 	want := cfg.filterSubjects()
 	have := got.FilterSubjects
@@ -703,10 +704,13 @@ func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
 		return refuse(fmt.Sprintf("stops redelivering after %d attempts", got.MaxDeliver))
 	case cfg.MaxAckPending > 0 && got.MaxAckPending != cfg.MaxAckPending:
 		return refuse(fmt.Sprintf("caps unacked deliveries at %d, not %d", got.MaxAckPending, cfg.MaxAckPending))
+	case got.InactiveThreshold > 0:
+		return refuse(fmt.Sprintf("is deleted after %s inactive, and this subscriber never re-creates it", got.InactiveThreshold))
 	}
 	return nil
 }
 
+// filterSubjects is the consumer's filter set, however it was spelled.
 func (cfg SubscribeConfig) filterSubjects() []string {
 	if cfg.Subject != "" {
 		return []string{cfg.Subject}

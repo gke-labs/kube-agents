@@ -4923,7 +4923,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-e7cd1561
+  name: platformagent-a2a-provision-508494be
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5057,18 +5057,24 @@ spec:
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=21474836480
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=4096 \\\n  --max-consumers=110
               --defaults\n\n# The TASKS durables whose name and filter are fixed (#4173):
-              the gateway's\n# event relay and the bridge's intake. Created here, create-only,
-              so their\n# readers bind to them and create nothing, and every principal
-              that may\n# create consumers on TASKS is denied these names\n# (a2aTasksFixedDurableDenyPublish).
-              An install whose gateway or bridge made\n# them before keeps those, with
-              the same settings. Pull, explicit ack, every\n# message from the start:
-              what the readers' own create asked for.\n$NATS consumer info TASKS gateway-relay
-              >/dev/null 2>&1 || $NATS consumer add TASKS gateway-relay --pull \\\n  --filter='a2a.tasks.*.*.events'
-              --filter='a2a.tasks.*.*.supervisor' \\\n  --ack=explicit --deliver=all --replay=instant
-              --max-deliver=-1 \\\n  --max-pending=8192 --defaults\n$NATS consumer info
-              TASKS bridge-platform >/dev/null 2>&1 || $NATS consumer add TASKS bridge-platform
-              --pull \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
-              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
+              the gateway's\n# event relay and the bridge's intake. Made here, so their
+              readers bind to them\n# and create nothing, and every principal that may
+              create consumers on TASKS is\n# denied these names (a2aTasksFixedDurableDenyPublish).
+              Pull, explicit ack,\n# every message from the start: what the readers ask
+              for. A consumer add on a\n# durable that exists updates it to these settings,
+              so one an older gateway or\n# bridge made (one filter, the server's max-pending)
+              converges here; a reader\n# refuses to bind one made differently. A durable
+              the server won't update that\n# way is reported and left, and its reader
+              names the difference when it\n# refuses it, rather than this stopping the
+              rest of provisioning.\n$NATS consumer add TASKS gateway-relay --pull \\\n
+              \ --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor' \\\n
+              \ --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n  --max-pending=8192
+              --defaults >/dev/null \\\n  || echo \"WARN: could not make or update TASKS
+              gateway-relay; the gateway will not bind it until it matches\" >&2\n$NATS
+              consumer add TASKS bridge-platform --pull \\\n  --filter='a2a.tasks.platform.*.in'
+              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
+              >/dev/null \\\n  || echo \"WARN: could not make or update TASKS bridge-platform;
+              the bridge will not bind it until it matches\" >&2\n\n# DIRECTORY: last-value
               — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
               >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
               --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
@@ -5341,20 +5347,22 @@ spec:
               delegations and spawning session pods while relaying no events, the\" >&2\n
               \ echo \"     bridge dispatches nothing, and the CR reads Ready over both.
               Session pods\" >&2\n  echo \"     recover by themselves, which hides it
-              rather than helping.\" >&2\n  echo \"     Restarting before TASKS is back
-              only fails the subscribe, so the order holds.\" >&2\n  # Exit 2, and the
-              convention it establishes: 2 means \"this will fail the\n  # same way next
-              time\", anything else is worth retrying. The Job's\n  # podFailurePolicy
-              matches on 2 and fails the Job from the first pod\n  # (buildA2AProvisionJob),
-              so a refusal nothing about a re-run can change\n  # does not spend the backoffLimit
-              before it is heard. This refusal is in\n  # that class: the budget's two
-              inputs, maxSessions and the bridge's worker\n  # count, and the stream's
-              max_consumers are all fixed until an operator\n  # lowers maxSessions, declares
-              the bridge sidecar with fewer workers where\n  # it declared more than the
-              default, or recreates the stream, and\n  # provisioning does none of those.
-              Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              rather than helping.\" >&2\n  echo \"     A client restarted before TASKS
+              and its two durables are back waits for them\" >&2\n  echo \"     and binds
+              once this Job has made them, so restarting early costs nothing.\" >&2\n
+              \ # Exit 2, and the convention it establishes: 2 means \"this will fail
+              the\n  # same way next time\", anything else is worth retrying. The Job's\n
+              \ # podFailurePolicy matches on 2 and fails the Job from the first pod\n
+              \ # (buildA2AProvisionJob), so a refusal nothing about a re-run can change\n
+              \ # does not spend the backoffLimit before it is heard. This refusal is
+              in\n  # that class: the budget's two inputs, maxSessions and the bridge's
+              worker\n  # count, and the stream's max_consumers are all fixed until an
+              operator\n  # lowers maxSessions, declares the bridge sidecar with fewer
+              workers where\n  # it declared more than the default, or recreates the stream,
+              and\n  # provisioning does none of those. Note that\n  # set -euo pipefail
+              exits with the failing command's own status, which is\n  # not 2, so an
+              unexpected failure stays on the retry budget.\n  exit 2\nfi\n\necho \"a2a
+              provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp

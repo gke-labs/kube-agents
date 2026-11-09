@@ -728,11 +728,11 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
-			// The two TASKS durables it pre-creates (#4173), as natscli 0.1.5
-			// asks for them: INFO for `consumer info`, then CREATE with the
-			// filter token for one filter and without it for two. No delete,
-			// and no listing: a miss on info does not make the CLI list
-			// consumers.
+			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
+			// consumer add asks for them: INFO, then CREATE with the filter
+			// token for one filter and without it for two. CREATE is
+			// create-or-update, which is how the Job brings a durable an older
+			// reader made to its settings. No delete, and no listing.
 			"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable,
 			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable,
 			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable + ".>",

@@ -1812,9 +1812,10 @@ func a2aSeedJetStreamGrants() []string {
 // (TestBridgeJetStreamGrantOnARealServer). Per stream:
 //
 //   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet, lib.TaskInReplay,
-//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the durable through
-//     CreateOrUpdateConsumer, and the replay's ordered consumer; nats.go puts
-//     the filter subject in the API subject, so the grant ends in `>`),
+//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the replay's ordered
+//     consumer; nats.go puts the filter subject in the API subject, so the
+//     grant ends in `>`), CONSUMER.INFO on its own intake durable (the bind:
+//     the provision Job creates that durable, #4173),
 //     CONSUMER.MSG.NEXT (every pull), and DIRECT.GET (GetLastMsgForSubject:
 //     the replay horizon, the sweep's CAS baseline, the worker's look-ahead
 //     reading the in subject's newest message, and the orphan cancel reading
@@ -1867,15 +1868,14 @@ func a2aSeedJetStreamGrants() []string {
 // first. CONSUMER.CREATE is create-OR-UPDATE by name -- the request's `action`
 // field is empty for both, and the server has no ownership concept for a
 // consumer name -- so within a stream the bridge may create consumers on,
-// every consumer on that stream is the bridge's to reconfigure. Measured
-// against this render, on the gateway's relay durable: one permitted
-// $JS.API.CONSUMER.CREATE.TASKS.gateway-relay carrying the durable's own
-// config with filter_subject changed retunes it, and the gateway stops seeing
-// task events with no permissions violation logged anywhere; the same subject
-// carrying inactive_threshold has the server reap the durable, ack floor and
-// all, while CONSUMER.DELETE is refused in the same run. That is the residue
-// the web block below already records for web, on the one stream where
-// another principal has a durable to aim at. It is not new -- $JS.API.>
+// every consumer on that stream is the bridge's to reconfigure, except the
+// two durables the provision Job makes, whose names are denied to it (#4173).
+// Measured against this render, on a per-task durable another principal
+// made: one permitted CONSUMER.CREATE carrying the durable's own config with
+// filter_subject changed retunes it, with no permissions violation logged
+// anywhere; the same subject carrying inactive_threshold has the server reap
+// the durable, ack floor and all, while CONSUMER.DELETE is refused in the same
+// run. That is the residue the web block below already records for web. It is not new -- $JS.API.>
 // permitted all of it -- and no narrower grant exists: nats.go's ordered
 // consumers take server-generated names, so the last token has to be `>`, and
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
@@ -1976,22 +1976,19 @@ func a2aAgentJetStreamGrants() []string {
 // v1.53.1 and then measured against a real server running this render
 // (TestGatewayJetStreamGrantOnARealServer). Per stream:
 //
-//   - TASKS: STREAM.INFO (js.Stream, in lib.TasksGet), CONSUMER.CREATE (the
-//     `gateway-relay` durable through CreateOrUpdateConsumer, and the
-//     replay's ordered consumer), CONSUMER.MSG.NEXT (every pull on both),
-//     and DIRECT.GET (GetLastMsgForSubject: tasks/get's replay horizon).
-//     Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - TASKS: STREAM.INFO (js.Stream, in lib.TasksGet), CONSUMER.INFO on
+//     `gateway-relay` only (the relay's bind: the provision Job creates that
+//     durable, #4173), CONSUMER.CREATE (the replay's ordered consumer),
+//     CONSUMER.MSG.NEXT (every pull on both), and DIRECT.GET
+//     (GetLastMsgForSubject: tasks/get's replay horizon). Acks are
+//     $JS.ACK.TASKS.>, granted beside this list.
 //
-//     CONSUMER.CREATE ends in `>` rather than naming the durable, and both
-//     reasons are load-bearing. The relay carries TWO filter subjects
-//     (`…events` and `…supervisor`, since the supervisor split), and nats.go
-//     puts the filter in the API subject only when there is exactly one
-//     (jetstream/consumer.go, apiConsumerCreateWithFilterSubjectT), so the
-//     relay's own create is `CONSUMER.CREATE.TASKS.gateway-relay` while a
-//     single-filter rebind would be four tokens longer. And the replay's
-//     ordered consumers take server-generated names
+//     CONSUMER.CREATE ends in `>` rather than naming a consumer because the
+//     replay's ordered consumers take server-generated names
 //     (jetstream.go, OrderedConsumer, which seeds namePrefix from nuid.Next),
-//     so no literal exists to name.
+//     so no literal exists to name. The relay's own name is denied to this
+//     principal (a2aTasksFixedDurableDenyPublish), so the wildcard doesn't
+//     reach it.
 //
 //   - KV_session-state, the session registry: STREAM.INFO (js.KeyValue binds
 //     a bucket by reading its stream), DIRECT.GET (kv.Get, which every
@@ -2030,9 +2027,9 @@ func a2aAgentJetStreamGrants() []string {
 // enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST); and
 // account INFO, which jetstream.New never asks for.
 //
-// CONSUMER.INFO is withheld, and it is worth stating because it costs
-// something. Nothing on the gateway path binds a consumer by name -- the
-// relay is CreateOrUpdateConsumer, the replay is an ordered consumer -- and on
+// CONSUMER.INFO is withheld beyond the relay's bind, and it is worth stating
+// because it costs something. Nothing else on the gateway path binds a
+// consumer by name -- the replay is an ordered consumer -- and on
 // nats.go v1.53.1 neither re-verifies itself with Info() after a reconnect
 // either: the Consume status loop re-issues a pull on CONNECTED, and the
 // ordered consumer's reset is a CONSUMER.CREATE. TestGatewayConsumersSurviveABusRestart
@@ -3364,19 +3361,24 @@ $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
 # The TASKS durables whose name and filter are fixed (#4173): the gateway's
-# event relay and the bridge's intake. Created here, create-only, so their
-# readers bind to them and create nothing, and every principal that may
-# create consumers on TASKS is denied these names
-# (a2aTasksFixedDurableDenyPublish). An install whose gateway or bridge made
-# them before keeps those, with the same settings. Pull, explicit ack, every
-# message from the start: what the readers' own create asked for.
-$NATS consumer info TASKS ` + a2aGatewayRelayDurable + ` >/dev/null 2>&1 || $NATS consumer add TASKS ` + a2aGatewayRelayDurable + ` --pull \
+# event relay and the bridge's intake. Made here, so their readers bind to them
+# and create nothing, and every principal that may create consumers on TASKS is
+# denied these names (a2aTasksFixedDurableDenyPublish). Pull, explicit ack,
+# every message from the start: what the readers ask for. A consumer add on a
+# durable that exists updates it to these settings, so one an older gateway or
+# bridge made (one filter, the server's max-pending) converges here; a reader
+# refuses to bind one made differently. A durable the server won't update that
+# way is reported and left, and its reader names the difference when it
+# refuses it, rather than this stopping the rest of provisioning.
+$NATS consumer add TASKS ` + a2aGatewayRelayDurable + ` --pull \
   --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
-  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
-$NATS consumer info TASKS ` + a2aBridgeDurable() + ` >/dev/null 2>&1 || $NATS consumer add TASKS ` + a2aBridgeDurable() + ` --pull \
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults >/dev/null \
+  || echo "WARN: could not make or update TASKS ` + a2aGatewayRelayDurable + `; the gateway will not bind it until it matches" >&2
+$NATS consumer add TASKS ` + a2aBridgeDurable() + ` --pull \
   --filter='` + a2aBridgeIntakeFilter() + `' \
-  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults >/dev/null \
+  || echo "WARN: could not make or update TASKS ` + a2aBridgeDurable() + `; the bridge will not bind it until it matches" >&2
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
@@ -3655,7 +3657,8 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
-  echo "     Restarting before TASKS is back only fails the subscribe, so the order holds." >&2
+  echo "     A client restarted before TASKS and its two durables are back waits for them" >&2
+  echo "     and binds once this Job has made them, so restarting early costs nothing." >&2
   # Exit 2, and the convention it establishes: 2 means "this will fail the
   # same way next time", anything else is worth retrying. The Job's
   # podFailurePolicy matches on 2 and fails the Job from the first pod
@@ -4860,7 +4863,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and binds once it exists; a bridge restarted early only fails its subscribe, so the bridge's restart is the one that has to follow the stream.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway or bridge restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }

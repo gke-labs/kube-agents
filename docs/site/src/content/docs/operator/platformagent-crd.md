@@ -1675,7 +1675,7 @@ Deleting the Job before one of those ways out is taken (the two, or the three wh
 
 Recreating the stream costs one more step, and the order matters. Once `TASKS` is back, restart the A2A gateway (`kubectl rollout restart deployment/<agent>-a2a-gateway`), and the agent workload `<agent>-gateway` with it where a Hermes bridge sidecar runs. Deleting a stream deletes every consumer on it, and neither of those two durable readers re-creates one, so a gateway left running keeps accepting delegations and spawning session pods while relaying no events, the bridge dispatches nothing, and the CR reads `Ready` over both; session pods recover by themselves, which hides it.
 
-A gateway restarted before the stream is back waits for it, not ready, and binds once it is recreated; a bridge restarted early only fails its subscribe, so it is the bridge's restart that has to follow the stream.
+A gateway or bridge restarted before the stream is back waits for it, not ready, and for its durable, which provisioning creates with the stream, then binds once both exist.
 
 ### What `Degraded` reports
 

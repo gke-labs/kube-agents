@@ -166,18 +166,19 @@ func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
 		return false
 	}
-	for _, c := range agent.Spec.Deployment.Sidecars {
-		if c.Name == a2aBridgeContainerName {
-			return true
-		}
-		if _, set := a2aBridgeConcurrencyValue(c); set {
-			return true
-		}
-		if imageRepositoryName(c.Image) == a2aBridgeImageName {
-			return true
-		}
+	return slices.ContainsFunc(agent.Spec.Deployment.Sidecars, a2aIsBridgeSidecar)
+}
+
+// a2aIsBridgeSidecar reports whether a declared sidecar is the bridge: by its
+// container name, its BRIDGE_CONCURRENCY, or its image.
+func a2aIsBridgeSidecar(c corev1.Container) bool {
+	if c.Name == a2aBridgeContainerName {
+		return true
 	}
-	return false
+	if _, set := a2aBridgeConcurrencyValue(c); set {
+		return true
+	}
+	return imageRepositoryName(c.Image) == a2aBridgeImageName
 }
 
 // a2aBridgeRendered reports whether the operator renders the bridge for this

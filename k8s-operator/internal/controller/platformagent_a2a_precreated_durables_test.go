@@ -80,8 +80,9 @@ func a2aFixedDurableConfigs() []jetstream.ConsumerConfig {
 	}
 }
 
-// a2aPreCreateLikeTheProvisionJob creates the two durables as the provision
-// stand-in, the way the script does: info, and create only on a miss. nats.go
+// a2aPreCreateLikeTheProvisionJob makes the two durables as the provision
+// stand-in, the way the script does: natscli's consumer add, which reads the
+// durable and then creates it or updates it to the script's settings. nats.go
 // sends the same API subjects natscli 0.1.5 does for these shapes (CREATE
 // with the filter token for one filter, without it for two), so a grant this
 // misses is the grant the Job would miss.
@@ -91,10 +92,8 @@ func a2aPreCreateLikeTheProvisionJob(t *testing.T, url string, log *a2aServerLog
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	for _, cfg := range a2aFixedDurableConfigs() {
-		if _, err := js.Consumer(ctx, a2aTasksStream, cfg.Durable); err == nil {
-			continue
-		}
-		if _, err := js.CreateConsumer(ctx, a2aTasksStream, cfg); err != nil {
+		_, _ = js.Consumer(ctx, a2aTasksStream, cfg.Durable)
+		if _, err := js.CreateOrUpdateConsumer(ctx, a2aTasksStream, cfg); err != nil {
 			t.Fatalf("pre-create %s as provision: %v\nserver log for provision: %q", cfg.Durable, err, log.publishViolations("provision"))
 		}
 	}
@@ -172,13 +171,21 @@ func TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables(t *testing.T) {
 func TestTheProvisionScriptCreatesTheFixedDurablesAsTheTestsDo(t *testing.T) {
 	script := a2aProvisionScript(a2aTestAgent())
 	for _, cfg := range a2aFixedDurableConfigs() {
-		info := "$NATS consumer info TASKS " + cfg.Durable + " >/dev/null 2>&1 || $NATS consumer add TASKS " + cfg.Durable + " --pull"
-		i := strings.Index(script, info)
+		// Unconditional, so an older reader's durable converges; and
+		// guarded, so a refusal can't stop the rest of provisioning.
+		add := "\n$NATS consumer add TASKS " + cfg.Durable + " --pull"
+		i := strings.Index(script, add)
 		if i < 0 {
-			t.Errorf("the script does not create %s create-only", cfg.Durable)
+			t.Errorf("the script does not make %s with an unconditional consumer add", cfg.Durable)
 			continue
 		}
-		line := script[i:]
+		line := script[i+1:]
+		if end := strings.Index(line, "\n$NATS"); end >= 0 {
+			line = line[:end]
+		}
+		if !strings.Contains(line, "|| echo \"WARN: could not make or update TASKS "+cfg.Durable) {
+			t.Errorf("%s: a failed consumer add would stop the script under set -e:\n%s", cfg.Durable, line)
+		}
 		if end := strings.Index(line, "--defaults"); end >= 0 {
 			line = line[:end]
 		}
@@ -203,6 +210,39 @@ func TestTheProvisionScriptCreatesTheFixedDurablesAsTheTestsDo(t *testing.T) {
 		if got := strings.Count(line, "--filter="); got != len(filters) {
 			t.Errorf("%s: the script passes %d filters, the test config %d", cfg.Durable, got, len(filters))
 		}
+	}
+}
+
+// TestAnOlderReadersDurableConvergesToTheProvisionedOne: an install whose
+// gateway made its relay before it asked for both filters and 8192 pending
+// holds a durable the gateway's bind would refuse. The provision Job's
+// consumer add updates it in place, and nobody needs delete.
+func TestAnOlderReadersDurableConvergesToTheProvisionedOne(t *testing.T) {
+	creds := a2aFullCreds("e", "1")
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"]))
+	s, log := a2aStartRenderedServer(t, conf)
+	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, js := a2aConnectAs(t, s.ClientURL(), "provision", a2aProvisionStandInPW)
+	// The shape an older gateway left: one filter, the server's max-pending.
+	if _, err := js.CreateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
+		Durable: a2aGatewayRelayDurable, FilterSubject: a2aGatewayEventsFilter, AckPolicy: jetstream.AckExplicitPolicy,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a2aPreCreateLikeTheProvisionJob(t, s.ClientURL(), log)
+	c, err := js.Consumer(ctx, a2aTasksStream, a2aGatewayRelayDurable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.CachedInfo().Config
+	if !slices.Equal(got.FilterSubjects, []string{a2aGatewayEventsFilter, a2aGatewaySupervisorFilter}) || got.FilterSubject != "" ||
+		got.MaxAckPending != a2aGatewayRelayMaxAckPending {
+		t.Errorf("the older relay did not converge: filters %q / %q, max pending %d", got.FilterSubject, got.FilterSubjects, got.MaxAckPending)
+	}
+	if v := log.publishViolations("provision"); len(v) != 0 {
+		t.Errorf("converging tripped publish violations for provision:\n%s", strings.Join(v, "\n"))
 	}
 }
 

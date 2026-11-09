@@ -165,6 +165,35 @@ func createTasksStreamIfAbsent(t *testing.T, js jetstream.JetStream) {
 	createTasksStream(t, js)
 }
 
+func TestPrecreated_RefusesADurableTheServerWouldReap(t *testing.T) {
+	s := startServer(t)
+	admin, err := Connect(context.Background(), clientURL(s), WithName("provision"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	createTasksStreamIfAbsent(t, admin.js)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := admin.js.CreateConsumer(ctx, TasksStream, jetstream.ConsumerConfig{
+		Durable: "relay-reaped", FilterSubject: precreatedFilter,
+		AckPolicy: jetstream.AckExplicitPolicy, InactiveThreshold: time.Hour,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Connect(context.Background(), clientURL(s), WithName("relay"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_, err = c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream: TasksStream, Subject: precreatedFilter, Durable: "relay-reaped",
+		Session: agreementRequester, Precreated: true,
+	}, func(*Envelope) {})
+	if !errors.Is(err, ErrPrecreatedBindRefused) || !strings.Contains(err.Error(), "inactive") {
+		t.Fatalf("bind of a durable with an inactivity threshold: %v, want a refusal naming it", err)
+	}
+}
 
 func TestPrecreated_RefusesAHeadersOnlyDurable(t *testing.T) {
 	s := startServer(t)

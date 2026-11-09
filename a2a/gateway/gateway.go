@@ -724,11 +724,12 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
-	// Two filter subjects put the filter in the request body, which the
-	// gateway's unscoped consumer-create grant permits and a session's
-	// pinned grant would not; the durable already exists on every install
-	// with the single filter, and rebinding it to the pair is an update the
-	// server accepts (lib's rebind test).
+	// On a deployed install the provision Job creates this durable with
+	// both filters, and the gateway binds it with Precreated and never
+	// creates it (#4173). A live test's own durable, and a gateway run
+	// without the operator, still creates it: two filter subjects put the
+	// filter in the request body, and rebinding a single-filter durable to
+	// the pair is an update the server accepts (lib's rebind test).
 	agreement := SupervisorAgreement(g.cfg)
 	// WaitForStream: the provision Job creates TASKS, and on a three-server
 	// bus that can trail the gateway's start by more than lib's bind window.
