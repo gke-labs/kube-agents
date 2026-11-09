@@ -48,6 +48,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1094,6 +1095,13 @@ const (
 	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
 	// if this one stops matching it.
 	a2aBridgeDefaultConcurrency = 2
+	// a2aBridgeDurablePrecreatedEnvVar tells the bridge to bind the intake
+	// durable the provision Job created rather than create it (#4173); its
+	// grant denies it the create on that name.
+	a2aBridgeDurablePrecreatedEnvVar = "BRIDGE_DURABLE_PRECREATED"
+	// a2aGatewayRelayPrecreatedEnvVar does the same for the gateway's event
+	// relay.
+	a2aGatewayRelayPrecreatedEnvVar = "A2A_GATEWAY_RELAY_PRECREATED"
 	// a2aBridgeConcurrencyEnvVar is the env key the bridge reads its worker
 	// count from (a2a/cmd/hermes-bridge/main.go), and so the key
 	// a2aBridgeConcurrency looks for on spec.deployment.sidecars.
@@ -1911,6 +1919,9 @@ func a2aBridgeJetStreamGrants() []string {
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		// Its intake durable, which the provision Job creates (#4173):
+		// binding reads it back to check it was made as the bridge expects.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
 		"$JS.API.STREAM.INFO." + kvRuntimeState,
@@ -2089,6 +2100,9 @@ func a2aGatewayJetStreamGrants() []string {
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		// Its relay durable, which the provision Job creates (#4173):
+		// binding reads it back to check it was made as the relay expects.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable,
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
 		"$JS.API.STREAM.INFO." + kvSessionState,
@@ -2250,6 +2264,51 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // the callout keypair would update the config Secret without rolling the
 // StatefulSet, leaving the server trusting an issuer nothing signs with any
 // more — every answer the callout gives refused, on a bus that looks healthy.
+// a2aCrossAccountConsumerCreateStreams are the streams a principal in APP
+// or CONSOLE may create consumers on, which is all the TRUSTED account
+// exports the consumer-create API for (#4173): the streams its users'
+// consumer-create grants name, and TASKS for the per-task consumers the
+// callout grants sessions and profile workers (a2a/authcallout session.go).
+// Read from the grants, so a grant and the export can't drift apart.
+func a2aCrossAccountConsumerCreateStreams(agent *agentv1alpha1.PlatformAgent) []string {
+	set := map[string]bool{a2aTasksStream: true}
+	for _, id := range a2aIdentities(agent) {
+		if id.account != a2aAccountApp && id.account != a2aAccountConsole {
+			continue
+		}
+		for _, grant := range id.publish {
+			if rest, ok := strings.CutPrefix(grant, "$JS.API.CONSUMER.CREATE."); ok {
+				set[strings.SplitN(rest, ".", 2)[0]] = true
+			}
+		}
+	}
+	streams := make([]string, 0, len(set))
+	for stream := range set {
+		streams = append(streams, stream)
+	}
+	sort.Strings(streams)
+	return streams
+}
+
+// a2aConsumerCreateExportLines is TRUSTED's consumer-create export, one
+// entry per stream in a2aCrossAccountConsumerCreateStreams.
+func a2aConsumerCreateExportLines(agent *agentv1alpha1.PlatformAgent) string {
+	var b strings.Builder
+	for _, stream := range a2aCrossAccountConsumerCreateStreams(agent) {
+		fmt.Fprintf(&b, "      { service: \"$JS.API.CONSUMER.CREATE.%s.>\", accounts: [ APP, CONSOLE ] }\n", stream)
+	}
+	return b.String()
+}
+
+// a2aConsumerCreateImportLines is the matching import for APP and CONSOLE.
+func a2aConsumerCreateImportLines(agent *agentv1alpha1.PlatformAgent) string {
+	var b strings.Builder
+	for _, stream := range a2aCrossAccountConsumerCreateStreams(agent) {
+		fmt.Fprintf(&b, "      { service: { account: TRUSTED, subject: \"$JS.API.CONSUMER.CREATE.%s.>\" } }\n", stream)
+	}
+	return b.String()
+}
+
 func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
 	return a2aPostureComment + `
 
@@ -2359,8 +2418,7 @@ accounts {
     exports [
       { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
-      { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
-      { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
+` + a2aConsumerCreateExportLines(agent) + `      { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
       { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
       { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
       { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
@@ -2407,8 +2465,7 @@ accounts {
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
       { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
-      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+` + a2aConsumerCreateImportLines(agent) + `      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
       { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
@@ -2435,8 +2492,7 @@ accounts {
     imports [
       { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
       { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
-      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+` + a2aConsumerCreateImportLines(agent) + `      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
       { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
@@ -3306,6 +3362,21 @@ $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct
   --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
+
+# The TASKS durables whose name and filter are fixed (#4173): the gateway's
+# event relay and the bridge's intake. Created here, create-only, so their
+# readers bind to them and create nothing, and every principal that may
+# create consumers on TASKS is denied these names
+# (a2aTasksFixedDurableDenyPublish). An install whose gateway or bridge made
+# them before keeps those, with the same settings. Pull, explicit ack, every
+# message from the start: what the readers' own create asked for.
+$NATS consumer info TASKS ` + a2aGatewayRelayDurable + ` >/dev/null 2>&1 || $NATS consumer add TASKS ` + a2aGatewayRelayDurable + ` --pull \
+  --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+$NATS consumer info TASKS ` + a2aBridgeDurable() + ` >/dev/null 2>&1 || $NATS consumer add TASKS ` + a2aBridgeDurable() + ` --pull \
+  --filter='` + a2aBridgeIntakeFilter() + `' \
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
@@ -5585,6 +5656,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The relay binds the durable the provision Job created (#4173).
+		{Name: a2aGatewayRelayPrecreatedEnvVar, Value: "true"},
 		// The busy notice's threshold, rendered explicitly
 		// for the same reason: the number a reader of the
 		// live Deployment sees is the bridge worker count it

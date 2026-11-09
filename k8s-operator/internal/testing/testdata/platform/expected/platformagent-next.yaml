@@ -2081,6 +2081,8 @@ spec:
                   name: platformagent-a2a-nats-creds
             - name: BRIDGE_CONCURRENCY
               value: "10"
+            - name: BRIDGE_DURABLE_PRECREATED
+              value: "true"
             - name: A2A_ACTIVITY_SECRET
               valueFrom:
                 secretKeyRef:
@@ -2822,7 +2824,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "4b0b34d2bf914fb8",
+      "version": "97c8c35dd2e8d6af",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2863,6 +2865,12 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+              "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
               "_INBOX.provision.>"
             ],
             "subscribe": [
@@ -2932,7 +2940,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 4b0b34d2bf914fb8
+    kubeagents.x-k8s.io/a2a-authmap-version: 97c8c35dd2e8d6af
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3429,7 +3437,11 @@ stringData:
         exports [
           { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
-          { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.DIRECTORY.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TASKS.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
           { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
@@ -3502,6 +3514,7 @@ stringData:
                   "chat.board",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
                   "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
                   "$JS.API.DIRECT.GET.TASKS.>",
                   "$JS.API.STREAM.INFO.KV_session-state",
@@ -3526,7 +3539,15 @@ stringData:
                   "$JS.API.*.*.KV_cap",
                   "$JS.API.*.*.KV_cap.>",
                   "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3626,7 +3647,11 @@ stringData:
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
           { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
@@ -3669,6 +3694,16 @@ stringData:
                   "chat.console.*.in",
                   "chat.console.*.confirm",
                   "_INBOX.console.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3714,6 +3749,16 @@ stringData:
                   "chat.console.*.in",
                   "_INBOX.console-mcp.>"
                 ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
               }
               subscribe {
                 allow = [
@@ -3745,7 +3790,11 @@ stringData:
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
           { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
@@ -3786,6 +3835,7 @@ stringData:
                   "$KV.runtime-state.>",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
                   "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
                   "$JS.API.DIRECT.GET.TASKS.>",
                   "$JS.API.STREAM.INFO.KV_runtime-state",
@@ -3801,7 +3851,15 @@ stringData:
                   "$JS.API.*.*.KV_cap",
                   "$JS.API.*.*.KV_cap.>",
                   "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3847,6 +3905,16 @@ stringData:
                   "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
                   "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
                   "_INBOX.web.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -4855,7 +4923,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-da9e6400
+  name: platformagent-a2a-provision-e7cd1561
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -4988,10 +5056,22 @@ spec:
               2>&1 || $NATS stream add TASKS --allow-direct \\\n  --subjects='a2a.tasks.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=21474836480
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=4096 \\\n  --max-consumers=110
-              --defaults\n\n# DIRECTORY: last-value — the tombstone replaces the card.
-              1GiB cap.\n$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add
-              DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>' --storage=file
-              --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
+              --defaults\n\n# The TASKS durables whose name and filter are fixed (#4173):
+              the gateway's\n# event relay and the bridge's intake. Created here, create-only,
+              so their\n# readers bind to them and create nothing, and every principal
+              that may\n# create consumers on TASKS is denied these names\n# (a2aTasksFixedDurableDenyPublish).
+              An install whose gateway or bridge made\n# them before keeps those, with
+              the same settings. Pull, explicit ack, every\n# message from the start:
+              what the readers' own create asked for.\n$NATS consumer info TASKS gateway-relay
+              >/dev/null 2>&1 || $NATS consumer add TASKS gateway-relay --pull \\\n  --filter='a2a.tasks.*.*.events'
+              --filter='a2a.tasks.*.*.supervisor' \\\n  --ack=explicit --deliver=all --replay=instant
+              --max-deliver=-1 \\\n  --max-pending=8192 --defaults\n$NATS consumer info
+              TASKS bridge-platform >/dev/null 2>&1 || $NATS consumer add TASKS bridge-platform
+              --pull \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
+              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
+              — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
+              >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
+              --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
               --discard=old --replicas=1 --max-consumers=64 --defaults\n\n# TOPICS-STATE:
               current answer plus short history, no age limit. 1GiB cap.\n# State-class
               topics (provisioned registry): upgrade-readiness, topology-skew, blueprint,
@@ -5434,6 +5514,8 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_GATEWAY_RELAY_PRECREATED
+              value: "true"
             - name: A2A_BUSY_NOTICE_AT
               value: "10"
             - name: A2A_METRICS_PORT

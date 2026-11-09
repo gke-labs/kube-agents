@@ -250,6 +250,12 @@ type Config struct {
 	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
 	// workspace's member is still refused.
 	SlackAllowAllUsers bool
+	// RelayPrecreated binds the event relay to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// A2A_GATEWAY_RELAY_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, as in tests and a hand-run
+	// gateway, the relay creates its own durable as before.
+	RelayPrecreated bool
 
 	// TargetAllowedUsers is the per-target, per-backend trusted-human
 	// allowlist a session's delegation is checked against: target ->
@@ -764,6 +770,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
+	cfg.RelayPrecreated = os.Getenv("A2A_GATEWAY_RELAY_PRECREATED") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

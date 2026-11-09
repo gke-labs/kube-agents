@@ -370,6 +370,10 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// relayPrecreated is Config.RelayPrecreated, for the default durable
+	// only: a live test's own durable (Options.RelayDurable) isn't one the
+	// provision Job made, so that relay still creates it.
+	relayPrecreated bool
 	// relayBound is set once the event relay has bound; Readiness answers
 	// from it. relayHeldBack is set while a start after a crash holds the
 	// bind back (RunOptions.RelayBindDelay), so Readiness names that wait
@@ -609,6 +613,7 @@ func New(o Options) (*Gateway, error) {
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		droppedNotices:   map[string]bool{},
 		relayDurable:     o.RelayDurable,
+		relayPrecreated:  o.Config.RelayPrecreated && o.RelayDurable == relayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -738,6 +743,7 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 		Agreement:     &agreement,
 		MaxAckPending: relayMaxAckPending,
 		WaitForStream: true,
+		Precreated:    g.relayPrecreated,
 	}
 }
 
