@@ -2950,8 +2950,13 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A wake runs without the tool, so it carries none.
 	var extra []lib.Part
 	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
-		authors, unknown := delegateAuthors(rec, ts.Requester)
-		if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
+		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
+		if unknown && approximate {
+			// The record's people overflow the cap, but the pod's seeded set
+			// (the primer's turns) may not: no list, so the tool falls back
+			// to platform rather than being told there is no one.
+			g.log.Info("delegate targets not attached: the record's people pass the author cap before the primer's turns are known", "taskId", taskID)
+		} else if part, err := lib.DelegateTargetsPart(g.delegateTargets(ts.Requester, authors, unknown, g.profiles)); err != nil {
 			g.log.Warn("delegate targets not attached; the session's delegate tool falls back to platform", "taskId", taskID, "err", err)
 		} else {
 			extra = append(extra, part)

@@ -217,19 +217,19 @@ func TestDelegateAuthorsAreWhomTheDelegationWillCheck(t *testing.T) {
 	// count, though the set the primer seeds isn't written yet.
 	fresh := &SessionRecord{BusSession: "chat-new", SessionAuthorsFor: "chat-old",
 		Tasks: []TaskRef{{ID: "t1", Requester: &u2, SteerAuthors: []TaskRequester{u3}}, {ID: "t0"}}}
-	got, unknown := delegateAuthors(fresh, u1)
-	if unknown || !slices.Contains(got, u2) || !slices.Contains(got, u3) || !slices.Contains(got, u1) {
-		t.Fatalf("fresh incarnation: %v unknown=%v, want u1, u2 and u3", got, unknown)
+	got, unknown, approx := delegateAuthors(fresh, u1)
+	if unknown || !approx || !slices.Contains(got, u2) || !slices.Contains(got, u3) || !slices.Contains(got, u1) {
+		t.Fatalf("fresh incarnation: %v unknown=%v approximate=%v, want u1, u2 and u3, approximate", got, unknown, approx)
 	}
 	fresh.Tasks[0].SteerAuthorsOverflow = true
-	if _, unknown := delegateAuthors(fresh, u1); !unknown {
+	if _, unknown, _ := delegateAuthors(fresh, u1); !unknown {
 		t.Fatal("fresh incarnation with an overflowed steer set: known, want unknown")
 	}
 
 	// A running incarnation: its set, plus this turn's requester.
 	live := &SessionRecord{BusSession: "chat-a", SessionAuthorsFor: "chat-a", SessionAuthors: []TaskRequester{u2},
 		Tasks: []TaskRef{{ID: "t1", Requester: &u3}}}
-	if got, unknown := delegateAuthors(live, u1); unknown || !reflect.DeepEqual(got, []TaskRequester{u2, u1}) {
+	if got, unknown, approx := delegateAuthors(live, u1); unknown || approx || !reflect.DeepEqual(got, []TaskRequester{u2, u1}) {
 		t.Fatalf("running incarnation: %v unknown=%v, want [u2 u1] (u3's turn was another incarnation's)", got, unknown)
 	}
 
@@ -239,10 +239,10 @@ func TestDelegateAuthorsAreWhomTheDelegationWillCheck(t *testing.T) {
 	for i := 0; i < sessionAuthorCap; i++ {
 		full.SessionAuthors = append(full.SessionAuthors, TaskRequester{Backend: "discord", Subject: fmt.Sprintf("p%d", i)})
 	}
-	if _, unknown := delegateAuthors(full, u1); !unknown {
+	if _, unknown, _ := delegateAuthors(full, u1); !unknown {
 		t.Fatal("a new requester past the cap: known, want unknown")
 	}
-	if _, unknown := delegateAuthors(full, full.SessionAuthors[0]); unknown {
+	if _, unknown, _ := delegateAuthors(full, full.SessionAuthors[0]); unknown {
 		t.Fatal("a requester already in a full set: unknown, want known")
 	}
 }
@@ -294,5 +294,27 @@ func TestAFreshIncarnationsListCountsTheRecordsPeople(t *testing.T) {
 	}
 	if slices.Contains(targetNames(got), "listed") {
 		t.Fatalf("targets = %v: listed offered though someone off its list spoke in a turn the pod replays", targetNames(got))
+	}
+}
+
+// A fresh incarnation whose record holds more people than the cap gets no
+// list at all, so its tool falls back to platform: the primer may keep fewer
+// turns than the record holds, and the pod's seeded set may be under the cap.
+func TestAFreshIncarnationPastTheCapSendsNoList(t *testing.T) {
+	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
+	conv := "discord:g1/t-busy"
+	rec := &SessionRecord{Key: conv, ContextID: "ctx-busy", Kind: "group", Addressee: "platform"}
+	for i := 0; i <= sessionAuthorCap; i++ {
+		p := TaskRequester{Backend: "discord", Subject: fmt.Sprintf("person-%d", i)}
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: fmt.Sprintf("task-busy-%d", i), Addressee: "chat-old-1", Requester: &p, Request: "an ask"})
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "busy-1", Text: "hello"}
+	waitFor(t, "the session spawned", func() bool { return len(spawn.calls()) == 1 })
+	origin := r.awaitTask(t, spawn.calls()[0].Session)
+	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, origin)); found {
+		t.Fatal("a fresh incarnation past the cap carried a list; want none, so the tool names platform")
 	}
 }
