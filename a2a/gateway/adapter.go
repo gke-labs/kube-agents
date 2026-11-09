@@ -45,6 +45,14 @@ type InboundMessage struct {
 	// Google Chat's quote-in-reply (gchat.go, quotedAsk); empty on every
 	// other path.
 	Quoted string
+	// QuotedUnread marks a message that quoted one the adapter could not
+	// read (the read refused or timed out, or a card or an image with no
+	// text), so the words travel alone: Quoted is empty and the member is
+	// owed one line saying so. The router posts that line only for a turn
+	// that reaches an agent (noteUnreadQuote), since a command it answers
+	// itself never needed the quote. Set with words beside the quote; a
+	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
+	QuotedUnread bool
 
 	// Backend names the ingress this message arrived through, and empty
 	// means the gateway's own configured backend. It exists because one

@@ -2123,15 +2123,21 @@ router already has (a status phrase is answered without an agent only on a runni
 top of a DM with none); anything that reaches an agent, a task, a steer, a session's first turn or
 a delegation, carries the quote (`agentText`), with a command word a matcher took off the words
 ("/session", "delegate") off the quoted ask's head too (`wordsAfter`). The adapter does not know
-the conversation's task state, so no gate in it re-spells that set. The read runs off the event
-pump under a ten-second budget, after the dedupe. A quote that yields nothing, the read
+the conversation's task state, so no gate in it re-spells that set; the one command it knows is a
+stop, which reaches no agent whatever is running and goes over inline with no read
+(`quotedReadNeeded`), so a cancel never waits on the relay. The read runs off the event pump
+under a ten-second budget, after the dedupe. A quote that yields nothing, the read
 refused or timed out or the message empty (a card or an image alone), is never silent for a
-sender the gateway admits: one line posts in the conversation, `I couldn't read the message you
-quoted, so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't
-read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
-the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
-the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
-words go over unchanged to the refusal any message gets, and their bare quote is dropped.
+sender the gateway admits when an agent would have read it: with words, the turn goes ahead on
+the words, marked (`InboundMessage.QuotedUnread`), and the router posts `I couldn't read the
+message you quoted, so I'm answering your words alone.` in the conversation as it hands them to
+an agent (`noteUnreadQuote`, at `startTask` and `steerTask`), so a "stop" or a status ask it
+answers itself gets no line about a quote it never needed; a bare quote is no turn, and the
+adapter posts `I couldn't read the message you quoted. Paste its text, or ask again in a moment.`
+and logs the reason. The adapter reads the gateway's admission gate for that line
+(`SenderAdmission`, wired as the session lookup is) and posts nothing ahead of the gateway for a
+sender it would refuse: their words go over to the refusal any message gets, and their bare quote
+is dropped.
 
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an

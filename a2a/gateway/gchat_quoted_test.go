@@ -296,17 +296,14 @@ func TestGchatQuotedReadFailureFallsBackToTheTypedWords(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if msg.Text != "is this one ours?" || msg.Quoted != "" || msg.Shortcut {
-		t.Errorf("turn = %+v, want the typed words alone", msg)
+	if msg.Text != "is this one ours?" || msg.Quoted != "" || msg.Shortcut || !msg.QuotedUnread {
+		t.Errorf("turn = %+v, want the typed words alone, marked unread", msg)
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), gchatQuotedName) || !strings.Contains(logs.String(), "chat 404") {
 		t.Errorf("log = %q, want a warning naming the quoted message and the error", logs.String())
 	}
-	if got := postedTexts(f); len(got) != 1 || got[0] != gchatQuotedUnreadWords {
-		t.Errorf("posted = %q, want the one unread-quote line", got)
-	}
-	if c := f.call(1); c.arguments["body"].(map[string]any)["thread"].(map[string]any)["name"] != "spaces/S1/threads/T1" {
-		t.Errorf("the line must post in the message's own thread, got %+v", c.arguments)
+	if got := postedTexts(f); len(got) != 0 {
+		t.Errorf("posted = %q, want nothing from the adapter: the router posts the line for a turn an agent reads (TestUnreadQuoteLinePostsOnlyForATurnAnAgentReads)", got)
 	}
 }
 
@@ -346,8 +343,8 @@ func TestGchatEmptyQuoteIsAFailedQuote(t *testing.T) {
 			switch {
 			case words == "" && (reason == "" || len(got) != 1 || got[0] != gchatQuotedUnreadBare):
 				t.Errorf("bare: reason=%q posted=%q, want no turn and the bare line", reason, got)
-			case words != "" && (reason != "" || msg.Text != words || msg.Quoted != "" || len(got) != 1 || got[0] != gchatQuotedUnreadWords):
-				t.Errorf("words: reason=%q text=%q posted=%q, want the words alone and the line", reason, msg.Text, got)
+			case words != "" && (reason != "" || msg.Text != words || msg.Quoted != "" || !msg.QuotedUnread || len(got) != 0):
+				t.Errorf("words: reason=%q turn=%+v posted=%q, want the words alone, marked unread, and no line from the adapter", reason, msg, got)
 			}
 		})
 	}
@@ -456,11 +453,11 @@ func TestGchatQuotedReadTimesOutToTheTypedWords(t *testing.T) {
 	}()
 	select {
 	case msg := <-done:
-		if msg.Text != "is this one ours?" || msg.Quoted != "" {
-			t.Errorf("turn = %+v, want the typed words alone", msg)
+		if msg.Text != "is this one ours?" || msg.Quoted != "" || !msg.QuotedUnread {
+			t.Errorf("turn = %+v, want the typed words alone, marked unread", msg)
 		}
-		if got := postedTexts(f); len(got) != 1 || got[0] != gchatQuotedUnreadWords {
-			t.Errorf("posted = %q, want the one unread-quote line", got)
+		if got := postedTexts(f); len(got) != 0 {
+			t.Errorf("posted = %q, want nothing from the adapter", got)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the turn waited on the relay past its budget")
@@ -630,8 +627,8 @@ func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
 			c.set(a)
 			words := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot is this one ours?", "is this one ours?", gchatQuotedName)
 			msg, reason := quotedTurn(a, words)
-			if reason != "" || msg.Text != "is this one ours?" || msg.Quoted != "" || msg.AuthorID != "u1@example.com" {
-				t.Errorf("words: turn = %+v (%q), want the words handed over unchanged", msg, reason)
+			if reason != "" || msg.Text != "is this one ours?" || msg.Quoted != "" || !msg.QuotedUnread || msg.AuthorID != "u1@example.com" {
+				t.Errorf("words: turn = %+v (%q), want the words handed over marked, to the refusal verifySender gives them", msg, reason)
 			}
 			bare := gchatBareQuotedMsg(gchatQuotedName)
 			bare.Message.Name = "spaces/S1/messages/M2"
@@ -646,15 +643,63 @@ func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
 	}
 }
 
+// A stop typed beside a quote is handed over inline, with no read: it
+// reaches no agent whatever is running, so the quote is never needed and a
+// cancel does not wait on the relay. Every other command goes through the
+// read like a question, since whether it is one turns on task state the
+// adapter does not have.
+func TestGchatQuotedStopIsHandedOverInlineWithNoRead(t *testing.T) {
+	for _, words := range []string{"stop", "Stop", "/stop"} {
+		t.Run(words, func(t *testing.T) {
+			f := newFakeChatRelay(t)
+			a := newTestGchatAdapterWithRelay(t, f)
+			ev := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot "+words, words, gchatQuotedName)
+			msg, reason := a.classify(ev)
+			if reason != "" {
+				t.Fatalf("dropped: %s", reason)
+			}
+			if quotedReadNeeded(ev, msg) {
+				t.Error("Run must hand a stop over inline, not through the quote path")
+			}
+			if msg, reason = a.quotedAsk(context.Background(), ev, msg); reason != "" || msg.Text != words || msg.Quoted != "" || msg.QuotedUnread {
+				t.Errorf("turn = %+v (%q), want the stop unchanged", msg, reason)
+			}
+			if len(f.calls) != 0 {
+				t.Errorf("relay calls = %+v, want none", f.calls)
+			}
+		})
+	}
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/get"] = quotedResponse(humanSender("Alex"), gchatQuotedAlert)
+	a := newTestGchatAdapterWithRelay(t, f)
+	ev := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M2", "@bot /session off", "/session off", gchatQuotedName)
+	msg, reason := quotedTurn(a, ev)
+	if reason != "" || msg.Text != "/session off" || msg.Quoted == "" || len(f.calls) != 1 {
+		t.Errorf("turn = %+v (%q), relay calls = %d; want \"/session off\" read and composed like any other words", msg, reason, len(f.calls))
+	}
+}
+
+// wordsAfter (gateway.go) takes a command word off the head of the quoted
+// ask by the words as typed, which holds only while every with-words frame
+// opens with them. The frames are pinned here so a prefix added to one is a
+// red test, not a worker whose task reads "delegate".
+func TestGchatQuotedFramesWithWordsOpenWithTheWords(t *testing.T) {
+	for name, frame := range map[string]string{"gchatQuotedAskWithWords": gchatQuotedAskWithWords, "gchatQuotedOwnAskWithWords": gchatQuotedOwnAskWithWords} {
+		if !strings.HasPrefix(frame, "%s") {
+			t.Errorf("%s = %q, want it to open with the member's words", name, frame)
+		}
+	}
+}
+
 // Words typed beside a quote stay the words, on Text, and the composed ask
 // goes beside them on Quoted, a command and an ordinary question alike: the
 // adapter does not know whether a task is running, which is what decides
 // whether routeTurn answers "status" itself or hands it to an agent, so it
-// composes every quote and the router reads the words
-// (TestQuotedAskTravelsBesideTheWords in quoted_route_test.go). A quote of
-// the bot's own post gets the own frame; the snapshot spares the read.
+// composes every quote but a stop's (TestGchatQuotedStopIsHandedOverInlineWithNoRead)
+// and the router reads the words (quoted_route_test.go). A quote of the
+// bot's own post gets the own frame; the snapshot spares the read.
 func TestGchatQuoteReplyKeepsTheWordsBesideTheQuote(t *testing.T) {
-	for i, words := range []string{"stop", "/session off", "status", "/feedback", "delegate check node-3", "delegate", "what is happening here?", "/session what is this alert?"} {
+	for i, words := range []string{"/session off", "status", "/feedback", "delegate check node-3", "delegate", "what is happening here?", "/session what is this alert?"} {
 		t.Run(words, func(t *testing.T) {
 			f := newFakeChatRelay(t)
 			a := newTestGchatAdapterWithRelay(t, f)

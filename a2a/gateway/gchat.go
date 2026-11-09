@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 const (
@@ -99,11 +101,13 @@ const (
 	// sentence (ownQuoted).
 	gchatQuotedOwnAsk          = "Look into this message of yours for me. I quoted it in my reply:\n\n%s"
 	gchatQuotedOwnAskWithWords = "%s\n\nThe message of yours I quoted in my reply:\n\n%s"
-	// gchatQuotedUnreadWords and gchatQuotedUnreadBare are the one line the
-	// gateway posts in the conversation when the quoted message could not
-	// be read, or had nothing to read: with the member's words, the turn
-	// goes ahead on those; without, nothing starts and the line says what
-	// to do. A failed quote is never silent.
+	// gchatQuotedUnreadWords and gchatQuotedUnreadBare are the one line
+	// posted in the conversation when the quoted message could not be
+	// read, or had nothing to read: with the member's words, the turn goes
+	// ahead on those and the router posts the line as it hands them to an
+	// agent (InboundMessage.QuotedUnread); without, nothing starts and the
+	// adapter's line says what to do. A failed quote an agent would have
+	// read is never silent.
 	gchatQuotedUnreadWords = "I couldn't read the message you quoted, so I'm answering your words alone."
 	gchatQuotedUnreadBare  = "I couldn't read the message you quoted. Paste its text, or ask again in a moment."
 	// gchatQuoteTypeForward is the quoteType of a message quoted from
@@ -1090,7 +1094,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "reason", reason)
 			continue
 		}
-		if ev.Message.QuotedMessageMetadata.Name == "" {
+		if !quotedReadNeeded(ev, msg) {
 			handler(msg)
 			continue
 		}
@@ -1458,6 +1462,18 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	return msg, ""
 }
 
+// quotedReadNeeded reports a message whose turn is composed from the
+// message it quotes (quotedAsk): one that quotes a message, unless its words
+// are a stop. A stop never reaches an agent whatever the conversation's
+// task state (routeTurn answers every form of it itself), so the quote it
+// was typed under is never read, and the stop goes over inline on the pump:
+// a cancel does not wait on the relay's read, nor queue behind the member's
+// next message. It is the one command the adapter knows; the rest turn on
+// task state the router alone has.
+func quotedReadNeeded(ev *gchatEvent, msg InboundMessage) bool {
+	return ev.Message.QuotedMessageMetadata.Name != "" && !chattext.IsStop(msg.Text)
+}
+
 // quotedAsk is the turn for a message that quotes another in reply, Chat's
 // counterpart of Slack's "ask about this" shortcut: the quoted message is
 // put to the agent quoted, opened by who posted it and closed by the rule
@@ -1472,7 +1488,8 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // is the command when routeTurn would answer it without an agent, and a
 // turn that reaches an agent carries the quote. The adapter does not know
 // the conversation's task state, which that answer turns on, so it decides
-// nothing here. Everything else about the turn is the message's own, as
+// nothing here beyond the stop (quotedReadNeeded). Everything else about
+// the turn is the message's own, as
 // classify set it: the member typed it themselves, so its conversation is
 // their message's thread and it is no Shortcut (that flag moves a refusal
 // out of a thread the clicker did not start; here they did).
@@ -1482,17 +1499,19 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 // calls this off the event pump, since the read happens before it has the
 // turn to hand over, under quotedReadTimeout. A quote that yields nothing,
 // the read refused or timed out or the message empty, is never silent for a
-// sender the gateway admits: one line in the conversation says so, the
-// member's words go ahead alone, and a message with none is no turn, with
-// the reason logged. A sender it would refuse gets no line, since the
-// adapter posts nothing in their conversation ahead of the gateway: their
-// words go ahead unchanged, to the refusal verifySender gives any message,
-// and their bare quote is dropped.
+// sender the gateway admits when an agent would have read it: the member's
+// words go ahead alone, marked QuotedUnread, and the router posts the line
+// saying so as it hands them to an agent (a command it answers itself gets
+// none); a message with no words is no turn, the adapter's line says what
+// to do, and the reason is logged. A sender it would refuse gets no line,
+// since the adapter posts nothing in their conversation ahead of the
+// gateway: their words go ahead, to the refusal verifySender gives any
+// message, and their bare quote is dropped.
 func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
-	name := ev.Message.QuotedMessageMetadata.Name
-	if name == "" {
+	if !quotedReadNeeded(ev, msg) {
 		return msg, ""
 	}
+	name := ev.Message.QuotedMessageMetadata.Name
 	if ctx.Err() != nil {
 		return InboundMessage{}, gchatShuttingDownReason
 	}
@@ -1504,23 +1523,20 @@ func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg I
 			// never comes, and no post for Run's wait to sit behind.
 			return InboundMessage{}, gchatShuttingDownReason
 		}
-		if !a.admitted(msg) {
-			if msg.Text == "" {
-				return InboundMessage{}, "the quoted message " + name + " could not be read, the message has no words of its own, and its sender is not admitted, so no line is posted"
-			}
+		if msg.Text != "" {
+			// The words go ahead alone, marked: the gateway posts the
+			// line for them once they reach an agent, since it, not the
+			// adapter, knows whether they are a command it answers itself.
+			msg.QuotedUnread = true
 			return msg, ""
 		}
-		notice := gchatQuotedUnreadWords
-		if msg.Text == "" {
-			notice = gchatQuotedUnreadBare
+		if !a.admitted(msg) {
+			return InboundMessage{}, "the quoted message " + name + " could not be read, the message has no words of its own, and its sender is not admitted, so no line is posted"
 		}
-		if _, err := a.Post(msg.Conversation, notice); err != nil {
+		if _, err := a.Post(msg.Conversation, gchatQuotedUnreadBare); err != nil {
 			a.log.Warn("gchat: posting the unread-quote line failed", "conversation", msg.Conversation, "err", err)
 		}
-		if msg.Text == "" {
-			return InboundMessage{}, "the quoted message " + name + " could not be read and the message has no words of its own"
-		}
-		return msg, ""
+		return InboundMessage{}, "the quoted message " + name + " could not be read and the message has no words of its own"
 	}
 	quote := shortcutAskQuoted(quoted.poster, quoted.content)
 	own := a.ownQuoted(ev, quoted)

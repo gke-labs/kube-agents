@@ -49,6 +49,21 @@ func quotedOntoAlert(t *testing.T, words, id string, dm bool) InboundMessage {
 	return msg
 }
 
+// quotedOntoUnread is the turn the adapter hands over for words typed in a
+// space quote-reply to a message it could not read: no snapshot, and the
+// relay refuses the read. The words travel alone, marked.
+func quotedOntoUnread(t *testing.T, words, id string) InboundMessage {
+	t.Helper()
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/get"] = fakeChatAPIError{status: 404, reason: "NOT_FOUND"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	msg, reason := quotedTurn(a, gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", id, "@bot "+words, words, gchatQuotedName))
+	if reason != "" || !msg.QuotedUnread || msg.Quoted != "" || msg.Text != words {
+		t.Fatalf("turn = %+v (%q), want the words alone, marked unread", msg, reason)
+	}
+	return msg
+}
+
 // quotedAskFor is the ask an agent reads for words quoted onto the alert:
 // the words first, or the bare opening when there are none.
 func quotedAskFor(words string) string {
@@ -86,6 +101,31 @@ func TestQuotedStopOnARunningTaskStopsIt(t *testing.T) {
 	}
 }
 
+// The line for a quote that could not be read posts only ahead of a turn an
+// agent reads. A quoted "status" on a running task is answered by replay,
+// with no line saying the quote went unread, since the answer never needed
+// it; a quoted question gets the line in its conversation, then the task on
+// the words alone.
+func TestUnreadQuoteLinePostsOnlyForATurnAnAgentReads(t *testing.T) {
+	r := startGchatRig(t, []string{quotedRouteUser}, false)
+	startQuotedRouteTask(t, r, quotedRouteSpace)
+	r.adapter.inbox <- quotedOntoUnread(t, "status", "spaces/S1/messages/M1")
+	awaitPostIn(t, r, "the replayed status card", quotedRouteSpace, "🎯 on: “check the fleet”")
+	if posts := r.adapter.postTextsFor(quotedRouteSpace); slices.Contains(posts, gchatQuotedUnreadWords) {
+		t.Errorf("posts = %q, want no unread-quote line ahead of a status answer", posts)
+	}
+	if n := messagesOn(t, r, "platform"); n != 1 {
+		t.Fatalf("%d messages on platform, want the task alone", n)
+	}
+
+	r = startGchatRig(t, []string{quotedRouteUser}, false)
+	r.adapter.inbox <- quotedOntoUnread(t, "is this one ours?", "spaces/S1/messages/M2")
+	awaitPostIn(t, r, "the unread-quote line in the question's conversation", quotedRouteSpace, gchatQuotedUnreadWords)
+	if got, want := envText(t, awaitSubmission(t, r, "platform", 0)), "is this one ours?"; got != want {
+		t.Errorf("the task reads %q\nwant %q, the words alone", got, want)
+	}
+}
+
 // A quote-reply status phrase on a running task is answered as a status ask,
 // from the stream, and reaches no agent.
 func TestQuotedStatusOnARunningTaskIsAnsweredAsStatus(t *testing.T) {
@@ -95,6 +135,23 @@ func TestQuotedStatusOnARunningTaskIsAnsweredAsStatus(t *testing.T) {
 	awaitPostIn(t, r, "the replayed status card", quotedRouteSpace, "🎯 on: “check the fleet”")
 	if n := messagesOn(t, r, "platform"); n != 1 {
 		t.Fatalf("%d messages on platform, want the task alone: a quoted status ask reached the agent", n)
+	}
+}
+
+// On a running task whose addressee refuses follow-ups the router reads the
+// wide status forms too, and a quoted one is answered as status like a typed
+// one: the words are what the matcher sees, and the quote reaches no agent
+// (spec-chatops-gateway.md, "The quote travels beside the words").
+func TestQuotedWideStatusOnARefusingAddresseeIsAnsweredAsStatus(t *testing.T) {
+	r := startGchatRig(t, []string{quotedRouteUser}, false)
+	r.g.mu.Lock()
+	r.g.steersRefusedBy["platform"] = true
+	r.g.mu.Unlock()
+	startQuotedRouteTask(t, r, quotedRouteSpace)
+	r.adapter.inbox <- quotedOntoAlert(t, "what is happening here?", "spaces/S1/messages/M1", false)
+	awaitPostIn(t, r, "the replayed status card", quotedRouteSpace, "🎯 on: “check the fleet”")
+	if n := messagesOn(t, r, "platform"); n != 1 {
+		t.Fatalf("%d messages on platform, want the task alone: a quoted wide status ask reached the agent", n)
 	}
 }
 

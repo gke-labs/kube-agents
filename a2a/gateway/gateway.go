@@ -1598,6 +1598,18 @@ func wordsAfter(msg InboundMessage, rest string) InboundMessage {
 	return msg
 }
 
+// noteUnreadQuote posts the one line a member is owed when the message they
+// quoted could not be read (InboundMessage.QuotedUnread), in the
+// conversation, ahead of the turn that now reads their words alone. It runs
+// at the two sinks that hand words to an agent, startTask and steerTask,
+// and nowhere else: a "stop" or a status ask the router answers itself never
+// needed the quote, so no line says it was not read.
+func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
+	if msg.QuotedUnread {
+		g.post(conversation, gchatQuotedUnreadWords)
+	}
+}
+
 // backendFor names the ingress one message arrived through. A message that
 // names none is the configured backend's, which is the Discord and Google
 // Chat adapters' case; the inject door and the console adapter stamp their
@@ -2919,6 +2931,7 @@ type taskStart struct {
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
+	g.noteUnreadQuote(rec.Key, msg)
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
 		Text:      agentText(msg),
@@ -3237,6 +3250,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
+	g.noteUnreadQuote(rec.Key, msg)
 	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
