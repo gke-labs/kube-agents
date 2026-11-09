@@ -3539,6 +3539,14 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.relay_db.unlink()
         self.assertEqual(self._resend("C0123"), [])
 
+    def test_an_unreadable_or_malformed_tries_file_reads_as_no_tries(self):
+        for raw in ("not json", "[1, 2]", '{"fleet-wide-cost-analysis": 3, "x": {"tries": "a", "posted": 1}}'):
+            with self.subTest(raw=raw):
+                (self.d / bootstrap_delivery.RESENT_FILE).write_text(raw, encoding="utf-8")
+                state = bootstrap_delivery._resend_state(self.d)
+                self.assertEqual(bootstrap_delivery._resend_tries(state.get("x", {})), 0)
+                self.assertNotIn("fleet-wide-cost-analysis", state)
+
     def test_a_posted_run_is_not_pending(self):
         claimed = self._lost_first_run()
         self._relay("fleet-wide-cost-analysis", claimed + 60)
