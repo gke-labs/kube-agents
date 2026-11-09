@@ -207,8 +207,11 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-upgrade-releases` — `scripts/check_upgrade_table_releases.py`;
   once a release is tagged, every row of the upgrade page's breaking-changes
   table labelled with it must come from a commit the tag contains (or sit in the
-  tag's own copy of the table). A wrong label fails a push to `main` and a pull
-  request that changes the page; on any other pull request it is a warning. It
+  tag's own copy of the table). For a reworded shipped row or a row added after
+  its release was tagged, `scripts/upgrade_table_traces.txt` names the commit
+  that shipped the change, and the tag must contain that commit instead. A wrong
+  label fails a push to `main` and a pull request that adds or relabels the row
+  or edits its entry; on any other pull request it is a warning. It
   reads the history and the release tags, so it fails on a shallow or tagless
   clone; run `git fetch --tags --unshallow` first.
 
