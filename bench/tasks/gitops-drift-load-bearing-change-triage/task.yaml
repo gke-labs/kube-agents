@@ -386,7 +386,7 @@ verification_spec:
         - "eval-operator@example.com"
         # The recorder nightly plants under this identity, so the audit log names it.
         - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-        # The Claude nightly twins plant under this identity.
+        # The next-mode nightly twins plant under this identity.
         - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-loosened-setting

@@ -27,8 +27,6 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
 - `bench/`: Evaluation harness running [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent.
 - `images.json`: Inventory of every container image an install pulls, with its upstream reference
   and pin; read by `make mirror-images`, the kustomize deploy targets, and the docs generator.
-- `INSTALL.md`: Installation guide.
-- `README.md`: Project overview.
 
 ## Where Tests Go
 
@@ -55,10 +53,9 @@ A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makef
 
 ## Agent Setup & Integration
 
-This repository is mostly configuration and documentation for AI agents, plus the Go modules in
-`k8s-operator/` and `a2a/`. Follow [INSTALL.md](INSTALL.md) to set up and register the Platform
-Agent; [docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts,
-and operational guides.
+Follow [INSTALL.md](INSTALL.md) to set up and register the Platform Agent;
+[docs/site/src/content/docs/](docs/site/src/content/docs/) has the architecture, concepts, and
+operational guides.
 
 ## Before Starting a Task
 
@@ -78,7 +75,6 @@ drift check in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
 If it lists a file, rebase onto `upstream/main` and re-read those files before writing more; if it
 lists nothing, being behind is a merge-conflict risk to settle later, not a reason to stop.
-[`CONTRIBUTING.md`](CONTRIBUTING.md) points here rather than restating this.
 
 ### Check whether someone is already doing it
 
@@ -207,6 +203,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   into the chart in step.
 - **Expect an automated review after opening a PR** from `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
+- **Quarantine a flaky test, don't re-run it**, once a product race is ruled out and an owner named;
+  never a conformance or security test without a security approver
+  ([how](docs/pull-request-workflow.md#quarantining-a-flaky-test)).
 - **Leave no conversation unanswered.** Open threads block merge and keep the PR counted as
   [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request).
   Reply first, then resolve every addressed thread

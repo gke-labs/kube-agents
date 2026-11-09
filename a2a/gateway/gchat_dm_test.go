@@ -35,6 +35,19 @@ func gchatDM(r *rig, conv, id, text string, topLevel bool) {
 	}
 }
 
+// awaitEditIn waits for an edit of a message in conv whose text contains
+// want: a stop typed on Google Chat answers on the task's line.
+func awaitEditIn(t *testing.T, r *rig, what, conv, want string) {
+	t.Helper()
+	waitFor(t, what, func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return slices.ContainsFunc(r.adapter.edits, func(e fakePost) bool {
+			return e.Conversation == conv && strings.Contains(e.Text, want)
+		})
+	})
+}
+
 // awaitPostIn waits for a post into conv whose text contains want.
 func awaitPostIn(t *testing.T, r *rig, what, conv, want string) {
 	t.Helper()
@@ -71,7 +84,7 @@ func TestGchatDMTopLevelStopPointsAtTheThread(t *testing.T) {
 	}
 
 	gchatDM(r, gchatDMQuestion, "spaces/D1/messages/M3", "stop", false)
-	awaitPostIn(t, r, "the cancel in the question's thread", gchatDMQuestion, gchatDMCancelNotice)
+	awaitEditIn(t, r, "the cancel on the question's line", gchatDMQuestion, gchatDMCancelNotice)
 	waitFor(t, "the cancel on the question's task", func() bool {
 		return slices.ContainsFunc(inSubjectEnvelopes(t, r.url, "platform"), func(e *lib.Envelope) bool {
 			return e.TaskID == first.TaskID && e.Kind == lib.KindCancel
