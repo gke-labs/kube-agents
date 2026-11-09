@@ -1082,6 +1082,8 @@ health and stats, not payloads or tokens. The operator reads it for one thing, `
 `nats-server-config-reloader` beside nats-server, in one PID namespace. When the kubelet
 writes a new `nats.conf` into the pod, the reloader sends nats-server the reload signal,
 and the server applies the new users and permissions to the connections it already holds.
+It also runs the auth callout again for each connection the callout authenticated; on
+2.10.29 those connections dropped at the reload and reconnected within a second.
 The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
 added, removed or done draining changes the config Secret and not the template: the bus is
 reloaded, not rolled. Every other config change still rolls it. The operator records the
