@@ -30,9 +30,11 @@ type profileLister interface {
 // it is every requester and steer author still on the conversation's record,
 // a superset of what the primer keeps: the list may leave out a profile the
 // delegation would allow, never offer one it would refuse for these people.
-func delegateAuthors(rec *SessionRecord, r TaskRequester) ([]TaskRequester, bool) {
+// approximate reports that branch, where an unknown set may be the
+// superset's overflow rather than the pod's (the primer drops turns to fit),
+// so the caller sends no list rather than an empty one.
+func delegateAuthors(rec *SessionRecord, r TaskRequester) (authors []TaskRequester, unknown, approximate bool) {
 	var out []TaskRequester
-	unknown := false
 	add := func(a TaskRequester) {
 		if !slices.Contains(out, a) {
 			out = append(out, a)
@@ -44,6 +46,7 @@ func delegateAuthors(rec *SessionRecord, r TaskRequester) ([]TaskRequester, bool
 			add(a)
 		}
 	} else {
+		approximate = true
 		for _, ref := range rec.Tasks {
 			if ref.Requester == nil {
 				continue
@@ -56,7 +59,7 @@ func delegateAuthors(rec *SessionRecord, r TaskRequester) ([]TaskRequester, bool
 		}
 	}
 	add(r)
-	return out, unknown || len(out) > sessionAuthorCap
+	return out, unknown || len(out) > sessionAuthorCap, approximate
 }
 
 // sortedCards is every card the directory holds, in name order.
