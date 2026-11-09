@@ -644,6 +644,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          current-context locally via credential_proxy_client,
 #                          its kubectl reads go through the same wrapper, and it
 #                          is here for the same reason as stall_report.py
+#   kcc_fleet_audit.py     batched parallel Config Connector (KCC) CRD and custom
+#                          resource auditor for Cluster Agent KCC audits (#3142)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -694,6 +696,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/audit_networking.py \
      agents/platform/scripts/audit_certificates.py \
      agents/platform/scripts/workload_triage.py \
+     agents/platform/scripts/kcc_fleet_audit.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
