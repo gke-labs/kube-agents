@@ -234,8 +234,8 @@ class StanzaTest(unittest.TestCase):
     def test_a_yes_or_no_answer_carries_no_claims_unless_the_card_asks(self):
         # The same condition as verified_claims' tool description; a why-question keeps its claims.
         flat = " ".join(REPORT_FORMAT_STANZA.split())
-        self.assertIn("On a yes-or-no question or a status check, even one that ends", flat)
-        self.assertIn("leave `verified_claims` empty and call nothing verified", flat)
+        self.assertIn("On a yes-or-no question or a status check, leave `verified_claims` empty", flat)
+        self.assertIn('list of the commands you ran, even when it ends "report a summary of the findings"', flat)
         self.assertIn("unless the card asks for verified claims", flat)
 
     def test_the_question_budget_is_the_cases(self):
