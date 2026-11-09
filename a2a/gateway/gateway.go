@@ -2144,6 +2144,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
+	state.ChildAddressees = chainChildAddressees(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2221,6 +2222,27 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 		}
 	}
 	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// chainChildAddressees is whom the delegation chain rooted at taskID's root
+// delegated to: the addressee each child task was minted for (a profile's
+// name, or platform), once each, in the record's order, which is the order
+// they were delegated. Empty, not nil, when the chain delegated nothing, so
+// the wire tells "none" from "unknown"; nil only when taskID is unknown.
+func chainChildAddressees(rec *SessionRecord, taskID string) []string {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	out := []string{}
+	for _, t := range rec.Tasks {
+		if t.Role != taskRoleChild || t.rootID() != root || t.Addressee == "" || slices.Contains(out, t.Addressee) {
+			continue
+		}
+		out = append(out, t.Addressee)
+	}
+	return out
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.

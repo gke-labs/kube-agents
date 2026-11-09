@@ -2748,6 +2748,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
         errors=[],
         metadata={
             "transport": TRANSPORT_INJECT,
+            "child_addressees": None if fold.child_addressees is None else list(fold.child_addressees),
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
@@ -2877,6 +2878,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
+            child_addressees=result.metadata.get("child_addressees"),
         )
         _write_chat_shape(result)
         return result
@@ -3684,6 +3686,8 @@ class KubeAgentsHarness(AgentHarness):
                     exchange.fold.usage = settled.fold.usage
                     exchange.fold.child_usage = settled.fold.child_usage
                     exchange.fold.usage_partial = settled.fold.usage_partial
+                if timed_out and settled is not None and settled.fold.child_addressees is not None:
+                    exchange.fold.child_addressees = settled.fold.child_addressees
             return timed_out, stop_pending
 
         def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:

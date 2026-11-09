@@ -3214,6 +3214,92 @@ class WorkerAgentsVerifier(BaseVerifier):
 
 
 
+_NO_CHILD_ADDRESSEES_REASON = (
+    "the run did not report whom its chain delegated to: the record came through a "
+    "transport other than the inject door, or a door older than its childAddressees "
+    "field, so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("delegated_to")
+class DelegatedToVerifier(BaseVerifier):
+    """Checks whom the delegating turn's chain delegated to.
+
+    The inject door's read route names each child task's addressee once, in
+    the order delegated (``childAddressees``): an AgentProfile's name, or
+    ``platform``. The harness keeps that on the transcript
+    (``TranscriptSnapshot.child_addressees``). This reads it and nothing
+    else, so a case can grade which agent a session chose, which neither the
+    answer nor the trajectory says.
+
+    ``required_addressees``: Python regular expressions, each of which must
+    ``re.fullmatch`` at least one addressee.
+    ``forbidden_addressees``: Python regular expressions, none of which may
+    ``re.fullmatch`` any addressee. At least one of the two lists is set.
+
+    Fails closed: a run that could not say (the api transport, or a door
+    older than the field) is ``status="error"``, never a pass or a fail. A
+    case that relies on this check belongs in
+    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    """
+
+    type: Literal["delegated_to"]
+    required_addressees: list[str] = Field(default_factory=list)
+    forbidden_addressees: list[str] = Field(default_factory=list)
+
+    @field_validator("required_addressees", "forbidden_addressees")
+    @classmethod
+    def _addressee_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            if re.compile(pattern).fullmatch(""):
+                raise ValueError(f"addressee pattern {pattern!r} matches the empty string")
+        return patterns
+
+    @model_validator(mode="after")
+    def _one_list_set(self) -> "DelegatedToVerifier":
+        if not self.required_addressees and not self.forbidden_addressees:
+            raise ValueError("delegated_to needs required_addressees, forbidden_addressees, or both")
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.child_addressees is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_CHILD_ADDRESSEES_REASON,
+            )
+        addressees = list(snap.child_addressees)
+        missing = [p for p in self.required_addressees if not any(re.fullmatch(p, a) for a in addressees)]
+        forbidden = [a for a in addressees if any(re.fullmatch(p, a) for p in self.forbidden_addressees)]
+        seen = addressees or "nobody"
+        if missing or forbidden:
+            parts = []
+            if missing:
+                parts.append(f"no delegation went to an addressee matching {missing}")
+            if forbidden:
+                parts.append(f"the chain delegated to forbidden addressee(s) {forbidden}")
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"{'; '.join(parts)}; the chain delegated to {seen}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"the chain delegated to {seen}",
+        )
+
+
 # The dispatcher's record of a worker that ran out of its turn budget: the
 # run closes ``timed_out`` with this at the head of ``error`` (hermes
 # ``agent/turn_finalizer.py``, ``_record_kanban_budget_exhausted``). The two

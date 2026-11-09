@@ -454,7 +454,9 @@ splits with an empty quote inside it is one word to the shell and none to the pa
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
-judged metrics receive those entries as the execution trace.
+judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
+delegating turn's chain delegated to, by profile name, from the inject read route's
+`childAddressees`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below

@@ -46,7 +46,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from kube_agents_bench import board, harness, worker_trajectory
+from kube_agents_bench import board, harness, transcript, worker_trajectory
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import scoring, stop_hook
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -344,6 +344,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     probe_usage: dict[str, Any] | None = None
     # The chain's child tasks' usage and the partial flag, sent beside it.
     probe_child_usage: dict[str, Any] | None = None
+    # The read route's childAddressees on the chain read after the terminal;
+    # None leaves the key out, as a door older than the field does.
+    probe_child_addressees: list[str] | None = None
     probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
@@ -386,6 +389,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 report["activityDropped"] = self.probe_activity_dropped
             if self.probe_progress:
                 report["progress"] = self.probe_progress
+        if self.probe_child_addressees is not None and chain and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["childAddressees"] = list(self.probe_child_addressees)
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
@@ -4346,6 +4352,43 @@ def test_the_chains_children_count_apart_and_join_the_total(stub_gateway: _StubG
     assert result.tokens["children"] == {"input": 900, "output": 90, "total": 990}
     assert result.tokens["total"] == 2690
     assert "usage_partial" not in result.tokens
+
+
+def test_the_chains_addressees_reach_the_record_and_the_transcript(stub_gateway: _StubGatewayServer) -> None:
+    """The read after the terminal names whom the chain delegated to; the
+    record's metadata and the verifiers' transcript carry it as given."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the tse agent found it")
+    stub_gateway.probe_child_addressees = ["tse", "platform"]
+
+    result = KubeAgentsHarness().run("/session ask the tse agent")
+
+    assert result.metadata["child_addressees"] == ["tse", "platform"]
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees == ["tse", "platform"]
+
+
+def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.metadata["child_addressees"] is None
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees is None
+
+
+def test_the_addressees_field_parses_none_from_cannot_say() -> None:
+    def parsed(value: Any) -> list[str] | None:
+        probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})
+        assert probe is not None
+        return probe.child_addressees
+
+    assert parsed([]) == []
+    assert parsed(["tse"]) == ["tse"]
+    assert parsed(None) is None
+    assert parsed("tse") is None
+    assert parsed(["tse", 3]) is None
+    assert inject.Probe.from_body({"probe": {"active": False}}).child_addressees is None
 
 
 def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(
