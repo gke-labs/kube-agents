@@ -5748,6 +5748,9 @@ type a2aProvisionState struct {
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
+	// busPodRequeue is how long until a bus pod stuck on an old revision is
+	// due for replacement (replaceStuckA2ANATSPod); zero when none waits.
+	busPodRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -6033,6 +6036,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		if err := r.applyManaged(ctx, agent, sts); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+		}
+		// A pod that never became Ready on an earlier template blocks the
+		// rolling update this apply starts (replaceStuckA2ANATSPod).
+		if state.busPodRequeue, err = r.replaceStuckA2ANATSPod(ctx, agent, sts, time.Now()); err != nil {
+			return state, err
 		}
 	}
 
