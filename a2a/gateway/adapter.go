@@ -36,6 +36,15 @@ type InboundMessage struct {
 	MessageID string
 	// Text is the message content.
 	Text string
+	// Quoted is the turn's text when it reaches an agent: the member's words
+	// followed by the message they quoted, framed; empty when the message
+	// quotes nothing. Text stays the member's own words so the gateway's
+	// command matchers read them: a stop or a status ask quoted onto an
+	// alert is answered on the words alone, and the router puts Quoted in
+	// Text's place only for a turn that reaches an agent (agentText). Set by
+	// Google Chat's quote-in-reply (gchat.go, quotedAsk); empty on every
+	// other path.
+	Quoted string
 
 	// Backend names the ingress this message arrived through, and empty
 	// means the gateway's own configured backend. It exists because one

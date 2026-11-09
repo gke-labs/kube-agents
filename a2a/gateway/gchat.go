@@ -18,8 +18,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-
-	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 const (
@@ -1092,7 +1090,7 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "reason", reason)
 			continue
 		}
-		if !quotedAskNeeded(ev, msg) {
+		if ev.Message.QuotedMessageMetadata.Name == "" {
 			handler(msg)
 			continue
 		}
@@ -1460,43 +1458,6 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	return msg, ""
 }
 
-// quotedAskNeeded reports a message whose turn is composed from the message
-// it quotes (quotedAsk): one that quotes a message and whose own words are
-// not a command the gateway answers itself (gchatQuotedWordsAreACommand).
-func quotedAskNeeded(ev *gchatEvent, msg InboundMessage) bool {
-	return ev.Message.QuotedMessageMetadata.Name != "" && !gchatQuotedWordsAreACommand(msg.Text)
-}
-
-// gchatQuotedWordsAreACommand reports words typed beside a quote that are a
-// command the gateway answers without an agent, so the quote must not be
-// framed around them: routeTurn matches these on the words alone, and the
-// quote is where the member typed them, not what they asked. It is
-// narrower than chattext.IsCommand on purpose: that one is the button
-// validator's superset and takes the status ask in its wide form ("what is
-// happening here?", "how is the deploy doing?"), which routeTurn reads only
-// under wideStatus on a running task, so a quoted question that merely
-// looks like one would lose its quote and reach no one. The forms, as
-// routeTurn parses them: a stop; a bare "/feedback" and "/feedback summary";
-// "/session" bare or "off" (a "/session <text>" is an agent's turn); the
-// exact status phrases; and a delegation, with its task or the bare word,
-// which routeTurn would otherwise read with the frame's line break as its
-// separator and spawn a worker whose task is the frame.
-func gchatQuotedWordsAreACommand(text string) bool {
-	if chattext.IsStop(text) || chattext.IsStatusQuery(text, false) {
-		return true
-	}
-	if rest, ok := chattext.IsFeedbackCommand(text); ok && (rest == "" || chattext.IsFeedbackSummaryCommand(text)) {
-		return true
-	}
-	if rest, ok := chattext.IsSessionCommand(text); ok && (rest == "" || chattext.IsSessionOff(rest)) {
-		return true
-	}
-	if _, ok := chattext.IsDelegate(text); ok {
-		return true
-	}
-	return chattext.Normalize(text) == chattext.DelegateWord
-}
-
 // quotedAsk is the turn for a message that quotes another in reply, Chat's
 // counterpart of Slack's "ask about this" shortcut: the quoted message is
 // put to the agent quoted, opened by who posted it and closed by the rule
@@ -1504,11 +1465,17 @@ func gchatQuotedWordsAreACommand(text string) bool {
 // member's own words, when they typed any beside the quote, come first. A
 // quote of the gateway's own message (ownQuoted) is Chat's ordinary reply
 // gesture, a "yes" to its question or a "why?" to its answer, and gets the
-// quote as context with no rule sentence. Everything else about the turn is
-// the message's own, as classify set it: the member typed it themselves, so
-// its conversation is their message's thread and it is no Shortcut (that
-// flag moves a refusal out of a thread the clicker did not start; here they
-// did).
+// quote as context with no rule sentence. The composed ask travels beside
+// the words, as InboundMessage.Quoted, and Text stays the words as typed
+// (empty for a bare quote): the gateway's own routing reads the words, so a
+// stop, a status ask or a "/session off" quoted onto one of the bot's posts
+// is the command when routeTurn would answer it without an agent, and a
+// turn that reaches an agent carries the quote. The adapter does not know
+// the conversation's task state, which that answer turns on, so it decides
+// nothing here. Everything else about the turn is the message's own, as
+// classify set it: the member typed it themselves, so its conversation is
+// their message's thread and it is no Shortcut (that flag moves a refusal
+// out of a thread the clicker did not start; here they did).
 //
 // The quoted message comes from the event's snapshot when that carries
 // content, and from a read through the relay otherwise (quotedMessage). Run
@@ -1523,7 +1490,7 @@ func gchatQuotedWordsAreACommand(text string) bool {
 // and their bare quote is dropped.
 func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
 	name := ev.Message.QuotedMessageMetadata.Name
-	if !quotedAskNeeded(ev, msg) {
+	if name == "" {
 		return msg, ""
 	}
 	if ctx.Err() != nil {
@@ -1559,13 +1526,13 @@ func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg I
 	own := a.ownQuoted(ev, quoted)
 	switch {
 	case own && msg.Text == "":
-		msg.Text = fmt.Sprintf(gchatQuotedOwnAsk, quote)
+		msg.Quoted = fmt.Sprintf(gchatQuotedOwnAsk, quote)
 	case own:
-		msg.Text = fmt.Sprintf(gchatQuotedOwnAskWithWords, msg.Text, quote)
+		msg.Quoted = fmt.Sprintf(gchatQuotedOwnAskWithWords, msg.Text, quote)
 	case msg.Text == "":
-		msg.Text = fmt.Sprintf(gchatQuotedAsk, quote)
+		msg.Quoted = fmt.Sprintf(gchatQuotedAsk, quote)
 	default:
-		msg.Text = fmt.Sprintf(gchatQuotedAskWithWords, msg.Text, quote)
+		msg.Quoted = fmt.Sprintf(gchatQuotedAskWithWords, msg.Text, quote)
 	}
 	return msg, ""
 }

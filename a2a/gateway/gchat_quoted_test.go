@@ -112,11 +112,11 @@ func TestGchatQuotedDMWithNoWordsIsTheQuotedAsk(t *testing.T) {
 		t.Fatalf("dropped: %s", reason)
 	}
 	want := fmt.Sprintf(gchatQuotedAsk, "> Posted by Alex Doe:\n> "+gchatQuotedAlert)
-	if msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if msg.Quoted != want || msg.Text != "" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside no words", msg.Quoted, msg.Text, want)
 	}
-	if !strings.HasPrefix(msg.Text, shortcutAskOpen) || !strings.HasSuffix(msg.Text, shortcutAskRule) {
-		t.Errorf("the ask must open as Slack's shortcut does and close with the rule: %q", msg.Text)
+	if !strings.HasPrefix(msg.Quoted, shortcutAskOpen) || !strings.HasSuffix(msg.Quoted, shortcutAskRule) {
+		t.Errorf("the ask must open as Slack's shortcut does and close with the rule: %q", msg.Quoted)
 	}
 	c := f.call(0)
 	if strings.Join(c.resource, ".") != "spaces.messages" || c.method != "get" || c.arguments["name"] != gchatQuotedName {
@@ -148,15 +148,15 @@ func TestGchatQuotedSpaceMessageWithWordsPutsTheWordsFirst(t *testing.T) {
 		t.Fatalf("dropped: %s", reason)
 	}
 	want := fmt.Sprintf(gchatQuotedAskWithWords, "is this one ours?", "> Posted by Alex Doe:\n> "+gchatQuotedAlert)
-	if msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if msg.Quoted != want || msg.Text != "is this one ours?" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside the typed words", msg.Quoted, msg.Text, want)
 	}
-	if strings.Contains(msg.Text, shortcutAskOpen) {
-		t.Errorf("a member who typed words does not get the bare opening: %q", msg.Text)
+	if strings.Contains(msg.Quoted, shortcutAskOpen) {
+		t.Errorf("a member who typed words does not get the bare opening: %q", msg.Quoted)
 	}
-	msg.Text, msg.MessageID = plainMsg.Text, plainMsg.MessageID
+	msg.Quoted, msg.MessageID = "", plainMsg.MessageID
 	if !reflect.DeepEqual(msg, plainMsg) {
-		t.Errorf("a quoted ask = %+v differs from the plain message %+v beyond its text", msg, plainMsg)
+		t.Errorf("a quoted ask = %+v differs from the plain message %+v beyond its quoted ask", msg, plainMsg)
 	}
 }
 
@@ -171,8 +171,8 @@ func TestGchatQuotedSnapshotComposesWithoutARead(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if want := fmt.Sprintf(gchatQuotedAsk, "> Posted by Alertmanager:\n> "+gchatQuotedAlert); msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if want := fmt.Sprintf(gchatQuotedAsk, "> Posted by Alertmanager:\n> "+gchatQuotedAlert); msg.Quoted != want {
+		t.Errorf("text = %q\nwant %q", msg.Quoted, want)
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("relay calls = %+v, want none: the snapshot is the message", f.calls)
@@ -198,8 +198,8 @@ func TestGchatQuotedForwardUsesTheSnapshot(t *testing.T) {
 		t.Fatalf("dropped: %s", reason)
 	}
 	want := fmt.Sprintf(gchatQuotedAskWithWords, "what happened here?", "> Posted by Pat Ops:\n> *node-3* is NotReady\n> [attached: kubelet.log]")
-	if msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if msg.Quoted != want || msg.Text != "what happened here?" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside the typed words", msg.Quoted, msg.Text, want)
 	}
 	if len(f.calls) != 0 {
 		t.Errorf("relay calls = %+v, want none", f.calls)
@@ -217,12 +217,12 @@ func TestGchatQuotedTextIsClippedAtTheCap(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	lines := strings.Split(msg.Text, "\n")
+	lines := strings.Split(msg.Quoted, "\n")
 	quoted := lines[3]
 	if n := len([]rune(quoted)); n != len("> ")+shortcutAskQuoteMax || !strings.HasSuffix(quoted, slackClipEllipsis) {
 		t.Errorf("quoted line is %d code points ending %q; want %d plus the prefix, ending in the ellipsis", n, quoted[len(quoted)-3:], shortcutAskQuoteMax)
 	}
-	if !strings.HasSuffix(msg.Text, shortcutAskRule) {
+	if !strings.HasSuffix(msg.Quoted, shortcutAskRule) {
 		t.Error("the rule must survive the clip")
 	}
 }
@@ -251,11 +251,11 @@ func TestGchatQuotedAppMessageNamesTheApp(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if want := "> Posted by " + c.posted + ":\n> disk 97% on node-3"; !strings.Contains(msg.Text, want) {
-				t.Errorf("text = %q, want it to carry %q", msg.Text, want)
+			if want := "> Posted by " + c.posted + ":\n> disk 97% on node-3"; !strings.Contains(msg.Quoted, want) {
+				t.Errorf("text = %q, want it to carry %q", msg.Quoted, want)
 			}
-			if !strings.HasSuffix(msg.Text, shortcutAskRule) {
-				t.Errorf("another app's message in a space keeps the rule: %q", msg.Text)
+			if !strings.HasSuffix(msg.Quoted, shortcutAskRule) {
+				t.Errorf("another app's message in a space keeps the rule: %q", msg.Quoted)
 			}
 		})
 	}
@@ -274,8 +274,8 @@ func TestGchatQuotedContentNamesFilesAndFallsBackToFormattedText(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if want := "> Posted by Alex:\n> *pods pending*\n> [attached: describe.txt]"; !strings.Contains(msg.Text, want) {
-		t.Errorf("text = %q, want it to carry %q", msg.Text, want)
+	if want := "> Posted by Alex:\n> *pods pending*\n> [attached: describe.txt]"; !strings.Contains(msg.Quoted, want) {
+		t.Errorf("text = %q, want it to carry %q", msg.Quoted, want)
 	}
 }
 
@@ -296,7 +296,7 @@ func TestGchatQuotedReadFailureFallsBackToTheTypedWords(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if msg.Text != "is this one ours?" || msg.Shortcut {
+	if msg.Text != "is this one ours?" || msg.Quoted != "" || msg.Shortcut {
 		t.Errorf("turn = %+v, want the typed words alone", msg)
 	}
 	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), gchatQuotedName) || !strings.Contains(logs.String(), "chat 404") {
@@ -346,7 +346,7 @@ func TestGchatEmptyQuoteIsAFailedQuote(t *testing.T) {
 			switch {
 			case words == "" && (reason == "" || len(got) != 1 || got[0] != gchatQuotedUnreadBare):
 				t.Errorf("bare: reason=%q posted=%q, want no turn and the bare line", reason, got)
-			case words != "" && (reason != "" || msg.Text != words || len(got) != 1 || got[0] != gchatQuotedUnreadWords):
+			case words != "" && (reason != "" || msg.Text != words || msg.Quoted != "" || len(got) != 1 || got[0] != gchatQuotedUnreadWords):
 				t.Errorf("words: reason=%q text=%q posted=%q, want the words alone and the line", reason, msg.Text, got)
 			}
 		})
@@ -379,10 +379,10 @@ func TestGchatQuoteOfTheBotsOwnMessageHasNoRule(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if want := fmt.Sprintf(gchatQuotedOwnAskWithWords, "yes", "> Posted by kube-agents:\n> Scale it to 3 replicas?"); msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if want := fmt.Sprintf(gchatQuotedOwnAskWithWords, "yes", "> Posted by kube-agents:\n> Scale it to 3 replicas?"); msg.Quoted != want || msg.Text != "yes" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside the typed words", msg.Quoted, msg.Text, want)
 	}
-	if strings.Contains(msg.Text, shortcutAskRule) {
+	if strings.Contains(msg.Quoted, shortcutAskRule) {
 		t.Error("the gateway's own message is not something to check against the member")
 	}
 	a.mu.Lock()
@@ -401,15 +401,15 @@ func TestGchatQuoteOfTheBotsOwnMessageHasNoRule(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("dropped: %s", reason)
 	}
-	if want := fmt.Sprintf(gchatQuotedOwnAsk, "> Posted by kube-agents:\n> Done: scaled to 3."); msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if want := fmt.Sprintf(gchatQuotedOwnAsk, "> Posted by kube-agents:\n> Done: scaled to 3."); msg.Quoted != want || msg.Text != "" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside no words", msg.Quoted, msg.Text, want)
 	}
 
 	// The same snapshot in a DM, the poster the member themself: not own.
 	theirs := withSnapshot(gchatQuotedMsg("spaces/D1", "DIRECT_MESSAGE", "spaces/D1/threads/T1", "spaces/D1/messages/M4", "", "", "spaces/D1/messages/MINE"),
 		"REPLY", "Uma One", "my earlier note")
-	if msg, _ = quotedTurn(a, theirs); !strings.HasSuffix(msg.Text, shortcutAskRule) {
-		t.Errorf("a member's own earlier message keeps the rule: %q", msg.Text)
+	if msg, _ = quotedTurn(a, theirs); !strings.HasSuffix(msg.Quoted, shortcutAskRule) {
+		t.Errorf("a member's own earlier message keeps the rule: %q", msg.Quoted)
 	}
 
 	// In a space the name decides: the message this process posted is own,
@@ -420,13 +420,13 @@ func TestGchatQuoteOfTheBotsOwnMessageHasNoRule(t *testing.T) {
 	}
 	own := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M5", "@bot why?", "why?", "spaces/S1/messages/ANSWER"),
 		"REPLY", "kube-agents", "It is OOMKilled.")
-	if msg, _ = quotedTurn(a, own); msg.Text != fmt.Sprintf(gchatQuotedOwnAskWithWords, "why?", "> Posted by kube-agents:\n> It is OOMKilled.") {
-		t.Errorf("space quote of the gateway's own answer = %q", msg.Text)
+	if msg, _ = quotedTurn(a, own); msg.Quoted != fmt.Sprintf(gchatQuotedOwnAskWithWords, "why?", "> Posted by kube-agents:\n> It is OOMKilled.") {
+		t.Errorf("space quote of the gateway's own answer = %q", msg.Quoted)
 	}
 	other := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M6", "@bot why?", "why?", "spaces/S1/messages/THEIRS"),
 		"REPLY", "Alertmanager", "[FIRING:1] something")
-	if msg, _ = quotedTurn(a, other); !strings.HasSuffix(msg.Text, shortcutAskRule) {
-		t.Errorf("space quote of another app's message = %q, want the rule kept", msg.Text)
+	if msg, _ = quotedTurn(a, other); !strings.HasSuffix(msg.Quoted, shortcutAskRule) {
+		t.Errorf("space quote of another app's message = %q, want the rule kept", msg.Quoted)
 	}
 }
 
@@ -456,7 +456,7 @@ func TestGchatQuotedReadTimesOutToTheTypedWords(t *testing.T) {
 	}()
 	select {
 	case msg := <-done:
-		if msg.Text != "is this one ours?" {
+		if msg.Text != "is this one ours?" || msg.Quoted != "" {
 			t.Errorf("turn = %+v, want the typed words alone", msg)
 		}
 		if got := postedTexts(f); len(got) != 1 || got[0] != gchatQuotedUnreadWords {
@@ -508,8 +508,8 @@ func TestGchatQuotedAskIsTheEvalCasesPrompt(t *testing.T) {
 	if err := yaml.Unmarshal(raw, &task); err != nil {
 		t.Fatal(err)
 	}
-	if task.Prompt != msg.Text {
-		t.Errorf("%s's prompt is not the ask the adapter writes.\ngot:\n%s\nwant:\n%s", quotedEvalCase, task.Prompt, msg.Text)
+	if task.Prompt != msg.Quoted {
+		t.Errorf("%s's prompt is not the ask the adapter writes.\ngot:\n%s\nwant:\n%s", quotedEvalCase, task.Prompt, msg.Quoted)
 	}
 }
 
@@ -600,8 +600,8 @@ func TestGchatQuotedReplyFixtureThroughRun(t *testing.T) {
 			defer mu.Unlock()
 			msg := got[0]
 			want := fmt.Sprintf(gchatQuotedAskWithWords, "is this one ours?", shortcutAskQuote("Posted by Alertmanager:\n"+alert))
-			if msg.Text != want {
-				t.Errorf("text = %q\nwant %q", msg.Text, want)
+			if msg.Quoted != want || msg.Text != "is this one ours?" {
+				t.Errorf("quoted = %q (text %q)\nwant %q beside the typed words", msg.Quoted, msg.Text, want)
 			}
 			if msg.Shortcut || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/Qu0teDr3ply" ||
 				msg.MessageID != "spaces/_c2fixtureAA/messages/Qu0teDr3ply.Qu0teDr3ply" || msg.AuthorID != "sender@example.com" || !msg.TopLevel {
@@ -630,7 +630,7 @@ func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
 			c.set(a)
 			words := gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@bot is this one ours?", "is this one ours?", gchatQuotedName)
 			msg, reason := quotedTurn(a, words)
-			if reason != "" || msg.Text != "is this one ours?" || msg.AuthorID != "u1@example.com" {
+			if reason != "" || msg.Text != "is this one ours?" || msg.Quoted != "" || msg.AuthorID != "u1@example.com" {
 				t.Errorf("words: turn = %+v (%q), want the words handed over unchanged", msg, reason)
 			}
 			bare := gchatBareQuotedMsg(gchatQuotedName)
@@ -646,48 +646,27 @@ func TestGchatUnadmittedSenderGetsNoUnreadQuoteLine(t *testing.T) {
 	}
 }
 
-// A command sent as a quote-reply to one of the bot's posts is the command:
-// the words go over unchanged, with no read and no frame, so routeTurn's
-// matchers see them. The bare delegate word is one too, since framed it
-// would read as a delegation of the frame. Ordinary words beside a quote are
-// still framed, a question that only looks like a status ask included:
-// routeTurn reads the wide form only on a running task, and a quoted
-// question that lost its quote would reach no one.
-func TestGchatQuoteReplyCommandStaysTheCommand(t *testing.T) {
-	for _, words := range []string{"stop", "/session off", "/session", "status", "/feedback", "/feedback summary", "delegate check node-3", "delegate", "Delegate."} {
+// Words typed beside a quote stay the words, on Text, and the composed ask
+// goes beside them on Quoted, a command and an ordinary question alike: the
+// adapter does not know whether a task is running, which is what decides
+// whether routeTurn answers "status" itself or hands it to an agent, so it
+// composes every quote and the router reads the words
+// (TestQuotedAskTravelsBesideTheWords in quoted_route_test.go). A quote of
+// the bot's own post gets the own frame; the snapshot spares the read.
+func TestGchatQuoteReplyKeepsTheWordsBesideTheQuote(t *testing.T) {
+	for i, words := range []string{"stop", "/session off", "status", "/feedback", "delegate check node-3", "delegate", "what is happening here?", "/session what is this alert?"} {
 		t.Run(words, func(t *testing.T) {
 			f := newFakeChatRelay(t)
-			f.responses["spaces.messages/get"] = quotedResponse(humanSender("Alex"), gchatQuotedAlert)
 			a := newTestGchatAdapterWithRelay(t, f)
-			ev := withSnapshot(gchatQuotedMsg("spaces/D1", "DIRECT_MESSAGE", "spaces/D1/threads/T1", "spaces/D1/messages/M1", words, "", "spaces/D1/messages/Q1"),
+			ev := withSnapshot(gchatQuotedMsg("spaces/D1", "DIRECT_MESSAGE", "spaces/D1/threads/T1", fmt.Sprintf("spaces/D1/messages/M%d", i), words, "", "spaces/D1/messages/Q1"),
 				"REPLY", "kube-agents", "Scale it to 3 replicas?")
-			msg, reason := a.classify(ev)
-			if reason != "" {
-				t.Fatalf("dropped: %s", reason)
-			}
-			if quotedAskNeeded(ev, msg) {
-				t.Error("Run must hand a command over inline, not through the quote path")
-			}
-			if msg, reason = a.quotedAsk(context.Background(), ev, msg); reason != "" || msg.Text != words {
-				t.Errorf("turn = %+v (%q), want the command unchanged", msg, reason)
-			}
-			if len(f.calls) != 0 {
-				t.Errorf("relay calls = %+v, want none", f.calls)
-			}
-		})
-	}
-	for i, words := range []string{"stop the bleeding, what is this?", "what is happening here?", "how is the deploy doing?", "/session what is this alert?", "/feedback the alert text is wrong"} {
-		t.Run(words, func(t *testing.T) {
-			f := newFakeChatRelay(t)
-			a := newTestGchatAdapterWithRelay(t, f)
-			ev := withSnapshot(gchatQuotedMsg("spaces/S1", "SPACE", "spaces/S1/threads/T1", fmt.Sprintf("spaces/S1/messages/W%d", i), "@bot "+words, words, gchatQuotedName),
-				"REPLY", "Alex", gchatQuotedAlert)
 			msg, reason := quotedTurn(a, ev)
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if !quotedAskNeeded(ev, msg) || msg.Text != fmt.Sprintf(gchatQuotedAskWithWords, words, "> Posted by Alex:\n> "+gchatQuotedAlert) {
-				t.Errorf("ordinary words = %q, want the frame around them", msg.Text)
+			want := fmt.Sprintf(gchatQuotedOwnAskWithWords, words, "> Posted by kube-agents:\n> Scale it to 3 replicas?")
+			if msg.Text != words || msg.Quoted != want {
+				t.Errorf("turn text = %q quoted = %q, want the words as typed beside %q", msg.Text, msg.Quoted, want)
 			}
 			if len(f.calls) != 0 {
 				t.Errorf("relay calls = %+v, want none: the snapshot is the message", f.calls)
@@ -787,8 +766,8 @@ func TestGchatCapturedLegacyQuotedReplyThroughRun(t *testing.T) {
 	defer mu.Unlock()
 	msg := got[0]
 	want := fmt.Sprintf(gchatQuotedOwnAskWithWords, "what was this about?", shortcutAskQuote("Posted by "+poster+":\n"+text))
-	if msg.Text != want {
-		t.Errorf("text = %q\nwant %q", msg.Text, want)
+	if msg.Quoted != want || msg.Text != "what was this about?" {
+		t.Errorf("quoted = %q (text %q)\nwant %q beside the typed words", msg.Quoted, msg.Text, want)
 	}
 	if msg.Shortcut || msg.Conversation != "gchat:dm/spaces/rj0PRyAAAAE/threads/eU4g-jRGHss" || msg.Kind != "dm" ||
 		msg.MessageID != message || msg.AuthorID != "sender@example.com" || !msg.TopLevel {
