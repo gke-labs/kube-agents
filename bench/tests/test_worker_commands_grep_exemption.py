@@ -144,6 +144,15 @@ def test_the_exemption_is_off_unless_the_case_sets_it():
     assert not passed
 
 
+def test_a_quoted_hash_is_text_and_a_bare_one_is_a_comment():
+    # Bash reads a `#` inside quotes, escaped or inside a word as text, so the grep is exempt.
+    for row in (f'grep -rn "{ROUTE} #x" SKILL.md', f"grep -rn '## Steps {ROUTE}' SKILL.md", f"grep -rn {ROUTE}#x SKILL.md", f"grep -rn \\#{ROUTE} SKILL.md"):
+        passed, reason = _verdict(row)
+        assert passed, (row, reason)
+    for row in (f"grep -rn x SKILL.md # {ROUTE}", f"grep -rn x SKILL.md;# {ROUTE}", f"#grep -rn x SKILL.md {ROUTE}"):
+        assert _without_grep_patterns(row) is None, row
+
+
 def test_a_single_quoted_lookalike_of_a_substitution_is_exempt():
     # Single quotes run nothing, so a pattern that only spells a backtick or `$(` is text.
     for row in ("grep -rn '`inspect_repository.py open`' SKILL.md", f"grep -rn '$(echo {ROUTE})' SKILL.md"):

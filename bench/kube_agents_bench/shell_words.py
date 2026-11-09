@@ -99,7 +99,7 @@ _GREP_STDOUT_REDIRECT = ">"
 _GREP_OUTPUT_SINK = "/dev/null"
 # A `#` where a word opens starts a comment, which the words drop; a card log row joins the next
 # typed line onto it with a space, so a comment there would hide that line from the grading.
-_COMMENT_START_RE = re.compile(r"(?:^|[\s<>&|;()])#")
+_COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
 
 
@@ -393,7 +393,12 @@ def _without_grep_patterns(command: str) -> str | None:
     A card log row that joined a second typed line onto the grep is one row here, so a line
     that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
     operand: the limit ``exempt_patterns`` had too."""
-    if _COLLAPSED_CHAIN_RE.search(command) or _COMMENT_START_RE.search(command):
+    if _COLLAPSED_CHAIN_RE.search(command):
+        return None
+    # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
+    # did not hand back opened a comment.
+    kept, kept_spans, _ = _read_shell_line(command)
+    if kept.count(_COMMENT_CHAR) + sum(span.count(_COMMENT_CHAR) for span in kept_spans) < command.count(_COMMENT_CHAR):
         return None
     words, spans = _shell_words_and_spans(command)
     if not words or isinstance(words[0], _ShellOperator) or words[0] not in _GREP_PROGRAMS:
