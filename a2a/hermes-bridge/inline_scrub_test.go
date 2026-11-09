@@ -1,0 +1,190 @@
+package hermesbridge
+
+import (
+	"strings"
+	"testing"
+)
+
+// The shape classes scrubInlineSecrets must catch, and the ordinary ops text
+// it must leave alone. Every value is synthetic. A positive names the values
+// that must not survive and the text that must; a negative must come back
+// unchanged.
+func TestScrubInlineSecretsShapeClasses(t *testing.T) {
+	positives := []struct {
+		name      string
+		in        string
+		forbidden []string
+		wantSub   []string
+	}{
+		// (a) a password passed as a CLI flag, in the spellings a CLI accepts.
+		{
+			name:      "cli flag: short form, attached single-quoted value",
+			in:        `mysql -u root -p'synthetic-pass-0001' appdb`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"mysql -u root -p", "appdb"},
+		},
+		{
+			name:      "cli flag: short form, attached double-quoted value",
+			in:        `mysqldump -u root -p"synthetic pass 0001" appdb`,
+			forbidden: []string{"synthetic pass 0001"},
+			wantSub:   []string{"mysqldump -u root -p", "appdb"},
+		},
+		{
+			name:      "cli flag: single-dash long form, spaced value",
+			in:        `app -password synthetic-pass-0001 -v`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"app -password [redacted] -v"},
+		},
+		{
+			name:      "cli flag: single-dash long form, capitalised name",
+			in:        `Connect-Db -Server db.internal -Password synthetic-pass-0001`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"-Server db.internal -Password [redacted]"},
+		},
+		{
+			name:      "cli flag: single-dash abbreviated name, token-shaped value",
+			in:        `app -pwd Synth3tic-Pass-0001`,
+			forbidden: []string{"Synth3tic-Pass-0001"},
+			wantSub:   []string{"app -pwd [redacted]"},
+		},
+		{
+			name:      "cli flag: user:password attached to the short user flag",
+			in:        `curl -uadmin:synthetic-pass-0001 https://api.example.test/v1`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"curl -uadmin:[redacted] https://api.example.test/v1"},
+		},
+		{
+			name:      "cli flag: argument list, flag and value as separate JSON strings",
+			in:        `"args": ["--db-password", "synthetic-pass-0001", "--port", "5432"]`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{`["--db-password", "[redacted]", "--port", "5432"]`},
+		},
+		{
+			name:      "cli flag: argument list, flag and value as separate YAML items",
+			in:        "args:\n  - --db-password\n  - synthetic-pass-0001\n  - --port\n  - \"5432\"",
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"  - --db-password\n  - [redacted]\n  - --port\n  - \"5432\""},
+		},
+		{
+			name:      "cli flag: directory tool password short flag",
+			in:        `ldapsearch -x -D cn=admin,dc=example,dc=test -w synthetic-pass-0001 -b dc=example,dc=test`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"-w [redacted] -b dc=example,dc=test"},
+		},
+		{
+			name:      "cli flag: pass-phrase source argument and long forms stay caught",
+			in:        `openssl pkcs12 -in a.p12 -passin pass:synthetic-pass-0001 && app --api-key=synthetic-key-0001 --secret 'synthetic secret 0001'`,
+			forbidden: []string{"synthetic-pass-0001", "synthetic-key-0001", "synthetic secret 0001"},
+			wantSub:   []string{"--api-key=[redacted]", "--secret [redacted]"},
+		},
+		// (b) an HTTP auth header whose credential follows the scheme word.
+		{
+			name:      "auth header: header setter call, non-bearer scheme",
+			in:        `req.Header.Set("Authorization", "Token synthetic-token-0001")`,
+			forbidden: []string{"synthetic-token-0001"},
+			wantSub:   []string{`req.Header.Set("Authorization", "Token [redacted]")`},
+		},
+		{
+			name:      "auth header: name/value header list",
+			in:        "httpHeaders:\n- name: Authorization\n  value: ApiKey Synth3ticT0kenValue0001",
+			forbidden: []string{"Synth3ticT0kenValue0001"},
+			wantSub:   []string{"value: ApiKey [redacted]"},
+		},
+		{
+			name:      "auth header: header line, curl argument, JSON map and table row stay caught",
+			in:        "Authorization: Bearer synthetic-token-0001\ncurl -H \"Authorization: Basic c3ludGhldGljOnBhc3MtMDAwMQ==\" x\n{\"Authorization\": \"Token synthetic-token-0002\"}\n| Authorization | Bearer Synth3ticT0kenValue0003 |",
+			forbidden: []string{"synthetic-token-0001", "c3ludGhldGljOnBhc3MtMDAwMQ==", "synthetic-token-0002", "Synth3ticT0kenValue0003"},
+			wantSub:   []string{"Authorization: Bearer [redacted]", `"Authorization: Basic [redacted]"`, `"Authorization": "Token [redacted]"`, "| Authorization | Bearer [redacted] |"},
+		},
+		// (c) a host:port:database:user:password entry.
+		{
+			name:      "pgpass entry: bare line",
+			in:        "db.internal:5432:appdb:appuser:synthetic-pass-0001",
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{"db.internal:5432:appdb:appuser:[redacted]"},
+		},
+		{
+			name:      "pgpass entry: quoted, wildcard database",
+			in:        `echo 'db.internal:5432:*:postgres:synthetic-pass-0001' >> ~/.pgpass`,
+			forbidden: []string{"synthetic-pass-0001"},
+			wantSub:   []string{`'db.internal:5432:*:postgres:[redacted]' >> ~/.pgpass`},
+		},
+		{
+			name:      "pgpass entry: escaped colon in the password, wildcard host",
+			in:        `*:*:*:postgres:synthetic\:pass\:0001`,
+			forbidden: []string{"synthetic", "0001"},
+			wantSub:   []string{`*:*:*:postgres:[redacted]`},
+		},
+		// URL userinfo, by shape: everything between scheme://user: and the
+		// @ a host follows.
+		{
+			name:      "url userinfo: password holding sub-delimiters",
+			in:        `postgres://app:synth'pass(0001)*@db.internal:5432/app`,
+			forbidden: []string{"synth", "pass(0001)"},
+			wantSub:   []string{"postgres://app:[redacted]@db.internal:5432/app"},
+		},
+		{
+			name:      "url userinfo: password holding a raw @",
+			in:        `redis://:synthetic@pass-0001@cache.internal:6379/0`,
+			forbidden: []string{"synthetic", "pass-0001"},
+			wantSub:   []string{"redis://:[redacted]@cache.internal:6379/0"},
+		},
+		{
+			name:      "url userinfo: other sub-delimiters stay caught",
+			in:        `amqp://user:synthetic!pass$0001&x;y=z,w+@mq.internal/vhost`,
+			forbidden: []string{"synthetic!pass"},
+			wantSub:   []string{"amqp://user:[redacted]@mq.internal/vhost"},
+		},
+		// The keyword-led rules still catch a token-shaped value.
+		{
+			name:      "keyword rules: a token-shaped value after a scheme word, in prose, under an ambiguous key",
+			in:        "Basic c3ludGhldGljOnBhc3MtMDAwMQ== was sent. The token is Synth3ticT0kenValue0001. pass=Synth3tic-Pass-0001 auth: Synth3ticT0kenValue0002",
+			forbidden: []string{"c3ludGhldGljOnBhc3MtMDAwMQ==", "Synth3ticT0kenValue0001", "Synth3tic-Pass-0001", "Synth3ticT0kenValue0002"},
+			wantSub:   []string{"Basic [redacted] was sent.", "The token is [redacted].", "pass=[redacted]", "auth: [redacted]"},
+		},
+	}
+	for _, tc := range positives {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubInlineSecrets(tc.in)
+			for _, f := range tc.forbidden {
+				if strings.Contains(got, f) {
+					t.Errorf("scrubInlineSecrets(%q) = %q: leaked %q", tc.in, got, f)
+				}
+			}
+			for _, w := range tc.wantSub {
+				if !strings.Contains(got, w) {
+					t.Errorf("scrubInlineSecrets(%q) = %q: missing %q", tc.in, got, w)
+				}
+			}
+		})
+	}
+
+	// Ordinary ops text: a keyword with no value shape after it.
+	negatives := []string{
+		"Enable basic monitoring and basic authentication on the cluster.",
+		"Bearer tokens are rotated hourly.",
+		"Fix auth: redirect loop on login",
+		"pass: all checks green",
+		"pwd: /home/user",
+		"The token is expired and the secret is mounted.",
+		"The credential is stored in Secret Manager.",
+		"The secret is base64-encoded and the token is valid for 1h.",
+		"Set `automountServiceAccountToken: false` on the pod template.",
+		"Binary Authorization is disabled (`binaryAuthorization: {}`) on `seeded-a`.",
+		"`secure-boot=NONE`, `binary-authorization=OFF`, `database-encryption=DECRYPTED`",
+		"set `spec.binaryAuthorization.evaluationMode: PROJECT_SINGLETON_POLICY_ENFORCE`.",
+		"platform-agent-host/kube-system/Deployment/platform-agent-credential-proxy: entry 4",
+		"`Deployment/github-token-minter` (`token-minter: httpGet` probe on /version)",
+		"gcloud backup-dr plans create p \\\n  --include-secrets \\\n  --cron-schedule=\"0 2 * * *\"",
+		"Raise max_tokens: 4096 for the summariser.",
+		"Use --password-file /etc/app/db-pass and --token-ttl 30m.",
+		"The node fe80:0:0:0:200:f8ff:fe21:67cf answered at 10:15:30:123:456 UTC.",
+		"See http://localhost:8080/healthz and https://example.test/docs/page.",
+		"Rotate the token: run `kubectl create token app-sa` and update the Secret.",
+	}
+	for _, in := range negatives {
+		if got := scrubInlineSecrets(in); got != in {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
