@@ -183,6 +183,11 @@ verification_spec:
       type: report_contains
       forbidden_patterns:
         - '(?m)^\s*(?:[-•]|\d+[.)])\s'
+        # A second line of text: the instruction asks for one message of at most
+        # 60 words in plain sentences, which is one paragraph. The normaliser
+        # deletes `*`, so a `*` bullet cannot be told from an indented line;
+        # counting lines needs neither, and catches a list whatever opens it.
+        - '\S[^\n]*\n\s*\S'
         - "i can help( you)? with"
 
   - name: no-apology-hype-or-filler

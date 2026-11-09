@@ -719,18 +719,39 @@ def delivery_settled(data_dir: Path) -> bool:
 
 def _mark_claiming(data_dir: Path) -> bool:
     """Mark the claim about to be taken as this path's; without the mark no claim is taken, since an
-    unmarked claim that then dies would read as a delivered origin claim and retire the jobs."""
-    try:
-        (data_dir / REPORT_CLAIMING_FILE).write_text(f"{time.time()}\n", encoding="utf-8")
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
-        return False
-    return True
+    unmarked claim that then dies would read as a delivered origin claim and retire the jobs.
+
+    ``O_EXCL``, so a marker already there is never overwritten: it is another no-human run's (a manual
+    run beside the tick), either holding the claim or about to take it, and this run yields to it. A
+    marker with no claim behind it that is older than ``STALE_CLAIM_SECONDS`` was left by a run that
+    died between its mark and its claim; it is taken over."""
+    marker = data_dir / REPORT_CLAIMING_FILE
+    for _ in range(2):
+        try:
+            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if (data_dir / ".bootstrap_completed").exists():
+                return False
+            try:
+                if time.time() - marker.stat().st_mtime < STALE_CLAIM_SECONDS:
+                    return False
+                marker.unlink()
+            except OSError:
+                return False
+            continue
+        except OSError as e:
+            sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"{time.time()}\n")
+        return True
+    return False
 
 
 def _unmark_claiming(data_dir: Path) -> None:
-    """A lost claim is someone else's (an origin run that got there first): the marker must not
-    make theirs read as one of this path's with no record."""
+    """A lost claim is an origin run's (it got there first, with no marker of its own): the marker
+    this run wrote must not make theirs read as one of this path's with no record. A marker another
+    no-human run wrote is never this run's to remove: ``_mark_claiming`` does not write over one."""
     try:
         (data_dir / REPORT_CLAIMING_FILE).unlink()
     except FileNotFoundError:

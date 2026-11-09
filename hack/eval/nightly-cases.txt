@@ -485,10 +485,6 @@
 # prebuilt/first-install-hello arms per case. No fixture; the host install only.
 ./tasks/first-install-hello-running/task.yaml
 ./tasks/first-install-hello-done/task.yaml
-# The first-install hello when the report was filed as a ledger issue before
-# anyone wrote (#4058): the greeting answers first and links the issue once,
-# never in front of the answer. Same seam, variant filed; no fixture.
-./tasks/first-install-hello-filed/task.yaml
 
 # The fleet-audit report store's reader: a user's question about a past
 # audit, graded on the route (the worker queried the store through the
@@ -1106,6 +1102,11 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# The first-install hello when the report was filed as a ledger issue before
+# anyone wrote (#4058): the greeting answers first and links the issue once,
+# never in front of the answer. Same seam, variant filed; no fixture.
+./tasks/first-install-hello-filed/task.yaml
 
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is

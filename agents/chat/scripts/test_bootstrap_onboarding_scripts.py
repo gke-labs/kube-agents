@@ -2193,6 +2193,39 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
 
+    def test_a_claim_lost_to_another_no_human_run_leaves_its_marker_in_place(self):
+        """A manual run beside the tick claimed first, marker and all: the loser must not take the
+        winner's marker with it, or the winner's claim would read as an origin one and settle unfiled."""
+        self._filed(self.DAY + self.HOUR)
+        real = bootstrap_delivery._register_findings
+        def other_claims(*a, **k):
+            (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
+            (self.d / COMPLETED).touch()
+            return real(*a, **k)
+        with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=other_claims):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "the winner's marker stays")
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d), "the winner's filing is still owed")
+
+    def test_a_fresh_marker_with_no_claim_yet_is_another_run_mid_claim(self):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).write_text("other\n", encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).read_text(encoding="utf-8"), "other\n")
+
+    def test_a_marker_a_dead_run_left_before_its_claim_is_taken_over_once_stale(self):
+        self._filed(self.DAY + self.HOUR)
+        marker = self.d / bootstrap_delivery.REPORT_CLAIMING_FILE
+        marker.write_text("dead\n", encoding="utf-8")
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(marker, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists(), "filed")
+        self.assertNotEqual(marker.read_text(encoding="utf-8"), "dead\n", "the marker is this run's")
+
     def test_a_stale_no_human_claim_is_counted_in_its_own_record(self):
         self._filed(self.DAY + self.HOUR)
         (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
