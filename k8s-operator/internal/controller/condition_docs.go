@@ -80,7 +80,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    a2aVerifierConditionType,
-		Written: "Under `mode: next`, while the capability verifier has no ready replica",
+		Written: "Under `mode: next`, while the capability verifier's Deployment exists and has no ready replica. A pass that cannot read the Deployment leaves it as it stands",
 		Meaning: "`status: False`, `Reason: VerifierNotReady`. A capability check that gets no answer is refused, so every submission is refused terminally while this holds. The CR stays `Ready`: the verifier is on the request path, not the readiness path. Check the `<agent>-a2a-verifier` Deployment's pods and their logs, including the previous container's: a verifier that cannot bind its capability bucket exits, and its log says why. Removed once a replica is ready.",
 	},
 	{

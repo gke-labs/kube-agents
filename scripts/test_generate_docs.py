@@ -746,6 +746,13 @@ class FootprintBlocksTest(unittest.TestCase):
         self.assertEqual(footprint.memory(2 * 1024**3), "2Gi")
         self.assertEqual(footprint.memory(10048 * 1024**2), "10048Mi")
 
+    def test_a_sum_that_does_not_split_evenly_over_its_pods_is_refused(self):
+        footprint = generate_docs.install_footprint
+        self.assertEqual(footprint._per_pod({"pods": 2, "cpuMillisRequest": 100, "surges": True}), {"cpuMillisRequest": 50})
+        with self.assertRaises(SystemExit) as caught:
+            footprint._per_pod({"pods": 2, "cpuMillisRequest": 101})
+        self.assertIn("cpuMillisRequest", str(caught.exception))
+
     @unittest.skipIf(shutil.which(generate_docs.HELM_BINARY) is None, "needs helm")
     def test_a_next_mode_workload_the_table_does_not_list_fails_the_render(self):
         footprint = generate_docs.install_footprint

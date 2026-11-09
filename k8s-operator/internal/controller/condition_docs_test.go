@@ -65,46 +65,91 @@ func writtenConditionTypes(t *testing.T) map[string]writtenCondition {
 		w.at = append(w.at, fmt.Sprintf("%s:%d", p.Filename, p.Line))
 		found[value] = w
 	}
+	readConditionLiteral := func(lit *ast.CompositeLit) {
+		for _, elt := range lit.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				t.Errorf("%s: an unkeyed Condition literal; key its fields so the scan can read its Type",
+					fset.Position(elt.Pos()))
+				return
+			}
+			if key, ok := kv.Key.(*ast.Ident); !ok || key.Name != "Type" {
+				continue
+			}
+			switch v := kv.Value.(type) {
+			case *ast.Ident:
+				value, ok := consts[v.Name]
+				// The parser resolves names declared in the same file: a
+				// local variable shadowing a constant is not the constant.
+				if v.Obj != nil && v.Obj.Kind != ast.Con {
+					ok = false
+				}
+				if !ok {
+					t.Errorf("%s: a condition's Type is %s, which is not a string constant of this package; "+
+						"use a constant so TestEveryWrittenConditionIsDocumented can name it", fset.Position(v.Pos()), v.Name)
+					continue
+				}
+				note(value, v.Name, v.Pos())
+			case *ast.BasicLit:
+				value, _ := strconv.Unquote(v.Value)
+				note(value, conditionConstantFor(consts, value), v.Pos())
+			case *ast.SelectorExpr:
+				// Another package's constant: another CRD's condition.
+			default:
+				t.Errorf("%s: a condition's Type is a %T the scan cannot read; use a constant", fset.Position(v.Pos()), v)
+			}
+		}
+	}
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
+			// A Type set after construction is one the scan cannot tie to a
+			// Condition, so the package may not do it: write the literal keyed.
+			if assign, ok := n.(*ast.AssignStmt); ok {
+				for _, lhs := range assign.Lhs {
+					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "Type" {
+						t.Errorf("%s: a .Type assignment; set a condition's Type in a keyed metav1.Condition literal "+
+							"so TestEveryWrittenConditionIsDocumented can read it", fset.Position(sel.Pos()))
+					}
+				}
+				return true
+			}
 			lit, ok := n.(*ast.CompositeLit)
 			if !ok {
 				return true
 			}
-			sel, ok := lit.Type.(*ast.SelectorExpr)
-			if !ok || sel.Sel.Name != "Condition" {
+			if isConditionType(lit.Type) {
+				readConditionLiteral(lit)
+				return true
+			}
+			// A slice or map literal of X.Condition elides its elements' type,
+			// so each element literal without one is a Condition too.
+			var elem ast.Expr
+			switch typ := lit.Type.(type) {
+			case *ast.ArrayType:
+				elem = typ.Elt
+			case *ast.MapType:
+				elem = typ.Value
+			}
+			if elem == nil || !isConditionType(elem) {
 				return true
 			}
 			for _, elt := range lit.Elts {
-				kv, ok := elt.(*ast.KeyValueExpr)
-				if !ok {
-					continue
+				if kv, ok := elt.(*ast.KeyValueExpr); ok {
+					elt = kv.Value
 				}
-				if key, ok := kv.Key.(*ast.Ident); !ok || key.Name != "Type" {
-					continue
-				}
-				switch v := kv.Value.(type) {
-				case *ast.Ident:
-					value, ok := consts[v.Name]
-					if !ok {
-						t.Errorf("%s: a condition's Type is %s, which is not a string constant of this package; "+
-							"use a constant so TestEveryWrittenConditionIsDocumented can name it", fset.Position(v.Pos()), v.Name)
-						continue
-					}
-					note(value, v.Name, v.Pos())
-				case *ast.BasicLit:
-					value, _ := strconv.Unquote(v.Value)
-					note(value, conditionConstantFor(consts, value), v.Pos())
-				case *ast.SelectorExpr:
-					// Another package's constant: another CRD's condition.
-				default:
-					t.Errorf("%s: a condition's Type is a %T the scan cannot read; use a constant", fset.Position(v.Pos()), v)
+				if inner, ok := elt.(*ast.CompositeLit); ok && inner.Type == nil {
+					readConditionLiteral(inner)
 				}
 			}
 			return true
 		})
 	}
 	return found
+}
+
+func isConditionType(e ast.Expr) bool {
+	sel, ok := e.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "Condition"
 }
 
 // conditionConstantFor names the condition-type constant whose value a

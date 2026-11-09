@@ -288,7 +288,11 @@ def _ephemeral(entry: dict) -> str:
 def _per_pod(entry: dict) -> dict:
     """footprint.yaml sums each workload over its pods; the page quotes one pod."""
     pods = entry["pods"]
-    return {k: v // pods for k, v in entry.items() if type(v) is int and k != "pods"}
+    figures = {k: v for k, v in entry.items() if type(v) is int and k != "pods"}
+    uneven = sorted(k for k, v in figures.items() if v % pods)
+    if uneven:
+        raise SystemExit(f"footprint.yaml sums {uneven} unevenly over {pods} pods; one pod's figure is not a whole number")
+    return {k: v // pods for k, v in figures.items()}
 
 
 def _session_pod() -> dict:
@@ -337,7 +341,14 @@ def workloads_rows() -> list[str]:
         entry = following[key]
         pods = entry["pods"]
         if key == "a2aGateway":
-            # The standby the election runs, which no golden renders.
+            # The standby the election runs, which no golden renders; a golden
+            # that starts rendering it would be counted twice.
+            if pods != 1:
+                raise SystemExit(
+                    f"footprint.yaml nextMode.a2aGateway has {pods} pods; the footprint table adds the "
+                    "election's standby to a golden that renders one gateway. Drop that addition in "
+                    f"{Path(__file__).relative_to(REPO)} if the golden now renders the standby."
+                )
             pods += 1
         rows.append(_workload_row(label, str(pods), _per_pod(entry), runs.format(claim=claim)))
     bridge = following["agentPod"]["hermesBridge"]
