@@ -257,6 +257,31 @@ func TestSlackShortcutFromAListedGuestIsATurn(t *testing.T) {
 	}
 }
 
+// After the gateway's word on a listed guest's shortcut: verified, a question
+// the task posts waits on the guest's Home tab, which Slack opens under their
+// member id; refused, the private note names their "T…:U…" entry, as the
+// gateway's own notice does.
+func TestSlackShortcutFromAListedGuestAfterTheVerdict(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	a.SetAllowedGuests([]string{"T2:U9"})
+	turns := runShortcut(a, shortcutFrom(t, "U9", "T2", "T2", "212.1"))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.trackQuestion(turns[0].Conversation, "106.0", OutMessage{Text: "Raise the limit?",
+		Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Raise the limit?",
+			Choices: []chatmsg.Choice{{Text: "yes"}, {Text: "no"}}}})
+	if got := a.waitingOn("U9"); len(got) != 1 {
+		t.Errorf("the guest's Home tab lists %d questions, want 1", len(got))
+	}
+
+	refused, hooks := newShortcutAdapter(&fakeSlackAPI{})
+	refused.SetAllowedGuests([]string{"T2:U9"})
+	turns = runShortcut(refused, shortcutFrom(t, "U9", "T2", "T2", "212.2"))
+	refused.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
+	if got := hooks.got(); len(got) != 1 || got[0].text != unverifiedNotice(slackBackend, "T2:U9") {
+		t.Errorf("notes = %+v, want the notice naming T2:U9", got)
+	}
+}
+
 // Every other member of another workspace stays refused, with no reply: an
 // unlisted member of the listed guest's workspace, the listed member when the
 // two workspace fields disagree, and any guest under an empty list.
