@@ -608,6 +608,76 @@ class CRDFieldBlocksTest(unittest.TestCase):
                 self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
 
 
+class ConditionsBlockTest(unittest.TestCase):
+    """The PlatformAgent conditions table is rendered from the controller's slice."""
+
+    def test_the_block_is_on_the_crd_guide_and_in_the_go_family(self):
+        paths, generator = generate_docs.BLOCKS[generate_docs.CONDITIONS_BLOCK]
+        self.assertEqual(paths, (generate_docs.CONDITIONS_PAGE,))
+        self.assertIs(generator, generate_docs.gen_platformagent_conditions)
+        # The operator Makefile's `manifests` refreshes the family by prefix.
+        self.assertTrue(generate_docs.CONDITIONS_BLOCK.startswith(generate_docs.CRD_FAMILY_PREFIX))
+        self.assertTrue(generate_docs.needs_go(generate_docs.CONDITIONS_BLOCK))
+        makefile = (generate_docs.REPO / "k8s-operator/Makefile").read_text(encoding="utf-8")
+        self.assertIn(f"CRD_DOC_BLOCK_PREFIX := {generate_docs.CRD_FAMILY_PREFIX}\n", makefile)
+
+    def test_reasons_render_as_a_code_spanned_list(self):
+        self.assertEqual(generate_docs.code_span_list(["A"]), "`A`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B"]), "`A` or `B`")
+        self.assertEqual(generate_docs.code_span_list(["A", "B", "C"]), "`A`, `B` or `C`")
+        row = generate_docs.render_condition_row(
+            {"type": "T", "written": "When <x>", "meaning": "One of {reasons}; a|b", "reasons": ["A", "B"]}
+        )
+        self.assertEqual(row, "| `T` | When &lt;x&gt; | One of `A` or `B`; a\\|b |")
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_the_table_carries_every_row_with_its_reasons(self):
+        lines = generate_docs.gen_platformagent_conditions().split("\n")
+        self.assertEqual(tuple(lines[:2]), generate_docs.CONDITIONS_TABLE_HEADER)
+        types = [line.split(" | ")[0].removeprefix("| ") for line in lines[2:]]
+        self.assertEqual(types[0], "`Ready`")
+        self.assertIn("`A2AVerifier`", types)
+        self.assertEqual(len(types), len(set(types)))
+        degraded = next(line for line in lines if line.startswith("| `Degraded`"))
+        self.assertIn("`InvalidCredentialProxyExec` or `RBACIncomplete`", degraded)
+        self.assertNotIn(generate_docs.CONDITIONS_REASONS_PLACEHOLDER, "\n".join(lines))
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_hand_edited_row_fails_the_check_with_the_command_that_fixes_it(self):
+        page_text = generate_docs.CONDITIONS_PAGE.read_text(encoding="utf-8")
+        edited = page_text.replace("| `Degraded` | Only while degraded |", "| `Degraded` | Sometimes |", 1)
+        self.assertNotEqual(edited, page_text)
+        with tempfile.TemporaryDirectory() as tmp:
+            page = Path(tmp) / "platformagent-crd.md"
+            blocks = {generate_docs.CONDITIONS_BLOCK: ((page,), generate_docs.gen_platformagent_conditions)}
+            for text, want in ((page_text, 0), (edited, 1)):
+                page.write_text(text, encoding="utf-8")
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(generate_docs.main(["--check"], blocks), want)
+            self.assertIn("STALE", out.getvalue())
+            self.assertIn("Run `make docs-generate`", err.getvalue())
+
+    @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
+    def test_a_value_syntax_cannot_resolve_is_refused_with_its_position(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "docs.go").write_text(
+                "package controller\n\n"
+                'const knownType = "Known"\n\n'
+                "var platformAgentConditionDocs = []conditionDoc{\n"
+                '\t{Type: knownType, Written: "w", Meaning: "m"},\n'
+                '\t{Type: strings.ToUpper("x"), Written: "w", Meaning: "m"},\n'
+                "}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as caught:
+                generate_docs.run_go_generator(
+                    generate_docs.CONDITION_DOCS_GENERATOR, ["-dir", tmp], "the conditions table"
+                )
+        self.assertIn("docs.go:7", str(caught.exception))
+        self.assertIn("not a string literal or constant", str(caught.exception))
+
+
 class ReplayBaselineMetricsTest(unittest.TestCase):
     """The replay proxy README's metric table is baseline_report.py's METRICS and CASE_METRICS."""
 
