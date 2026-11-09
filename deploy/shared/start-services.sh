@@ -317,7 +317,8 @@ duration_nanoseconds() {
 # into `--flag=${value}`, and one the watcher rejects is an exit on every start
 # -- the supervisor's backoff, `NO cluster events are being watched`, and a
 # container that stays Ready -- for a missing unit. $3, when set, also refuses
-# zero, for the flag whose validate() requires a value above it.
+# zero, for a flag whose validate() refuses zero or whose zero the watcher
+# replaces with its default without a log line.
 normalize_duration() {
   local name="$1"
   local fallback="$2"
@@ -343,21 +344,24 @@ normalize_duration() {
 # Rewrite the *named* variable, in place, to a decimal count the watcher's flag
 # parser accepts, or to $2 if it is not one. Leading zeros are dropped rather
 # than reported, as clamp_at_least drops them: `08` and `8` are the same
-# request, and only the binary would have read them differently.
+# request, and only the binary would have read them differently. $3, when set,
+# also refuses zero, for a count the watcher replaces with its default without
+# a log line.
 normalize_count() {
   local name="$1"
   local fallback="$2"
+  local positive="${3:-}"
   local value="${!name}"
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
 
-  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]]; then
+  if [[ "${value}" =~ ${WATCHER_COUNT_PATTERN} ]] && { [[ -z "${positive}" ]] || ((10#${value} > 0)); }; then
     printf -v "${name}" '%s' "$((10#${value}))"
     return 0
   fi
 
   printf -v "${name}" '%s' "${fallback}"
-  echo "start-services: ${name}=${value} is not a usable count (decimal digits); using ${fallback}" >&2
+  echo "start-services: ${name}=${value} is not a usable count (decimal digits${positive:+, above zero}); using ${fallback}" >&2
 }
 
 clamp_at_least WATCHER_RETRY_MIN_SECONDS
@@ -473,8 +477,9 @@ WATCHER_DEDUP_DIR="${WATCHER_DEDUP_DIR:-${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/
 # This and the seven tunables below reach the watcher as flags, so each is
 # normalised where it is declared (normalize_duration, normalize_count) against
 # a default named once, as WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD is: an unset
-# value and an unusable one resolve the same way. The window is the one that
-# also refuses zero, which the watcher's validate() rejects.
+# value and an unusable one resolve the same way. The window, the scale-up hold
+# and the three counts also refuse zero: validate() rejects a zero window, and
+# the watcher replaces the others with its own default without a log line.
 readonly WATCHER_DEDUP_WINDOW_DEFAULT=24h
 WATCHER_DEDUP_WINDOW="${WATCHER_DEDUP_WINDOW:-${WATCHER_DEDUP_WINDOW_DEFAULT}}"
 normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positive
@@ -488,7 +493,7 @@ normalize_duration WATCHER_DEDUP_WINDOW "${WATCHER_DEDUP_WINDOW_DEFAULT}" positi
 # rebuilding the image. Set to 1 to restore firing on the first event.
 readonly WATCHER_BACKOFF_MIN_COUNT_DEFAULT=3
 WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}" positive
 
 # The same debounce for the half of the image-pull family that self-clears —
 # registry rate limits, 5xx, connection timeouts. Only failures the watcher
@@ -499,7 +504,7 @@ normalize_count WATCHER_BACKOFF_MIN_COUNT "${WATCHER_BACKOFF_MIN_COUNT_DEFAULT}"
 # mirror will rarely see it apply at all. Set to 1 to disable.
 readonly WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT=3
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT_DEFAULT}" positive
 
 # The backstop for FailedScheduling when cluster-autoscaler has recorded no
 # verdict on the pod: five failed scheduling attempts, with
@@ -514,7 +519,7 @@ normalize_count WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT "${WATCHER_IMAGEPULL_TRANS
 # no verdict is on record.
 readonly WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT=5
 WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}}"
-normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}"
+normalize_count WATCHER_FAILEDSCHEDULING_MIN_COUNT "${WATCHER_FAILEDSCHEDULING_MIN_COUNT_DEFAULT}" positive
 
 # How long such a FailedScheduling has to have lasted, by the event's own first
 # and last sighting, before the count backstop passes it. The count alone
@@ -536,7 +541,7 @@ normalize_duration WATCHER_FAILEDSCHEDULING_MIN_SPAN "${WATCHER_FAILEDSCHEDULING
 # last said. Raise it on a cluster whose node pools take longer to provision.
 readonly WATCHER_SCALEUP_HOLD_DEFAULT=15m
 WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
-normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
+normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}" positive
 
 # The settle period: how long a failure in the settle family (the crash-loop
 # family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
