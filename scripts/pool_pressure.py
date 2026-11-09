@@ -1785,8 +1785,8 @@ def summarise(
 
     # The cap and the pool size are set in two different repositories, so
     # nothing keeps them in step. A cap below the pool leaves the extra projects
-    # unreachable: they sit free while runs queue, which from outside reads
-    # exactly like a control-plane stall.
+    # to the other jobs: they sit free while presubmit runs queue, which from
+    # outside reads exactly like a control-plane stall.
     stranded = (
         max(0, pool_state.total - concurrency)
         if pool_state is not None and concurrency is not None

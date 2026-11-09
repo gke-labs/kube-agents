@@ -1981,16 +1981,18 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         # breached on, the longest wait among them (the window's when none
         # is a day's), and how many runs are queued right now.
         "breached_days": [d for d in (trend.get("breached_days") or []) if isinstance(d, str)],
-        "worst_s": _as_seconds(_worst_breached_minutes(trend)),
+        "worst_s": _worst_breached_s(trend),
         "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
 
 
-def _worst_breached_minutes(trend: dict):
-    """The longest wait among the days that breached, else the window's."""
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
     days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
-    worst = [d.get("worst_minutes") for d in days if isinstance(d.get("worst_minutes"), (int, float))]
-    return max(worst) if worst else trend.get("worst_minutes")
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:

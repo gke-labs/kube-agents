@@ -1870,6 +1870,14 @@ class PoolNote(unittest.TestCase):
         artifact["trend"]["worst_minutes"] = 300.0
         note = health.pool_note(artifact, T0, None)
         self.assertEqual((note["worst_s"], note["breached_days"]), (int(175.2 * 60), ["2026-09-06"]))
+        # Another job's output: a day row whose worst is not a number neither
+        # wins nor blocks the fallback to the window's.
+        bad = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        bad["trend"]["worst_minutes"] = 300.0
+        for row in bad["trend"]["days"]:
+            if row.get("breached"):
+                row["worst_minutes"] = True
+        self.assertEqual(health.pool_note(bad, T0, None)["worst_s"], 300 * 60)
 
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet

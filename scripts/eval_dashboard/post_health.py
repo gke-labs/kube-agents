@@ -188,9 +188,9 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
 # through health.json's `pool` note. Copied rather than imported, and
-# test_integration_contracts.py fails if the copy drifts. The four causes have
-# four different remedies, one of which spends money, so the message branches
-# on them rather than printing the label.
+# test_integration_contracts.py fails if the copy drifts. The four causes call
+# for different things, one of which spends money, so the message branches on
+# them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
