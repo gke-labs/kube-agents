@@ -176,8 +176,11 @@ const (
 	// (a2aNATSExporterContainer); images.json carries it as
 	// prometheus-nats-exporter. Pinned by digest as well as tag, the OCI
 	// index, so the same reference serves amd64 and arm64 nodes.
-	a2aNATSExporterImageEnvVar  = "A2A_NATS_EXPORTER_IMAGE"
-	defaultA2ANATSExporterImage = "natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
+	a2aNATSExporterImageEnvVar = "A2A_NATS_EXPORTER_IMAGE"
+	// a2aNATSExporterOmittedReason is the Warning event's reason when the
+	// NATS pod renders without the metrics sidecar (a2aNATSExporterOmitted).
+	a2aNATSExporterOmittedReason = "A2ABusMetricsExporterOmitted"
+	defaultA2ANATSExporterImage  = "natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
 
 	// Requests and limits on the next-stack pods. A namespace whose
 	// ResourceQuota requires limits refuses a pod that omits them at
@@ -206,8 +209,11 @@ const (
 	// The exporter sidecar holds one scrape's worth of /varz and /jsz JSON
 	// at a time. The /jsz payload grows with the bus's streams and
 	// consumers, which is what the memory limit leaves room for above the
-	// request.
-	a2aNATSExporterCPURequest    = "10m"
+	// request. The CPU request is the stack's floor, 50m, rather than what
+	// the exporter uses idle, so a namespace LimitRange that admits the
+	// bus's other containers admits this one: a refused sidecar would keep
+	// its server out of the bus.
+	a2aNATSExporterCPURequest    = "50m"
 	a2aNATSExporterMemoryRequest = "32Mi"
 	a2aNATSExporterCPULimit      = "100m"
 	a2aNATSExporterMemoryLimit   = "128Mi"
@@ -1252,6 +1258,27 @@ func a2aNATSExporterImage() string {
 		return override
 	}
 	return defaultA2ANATSExporterImage
+}
+
+// a2aNATSExporterOmitted reports whether the NATS pod renders without the
+// metrics sidecar: when A2A_NATS_IMAGE is overridden and
+// A2A_NATS_EXPORTER_IMAGE is not. An install that mirrors the bus's images
+// set the first before the sidecar existed, and the default exporter
+// reference would not pull there. The sidecar is a plain container, so a pod
+// whose sidecar cannot start never goes Ready and its server leaves the bus;
+// metrics never cost a bus server. The reconcile says so in a Warning event
+// (a2aNATSExporterOmittedReason).
+func a2aNATSExporterOmitted() bool {
+	return os.Getenv(a2aNATSImageEnvVar) != "" && os.Getenv(a2aNATSExporterImageEnvVar) == ""
+}
+
+// a2aNATSContainers is the NATS pod's containers: the server, and the
+// metrics sidecar unless a2aNATSExporterOmitted.
+func a2aNATSContainers(server corev1.Container) []corev1.Container {
+	if a2aNATSExporterOmitted() {
+		return []corev1.Container{server}
+	}
+	return []corev1.Container{server, a2aNATSExporterContainer()}
 }
 
 func a2aProvisionImage() string {
@@ -2847,7 +2874,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					// default (a2aNATSTerminationGrace).
 					TerminationGracePeriodSeconds: a2aNATSTerminationGrace(replicas),
 					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
-					Containers: []corev1.Container{{
+					Containers: a2aNATSContainers(corev1.Container{
 						Name:    "nats",
 						Image:   a2aNATSImage(),
 						Command: []string{"/bin/sh", "-c", a2aNATSStartupScript},
@@ -2874,7 +2901,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 								HTTPGet: &corev1.HTTPGetAction{Path: a2aNATSReadinessPath(replicas), Port: intstr.FromString("monitor")},
 							},
 						},
-					}, a2aNATSExporterContainer()},
+					}),
 					Volumes: []corev1.Volume{{
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
@@ -6786,6 +6813,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		if err := r.applyManaged(ctx, agent, config); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
+		}
+		if a2aNATSExporterOmitted() {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aNATSExporterOmittedReason,
+				"the A2A bus runs without its metrics exporter: "+a2aNATSImageEnvVar+" is set and "+a2aNATSExporterImageEnvVar+" is not; set it to the mirrored prometheus-nats-exporter image")
 		}
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return state, err

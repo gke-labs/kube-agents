@@ -157,6 +157,13 @@ spec:
     - port: 7777
       path: /metrics
       interval: 30s
+      # The per-consumer series carry the consumer's name, so every
+      # ephemeral consumer mints new ones; stream, account and server
+      # storage are what the bus is sized from.
+      metricRelabeling:
+        - sourceLabels: [__name__]
+          regex: jetstream_consumer_.*
+          action: drop
 {{- end }}
 {{- if and .Values.platformAgent.enabled (include "kube-agents.platformAgentServiceMonitor" .) }}
 ---

@@ -137,8 +137,9 @@ if [ "$COPY_TOOL" = "docker" ] && [ "$DRY_RUN" -ne 1 ]; then
 fi
 
 # Drop the tag from a reference that carries both a tag and a digest, leaving
-# "repo@sha256:...". Four inventory entries pin that way — both Hindsight
-# images, busybox, and the Hermes base (through tags.env) — and skopeo's
+# "repo@sha256:...". Five inventory entries pin that way — both Hindsight
+# images, busybox, the NATS metrics exporter, and the Hermes base (through
+# tags.env) — and skopeo's
 # docker:// transport refuses the combined form outright ("Docker references
 # with both a tag and digest are currently not supported"), so a skopeo host
 # would fail exactly those copies and mirror everything else. The digest half

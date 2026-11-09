@@ -135,6 +135,9 @@ _NATS_SCRAPE = {
     "container": "nats-exporter",
     "port_name": "nats-metrics",
     "selector_keys": ("app",),
+    # The per-consumer series, labelled by consumer name, are dropped: every
+    # ephemeral consumer would mint new ones. Nothing else is.
+    "metric_relabeling": [{"sourceLabels": ["__name__"], "regex": "jetstream_consumer_.*", "action": "drop"}],
 }
 # Every row with a PodMonitoring, in template order.
 _POD_MONITORING_SCRAPES = _SCRAPES + (_NATS_SCRAPE,)
@@ -294,6 +297,7 @@ class MonitoringRenderTest(unittest.TestCase):
                         "port": _scrape_port(row),
                         "path": "/metrics",
                         "interval": "30s",
+                        **({"metricRelabeling": row["metric_relabeling"]} if "metric_relabeling" in row else {}),
                     } for row in rows],
                 )
 

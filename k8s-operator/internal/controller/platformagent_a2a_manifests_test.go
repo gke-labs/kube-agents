@@ -8927,6 +8927,68 @@ func TestTheNATSPodCarriesTheExporterSidecar(t *testing.T) {
 	}
 }
 
+// An install that overrides the NATS image and not the exporter's mirrors the
+// bus's images, and the default exporter reference would not pull there. The
+// pod renders without the sidecar then, so a missing image cannot keep a
+// server out of the bus, and the reconcile warns.
+func TestTheNATSPodOmitsTheExporterWhenOnlyTheServerImageIsOverridden(t *testing.T) {
+	for _, tc := range []struct {
+		nats, exporter string
+		wantExporter   bool
+	}{
+		{"", "", true},
+		{"", "mirror.example/prometheus-nats-exporter:0.20.3", true},
+		{"mirror.example/nats:2.10-alpine", "mirror.example/prometheus-nats-exporter:0.20.3", true},
+		{"mirror.example/nats:2.10-alpine", "", false},
+	} {
+		t.Run(fmt.Sprintf("nats %q exporter %q", tc.nats, tc.exporter), func(t *testing.T) {
+			t.Setenv(a2aNATSImageEnvVar, tc.nats)
+			t.Setenv(a2aNATSExporterImageEnvVar, tc.exporter)
+			for _, replicas := range []int{1, 3} {
+				spec := buildA2ANATSStatefulSet(a2aTestAgentWithBusReplicas(replicas), "h").Spec.Template.Spec
+				if got := a2aNATSExporterOf(spec) != nil; got != tc.wantExporter {
+					t.Errorf("busReplicas %d: exporter rendered = %v, want %v", replicas, got, tc.wantExporter)
+				}
+				if len(spec.Containers) == 0 || spec.Containers[0].Name != "nats" {
+					t.Errorf("busReplicas %d: the server is not the pod's first container", replicas)
+				}
+			}
+		})
+	}
+}
+
+func TestTheReconcileWarnsWhenTheExporterIsOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		exporter string
+		wantWarn bool
+	}{{"", true}, {"mirror.example/prometheus-nats-exporter:0.20.3", false}} {
+		t.Run(fmt.Sprintf("exporter %q", tc.exporter), func(t *testing.T) {
+			t.Setenv(a2aNATSImageEnvVar, "mirror.example/nats:2.10-alpine")
+			t.Setenv(a2aNATSExporterImageEnvVar, tc.exporter)
+			agent := a2aTestAgent()
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: agent.Namespace}
+			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			warned := false
+			for len(rec.Events) > 0 {
+				e := <-rec.Events
+				if strings.HasPrefix(e, corev1.EventTypeWarning+" "+a2aNATSExporterOmittedReason+" ") {
+					warned = strings.Contains(e, a2aNATSExporterImageEnvVar)
+				}
+			}
+			if warned != tc.wantWarn {
+				t.Errorf("warned naming %s = %v, want %v", a2aNATSExporterImageEnvVar, warned, tc.wantWarn)
+			}
+		})
+	}
+}
+
 // The exporter runs as the server does: non-root (the image sets no USER, so
 // the UID is the pod's to say), no escalation, a read-only root, no
 // capabilities, the runtime's seccomp profile, and requests and limits a

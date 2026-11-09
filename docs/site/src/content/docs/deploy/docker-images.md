@@ -38,6 +38,10 @@ NATS, its metrics exporter and nats-box are ordinary third-party pins, in the ta
 set their env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE`,
 `A2A_NATS_EXPORTER_IMAGE` and `A2A_PROVISION_IMAGE` at the copies itself, through the operator's
 environment ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
+If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a mirrored install set up
+before the exporter existed, the operator renders the NATS pods without the exporter. It records
+an `A2ABusMetricsExporterOmitted` Warning event on the `PlatformAgent`. The bus keeps running, and
+its metrics are absent until the variable names the mirrored copy.
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,

@@ -84,8 +84,8 @@ Two optional stacks add to the total:
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
   at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: about 0.9 vCPU and 1.4 GiB of standing requests across seven pods, and
-  a 40 GiB NATS claim. Each delegation adds a session pod at 0.25 vCPU and 512 MiB requests with
+- **`spec.mode: next`**: about 1.6 vCPU and 2.6 GiB of standing requests across ten pods and the
+  agent pod's bridge container, and a 40 GiB NATS claim per server. Each delegation adds a session pod at 0.25 vCPU and 512 MiB requests with
   2 vCPU and 2 GiB limits, up to `maxSessions` (default 10) at once. The
   [prerequisites page](/kube-agents/install/prerequisites/#cluster-requirements) itemises them.
 
