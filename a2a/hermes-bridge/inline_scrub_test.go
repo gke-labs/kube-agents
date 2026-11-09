@@ -181,6 +181,8 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"The node fe80:0:0:0:200:f8ff:fe21:67cf answered at 10:15:30:123:456 UTC.",
 		"See http://localhost:8080/healthz and https://example.test/docs/page.",
 		"Rotate the token: run `kubectl create token app-sa` and update the Secret.",
+		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
+		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
 	}
 	for _, in := range negatives {
 		if got := scrubInlineSecrets(in); got != in {

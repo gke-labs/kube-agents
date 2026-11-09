@@ -25,21 +25,53 @@ var (
 	// PKCS#8, EC, RSA, DSA) or "PRIVATE KEY BLOCK-----" (PGP).
 	pemPrivateKeyBlockPattern     = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----`)
 	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*`)
-	inlineAuthHeaderPattern       = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
 	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
-	// The password runs to the userinfo's closing @ and may hold a path
-	// character, as base64-style passwords do; a URL with an @ in its path
-	// after a port is over-redacted, the safe side.
-	inlineURLCredPattern     = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s'"]+(@)`)
-	cliUserPassPattern       = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+))(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern   = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
+	// A credential after an HTTP auth scheme word wherever the word stands
+	// (a header value, a curl -H argument, a JSON map, a header list's
+	// value, a table row, prose). With no Authorization key in front of it
+	// the scheme word is just a word, so the value must be token-shaped
+	// (valueTokenShaped): "basic monitoring" and "Bearer tokens" are prose.
+	// Where an Authorization key does stand in front, the key=value rule
+	// owns the pair and redacts the value whatever its shape
+	// (authHeaderKVLeadPattern).
+	authSchemeCredentialPattern = regexp.MustCompile(`(?i)\b(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+([^\s"'\x60,;)\]}>|]+)`)
+	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)authorization\\?["']?[ \t]*[:=][ \t]*\\?["']?[ \t]*$`)
+	// "Authorization", "<scheme> <credential>": a header setter call or a
+	// header pair in code, the credential redacted whatever its shape.
+	authHeaderPairPattern = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\\?["'][ \t]*,[ \t]*\\?["'](?:(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+)?([^"'\\\r\n]+)`)
+	// A URL's password is the userinfo by shape: everything between
+	// scheme://user: and the @ a host follows, whatever bytes it holds (a
+	// sub-delimiter, a path character, a raw @), to the last such @ in the
+	// unbroken run. A URL with an @ later in its path after a port is
+	// over-redacted, the safe side.
+	inlineURLCredPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@"'\x60]*:)([^\s"\x60<>]+)@(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9._~%-]*[A-Za-z0-9])?)`)
+	// A libpq password file entry, host:port:database:user:password, a
+	// colon in a field escaped with a backslash. pgpassEntryRedacted tells
+	// one from a timestamp or an IPv6 address.
+	pgpassEntryPattern = regexp.MustCompile(`(?:^|[\s"'\x60=(])(\*|\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_.-]+):(?:\*|[0-9]{1,5}):((?:[A-Za-z0-9_.$*-]|\\.)+):((?:[A-Za-z0-9_.$*-]|\\.)+):((?:[^\s"'\x60\\]|\\.)+)`)
+	// The host field of an RFC 3339 timestamp, which a time range in an
+	// answer (2026-10-28T03:56:05Z-03:59:15Z) puts where a host would be.
+	timestampHostPattern     = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}$`)
+	cliUserPassPattern       = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+)?)(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
+	cliAttachedPassPattern   = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
 	cliSpacedPassPattern     = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliLDAPPassPattern       = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliPassphraseArgPattern  = regexp.MustCompile(`(?i)(\s-pass(?:in|out|word)?[ \t]+pass:)([^\s"';|&]+)`)
 	cliLongSecretFlagPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	// A single-dash long flag (-password x, -Password x, -token=x), the
+	// spelling Go's flag package, Java tools and PowerShell take.
+	cliSingleDashSecretFlagPattern = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	// A flag and its value as separate items of an argument list: JSON or
+	// Python strings ("--db-password", "x") or YAML items (- --db-password
+	// then - x on the next line), as a container's args carry them.
+	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*["']([^"'\r\n]*)["']`)
+	cliArgListYAMLPattern = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+["']?--?([A-Za-z][A-Za-z0-9_.-]*)["']?[ \t]*\r?\n[ \t]*-[ \t]+["']?([^"'\r\n#]*[^"'\r\n#\s])`)
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the token was abc", "the password is now hunter2",
 	// "the secret is set to abc". The verb may be followed by a qualifier
 	// (now, currently, still, just, simply, set to, equal to) or a colon,
-	// none of which is the value.
+	// none of which is the value. The value must be token-shaped
+	// (valueTokenShaped): "the token is expired" states no secret.
 	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:for\s+[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
@@ -943,51 +975,325 @@ func inlineSecretKey(k string) bool {
 	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
 }
 
-// scrubInlineSecrets is the defence in depth on the little text the api
-// executor does publish: the identifier a step title names (a cluster, a
-// file's tail, a search query, a card's title) and a settled card's report.
-// Tool arguments, results, error messages and model reasoning never reach
-// it, because they are not published at all (the executor note in
-// activity.go); a scrubber is a net, not a contract.
+// strongSecretKey says whether a key inlineSecretKey accepts names the
+// credential itself: its last component is the credential word
+// (db_password, accessToken, X-Api-Key, Authorization, PGPASSWORD,
+// AWS_CREDS, tls.key). The value under such a key is redacted unless it is
+// plainly not a secret (keyedValueRedacted). Any other accepted key carries
+// the word somewhere else (token-minter, credential-proxy,
+// binaryAuthorization.evaluationMode, a token-ttl) or is one of the
+// ambiguous short words (pass, pwd, auth, which ordinary text uses as
+// labels), and its value is redacted only when token-shaped.
+func strongSecretKey(k string) bool {
+	return strongSecretKeyEndPattern.MatchString(k) || strongSecretCamelEndPattern.MatchString(k) ||
+		redactedUpperSuffixPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
+}
+
+var (
+	strongSecretKeyEndPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:token|secret|password|passwd|passphrase|authorization|cookie|api[_-]?key|apikey|private[_-]?key|privatekey|ssh[_-]?key|signing[_-]?key|key[_-]?data|access[_-]?key|secret[_-]?key|credential|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)s?$|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
+	strongSecretCamelEndPattern = regexp.MustCompile(`[A-Za-z0-9](?:Token|Secret|Password|Passwd|Passphrase|Authorization|Cookie|Api[_-]?Key|APIKey|Private[_-]?Key|Ssh[_-]?Key|SSHKey|Signing[_-]?Key|Key[_-]?Data|Access[_-]?Key|Secret[_-]?Key|Credential)s?$`)
+	// A value that stands for a secret rather than being one: an
+	// environment reference, a command substitution, a <placeholder>.
+	secretPlaceholderPattern = regexp.MustCompile(`^(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|\$\(.*\)|<[^<>]+>)$`)
+)
+
+// nonSecretLiterals are the values a credential key takes in config and
+// prose that are not a credential: a YAML or JSON literal, a switch.
+var nonSecretLiterals = map[string]bool{
+	"true": true, "false": true, "null": true, "nil": true, "none": true, "yes": true, "no": true,
+	"on": true, "off": true, "enabled": true, "disabled": true, "unset": true, "empty": true,
+	"required": true, "optional": true, "n/a": true,
+}
+
+// trimValueEdges strips what wraps a value in text and is not part of it:
+// quotes, backticks, and the sentence punctuation or closing bracket that
+// follows it.
+func trimValueEdges(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimRight(v, ".,;:!?)]}`*")
+	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+		v = v[1 : len(v)-1]
+	}
+	return strings.Trim(v, "`\"'")
+}
+
+// keyedValueRedacted says whether the value under a key inlineSecretKey
+// accepts is redacted: never one with no letter or digit (a line
+// continuation, "{", markdown), a marker already placed, or a placeholder;
+// under a strong key anything else but a non-secret literal or a short
+// number (max_tokens: 4096); under any other key only a token-shaped value.
+func keyedValueRedacted(key, value string) bool {
+	return valueRedacted(strongSecretKey(key), value)
+}
+
+// valueRedacted is keyedValueRedacted with the key's strength decided.
+func valueRedacted(strongKey bool, value string) bool {
+	v := trimValueEdges(value)
+	if !hasAlnum(v) || strings.Contains(v, redactedValue) || secretPlaceholderPattern.MatchString(v) {
+		return false
+	}
+	if strongKey {
+		if nonSecretLiterals[strings.ToLower(v)] {
+			return false
+		}
+		return !(len(v) <= 5 && isAllDigits(v))
+	}
+	return valueTokenShaped(v)
+}
+
+// valueTokenShaped says whether a value looks like a credential rather than
+// a word: at least 8 bytes with no space, not a URL or a path, and holding
+// a symbol a word does not (!@#$%^&*+=~\|?<>), all three of lower case,
+// upper case and digits, a run of 8 or more letters and digits holding two
+// digits (hunter301, AKIA...), or the case churn of base62 (three or more
+// lower-to-upper or letter-digit changes). A dictionary word, a DNS name
+// (kube-agents-evals-31, us-central1), an enum (PROJECT_SINGLETON_POLICY)
+// and a camelCase field (httpGet) are not.
+func valueTokenShaped(v string) bool {
+	if len(v) < 8 || strings.ContainsAny(v, " \t\r\n") || strings.Contains(v, "://") ||
+		strings.HasPrefix(v, "/") || strings.HasPrefix(v, "~/") || strings.HasPrefix(v, "./") {
+		return false
+	}
+	if strings.ContainsAny(v, "!@#$%^&*+=~\\|?<>") && hasAlnum(v) {
+		return true
+	}
+	var lower, upper, digit bool
+	changes := 0
+	prev := byte(0)
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			lower = true
+			if prev == 'd' {
+				changes++
+			}
+			prev = 'l'
+		case c >= 'A' && c <= 'Z':
+			upper = true
+			if prev == 'l' || prev == 'd' {
+				changes++
+			}
+			prev = 'u'
+		case c >= '0' && c <= '9':
+			digit = true
+			if prev == 'l' || prev == 'u' {
+				changes++
+			}
+			prev = 'd'
+		default:
+			prev = 0
+		}
+	}
+	if lower && upper && digit || changes >= 3 {
+		return true
+	}
+	for _, seg := range strings.FieldsFunc(v, func(r rune) bool { return r == '-' || r == '.' || r == ':' || r == '/' }) {
+		digits, letters := 0, 0
+		for i := 0; i < len(seg); i++ {
+			switch c := seg[i]; {
+			case c >= '0' && c <= '9':
+				digits++
+			case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z':
+				letters++
+			}
+		}
+		if len(seg) >= 8 && letters > 0 && digits >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAlnum(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func isAllDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// secretSink receives each value a shape rule redacts, so a caller can
+// collect what a tool's result held (seenSecrets); nil drops them.
+type secretSink func(value string)
+
+func (sink secretSink) emit(v string) {
+	if sink != nil && v != "" && !strings.Contains(v, redactedValue) {
+		sink(v)
+	}
+}
+
+// inlineScrubRule is one step of scrubInlineSecrets, in order.
+type inlineScrubRule struct {
+	name string
+	fn   func(s string, sink secretSink) string
+}
+
+// inlineScrubRules are scrubInlineSecrets's steps, in the order they run.
+// The names are for tests and the evidence tooling, which attribute a
+// redaction to the step that made it.
+var inlineScrubRules = []inlineScrubRule{
+	{"pem-private-key", func(s string, sink secretSink) string {
+		s = redactSubmatch(pemPrivateKeyBlockPattern, s, 0, sink, nil)
+		return redactSubmatch(pemPrivateKeyOpenPattern, s, 0, sink, nil)
+	}},
+	{"yaml-secret-block", scrubYAMLSecretBlocks},
+	{"token-prefix", func(s string, sink secretSink) string {
+		return redactSubmatch(inlineTokenValuePattern, s, 0, sink, nil)
+	}},
+	{"auth-header-pair", func(s string, sink secretSink) string {
+		return redactSubmatch(authHeaderPairPattern, s, 1, sink, nil)
+	}},
+	{"auth-scheme", func(s string, sink secretSink) string {
+		return redactSubmatch(authSchemeCredentialPattern, s, 1, sink, authSchemeCredentialRedacted)
+	}},
+	{"url-userinfo", func(s string, sink secretSink) string {
+		return redactSubmatch(inlineURLCredPattern, s, 2, sink, nil)
+	}},
+	{"pgpass-entry", func(s string, sink secretSink) string {
+		return redactSubmatch(pgpassEntryPattern, s, 4, sink, pgpassEntryRedacted)
+	}},
+	{"cli-flag", scrubCLISecretFlags},
+	{"prose", func(s string, sink secretSink) string {
+		return redactSubmatch(proseSecretPattern, s, 2, sink, func(s string, m []int) bool {
+			return valueTokenShaped(trimValueEdges(s[m[4]:m[5]]))
+		})
+	}},
+	{"key-value", scrubInlineKVSecrets},
+}
+
+// scrubInlineSecrets is the defence in depth on the text the bridge
+// publishes that a model wrote: the identifier a step title names (a
+// cluster, a file's tail, a search query, a card's title), a settled card's
+// report, and the answer itself (scrubAnswer). Tool arguments, results,
+// error messages and model reasoning never reach the bus, because they are
+// not published at all (the executor note in activity.go); a scrubber is a
+// net, not a contract.
 func scrubInlineSecrets(s string) string {
+	return scrubInlineSecretsTo(s, nil)
+}
+
+// scrubInlineSecretsTo is scrubInlineSecrets, handing each value it redacts
+// to sink.
+func scrubInlineSecretsTo(s string, sink secretSink) string {
 	if s == "" || s == redactedValue {
 		return s
 	}
-	s = pemPrivateKeyBlockPattern.ReplaceAllString(s, redactedValue)
-	s = pemPrivateKeyOpenPattern.ReplaceAllString(s, redactedValue)
-	s = scrubYAMLSecretBlocks(s)
-	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
-	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
-	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
-	s = scrubCLISecretFlags(s)
-	s = proseSecretPattern.ReplaceAllString(s, "${1}"+redactedValue)
-	return scrubInlineKVSecrets(s)
-}
-
-func scrubCLISecretFlags(s string) string {
-	s = cliUserPassPattern.ReplaceAllString(s, "${1}${2}${3}:"+redactedValue+"${5}")
-	s = cliSpacedPassPattern.ReplaceAllStringFunc(s, func(m string) string {
-		sub := cliSpacedPassPattern.FindStringSubmatch(m)
-		if len(sub) < 3 || strings.HasPrefix(sub[2], "-") {
-			return m
-		}
-		return sub[1] + redactedValue
-	})
-	s = cliAttachedPassPattern.ReplaceAllString(s, "${1}"+redactedValue)
-	s = cliLongSecretFlagPattern.ReplaceAllStringFunc(s, func(m string) string {
-		sub := cliLongSecretFlagPattern.FindStringSubmatch(m)
-		if len(sub) < 5 || !inlineSecretKey(sub[2]) {
-			return m
-		}
-		if sub[3] != "=" && strings.HasPrefix(sub[4], "-") {
-			return m
-		}
-		return sub[1] + redactedValue
-	})
+	for _, r := range inlineScrubRules {
+		s = r.fn(s, sink)
+	}
 	return s
 }
 
-func scrubYAMLSecretBlocks(s string) string {
+// redactSubmatch replaces group of each match of re in s with the marker,
+// where keep (nil for always) says so, handing the value to sink.
+func redactSubmatch(re *regexp.Regexp, s string, group int, sink secretSink, keep func(s string, m []int) bool) string {
+	ms := re.FindAllStringSubmatchIndex(s, -1)
+	if ms == nil {
+		return s
+	}
+	var sb strings.Builder
+	last := 0
+	for _, m := range ms {
+		lo, hi := m[2*group], m[2*group+1]
+		if lo < last || hi <= lo || s[lo:hi] == redactedValue || (keep != nil && !keep(s, m)) {
+			continue
+		}
+		sb.WriteString(s[last:lo])
+		sb.WriteString(redactedValue)
+		sink.emit(s[lo:hi])
+		last = hi
+	}
+	if last == 0 {
+		return s
+	}
+	sb.WriteString(s[last:])
+	return sb.String()
+}
+
+// authSchemeCredentialRedacted says whether a credential after a scheme
+// word is redacted here: not where an Authorization key leads it on its
+// line (the key=value rule takes the whole value there, a Digest's
+// parameters included), and elsewhere only when token-shaped.
+func authSchemeCredentialRedacted(s string, m []int) bool {
+	lineStart := strings.LastIndexByte(s[:m[0]], '\n') + 1
+	if authHeaderKVLeadPattern.MatchString(s[lineStart:m[0]]) {
+		return false
+	}
+	return valueTokenShaped(trimValueEdges(s[m[2]:m[3]]))
+}
+
+// pgpassEntryRedacted tells a password file entry from a timestamp or an
+// IPv6 address with as many colons: the host names a host (a letter or a
+// dot in it, or the * wildcard, and not a timestamp's date and hour), and
+// the database or user field holds something a run of hex digits does not.
+func pgpassEntryRedacted(s string, m []int) bool {
+	host := s[m[2]:m[3]]
+	if timestampHostPattern.MatchString(host) {
+		return false
+	}
+	if host != "*" && !strings.ContainsAny(host, ".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		return false
+	}
+	for _, f := range []string{s[m[4]:m[5]], s[m[6]:m[7]]} {
+		for i := 0; i < len(f); i++ {
+			c := f[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func scrubCLISecretFlags(s string, sink secretSink) string {
+	notAFlag := func(group int) func(s string, m []int) bool {
+		return func(s string, m []int) bool { return !strings.HasPrefix(s[m[2*group]:m[2*group+1]], "-") }
+	}
+	s = redactSubmatch(cliUserPassPattern, s, 4, sink, nil)
+	s = redactSubmatch(cliSpacedPassPattern, s, 2, sink, notAFlag(2))
+	s = redactSubmatch(cliAttachedPassPattern, s, 2, sink, nil)
+	s = redactSubmatch(cliLDAPPassPattern, s, 2, sink, notAFlag(2))
+	s = redactSubmatch(cliPassphraseArgPattern, s, 2, sink, nil)
+	// A flag whose name is a credential key (flagValueRedacted).
+	s = redactSubmatch(cliLongSecretFlagPattern, s, 4, sink, func(s string, m []int) bool {
+		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
+	})
+	s = redactSubmatch(cliSingleDashSecretFlagPattern, s, 4, sink, func(s string, m []int) bool {
+		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
+	})
+	argListValue := func(s string, m []int) bool {
+		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
+	}
+	s = redactSubmatch(cliArgListJSONPattern, s, 2, sink, argListValue)
+	return redactSubmatch(cliArgListYAMLPattern, s, 2, sink, argListValue)
+}
+
+// flagValueRedacted says whether a flag's value is redacted: the flag's
+// name is a credential key, a spaced value is not the next flag, and the
+// value passes keyedValueRedacted (so --token-ttl 30m and --password-file
+// /path stay, and --include-secrets followed by a line continuation does).
+func flagValueRedacted(name, sep, value string) bool {
+	if !inlineSecretKey(name) {
+		return false
+	}
+	if sep != "=" && sep != ":" && strings.HasPrefix(value, "-") {
+		return false
+	}
+	return keyedValueRedacted(name, value)
+}
+
+func scrubYAMLSecretBlocks(s string, sink secretSink) string {
 	if !strings.Contains(s, "data:") && !strings.Contains(s, "stringData:") {
 		return s
 	}
@@ -1018,19 +1324,24 @@ func scrubYAMLSecretBlocks(s string) string {
 		}
 		if em := yamlBlockEntryPattern.FindStringSubmatch(trimmedLine); em != nil {
 			val := strings.TrimSpace(em[2])
-			if val != "" && val != "{}" && val != "[]" && val != "|" && val != ">" && val != "|-" && val != ">-" {
+			if val != "" && val != "{}" && val != "[]" && val != "|" && val != ">" && val != "|-" && val != ">-" && val != redactedValue {
 				cr := ""
 				if strings.HasSuffix(line, "\r") {
 					cr = "\r"
 				}
 				lines[i] = em[1] + redactedValue + em[3] + cr
+				sink.emit(val)
 			}
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
-func scrubInlineKVSecrets(s string) string {
+// scrubInlineKVSecrets redacts the value after a credential key and a = or
+// :, as keyedValueRedacted says. A bare lower-case key used as a label in
+// the middle of a sentence ("rotate the token: run ...") keeps a value that
+// is one plain word.
+func scrubInlineKVSecrets(s string, sink secretSink) string {
 	var sb strings.Builder
 	pos := 0
 	for pos < len(s) {
@@ -1067,6 +1378,15 @@ func scrubInlineKVSecrets(s string) string {
 			matchEnd += sloc[1]
 			rest = rest[sloc[1]:]
 		}
+		lineLeading := isLineLeadingKVKey(s, matchStart)
+		strongKey := strongSecretKey(key)
+		label := sep == ':' && hadPostSepSpace && openQuote == "" && closeQuote == "" && !lineLeading && isLowerWord(key)
+		redacts := func(v string) bool {
+			if label && isLowerWord(strings.ToLower(trimValueEdges(v))) {
+				return false
+			}
+			return valueRedacted(strongKey, v)
+		}
 		if openQuote != "" && closeQuote == "" && sep == ':' && !strings.HasPrefix(rest, `"`) && !strings.HasPrefix(rest, `'`) && !strings.HasPrefix(rest, `\"`) && !strings.HasPrefix(rest, `\'`) {
 			var closeIdx int
 			if len(openQuote) == 2 {
@@ -1074,9 +1394,14 @@ func scrubInlineKVSecrets(s string) string {
 			} else {
 				closeIdx = findUnescapedQuote(rest, openQuote[0])
 			}
-			if closeIdx >= 0 {
+			if closeIdx >= 0 && redacts(rest[:closeIdx]) {
 				sb.WriteString(redactedValue)
+				sink.emit(rest[:closeIdx])
 				pos = matchEnd + closeIdx
+				continue
+			}
+			if closeIdx >= 0 {
+				pos = matchEnd
 				continue
 			}
 		}
@@ -1084,7 +1409,19 @@ func scrubInlineKVSecrets(s string) string {
 		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
 			q := rest[:2]
 			afterOpen := rest[2:]
-			if closeIdx := findUnescapedEscapedQuote(afterOpen, q[1]); closeIdx >= 0 {
+			closeIdx := findUnescapedEscapedQuote(afterOpen, q[1])
+			val := afterOpen
+			if closeIdx >= 0 {
+				val = afterOpen[:closeIdx]
+			} else if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
+				val = afterOpen[:nl]
+			}
+			if !redacts(val) {
+				pos = matchEnd
+				continue
+			}
+			sink.emit(val)
+			if closeIdx >= 0 {
 				sb.WriteString(q + redactedValue + q)
 				pos = matchEnd + 2 + closeIdx + 2
 			} else {
@@ -1098,12 +1435,26 @@ func scrubInlineKVSecrets(s string) string {
 		case strings.HasPrefix(rest, `"`), strings.HasPrefix(rest, `'`):
 			q := rest[0]
 			afterOpen := rest[1:]
-			if closeIdx := findUnescapedQuote(afterOpen, q); closeIdx >= 0 {
+			closeIdx := findUnescapedQuote(afterOpen, q)
+			val := afterOpen
+			if closeIdx >= 0 {
+				val = afterOpen[:closeIdx]
+			} else if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
+				val = afterOpen[:nl]
+			}
+			schemeEnd := 0
+			if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(val); sloc != nil && closeIdx >= 0 {
+				schemeEnd = sloc[1]
+			}
+			if !redacts(val[schemeEnd:]) {
+				pos = matchEnd
+				continue
+			}
+			sink.emit(val[schemeEnd:])
+			if closeIdx >= 0 {
 				inner := afterOpen[:closeIdx]
 				sb.WriteByte(q)
-				if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(inner); sloc != nil {
-					sb.WriteString(inner[:sloc[1]])
-				}
+				sb.WriteString(inner[:schemeEnd])
 				sb.WriteString(redactedValue)
 				sb.WriteByte(q)
 				pos = matchEnd + 1 + closeIdx + 1
@@ -1120,13 +1471,18 @@ func scrubInlineKVSecrets(s string) string {
 			sb.WriteString(redactedValue)
 			pos = matchEnd + len(redactedValue)
 		default:
-			if sep == ':' && openQuote == "" && closeQuote == "" && isLineLeadingKVKey(s, matchStart) {
+			if sep == ':' && openQuote == "" && closeQuote == "" && lineLeading {
 				lineEnd := len(rest)
 				if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
 					lineEnd = nl
 				}
 				lineRest := strings.TrimRight(rest[:lineEnd], " \t")
 				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
+					if !redacts(lineRest) {
+						pos = matchEnd
+						continue
+					}
+					sink.emit(lineRest)
 					sb.WriteString(redactedValue)
 					pos = matchEnd + len(lineRest)
 					continue
@@ -1146,15 +1502,26 @@ func scrubInlineKVSecrets(s string) string {
 				}
 				valLen++
 			}
-			if valLen == 0 {
+			if valLen == 0 || !redacts(rest[:valLen]) {
 				pos = matchEnd
 				continue
 			}
+			sink.emit(rest[:valLen])
 			sb.WriteString(redactedValue)
 			pos = matchEnd + valLen
 		}
 	}
 	return sb.String()
+}
+
+// isLowerWord says whether k is one lower-case word, no separator.
+func isLowerWord(k string) bool {
+	for i := 0; i < len(k); i++ {
+		if k[i] < 'a' || k[i] > 'z' {
+			return false
+		}
+	}
+	return k != ""
 }
 
 func isLineLeadingKVKey(s string, matchStart int) bool {
