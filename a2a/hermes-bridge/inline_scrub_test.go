@@ -176,9 +176,15 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		},
 		{
 			name:      "fail closed: a lower-case hyphenated passphrase, whatever word it ends in",
-			in:        "The passphrase is quiet-meadow-lantern-expired and the password is meadow-lantern-plaintext.",
-			forbidden: []string{"quiet-meadow-lantern-expired", "meadow-lantern-plaintext"},
-			wantSub:   []string{"The passphrase is [redacted] and the password is [redacted]."},
+			in:        "The passphrase is quiet-meadow-lantern-expired and the password is meadow-lantern-plaintext; the secret is meadow-lantern-expired.",
+			forbidden: []string{"quiet-meadow-lantern-expired", "meadow-lantern-plaintext", "meadow-lantern-expired"},
+			wantSub:   []string{"The passphrase is [redacted] and the password is [redacted]; the secret is [redacted]."},
+		},
+		{
+			name:      "cli flag: pass-phrase source argument followed by a word",
+			in:        "openssl pkcs12 -export -passout pass:quietpasture outfile.p12",
+			forbidden: []string{"quietpasture"},
+			wantSub:   []string{"-passout pass:[redacted] outfile.p12"},
 		},
 	}
 	for _, tc := range positives {
@@ -222,6 +228,7 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"The secret is now-expired, the token is not-set and the credential is still-mounted.",
 		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
 		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
+		"The upgrade ran 2026-10-28T03:56:05Z-03:59:15Z on default-pool.",
 	}
 	for _, in := range negatives {
 		if got := scrubInlineSecrets(in); got != in {

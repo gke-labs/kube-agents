@@ -24,8 +24,8 @@ import (
 //     that says what it is.
 //
 // The set takes every Secret data and stringData value of eight bytes or
-// more, and every value a shape rule catches in a result's text that is
-// not one plain word (shapeCaught).
+// more, and every value a shape rule catches in a result's text, a plain
+// word only where the text named it a secret outright (shapeCaught).
 //
 // The bridge sees a tool's result only through the activity door: hermes's
 // post_tool_call delivery carries the tool's whole result (extra.result).
@@ -289,14 +289,16 @@ func (c *toolResultCollector) text(t string, depth int) {
 	scrubInlineSecretsTo(scan, c.shapeCaught)
 }
 
-// shapeCaught tracks a value a shape rule redacted in a result's text,
-// unless it is one plain word. The shape rules fail closed after a
-// credential key, which costs one word where it stands, but the set
-// redacts its values everywhere in the answer, so a plain word a rule
-// caught (a constant's value under a *_KEY name in a source file the agent
-// read) would come out of every sentence that uses it.
-func (c *toolResultCollector) shapeCaught(v string) {
-	if isPlainWord(trimValueEdges(v)) {
+// shapeCaught tracks a value a shape rule redacted in a result's text. A
+// plain word is tracked only when the text named it a secret outright (a
+// password, secret, token or api key key, flag or prose noun, or the
+// rule's own shape). The shape rules fail closed after a weak or ambiguous
+// key too, which costs one word where it stands, but the set redacts its
+// values everywhere in the answer, so a plain word caught under one (a
+// constant's value under a *_KEY name in a source file the agent read)
+// would come out of every sentence that uses it.
+func (c *toolResultCollector) shapeCaught(v string, named bool) {
+	if !named && isPlainWord(trimValueEdges(v)) {
 		return
 	}
 	c.set.add(v)

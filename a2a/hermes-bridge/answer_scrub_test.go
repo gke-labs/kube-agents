@@ -143,6 +143,21 @@ func TestSeenSecrets_AShapeCaughtPlainWordIsNotTracked(t *testing.T) {
 	}
 }
 
+// A plain word a tool result revealed under a key that names a secret
+// outright (password, secret, token, api key) is tracked, so its echo in
+// the answer is redacted; the eight-byte floor still holds.
+func TestSeenSecrets_AStrongKeysPlainWordIsTracked(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "db_password: quietpasture\nSERVICE_TOKEN=meadowlark\napi_key: shortpw"))
+	got := scrubAnswerText("Log in with quietpasture, then meadowlark; shortpw stays.", &s)
+	if strings.Contains(got, "quietpasture") || strings.Contains(got, "meadowlark") {
+		t.Errorf("answer = %q, want the strong-key plain words redacted", got)
+	}
+	if !strings.Contains(got, "shortpw") || s.has("shortpw") {
+		t.Errorf("answer = %q: a value under %d bytes is tracked", got, seenSecretMinBytes)
+	}
+}
+
 // The longest value wins where two overlap, so no fragment is left over.
 func TestSeenSecrets_TheLongestValueWins(t *testing.T) {
 	var s seenSecrets
