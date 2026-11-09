@@ -7364,8 +7364,11 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
         check_no_pdb,
         "major",
         None,
-        "Nothing constrains the eviction API, so a single node drain during "
-        "an upgrade can terminate every replica at once.",
+        "Nothing limits how many replicas the eviction API may take at once, "
+        "so the workload is unprotected during voluntary disruptions such as "
+        "node upgrades and autoscaler scale-downs: one drain evicts every "
+        "replica on that node, and back-to-back drains can evict the next "
+        "replica before its replacement is Ready.",
     ),
     CheckSpec(
         "blocking-pdb",

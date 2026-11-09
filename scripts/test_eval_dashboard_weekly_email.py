@@ -32,7 +32,7 @@ NOW = datetime.datetime(2026, 10, 19, 13, 0, tzinfo=datetime.timezone.utc)
 THIS_WEEK = list(range(12, 19))
 LAST_WEEK = list(range(5, 12))
 MODEL = "gemini-3-1-pro-preview-kubeagents-mcp"
-OTHER_MODEL = "claude-opus-5-5-kubeagents-mcp"
+OTHER_MODEL = "other-model-kubeagents-mcp"
 WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci-health.yml"
 
 DOMAINS = [

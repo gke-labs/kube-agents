@@ -88,13 +88,16 @@ GAVE_UP_SQL = """
         0))
 """
 # A run can record a PR or MR URL in its metadata. Any run counts, because a
-# later review run does not repeat the URL. Only a text value is a URL.
+# later review run does not repeat the URL. The read selects each run's text
+# pr_url in this column, one per line, matches it with PR_URL_PATTERN as it does
+# the result, and removes the column before it sends the row.
+PR_METADATA_COLUMN = "pr_scan_metadata"
 PR_METADATA_SQL = """
-    EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id
-            AND CASE WHEN json_valid(r.metadata)
-                     THEN json_type(r.metadata, '$.pr_url') = 'text'
-                          AND json_extract(r.metadata, '$.pr_url') <> ''
-                     ELSE 0 END)
+    (SELECT group_concat(json_extract(r.metadata, '$.pr_url'), char(10))
+     FROM task_runs r WHERE r.task_id = t.id
+       AND CASE WHEN json_valid(r.metadata)
+                THEN json_type(r.metadata, '$.pr_url') = 'text'
+                ELSE 0 END)
 """
 # Most workers give the PR or MR URL only in the card result. The console shows
 # the PR only for a done card. Thus the read selects the result of a done card
@@ -146,20 +149,21 @@ def card_state(connection):
 
     block_kind = "t.block_kind" if has("tasks", "block_kind") else "NULL"
     gave_up = GAVE_UP_SQL if has("task_events", "kind") else "0"
-    has_pr = PR_METADATA_SQL if has("task_runs", "metadata") else "0"
+    pr_metadata = PR_METADATA_SQL if has("task_runs", "metadata") else "NULL"
     result = PR_RESULT_SQL if has("tasks", "result") else "NULL"
     return (
-        f"{block_kind} AS block_kind, {gave_up} AS gave_up, {has_pr} AS has_pr, "
-        f"{result} AS {PR_RESULT_COLUMN}"
+        f"{block_kind} AS block_kind, {gave_up} AS gave_up, "
+        f"{pr_metadata} AS {PR_METADATA_COLUMN}, {result} AS {PR_RESULT_COLUMN}"
     )
 
 
 def card_row(row):
-    # Scan the result for a PR or MR URL. Then remove the result to keep the
-    # read small.
+    # Scan the runs' pr_url values and the result for a PR or MR URL. Then remove
+    # both columns to keep the read small.
     card = dict(row)
+    pr_metadata = card.pop(PR_METADATA_COLUMN) or ""
     result = card.pop(PR_RESULT_COLUMN) or ""
-    card["has_pr"] = bool(card["has_pr"]) or bool(PR_URL_PATTERN.search(result))
+    card["has_pr"] = bool(PR_URL_PATTERN.search(pr_metadata) or PR_URL_PATTERN.search(result))
     return card
 
 

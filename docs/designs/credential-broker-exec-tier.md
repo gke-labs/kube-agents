@@ -175,16 +175,16 @@ one pod's CPU is one limit.
 
 ### 3.1 Which routes move
 
-| Route                                                       | Where                                                         | Why                                                                           |
-| ----------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `POST /v1/exec`                                             | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls (§11, question 1, closed); most of the slot-taking load |
-| `GET /v1/exec/admission` (#4084)                            | Exec tier                                                     | Reports the tier's capacity (§3.5)                                            |
-| `/v1/gcp/` Cloud API relay                                  | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls; #4199 moved the reconcile's GKE cluster reads onto it  |
-| `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N    |
-| `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection        |
-| `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                           |
-| `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                         |
-| `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                 |
+| Route                                                       | Where                                                         | Why                                                                                                                                                                        |
+| ----------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/exec`                                             | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state a call depends on (§11, question 1, closed): the per-session tool-call counts are a per-replica LRU, lost without harm on a restart; most of the slot-taking load |
+| `GET /v1/exec/admission` (#4084)                            | Exec tier                                                     | Reports the tier's capacity (§3.5)                                                                                                                                         |
+| `/v1/gcp/` Cloud API relay                                  | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls; #4199 moved the reconcile's GKE cluster reads onto it                                                                                               |
+| `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N                                                                                                 |
+| `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection                                                                                                     |
+| `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                                                                                                                        |
+| `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                                                                                                                      |
+| `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                                                                                                              |
 
 Two route groups need the single pod: the chat relays' event, ack and nack routes, and the
 `scope` role's `/v1/exec` calls (#4119), whose member window lives in one process. The content
@@ -249,8 +249,12 @@ shim always takes the fallback and nothing reports it.
 ### 3.3 Deployment
 
 - A second Deployment, `<agent>-credential-proxy-exec-tier`, and Service, port 8765. Replicas from a new
-  CR field (§9). Strategy `RollingUpdate`: no exec call keeps state across calls (§11, question
-  1, closed). Step 0's long drain on SIGTERM (§9) lets a stopping replica finish the commands in
+  CR field (§9). Strategy `RollingUpdate`: no exec call keeps state another call depends on (§11,
+  question 1, closed). The one thing a replica remembers between calls is its per-session
+  tool-call counts (`SessionToolBudget`, the ceiling and the loop breaker), a bounded LRU that a
+  restart or a reschedule drops without harm; since each replica counts alone, N replicas admit
+  about N times the per-session ceiling, and the breaker trips per replica. Step 0's long drain
+  on SIGTERM (§9) lets a stopping replica finish the commands in
   flight, while `RollingUpdate` keeps another replica serving. This removes the exec outage
   during an upgrade at 2 or more replicas. A PodDisruptionBudget, set only when replicas are 2 or
   more, guards voluntary evictions such as a node drain; it has no part in a rollout.
@@ -281,6 +285,12 @@ shim always takes the fallback and nothing reports it.
   values hold there. The slot cap and the memory budget stay per replica. For comparison, before
   step 0 the broker requested 500m CPU / 1 GiB with limits 1 CPU / 2 GiB. Step 0 (§9) raised
   its limit to 2 CPU and, on Autopilot only, its requests to 2 CPU / 2 GiB.
+  Decided (#4536): the request stays at 2 CPU, equal to the limit. A lower request would let more
+  node pools schedule the tier, but a replica could then be throttled under the load §8.4 sizes
+  it for. A small node pool shows the cost instead: each replica needs a node with 2 free CPU, and
+  the operator reports a replica that does not schedule in the `CredentialProxyExecReady`
+  condition. Once callers are given the tier's URL (§9), the shell sandbox also restarts when the
+  tier turns on, and needs room on the node pool too.
 - A NetworkPolicy target for the exec tier: ingress on 8765 from the sandbox, from session pods
   only under the cluster-view flag (the condition the stateful broker has today), and the metrics
   port from GMP. The egress rules that select the broker's pod labels also need the exec tier as a

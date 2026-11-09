@@ -77,8 +77,12 @@ leader hold its relay too.
 
 - **Graceful (a rollout, a drain).** The active replica stops as above and releases the lease.
   The standby, which has been retrying the lease every `retryPeriod` (2s, jittered to between 2 and
-  4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered at
-  once, in order. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
+  4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered as
+  soon as the standby's relay binds, without waiting out AckWait, but not always in order: the
+  give-back keeps stream order only for a relay already bound when it falls due, milliseconds
+  after the stop, and with none bound the bus can move the oldest event behind later ones. The relay
+  sorts each batch by stream sequence, which restores the order only among events that land in
+  one batch. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
   socket, Discord's identify, the relay's bind): a few seconds.
 - **Crash.** The lease expires (`leaseDuration`, 20s) and the standby takes it. The dead replica's
   held relay events come back only when the relay durable's AckWait (30s) runs out, and a newer
@@ -261,7 +265,8 @@ ingress gap above.
 
 ## Operator changes
 
-- **Replicas from the CR,** default two on `next` installs, one allowed. More replicas add
+- **Replicas from the CR** (`spec.deployment.availability.a2aGateway.replicas`), default two on
+  `next` installs, one allowed. More replicas add
   standbys and nothing else in phase one.
 - **A readiness probe** that holds the pod not Ready until it has a NATS connection and has read
   the Lease. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
@@ -284,7 +289,10 @@ ingress gap above.
   and removing the pin rolls once at one replica again. A deleted Lease or its held-back recreate
   doesn't change the running image, so it leaves the condition, and the two replicas, in place. A status condition doesn't
   survive most restores, so a restored install starts at one replica until a
-  gateway takes the Lease again. A CI install, which always pins the image, spends its first roll
+  gateway takes the Lease again. The condition can outlive the gateway it describes when an older
+  operator, which doesn't know it, runs the gateway unelected in between. So the operator scales out
+  from one replica only on an election it reads that pass, and uses a recorded condition only to
+  keep a gateway already rolling with the election's env. A CI install, which always pins the image, spends its first roll
   at one replica and runs two after that. A gateway from before the election never takes the
   Lease, so a pin to one stays at one replica. The same check covers an install upgrading across
   the election in one roll: its old gateway holds no
@@ -297,7 +305,8 @@ ingress gap above.
   patch, so it isn't done.
 - **A PodDisruptionBudget** of `maxUnavailable: 1`, with `unhealthyPodEvictionPolicy:
 AlwaysAllow` as the callout's has, so a node drain takes one replica at a time and an unhealthy
-  replica never blocks a drain.
+  replica never blocks a drain. It exists only while more than one replica is Ready: one
+  applied while the standby can't come up (no room, a failed pull) would pin the only pod.
 - **A zone topology spread** (`ScheduleAnyway`), as the callout and verifier already have, so a
   single-zone install still schedules. On Autopilot the spread and the PDB behave as on Standard:
   Autopilot honours a PDB on its own node upgrades, and `ScheduleAnyway` asks for no capacity it
@@ -349,7 +358,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    each, including the held-back recreate, the first roll across the election, and a pin to a
    pre-election image and back. It lands in two parts: first the Lease, its Role grant and the
    gateway's election env, at one replica with `Recreate`, behind an operator flag
-   (`A2A_GATEWAY_ELECTION`) that CI and the live runs turn on; then the replicas, the strategy and
+   (`A2A_GATEWAY_ELECTION`) that CI and the live runs turn on; then the flag on by default
+   (`false` turns it off), the replicas, the strategy and
    their guard, the readiness probe, the PDB and the spread.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod

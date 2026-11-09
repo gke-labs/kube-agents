@@ -197,6 +197,22 @@ BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
 EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
 # The broker route `execute` sends a command to, under the broker's URL.
 EXEC_ROUTE = "/v1/exec"
+# The exec body's session key (the broker's SESSION_ID_FIELD): the card or
+# session id this process runs under, `default_caller_label`, so the broker
+# can count a run's commands and break its retry loops. Omitted when there is
+# none; a request without one is uncounted.
+SESSION_ID_FIELD = "sessionId"
+# The refusal codes the shim prints as a policy block (the message, then
+# `policy rule: <rule>`) and exits EXIT_SECURITY_POLICY_BLOCKED on: the policy's
+# own, and the broker's two per-session bounds. The exit code keeps the runtime
+# from reading the refusal as a missing executable; the runtime's refusal stop
+# (deploy/docker/patches/permission_refusal_stop.py) halts on the read-only
+# rule's write refusals only, so for the two session bounds the message is
+# what tells the model to stop.
+SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
+SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
+LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
+POLICY_BLOCKED_CODES = frozenset({SECURITY_POLICY_BLOCKED_CODE, SESSION_BUDGET_EXCEEDED_CODE, LOOP_BREAKER_CODE})
 # The line a malformed exec URL writes, once per process, when the stateful
 # broker takes its place. No "credential proxy" prefix, for the same reason as
 # EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
@@ -223,6 +239,19 @@ KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
+# What an exec request sends as its `sessionId`, so the broker can count the
+# run's commands: the kanban card first, then the scheduled run, then the
+# session. Where each comes from matters, because no process environment
+# crosses the SSH hop into the shell sandbox: there the ForceCommand
+# (deploy/sandbox/session-command.sh) recovers the card and the cron run from
+# the command's cwd, and a chat turn, which runs from neither, sends no key.
+# HERMES_SESSION_ID reaches the shim only where the terminal runs in the
+# shim's own pod, the profile and session pods. The grammar mirrors the
+# broker's SESSION_ID_RE; a value outside it is dropped rather than sent,
+# because the key serves the broker's count and must never be what fails a
+# command.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_CRON_RUN", "HERMES_SESSION_ID")
+CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
 # A shell's context pin: which cluster the last context-less `get-credentials`
@@ -1401,7 +1430,9 @@ def _exec_refused(exc: urllib.error.HTTPError, payload: dict | None) -> int:
             file=sys.stderr,
         )
         return 1
-    if payload.get("code") == "SECURITY_POLICY_BLOCKED":
+    # The far side composes the payload: a `code` that is not a string (a
+    # list, an object) is not a refusal code, and must not raise out of here.
+    if isinstance(payload.get("code"), str) and payload["code"] in POLICY_BLOCKED_CODES:
         print(
             payload.get("message", "Command blocked for security reasons."),
             file=sys.stderr,
@@ -1633,6 +1664,9 @@ def execute(
     }
     if context:
         request_payload["kubeconfigContext"] = context
+    session_label = default_caller_label()
+    if session_label:
+        request_payload[SESSION_ID_FIELD] = session_label
     if destination is not None or implicit_destination:
         request_payload["wantsKubeconfig"] = True
     if stdin is not None:
@@ -1817,6 +1851,23 @@ class WorkspaceRequestError(RuntimeError):
         )
         self.status = status
         self.payload = payload
+
+
+def default_caller_label() -> str:
+    """The card, scheduled run or session id this process runs under, or ""
+    when it has none.
+
+    Read at call time, like `session_lease` in the skill, because the agent
+    runs each command in a fresh process and the identity lives in its
+    environment. A value the broker's grammar would refuse is dropped here:
+    the key exists so the broker can count a run's commands, and it must
+    never be the reason a command fails.
+    """
+    for name in CALLER_LABEL_ENV:
+        value = os.environ.get(name, "").strip()
+        if value and CALLER_LABEL_RE.match(value):
+            return value
+    return ""
 
 
 def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
