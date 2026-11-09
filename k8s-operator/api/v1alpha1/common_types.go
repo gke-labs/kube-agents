@@ -818,18 +818,22 @@ type StallWatchSpec struct {
 	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
 
 	// Kinds replaces the watch's default list of resources to scan (Deployments,
-	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
-	// cert-manager Certificates). Each item is a kubectl resource name such as
-	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
-	// scans every namespaced kind the cluster serves, one read per kind per
-	// namespace, which is slow on a large fleet. Absent or empty keeps the
-	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes,
+	// cert-manager Certificates, and `*.cnrm.cloud.google.com`, every Config
+	// Connector kind the cluster serves). Each item is a kubectl resource name
+	// such as `deployments` or `gateways.gateway.networking.k8s.io`, or a group
+	// wildcard `*.<suffix>` for every namespaced kind whose API group ends in
+	// the suffix; the watch reads a wildcard's kinds only in the namespaces
+	// where it found their objects. The single item `all` scans every
+	// namespaced kind the cluster serves, one read per kind per namespace,
+	// which is slow on a large fleet. Absent or empty keeps the default list.
+	// Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
 	// ControllerRevisions and Leases are refused: the scan reports nothing from
 	// them, and a Secret listing would carry every body.
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=20
 	// +kubebuilder:validation:items:MaxLength=253
-	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:items:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|\*(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+)$`
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
 	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
 	// +optional
