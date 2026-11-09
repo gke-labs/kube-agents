@@ -487,8 +487,14 @@ func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSp
 	if deployment == nil {
 		return replicasAndStrategyFor(1, false)
 	}
-	scaleToZero := deployment.ScaleToZero != nil && *deployment.ScaleToZero
-	return replicasAndStrategyFor(min(requestedGatewayReplicas(deployment), supportedGatewayReplicas), scaleToZero)
+	return replicasAndStrategyFor(min(requestedGatewayReplicas(deployment), supportedGatewayReplicas), scaleToZeroRequested(deployment))
+}
+
+// scaleToZeroRequested reports whether the spec asks for the gateway at zero
+// replicas. The render and the status writer both read it, so the phase that
+// reports the pause keys on the same predicate as the replica count it reports.
+func scaleToZeroRequested(deployment *agentv1alpha1.DeploymentSpec) bool {
+	return deployment != nil && deployment.ScaleToZero != nil && *deployment.ScaleToZero
 }
 
 // replicasAndStrategyFor is the replica count and strategy for a gateway meant

@@ -121,7 +121,8 @@ totalling 142 GiB of `requests.storage`), and the operator renders a namespace-w
 runs for the agent (one more with `A2A_MCP_DOOR=true`, for the MCP server, and one more with `A2A_DISPATCHER_IMAGE` set, for the profile dispatcher, and two more for the A2A gateway's standby and its rollout's surge pod under the election), the chart's own pods in the namespace with the surge pods
 each one's rollout can add, from its `maxSurge` (the chart stamps them on the `PlatformAgent`, or for one
 written by hand in an operator-only release puts them in an `a2a-quota-chart-pods`
-ConfigMap in the operator's namespace; 5 without the chart), and 7 for the operator's rollout surges, the provisioning and
+ConfigMap in the operator's namespace, and for one written by hand in another namespace
+are counted from the chart's workloads there; 5 without the chart), and 7 for the operator's rollout surges, the provisioning and
 scope-publishing Jobs and the gateway's count-then-create overshoot (36 pods by
 default, from `spec.harness.tuning.maxSessions: 10`, 42 with Hindsight and the
 GitHub minter),

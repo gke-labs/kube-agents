@@ -203,9 +203,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
-    from . import nightly, tiers
+    from . import links, nightly, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import links
     import nightly
     import tiers
 try:
@@ -249,9 +250,8 @@ DEFAULT_NIGHTLY_MAIN_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_B_JO
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
-# Where Prow's Spyglass shows a build directory: the gs:// path after the
-# scheme, so a link follows the bucket the build was read from.
-SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
+# Where Prow's Spyglass shows a build directory (links.py).
+SPYGLASS_VIEW = links.SPYGLASS_VIEW
 # What `gcloud storage ls` says about a prefix that exists but holds nothing
 # yet ("One or more URLs matched no objects."), as distinct from a bucket or
 # a grant failing (a 403, a bucket "not found: 404", a timeout): the
@@ -291,7 +291,7 @@ INDEX_POINTER_SUFFIX = ".txt"
 
 # What a pointer must start with to be followed, and how much of one that
 # does not is quoted in the warning.
-GS_SCHEME = "gs://"
+GS_SCHEME = links.GS_SCHEME
 POINTER_EXCERPT_CHARS = 80
 
 # Every bucket read is `gcloud storage ls` or `gcloud storage cat` through
@@ -342,11 +342,12 @@ BUILD_LOG_FILE = "build-log.txt"
 # line closes the grading; a build from before the file existed parses as it
 # always did.
 EVAL_GRADING_FILE = "artifacts/eval-grading.log"
-# Buckets Deck has no read on, so Spyglass shows nothing for a build there:
-# a run read from one records its directory (runs[].gcs_base) and the pages
-# and the health bot link the Cloud Console instead. A run in any other
-# bucket keeps the Spyglass link, which still renders it.
-PRIVATE_LOG_BUCKETS = frozenset({"kube-agents-evals-presubmit-logs"})
+# Buckets Deck has no read on (links.py): the smoke lanes' and the
+# nightly's. A run read from one records its directory (runs[].gcs_base)
+# and the pages, the health bot and the nightly issues link the Cloud
+# Console instead. A run in any other bucket keeps the Spyglass link, which
+# still renders it.
+PRIVATE_LOG_BUCKETS = links.PRIVATE_LOG_BUCKETS
 # The suite's own verdict, written by `bench-gate suite --json-out` into
 # the job's artifacts and uploaded by Prow beside the log (module
 # docstring). Read only for a build whose final line carries the marker
@@ -1660,9 +1661,7 @@ def records_location(base: str) -> bool:
     """Whether a run read from `base` carries `gcs_base`: only for a bucket
     Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
     the build and the pages keep that link."""
-    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
-        return False
-    return base[len(GS_SCHEME):].split("/", 1)[0] in PRIVATE_LOG_BUCKETS
+    return links.is_private(base)
 
 
 def spyglass_url(base: str) -> str | None:
@@ -1670,9 +1669,9 @@ def spyglass_url(base: str) -> str | None:
     for anything that is not one. The nightly's runs and pending entries
     carry it (`log_url`) so the report links follow the bucket the build was
     listed in rather than a bucket the renderer assumes."""
-    if not isinstance(base, str) or not base.startswith("gs://"):
+    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
         return None
-    return SPYGLASS_VIEW + base[len("gs://"):].rstrip("/")
+    return SPYGLASS_VIEW + base[len(GS_SCHEME):].rstrip("/")
 
 
 def _read_build(

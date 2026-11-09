@@ -13,6 +13,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -24,6 +25,11 @@ import unittest.mock
 import yaml
 from eval_dashboard import coverage_gaps, nightly_bugs, post_health
 from test_eval_dashboard_nightly_bugs import FakeGh, night, task
+
+# What a public post must never carry: a pass ratio, a repetition count, a
+# percentage, a streak, a failing-check reason, or the wording the posts
+# carried before. "every repetition" in a rule's wording is not a count.
+RESULTS_RE = re.compile(r"\d+/\d+|\d+ of \d+|\d+ repetitions?|\d+ ?%|\bpassed\b|failed every|failed all|fails every|nights in a row|RESOURCE_EXHAUSTED|\b429\b")
 
 ISSUES = "repos/gke-labs/kube-agents/issues"
 NOW = "2026-10-26T13:00:00+00:00"
@@ -292,12 +298,24 @@ class FilingTest(Harness):
         self.assertIn("for 9 days (since 2026-10-17)", beta["body"])
         self.assertIn("Backup: @dave.", beta["body"])
         self.assertIn("for #3120 since 2026-10-17", beta["body"])
-        self.assertIn("| `beta-good` | 21/21 over 7 nights (100%) | meets 90% | not read this tick |", beta["body"])
+        self.assertIn("| Candidate (best first) |\n|---|\n| `beta-good` |", beta["body"])
+        self.assertNotIn("21/21", beta["body"], "the record stays on the Nightly report")
         self.assertIn("`gamma-held` still runs on the presubmit as a held-out seat.", gamma["body"])
         self.assertIn("**Assigned to** @carol (the domain owner in `docs/designs/domains.yaml`).", beta["body"])
         self.assertIn("**Assigned to** @grace (the owner on the domain's allowlist record).", gamma["body"])
-        self.assertIn("| `gamma-held` (held out on the presubmit) | 18/21 over 7 nights (85%) | below 90% |", gamma["body"])
+        self.assertIn("| `gamma-held` (held out on the presubmit) |", gamma["body"])
+        self.assertNotIn("18/21", gamma["body"])
         self.assertTrue(out.startswith("coverage gaps (live): file 2, update 0,"), out)
+
+    def test_the_issue_carries_no_result(self):
+        gh, _, _ = self.run_once()
+        for issue in self.posted(gh):
+            # The one percentage the body may print is the roster's bar, a
+            # constant, not a record; the guard reads the body without it.
+            body = re.sub(r"held to the roster's bar of \d+% over at least \d+ graded runs", "", issue["body"])
+            self.assertNotEqual(body, issue["body"], "the bar sentence is there to strip")
+            for text in (issue["title"], body):
+                self.assertIsNone(RESULTS_RE.search(text), text)
 
     def test_a_refused_owner_files_unassigned_and_says_so(self):
         gh, _, _ = self.run_once(FakeGh(refuse_assignees=("carol",)))
