@@ -3517,18 +3517,6 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertEqual(len(self._resend("C0123")), 1)
         self.assertEqual(self._resend("C0123"), [])
 
-    def test_a_refusal_for_want_of_a_home_channel_at_the_gateway_is_not_a_try(self):
-        self._lost_first_run()
-        for _ in range(bootstrap_delivery.RESEND_MAX_ATTEMPTS + 2):
-            lagging = urllib.error.HTTPError(
-                "http://relay.test", 502, "Bad Gateway", {},
-                io.BytesIO(b"chat relay failed: composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)"),
-            )
-            self.assertEqual(len(self._resend("C0123", [lagging])), 1)
-        self.assertEqual(bootstrap_delivery._resend_state(self.d), {"fleet-wide-cost-analysis": {"tries": 0, "posted": False}})
-        self.assertIn("while the gateway has no home channel yet", self._stage_log())
-        self.assertEqual(len(self._resend("C0123")), 1)
-
     def test_a_crashed_run_is_not_re_sent(self):
         now = time.time()
         self._filed(now - 3600)

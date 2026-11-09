@@ -76,9 +76,11 @@ an older stage's no-repository skip ran the workload checks in the scan), and a 
 otherwise read as a healthy fleet. It also names every shipped fleet audit that ran since the sweep
 was filed and whose summary was not posted, however its run started, with a request for those
 reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
-to post to, and nothing posts it later. The note is built before the claim. The text path appends it
-to the report; the
-card paths print it on their own, since the card leaves closing lines out.
+to post to. A first-run audit's summary is posted after all by the ``oobe`` tick's last stage,
+``resend_lost_summaries``, once the operator projects a home channel, while its run is inside
+``RESEND_WINDOW_SECONDS``; every other one keeps the request. The note is built before the claim. The
+text path appends it to the report; the card paths print it on their own, since the card leaves
+closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
 findings queue from this pod, from the items and scores the prioritization
@@ -404,11 +406,9 @@ REQUEST_TITLE_KEY = "title"
 REQUEST_REPORT_KEY = "report"
 # How many times one audit's re-send is tried, one per tick. An answered request settles the audit
 # (``RESENT_POSTED_KEY``); for one whose answer was lost the relay's own record decides; the cap is for a
-# relay that keeps refusing.
+# relay that keeps refusing. A refusal while the gateway's projected copy of the home file still lags the
+# agent's (one kubelet refresh) costs one of these, and the gateway keeps that post for its digest.
 RESEND_MAX_ATTEMPTS = 5
-# The relay's refusal while the gateway has no home channel yet: the gateway reads its own projected
-# copy of the file, which can lag the agent's by a kubelet refresh. Not a try: the next tick asks again.
-RELAY_NO_HOME_MARK = "no home channel"
 # One request to the relay, which posts synchronously and answers when the post has landed or failed.
 RESEND_TIMEOUT_SECONDS = 180
 RELAY_ANSWER_MAX_CHARS = 300
@@ -1464,9 +1464,8 @@ def _post_cron_report(audit: str, title: str) -> RelayAnswer:
     """Ask the relay to post ``audit``'s latest report as a scheduled run's delivery leg would.
 
     A 2xx settles the audit: the relay posted the report, or a notice in its place, and asking again
-    would post a notice. A refusal for want of a home channel is the gateway's projected copy lagging
-    the agent's, and is not a try. An answer that does not come is a try and not a failure: the relay
-    may have posted, and its record says so next tick.
+    would post a notice. A refusal is a try; so is an answer that does not come, which is not a
+    failure: the relay may have posted, and its record says so next tick.
     """
     body = {
         REQUEST_JOB_KEY: audit,
@@ -1486,8 +1485,6 @@ def _post_cron_report(audit: str, title: str) -> RelayAnswer:
             answer = json.loads(response.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:RELAY_ANSWER_MAX_CHARS]
-        if RELAY_NO_HOME_MARK in detail:
-            return RelayAnswer(f"the relay answered {e.code} while the gateway has no home channel yet; asking again next tick: {detail}", False, False)
         return RelayAnswer(f"the relay answered {e.code}: {detail}", False, True)
     except (urllib.error.URLError, OSError, ValueError) as e:
         return RelayAnswer(f"no answer from the relay, which may have posted; its record decides the next tick: {e!r}", False, True)
