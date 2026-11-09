@@ -3244,8 +3244,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          fixed, but the operator gives the tier the broker's other resource keys, so
          an ephemeral-storage override on the broker moves each replica too: merged
          as kube-agents.credentialProxyFootprint does, keeping the entry's cpu and
-         memory. No surge term: the tier rolls with maxUnavailable 1, so when a quota
-         refuses the surge pod the rollout goes on by replacing a pod in place. This
+         memory. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         a rollout replaces a pod in place and adds none. This
          counts the quota only; whether the nodes have room for a 2 CPU pod is the
          scheduler's, which this cannot see. */ -}}
   {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int64 -}}
@@ -3255,7 +3255,10 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- if $proxyOverride -}}
-      {{- $merged := include "kube-agents.credentialProxyFootprint" (dict "workload" $exec "override" $proxyOverride) | fromJson -}}
+      {{- /* Refused or merged against the sizing tier's row, as the broker's check is above;
+             only the ephemeral-storage figures are taken from it. */ -}}
+      {{- $execSized := include "kube-agents.sizingTierFootprintEntry" (dict "workload" $exec "tier" $sizingTier "container" "credentialProxy") | fromJson -}}
+      {{- $merged := include "kube-agents.credentialProxyFootprint" (dict "workload" $execSized "override" $proxyOverride "tier" $sizingTier) | fromJson -}}
       {{- $exec = dict
             "cpuMillisRequest" $exec.cpuMillisRequest "cpuMillisLimit" $exec.cpuMillisLimit
             "memoryBytesRequest" $exec.memoryBytesRequest "memoryBytesLimit" $exec.memoryBytesLimit

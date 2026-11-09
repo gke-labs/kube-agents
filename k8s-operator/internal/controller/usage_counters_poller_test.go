@@ -4425,6 +4425,31 @@ func TestUsagePoller_CountsTheExecTiersCommands(t *testing.T) {
 	}
 }
 
+// The exec tier's tool pairs join the broker's in topTools, as its commands
+// join the totals: with the tier on, the callers' commands run there.
+func TestUsagePoller_TopToolsCountTheExecTiersCommands(t *testing.T) {
+	const execIP = "10.0.0.30"
+	execAddr := execIP + ":8766"
+	created := usageClock(0).Add(-time.Hour)
+	objs := append(usageDefaultObjects(created), usageExecTierPod("agent-credential-proxy-exec-tier-ccc", "exec-c", execIP, created))
+	h := newUsageHarness(t, usageTestAgent(created), objs...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.set(execAddr, 0, ptr.To(300.0))
+	get := usageToolPair{Tool: "kubectl", Subcommand: "get"}
+	clusters := usageToolPair{Tool: "gcloud", Subcommand: "container"}
+	h.stub.setTopTools(brokerAddr(), map[usageToolPair]usageToolCounts{get: {"success": 2}})
+	h.stub.setTopTools(execAddr, map[usageToolPair]usageToolCounts{get: {"success": 5}, clusters: {"success": 3, "error": 1}})
+	h.poll(5)
+	want := []agentv1alpha1.ToolUsageSummary{
+		{Tool: "kubectl", Subcommand: "get", Total: 7, Success: 7},
+		{Tool: "gcloud", Subcommand: "container", Total: 4, Success: 3, Error: 1},
+	}
+	if got := h.status().TopTools; !usageTopToolsEqual(got, want) {
+		t.Fatalf("topTools = %+v, want %+v (the broker's and the exec pod's pairs)", got, want)
+	}
+}
+
 // usageTestSecondBrokerIP is a second broker pod, for the sum across pods.
 const usageTestSecondBrokerIP = "10.0.0.21"
 

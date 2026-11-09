@@ -387,6 +387,20 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(cpu_three["limitsCpu"] - cpu_base["limitsCpu"], 3 * 2000)
         self.assertEqual(cpu_three["limitsMemory"] - cpu_base["limitsMemory"], 3 * 2 * 1024**3)
 
+    def test_exec_tier_follows_an_ephemeral_storage_override_the_sizing_row_admits(self) -> None:
+        """Under fleet, a broker override with a memory request alone above the small
+        row's 2Gi limit (admitted on the fleet row) and an ephemeral-storage limit: the
+        operator gives each exec replica that ephemeral-storage, so the preflight counts
+        it, rather than treating the override as refused against the small row."""
+        ten_gib = 10 * 1024**3
+        override = [f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.memory=4Gi",
+                    f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
+        base = self._requirements(override)
+        three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["limitsMemory"] - base["limitsMemory"], 3 * 2 * 1024**3)
+
     def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
         footprint = self.chart / "files" / "footprint.yaml"
         original = footprint.read_text()

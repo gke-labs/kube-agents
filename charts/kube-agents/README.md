@@ -1274,8 +1274,8 @@ The credential broker's exec tier is counted as `platformAgent.deployment.creden
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
 all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
 moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxUnavailable: 1`, so when a
-quota refuses the surge pod the rollout goes on by replacing a pod in place. The check counts the
+cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
