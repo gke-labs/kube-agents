@@ -578,6 +578,9 @@ class Storm(unittest.TestCase):
             ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
             # The cut right after a ")" of the detail's own is still a cut.
             ('the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-93cb2a3275225fb7 on devops-bench-0123456789ab/case-12345678/1 sat queued (submitted, never working)', "task [id] on [run]/case-12345678/[rep] sat queued (submitted, never…"),
+            (wrap + "harness_stop_sent: the session store for a2a-ctx-0123456789abcdef could not be read 3 times running; stop sent: True (x))", "harness_stop_sent: the session store for [session] could not be read 3 times…"),
+            # "-a2a-" inside a resource name is not a session id.
+            (wrap + "the inject tunnel to svc/platform-agent-a2a-inject failed to establish 3 times running)", "the inject tunnel to svc/platform-agent-a2a-inject failed to establish 3 times…"),
             (RETRIES, ""),
             ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-4 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
             (EMPTY_RECORD, "the record is not evidence of a real agent run: the trajectory is empty: the…"),
@@ -610,6 +613,7 @@ class Storm(unittest.TestCase):
             self.assertIn(fragment, harness, fragment)
         self.assertIn('f"(reason: {exchange.fold.terminal_reason or \'none given\'})"', harness)
         self.assertIn('_RUN_ID_PREFIX = "devops-bench-"', harness)
+        self.assertIn('f"the session store for {session_id} could not be read', harness)
         # The collector keeps 300 characters: the scorer's usual wrapper and
         # the harness's prefix plus the longest executor token must fit, or
         # the shell arrives cut and unpeelable. (The 260-character safeguard
@@ -620,8 +624,11 @@ class Storm(unittest.TestCase):
         self.assertTrue(tokens)
         longest = max(tokens, key=len)
         wrapper = "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade ("
-        reason = wrapper + "task task-" + "0" * 16 + f" ended canceled: the executor's own failure ({longest})"
-        self.assertLess(len(reason), 300, f"the wrappers plus {longest} must fit the collector's cut")
+        words = wrapper + "task task-" + "0" * 16 + f" ended canceled: the executor's own failure ({longest})"
+        self.assertLess(len(words), 300, f"the wrappers plus {longest} must fit the collector's cut")
+        # As the harness writes it: the "(reason: …)" echo follows, and the cut
+        # lands in the echo, not the words.
+        reason = words + f" (reason: {longest}))"
         self.assertEqual(health.storm_cause({"result": "infra", "reason": reason[:300]}), f"the executor's own failure ({longest})")
 
     def test_the_storm_line_quotes_the_reps_own_words(self):

@@ -249,6 +249,12 @@ HARNESS_TASK_ID_FORM = "task [id]"
 # hex, are the repetition's as well.
 KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
 KANBAN_CARD_ID_FORM = "[card]"
+# The agent API's session id, "a2a-" + the conversation's contextId
+# (bench/kube_agents_bench/board.py API_SESSION_PREFIX), per repetition too;
+# only where the harness writes it ("the session store for <id>"), since
+# "-a2a-" is also inside the inject Service's and Secret's names.
+HERMES_SESSION_ID_RE = re.compile(r"(?<=the session store for )a2a-[A-Za-z0-9_.:-]+")
+HERMES_SESSION_ID_FORM = "[session]"
 # The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
 # (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
 # its own phrasing on every repetition, so the run id and the repetition
@@ -846,7 +852,8 @@ def rep_kind(rep: dict) -> str:
 def storm_cause(rep: dict) -> str:
     """A storm repetition's own words for how it died: the reason with the
     scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
-    peeled, the task id, card ids and the conversation key reduced to placeholders, cut
+    peeled, the task, card and session ids and the conversation key reduced to
+    placeholders, cut
     before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
     STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
     (no reason, or the scorer's "no reason given")."""
@@ -856,6 +863,7 @@ def storm_cause(rep: dict) -> str:
     text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
     text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
     text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
+    text = HERMES_SESSION_ID_RE.sub(HERMES_SESSION_ID_FORM, text)
     text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
     whole = STORM_CAUSE_STOP not in text
     text = text.split(STORM_CAUSE_STOP, 1)[0]
