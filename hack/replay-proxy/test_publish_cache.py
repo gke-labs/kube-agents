@@ -168,6 +168,17 @@ class PublishTest(unittest.TestCase):
         self.write_logs()
         self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 2})
 
+    def test_records_name_the_recording_job(self):
+        self.publisher.job = P.job_identity("ci-kube-agents-eval-nightly", "1", "")
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        self.assertEqual(self._records()[-1]["job"],
+                         {"name": "ci-kube-agents-eval-nightly", "mode": "next", "forge": "github"})
+        self.assertEqual(P.job_identity("gl", "", "gitlab"), {"name": "gl", "mode": "today", "forge": "gitlab"})
+
     def test_records_give_each_objects_size_and_each_slots_target(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
         self.world.request(worker("t_11111111"), fp(1), recorded=True)

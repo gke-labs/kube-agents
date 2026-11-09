@@ -950,6 +950,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--verdicts-dir", default="", help="where bench-gate writes case-<name>.json")
     parser.add_argument("--publish-bucket", default="", help="record: the shared replay cache bucket")
     parser.add_argument("--publish-interval", type=float, default=DEFAULT_PUBLISH_INTERVAL_SECONDS)
+    parser.add_argument("--job-name", default="", help="record: the Prow job name, written into each record")
+    parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
+    parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
     parser.add_argument("--seed-once", action="store_true", help="replay: seed every pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
@@ -978,7 +981,8 @@ def make_publisher(args: argparse.Namespace, collector: "Collector"):
         return None
     return publish_cache.Publisher(keep_dir=args.keep_dir, verdicts_dir=args.verdicts_dir,
                                    bucket=args.publish_bucket, build=args.build, run=collector.run,
-                                   env=GCLOUD_ENV, emit=collector.emit)
+                                   env=GCLOUD_ENV, emit=collector.emit,
+                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge))
 
 
 def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optional[str]]]:

@@ -769,13 +769,16 @@ class ModeCollectorTest(_LifecycleBase):
         return proc
 
     def test_a_trusted_nightly_installed_in_record_mode_collects_and_publishes(self):
-        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record")
+        proc = self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", JOB_NAME="ci-kube-agents-eval-nightly",
+                           EVAL_MODE_NEXT="1")
         argv, pairs = self._argv_pairs()
         self.assertEqual(pairs["--mode"], "record")
         self.assertEqual(pairs["--publish-bucket"], "kube-agents-replay-cache")
         self.assertEqual(pairs["--verdicts-dir"], str(self.artifacts))
         self.assertEqual(pairs["--cache-subdir"], "replay-cache")
         self.assertEqual(pairs["--final-deadline"], "240")
+        self.assertEqual((pairs["--job-name"], pairs["--eval-mode-next"], pairs["--forge"]),
+                         ("ci-kube-agents-eval-nightly", "1", ""))
         self.assertTrue(os.path.isdir(pairs["--keep-dir"]))
         self.assertNotIn(str(self.artifacts), pairs["--keep-dir"], "kept answers stay out of the public artifacts")
         self.assertIn("wait=255", proc.stdout)
@@ -885,12 +888,13 @@ class PrepareLaneCacheTest(_LifecycleBase):
         self.assertEqual(calls, [])
 
     def test_it_fetches_then_seeds_every_pod(self):
-        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay")
+        proc, calls = self._prepare(EVAL_REPLAY_LANE="true", FAKE_DEPLOYED="replay", EVAL_MODE_NEXT="1", EVAL_FORGE="gitlab")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["fetch", "seed"])
         self.assertIn("--bucket kube-agents-replay-cache", calls[0])
         self.assertIn("--max-age-hours 30", calls[0])
         self.assertIn(f"--max-bytes {512 * 1024 * 1024}", calls[0])
+        self.assertIn("--eval-mode-next 1 --forge gitlab", calls[0], "the lane's own mode and forge pick the records")
         self.assertIn("--seed-once", calls[1])
         self.assertIn("--mode replay", calls[1])
 

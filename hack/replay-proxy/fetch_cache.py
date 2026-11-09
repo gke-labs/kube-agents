@@ -114,6 +114,8 @@ class Fetched:
     verdict_records: int = 0
     builds: List[str] = field(default_factory=list)
     objects: int = 0
+    # Recent records whose job's mode or forge isn't the lane's, or that name none.
+    other_job_records: int = 0
     downloaded: int = 0
     bytes: int = 0
     by_kind: Dict[str, int] = field(default_factory=dict)
@@ -157,8 +159,12 @@ def object_path(dest: str, name: str) -> str:
 
 class Fetcher:
     def __init__(self, *, bucket: str, version: str, run: Run, max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
-                 max_bytes: int = DEFAULT_MAX_BYTES, clock: Callable[[], float] = time.time):
+                 max_bytes: int = DEFAULT_MAX_BYTES, clock: Callable[[], float] = time.time,
+                 mode: str = P.MODE_NEXT, forge: str = P.DEFAULT_FORGE):
         self.bucket = bucket
+        # The lane's own install mode and forge: objects come only from records of the same.
+        self.mode = mode
+        self.forge = forge
         self.version = version
         self.run = run
         self.max_age_seconds = max_age_hours * SECONDS_PER_HOUR
@@ -217,6 +223,11 @@ class Fetcher:
                 raise Refused("a record gives a slot no answer")
             out.append((name, size, target))
         return out
+
+    def _same_job(self, record: Dict[str, object]) -> bool:
+        """Whether a record's job graded the lane's own mode on its forge; a record naming no job doesn't."""
+        job = record.get(P.RECORD_JOB)
+        return isinstance(job, dict) and job.get(P.JOB_MODE) == self.mode and job.get(P.JOB_FORGE) == self.forge
 
     def _plan(self, confirmed: List[Tuple[str, int, str]], result: Fetched) -> Dict[str, List[Tuple[str, int, str]]]:
         """What fits under max_bytes, by kind in PRIORITY order; the rest counted as left out."""
@@ -289,7 +300,13 @@ class Fetcher:
                 runs = record.get(P.RECORD_RUNS)
                 if isinstance(runs, list) and len(runs) > len(result.runs.get(build, [])):
                     result.runs[build] = [r for r in runs if isinstance(r, dict)]
-                for item in self._confirmed(record):
+                # Every record's names are checked, matching or not: a name
+                # outside the layout means the writer is not this code.
+                items = self._confirmed(record)
+                if not self._same_job(record):
+                    result.other_job_records += 1
+                    continue
+                for item in items:
                     confirmed.setdefault(item[0], item)
             result.objects = len(confirmed)
             chosen = self._plan(list(confirmed.values()), result)
@@ -362,14 +379,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="the normalizer version to fetch (default: this checkout's)")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    parser.add_argument("--eval-mode-next", default="", help="the lane's EVAL_MODE_NEXT (1 is next mode)")
+    parser.add_argument("--forge", default="", help="the lane's EVAL_FORGE (empty is github)")
     args = parser.parse_args(argv)
     summary: Dict[str, object] = {"event": "fetch", "version": args.version}
     if not P.valid_bucket(args.bucket) or not P.NORMALIZER_VERSION_RE.match(args.version):
         summary["error"] = "bad_arguments"
         print(json.dumps(summary, sort_keys=True))
         return 1
+    job = P.job_identity("", args.eval_mode_next, args.forge)
     fetcher = Fetcher(bucket=args.bucket, version=args.version, run=default_run,
-                      max_age_hours=args.max_age_hours, max_bytes=args.max_bytes)
+                      max_age_hours=args.max_age_hours, max_bytes=args.max_bytes,
+                      mode=job[P.JOB_MODE], forge=job[P.JOB_FORGE])
     try:
         result = fetcher.fetch(args.dest, args.runs_out or None)
     except Refused as exc:
@@ -382,7 +403,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary["error"] = str(exc)
         print(json.dumps(summary, sort_keys=True))
         return 1
-    summary.update(records=result.records, verdict_records=result.verdict_records, builds=len(result.builds),
+    summary.update(records=result.records, verdict_records=result.verdict_records,
+                   other_job_records=result.other_job_records, builds=len(result.builds),
                    objects=result.objects,
                    downloaded=result.downloaded, bytes=result.bytes, fetched=result.by_kind,
                    left_out=result.left_out, removed=result.removed)

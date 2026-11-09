@@ -996,7 +996,8 @@ start_replay_shadow_collector() {
   "${REPLAY_MODE_RECORD}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --publish-bucket "${REPLAY_CACHE_BUCKET}" --verdicts-dir "${artifact_dir}"
-      --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}")
+      --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}"
+      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}")
     ;;
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
@@ -1047,7 +1048,8 @@ prepare_replay_lane_cache() {
   mkdir -p "${REPLAY_KEEP_DIR}" "${REPLAY_LANE_SEED_DIR}" || return 1
   if ! python3 "${REPLAY_CACHE_FETCH_SCRIPT}" --bucket "${REPLAY_CACHE_BUCKET}" --dest "${REPLAY_LANE_SEED_DIR}" \
     --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
-    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" < /dev/null; then
+    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}" \
+    < /dev/null; then
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
   fi

@@ -82,7 +82,9 @@ class FetchTest(unittest.TestCase):
         settings.update(overrides)
         return FC.Fetcher(**settings)
 
-    def record(self, build, ms, objects, runs=(), created=NOW):
+    NEXT_GITHUB = {"name": "ci-kube-agents-eval-nightly", "mode": "next", "forge": "github"}
+
+    def record(self, build, ms, objects, runs=(), created=NOW, job=NEXT_GITHUB):
         """A publish record; `objects` maps a version to names, or to (name, bytes, target) entries."""
         described = {}
         for version, names in objects.items():
@@ -95,7 +97,8 @@ class FetchTest(unittest.TestCase):
                     entry["target"] = target
                 described[version].append(entry)
         self.bucket.put(f"replay-cache/builds/{build}/publish-{ms}.json",
-                        json.dumps({"build": build, "objects": described, "runs": list(runs)}), created)
+                        json.dumps({"build": build, "objects": described, "runs": list(runs),
+                                    **({"job": job} if job is not None else {})}), created)
 
     def objects(self, version, *names, content=None):
         for name in names:
@@ -287,6 +290,30 @@ class FetchTest(unittest.TestCase):
         proc = FC.default_run("list_records", failing, 30)
         self.assertEqual((proc.returncode, proc.stderr), (1, b"matched no objects"))
         self.assertIsNone(FC.default_run("upload", failing, 30), "other kinds still fail as None")
+
+    def test_only_records_of_the_lanes_mode_and_forge_give_objects(self):
+        names = {key: f"answers/{fp(n)}.json" for n, key in enumerate(("github-next", "gitlab", "today", "old"), 1)}
+        self.objects(VERSION, *names.values())
+        runs = [{"case": "a", "rep": 1, "outcome": "pass"}]
+        self.record("101", 1, {VERSION: [names["github-next"]]}, runs=runs)
+        self.record("102", 1, {VERSION: [names["gitlab"]]}, runs=runs,
+                    job={"name": "ci-kube-agents-eval-nightly-gitlab", "mode": "today", "forge": "gitlab"})
+        self.record("103", 1, {VERSION: [names["today"]]}, runs=runs,
+                    job={"name": "ci-kube-agents-eval-nightly-today", "mode": "today", "forge": "github"})
+        self.record("104", 1, {VERSION: [names["old"]]}, runs=runs, job=None)
+        result = self.fetcher().fetch(self.dest, self.runs_out)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "answers")), [f"{fp(1)}.json"])
+        self.assertEqual(result.other_job_records, 3, "a record naming no job counts as another job's")
+        with open(self.runs_out) as handle:
+            self.assertEqual(sorted(json.load(handle)), ["101", "102", "103", "104"], "verdicts from every record")
+        gitlab = self.fetcher(mode="today", forge="gitlab").fetch(os.path.join(self.dest, "gl"))
+        self.assertEqual(gitlab.downloaded, 1)
+
+    def test_another_jobs_record_with_a_name_outside_the_layout_still_refuses(self):
+        self.record("102", 1, {VERSION: [("answers/../x.json", 1, "")]},
+                    job={"name": "gl", "mode": "today", "forge": "gitlab"})
+        with self.assertRaises(FC.Refused):
+            self.fetcher().fetch(self.dest)
 
     def test_a_build_with_a_dot_is_a_record_like_any_other(self):
         self.objects(VERSION, f"answers/{fp(1)}.json")

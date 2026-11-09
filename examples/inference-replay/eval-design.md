@@ -775,7 +775,8 @@ before stage 3 of the rollout (turning replay on):
    as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
    that account can write. It works out which run each answer came from after the fact, from the
    cards each request and each run's results name ("Telling the runs in a build apart"). A
-   periodic on `main` replays the last night's selection, gating nothing. It reports what was
+   periodic on `main`, at 06:00 UTC, replays the previous nights' complete recordings plus
+   tonight's partial ones, gating nothing. It reports what was
    served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM

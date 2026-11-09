@@ -85,6 +85,17 @@ RECORD_RUNS = "runs"
 RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
 RECORD_OBJECTS = "objects"
+# The recording job: its Prow job name, the install mode it graded (next or
+# today) and its forge (github when EVAL_FORGE is unset). The lane fetches
+# objects only from records whose mode and forge match its own run's, so a
+# GitLab or today-mode night's answers, which it can't hit, never take its room.
+RECORD_JOB = "job"
+JOB_NAME = "name"
+JOB_MODE = "mode"
+JOB_FORGE = "forge"
+MODE_NEXT = "next"
+MODE_TODAY = "today"
+DEFAULT_FORGE = "github"
 RUN_CASE = "case"
 RUN_REP = "rep"
 RUN_OUTCOME = "outcome"
@@ -271,8 +282,10 @@ class Publisher:
 
     def __init__(self, *, keep_dir: str, verdicts_dir: str, bucket: str, build: str, run: Run,
                  env: Optional[Dict[str, str]] = None, emit: Callable[[Dict[str, object]], None] = lambda r: None,
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, job: Optional[Dict[str, str]] = None):
         self.keep_dir = keep_dir
+        # The recording job's identity (RECORD_JOB), written into every record.
+        self.job = dict(job or {})
         self.verdicts_dir = verdicts_dir
         self.bucket = bucket
         self.build = build
@@ -317,7 +330,7 @@ class Publisher:
             path = os.path.join(stage, name)
             with open(path, "w", encoding=TEXT_ENCODING) as handle:
                 json.dump({
-                    RECORD_BUILD: self.build, RECORD_FINAL: final,
+                    RECORD_BUILD: self.build, RECORD_FINAL: final, RECORD_JOB: self.job,
                     RECORD_RUNS: [{RUN_CASE: r.case, RUN_REP: r.rep, RUN_OUTCOME: r.outcome} for r in selection.runs],
                     RECORD_DECISIONS: selection.decisions, RECORD_LOST_LINES: selection.lost_lines,
                     RECORD_OBJECTS: {version: [objects[n] for n in sorted(objects)]
@@ -367,6 +380,12 @@ class Publisher:
         }
         self.emit(report)
         return report
+
+
+def job_identity(name: str, mode_next: str, forge: str) -> Dict[str, str]:
+    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE)."""
+    return {JOB_NAME: name, JOB_MODE: MODE_NEXT if mode_next == "1" else MODE_TODAY,
+            JOB_FORGE: forge or DEFAULT_FORGE}
 
 
 def _size(path: str) -> int:
