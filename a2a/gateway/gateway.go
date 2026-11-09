@@ -2225,8 +2225,9 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 }
 
 // chainChildAddressees is whom the delegation chain rooted at taskID's root
-// delegated to: the addressee each child task was minted for (a profile's
-// name, or platform), once each, in the record's order, which is the order
+// delegated to: the addressee each child task was minted for (the profile the
+// delegation resolved to, which for a cluster target may be a pinned
+// profile's own name, or platform), once each, in the record's order, which is the order
 // they were delegated. Empty, not nil, when the chain delegated nothing, so
 // the wire tells "none" from "unknown"; nil only when taskID is unknown.
 func chainChildAddressees(rec *SessionRecord, taskID string) []string {

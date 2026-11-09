@@ -499,10 +499,12 @@ type probeReport struct {
 	ChildUsage   *lib.Usage `json:"childUsage,omitempty"`
 	UsagePartial bool       `json:"usagePartial,omitempty"`
 	// ChildAddressees names whom the chain delegated to, each child's
-	// addressee once in the order delegated: a profile's name or platform,
-	// never a task id (ConversationState). On every read, since it comes
-	// from the record: [] when the chain delegated nothing, null when the
-	// read found no task to look at, and absent only on a door older than
+	// addressee once in the order delegated: the profile its address
+	// resolved to (a pinned profile's own name, when a cluster target picked
+	// it) or platform, never a task id (ConversationState). On every read,
+	// since it comes from the record: [] when the chain delegated nothing,
+	// null when the read had no task to look at (no record, no task, or a
+	// read that failed), and absent only on a door older than
 	// the field, so a harness can tell "none" from "can't say". The inject
 	// door's alone: no chat surface or the console reports it.
 	ChildAddressees []string `json:"childAddressees"`

@@ -319,7 +319,11 @@ line is still graded; or with `required_runs` a script by its basename and the f
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries), `worker_budget` (the turn budget a delegated worker ran under,
+workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
+and none of which may match, an addressee the delegating turn's chain delegated to, read from the
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
+error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+`worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
