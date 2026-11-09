@@ -903,7 +903,7 @@ type TuningSpec struct {
 	// over the gateway's 1.8 GiB idle set, about 4.4 GiB under its 8Gi memory limit; a
 	// coordinator waiting on its own children gives its slot back but stays resident, so
 	// processes can sit above six. The credential proxy at its default 2Gi memory limit
-	// admits 9 brokered commands at once, held to 8 by its slot cap, which the stall
+	// admits 10 brokered commands at once, held to 8 by its slot cap, which the stall
 	// watch's and cluster-agent reconcile's four-wide listings share. Per-install model
 	// rate limits are not measured: a small quota may see 429s at 6, so lower this if
 	// worker logs show them.
@@ -915,9 +915,9 @@ type TuningSpec struct {
 	// slot cap binds, and no CR field moves it, so raising the memory limit in
 	// spec.deployment.credentialProxy.resources does not help: a command beyond eight
 	// waits up to 60 s for a slot and is then refused busy. Keep that limit at 2Gi or
-	// more, since below it the memory budget (176 MiB per command after 320 MiB of fixed
-	// reserves) binds first. Set it to 1 to serialise all delegated work. When quota rather than
-	// memory binds, note the related failure mode: workers that exhaust their retry
+	// more, since below it the memory budget (176 MiB per command after the 192 MiB
+	// resident reserve) binds first. Set it to 1 to serialise all delegated work. When
+	// quota rather than memory binds, note the related failure mode: workers that exhaust their retry
 	// budget exit without calling a terminal kanban tool, and the dispatcher reports that
 	// as a "protocol violation" rather than as the quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
@@ -1399,9 +1399,9 @@ type CredentialProxySpec struct {
 	// a listing of a small cluster, and a kubectl listing thousands of objects
 	// holds several hundred Mi on its own, so size the limit to the largest
 	// listing the fleet produces for every command that runs at once (eight
-	// at the slot cap) plus the 320Mi of fixed reserves (192Mi for the broker
-	// and Envoy, 128Mi for the content workspace); the broker's child peak and
-	// memory high-water series give the figure.
+	// at the slot cap) plus the 192Mi resident reserve for the broker and
+	// Envoy; the broker's child peak and memory high-water series give the
+	// figure.
 	// Only cpu, memory and ephemeral-storage
 	// are accepted, the quantities the container declares. The operator
 	// refuses a memory limit below what admits two commands at once, a request
