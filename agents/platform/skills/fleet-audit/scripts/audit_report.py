@@ -16305,27 +16305,22 @@ def clean_close_banner(
         if len(retired) > MAX_DELTA_ROWS:
             named += f", and {len(retired) - MAX_DELTA_ROWS} more"
         verb = "is" if len(retired) == 1 else "are"
-        return (
-            f"{CLEAN_CLOSE_MARKER}\n"
-            f"> **Closed as clean on {stamp}.** The `{audit_id}` audit ran again and "
+        lead = (
             "found none of the findings below on the clusters it listed, so those "
             f"are resolved. {len(retired)} of them {verb} not confirmed fixed: {named}. "
             "This run listed their cluster in neither `scope.clusters` nor "
             "`scope.skipped`, so nobody looked for them; they are retired with the "
-            "ledger, and the closing comment names their clusters. The rows below "
-            "still show the state from the last run that had findings. They stay as "
-            "the record of what the audit found. The closing comment lists the "
-            "clusters that this run checked. If a finding comes back, the next run "
-            "opens a new ledger issue."
+            "ledger, and the closing comment names their clusters."
         )
+    else:
+        lead = "found none of the findings below, so all of them are resolved."
     return (
         f"{CLEAN_CLOSE_MARKER}\n"
         f"> **Closed as clean on {stamp}.** The `{audit_id}` audit ran again and "
-        "found none of the findings below, so all of them are resolved. The rows "
-        "below still show the state from the last run that had findings. They "
-        "stay as the record of what the audit found. The closing comment lists "
-        "the clusters that this run checked. If a finding comes back, the next "
-        "run opens a new ledger issue."
+        f"{lead} The rows below still show the state from the last run that had "
+        "findings. They stay as the record of what the audit found. The closing "
+        "comment lists the clusters that this run checked. If a finding comes "
+        "back, the next run opens a new ledger issue."
     )
 
 
@@ -17465,17 +17460,24 @@ def close_stale_remediation_prs(
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
-    `previous_ids` are the ids the ledger carried before this run. On a
-    scoped install they decide whether an open pull request with no scope
-    label is this install's at all. Such a pull request is from before
+    `previous_ids` are the ids the ledger carried before this run: the last
+    body's hidden block and the stored record behind it. On a scoped install,
+    on a forge with labels, they decide whether an open pull request with no
+    scope label is this install's at all. Such a pull request is from before
     scopes, and in a mixed-version window every install that shares the
     repository reads it as its own; one whose covered ids were never on this
     install's ledger and are not among `current_ids` is another install's fix
-    for findings this run never looked for, so neither rule below touches it
-    (#5229). Left as None, the caller has no ledger to judge by and every
-    listed pull request is read as before. A fix of this install's whose ids
-    the shared pre-scope ledger happened not to carry is skipped too, and
-    logged: left open for a person, not closed over another install's fleet.
+    for findings this run never looked for, so neither the finding rule nor
+    the branch rule touches it (#5229). The shield's close still does: a
+    namespace this install declared is this install's. Left as None, the
+    caller has no ledger to judge by and every listed pull request is read as
+    before; an empty list is a ledger that listed nothing, a lost memory
+    included, and reads the same as any other list. A fix of this install's
+    whose ids the shared pre-scope ledger happened not to carry is skipped
+    too, and logged: left open for a person, not closed over another
+    install's fleet. On a forge with no labels no pull request carries a
+    scope label and the listing proved each one this install's, so nothing
+    is skipped there.
 
     A third reason, `shielded_ids`: a pull request whose only persisting
     findings `shield_declared_account_siblings` demoted this run proposes the
@@ -17555,7 +17557,11 @@ def close_stale_remediation_prs(
             for key_cluster, key_namespace in shielded_namespaces
         )
     live_branches = set(branch_by_finding.values())
-    scope = ledger_scope()
+    # Whose an unlabelled pull request is can only be asked on a forge with
+    # labels: without them no pull request carries a scope label, and the
+    # listing already proved each one this install's (`_proposal_is_own`).
+    labelled_forge = forge_has_labels(repo)
+    scope = ledger_scope() if labelled_forge else None
     known = None if previous_ids is None else set(previous_ids) | set(current_ids)
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
@@ -17563,19 +17569,6 @@ def close_stale_remediation_prs(
         number = int(pr.get("number", 0))
         head = str(pr.get("headRefName", ""))
         covered = parse_delta_block(str(pr.get("body", "")))
-        if (
-            known is not None
-            and scope is not None
-            and scope_label_of(pr.get("labels")) is None
-            and not set(covered) & known
-        ):
-            log(
-                f"PR #{number} carries no scope label and covers "
-                f"{', '.join(covered) or 'no readable finding id'}; this install's "
-                "ledger never listed any of them, so it is left to the install that "
-                "opened it."
-            )
-            continue
         located = parse_finding_locations(str(pr.get("body", "")))
         # A body written under a different identity scheme names its findings
         # by ids this run cannot join against, so "none of them still
@@ -17610,6 +17603,28 @@ def close_stale_remediation_prs(
             shielded_only or bool(persisting) or any(fid in shielded_ids for fid in shield_persisting)
         )
         if shielded_only and not only_shielded:
+            continue
+        # A pull request with no scope label on a scoped install is from
+        # before scopes, and in a mixed-version window every install that
+        # shares the repository reads it as its own (#5229). It is this
+        # install's when one of the ids it covers was on this install's
+        # ledger or is one this run sees, or when the shield matched it to a
+        # namespace this install declared; otherwise it is another install's
+        # fix for findings nobody here looked for, and neither rule below
+        # may close it.
+        if (
+            known is not None
+            and scope is not None
+            and not only_shielded
+            and scope_label_of(pr.get("labels")) is None
+            and not set(covered) & known
+        ):
+            log(
+                f"PR #{number} carries no scope label and covers "
+                f"{', '.join(covered) or 'no readable finding id'}; this install's "
+                "ledger never listed any of them, so it is left to the install that "
+                "opened it."
+            )
             continue
         if not orphaned:
             if not covered or not joinable or (persisting and not only_shielded):
@@ -25176,6 +25191,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     delta_known = existing_issue is None or memory is not None
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
+    # Every id the ledger carried, for the stale close's reading of an
+    # unlabelled pull request: the body's block, and the stored document
+    # behind it, which also names the ids the body budget cut.
+    ledger_ids_known = sorted(set(parse_delta_block(previous_body)) | set(_stored_finding_places(memory)))
     previous_ids = parse_delta_block(previous_body)
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
@@ -25579,7 +25598,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 shielded_only=bool(gaps or unaccounted),
                 noun=noun,
                 sweep_off=not sweep_on,
-                previous_ids=previous_ids,
+                previous_ids=ledger_ids_known,
             )
         )
         conversation_unread = False
@@ -26375,7 +26394,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             shielded_namespaces=shielded_namespaces,
             finding_places=finding_places,
             shielded_only=bool(gaps),
-            previous_ids=previous_ids,
+            previous_ids=ledger_ids_known,
         )
 
     prs_opened = _open_promoted_prs(

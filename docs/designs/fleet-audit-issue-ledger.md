@@ -204,12 +204,15 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
   such neighbour and for every pull request open today, so nothing is renamed on upgrade. A pull
   request with no scope label is from before scopes, and the listing keeps it, since the install
   that opened it cannot be read off it. The stale close on a scoped install therefore leaves an
-  unlabelled open pull request alone when none of the ids it covers was ever on this install's
-  ledger (`previous_ids`) or is current: in the mixed-version window of an upgrade, every install
-  that shares the repository reads such a pull request as its own, and closing it as stale or as
-  "no longer reproduces" would retire another install's fix over a fleet this run never read. The
-  run logs the pull request it leaves. This install's own pre-scope fix whose ids the shared ledger
-  happened not to carry is left open the same way, for a person to close.
+  unlabelled open pull request alone when none of the ids it covers was on this install's ledger
+  (the last body's hidden block and the stored document behind it, `previous_ids`), is current, or
+  is shielded by a namespace this install declared: in the mixed-version window of an upgrade,
+  every install that shares the repository reads such a pull request as its own, and closing it as
+  stale or as "no longer reproduces" would retire another install's fix over a fleet this run never
+  read. The run logs the pull request it leaves. This install's own pre-scope fix whose ids the
+  shared ledger happened not to carry is left open the same way, for a person to close. A forge
+  with no labels skips nothing: no pull request there carries a scope label, and the listing already
+  proved each one this install's.
 
 ## 3. Decisions
 
