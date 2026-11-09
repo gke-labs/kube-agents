@@ -1542,6 +1542,26 @@ type AvailabilitySpec struct {
 	// store this repository runs beside Hermes is not covered by the pin.
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// A2AGateway is the A2A gateway's availability, under mode next.
+	// +optional
+	A2AGateway *A2AGatewayAvailabilitySpec `json:"a2aGateway,omitempty"`
+}
+
+// A2AGatewayAvailabilitySpec is the A2A gateway's availability, under mode
+// next.
+type A2AGatewayAvailabilitySpec struct {
+	// Replicas is how many A2A gateway pods run. One holds the gateway's Lease
+	// and does the work, and the others stand by to take over. Defaults to 2.
+	// Set 1 where the namespace's quota has no room for the extra pod a
+	// rolling update starts. The operator renders more than one replica only
+	// once a gateway on the image it renders has taken the Lease (the
+	// GatewayElected condition), and one replica until then. At most 5: only
+	// one replica works at a time, and the count feeds the namespace pod quota.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,

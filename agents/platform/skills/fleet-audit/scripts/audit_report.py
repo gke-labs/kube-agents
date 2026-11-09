@@ -532,9 +532,16 @@ MAX_REPORTED_FINDINGS_ERRORS = 20
 # argparse's own line, and what a missing input names: the command that
 # produces it, not only the flag (#2856).
 DRAFT_COMMAND = "draft --audit <id> --manifest-file <collector manifest> --out <findings file>"
+PRECHECK_COMMAND = "precheck --audit <id> --manifest-file <collector manifest> [--scheduled]"
 LIFECYCLE_HINT = (
-    f"The order is `start`, the SOP's collector command, `{DRAFT_COMMAND}`, then "
+    f"The order is `start`, the SOP's collector command, `{PRECHECK_COMMAND}` on its manifest (which "
+    f"closes an unchanged scheduled run itself), the drafting by hand (`{DRAFT_COMMAND}` writes the "
+    "document to fill), then "
     "`finish --audit <id> --findings-file <findings file> --manifest-file <collector manifest>`."
+)
+PRECHECK_USAGE_HINT = (
+    f"`{PRECHECK_COMMAND}` takes the manifest the SOP's collector command wrote; pass --scheduled "
+    "only when the cron prompt says the run is scheduled."
 )
 FINISH_USAGE_HINT = (
     f"`finish` takes --audit, --findings-file (write it with `{DRAFT_COMMAND}`) and "
@@ -1770,6 +1777,52 @@ SCHEDULED_REPORTED_UNDER_GAP_KEY = "scheduled_reported_under_gap"
 # the published ids did not move, or when `new` and `resolved` counted
 # against the record of the last scheduled run. See `since_last_scheduled`.
 SINCE_SCHEDULED_KEY = "since_last_scheduled"
+# On the JSON line and the stored envelope of a `finish` that `precheck` ran
+# from the stored document of the last scheduled run, because the
+# collector manifest digested the same as that run's: its value is the
+# gate's verdict, `unchanged`. Absent on every `finish` a worker ran.
+PRECHECK_KEY = "precheck"
+# On `precheck`'s own JSON line when it did not close the run: the gate's
+# verdict (`first-run`, `findings-changed`, `periodic-refresh` or
+# `unchanged`), whether the run was closed (always false on that line), and
+# why the SOP continues.
+PRECHECK_VERDICT_KEY = "verdict"
+PRECHECK_CLOSED_KEY = "closed"
+PRECHECK_REASON_KEY = "reason"
+PRECHECK_NOT_SCHEDULED_REASON = (
+    "not a scheduled run: only a scheduled run is closed from the stored document; the SOP continues"
+)
+PRECHECK_REASON_FIRST_RUN = "no scheduled run of this stream has recorded a manifest digest; the SOP continues"
+PRECHECK_REASON_FINDINGS_CHANGED = (
+    "the collector's findings are not the last scheduled run's, or the run is partial; the SOP continues"
+)
+PRECHECK_REASON_PERIODIC_REFRESH = "the last full synthesis is a week or more old; the SOP continues"
+PRECHECK_CONTINUES_SUFFIX = "; the SOP continues as a full run"
+PRECHECK_PENDING_REQUESTS_REASON = "a /remediate request is pending on the ledger for {ids}"
+PRECHECK_LEDGER_UNREAD_REASON = "the ledger's requests could not be read ({error})"
+PRECHECK_CONVERSATION_UNREAD = "the conversation could not be read whole"
+PRECHECK_RECORD_MISMATCH_REASON = (
+    "the digest record was written for the scheduled run that finished at {recorded}, and the newest "
+    "stored run finished at {stored}"
+)
+PRECHECK_HELD_OPEN_REASON = (
+    "the newest stored run held the ledger open over findings it neither reported nor explained, "
+    "so its document is no baseline"
+)
+PRECHECK_REMEDIATION_REASON = (
+    "the stored document's remediation for {ids} names a file this run has not written, or "
+    "carries a note finish wrote, which a close cannot write again"
+)
+PRECHECK_WITHHELD_REASON = (
+    "the stored run withheld posture findings for want of a declared-intent search, so it is no baseline"
+)
+PRECHECK_NO_RUN_RECORD_REASON = "this run has no record from start, so its declared-intent search is unknown"
+PRECHECK_UNSEARCHED_REASON = (
+    "this run's start did not search {slugs}, which the stored document's own search record would hide"
+)
+PRECHECK_DECLARATION_GONE_REASON = (
+    "the declaration the stored document relied on for {ids} is not among the ones this run's start filed"
+)
 # On the stored envelope only: the title and place of each previous finding
 # that the run kept under _Not re-checked this run_ (`unread_held_entries`).
 # The note and id-only tiers of the held span write no row for them, and the
@@ -2524,6 +2577,35 @@ SWEEP_OFF_ON_INSTALL_REASON = (
     f"the automatic sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`)"
 )
 _SWEEP_WAIVED = False
+# The gate verdict the running `finish` was started under by `precheck`, or
+# None for a `finish` a worker ran; set once per command.
+_PRECHECK_VERDICT: str | None = None
+
+
+def set_precheck_verdict(verdict: str | None) -> None:
+    """Record that `precheck` is running this `finish` from the stored document."""
+    global _PRECHECK_VERDICT
+    _PRECHECK_VERDICT = verdict
+
+
+def precheck_payload() -> dict:
+    """`{PRECHECK_KEY: verdict}` on a `finish` `precheck` ran, else nothing."""
+    return {PRECHECK_KEY: _PRECHECK_VERDICT} if _PRECHECK_VERDICT else {}
+
+
+def _manifest_delta():
+    """The gate module beside this file, imported on first use.
+
+    Lazy, and by this file's own directory, because `audit_report` is imported
+    from other directories (the status view, the bench plants) that put only
+    this file's path on `sys.path`.
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import manifest_delta
+
+    return manifest_delta
 
 
 def set_sweep_waived(waived: bool) -> None:
@@ -3924,6 +4006,7 @@ def report_envelope(
         ),
         SCHEDULED_REPORTED_UNDER_GAP_KEY: sorted(set(scheduled_reported_under_gap or [])),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
+        **({PRECHECK_KEY: payload[PRECHECK_KEY]} if payload.get(PRECHECK_KEY) else {}),
         "ledger_held_open": ledger_held_open,
         **({OPEN_LEDGER_KEY: open_issue_number} if open_issue_number is not None else {}),
         "delta_known": delta_known,
@@ -22393,8 +22476,10 @@ def _finish_without_forge(
     scheduled: bool = False,
     unreachable: tuple[str, str] | None = None,
     probe: str = REACHABILITY_PROBE_VERB,
-) -> None:
+) -> dict | None:
     """Keep a run on an install with no forge in the report store, and print its line.
+
+    Returns the envelope the store kept, or None when the write failed.
 
     `unreachable` is the repository and the reason when a repository resolved
     but the broker cannot reach it (`resolve_reachable_repo`); the note then
@@ -22526,6 +22611,7 @@ def _finish_without_forge(
     )
     payload = {
         "status": NO_FORGE_STATUS,
+        **precheck_payload(),
         "issue_url": None,
         "new": len(new_ids),
         "resolved": len(resolved_ids),
@@ -22611,6 +22697,7 @@ def _finish_without_forge(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 class _FixPlan(NamedTuple):
@@ -22781,8 +22868,10 @@ def _finish_store_ledger(
     timers: Callable[[], dict],
     scheduled: bool = False,
     kcc_index: dict[KccKey, KccDeclaration] | None = None,
-) -> None:
+) -> dict | None:
     """Keep the ledger in the report store and chat, and open the fixes on the forge.
+
+    Returns the envelope the store kept, or None when the write failed.
 
     The run of a repository whose forge has no issue tracker, or no labels
     (version-control-support.md §8). `finish` has already validated the
@@ -23232,6 +23321,7 @@ def _finish_store_ledger(
     )
     payload = {
         "status": STORE_LEDGER_STATUS,
+        **precheck_payload(),
         "issue_url": None,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -23313,6 +23403,7 @@ def _finish_store_ledger(
         audit_id, repo, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 def handle_finish(args: argparse.Namespace) -> None:
@@ -23322,7 +23413,7 @@ def handle_finish(args: argparse.Namespace) -> None:
         _finish(args, audit_id)
         return
     try:
-        _finish(args, audit_id)
+        stored = _finish(args, audit_id)
     except ValidationError:
         # The validator rejected the document and nothing was published. Every
         # SOP's next step is "fix the findings file and re-run `finish`", so
@@ -23333,11 +23424,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     except Exception as exc:
         # A lost broker that reached here raw is the same outage `forge`
         # names, and keeps the note for the re-run the skill prescribes.
-        if broker_lost(exc):
-            raise BrokerUnavailable(
-                f"the broker at {proxy_endpoint()} did not answer: {exc}. "
-                "Check the credential-proxy pod and re-run `finish`."
-            ) from exc
+        raise_if_broker_lost(exc, "finish")
         release_in_flight(audit_id)
         raise
     except BaseException:
@@ -23351,6 +23438,404 @@ def handle_finish(args: argparse.Namespace) -> None:
         release_in_flight(audit_id)
         raise
     release_in_flight(audit_id)
+    _record_scheduled_digest(args, audit_id, stored)
+
+
+def raise_if_broker_lost(exc: BaseException, command: str) -> None:
+    """Raise `exc` again as `BrokerUnavailable` when it is a lost broker; otherwise return."""
+    if broker_lost(exc):
+        raise BrokerUnavailable(
+            f"the broker at {proxy_endpoint()} did not answer: {exc}. "
+            f"Check the credential-proxy pod and re-run `{command}`."
+        ) from exc
+
+
+def _record_scheduled_digest(args: argparse.Namespace, audit_id: str, stored: dict | None) -> None:
+    """Leave the gate's record after a scheduled `finish` published. Best-effort: never fails the run.
+
+    `stored` is what `_finish` handed back: the envelope the store kept of
+    this run, or None when the store did not keep it. Only a scheduled run
+    with a manifest records one: the digest is what the next scheduled run's
+    `precheck` compares its manifest with, and a run that waived the manifest
+    leaves nothing to compare, so its record is removed and the next run is
+    a first run. A `finish` that `precheck` ran from the stored document
+    keeps the previous `last_full_run_at`.
+    """
+    if not getattr(args, "scheduled", False):
+        return
+    delta = _manifest_delta()
+    manifest_file = str(getattr(args, "manifest_file", None) or "").strip()
+    record_path = delta.digest_path_for(audit_id, SCRATCH_DIR)
+    try:
+        if not manifest_file:
+            record_path.unlink(missing_ok=True)
+            return
+        manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return
+        # The record names the envelope this run stored, and only a published
+        # scheduled one: a run that was diverted (its repository unreachable)
+        # published nothing, so the next run must not read its digest as the
+        # ledger's state, and a run the store did not keep leaves nothing for
+        # `precheck` to republish. What this run stored is what `_finish`
+        # handed back, never read back from the store: after a failed write
+        # the store's newest envelope is an earlier run's, and a record naming
+        # it would pair this run's digest with that run's document.
+        if not stored or is_diverted(stored) or stored.get(RUN_SCHEDULED_KEY) is not True:
+            record_path.unlink(missing_ok=True)
+            log(
+                f"precheck: no manifest digest recorded for {audit_id}; the store holds no published "
+                "scheduled run of this finish, so the next scheduled run drafts its findings in full."
+            )
+            return
+        path = delta.record_scheduled_digest(
+            audit_id,
+            manifest,
+            time.time(),
+            full_run=_PRECHECK_VERDICT is None,
+            scratch_dir=SCRATCH_DIR,
+            envelope_finished_at=str(stored.get("finished_at") or ""),
+        )
+        log(f"precheck: recorded this scheduled run's manifest digest at {path}")
+    except Exception as exc:  # noqa: BLE001 -- the record is for the next run; this one has published
+        record_path.unlink(missing_ok=True)
+        log(
+            f"WARNING: the manifest digest for {audit_id} was not recorded: {exc}; "
+            "the next scheduled run drafts its findings in full."
+        )
+
+
+def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | None = None) -> tuple[dict | None, str]:
+    """The findings document of the last scheduled run of the ledger this run publishes to, or why not.
+
+    The newest published envelope of that ledger's store (`first_stored_record`,
+    skipping a diverted one) has to be a scheduled run's (`RUN_SCHEDULED_KEY`),
+    one that did not hold the ledger open (`ledger_held_open`: its document
+    is the empty set the ledger's findings were held against, and replaying
+    it would hold the ledger again, with another comment, instead of the full
+    run the comment asks for), under this id scheme, with a `document` that
+    has a findings list, and the run the digest `record` names
+    (`envelope_finished_at`), so the digest and the document are one run's.
+    The ledger must carry no `/remediate` request
+    still owed an answer (`pending_ledger_requests`): the stored document
+    answers none, and `finish` opens a fix only for a `manifest` remediation,
+    so a request on a `manual` finding would wait until the fleet changed. A
+    newer on-demand run, a store that holds nothing, a document from another
+    scheme, a mismatched record, a pending request or a ledger that cannot be
+    read is a reason to run the audit in full, never an error: the gate costs
+    a full run when it cannot vouch for a close.
+    """
+    try:
+        store_repo = resolve_repo_or_no_forge(audit_id, repo)
+    except Exception as exc:  # noqa: BLE001 -- a resolver failure is a reason to run in full
+        return None, f"the repository could not be resolved ({exc})"
+    try:
+        directory = reports_dir_for(audit_id, store_repo)
+    except ValueError as exc:
+        return None, f"no report store for {store_repo} ({exc})"
+    key = _ledger_key(store_repo)
+    newest = first_stored_record(
+        directory, lambda envelope: _ledger_key(envelope.get("repo")) == key and not is_diverted(envelope)
+    )
+    if not newest:
+        return None, f"the report store holds no published run of {audit_id} for {store_repo}"
+    if newest.get(RUN_SCHEDULED_KEY) is not True:
+        return None, "the newest stored run of this ledger was not a scheduled run"
+    if newest.get("ledger_held_open"):
+        return None, PRECHECK_HELD_OPEN_REASON
+    if newest.get("id_scheme") != ID_SCHEME:
+        return None, "the newest stored run was written under another id scheme"
+    recorded = str((record or {}).get(_manifest_delta().RECORD_ENVELOPE_KEY) or "")
+    stored = str(newest.get("finished_at") or "")
+    if recorded and recorded != stored:
+        return None, PRECHECK_RECORD_MISMATCH_REASON.format(recorded=recorded, stored=stored)
+    document = newest.get("document")
+    if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
+        return None, "the newest stored run carries no usable findings document"
+    unreplayable = stored_document_replay_problem(document, audit_id, store_repo)
+    if unreplayable:
+        return None, unreplayable
+    pending, unread = pending_ledger_requests(audit_id, store_repo)
+    if unread:
+        return None, PRECHECK_LEDGER_UNREAD_REASON.format(error=unread)
+    if pending:
+        return None, PRECHECK_PENDING_REQUESTS_REASON.format(ids=", ".join(pending))
+    return document, f"the document of the scheduled run that finished at {stored}"
+
+
+def stored_document_replay_problem(document: dict, audit_id: str, store_repo: str) -> str | None:
+    """Why `finish` cannot be run again on a stored document, or None when it can.
+
+    The store keeps the document as `finish` left it, after the passes that
+    write on it, and a close runs those passes again on a workspace `start`
+    has reset. Two kinds of state do not survive that. A remediation the carry
+    would not copy either (`_remediation_may_carry`): one that names a file
+    (the worker's `manifest` fix, or a generated one, which this run has not
+    written, so the pass would degrade it or refuse the close) or one `finish`
+    wrote a note on (a declined fix, which the pass would refuse again for
+    want of the decline; a shield, which it would write a second time). And
+    the previous run's reading of the repositories: postures it withheld
+    because a repository went unsearched, which the pass would empty; a
+    `declared[]` entry whose declaration this run's `start` did not file
+    again, which the close would keep silent; and a search record of its own
+    that would hide a repository this run's `start` did not search. Each is
+    a reason to run in full: the gate costs a full run when it cannot vouch
+    for a close.
+    """
+    unreplayable = [
+        str(finding.get("id", ""))
+        for finding in document.get("findings") or []
+        if isinstance(finding, dict)
+        and (
+            _remediation_is_file_backed(finding.get("remediation"))
+            or _harness_wrote_note(finding.get("remediation"))
+        )
+    ]
+    if unreplayable:
+        return PRECHECK_REMEDIATION_REASON.format(ids=", ".join(unreplayable))
+    if isinstance(document.get(POSTURES_WITHHELD_KEY), dict):
+        return PRECHECK_WITHHELD_REASON
+    declared = [entry for entry in document.get("declared") or [] if isinstance(entry, dict)]
+    if declared:
+        filed = read_declarations(audit_id, repo=store_repo)
+        scoped = {
+            _declaration_key(entry, with_cluster=True)
+            for entry in filed
+            if entry.get(DECLARATION_CLUSTER_FIELD)
+        }
+        fleet_wide = {
+            _declaration_key(entry, with_cluster=False)
+            for entry in filed
+            if not entry.get(DECLARATION_CLUSTER_FIELD)
+        }
+        gone = [
+            published_id(entry)
+            for entry in declared
+            if _declaration_key(entry, with_cluster=True) not in scoped
+            and _declaration_key(entry, with_cluster=False) not in fleet_wide
+        ]
+        if gone:
+            return PRECHECK_DECLARATION_GONE_REASON.format(ids=", ".join(gone))
+    if declared_intent_applies(document):
+        record = read_run_record(audit_id, repo=store_repo)
+        if record is None:
+            return PRECHECK_NO_RUN_RECORD_REASON
+        # The harness's own search, without the document's: the stored
+        # document's entries are the previous run's, and would hide a
+        # repository this run's `start` could not read.
+        own = {DECLARED_INTENT_SEARCHED_KEY: list(record.get(RUN_RECORD_SEARCHED_KEY) or [])}
+        missing = unsearched_repositories(own, record)
+        if missing:
+            return PRECHECK_UNSEARCHED_REASON.format(slugs=", ".join(missing))
+    return None
+
+
+def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], str | None]:
+    """The `/remediate` targets still owed an answer on the stream's open ledger issue, or why they are unknown.
+
+    A request a writer made that no acked or refused marker has answered
+    (`unanswered_remediate_comments`, which reads the markers and keeps
+    `all`): those are the requests a full run acts on and the stored document
+    answers none of; one already answered holds nothing, since the markers
+    are permanent and the comment is never edited, and a non-writer's is
+    refused the same on either path. A ledger that is not an issue (no
+    forge, or a forge with no issue tracker) carries no requests. A
+    repository `start` could not reach (`LedgerDecision.unreachable`) keeps
+    its ledger in the store too, but its issue could not be read at all, so
+    its requests are unknown and the reason is the probe's. The
+    conversation is read, not fetched: `read_comments` answers None for one
+    it could not read whole (a refusal, a truncated thread, an identity or a
+    standing it could not get), and that is unknown, as any other lookup
+    failure is, so the caller runs in full rather than close over a request.
+    A lost broker is neither: it is raised as from any command, so the SOP
+    waits for the broker and runs the same `precheck` again.
+    """
+    if _ledger_key(store_repo) == _ledger_key(NO_FORGE_REPO):
+        return [], None
+    try:
+        decision = finish_target(audit_id, store_repo)
+        if decision.unreachable is not None:
+            return [], decision.unreachable[1]
+        if decision.ledger != LEDGER_FORGE:
+            return [], None
+        refresh_credentials(store_repo)
+        number, _, _, _ = find_existing_issue(store_repo, audit_id)
+        if number is None:
+            return [], None
+        comments = read_comments("issue-view", store_repo, number, standing=True)
+    except BrokerUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- unknown requests are a reason to run in full
+        raise_if_broker_lost(exc, "precheck")
+        return [], str(exc)
+    if comments is None:
+        return [], PRECHECK_CONVERSATION_UNREAD
+    standing_of = {
+        str(comment.get("id", "") or ""): str(comment.get("authorAssociation", "") or "").upper()
+        for comment in comments
+        if isinstance(comment, dict)
+    }
+    pending = {
+        target
+        for request in unanswered_remediate_comments(comments)
+        if standing_of.get(str(request.get("comment_id", "") or "")) in WRITE_ASSOCIATIONS
+        for target in request.get("targets") or []
+    }
+    return sorted(pending), None
+
+
+def _close_from_stored_document(
+    args: argparse.Namespace, audit_id: str, document: dict, verdict: str, manifest_file: str, source: str
+) -> str | None:
+    """Run `finish --scheduled` on the stored document and this run's manifest.
+
+    None when `finish` published (it printed its own JSON line, with
+    `PRECHECK_KEY`); otherwise the reason the SOP continues. The document
+    goes in with each remediation's note as the worker wrote it
+    (`_strip_route_notes`): the route notes and the Config Connector
+    paragraph are `finish`'s to write again from this run's manifest; and
+    without the previous run's search record and with each `declared[]`
+    entry's declaration as this run's `start` filed it, so the ledger's
+    search line and Declared intent rows are this run's. On
+    every outcome but a publish the findings file is put back as it was, so
+    a `draft` the collector command wrote is still the one the worker fills.
+    A rejected
+    document is that reason: the manifest digested the same, but `finish` is
+    the judge of whether the document still fits it. A broker outage, and any
+    other failure of the close, is raised as it is from any command; the same
+    `precheck` is re-run once the broker answers. The stream's in-flight note
+    is released only by a close that published: after any failure the run is
+    still under way, and the SOP's own `finish` releases it.
+    """
+    path = Path(findings_path_for(audit_id))
+    previous = path.read_bytes() if path.is_file() else None
+    document = copy.deepcopy(document)
+    # This run's reading of the repositories, not the previous run's. The
+    # stored search record goes: `fold_searched_record` unions by slug, so
+    # its `owner/name@sha` would keep this run's sha out of the ledger's
+    # search line, and the gate has already held this run's own record to
+    # every repository the step names. Each `declared[]` entry takes its
+    # declaration's `repo`, `path` and `excerpt` from the file this run's
+    # `start` filed, joined as `apply_declarations` joins, so a note the
+    # owner edited or moved publishes as it stands today; the gate has
+    # already refused an entry no filed declaration matches.
+    document.pop(DECLARED_INTENT_SEARCHED_KEY, None)
+    declared = [entry for entry in document.get("declared") or [] if isinstance(entry, dict)]
+    if declared:
+        store_repo = resolve_repo_or_no_forge(audit_id, getattr(args, "repo", None))
+        scoped, fleet_wide = _declaration_lookup(read_declarations(audit_id, repo=store_repo))
+        for entry in declared:
+            match = scoped.get(_declaration_key(entry, with_cluster=True)) or fleet_wide.get(
+                _declaration_key(entry, with_cluster=False)
+            )
+            if match is not None:
+                entry["declaration"] = {field: str(match.get(field, "")) for field in DECLARATION_FIELDS}
+    for finding in document.get("findings") or []:
+        if isinstance(finding, dict):
+            # The note as the worker wrote it, before the route notes and the
+            # cut `finish` made to fit them (`ROUTE_UNCUT_NOTE_FIELD`), as the
+            # carry puts it back: `validate_findings` drops the field, and a
+            # finding whose evidence moved is not carried, so the cut text
+            # would otherwise pass for the worker's own and the uncut note
+            # would leave the store for good.
+            _strip_route_notes(finding.get("remediation"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    close = argparse.Namespace(
+        audit=audit_id,
+        findings_file=str(path),
+        repo=getattr(args, "repo", None),
+        dry_run=False,
+        scheduled=True,
+        no_promote=False,
+        decline_fix=None,
+        manifest_file=manifest_file,
+        no_collector_manifest=None,
+    )
+    def put_back() -> None:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+
+    log(f"PRECHECK: {verdict}: closing the run from {source}")
+    set_precheck_verdict(verdict)
+    # `_finish` rather than `handle_finish`: the in-flight note is this run's,
+    # and on every failure the run goes on (the SOP's next step is the same
+    # `precheck` once more, then the rest of the SOP, whose own `finish`
+    # releases it), so only a close that published releases it here.
+    try:
+        stored = _finish(close, audit_id)
+    except BrokerUnavailable:
+        put_back()
+        raise
+    except ValidationError as exc:
+        put_back()
+        return f"finish did not take the stored document ({exc}){PRECHECK_CONTINUES_SUFFIX}"
+    except Exception as exc:
+        put_back()
+        raise_if_broker_lost(exc, "precheck")
+        raise
+    except BaseException:
+        # A close that died on anything else: the worker continues from the
+        # draft it had, and `main` reports the failure as for any command.
+        put_back()
+        raise
+    else:
+        # While the verdict is still set: the record keeps `last_full_run_at`.
+        release_in_flight(audit_id)
+        _record_scheduled_digest(close, audit_id, stored)
+    finally:
+        set_precheck_verdict(None)
+    return None
+
+
+def handle_precheck(args: argparse.Namespace) -> None:
+    """The delta gate between the SOP's collector command and the drafting by hand.
+
+    Reads the manifest the collector just wrote, digests it
+    (`manifest_delta.manifest_digest`) and compares it with the digest the
+    last scheduled `finish` recorded. On a scheduled run whose fleet is
+    `unchanged`, it writes the last scheduled run's stored document to
+    `findings_path` and runs `finish --scheduled` on it with this run's
+    manifest, so the cross-check, the ledger comparison and the `silent_ok`
+    rule are `finish`'s own; the JSON line is then `finish`'s, plus
+    `precheck: unchanged`. In every other case it prints one JSON line with
+    the `verdict`, `closed: false` and the `reason`, and the SOP continues.
+    """
+    audit_id = validate_audit_id(args.audit)
+    scheduled = bool(getattr(args, "scheduled", False))
+    manifest_file = str(getattr(args, "manifest_file", None) or "").strip()
+    if not manifest_file:
+        raise ValidationError("--manifest-file: give the path of the manifest the collector wrote.")
+    manifest = load_manifest(manifest_file, audit_id, command="precheck")
+    delta = _manifest_delta()
+    run_llm, verdict = delta.should_run_llm_synthesis(
+        audit_id, manifest, datetime.now(timezone.utc).timestamp(), scratch_dir=SCRATCH_DIR
+    )
+    reasons = {
+        delta.VERDICT_FIRST_RUN: PRECHECK_REASON_FIRST_RUN,
+        delta.VERDICT_FINDINGS_CHANGED: PRECHECK_REASON_FINDINGS_CHANGED,
+        delta.VERDICT_PERIODIC_REFRESH: PRECHECK_REASON_PERIODIC_REFRESH,
+    }
+    line: dict[str, Any] = {PRECHECK_VERDICT_KEY: verdict, PRECHECK_CLOSED_KEY: False}
+    if not scheduled:
+        line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
+    elif run_llm:
+        line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
+    else:
+        document, source = stored_scheduled_document(
+            audit_id, getattr(args, "repo", None), delta.read_record(audit_id, SCRATCH_DIR)
+        )
+        if document is None:
+            line[PRECHECK_REASON_KEY] = f"{source}{PRECHECK_CONTINUES_SUFFIX}"
+        else:
+            reason = _close_from_stored_document(args, audit_id, document, verdict, manifest_file, source)
+            if reason is None:
+                return
+            line[PRECHECK_REASON_KEY] = reason
+    log(f"PRECHECK: {verdict}: {line[PRECHECK_REASON_KEY]}")
+    print(json.dumps(line))
 
 
 def findings_predate_run(path: str, audit_id: str) -> str | None:
@@ -23408,7 +23893,13 @@ def _kcc_paragraph_scan(repo: str, probe: _RepositoryProbe) -> "dict[KccKey, Kcc
     return kcc_declarations_via_broker(repo, snap, every_kind=True)
 
 
-def _finish(args: argparse.Namespace, audit_id: str) -> None:
+def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
+    """Publish the run and hand back the envelope the store kept of it, or None.
+
+    None after a dry run, and after a publish whose store write failed:
+    `_record_scheduled_digest` reads it as "no envelope of this run to
+    record", since reading the store back would find an earlier run's.
+    """
     # Only a scheduled run can be silent. The cron prompt passes
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
@@ -23584,7 +24075,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
 
     repo = repo_hint
     if repo == NO_FORGE_REPO:
-        _finish_without_forge(
+        return _finish_without_forge(
             audit_id,
             data,
             now,
@@ -23595,7 +24086,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             unreachable=unreachable,
             probe=decision.probe if decision is not None else REACHABILITY_PROBE_VERB,
         )
-        return
     earlier = earlier_finish(audit_id, repo, now)
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
@@ -23772,7 +24262,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if decision is not None and decision.store_ledger:
         # The forge has no issue tracker, or no labels: the ledger goes to the
         # report store and chat, and the fixes still open on the forge.
-        _finish_store_ledger(
+        return _finish_store_ledger(
             audit_id,
             decision,
             args,
@@ -23798,7 +24288,6 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             scheduled=scheduled,
             kcc_index=kcc_index,
         )
-        return
     existing_issue, existing_url, existing_body, existing_title = find_existing_issue(
         repo, audit_id
     )
@@ -24506,6 +24995,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # account for. A distinct word because the worker relays
             # this line, and "clean" is the one thing it is not.
             "status": "HELD" if unaccounted or held_unread else "CLEAN",
+            **precheck_payload(),
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -24610,41 +25100,37 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             news=not clean_quiet or bool(payload.get(SILENT_FLOOR_KEY)),
         )
-        write_report(
+        envelope = report_envelope(
             audit_id,
-            report_envelope(
-                audit_id,
-                payload,
-                data,
-                now,
-                repo=repo,
-                issue_number=stored_issue,
-                ledger_body=stored_body,
-                new_ids=[],
-                resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
-                rendered_ids=stored_ids,
-                ledger_document=ledger_document,
-                ledger_held_open=body_untouched,
-                delta_known=delta_known,
-                reported_under_gap=reported_under_gap,
-                scheduled=scheduled,
-                scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
-                # A body left untouched still publishes the previous ids, so
-                # a scheduled run stores those as the scheduled baseline,
-                # with what the run published: the postures it withheld are
-                # in no body block.
-                scheduled_published_ids=(
-                    sorted(set(stored_ids) | published_ids)
-                    if scheduled and body_untouched
-                    else next_scheduled_ids
-                ),
-                scheduled_reported_under_gap=next_scheduled_reported,
-                open_issue_number=open_issue,
-                not_rechecked=not_rechecked,
-            ),
+            payload,
+            data,
             now,
-            ledger_unchanged=body_untouched,
+            repo=repo,
+            issue_number=stored_issue,
+            ledger_body=stored_body,
+            new_ids=[],
+            resolved_ids=[] if body_untouched or gaps or unaccounted else previous_ids,
+            rendered_ids=stored_ids,
+            ledger_document=ledger_document,
+            ledger_held_open=body_untouched,
+            delta_known=delta_known,
+            reported_under_gap=reported_under_gap,
+            scheduled=scheduled,
+            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
+            # A body left untouched still publishes the previous ids, so
+            # a scheduled run stores those as the scheduled baseline,
+            # with what the run published: the postures it withheld are
+            # in no body block.
+            scheduled_published_ids=(
+                sorted(set(stored_ids) | published_ids)
+                if scheduled and body_untouched
+                else next_scheduled_ids
+            ),
+            scheduled_reported_under_gap=next_scheduled_reported,
+            open_issue_number=open_issue,
+            not_rechecked=not_rechecked,
         )
+        stored = write_report(audit_id, envelope, now, ledger_unchanged=body_untouched)
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
         run_resolved = 0 if gaps else len(baseline.ids)
@@ -24665,7 +25151,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             whole_run=whole_run,
         )
         print(json.dumps(payload))
-        return
+        return envelope if stored else None
 
     # --- Findings: publish the ledger, then propose fixes separately. ---
     # Every finding in the document reproduces by definition — the resolved ones
@@ -25081,6 +25567,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     payload = {
         "status": status,
+        **precheck_payload(),
         "issue_url": issue_url,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -25169,32 +25656,29 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         now,
         news=not quiet or bool(payload.get(SILENT_FLOOR_KEY)),
     )
-    write_report(
+    envelope = report_envelope(
         audit_id,
-        report_envelope(
-            audit_id,
-            payload,
-            data,
-            now,
-            repo=repo,
-            issue_number=number,
-            ledger_body=ledger_body,
-            new_ids=new_ids if delta_known else [],
-            resolved_ids=[] if (gaps or stale_scheme or not delta_known) else resolved_ids,
-            # The block as published, held ids included, so the stored set
-            # is the one the next run's memory parses out of `ledger_body`.
-            rendered_ids=parse_delta_block(ledger_body),
-            delta_known=delta_known,
-            reported_under_gap=reported_under_gap,
-            scheduled=scheduled,
-            scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
-            scheduled_published_ids=next_scheduled_ids,
-            scheduled_reported_under_gap=next_scheduled_reported,
-            # Their places, which the note and id-only tiers do not render.
-            not_rechecked=unread_entries,
-        ),
+        payload,
+        data,
         now,
+        repo=repo,
+        issue_number=number,
+        ledger_body=ledger_body,
+        new_ids=new_ids if delta_known else [],
+        resolved_ids=[] if (gaps or stale_scheme or not delta_known) else resolved_ids,
+        # The block as published, held ids included, so the stored set
+        # is the one the next run's memory parses out of `ledger_body`.
+        rendered_ids=parse_delta_block(ledger_body),
+        delta_known=delta_known,
+        reported_under_gap=reported_under_gap,
+        scheduled=scheduled,
+        scheduled_coverage_gaps=next_scheduled_value(scheduled, gaps, scheduled_gaps_baseline(memory)),
+        scheduled_published_ids=next_scheduled_ids,
+        scheduled_reported_under_gap=next_scheduled_reported,
+        # Their places, which the note and id-only tiers do not render.
+        not_rechecked=unread_entries,
     )
+    stored = write_report(audit_id, envelope, now)
     run_counts = None
     if baseline.from_entry and baseline.known:
         # The run's delta, on the yardsticks and filters this run's own took.
@@ -25222,6 +25706,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         whole_run=baseline.from_entry,
     )
     print(json.dumps(payload))
+    return envelope if stored else None
 
 
 # --------------------------------------------------------------------------- #
@@ -25373,6 +25858,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    precheck_parser = subparsers.add_parser(
+        "precheck",
+        help="After the SOP's collector command: compare its manifest with the last "
+        "scheduled run's digest and, on a scheduled run whose fleet did not change, "
+        "close the run from that run's stored document (its JSON line is then "
+        "finish's, plus precheck: unchanged). Otherwise print the verdict and continue the SOP.",
+    )
+    precheck_parser.usage_hint = PRECHECK_USAGE_HINT
+    precheck_parser.add_argument("--audit", required=True, help="Audit id.")
+    precheck_parser.add_argument(
+        "--manifest-file", required=True, metavar="PATH", help="The manifest the collector wrote this run."
+    )
+    precheck_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository, as for finish (defaults to leased workspace repo or ConfigMap registered repo).",
+    )
+    precheck_parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=(
+            "The run is a scheduled run: the cron prompt passes this flag, to precheck and to "
+            "finish. Only a scheduled run is closed from the stored document; without the flag "
+            "precheck only prints its verdict. Do not pass it on a run a person asked for."
+        ),
+    )
+
     fetch_parser = subparsers.add_parser(
         "fetch",
         help="Copy repository files into the workspace so a fix can edit them "
@@ -25507,6 +26018,8 @@ def main(argv: list[str] | None = None) -> int:
             handle_grep(args)
         elif args.subcommand == "draft":
             handle_draft(args)
+        elif args.subcommand == "precheck":
+            handle_precheck(args)
         elif args.subcommand == "remediate":
             handle_remediate(args)
         else:

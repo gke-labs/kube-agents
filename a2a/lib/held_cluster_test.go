@@ -23,6 +23,15 @@ import (
 // clusterSize is the cluster an install runs (R3).
 const clusterSize = 3
 
+// clusterStartAttempts is how many clusters startCluster starts, each on
+// fresh route ports, before a server that never binds its route port fails
+// the test.
+const clusterStartAttempts = 3
+
+// serverReadyTimeout is how long tryStartCluster waits for each server to
+// listen.
+const serverReadyTimeout = 10 * time.Second
+
 func freePort(t *testing.T) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -34,11 +43,41 @@ func freePort(t *testing.T) int {
 }
 
 // startCluster runs clusterSize JetStream servers routed to each other.
+// freePort releases each route port before its server binds it, so another
+// socket can take the port in between. That server then listens for clients
+// but not for routes and never becomes ready (#5056). A cluster with such a
+// server is shut down and started again on fresh ports.
 func startCluster(t *testing.T) []*natsserver.Server {
+	t.Helper()
+	return startClusterOn(t, freePort)
+}
+
+// startClusterOn is startCluster with the route ports taken from pick, so a
+// test can hand it a port that another socket holds.
+func startClusterOn(t *testing.T, pick func(*testing.T) int) []*natsserver.Server {
+	t.Helper()
+	for attempt := 1; ; attempt++ {
+		servers, unrouted := tryStartCluster(t, pick)
+		if unrouted == nil {
+			return servers
+		}
+		for _, s := range servers {
+			s.Shutdown()
+		}
+		if attempt == clusterStartAttempts {
+			t.Fatalf("each of %d clusters had a server that never bound its route port (last: %s)", clusterStartAttempts, unrouted.Name())
+		}
+		t.Logf("nats-server %s never bound its route port; starting the cluster again on fresh ports", unrouted.Name())
+	}
+}
+
+// tryStartCluster starts one cluster, and returns with it the server that
+// listens for clients but not for routes, or nil when every server is ready.
+func tryStartCluster(t *testing.T, pick func(*testing.T) int) ([]*natsserver.Server, *natsserver.Server) {
 	t.Helper()
 	ports := make([]int, clusterSize)
 	for i := range ports {
-		ports[i] = freePort(t)
+		ports[i] = pick(t)
 	}
 	var routes []*url.URL
 	for _, p := range ports {
@@ -62,11 +101,50 @@ func startCluster(t *testing.T) []*natsserver.Server {
 		servers[i] = s
 	}
 	for _, s := range servers {
-		if !s.ReadyForConnections(10 * time.Second) {
-			t.Fatal("nats-server not ready")
+		if s.ReadyForConnections(serverReadyTimeout) {
+			continue
+		}
+		// A server binds its route port right after its client port, so one
+		// that listens only for clients lost its route port.
+		client, route := s.Addr(), s.ClusterAddr()
+		if client != nil && route == nil {
+			return servers, s
+		}
+		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
+	}
+	return servers, nil
+}
+
+// TestStartClusterStartsAgainWhenARoutePortIsTaken pins the #5056 retry and
+// the nats-server behaviour it rests on: a server whose route port another
+// socket holds still listens for clients, tryStartCluster names it, and
+// startCluster starts the cluster again on fresh ports. If a nats-server
+// upgrade stops binding the client listener first, this test fails rather
+// than the flake coming back under another message.
+func TestStartClusterStartsAgainWhenARoutePortIsTaken(t *testing.T) {
+	held, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer held.Close()
+	heldPort := held.Addr().(*net.TCPAddr).Port
+	picks := 0
+	pick := func(t *testing.T) int {
+		picks++
+		if picks == 1 {
+			return heldPort
+		}
+		return freePort(t)
+	}
+	servers := startClusterOn(t, pick)
+	if picks < 2*clusterSize {
+		t.Fatalf("picked %d route ports, want at least %d: the cluster with the held port was not started again", picks, 2*clusterSize)
+	}
+	for _, s := range servers {
+		if s.ClusterAddr() == nil {
+			t.Fatalf("nats-server %s has no route listener", s.Name())
 		}
 	}
-	return servers
 }
 
 func TestHeldStopHandsBackAtOnceAcrossAClusterRoute(t *testing.T) {
