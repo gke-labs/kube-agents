@@ -5311,6 +5311,14 @@ def previous_filed_ids(
     filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
     if filed is not None:
         return set(filed[0])
+    return body_filed_ids(previous_body)
+
+
+def body_filed_ids(previous_body: str) -> set[str]:
+    """The ids in a body's `audit-findings-all` block: every finding a body that cut rows for space filed.
+
+    Empty for a body that cut nothing, or whose block cannot be read.
+    """
     complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
     try:
         return set(json.loads(complete[-1])) if complete else set()
@@ -25234,9 +25242,13 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
     # Every id the ledger carried, for the stale close's reading of an
     # unlabelled pull request: the body's block, the stored document behind
-    # it, and the complete block of a body that cut findings for space, which
-    # is all a memory seeded from the issue body has of them.
-    ledger_ids_known = sorted(set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut)
+    # it, and the complete block of a body that cut findings for space. The
+    # block is read off the body itself, not only through `filed_cut`: a
+    # memory seeded from the issue, or the empty document a held-open run
+    # stored over that seed, has no document that names the cut ids.
+    ledger_ids_known = sorted(
+        set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut | body_filed_ids(previous_body)
+    )
     # Where the last scheduled run's ids are read from (see `scheduled_ids`
     # below). Read here, so the run's first `finish` saves what it read with
     # the baseline.
