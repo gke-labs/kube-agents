@@ -160,9 +160,9 @@ def regressions(nights: list[dict], shape_of=whole_shape, drop_points: int = SHA
 
 def _line(nights: list[dict], label: str, shape_of, drop_points: int) -> str | None:
     # One night per date, the newest run of each, as the latency line counts
-    # them (nightly_latency.one_per_date): a same-date re-run is not a second
+    # them (nightly.one_per_date): a same-date re-run is not a second
     # earlier night in the typicals.
-    nights = nightly_latency.one_per_date(nights)
+    nights = nightly.one_per_date(nights)
     now = numbers(shape_of(nights[0])) if nights else None
     if now is None:
         return None

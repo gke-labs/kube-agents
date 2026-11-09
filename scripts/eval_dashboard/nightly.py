@@ -820,6 +820,51 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD, running: list[dict]
     return out
 
 
+def one_per_date(nights: list[dict]) -> list[dict]:
+    """``nights`` (newest first) with one night per date, the newest run of
+    each, dated as ``nightly_bugs.graded_nights`` dates its nights.
+    ``night_reports`` makes a same-date re-run of the main job a night of
+    its own, and counted as two it would make a case's typical span one date
+    fewer, a sustained streak reach two from one date, and the night typical
+    count the date twice. Unlike ``graded_nights``, which keeps the newest
+    run that graded each case, this keeps the newest night as it stands: a
+    re-run cut short, or one that timed fewer cases, stands for its date. A
+    night with no start time is kept."""
+    seen: set = set()
+    out = []
+    for night in nights:
+        day = night_day(parse_iso(night.get("started")))
+        if day is not None:
+            if day in seen:
+                continue
+            seen.add(day)
+        out.append(night)
+    return out
+
+
+def night_dates(data: dict, limit: int = NIGHTS_ON_RECORD, running: list[dict] = ()) -> list[dict]:
+    """``night_reports`` for the last ``limit`` dates, not runs: every night
+    on record, one per date (``one_per_date``), newest first. The digest's
+    latency and reply-shape lines read this, so a same-date re-run lets an
+    older date into their typicals instead of pushing one out. The page and
+    brief.json read ``night_reports``, which lists each re-run. Only the
+    nights those dates span are built, dated as their reports are (the
+    earliest start of their own parts)."""
+    seen: set = set()
+    kept = span = 0
+    for night in reversed(group_nights(sorted_nightly_runs(data))):
+        starts = [parse_iso(run.get("started")) for run in night_parts(night)]
+        day = night_day(min((s for s in starts if s), default=None))
+        if day is None or day not in seen:
+            if kept == limit:
+                break
+            kept += 1
+            if day is not None:
+                seen.add(day)
+        span += 1
+    return one_per_date(night_reports(data, limit=span, running=running))
+
+
 def nightly_job(data: dict) -> str:
     """The periodic's name as the newest main-part run carries it, else the default."""
     return next((r.get("job") for r in reversed(sorted_nightly_runs(data)) if isinstance(r.get("job"), str) and night_part(r) == PART_MAIN), DEFAULT_NIGHTLY_JOB)

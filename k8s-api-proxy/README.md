@@ -33,7 +33,7 @@ ends, so a watch or an `exec` session is recorded when it closes. The event hold
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
 `upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
-mid-copy otherwise or an upgrade's 101 cannot be written), the status and the duration. An upgraded session that breaks off after its 101 is recorded as
+mid-copy otherwise or an upgrade's 101 cannot be written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response
@@ -57,6 +57,27 @@ metadata and is absent unless the caller asked for a `Table`. The handler never 
 it cannot tell an empty one from a set one: `kubectl describe secret` prints every key as 8 bytes,
 the placeholder's size, and an empty key looks the same as a populated one. A response the handler
 cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event.
+
+`pkg/k8sapiproxy/cache.go` provides an optional HTTP response cache (`CacheConfig`, `CacheStore`,
+`CacheStatsProvider`, and the default `MemoryCacheStore`). By default, `cmd/k8s-api-proxy` enables a
+64 MiB in-memory cache (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES`; `0` disables the cache)
+with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a `0s`
+default TTL for resource `get` and `list` responses (`DefaultResourceCacheTTL`, configured via
+`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`), and a `30s` default TTL for discovery
+responses (`DefaultDiscoveryCacheTTL`, configured via `--cache-discovery-ttl` /
+`KUBE_PROXY_CACHE_DISCOVERY_TTL`). With the `0s` default resource TTL, the proxy coalesces concurrent
+in-flight resource `GET` and `LIST` requests without post-flight storage across per-pod
+`MemoryCacheStore` replicas. Operators and embedders can set `--cache-resource-ttl` /
+`KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` when callers stick to one replica
+(`sessionAffinity`); invalidation is per replica, so a shared `CacheStore` alone keeps stale entries.
+Health and metrics discovery paths (`/healthz`, `/livez`, `/readyz`, `/metrics`), watches,
+subresources, and dry-run writes are never cached. Concurrent cache misses coalesce into one
+upstream request, `Secret` payloads are redacted before cache storage, non-dry-run mutations and
+`401`/`403` responses invalidate the affected resource scope, and responses carry RFC 9211
+`Cache-Status` and `Age` headers while honoring RFC 9111 `Cache-Control` directives. Cache lookups,
+evictions, byte size, and entry count are exported on the metrics listener as
+`kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
+`kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
 It is a self-contained Go module. Run its checks from this directory:
 

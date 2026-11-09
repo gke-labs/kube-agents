@@ -848,6 +848,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
@@ -1697,8 +1699,16 @@ func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
 	if len(names) == 0 {
 		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
 	}
-	if got := a2aStandingPods(agent); got != rendered {
-		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
+	// The golden runs the gateway at the one replica it starts with: no pod
+	// holds the election's Lease there, so the scale-out to its standby (and a
+	// rollout's surge pod) never renders, and a2aGatewayStandbyPods counts them.
+	standby := a2aGatewayStandbyPods(agent)
+	if standby == 0 {
+		t.Fatal("the next-mode golden's CR runs no gateway standby, so this proves nothing about it")
+	}
+	if got := a2aStandingPods(agent); got != rendered+standby {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v, plus %d for the gateway's standby",
+			got, rendered, names, standby)
 	}
 
 }
@@ -2335,6 +2345,17 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// The gateway's budget renders only once it's scaled out and both
+	// replicas are Ready, which takes a pod on its image holding the Lease,
+	// a pass to scale out, and a pass that reads the standby Ready.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
+	}
+	gatewayReplicasReady(t, ctx, cl, agent, 2)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render with the standby Ready: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.

@@ -150,6 +150,138 @@ class AgeTest(unittest.TestCase):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
 
 
+class AgeColumnTest(unittest.TestCase):
+    def test_a_line_below_the_header_that_is_not_a_row_keeps_its_text(self):
+        # The AGE cell spans columns 60-67; on the JSON line below the table that
+        # is the uid's `-83d`, which once read as an age of 83 days.
+        header = "NAME".ljust(60) + "AGE     IP"
+        row = "web-7d4b9c8f6d-x2k9p".ljust(60) + "5m".ljust(8) + "10.1.2.3"
+        line = '{"name":"' + "x" * 28 + '","uid":"6f79db96-15b3-4308-83df-7c4f203b6015","phase":"Pending"}'
+        out = norm("\n".join((header, row, line)))
+        self.assertIn('"uid":"⟦UID_1⟧"', out)
+        self.assertRegex(out, r"⟦AGEm_\d+⟧")
+
+
+class TimeOccurrenceTest(unittest.TestCase):
+    def test_only_timestamps_outside_assistant_messages_take_a_position(self):
+        # A slot blanks an answer's words, so a timestamp counted there could
+        # shift every later position between two requests that share a slot key.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "assistant", "content": "as of 2026-11-03T11:00:00Z"},
+            {"role": "tool", "tool_call_id": "c", "content": "created 2026-11-03T11:30:00Z"},
+        ]}, NOW)
+        self.assertEqual(n.mapping.time_occurrences, ["2026-11-03T11:30:00Z"])
+        self.assertEqual(n.mapping.apply_to_answer("created 2026-11-03T11:30:00Z"), "created ⟦TIMEVAL_1⟧")
+
+
+class TimeOccurrenceInJsonTest(unittest.TestCase):
+    def test_asking_whether_a_value_holds_a_time_notes_no_timestamp(self):
+        # The walk asks of each JSON value whether it holds a time of day
+        # (Normalizer.timed) before walking it; only the walk notes the text.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "tool", "tool_call_id": "c",
+             "content": '{"created": "2026-11-03T11:30:00Z", "name": "web", "updated": "2026-11-03T11:40:00Z"}'},
+        ]}, NOW)
+        self.assertEqual(n.mapping.time_occurrences, ["2026-11-03T11:30:00Z", "2026-11-03T11:40:00Z"])
+
+
+class StderrOrderTest(unittest.TestCase):
+    def test_a_warning_before_or_after_the_output_gives_one_key(self):
+        warning = "WARNING: --filter : operator evaluation is changing for consistency across Google APIs."
+        body = '{\n  "quotas": [{"limit": 16.0, "metric": "NVIDIA_A100_GPUS"}]\n}'
+        after = json.dumps({"exit_code": 0, "output": body + "\n" + warning})
+        before = json.dumps({"exit_code": 0, "output": warning + "\n" + body + "\n"})
+        self.assertEqual(norm(after), norm(before))
+
+    def test_a_wrapped_warning_moves_with_its_continuation_lines(self):
+        warning = "WARNING: Accessing a Kubernetes Engine cluster requires the kubernetes commandline\n    tool [kubectl]."
+        body = '[{"name": "alpha", "status": "RUNNING"}]'
+        self.assertEqual(norm(warning + "\n" + body + "\n"), norm(body + "\n" + warning))
+        self.assertEqual(norm(warning + "\n" + body), body + "\n" + warning)
+
+    def test_the_order_of_a_warning_and_plain_output_still_counts(self):
+        # In either direction: only a JSON document between warnings is reordered.
+        self.assertNotEqual(norm("WARNING: disk pressure\nPod evicted"), norm("Pod evicted\nWARNING: disk pressure"))
+        self.assertNotEqual(norm("Pod evicted\nWARNING: disk pressure"), norm("WARNING: disk pressure\nPod evicted"))
+        self.assertEqual(norm("WARNING: disk pressure\nPod evicted"), "WARNING: disk pressure\nPod evicted")
+        body = '{"ok": true}'
+        self.assertNotEqual(norm("WARNING: a\nnote\n" + body), norm(body + "\nWARNING: a\nnote"),
+                            "an unindented line is output, not a warning's continuation")
+
+    def test_the_rest_of_the_output_still_counts(self):
+        warning = "WARNING: something"
+        self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))
+        self.assertEqual(norm(warning), warning)
+
+
+class AnswerSlotTest(unittest.TestCase):
+    CONTEXT = normalizer.KeyContext("c", "i")
+
+    @staticmethod
+    def convo(said, shown, task="t_aaaaaaaa"):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": f"work kanban task {task}"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": shown},
+        ]}, NOW)
+
+    def test_the_slot_key_ignores_which_answer_and_keeps_what_followed(self):
+        a, a_slots = normalizer.answer_slots(self.convo("Yes please.", "ticket Tea"), self.CONTEXT)
+        b, b_slots = normalizer.answer_slots(self.convo("Yes.", "ticket Tea", task="t_bbbbbbbb"), self.CONTEXT)
+        c, _ = normalizer.answer_slots(self.convo("Yes.", "ticket Latte"), self.CONTEXT)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(a_slots[0][0], b_slots[0][0], "both answers fill the same context")
+        self.assertNotEqual(a_slots[0][1], b_slots[0][1])
+
+    @staticmethod
+    def acted(name, arguments, said, call_id):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_aaaaaaaa"},
+            {"role": "assistant", "content": said, "tool_calls": [{"id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": '{"ok": true}'},
+        ]}, NOW)
+
+    def test_the_slot_key_keeps_the_tool_calls_and_blanks_only_the_words(self):
+        get = {"command": "kubectl get pods"}
+        base, _ = normalizer.answer_slots(self.acted("terminal", get, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+        worded, slots = normalizer.answer_slots(
+            self.acted("terminal", get, "Let me look.", "call_8__thought__WFla"), self.CONTEXT)
+        self.assertEqual(base, worded, "other words, another call id and thought signature: the same slot")
+        for name, arguments in (("kanban_complete", get), ("terminal", {"command": "kubectl delete pods --all"})):
+            other, _ = normalizer.answer_slots(self.acted(name, arguments, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+            self.assertNotEqual(base, other, (name, arguments))
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("terminal", get, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
+
+    def test_a_read_only_tool_keeps_its_name_and_blanks_its_arguments(self):
+        show, _ = normalizer.answer_slots(self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)
+        own, slots = normalizer.answer_slots(self.acted("kanban_show", {"task_id": "t_aaaaaaaa"}, "", "call_2"), self.CONTEXT)
+        self.assertEqual(show, own)
+        other, _ = normalizer.answer_slots(self.acted("kanban_list", {}, "", "call_1"), self.CONTEXT)
+        self.assertNotEqual(show, other, "the name stays in the key")
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)[1][0][1], "the arguments still name the answer")
+
+    def test_an_answer_noted_at_record_time_is_the_one_a_later_slot_holds(self):
+        asked = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_aaaaaaaa"}]}
+        # As the proxy assembled it from the stream, and as the client sends it back.
+        streamed = {"role": "assistant", "content": "", "tool_calls": [{"index": 0, "id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        returned = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        later = dict(asked, messages=asked["messages"] + [returned, {"role": "tool", "tool_call_id": "call_1__thought__QUJD",
+                                                                     "content": "ok"}])
+        context, _ = normalizer.answer_slots(normalizer.normalize_request(asked, NOW), self.CONTEXT)
+        _, slots = normalizer.answer_slots(normalizer.normalize_request(later, NOW), self.CONTEXT)
+        self.assertEqual(slots, [(context, normalizer.answer_in_context(asked, streamed, NOW))])
+
+    def test_placeholders_outside_answers(self):
+        n = self.convo("I'll look at web-7d4b9c8f6d-x2k9p", "ticket for web-5f6c7d8b9c-m8n7q")
+        self.assertEqual(normalizer.placeholders_outside_answers(n), {"⟦TASK_1⟧", "⟦POD_2⟧"})
+
+
 class LongDateTest(unittest.TestCase):
     """The date Hermes writes into every system prompt, with no time of day."""
 
@@ -657,6 +789,33 @@ class AnswerMappingTest(unittest.TestCase):
         self.assertEqual(mapping.apply_to_answer("xt_11111111"), "xt_11111111")
         self.assertTrue(mapping.answer_repeats_bare_number("kill 9921"))
         self.assertFalse(mapping.answer_repeats_bare_number("kill 99210"))
+
+    def test_answer_swaps_a_pod_or_node_tail_after_its_dash(self):
+        mapping = normalizer.normalize_request(
+            request("pod web-7d4b9c8f6d-x2k9p on gke-seeded-a-default-pool-1a2b3c4d-wxyz"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("describe web-7d4b9c8f6d-x2k9p"), "describe web-⟦POD_1⟧")
+        self.assertEqual(mapping.apply_to_answer("drain gke-seeded-a-default-pool-1a2b3c4d-wxyz"),
+                         "drain gke-seeded-a-default-pool-⟦NODE_1⟧")
+        self.assertEqual(mapping.apply_to_answer("x7d4b9c8f6d-x2k9p"), "x7d4b9c8f6d-x2k9p")
+
+    def test_restore_puts_this_requests_values_back(self):
+        mapping = normalizer.normalize_request(request("task t_11111111 pod web-7d4b9c8f6d-x2k9p age: 5m"), NOW).mapping
+        self.assertEqual(mapping.to_value["⟦TASK_1⟧"], "t_11111111")
+        restored, missing = mapping.restore("kanban_show(⟦TASK_1⟧) on web-⟦POD_1⟧")
+        self.assertEqual(restored, "kanban_show(t_11111111) on web-7d4b9c8f6d-x2k9p")
+        self.assertEqual(missing, [])
+        # An age is never put back: this run's would be another reading of the clock.
+        _, missing = mapping.restore("⟦AGEm_1⟧ old")
+        self.assertEqual(missing, ["⟦AGEm_1⟧"])
+        _, missing = mapping.restore("and ⟦TASK_2⟧")
+        self.assertEqual(missing, ["⟦TASK_2⟧"])
+
+    def test_an_age_is_never_swapped_into_an_answer_and_repeating_one_counts(self):
+        mapping = normalizer.normalize_request(request("pod web-7d4b9c8f6d-x2k9p AGE: 5m"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("kubectl logs --since 5m"), "kubectl logs --since 5m")
+        self.assertTrue(mapping.answer_repeats_age("kubectl logs --since 5m"))
+        for answer in ("cpu 25m", "requests 5mi", "x5m"):
+            self.assertFalse(mapping.answer_repeats_age(answer), answer)
 
     def test_repeated_number_uses_token_boundaries(self):
         mapping = normalizer.normalize_request(request("resourceVersion: 4821"), NOW).mapping

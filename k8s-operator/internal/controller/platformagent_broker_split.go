@@ -61,7 +61,7 @@ const (
 	//
 	// What it buys: the sandbox, where every model-authored command runs, cannot
 	// reach /v1/chat/** at all, and the gateway cannot reach /v1/exec,
-	// /v1/github/** or /v1/workspace/**. Neither needed the other's routes —
+	// /v1/github/** or /v1/vcs/**. Neither needed the other's routes —
 	// CREDENTIAL_PROXY_URL is empty on the gateway and the relay URLs are absent
 	// from the sandbox — so this enforces a separation the deployment already
 	// had and nothing checked. credential_proxy.py's ROUTE_ROLES is the table.
