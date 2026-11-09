@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -231,11 +232,32 @@ func TestTheGatewayLeaseFollowsTheMode(t *testing.T) {
 	}
 }
 
-// TestTheElectionIsOffByDefault: without A2A_GATEWAY_ELECTION=true on the
+// TestTheElectionIsOnByDefault: with A2A_GATEWAY_ELECTION unset, the
+// gateway gets its Lease grant and its election env.
+func TestTheElectionIsOnByDefault(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	granted := false
+	for _, rule := range buildA2AGatewayRole(agent).Rules {
+		granted = granted || slices.Contains(rule.APIGroups, "coordination.k8s.io")
+	}
+	if !granted {
+		t.Error("no Lease grant with the election at its default")
+	}
+	var names []string
+	for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		names = append(names, e.Name)
+	}
+	if !slices.Contains(names, "A2A_GATEWAY_LEASE") || !slices.Contains(names, "POD_NAME") {
+		t.Errorf("gateway env %v lacks the election's", names)
+	}
+}
+
+// TestFalseTurnsTheElectionOff: with A2A_GATEWAY_ELECTION=false on the
 // operator, nothing changes for an install: no Lease, no grant on one, and
 // no election env, so the gateway runs unelected.
-func TestTheElectionIsOffByDefault(t *testing.T) {
-	t.Setenv(a2aGatewayElectionEnvVar, "")
+func TestFalseTurnsTheElectionOff(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 	for _, rule := range buildA2AGatewayRole(agent).Rules {
 		for _, group := range rule.APIGroups {

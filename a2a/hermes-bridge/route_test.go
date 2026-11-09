@@ -574,3 +574,27 @@ func TestPutOrigin_A409IsTheExistingRecord(t *testing.T) {
 		t.Fatalf("putOrigin on 409 = %v, want errOriginExists", err)
 	}
 }
+
+// Only a console or MCP turn waits on its cards in turn. Every other origin
+// ends at its acknowledgement, whether or not its route was recorded: the
+// in-turn wait on those lanes dropped the agent's own report of a card's
+// result from the answer (#5170).
+func TestOnlyAConsoleTurnWaitsForItsCardsInTurn(t *testing.T) {
+	for _, tc := range []struct {
+		conversation string
+		want         bool
+	}{
+		{"console:tab-1", true},
+		{"gchat:spaces/A/threads/B", false},
+		{"slack:C0HOME/1712.0001", false},
+		{"", false},
+	} {
+		env := routeEnvelope(t, "ctx-w", tc.conversation)
+		if got := waitsForCardsInTurn(env); got != tc.want {
+			t.Errorf("waitsForCardsInTurn(%q) = %v, want %v", tc.conversation, got, tc.want)
+		}
+	}
+	if waitsForCardsInTurn(nil) {
+		t.Error("waitsForCardsInTurn(nil) = true, want false")
+	}
+}

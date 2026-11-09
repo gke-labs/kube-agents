@@ -1118,10 +1118,11 @@ type AgentLimits struct {
 	APIMaxRetries *int `json:"apiMaxRetries,omitempty"`
 
 	// MaxTurns is how many iterations (model calls) a single turn may take. Hermes
-	// defaults to 90. A long multi-step task can exhaust it while still mid-flight, and
-	// a run that does cannot even produce a closing summary. Repository exploration is
-	// the main consumer, so size this against how much the agent has to read, not
-	// against how complex the request is.
+	// defaults to 90. A long multi-step task can exhaust it while still mid-flight; a
+	// kanban worker that does ends with its closing summary saved on its card for the
+	// retry, not with the result it was asked for. Repository exploration is the main
+	// consumer, so size this against how much the agent has to read, not against how
+	// complex the request is.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=1000
 	// +optional
@@ -1542,6 +1543,26 @@ type AvailabilitySpec struct {
 	// store this repository runs beside Hermes is not covered by the pin.
 	// +optional
 	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
+
+	// A2AGateway is the A2A gateway's availability, under mode next.
+	// +optional
+	A2AGateway *A2AGatewayAvailabilitySpec `json:"a2aGateway,omitempty"`
+}
+
+// A2AGatewayAvailabilitySpec is the A2A gateway's availability, under mode
+// next.
+type A2AGatewayAvailabilitySpec struct {
+	// Replicas is how many A2A gateway pods run. One holds the gateway's Lease
+	// and does the work, and the others stand by to take over. Defaults to 2.
+	// Set 1 where the namespace's quota has no room for the extra pod a
+	// rolling update starts. The operator renders more than one replica only
+	// once a gateway on the image it renders has taken the Lease (the
+	// GatewayElected condition), and one replica until then. At most 5: only
+	// one replica works at a time, and the count feeds the namespace pod quota.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // SecuritySpec manages Kubernetes RBAC, Pod Security, and Cloud Workload Identity,
@@ -2930,8 +2951,10 @@ type AgentUsageStatus struct {
 	// the nine origin fields usually sum to at most RemediationsProposedTotal.
 	// A reading, not an accumulation: the ledger survives a restart and the
 	// plugin reads it whole; a read that fails after the plugin's first success
-	// keeps serving the last counts, so a stale count reads as current until
-	// the plugin restarts. A 0 is a reading. Absent until the first
+	// keeps serving the last counts, and the poller reads a read age past two
+	// poll intervals as no reading, so a stale count clears two polls after
+	// that, about twenty minutes after the ledger stops answering. A 0 is a
+	// reading. Absent until the first
 	// reading, after two polls in a row without one, and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.

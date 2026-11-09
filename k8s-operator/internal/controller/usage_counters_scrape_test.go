@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +303,10 @@ func TestPodUsageSource_ReadsTheBrokersReadings(t *testing.T) {
 		`kubeagents_vcs_readings_age_seconds{reading="details"} 340.000`,
 		"# TYPE kubeagents_vcs_readings_failures_total counter",
 		`kubeagents_vcs_readings_failures_total{reason="forge"} 3`,
+		// The chat plugin's ledger age, stale, which the broker's readings
+		// do not read.
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds 99999",
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -1155,6 +1160,20 @@ func TestToolInvocationsVocabularyIsClosed(t *testing.T) {
 	}
 }
 
+// usageOriginsAge is the ledger read age line the chat plugin serves beside
+// its rows, at age seconds.
+func usageOriginsAge(age string) []string {
+	return []string{
+		"# TYPE kubeagents_proposals_opened_read_age_seconds gauge",
+		"kubeagents_proposals_opened_read_age_seconds " + age,
+	}
+}
+
+// usageOriginsFresh is the nine origins' rows with a fresh read age.
+func usageOriginsFresh(rows ...string) []string {
+	return append(slices.Clone(rows), usageOriginsAge("0.000")...)
+}
+
 // usageOriginsBody is the chat metrics listener's text exposition: the chat
 // counters' families and the start time, with the proposals ledger's rows
 // appended.
@@ -1193,10 +1212,10 @@ var usageOriginsRows = []string{
 
 // The chat listener's ledger series lands in the nine origin fields, chat
 // summed over its platforms, a zero as a zero, an unknown origin ignored, and
-// marks the origins reading present, with no age series. The chat counters
-// read beside it are the body's, as without it.
+// marks the origins reading present beside a read age of 0. The chat
+// counters read beside it are the body's, as without it.
 func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) {
-	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsRows...))
+	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
 	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
@@ -1227,16 +1246,17 @@ func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) 
 
 // The listener serves no ledger family before its first ledger read, and a
 // row per origin after; a body missing an origin, or without the family, is
-// no origins reading, and an origin outside the nine resolves no field.
+// no origins reading, and an origin outside the nine resolves no field. Each
+// body but the first carries a fresh read age, so the origins alone decide.
 func TestPodUsageSource_AMissingOriginIsNotPresent(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		rows []string
 	}{
 		{"no ledger family", nil},
-		{"the other origin missing", usageOriginsRows[:len(usageOriginsRows)-1]},
-		{"the chat origin missing", usageOriginsRows[2:]},
-		{"an unknown origin in place of other", append(slices.Clone(usageOriginsRows[:len(usageOriginsRows)-1]), `kubeagents_proposals_opened{origin="robot",platform=""} 10`)},
+		{"the other origin missing", usageOriginsFresh(usageOriginsRows[:len(usageOriginsRows)-1]...)},
+		{"the chat origin missing", usageOriginsFresh(usageOriginsRows[2:]...)},
+		{"an unknown origin in place of other", usageOriginsFresh(append(slices.Clone(usageOriginsRows[:len(usageOriginsRows)-1]), `kubeagents_proposals_opened{origin="robot",platform=""} 10`)...)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
@@ -1246,6 +1266,48 @@ func TestPodUsageSource_AMissingOriginIsNotPresent(t *testing.T) {
 			}
 			if reading.ReadingsPresent[usageReadingOrigins] || len(reading.Readings) != 0 {
 				t.Errorf("present %v, readings %v; want no origins reading", reading.ReadingsPresent, reading.Readings)
+			}
+			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
+				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
+			}
+		})
+	}
+}
+
+// The origins reading is present only beside a read age at or below
+// proposalsReadAgeLimit: the plugin keeps serving its last counts while its
+// ledger reads fail, and a plugin from before the age serves the counts with
+// no age at all. The age alone, with no counts, is no reading either.
+func TestPodUsageSource_TheOriginsReadingNeedsAFreshReadAge(t *testing.T) {
+	limit := strconv.FormatFloat(proposalsReadAgeLimit.Seconds(), 'f', 3, 64)
+	if limit != "600.000" {
+		t.Fatalf("the limit is %s seconds, want two five-minute poll intervals", limit)
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []string
+		present bool
+	}{
+		{"an age at the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge(limit)...), true},
+		{"an age past the limit", append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), false},
+		{"a repeated age, one sample past the limit", append(append(slices.Clone(usageOriginsRows), usageOriginsAge("600.001")...), usageOriginsAge("0.000")[1]), false},
+		{"the counts with no age series keep the old rule", usageOriginsRows, true},
+		{"the age series with no counts", usageOriginsAge("0.000"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := serveBody(t, http.StatusOK, usageOriginsBody(tc.rows...))
+			reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
+			if err != nil {
+				t.Fatalf("Scrape: %v", err)
+			}
+			if got := reading.ReadingsPresent[usageReadingOrigins]; got != tc.present {
+				t.Fatalf("present = %v, want %v (readings %v)", got, tc.present, reading.Readings)
+			}
+			if tc.present && (len(reading.Readings) != 9 || reading.Readings[usageExportProposalsFromChat] != 7) {
+				t.Errorf("readings = %v, want the nine origins, chat 7", reading.Readings)
+			}
+			if !tc.present && len(reading.Readings) != 0 {
+				t.Errorf("readings = %v, want none", reading.Readings)
 			}
 			if reading.Samples[usageCounterChatMessagesInbound] != 9 {
 				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)

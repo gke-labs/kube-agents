@@ -172,7 +172,9 @@ struct also decodes `type` and `altText`. The rating memory starts empty after a
 the filled state then comes from the event's copy, and the bucket still holds the rating. The restart-recovery of a choice click's link
 buttons (`gchatMessageButtons`) tells the three kinds apart by function and link, not by index.
 Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
-`kage.feedback-note`) or `onClick.openLink`.
+`kage.feedback-note`) or `onClick.openLink`; a click on the Stop button's `kage.stop` never reaches
+this, since `classifyClick` dispatches it by that function first (spec-chatops-gateway.md "The Stop
+button").
 
 **Call 6: the switch.** `spec.integration.googleChat.answerFeedback *bool`, default `true`, the
 Slack field's twin. The operator renders `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` on the gateway

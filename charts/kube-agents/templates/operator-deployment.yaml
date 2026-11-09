@@ -108,6 +108,12 @@ spec:
             - name: A2A_GATEWAY_POD_POLICY
               value: "true"
             {{- end }}
+            {{- if include "kube-agents.a2aDispatcherJobPolicyEnabled" . }}
+            # The chart rendered the A2A dispatcher's Job admission policy, from the
+            # same helper. The operator runs the dispatcher's Job mode only under it.
+            - name: A2A_DISPATCHER_JOB_POLICY
+              value: "true"
+            {{- end }}
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders

@@ -360,7 +360,7 @@ make_certificates() {
   FORGE_CERT_DIR="$(mktemp -d "${FORGE_SCRATCH_DIR}/forge-certs.XXXXXX")" # 0700; make-certs.sh takes an empty directory
   bash "${SCRIPT_DIR}/ghes-proxy/make-certs.sh" "${EVAL_FORGE_HOST}" "${FORGE_CERT_DIR}" "${FORGE_CERT_DAYS}"
   # The deploy's gate would refuse this later; refuse it here, before a VM.
-  if ! openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null | grep -q 'CA:TRUE'; then
+  if ! grep -q 'CA:TRUE' <<<"$(openssl x509 -noout -text -in "${FORGE_CERT_DIR}/ca.crt" 2>/dev/null)"; then
     echo "ERROR: ${FORGE_CERT_DIR}/ca.crt is not a CA certificate; make-certs.sh needs OpenSSL (Linux), not LibreSSL (kube-agents#3682)." >&2
     exit 1
   fi

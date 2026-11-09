@@ -356,8 +356,8 @@ fi
 # A bare `grep "${PROJECT_ID}"` also matches comments and any longer project ID
 # that contains this one as a prefix.
 CI_DEPLOY="${REPO_ROOT}/hack/ci-deploy.sh"
-if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null \
-     | grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\""; then
+if ! grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\"" \
+     <<<"$(awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null)"; then
   echo "⚠️ ${PROJECT_ID} is not mapped in hack/ci-deploy.sh." >&2
   echo "   Add to gitops_repo_for_project():" >&2
   echo "       ${PROJECT_ID}) echo \"${GITOPS_REPO}\" ;;" >&2
@@ -617,7 +617,7 @@ seed_gitops_file() {
   local path="$1" message="$2" content="$3" what="$4" read_error
   if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
     return 0
-  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  elif grep -q "${GITOPS_NOTE_ABSENT_PATTERN}" <<<"${read_error}"; then
     echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
     gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
       -f message="${message}" \

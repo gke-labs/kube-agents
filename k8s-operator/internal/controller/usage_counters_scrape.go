@@ -134,6 +134,15 @@ const (
 	// no family before. The origins reading (usageReadingOrigins) maps each
 	// origin, summed over the platform label, to status.usage.
 	proposalsOpenedSeries = "kubeagents_proposals_opened"
+	// proposalsOpenedReadAgeSeries is the plugin's label-less gauge of the
+	// seconds since its last successful ledger read, served only beside
+	// proposalsOpenedSeries: 0 after a good read, growing while failed reads
+	// keep the last counts.
+	proposalsOpenedReadAgeSeries = "kubeagents_proposals_opened_read_age_seconds"
+	// proposalsReadAgeLimit is the oldest ledger read the origins reading
+	// accepts: two poll intervals, so a ledger that has not answered for two
+	// polls reads as a miss and the two-miss rule clears the nine fields.
+	proposalsReadAgeLimit = 2 * usageCountersPollInterval
 	proposalsOriginLabel  = "origin"
 	// The nine origins the ledger counts, in the chat plugin's ORIGINS order.
 	proposalOriginChat      = "chat"
@@ -466,9 +475,15 @@ func usageReadingAged(kind usageReadingKind) bool {
 // reading is present when both its windows resolved, with no age series:
 // the gateway serves both windows together or neither, so one alone is no
 // reading. The origins reading is present when all nine origins resolved,
-// each on at least one sample, sum fields though they are, again with no age
-// series: the chat plugin serves a row for every origin, zero included, from
-// its first ledger read on, and no family before it.
+// each on at least one sample, sum fields though they are, and the body
+// carried no proposalsOpenedReadAgeSeries above proposalsReadAgeLimit: the
+// chat plugin serves a row for every origin, zero included, from its first
+// ledger read on, and keeps serving the last counts while later reads fail,
+// so only the age tells fresh counts from stale ones. A body with the counts
+// and no age series, a plugin from before the age, keeps the old rule and is
+// present: an agent image can be pinned apart from the operator, and nine
+// fields absent with no cause would be worse than counts the plugin still
+// vouches for.
 func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
 	if kind == usageReadingTopTools {
 		// The tool counter is the broker's own, served from its first request
@@ -489,6 +504,9 @@ func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool 
 		}
 	}
 	return func(f *usageReadingFold) bool {
+		if kind == usageReadingOrigins && f.originsAgeSeen && f.originsAge > proposalsReadAgeLimit.Seconds() {
+			return false
+		}
 		for i, spec := range f.specs {
 			if spec.reading == kind && !f.resolved[i] {
 				return false
@@ -708,9 +726,6 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	if len(kinds) > 0 {
 		readings = newUsageReadingFold(kinds)
 		families := readings.families()
-		if slices.ContainsFunc(kinds, usageReadingAged) {
-			families = append([]string{vcsReadingsAgeSeries}, families...)
-		}
 		if slices.Contains(kinds, usageReadingTopTools) {
 			pairs = map[usageToolPair]map[string]float64{}
 			families = append(families, toolInvocationsSeries)
@@ -767,6 +782,9 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 				}
 				for _, metric := range mf.GetMetric() {
 					value, ok := usageSampleValue(metric)
+					// A wanted family's sample that is not a finite non-negative number
+					// fails the scrape; the plugin's read age is clamped at zero on a
+					// monotonic clock and printed finite, so it cannot trip this.
 					if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
 						return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 					}
@@ -900,13 +918,18 @@ func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
 
 // usageReadingFold is the reading slot's state through one body: the kinds
 // asked for, their specs, and per spec its running sum and whether a sample
-// resolved it.
+// resolved it; the broker readings whose age series the body carried; and,
+// for the origins reading, the age value the body carried.
 type usageReadingFold struct {
 	kinds    []usageReadingKind
 	specs    []usageReadingSpec
 	sums     []float64
 	resolved []bool
 	aged     map[usageReadingKind]bool
+	// originsAge is the plugin's read age when the body carried it, the
+	// largest of any repeated sample; originsAgeSeen says whether it did.
+	originsAge     float64
+	originsAgeSeen bool
 }
 
 func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
@@ -920,9 +943,16 @@ func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
 	}
 }
 
-// families is every family a field of the fold's readings is read from.
+// families is every family a field of the fold's readings is read from, and
+// the age series of the readings whose presence needs one.
 func (f *usageReadingFold) families() []string {
 	var families []string
+	if slices.ContainsFunc(f.kinds, usageReadingAged) {
+		families = append(families, vcsReadingsAgeSeries)
+	}
+	if slices.Contains(f.kinds, usageReadingOrigins) {
+		families = append(families, proposalsOpenedReadAgeSeries)
+	}
 	for _, spec := range f.specs {
 		if !slices.Contains(families, spec.family) {
 			families = append(families, spec.family)
@@ -931,13 +961,23 @@ func (f *usageReadingFold) families() []string {
 	return families
 }
 
-// fold takes one sample of family name into the reading fields it feeds, or
-// marks a reading aged, and reports whether name is a readings family.
+// fold takes one sample of family name into the reading fields it feeds,
+// marks a reading aged, or records the origins reading's age, and reports
+// whether name is a readings family.
 func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) bool {
 	if name == vcsReadingsAgeSeries && slices.ContainsFunc(f.kinds, usageReadingAged) {
 		kind := usageReadingKind(usageLabelValue(metric, vcsReadingsReadingLabel))
 		if slices.Contains(f.kinds, kind) && usageReadingAged(kind) {
 			f.aged[kind] = true
+		}
+		return true
+	}
+	if name == proposalsOpenedReadAgeSeries && slices.Contains(f.kinds, usageReadingOrigins) {
+		// The plugin renders one sample; a body that repeats it is judged by
+		// the oldest, so a stale ledger cannot pass on a fresh duplicate.
+		if !f.originsAgeSeen || value > f.originsAge {
+			f.originsAge = value
+			f.originsAgeSeen = true
 		}
 		return true
 	}
