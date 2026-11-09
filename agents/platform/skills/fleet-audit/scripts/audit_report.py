@@ -1677,6 +1677,8 @@ SCOPE_NOTES_KEY = "notes"
 NOTES_RESULT_KEY = "notes"
 NOTE_TARGET_FIELD = "target"
 NOTE_TEXT_FIELD = "note"
+# The lead of the notes list in a comment and in the no-forge summary.
+NOTES_LEAD = "Read but not visible, which is not a coverage gap"
 # A collected target's manifest entry may list the objects its `notes` names
 # as `{check, object}` (and `namespace` where the check has one): each one an
 # object a check read but could not see. `finish` refuses a `resolved_because`
@@ -2814,26 +2816,11 @@ NOTED_HOLD_END = (
     "it stays until the collector can see the object again (for a GCE instance, "
     "until the console shows a startup-script run again)"
 )
-# The lost-memory gaps when every still-flagged id the document does not carry
-# is a noted object: nothing is flagged, but the run cannot see those go away.
-LOST_MEMORY_NOTED_GAP = (
-    "the report store holds no trusted record of the open ledger (none, or one "
-    "that no longer matches the ledger's findings), so the findings it "
-    f"carries are unknown, and on an object a target's notes name {NOTED_HOLD_CAUSE}; "
-    "the ledger stays open over it"
-)
-STORE_LOST_MEMORY_NOTED_GAP = (
-    "the report store holds no trusted record of the stored ledger, so the "
-    f"findings it carries are unknown, and on an object a target's notes name "
-    f"{NOTED_HOLD_CAUSE}; no remediation fix is closed over it"
-)
 LOST_MEMORY_GAPS = (
     LOST_MEMORY_GAP,
     LOST_MEMORY_UNGUARDED_GAP,
-    LOST_MEMORY_NOTED_GAP,
     STORE_LOST_MEMORY_GAP,
     STORE_LOST_MEMORY_UNGUARDED_GAP,
-    STORE_LOST_MEMORY_NOTED_GAP,
 )
 # What a clean run says about a lost memory where a coverage gap would say
 # "did not see the whole fleet": the fleet may have been seen whole, and the
@@ -7663,7 +7650,7 @@ def _comment_scope_notes(data: dict) -> list[str]:
     notes = scope_notes(data)
     if not notes:
         return []
-    out = ["", f"Read but not visible, which is not a coverage gap ({len(notes)}):", ""]
+    out = ["", f"{NOTES_LEAD} ({len(notes)}):", ""]
     out += [f"- {_cell(note, limit=MAX_NOTE_CHARS)}" for note in notes[:MAX_SCOPE_ROWS]]
     if len(notes) > MAX_SCOPE_ROWS:
         out.append(f"- _…and {len(notes) - MAX_SCOPE_ROWS} more_")
@@ -7671,8 +7658,9 @@ def _comment_scope_notes(data: dict) -> list[str]:
 
 
 def _noted_objects(manifest: dict | None):
-    """`(entry, identity)` for every object a collected target lists under
-    `noted_objects`. `identity` has the four identity fields of a finding."""
+    """`(entry, identity, command)` for every object a collected target lists
+    under `noted_objects`. `identity` has the four identity fields of a
+    finding; `command` is the object's own read, or "" when the entry has none."""
     for entry in _manifest_clusters(manifest):
         if entry.get("outcome") != MANIFEST_OUTCOME_COLLECTED:
             continue
@@ -7683,31 +7671,20 @@ def _noted_objects(manifest: dict | None):
                     "cluster": str(entry.get("name") or ""),
                     "namespace": str(item.get("namespace") or ""),
                     "object": str(item["object"]),
-                }
+                }, str(item.get("command") or "").strip()
 
 
 def noted_ids(manifest: dict | None) -> set[str]:
     """The ledger ids (`published_id`) of the objects the targets' notes name.
 
     The collector ran the check on each one but could not see the result, so
-    a previous finding on one did not go away in this run's sight.
-    `still_flagged_ids` holds it as it holds a candidate the collector still
-    emits: it is not resolved, and its pull request is not closed.
+    a previous finding on one did not go away in this run's sight. A noted id
+    that the previous ledger carries is held as a candidate the collector
+    still emits is (`still_flagged_ids` with `carried`): it is not resolved,
+    and its pull request is not closed. A noted id that no previous finding
+    carries holds nothing, because there is no finding to keep.
     """
-    return {published_id(identity) for _entry, identity in _noted_objects(manifest)}
-
-
-def lost_memory_gap(unexplained: set[str], noted: set[str], *, store: bool = False) -> str:
-    """The lost-memory gap for the still-flagged ids the document does not carry.
-
-    `unexplained` is that set; `noted` is `noted_ids`. The noted variant when
-    every id in the set is a noted object, because nothing is flagged then.
-    """
-    if unexplained - noted:
-        return STORE_LOST_MEMORY_GAP if store else LOST_MEMORY_GAP
-    if unexplained:
-        return STORE_LOST_MEMORY_NOTED_GAP if store else LOST_MEMORY_NOTED_GAP
-    return STORE_LOST_MEMORY_UNGUARDED_GAP if store else LOST_MEMORY_UNGUARDED_GAP
+    return {published_id(identity) for _entry, identity, _command in _noted_objects(manifest)}
 
 
 def refuse_resolved_over_notes(data: dict, manifest: dict | None) -> None:
@@ -8012,7 +7989,7 @@ def _declared_ids(data: dict) -> set[str]:
     }
 
 
-def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
+def still_flagged_ids(manifest: dict | None, data: dict, carried: Iterable[str] = ()) -> set[str]:
     """The finding ids the collector still flags that the document has not declared.
 
     The one set both `finish` branches subtract, built from the manifest and
@@ -8026,9 +8003,11 @@ def still_flagged_ids(manifest: dict | None, data: dict) -> set[str]:
     release a still-flagged finding: that entry claims the object is gone, and
     the collector says it is not.
     """
-    # A noted object is held the same way: the collector could not see it,
-    # so the run cannot say that its finding went away (`noted_ids`).
-    return (collector_flagged_ids(manifest) | noted_ids(manifest)) - _declared_ids(data)
+    # A noted object that a previous finding carries (`carried`, the previous
+    # ledger ids) is held the same way: the collector could not see it, so
+    # the run cannot say that its finding went away (`noted_ids`).
+    noted = noted_ids(manifest) & set(carried)
+    return (collector_flagged_ids(manifest) | noted) - _declared_ids(data)
 
 
 def collector_held_entries(
@@ -8077,7 +8056,11 @@ def collector_held_entries(
     purposes of the close whatever the document says. `data` is what releases
     one: an entry under `declared`, per `still_flagged_ids`.
     """
-    flagged = still_flagged_ids(manifest, data) - set(exclude)
+    # A noted id is held only where the previous ledger's marker carries it,
+    # which the intersection below checks. The dry run reads no ledger, so
+    # it previews no noted id.
+    carried = () if preview_from_candidates else noted_ids(manifest)
+    flagged = still_flagged_ids(manifest, data, carried) - set(exclude)
     if not flagged:
         return []
     if preview_from_candidates:
@@ -8128,18 +8111,20 @@ def collector_held_entries(
             "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
         }
     # A noted object has no candidate. Its identity is the note's, and its
-    # command is the read the collector recorded for the check.
-    for entry, identity in _noted_objects(manifest):
+    # command is its own read; the check's joined record, which can be
+    # clipped before that read, only when the entry carries none.
+    for entry, identity, own_command in _noted_objects(manifest):
         commands = [
             str(command.get("command") or "")
             for command in entry.get("commands") or []
             if isinstance(command, dict) and command.get("rc") == 0 and command.get("check") == identity["check"]
         ]
+        command = own_command or (commands[0] if commands else "").strip()
         by_ledger_id.setdefault(
             published_id(identity),
             {
                 **identity,
-                "commands": [(commands[0] if commands else "").strip() or COLLECTOR_COMMAND_UNRECORDED],
+                "commands": [command or COLLECTOR_COMMAND_UNRECORDED],
                 NOTED_HELD_KEY: True,
             },
         )
@@ -22304,7 +22289,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     by_id = {str(f.get("id", "")): f for f in findings}
     still_flagged = still_flagged_ids(manifest, data) if manifest is not None else set()
     noted = noted_ids(manifest)
-    collector_noted = [fid for fid in args.finding if fid not in by_id and fid in still_flagged and fid in noted]
+    collector_noted = [fid for fid in args.finding if fid not in by_id and fid in noted]
     if collector_noted:
         raise ValidationError(
             f"--finding: {', '.join(collector_noted)} not in {args.findings_file}: "
@@ -22975,7 +22960,7 @@ def render_no_forge_summary(
         )
     notes = scope_notes(data)
     if notes:
-        lines.append("Read but not visible, which is not a coverage gap: " + "; ".join(notes))
+        lines.append(f"{NOTES_LEAD}: " + "; ".join(notes))
     if gaps:
         lines.append("Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
     lines.append(note)
@@ -23076,7 +23061,7 @@ def _finish_without_forge(
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
-        (set(previous_ids or []) & still_flagged_ids(manifest, data))
+        (set(previous_ids or []) & still_flagged_ids(manifest, data, previous_ids or []))
         - set(current_ids)
         - set(finding_ids(postures_withheld(data)))
     )
@@ -23473,6 +23458,9 @@ def _finish_store_ledger(
     )
     previous_ids = [str(fid) for fid in (memory or {}).get("current_ids") or []]
     previous_body = str((memory or {}).get("ledger_body") or "")
+    # A noted object a previous finding carries is held as a still-flagged
+    # one is (`noted_ids`).
+    still_flagged = still_flagged | still_flagged_ids(manifest, data, previous_ids)
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
     finding_places = report_finding_places(memory, data)
     # The forge path's stale-scheme rule: ids stored under another identity
@@ -23560,7 +23548,11 @@ def _finish_store_ledger(
     # Over a lost memory a clean run cannot tell what the stored ledger
     # carried, so it closes no fix, as the forge path's lost-memory gap says.
     if not delta_known and not findings:
-        gap = lost_memory_gap(still_flagged - held_exclude, noted_ids(manifest), store=True)
+        gap = (
+            STORE_LOST_MEMORY_GAP
+            if (still_flagged - held_exclude)
+            else STORE_LOST_MEMORY_UNGUARDED_GAP
+        )
         gaps = [*gaps, gap]
         log(f"COVERAGE GAP: {gap}")
     # A scheduled run compares with the last scheduled run's gaps, because the
@@ -24851,6 +24843,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     memory_lost = not delta_known
     previous_body = str(memory["ledger_body"]) if memory else ""
     previous_ids = parse_delta_block(previous_body)
+    # Now that the previous ids are known: a noted object a previous finding
+    # carries is held as a still-flagged one is (`noted_ids`).
+    still_flagged |= still_flagged_ids(manifest, data, previous_ids)
     # The body's headings name what it rendered; the stored document also names
     # what the body budget cut, which a resolved finding may be.
     previous_titles = {**report_finding_titles(memory), **parse_finding_titles(previous_body)}
@@ -25004,10 +24999,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     # its `silent_ok` is false on a lost memory (see the payload). For the same
     # reason the gap joins `gaps` only: `collector_gaps` feeds the findings
     # branch's delta comment, which this branch never posts.
-    if memory_lost and not findings:
-        lost_gap = lost_memory_gap(still_flagged - held_exclude, noted_ids(manifest))
-        gaps.append(lost_gap)
-        log(f"COVERAGE GAP: {lost_gap}")
+    if memory_lost and not findings and (still_flagged - held_exclude):
+        gaps.append(LOST_MEMORY_GAP)
+        log(f"COVERAGE GAP: {LOST_MEMORY_GAP}")
+    elif memory_lost and not findings:
+        gaps.append(LOST_MEMORY_UNGUARDED_GAP)
+        log(f"COVERAGE GAP: {LOST_MEMORY_UNGUARDED_GAP}")
     # Whether the coverage gaps changed since the stored run. Both silence
     # verdicts below use it instead of the gaps themselves: a gap that did
     # not change is not news on its fourteenth run (`coverage_changed`).

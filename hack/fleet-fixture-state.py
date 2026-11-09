@@ -45,7 +45,8 @@ as JSON beside the summary so the scan need not parse the warnings. And
 where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
 into a `fixture-drift:<role>` infrastructure record for the cases that need
 it. Detection is this script's whole job -- nothing here acts on a drift, and
-nothing anywhere repairs one.
+nothing anywhere repairs one, except a `serial_contains` drift, which the next
+reconcile's reset of the VM repairs (hack/fleet_reconcile.py).
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
@@ -980,7 +981,8 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
     lands in the second list; the caller decides what that means once it
     knows whether anything else in the role was positively out of shape. The
     flag is true when some failed assertion could converge within a wait,
-    which an age gate cannot.
+    which an age gate and a rotated serial console cannot
+    (`OPS_A_WAIT_CANNOT_CLEAR`).
     """
     drift: list[str] = []
     unreadable: list[str] = []
@@ -1075,7 +1077,8 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         # full deadline for nothing. Such a role is still re-read while another
         # role keeps the loop going, so a transient failure gets its retries.
         # An age gate is the same exception: a cluster under a day old is still
-        # under it when the wait runs out.
+        # under it when the wait runs out. So is a rotated serial console: only
+        # a reboot puts the line back.
         waiting = [role for role in pending if settling[role]]
         if not waiting or remaining <= 0:
             break

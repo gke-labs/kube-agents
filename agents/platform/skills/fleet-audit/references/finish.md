@@ -83,9 +83,9 @@ findings a clean run was refused its close over (empty on every other outcome; s
 [The clean run](clean-run.md#the-clean-run)). On every status, the line also carries `notes` when a
 target has one: a list of `{target, note}`, each one a sentence from the collector about what a check
 read on that target but could not see. A note is not a coverage gap: `partial` does not count it,
-and it does not change `silent_ok`. Relay each note in your report on every status, except on a run
-with `silent_ok: true`, and do not report the objects it names as clean. A scheduled run that is otherwise silent (`silent_ok: true`)
-does not report the notes in chat, which stay in the stored report; an on-demand run relays them. A previous finding on such an object did not go away in this run's
+and it does not change `silent_ok`. Relay each note in your report on every status, and do not report
+the objects it names as clean. The one exception is a scheduled run with `silent_ok: true`: it
+answers `[SILENT]` and does not report the notes in chat, and they stay in the stored report. A previous finding on such an object did not go away in this run's
 sight: report it again from the previous finding, because `finish` refuses a `resolved_because`
 entry for it. A `finish` that follows an earlier `finish` of the same
 repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report

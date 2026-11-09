@@ -1127,7 +1127,14 @@ class CollectProjectTest(unittest.TestCase):
         self.assertIn("startup-fail-seeded (us-central1-a)", entry["notes"])
         self.assertEqual(
             entry[cf.NOTED_OBJECTS_KEY],
-            [{"check": cf.STARTUP_SLUG, "object": "ComputeInstance/us-central1-a/startup-fail-seeded"}],
+            [
+                {
+                    "check": cf.STARTUP_SLUG,
+                    "object": "ComputeInstance/us-central1-a/startup-fail-seeded",
+                    "command": "gcloud compute instances get-serial-port-output startup-fail-seeded "
+                    "--zone=us-central1-a --port=1 --project=proj-1",
+                }
+            ],
         )
 
     def test_a_fresh_console_is_still_a_finding(self):
@@ -1227,7 +1234,14 @@ class CollectProjectTest(unittest.TestCase):
         # `finish` can refuse a resolve on the eleventh instance too.
         self.assertEqual(
             entry[cf.NOTED_OBJECTS_KEY],
-            [{"check": cf.STARTUP_SLUG, "object": f"ComputeInstance/z1/vm-{i:02d}"} for i in range(13)],
+            [
+                {
+                    "check": cf.STARTUP_SLUG,
+                    "object": f"ComputeInstance/z1/vm-{i:02d}",
+                    "command": f"gcloud compute instances get-serial-port-output vm-{i:02d} --zone=z1 --port=1 --project=proj-1",
+                }
+                for i in range(13)
+            ],
         )
 
     def test_the_failed_project_info_fallback_does_not_demand_a_run_marker(self):

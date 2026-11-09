@@ -322,6 +322,13 @@ collector_ and says what releases it — the collector no longer emitting it, or
 This is a hold, not a rejection: the model is allowed to reject a candidate as a false positive, so
 a dropped candidate cannot be refused the way a dropped cluster is.
 
+A noted object (`clusters[].noted_objects`, a check the collector ran but whose result it could not
+see) is held the same way, but only where the previous ledger carries a finding on it: the run
+cannot see that finding go away. A noted object that no previous finding names holds nothing, and a
+dry run, which reads no ledger, previews none. The held rows, the held comment, the `/remediate`
+deferral and the no-forge summary say that the collector could not see the result, not that it
+still flags the object; the held comment marks such a finding _not visible to the collector_.
+
 The ledger body is the persistence: `previous_ids` is parsed out of the hidden marker of the body
 the previous run published — the copy the report store kept
 ([report store design](fleet-audit-report-store.md)), not the issue fetched back from GitHub, except
@@ -332,7 +339,8 @@ longer named the finding, and a clean run closed the ledger over it with its pul
 the held set for a run is defined on the marker: the previous body's marker ids ∩ `still_flagged_ids`,
 less the ids the document carries. The identity of each held entry — check, cluster, namespace,
 object, and the command that produced it — comes from the manifest candidate that still emits it,
-which is what the collector vouches for; the title is the previous body's where its heading
+which is what the collector vouches for, or for a noted object from its `noted_objects` entry, with
+the object's own read as the command; the title is the previous body's where its heading
 survived and is otherwise built from the check and the object. That set drives the `HELD` merge on
 a clean run, the exclusion from `resolved`, and the carried rows on a findings run.
 
@@ -537,7 +545,8 @@ no sweep. Every id on the line, `unpublished_candidates[].id` included, is the l
 (`published_id`: derived, then clipped at `MAX_FINDING_ID`).
 
 They are absent, not empty, on a run without the flag, so the line a stream without a collector
-prints is unchanged. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
+prints is unchanged. A run whose targets carry `notes` (adopted from the manifest, §2) also has
+`notes`, a list of `{target, note}`, on every status. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
 a `finish` a worker ran never does.
 
 ### 3.7 The precheck — `manifest_delta`, `precheck`

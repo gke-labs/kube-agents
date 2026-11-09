@@ -25944,6 +25944,8 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
 # A target's note, as the GCE collector writes one when a serial console
 # has rotated past the last startup-script run.
 ROTATED_NOTE = "netpol-missing: the status of 1 object is not visible: Namespace/a."
+# The noted object's own read, as the collector records it on the entry.
+NOTED_READ = "kubectl --context prod-us-east get networkpolicy -n payments -o json"
 
 
 class TestScopeNotesReachTheReader(HarnessTestCase):
@@ -25960,7 +25962,7 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         manifest["clusters"][0]["notes"] = ROTATED_NOTE
         if noted_objects:
             manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
-                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a"}
+                {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/a", "command": NOTED_READ}
             ]
         return manifest
 
@@ -25992,6 +25994,16 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "OPENED")
         self.assertEqual(payload["notes"], [{"target": "prod-us-east", "note": ROTATED_NOTE}])
+
+    def test_a_dry_run_previews_no_noted_object_as_held(self):
+        """The dry run reads no ledger, so it cannot know that a noted object
+        is carried; it does not preview one as still flagged."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(findings=[make_finding(fid="b", title="Bravo finding")])
+        rc = self.run_finish(doc, ["--dry-run", "--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn(derived_id(fid="a"), self.out)
 
     def test_a_run_without_notes_prints_no_notes_key(self):
         self.harness.replies = {"issue-list": issues_view([])}
@@ -26104,6 +26116,8 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         # A noted object has its own wording: the collector does not flag it.
         self.assertIn("1 of them the collector does not flag", body)
         self.assertIn("could not see the result; the target's notes say why", body)
+        # The row shows the object's own read, not the check's joined record.
+        self.assertIn(f"`{NOTED_READ}`", body)
         self.assertNotIn("there this run and still flags this object", body)
         # The control: with no noted object, `a` is resolved and its pull
         # request is closed.
@@ -26113,16 +26127,16 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
 
 
     def test_a_clean_run_keeps_the_pull_request_of_a_noted_object(self):
-        """The clean branch's stale-close pass reads the same held set."""
-        self.harness.replies = {
-            "issue-list": issues_view([]),
-            "proposal-list": proposals_view(
-                [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
-            ),
-        }
+        """The clean branch holds a noted finding the ledger carries, and its
+        stale-close pass reads the same held set."""
+        self.previous_a()
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(8, "platform-agent/fix-a", body=audit_report.delta_block([derived_id(fid="a")]))]
+        )
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
         self.assertEqual(rc, 0, self.err)
-        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        payload = self.stdout_json()
+        self.assertEqual((payload["status"], payload["prs_closed"]), ("HELD", []))
         self.assertEqual(self.harness.forge_calls("proposal-close"), [])
 
 
@@ -27824,9 +27838,10 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(payload["prs_closed"], [])
 
-    def test_a_clean_run_over_a_lost_store_names_a_noted_object_as_not_flagged(self):
-        """When the only id the document does not carry is a noted object, the
-        gap does not say that the collector still flags something."""
+    def test_a_noted_object_no_ledger_carries_is_not_a_flagged_lost_memory(self):
+        """No record shows that the ledger has a finding on the noted object,
+        so it holds nothing: the gap is the one with the way out, not one that
+        says the collector still flags something."""
         self.replay_lost_store()
         manifest = _full_manifest()
         manifest["clusters"][0][audit_report.NOTED_OBJECTS_KEY] = [
@@ -27835,7 +27850,7 @@ class TestFinishManifestFlag(HarnessTestCase):
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
         self.assertEqual(rc, 0, self.err)
         payload = self.stdout_json()
-        self.assertIn(audit_report.LOST_MEMORY_NOTED_GAP, payload["coverage_gaps"])
+        self.assertIn(audit_report.LOST_MEMORY_UNGUARDED_GAP, payload["coverage_gaps"])
         self.assertNotIn(audit_report.LOST_MEMORY_GAP, payload["coverage_gaps"])
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
@@ -32778,7 +32793,7 @@ class TestNoForge(BaseTestCase):
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
         (fid,) = json.loads((self.store() / "latest.json").read_text())["current_ids"]
-        self.patch_attr("still_flagged_ids", lambda manifest, data: {fid})
+        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {fid})
         doc = make_doc()
         doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
         self.record_run(repo=audit_report.NO_FORGE_REPO, context=["acme/context"], audit=AUDIT)
@@ -32795,7 +32810,7 @@ class TestNoForge(BaseTestCase):
         kept = make_doc(findings=THREE_SEVERITIES[1:])
         kept_ids = set(audit_report.finding_ids(audit_report.load_findings(self.write_findings(kept), AUDIT)["findings"]))
         (left_out,) = previous - kept_ids
-        self.patch_attr("still_flagged_ids", lambda manifest, data: {left_out})
+        self.patch_attr("still_flagged_ids", lambda manifest, data, carried=(): {left_out})
 
         out = self.finish(kept)
 

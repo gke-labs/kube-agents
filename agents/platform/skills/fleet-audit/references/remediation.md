@@ -54,7 +54,10 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   never carried is named only on
   the run's JSON line as an unpublished candidate; and an id under _Not re-checked this run_ is
   held until a run checks its target, and the reply says the run did not read or did not check
-  that target. An id the collector still flags gets the collector's wording. Either way there is no finding to open a pull
+  that target. An id the collector still flags gets the collector's wording. An id held because a
+  target's `noted_objects` names it gets its own wording: the collector ran the check but could not
+  see the result, so the run cannot see the finding go away, and the id is held until the collector
+  can see the object again. Either way there is no finding to open a pull
   request from — on the findings branch and on the clean branch alike, since "no longer reproduces"
   would be false there. A run whose report store has no trusted record of the open ledger and that passed no manifest cannot
   know which ids are held, so it answers no `/remediate` at all; the next run with a trusted record answers
@@ -134,7 +137,8 @@ Exit 2 means nothing was published, unless the line is `BROKER UNAVAILABLE`: the
 opened before the broker went stands, and re-running the same `remediate` once it answers adopts it
 and opens the rest. Otherwise read the message before reporting why: a named id is not in
 the document at all; a named id is held by the collector (given the same `--manifest-file` `finish`
-had, the message says so instead of "not in the document"); a named target is not a `manifest`; or
+had, the message says so instead of "not in the document", and for a noted object it says that the
+collector could not see the result); a named target is not a `manifest`; or
 _every_ named target was refused because its file is not readable inside the workspace. The first
 three are fixed by dropping the bad id and asking again; only the last is about writing manifests.
 

@@ -489,7 +489,7 @@ ROTATED_NOTE_MORE = ", and {more} more"
 # The manifest key that holds the target's notes.
 NOTES_KEY = "notes"
 # The manifest key that lists every instance the note covers, with no limit,
-# as `{check, object}`. `finish` refuses a `resolved_because` for one of
+# as `{check, object, command}`, `command` being the instance's own read. `finish` refuses a `resolved_because` for one of
 # them: the audit did not see that finding go away.
 NOTED_OBJECTS_KEY = "noted_objects"
 # An instance's finding identity (`check_startup_script`).
@@ -1336,7 +1336,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 # no longer in it. No failure line here proves nothing, so the
                 # note below says so; GKE nodes are outside §2.1's universe.
                 rotated.append(f"{instance_name} ({zone})")
-                rotated_objects.append(INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name))
+                rotated_objects.append(
+                    (INSTANCE_OBJECT_FORMAT.format(zone=zone, name=instance_name), shlex.join(argv))
+                )
 
         if not instances:
             not_applicable.append(
@@ -1381,7 +1383,12 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
             if len(rotated) > len(shown):
                 names += ROTATED_NOTE_MORE.format(more=len(rotated) - len(shown))
             notes.append(ROTATED_SERIAL_NOTE.format(count=len(rotated), names=names))
-            noted_objects += [{"check": STARTUP_SLUG, "object": obj} for obj in sorted(rotated_objects)]
+            # Each with its own read: the slug's joined `commands` record can
+            # be clipped before this instance's read.
+            noted_objects += [
+                {"check": STARTUP_SLUG, "object": obj, "command": command}
+                for obj, command in sorted(rotated_objects)
+            ]
 
         # --- 2.2 MIG convergence -------------------------------------------- #
         migs = gated(

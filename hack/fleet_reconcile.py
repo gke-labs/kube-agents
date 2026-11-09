@@ -261,12 +261,21 @@ WARNING_MARKER = "applied.json not written: %s"
 # either goes on a gcloud command line.
 STARTUP_FAIL_ADDRESS = "google_compute_instance.startup_fail"
 STARTUP_FAIL_NAME_RE = re.compile(r"^startup-fail-[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
-ZONE_RE = re.compile(r"^[a-z]+-[a-z]+[0-9]+-[a-z]$")
+ZONE_RE = re.compile(r"[a-z]+-[a-z]+[0-9]+-[a-z]")
 # A reset waits for its zone operation, which takes seconds. No reset starts
 # once a termination is under way, but one already in flight runs to this
 # ceiling, so it ends inside the drain with the release margin left over.
 RESET_TIMEOUT_SECONDS = WORKER_DRAIN_SECONDS - WORKER_DRAIN_MARGIN_SECONDS
 REPORT_KEY_REFRESH = "startup_fail_reset"
+# The keys of that report field.
+REFRESH_RESULT_KEY = "result"
+REFRESH_DETAIL_KEY = "detail"
+REFRESH_INSTANCE_KEY = "instance"
+REFRESH_ZONE_KEY = "zone"
+# The state read before the plan has its own ceiling inside the project's, so
+# a hung read costs the reset and leaves the plan its time. `tofu show` of a
+# state takes seconds.
+STATE_READ_TIMEOUT_SECONDS = 120
 REFRESH_RESET = "reset"
 REFRESH_FAILED = "failed"
 REFRESH_SKIPPED = "skipped"
@@ -665,7 +674,7 @@ def startup_fail_instance(state_json):
             continue
         values = resource.get("values") or {}
         name, zone = str(values.get("name") or ""), str(values.get("zone") or "")
-        if not STARTUP_FAIL_NAME_RE.match(name) or not ZONE_RE.match(zone):
+        if not STARTUP_FAIL_NAME_RE.match(name) or not ZONE_RE.fullmatch(zone):
             raise ReconcileError("%s has a name or zone outside the expected shape" % STARTUP_FAIL_ADDRESS)
         return name, zone
     return None
@@ -705,11 +714,16 @@ def reconcile_project(project, runner=tofu_runner, dry_run=False, timeout=PROJEC
                     env=env,
                 )
             if refresh and extras is not None and not dry_run:
+                # A state read that fails, runs past its own ceiling or cannot
+                # start costs the reset only: a warning, and the plan runs. A
+                # termination still propagates.
                 try:
-                    state = _tofu(["show", "-json", "-no-color"], runner, deadline, env=env)
+                    state = _tofu(["show", "-json", "-no-color"], runner, min(deadline, clock() + STATE_READ_TIMEOUT_SECONDS), env=env)
                     extras[EXTRA_STARTUP_FAIL_INSTANCE] = startup_fail_instance(state.stdout)
                 except ReconcileError as exc:
                     extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR] = str(exc)
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR] = "tofu show: %s: %s" % (type(exc).__name__, exc)
             planned = _tofu(
                 [
                     "plan",
@@ -1017,15 +1031,15 @@ def reset_startup_fail(project, extras):
     or None). Only the one instance the state recorded, by name and zone."""
     if terminating():
         # The drain waits for this worker to release its project.
-        return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_TERMINATING}, None
+        return {REFRESH_RESULT_KEY: REFRESH_SKIPPED, REFRESH_DETAIL_KEY: REASON_REFRESH_TERMINATING}, None
     if EXTRA_STARTUP_FAIL_LOOKUP_ERROR in extras:
         why = extras[EXTRA_STARTUP_FAIL_LOOKUP_ERROR]
-        return {"result": REFRESH_FAILED, "detail": why}, WARNING_REFRESH % why
+        return {REFRESH_RESULT_KEY: REFRESH_FAILED, REFRESH_DETAIL_KEY: why}, WARNING_REFRESH % why
     instance = extras.get(EXTRA_STARTUP_FAIL_INSTANCE)
     if not instance:
-        return {"result": REFRESH_SKIPPED, "detail": REASON_REFRESH_NOT_IN_STATE}, None
+        return {REFRESH_RESULT_KEY: REFRESH_SKIPPED, REFRESH_DETAIL_KEY: REASON_REFRESH_NOT_IN_STATE}, None
     name, zone = instance
-    field = {"instance": name, "zone": zone}
+    field = {REFRESH_INSTANCE_KEY: name, REFRESH_ZONE_KEY: zone}
     argv = ["gcloud", "compute", "instances", "reset", name, "--zone=%s" % zone, "--project=%s" % project, "--quiet"]
     try:
         result = gcloud_runner(argv, capture_output=True, text=True, timeout=RESET_TIMEOUT_SECONDS)
@@ -1033,9 +1047,9 @@ def reset_startup_fail(project, extras):
         why = "%s: %s" % (type(exc).__name__, exc)
     else:
         if result.returncode == 0:
-            return dict(field, result=REFRESH_RESET), None
+            return dict(field, **{REFRESH_RESULT_KEY: REFRESH_RESET}), None
         why = _tail(result.stderr or result.stdout)
-    return dict(field, result=REFRESH_FAILED, detail=why), WARNING_REFRESH % why
+    return dict(field, **{REFRESH_RESULT_KEY: REFRESH_FAILED, REFRESH_DETAIL_KEY: why}), WARNING_REFRESH % why
 
 
 def _line(project, outcome):
@@ -1088,7 +1102,7 @@ def _record(project, outcomes, runner, dry_run, run=None):
         try:
             field, warning = reset_startup_fail(project, extras)
         except boskos_pool.Terminated:
-            run.mark(project, **{REPORT_KEY_REFRESH: {"result": REFRESH_FAILED, "detail": REASON_REFRESH_TERMINATED}})
+            run.mark(project, **{REPORT_KEY_REFRESH: {REFRESH_RESULT_KEY: REFRESH_FAILED, REFRESH_DETAIL_KEY: REASON_REFRESH_TERMINATED}})
             outcomes[project] = (outcomes[project][0], "%s; %s" % (outcomes[project][1], WARNING_REFRESH % REASON_REFRESH_TERMINATED))
             _line(project, outcomes[project])
             raise
