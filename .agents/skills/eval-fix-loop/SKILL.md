@@ -117,11 +117,11 @@ Refuse: a fixture name or a test id in product code; a phrase list edited to mat
 
 ## Step 6: green
 
-On the final head: run the case three times; run every sibling case of the same root cause once; read the second model's record for the case if the store has one. All three must pass on the deterministic checks. A judged score moving is not a pass.
+On the final head: run the case three times; run every sibling case of the same root cause once. All three must pass on the deterministic checks. A judged score moving is not a pass.
 
 ## Step 7: ship
 
-Open the pull request from the template: the red (install, model, commit, failing check and reason, one line of the report), the three greens (run directories), the class and its evidence, the markers flipped (`expected_fail: true` removed for the cases the fix proves), the registration line, and the self-review from `/pr-preflight`. A declared-gap case names its gap issue and never `Closes` it; a reviewer is never named by hand on any pull request (the review check's green assigns one).
+Before the push, run the whole set the CI shards run, not the touched files: `make test-python` and `cd bench && uv run pytest -q tests`; a change to a shared writer (a hand-off's compose, a finding line, a collector's object) reaches every fixture derived from it. Derived fixtures regenerate with their own writer, never by hand: the planted raw reports under `bench/tf/prebuilt/bootstrap-ranking/` from their `*.cards.json` (see `bench/tests/test_bootstrap_ranking.py`), the shared chat cases with `agents/chat/scripts/test_inventory_card.py --write-cases` then prettier. Open the pull request from the template: the red (install, model, commit, failing check and reason, one line of the report), the three greens (run directories), the class and its evidence, the markers flipped (`expected_fail: true` removed for the cases the fix proves), the registration line, and the self-review from `/pr-preflight`. A declared-gap case names its gap issue and never `Closes` it; a reviewer is never named by hand on any pull request (the review check's green assigns one).
 
 ## Step 8: record
 
