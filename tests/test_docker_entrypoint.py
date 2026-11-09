@@ -1714,6 +1714,52 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         self.assertEqual(kept, "stale\n")
         self.assertEqual(leftovers, [], "a failed rename left its temporary file behind")
 
+    def test_a_symlinked_plugin_destination_is_left_alone(self):
+        # A symlink at the destination is not the image's copy to refresh: the loop
+        # skips it, and the next plugin is still refreshed.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            elsewhere = pathlib.Path(tmp) / "mounted"
+            for name in ("agent_roster", "chat_metrics"):
+                (image / "plugins" / name).mkdir(parents=True)
+                (image / "plugins" / name / "plugin.py").write_text("image\n", encoding="utf-8")
+            (pvc / "plugins").mkdir(parents=True)
+            elsewhere.mkdir()
+            (elsewhere / "plugin.py").write_text("mounted\n", encoding="utf-8")
+            (pvc / "plugins" / "agent_roster").symlink_to(elsewhere)
+            (pvc / "plugins" / "chat_metrics").mkdir()
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", "set -e\n" + _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((elsewhere / "plugin.py").read_text(encoding="utf-8"), "mounted\n")
+            self.assertTrue((pvc / "plugins" / "agent_roster").is_symlink())
+            self.assertEqual((pvc / "plugins" / "chat_metrics" / "plugin.py").read_text(encoding="utf-8"), "image\n")
+
+    def test_a_refreshed_plugin_file_keeps_the_images_mtime(self):
+        # The copy preserves the image file's mtime (cp -p), as the cluster loop's does, so a
+        # later start reads the refreshed file as the image's, not as one written on the volume.
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / "plugins" / "chat_metrics").mkdir(parents=True)
+            (image / "plugins" / "chat_metrics" / "plugin.py").write_text("image\n", encoding="utf-8")
+            image_time = time.time() - 86400
+            os.utime(image / "plugins" / "chat_metrics" / "plugin.py", (image_time, image_time))
+            (pvc / "plugins" / "chat_metrics").mkdir(parents=True)
+            (pvc / "plugins" / "chat_metrics" / "plugin.py").write_text("stale\n", encoding="utf-8")
+            subprocess.run(
+                ["bash", "-c", _plugin_refresh_block(image)],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual(int((pvc / "plugins" / "chat_metrics" / "plugin.py").stat().st_mtime), int(image_time))
+
     def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
         # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
         # an old plugin beside the new script writes no greeting hold.
