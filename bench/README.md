@@ -176,7 +176,9 @@ and no pull request and no nightly runs a case named there. A certification case
 case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
 `scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
 outside the roster, and the script refuses an entry that is also in `presubmit-cases.txt` or
-`nightly-cases.txt`, so one case holds one record on one lane. The blocking roster is a subset of
+`nightly-cases.txt`, so one case holds one record on one lane. The roster starts with cases of its own; a nightly case
+joins it in a later change by moving its line out of the nightly file, and until then the page
+certifies a nightly case from its nightly record. The blocking roster is a subset of
 the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
 the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked

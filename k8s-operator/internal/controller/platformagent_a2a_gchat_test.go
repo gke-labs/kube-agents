@@ -189,6 +189,8 @@ func TestDisplayModeFollowsTheCRField(t *testing.T) {
 // gate holds it in a fake client).
 func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
+	// The unelected render; the election's env is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	for _, tc := range []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent

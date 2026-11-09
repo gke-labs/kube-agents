@@ -18,6 +18,12 @@ earlier one. The settings (tools, model, parameters) get their own hash with a
 fresh mapping, IPs kept literal only for a CIDR in the settings themselves,
 and the conversation's first-seen time (its first message's) as "now". This
 runs on the proxy's background analysis thread, off the agent's path.
+
+Replay mode also reads the first-seen times to decide a match: before a
+lookup, on the request's path, it notes each message's (first_seen_times),
+and checks a slot's recorded answer against the slot's prefix normalized as
+of when the prefix's last message arrived, as record mode normalized that
+request (normalizer.answer_variant).
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import normalizer
 
@@ -47,7 +53,9 @@ class DiagnosisHasher:
         self._lock = threading.Lock()
 
     def _first_seen(self, raw: str, now: float) -> float:
-        key = _digest(raw)
+        return self._first_seen_digest(_digest(raw), now)
+
+    def _first_seen_digest(self, key: str, now: float) -> float:
         with self._lock:
             seen = self.first_seen.get(key)
             if seen is None:
@@ -55,6 +63,15 @@ class DiagnosisHasher:
                 while len(self.first_seen) > self.capacity:
                     self.first_seen.popitem(last=False)
             return seen
+
+    def first_seen_times(self, messages: List[Any], now: float) -> List[float]:
+        """When this proxy first saw each message, noting `now` for the ones it has not seen."""
+        return self.first_seen_with_digests(messages, now)[1]
+
+    def first_seen_with_digests(self, messages: List[Any], now: float) -> Tuple[List[str], List[float]]:
+        """Each message's digest, and when this proxy first saw it (noting `now` for a new one)."""
+        digests = [_digest(json.dumps(m, sort_keys=True, ensure_ascii=False)) for m in messages]
+        return digests, [self._first_seen_digest(d, now) for d in digests]
 
     def settings_hash(self, body: Dict[str, Any], context: Dict[str, str], now: float) -> str:
         """The request's settings alone, normalized without any message's context."""
@@ -69,11 +86,17 @@ class DiagnosisHasher:
         return normalizer.stable_hash({"settings": settings, "context": context})
 
     def hashes(self, messages: List[Any], now: float) -> List[str]:
+        return self.normalized(messages, now)[0]
+
+    def normalized(self, messages: List[Any], now: float) -> Tuple[List[str], List[Any]]:
+        """The diagnosis hashes and the normalized messages they are hashes of."""
         norm = normalizer.Normalizer(now, keep_ips=False)
-        out = []
+        hashes, walked = [], []
         for message in messages:
             raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
             norm.now = self._first_seen(raw, now)
             norm.keep_ips = norm.keep_ips or normalizer.CIDR_RE.search(raw) is not None
-            out.append(normalizer.stable_hash(norm.walk(message))[: normalizer.MESSAGE_HASH_HEX_CHARS])
-        return out
+            value = norm.walk(message)
+            walked.append(value)
+            hashes.append(normalizer.stable_hash(value)[: normalizer.MESSAGE_HASH_HEX_CHARS])
+        return hashes, walked

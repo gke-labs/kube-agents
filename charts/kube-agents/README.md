@@ -992,7 +992,19 @@ boolean. A duration that the watcher cannot read keeps its default, and the cont
 An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
-gives each setting's meaning and default.
+gives each setting's meaning and default. Alert excludes are under
+`platformAgent.harness.eventWatcher.alertExclude`.
+
+`platformAgent.harness.eventWatcher.alertExclude` is a list of rules for events that open no
+incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
+`spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
+holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
+API server would refuse fails the render. A change rolls the agent pod. On an existing install,
+apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
+instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
+removes an `enabled: false` set on the CR by hand. The
+[`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
+gives the rule parts, how they match, and an example.
 
 `platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
 later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
@@ -1201,7 +1213,7 @@ web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
-another host, add a forge with a credential, add a GitHub forge at a new host, or
+another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
 change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
@@ -1274,7 +1286,15 @@ It also counts the standing pods the operator renders only behind an operator fl
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
 is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
 and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
-as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
+as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
+election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
+`A2A_GATEWAY_ELECTION` to `false`. It also counts the
+scope publisher's Job pod, sized in `files/transient-pods.yaml`, which the operator starts every
+15 minutes, one at a time, where the gateway pod admission policy is on (rendered by the chart,
+or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.scope` names a
+folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
+hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
+provisioning Job, so it overstates both. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
@@ -1335,7 +1355,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, or under `platformAgent.mode: next` a damaged `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible
@@ -1551,6 +1571,9 @@ helm uninstall kube-agents -n kubeagents-system
   operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
+- `files/transient-pods.yaml` is hand-kept too: the scope publisher's Job pod, which runs on a
+  schedule and which no golden declares a scope for. `TestTheChartCountsTheScopePublishersJobPod`
+  holds its size, its one-at-a-time count and its scope fields to the operator.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and

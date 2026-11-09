@@ -195,8 +195,8 @@ COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
 # The bot's issue carries this, so it re-finds its own whatever the title
 # has been edited to; an issue without one (a human's) is adopted when its
 # title or body names the case as a whole word. A bot issue is matched on
-# its marker alone: its body quotes failure reasons, which can name another
-# case.
+# its marker alone: an infra issue's body quotes infra reasons, which can name
+# another case.
 # The three kinds of issue, each with a marker of its own: a case's domain
 # bug, a case kept from running by infrastructure, a part's lost nights.
 KIND_RED = "nightly-red"
@@ -223,10 +223,6 @@ NAME_IN_TRANSCRIPT_RE = r"\beval_{name}_rep[0-9]+\.log"
 # GitHub's limits: a longer title or body is refused and files nothing.
 TITLE_MAX_CHARS = 256
 ISSUE_BODY_MAX_CHARS = 65536
-# Distinct failing-check reasons quoted per night, and their length
-# (nightly.REASON_MAX_CHARS, the collector's own cap).
-REASONS_PER_NIGHT = 3
-REASON_MAX_CHARS = nightly.REASON_MAX_CHARS
 UNKNOWN = "unknown"
 # The domain owner in an issue body; a domain with no owner on record is
 # said so rather than @-mentioning an account named "unknown".
@@ -256,14 +252,15 @@ Nightly report: {nightly_url}
 
 Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here when the case passes every repetition again; it never closes the issue.
 """
-NIGHT_LINE = "- {date}: {passed}/{graded} passed{infra} · [run]({run_url}) · [transcript]({transcript_url})"
-NIGHT_LINE_NO_LINK = "- {date}: {passed}/{graded} passed{infra}"
-# A reason is quoted as code: it can carry `@login` or `org/repo#N`, which
-# GitHub would otherwise turn into a mention or a cross-reference.
-REASON_LINE = "  - failed: {reason}"
+# One line per night: the date and the private links. The night's pass count
+# and the checks' reasons are on the dashboard behind them; the repository is
+# public, so the issue carries neither.
+NIGHT_LINE = "- {date} · [run]({run_url}) · [transcript]({transcript_url})"
+NIGHT_LINE_NO_LINK = "- {date}"
+# An infra reason is quoted as code: it can carry `@login` or `org/repo#N`,
+# which GitHub would otherwise turn into a mention or a cross-reference.
 # What a quoted reason's `<` becomes: SINGLE LEFT-POINTING ANGLE QUOTATION MARK.
 MARKER_SAFE_LT = "\u2039"
-NO_REASON_LINE = "  - (no reason recorded)"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
 # A refused login is shown as code, not @-mentioned: GitHub just said it is
@@ -277,7 +274,7 @@ UNASSIGNED = "**Unassigned** ({why})."
 ASSIGNEES_FIELD = gate_issue.ASSIGNEES_FIELD
 RECOVERY_COMMENT = """\
 {marker}
-`{case}` passed every graded repetition ({passed}/{graded}) on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
+`{case}` passed every graded repetition on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
 """
 INFRA_TRIAGE = """\
 **What triage decides (within a week)**
@@ -402,7 +399,7 @@ def resolve_assignee(owner: str | None, domain: str, domain_owners: dict[str, st
 def graded_nights(data: dict) -> dict[str, list[dict]]:
     """``{case: [night verdict, ...]}``, oldest first, over the newest
     LOOKBACK_NIGHTS dates on record. A verdict is ``{date, build, outcome,
-    passed, graded, infra, reasons, run_url, transcript_url}`` for a night
+    passed, graded, infra, run_url, transcript_url}`` for a night
     that graded the case (module docstring: what is skipped)."""
     nights = nightly.group_nights(nightly.sorted_nightly_runs(data))
     dates = sorted({nightly.night_date(nightly.night_parts(n)[0]) for n in nights} - {None})
@@ -431,11 +428,6 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                 # Claimed only by a verdict: an ungraded line in one part does
                 # not hide another part's verdict for the case that night.
                 seen.add(name)
-                reasons = []
-                for rep in classify.task_reps(task):
-                    reason = classify.clean_reason(rep.get("reason"))[:REASON_MAX_CHARS]
-                    if classify.rep_kind(rep) == classify.REP_FAIL and reason and reason not in reasons:
-                        reasons.append(reason)
                 by_date.setdefault(day, {})[name] = {
                     "date": day.isoformat(),
                     "started": run.get("started"),
@@ -445,7 +437,6 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                     "passed": counts["pass"],
                     "graded": counts["pass"] + counts["fail"],
                     "infra": counts["infra"] + counts["ceiling"] + counts["fixture"],
-                    "reasons": reasons[:REASONS_PER_NIGHT],
                     "run_url": nightly.build_url(run),
                     "transcript_url": nightly.transcript_url(run, name),
                 }
@@ -482,7 +473,7 @@ def recovery_night(verdicts: list[dict], news=lambda v: True) -> dict | None:
 
 
 def quoted(text: str | None) -> str:
-    """``text`` as inline code on one line (REASON_LINE says why), with
+    """``text`` as inline code on one line (the comment above MARKER_SAFE_LT says why), with
     ``<`` swapped for a look-alike so a reason can never carry a bot marker
     (``<!-- kube-agents-bot:... -->``) that dedupe would read as this
     issue's."""
@@ -492,12 +483,8 @@ def quoted(text: str | None) -> str:
 def night_block(streak: list[dict]) -> str:
     lines = []
     for v in reversed(streak):
-        infra = f", {v['infra']} infra" if v["infra"] else ""
         template = NIGHT_LINE if v["run_url"] else NIGHT_LINE_NO_LINK
-        lines.append(template.format(date=v["date"], passed=v["passed"], graded=v["graded"], infra=infra, run_url=v["run_url"], transcript_url=v["transcript_url"]))
-        lines.extend(REASON_LINE.format(reason=quoted(reason)) for reason in v["reasons"])
-        if not v["reasons"]:
-            lines.append(NO_REASON_LINE)
+        lines.append(template.format(date=v["date"], run_url=v["run_url"], transcript_url=v["transcript_url"]))
     return "\n".join(lines)
 
 

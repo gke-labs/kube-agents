@@ -469,6 +469,9 @@ class GeneratedAnswerTest(unittest.TestCase):
                                               unstorable=["client_disconnected"])],
             "no answer hash": [presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"], roles=ANSWER_ROLES[:2],
                                          answer_hash=None)],
+            # A replay-mode answer served from the cache: the model never gave it in this run.
+            "served from the cache": [dict(presubmit("b-ask", 9, "10", "b2", "BQ", ["sys", "task"],
+                                                     roles=ANSWER_ROLES[:2]), mode="replay", served=True)],
         }
         for name, asked in cases.items():
             with self.subTest(name):
@@ -951,7 +954,15 @@ class LoadTest(unittest.TestCase):
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
         self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1,
-                                   "kind_mismatch": 0, "off_layout_files": 0})
+                                   "kind_mismatch": 0, "off_layout_files": 0, "served": 0})
+
+    def test_a_served_replay_line_is_skipped_not_counted_unstorable(self):
+        # As the proxy logged served lines before it stopped judging them.
+        served = dict(presubmit("s", 2, "10", "b", "A", ["a"], unstorable=["no_model_group_header"]), mode="replay", served=True)
+        records, skipped = analyze_shadow.load(write([served, presubmit("p", 3, "10", "b", "A", ["a"])]))
+        self.assertEqual([r.request_id for r in records], ["p"])
+        self.assertEqual(skipped["served"], 1)
+        self.assertEqual(analyze_shadow.health(records, skipped)["unstorable_lines"], 0)
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])

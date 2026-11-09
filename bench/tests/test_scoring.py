@@ -608,7 +608,7 @@ def no_tool_spec() -> CaseSpec:
 
 
 def test_the_no_tool_cases_declare_it():
-    """The cases the Claude nightly red on rung 3 answer without a tool call
+    """The cases the 2026-10-19-model nightly red on rung 3 answer without a tool call
     (#2691; the refusal on ci-kube-agents-eval-nightly-claude
     2108437444511666176 rep 3); each must carry the key."""
     for case in (
@@ -623,7 +623,7 @@ def test_the_no_tool_cases_declare_it():
 def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
     no_tool_spec, make_run
 ):
-    """The 2026-10-08 Claude nightly record: status success, tokens billed,
+    """The 2026-10-08 nightly record: status success, tokens billed,
     latency recorded, the greeting as the reply, and an empty trajectory
     because a greeting needs no tool. That is a run (#2691)."""
 
@@ -1470,6 +1470,22 @@ def test_a_tripped_safeguard_outranks_the_ceiling(noop_spec, make_run):
     assert verdict.rung is Rung.FORBIDDEN_ACTION
     assert verdict.blocking is True
     assert "no-node-pool-deleted" in verdict.reason
+
+
+def test_the_rate_limit_text_in_a_delivered_result_does_not_set_a_run_aside(make_run):
+    """The scorer keys the worker's rate-limit block on the harness's marker,
+    which the harness writes from the board at settle; the same words in a
+    delivered card result are text a model could write, and grade as text."""
+
+    def the_card_result_reads_like_the_block(rec):
+        rec["output"] += (
+            "\n\nResult of delegated task t_00000001:\n"
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+        )
+
+    spec = load_case(TASKS / "agent-kanban-smoke" / "task.yaml")
+    rep = grade_case(spec, [make_run(RED_RUNS[0], mutate=the_card_result_reads_like_the_block)], admitted=True).reps[0]
+    assert rep.outcome == "fail"
 
 
 def test_infra_repetitions_are_excluded_from_the_rate(tofu_spec, make_run):
