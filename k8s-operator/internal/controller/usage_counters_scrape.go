@@ -838,7 +838,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						continue
 					}
 					if name == kanbanDispatcherFailedTicksSeries {
-						if len(dispatcher.Failing) >= usageDispatcherBoardCeiling {
+						if len(dispatcher.Failing) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64) {
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}
 						dispatcher.Failing = append(dispatcher.Failing, usageDispatcherFailure{

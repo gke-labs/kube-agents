@@ -355,8 +355,12 @@ class ChatMetrics:
             if not error_class:
                 self._dispatch_failures.pop(board, None)
                 return
-            streak = self._dispatch_failures.get(board, (0, "", 0.0))[0]
-            self._dispatch_failures[board] = (streak + 1, error_class, self._clock())
+            now = self._clock()
+            streak, _, at = self._dispatch_failures.get(board, (0, "", 0.0))
+            if now - at > DISPATCH_FAILURE_STALE_SECONDS:
+                # A streak past the window ended unseen: render had not run to drop it.
+                streak = 0
+            self._dispatch_failures[board] = (streak + 1, error_class, now)
 
     def record_negative_feedback(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)

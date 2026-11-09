@@ -161,6 +161,15 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         now[0] += 1
         self.assertEqual([("live", "OperationalError", "2")], _DISPATCH_LINE.findall(registry.render()))
 
+    def test_a_stale_streak_restarts_even_when_no_render_ran_in_between(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(70):
+            registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
     def test_an_idle_registry_renders_the_family_with_no_series(self):
         exposition = metrics.ChatMetrics().render()
         self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)

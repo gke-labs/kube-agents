@@ -1359,6 +1359,12 @@ func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
 		t.Fatalf("A2A gateway body: reading %+v, err %v; want none", reading.Dispatcher, err)
 	}
 
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 1e20`), usageChatCounters)
+	var hugeErr *usageScrapeError
+	if !errors.As(err, &hugeErr) || hugeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("a streak past int64: err %v, want a sample error", err)
+	}
+
 	many := make([]string, 0, usageDispatcherBoardCeiling+1)
 	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
 		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))
