@@ -207,16 +207,28 @@ const (
 	a2aNATSMemoryLimit   = "1Gi"
 
 	// The exporter sidecar holds one scrape's worth of /varz and /jsz JSON
-	// at a time. The /jsz payload grows with the bus's streams and
-	// consumers, which is what the memory limit leaves room for above the
-	// request. The CPU request is the stack's floor, 50m, rather than what
-	// the exporter uses idle, so a namespace LimitRange that admits the
-	// bus's other containers admits this one: a refused sidecar would keep
-	// its server out of the bus.
+	// at a time, and -jsz=all brings every consumer with it, so its memory
+	// and CPU grow with the bus's consumers (about two per AgentProfile).
+	// Measured with a synthetic /jsz: 20Mi on a dev bus with five consumers,
+	// 31Mi at 500, 90Mi and 0.7 CPU-seconds a scrape at 2,000, 121Mi and 4
+	// CPU-seconds at 5,000. The limits are sized for 2,000, the stated
+	// ceiling (about 1,000 clusters' profiles); past it the exporter nears
+	// its memory limit, and an OOM kill takes the container and so the pod's
+	// readiness. On an Autopilot cluster without Pod bursting the limit is
+	// rewritten to the request, so the ceiling there is lower: the exporter
+	// nears 96Mi before 2,000 consumers. The CPU request is the stack's
+	// floor, 50m, rather than what the exporter uses idle, so a namespace
+	// LimitRange that admits the bus's other containers admits this one: a
+	// refused sidecar would keep its server out of the bus.
 	a2aNATSExporterCPURequest    = "50m"
-	a2aNATSExporterMemoryRequest = "32Mi"
-	a2aNATSExporterCPULimit      = "100m"
-	a2aNATSExporterMemoryLimit   = "128Mi"
+	a2aNATSExporterMemoryRequest = "96Mi"
+	a2aNATSExporterCPULimit      = "500m"
+	a2aNATSExporterMemoryLimit   = "192Mi"
+	// The Go runtime's soft limit, below the container's so the exporter
+	// collects garbage before the kernel kills the container (which the
+	// supervisor loop cannot survive). GOMEMLIMIT takes a byte count with an
+	// IEC suffix.
+	a2aNATSExporterGoMemLimit = "160MiB"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
@@ -4898,16 +4910,28 @@ func a2aNATSLifecycle(replicas int) *corev1.Lifecycle {
 // out. The exporter labels its series with the URL it reads, the same on
 // every server; the collector's own pod label tells the servers apart.
 //
-// No preStop, unlike the server: the exporter stops its listener and exits
-// on SIGTERM, which the kubelet sends it at the start of the pod's grace
-// period while the server's lame duck runs (a2aNATSLifecycle). The bus is
-// unscraped for that window, which costs one or two missing samples per
-// roll.
+// The exporter runs under a2aNATSExporterSupervisor rather than as the
+// container's own process. The pod is Ready only while every container is,
+// so an exporter that exited would take its server out of the client Service
+// and count against the bus's disruption budget; the loop keeps the
+// container running and restarts the exporter instead. A native sidecar does
+// not help: measured on GKE 1.35, one that crashes or fails its probe makes
+// the pod NotReady the same way, and one whose image will not pull keeps the
+// server from starting at all. What the loop cannot cover is an OOM kill,
+// which takes the whole container: GOMEMLIMIT sits below the memory limit so
+// the exporter collects garbage before it gets there.
+//
+// No preStop, unlike the server: the loop kills the exporter and exits on
+// SIGTERM, which the kubelet sends it at the start of the pod's grace period
+// while the server's lame duck runs (a2aNATSLifecycle). The bus is unscraped
+// for that window, which costs one or two missing samples per roll.
 func a2aNATSExporterContainer() corev1.Container {
 	monitorURL := "http://" + net.JoinHostPort(a2aNATSExporterMonitorHost, strconv.Itoa(a2aNATSMonitorPort))
 	return corev1.Container{
-		Name:  a2aNATSExporterContainerName,
-		Image: a2aNATSExporterImage(),
+		Name:    a2aNATSExporterContainerName,
+		Image:   a2aNATSExporterImage(),
+		Command: []string{"/bin/sh", "-c", a2aNATSExporterSupervisor, a2aNATSExporterBinary},
+		Env:     []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: a2aNATSExporterGoMemLimit}},
 		Args: []string{
 			"-port=" + strconv.Itoa(int(a2aNATSMetricsPort)),
 			"-varz",
@@ -4929,6 +4953,35 @@ func a2aNATSExporterContainer() corev1.Container {
 		Resources: a2aResources(a2aNATSExporterCPURequest, a2aNATSExporterMemoryRequest, a2aNATSExporterCPULimit, a2aNATSExporterMemoryLimit),
 	}
 }
+
+// a2aNATSExporterBinary is the exporter's path in its image, which runs it
+// from /entrypoint.sh as exec "/${GO_APP}".
+const a2aNATSExporterBinary = "/prometheus-nats-exporter"
+
+// a2aNATSExporterSupervisor runs the exporter with the container's args and
+// restarts it whenever it exits, logging the exit code, after a pause that
+// doubles from 1s to 30s and starts again at 1s once a run has lasted a
+// minute, so a crashing exporter cannot spin. The shell is the container's
+// PID 1, which gets no default signal handling: the trap kills the exporter
+// (or the pause) and exits at once on TERM or INT, so a pod delete or a
+// NATS drain is not held for the grace period. The image is alpine, so sh,
+// sleep and date are busybox's.
+const a2aNATSExporterSupervisor = `trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+delay=1
+while :; do
+  started=$(date +%s)
+  "$0" "$@" &
+  pid=$!
+  wait "$pid"
+  rc=$?
+  if [ $(($(date +%s) - started)) -ge 60 ]; then delay=1; fi
+  echo "prometheus-nats-exporter exited with code $rc; restarting in ${delay}s" >&2
+  sleep "$delay" &
+  pid=$!
+  wait "$pid"
+  delay=$((delay * 2))
+  if [ "$delay" -gt 30 ]; then delay=30; fi
+done`
 
 // a2aNATSTerminationGrace is the pod's grace period: room for lame duck on a
 // cluster, the Kubernetes default on a single server, which runs none.

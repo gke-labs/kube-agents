@@ -4077,6 +4077,30 @@ spec:
             - -varz
             - -jsz=all
             - http://127.0.0.1:8222
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+              delay=1
+              while :; do
+                started=$(date +%s)
+                "$0" "$@" &
+                pid=$!
+                wait "$pid"
+                rc=$?
+                if [ $(($(date +%s) - started)) -ge 60 ]; then delay=1; fi
+                echo "prometheus-nats-exporter exited with code $rc; restarting in ${delay}s" >&2
+                sleep "$delay" &
+                pid=$!
+                wait "$pid"
+                delay=$((delay * 2))
+                if [ "$delay" -gt 30 ]; then delay=30; fi
+              done
+            - /prometheus-nats-exporter
+          env:
+            - name: GOMEMLIMIT
+              value: 160MiB
           image: natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255
           name: nats-exporter
           ports:
@@ -4084,11 +4108,11 @@ spec:
               name: nats-metrics
           resources:
             limits:
-              cpu: 100m
-              memory: 128Mi
+              cpu: 500m
+              memory: 192Mi
             requests:
               cpu: 50m
-              memory: 32Mi
+              memory: 96Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

@@ -8911,8 +8911,12 @@ func TestTheNATSPodCarriesTheExporterSidecar(t *testing.T) {
 			if !reflect.DeepEqual(exporter.Args, wantArgs) {
 				t.Errorf("exporter args = %q, want %q (the monitor port over loopback, and nothing else)", exporter.Args, wantArgs)
 			}
-			if len(exporter.Command) != 0 {
-				t.Errorf("exporter command = %q, want the image's entrypoint", exporter.Command)
+			wantCommand := []string{"/bin/sh", "-c", a2aNATSExporterSupervisor, a2aNATSExporterBinary}
+			if !reflect.DeepEqual(exporter.Command, wantCommand) {
+				t.Errorf("exporter command = %q, want the supervisor loop running %s", exporter.Command, a2aNATSExporterBinary)
+			}
+			if !reflect.DeepEqual(exporter.Env, []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: a2aNATSExporterGoMemLimit}}) {
+				t.Errorf("exporter env = %+v, want GOMEMLIMIT=%s and nothing else", exporter.Env, a2aNATSExporterGoMemLimit)
 			}
 			if len(exporter.Ports) != 1 || exporter.Ports[0].Name != a2aNATSMetricsPortName ||
 				exporter.Ports[0].ContainerPort != a2aNATSMetricsPort || (exporter.Ports[0].Protocol != "" && exporter.Ports[0].Protocol != corev1.ProtocolTCP) {
