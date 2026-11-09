@@ -3,7 +3,8 @@
 # SSH crossing drops and then runs the command sshd would have run anyway: the
 # working directory the incoming command is about to cd into, which nothing
 # creates on this side; when that directory is a kanban workspace, the
-# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables; and HERMES_HOME
+# HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE variables, and when it is a
+# cron run's, HERMES_CRON_RUN; and HERMES_HOME
 # with the kubeconfig pinned in it, from the profile the client named or,
 # failing that, from the directory when it is inside a profile home. All three
 # are set in the worker's process environment on the agent pod, and no part of
@@ -231,6 +232,29 @@ export_kanban_vars() { # export_kanban_vars <resolved cwd>
   export HERMES_KANBAN_TASK="$tid"
 }
 
+# A scheduled run's key, recovered the same way. The cron run workdir patch
+# (deploy/docker/patches/apply_cron_run_workdir.py) gives every run of a
+# cron/jobs.json job a directory of its own, `<home>/cron/runs/<job>_<execution>`,
+# and the run's commands cd into it. The name is the one thing that tells one
+# run's commands from the next's on this side of the crossing, and the
+# credential-proxy shim sends it as the exec request's `sessionId`
+# (credential_proxy_client.CALLER_LABEL_ENV), the key the broker counts a run's
+# commands on and breaks its retry loops with. Nothing else reads it. A chat
+# turn runs from no such directory and so sends no key, which is what keeps a
+# conversation out of the count. Derived from the `<...>/cron/runs/<name>`
+# prefix, so a command run from a subdirectory still reports the run, and only
+# a name in the shim's grammar is exported: the patch writes `[A-Za-z0-9._-]`
+# and nothing longer than a job id and an execution id.
+export_cron_run_var() { # export_cron_run_var <resolved cwd>
+  local path=$1 prefix rest name
+  prefix=${path%%/cron/runs/*}
+  [ "$prefix" != "$path" ] || return 0
+  rest=${path#"$prefix"/cron/runs/}
+  name=${rest%%/*}
+  [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]] || return 0
+  export HERMES_CRON_RUN="$name"
+}
+
 # HERMES_HOME, and the kubeconfig pinned inside it, recovered from the cwd the
 # same way as the kanban variables and for the same reason — the fallback for a
 # client that named no profile.
@@ -303,6 +327,7 @@ if [ -n "$script" ]; then
     # have worked into one that does not.
     mkdir -p -- "$resolved" 2>/dev/null || warn "could not create $resolved"
     export_kanban_vars "$resolved"
+    export_cron_run_var "$resolved"
     # The client's word beats the directory's. A worker's HERMES_HOME is the
     # profile it runs as; a cwd under some other profile's home is a place it
     # is working, not who it is.

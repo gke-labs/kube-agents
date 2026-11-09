@@ -2957,8 +2957,13 @@ while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
 check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+# A here-string, not `printf | grep -q`: grep exits on its first match, a
+# producer still writing dies of SIGPIPE, and under pipefail the duplicate
+# reads as absent. printf hands the pipe a few KiB per write, so on today's
+# rosters that is a rare race (the flake this replaced); past a pipe buffer
+# it is every run.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
-  if printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+  if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
     echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
     exit 1
   fi
@@ -3010,8 +3015,12 @@ gitlab_lane_matrix() { # <tier word, for the log line>
   # which check_case_entries has already proven to be a case path with a
   # directory behind it; the lane picks from the catalogue, it does not
   # register.
+  # A here-string, not `printf | grep -q`: grep exits on its first match, a
+  # producer still writing dies of SIGPIPE, and under pipefail a registered
+  # entry reads as unregistered. A rare race on today's rosters, every run
+  # past a pipe buffer; the certification check above says why.
   for ENTRY in "${GITLAB_LANE_TASKS[@]}"; do
-    if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+    if ! grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
       echo "ERROR: ${LANE_CASES_FILE}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the ${EVAL_FORGE} lane runs registered cases only." >&2
       exit 1
     fi
@@ -4199,6 +4208,10 @@ unit_cost_hint() {
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
     # then the same full drift audit as consistency-drift-outlier. Unmeasured.
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
+    # The sibling's plant plus a real scheduled drift run the stack fires and
+    # waits out: a full audit on an image without the gate, a collector and a
+    # precheck with it. Unmeasured; priced at the band plus the plant.
+    fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
