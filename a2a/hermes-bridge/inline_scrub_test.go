@@ -417,6 +417,8 @@ func TestScrubInlineSecretsAllValueColumnsAndWholeStatusValue(t *testing.T) {
 			"| Name | Decoded | Encoded |\n|---|---|---|\n| password | [redacted] | [redacted] |"},
 		{"| Name | Decoded | Encoded |\n|---|---|---|\n| password | quietpasture |",
 			"| Name | Decoded | Encoded |\n|---|---|---|\n| password | [redacted] |"},
+		{"| Key | Status | Value |\n|---|---|---|\n| api_key | quietpasture |",
+			"| Key | Status | Value |\n|---|---|---|\n| api_key | [redacted] |"},
 		{"Password (decoded): enabled quietpasture word", "Password (decoded): [redacted]"},
 		{"Password (prod): ready quietpasture", "Password (prod): [redacted]"},
 	}
