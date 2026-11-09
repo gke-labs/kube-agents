@@ -240,7 +240,8 @@ readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 # pod's shell container, the scratch directory audit_report.py writes its
 # in-flight note under, the bound on one `kubectl exec` round trip, and how
 # long a unit waits for a live run to release its own note before removing
-# it. The unit's delegation ceiling is not the worker's death -- the record
+# it; a unit with no ledger spends it once per stream it declares. The
+# unit's delegation ceiling is not the worker's death -- the record
 # under AGENT_DELEGATION_TIMEOUT below shows a worker rewriting its ledger
 # five minutes after the wait gave up -- so a note found at the next unit's
 # start may still be a live run's; 300s covers that record. The lock
@@ -4208,6 +4209,10 @@ unit_cost_hint() {
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
     # then the same full drift audit as consistency-drift-outlier. Unmeasured.
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
+    # The sibling's plant plus a real scheduled drift run the stack fires and
+    # waits out: a full audit on an image without the gate, a collector and a
+    # precheck with it. Unmeasured; priced at the band plus the plant.
+    fleet-audit-unchanged-manifest-skips-synthesis) echo 1200 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 900 ;;
     obtainability-planted-orphan-service) echo 900 ;;
     # Full audits of the same shape, registered 2026-11-06 unmeasured: SOP
@@ -4672,10 +4677,40 @@ stream_stack_wait() { # <audit-id>
 # (wait_platform_runs); a unit with none never waits, so a dead holder's
 # successor gives up as soon as it did before. For the stream a case grades,
 # or none, it is the task lock's too.
-stream_lock_deadline() { # <task-name> <audit-id> <the unit's streams>
-  local run_wait=0
+# How many in-flight notes the holder of a stream's lock may spend a grace on
+# before its run (run_one_unit): one for a ledger case, one per declared
+# stream for a case with no ledger. The largest over every case declaring the
+# stream and the waiter's own declared count, so a waiter on a stream a
+# five-stream ledgerless unit holds outlasts all five graces, whichever lock
+# it is taking (the task lock passes the ledger id, a stream lock the stream).
+# A ledger case that declares more streams than it writes counts them too,
+# which only lengthens a deadline. 1 for an empty id, a stream no case
+# declares, or a unit on no stream.
+stream_note_count() { # <audit-id or stream> <the waiter's own streams>
+  local id="$1" own="$2" n=1 t c
+  # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+  set -- ${own}
+  c=$#
+  if [ "${c}" -gt "${n}" ]; then n="${c}"; fi
+  if [ -n "${id}" ]; then
+    for t in "${TASK_STREAMS[@]}"; do
+      case " ${t} " in
+        *" ${id} "*)
+          # shellcheck disable=SC2086 # audit ids carry no spaces or glob characters
+          set -- ${t}
+          c=$#
+          if [ "${c}" -gt "${n}" ]; then n="${c}"; fi ;;
+      esac
+    done
+  fi
+  echo "${n}"
+}
+
+stream_lock_deadline() { # <task-name> <audit-id or stream> <the unit's streams>
+  local run_wait=0 notes
   if [ -n "${3:-}" ]; then run_wait="${EVAL_PLATFORM_RUN_WAIT_SECONDS}"; fi
-  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait) + $(stream_stack_wait "$2") ))
+  notes="$(stream_note_count "$2" "${3:-}")"
+  echo $(( $(stream_case_count "$2") * ($(unit_delegation_timeout "$1") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait) + $(stream_stack_wait "$2") ))
 }
 
 release_streams() { # <space-separated audit ids>
@@ -5060,8 +5095,18 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # same stream out: repetitions 2 and 3 audit from the empty ledger
   # repetition 1 had (the lease-time reset above). Only this stream's label,
   # so an audit case on another stream in another lane keeps its own.
+  # A case that grades its stream through the report store (audit_report_stored
+  # with audit_streams:, no ledger check) has no audit id, and a left note
+  # refuses its `start` all the same: the install's own 06:20 UTC
+  # compliance-audit run died with the gateway the scope patch rolled, and
+  # its two-hour note refused every repetition that launched inside it
+  # (#4268). Such a unit releases the note of each stream it declares; the
+  # reset stays a ledger case's.
+  local note_stream
+  for note_stream in ${audit_id:-${streams}}; do
+    release_inflight_note "${name} rep ${rep}" "${note_stream}"
+  done
   if [ -n "${audit_id}" ]; then
-    release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
   fi
   # The repository this unit's agent writes to, emptied of every agent pull

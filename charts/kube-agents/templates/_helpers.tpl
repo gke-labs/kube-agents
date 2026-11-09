@@ -174,6 +174,25 @@ true
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A dispatcher's Job admission policy
+(templates/a2a-dispatcher-job-admission-policy.yaml): the same condition, and
+on an upgrade, its param kind's CRD (DispatchJobTemplate) already installed.
+`helm upgrade` never applies crds/, and a policy naming a kind the API server
+doesn't serve refuses every Job in the profile namespace; left out, the
+operator's A2A_DISPATCHER_JOB_POLICY (set from this helper) is too, and
+unattended tasks have no worker (they are refused no-worker) until crds/ is applied (upgrade.sh does) and
+the release upgraded again. `lookup` is empty under `helm template`, which is
+no upgrade, so the template renders there as on a fresh install.
+*/}}
+{{- define "kube-agents.a2aDispatcherJobPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- if or (not .Release.IsUpgrade) (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "dispatchjobtemplates.kubeagents.x-k8s.io") -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 The operator flags the chart sets from first-class values, as a YAML env list (empty when
 none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
 preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
@@ -2169,7 +2188,8 @@ rollout can add: its maxSurge, a percentage rounded up against its replicas, non
 replicas, and none for Hindsight's PostgreSQL StatefulSet (#4876). quotaRequirements reads the same list, so a workload added there is counted
 here too. A chart bump rolls several of them in one upgrade, since the chart's version label
 is in their pod templates, and each surge pod counts against the quota while it starts.
-platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
+platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods
+(and a2a-quota-chart-pods.yaml renders it in a ConfigMap when the chart renders no PlatformAgent),
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
 it to the Deployments and StatefulSets a render actually puts in the release namespace.
@@ -2558,7 +2578,7 @@ platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
 credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
 credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
 credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
-default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+default output cap, 544Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
 tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
 the broker's declared copies; each side's own test holds its copy to its formula. Change all
 sides together.
@@ -2798,7 +2818,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end }}
 
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
-704643072
+570425344
 {{- end }}
 
 {{- define "kube-agents.quotaRequirements" -}}

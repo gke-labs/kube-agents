@@ -5,7 +5,7 @@
 > to 2026-11-02, and the replay lane's modes on 2026-11-04 and 05 (see "Replay lane trials").
 > [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the proxy with its shadow, record
 > and replay modes, its fingerprint log, the scrubbed request store, the hit-rate script, the lane's
-> report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
+> report, the baseline report and the CI collector. The chart carries the proxy behind `litellm.replayShadow`, and
 > `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh` deploy it in shadow mode on every Prow presubmit and
 > nightly and copy its output to a private bucket in `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false`
 > turns it off); nothing deploys record or replay mode yet. The join with run verdicts and the
@@ -766,7 +766,20 @@ before stage 3 of the rollout (turning replay on):
    live answer, while under replay it would be the saved one. That changes more than the answer
    itself:
    - the next request contains the live answer, so exact matches stop after the model's first
-     reply. The **simulated** estimate ignores the model's own replies to get past this;
+     reply. The **replayed** estimates (low and high, from the same sources) get past this: a
+     request counts when its settings and every message that isn't one of the model's replies
+     match an allowed recording, position by position. Only replies the logs show the model gave
+     in that conversation count as replies (an earlier request of the same build asked for exactly
+     that point, compared by hashes that don't drift as the conversation grows); an assistant
+     message the client wrote itself, such as a few-shot example or a prefill, must match. They're
+     still estimates: shadow mode can't hold the next two points fixed, so those still count as
+     misses here, and they judge each request alone, while a real replay stops at the conversation's
+     first miss. They also read low where a live reply names a new ID, IP or CIDR, which shifts how
+     later messages are keyed. For the high one's misses, the script adds up tokens by the role of
+     the first message no recording matched, replies' words aside, which is where normalizer work
+     pays. Two labels aren't roles: `assistant` means no recording matched at a reply's position
+     (none had a reply there, or the message was the client's and differed), and `none` means a
+     longer recording passes through but none stopped there;
    - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
      platform agent writes is what the Cluster Agent reads. Under replay that text would match;
      in shadow mode it's worded differently every run;
@@ -776,12 +789,13 @@ before stage 3 of the rollout (turning replay on):
 
    The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
-   simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
-   of the remaining misses were tool results after a differently chosen action. Real record and replay, in "Measurements", reused 46–100% when replayed minutes later and 23% then
-   63% in the replay lane trials. So the deciding measurement comes
-   from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
-   often pull requests start on a saved recording at all (prompt changes, project rotation), and the
-   stored text for normalizer work.
+   replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
+   raised it to 22%, and most of the remaining misses were tool results after a differently chosen
+   action. Real record and replay, in "Measurements", reused 46–100% when replayed minutes later
+   and 23% then 63% in the replay lane trials. So the deciding measurement comes from real replay,
+   in the replay lane below. Shadow mode stays for what only it can measure: how often pull
+   requests start on a saved recording at all (prompt changes, project rotation), and the stored
+   text for normalizer work.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
@@ -790,6 +804,15 @@ before stage 3 of the rollout (turning replay on):
    results, or a swap hid something that looks like real state, that's a collision. A reviewed
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
+
+   Two weeks of shadow data also freeze the baseline that replay is measured against: tokens,
+   cache hits, estimated cost, model time, 429s, retries and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. The window starts on the first full
+   UTC day after the proxy began logging LiteLLM's cost, retries, model name and reasoning and
+   cache-write tokens, so that nightlies and presubmits log every field the report compares from
+   its first line; days before that would show those figures as missing. Replay is not switched on
+   anywhere until that report is saved, and every report after it comes from the same script with
+   `--compare`, so before and after are measured the same way.
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a

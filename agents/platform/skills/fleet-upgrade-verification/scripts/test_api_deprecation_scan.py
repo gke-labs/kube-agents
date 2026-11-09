@@ -642,6 +642,31 @@ class InPartsTest(unittest.TestCase):
         self.assertEqual([None, ("clusters",), ("top.yaml",)], fake.calls)
         self.assertEqual(3, len(read.files))
 
+    def test_an_entry_the_refusal_gave_no_size_for_is_listed_and_the_rest_is_read(self):
+        sizeless = {"path": "clusters", "type": "tree", "manifests": 2}
+        fake = FakeParts(self.TREE, {None: [sizeless, entry("top.yaml", 20, kind="blob")]})
+        read = scan.read_repo_content("acme/infra", snapshot=fake)
+        self.assertEqual([None, ("top.yaml",)], fake.calls)
+        self.assertEqual(["top.yaml"], sorted(read.files))
+        self.assertEqual([{"path": "clusters", "reason": scan.UNREAD_NO_MEASURE}], read.unread)
+
+    def test_a_part_that_fails_to_unpack_keeps_the_parts_already_read(self):
+        fake = FakeParts(self.TREE, {None: [entry("clusters", 900, manifests=2), entry("top.yaml", 200, kind="blob")]})
+        real = fake.__call__
+
+        def failing(repo, into=None, paths=None, **kwargs):
+            if paths == ["top.yaml"]:
+                fake.calls.append(tuple(paths))
+                raise OSError(28, "No space left on device")
+            return real(repo, into=into, paths=paths, **kwargs)
+
+        read = scan.read_repo_content("acme/infra", snapshot=failing)
+        self.assertEqual([None, ("clusters",), ("top.yaml",)], fake.calls)
+        self.assertEqual(["clusters/a/pdb.yaml", "clusters/b/cron.yaml"], sorted(read.files))
+        self.assertEqual(1, len(read.unread))
+        self.assertEqual("top.yaml", read.unread[0]["path"])
+        self.assertIn("No space left on device", read.unread[0]["reason"])
+
     def test_a_refusal_that_names_no_entries_is_still_an_error(self):
         fake = FakeParts(self.TREE, {None: None})
         with self.assertRaises(scan.vcs_client.VcsError):

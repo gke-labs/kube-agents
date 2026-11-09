@@ -863,6 +863,31 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(line["unstorable"], [])
         self.assertEqual((line["litellm_model_group"], line["litellm_attempted_fallbacks"]), (None, None))
 
+    def test_a_served_line_carries_no_litellm_accounting(self):
+        # The recording's usage block keeps LiteLLM's cost and reasoning count;
+        # a served answer never reached LiteLLM, so its line says none of them.
+        FakeLiteLLM.extra_headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0",
+                                     "x-litellm-model-name": "vertex_ai/gemini-x", "x-litellm-attempted-retries": "1",
+                                     "x-litellm-response-cost": "0.5"}
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        FakeLiteLLM.custom_body = json.dumps({
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 600, "completion_tokens": 59, "cost": 0.25, "cache_creation_input_tokens": 40,
+                      "completion_tokens_details": {"reasoning_tokens": 57}},
+        }).encode()
+        self.record(chat("t_11111111", stream=False))
+        recorded = json.loads(self.record_out.getvalue().splitlines()[-1])
+        self.assertEqual((recorded["litellm_cost_usd"], recorded["litellm_model_name"], recorded["litellm_attempted_retries"],
+                          recorded["reasoning_tokens"], recorded["cache_write_tokens"]),
+                         (0.25, "vertex_ai/gemini-x", 1, 57, 40))
+        _, port, out = self.replay()
+        self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
+        line = self.lines(1, out)[0]
+        self.assertTrue(line["served"])
+        for name in ("litellm_cost_usd", "litellm_model_name", "litellm_attempted_retries", "reasoning_tokens",
+                     "cache_write_tokens"):
+            self.assertIsNone(line[name], name)
+
     def test_a_non_streamed_hit(self):
         self.record(chat("t_11111111", stream=False))
         _, port, out = self.replay()

@@ -205,7 +205,7 @@ resource "null_resource" "burst" {
         # delay the same answer. The daemon refuses when the day's Warning
         # alert limit is spent (ALERT_DAILY_LIMIT_WARNING, default 5 a UTC
         # day); hack/ci-deploy.sh turns it off for eval installs.
-        if printf '%s\n' "$log" | grep -qE "quota-suppressed [^ ]+ pod=${local.ns}/"; then
+        if grep -qE "quota-suppressed [^ ]+ pod=${local.ns}/" <<<"$log"; then
           echo "ERROR: the daemon refused alerts for pods in ${local.ns} against its daily Warning alert limit ($${fired:-0} of ${var.pod_count} fired). This case needs ALERT_DAILY_LIMIT_WARNING set to 0 (off) or to at least ${var.pod_count} plus what the install has spent today. The refusals follow." >&2
           printf '%s\n' "$log" | grep -E "quota-suppressed [^ ]+ pod=${local.ns}/" >&2 || true
           exit 1

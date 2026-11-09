@@ -109,7 +109,9 @@ exhausting sweep listed (a sweep that fit without one of them, because its listi
 identity could not be read, says nothing about the fit and posts nothing, for up to three
 consecutive ticks, after which the missing project counts as a standing fault and the fit
 stands); the ledger's budget entry carries the same coverage on every tick that falls short,
-and says when and why the flag is held. A new stall's notice is the alert the Session KV server
+and says when and why the flag is held, and its `cluster_timings` and `tick_timing` entries
+record what each cluster and the last sweeping tick cost to read
+(`docs/designs/stall-watch-inject.md` §3.9). A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
@@ -593,7 +595,7 @@ row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
 `hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
 the agent pod have them.
 
-In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+In Slack, and on Google Chat under `spec.mode: next`, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
 stuck cards are all a run says, the script leaves a card file beside its record
 (`kanban_board_health.card.json`): each row as printed, with the ids of the
 cards it stands for, and the text it printed. The relay posts that card in
@@ -606,9 +608,11 @@ and acts on one that has blocked again. The row is edited in place
 to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
 stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
 press: the Slack adapter's interactive authorization and channel gate under
-today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
-agent turn. Google Chat, and a run that also reports the board's other
-findings, get the text.
+today, the Home tab's admission rule on Slack under `spec.mode: next`, and the
+allowed-users list (`resolvePrincipal`) on Google Chat under `spec.mode: next`,
+where the rows are numbered and the buttons read "Retry 1" and "Drop 1". A tap
+is never an agent turn. Google Chat under today, and a run that also reports
+the board's other findings, get the text.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be
@@ -1033,15 +1037,24 @@ same numbers to go stale, and the test above checks the roster against the SOPs
 
 ## The `--scheduled` sentence in audit prompts
 
-Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`.
-Only a run with that flag can get `silent_ok: true`, so the sentence is what
-lets a quiet scheduled run answer `[SILENT]`. It is in the prompt and not in
-the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
-that passed the flag would let every on-demand run of its stream go silent.
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`,
+and every stream whose SOP runs `audit_report.py precheck` after its collector
+(every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run: `PRECHECK_STREAMS` in the test file below) tells it to pass the
+flag to `precheck` too. Only a run with that
+flag can get `silent_ok: true`, so the sentence is what lets a quiet scheduled
+run answer `[SILENT]`; and only a run with it is closed by `precheck` from the
+last scheduled run's stored document when the collector manifest digests the
+same, which is what spares a static fleet the by-hand drafting every day. It
+is in the prompt and not in the SOP, because a scheduled run and an on-demand
+run read the same SOP: an SOP that passed the flag would let every on-demand
+run of its stream go silent, or be closed from a stored document.
 `test_every_audit_cron_prompt_passes_scheduled_to_finish` in
 `../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
-prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
-flag. A prompt without it
+prompt has the phrase `pass --scheduled to precheck and finish` (`pass
+--scheduled to finish` on a stream without the step) and that no SOP passes
+the flag; `test_every_collector_sop_runs_precheck_after_its_collector` beside
+it holds the step to exactly those SOPs. A prompt without the sentence
 only makes its job noisier. The rule is in
 [ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 

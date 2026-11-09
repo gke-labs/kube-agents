@@ -780,8 +780,8 @@ back to `next` and to `today` again before the matrix, and a rollback that fails
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
 
-A check the transport blinds is the scorer's business. The door's trace carries no card ids,
-no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
+A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
+entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
 `worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern as blind on

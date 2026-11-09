@@ -18,7 +18,10 @@ above the old body. The banner says that the run found none of the findings belo
 issue does not show them as open. The findings below the banner are not rewritten; they stay as the
 record. On a ledger that a coverage gap opened, the banner says that a complete run found no
 findings and no gap. A later run
-with findings opens a new ledger issue; it does not reopen this one.
+with findings opens a new ledger issue; it does not reopen this one. A carried finding whose
+cluster this run lists in neither `scope.clusters` nor `scope.skipped` does not hold the close (the
+fleet listing has no such cluster), but the all-clear names it under "Not confirmed fixed", it is
+left out of `resolved`, and the JSON line lists its id under `retired_unlisted`; report that line.
 
 **Zero findings plus a coverage gap is not a clean run, and a run with a new or changed gap is not
 silent, even on a stream with no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
@@ -66,7 +69,8 @@ not earned — on 2026-08-03 a run with two partially-covered clusters answered 
 ledger URL never reached the operator who had asked for it.
 
 > **`silent_ok` is `true` only when the run moved nothing an operator needs to hear about:** nothing
-> new, nothing resolved, no new or changed coverage gap, no held close, no remediation pull request opened or
+> new, nothing resolved, nothing retired unread, no new or changed coverage gap, no held close, no
+> remediation pull request opened or
 > closed, and — on a stream that passes `--manifest-file` — no collector candidate the document
 > dropped.
 
@@ -84,11 +88,19 @@ Two rules follow, and they are the whole rule:
   prompt tells you to pass that flag. If someone dispatched this job, from a kanban card or straight
   from chat, do not pass it: `silent_ok` is then always `false`. Report the outcome and the ledger URL.
 
+A scheduled run that `precheck` closed, because the collector found the fleet as the last scheduled
+run left it, is decided by the same flag on the same line: `precheck` republishes that run's
+stored document through `finish --scheduled`, so `silent_ok` on its line is `finish`'s verdict on
+this run's manifest against the ledger, and the two rules above read it unchanged. `precheck:
+unchanged` on the line says the document was not drafted by hand; it does not say the run is silent.
+
 A zero-finding run comes back `silent_ok: false` in each of these cases, and all of them matter:
 
 - **`resolved > 0`** — the fleet was carrying findings yesterday and is not today. Something got
   fixed, and that is the best thing this audit ever gets to say. Reporting `partial` failures while
   swallowing this one would leave the operator hearing only bad news.
+- **`retired_unlisted` is not empty** — the close retired a finding on a cluster the run listed
+  nowhere, unread. The operator has to know that it left the ledger without being confirmed fixed.
 - **`partial: true` with a new or changed gap** — the ledger stayed open because the fleet was not
   fully read. "I found nothing" and "I could not look" must not arrive as the same silence. A gap
   that is the same as on the last stored scheduled run was said on the run that got it, and is still in
