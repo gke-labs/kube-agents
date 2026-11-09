@@ -959,7 +959,12 @@ class BrowserTest(unittest.TestCase):
             self.assertIn(f"/test {job}", app)
         self.assertIn("No scheduled run on record", app)
         self.assertIn("once a week", app)
-        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
+        self.assertNotIn("scheduled jobs are off", app, "no lane is paused")
+        # A paused lane says why, as the digest does.
+        from eval_dashboard import forge_lane, tiers
+        with unittest.mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": "the weekly job waits on a fix"}):
+            paused = render_to(pathlib.Path(self.tmp.name) / "paused", self.data, health=health_doc())
+        self.assertIn("GHES's scheduled jobs are off: the weekly job waits on a fix", dom_text(paused / "index.html"))
         data = copy.deepcopy(self.data)
         base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
