@@ -238,6 +238,11 @@ if [ -n "${AGENT_HOST_CONTEXT:-}" ]; then
   echo "    profile: ${profile}"
   # Then prove the path the worker will take: kubectl through the credential
   # proxy with the pinned kubeconfig, and the preflight the worker runs first.
+  # The probe is `kubectl version`: it reaches the API server's /version under
+  # the pinned kubeconfig, needs no RBAC beyond authentication and exits
+  # non-zero when the server does not answer. It was `get --raw=/readyz` until
+  # the command policy held `--raw` to paged collection reads and /metrics,
+  # which refuses the health endpoints at every role.
   # Where that path runs depends on the install's layout. The probe's exit
   # status is checked apart from its output: an API error here must not be
   # read as "no sandbox" and send a 0.5.0 install down the sidecar path.
@@ -254,7 +259,7 @@ if [ -n "${AGENT_HOST_CONTEXT:-}" ]; then
     kubectl --context "${AGENT_HOST_CONTEXT}" -n "${AGENT_NAMESPACE}" exec "${SHELL_SANDBOX_POD}" -- \
       runuser -u "${SHELL_SANDBOX_USER}" -- bash -lc "set -e; d=${SANDBOX_PROFILES_DIR}/${profile}; \
         test -s \$d/USER.md && test -s \$d/kubeconfig.yaml; \
-        KUBECONFIG=\$d/kubeconfig.yaml kubectl get --raw=/readyz >/dev/null; \
+        KUBECONFIG=\$d/kubeconfig.yaml kubectl version >/dev/null; \
         KUBECONFIG=\$d/kubeconfig.yaml HERMES_HOME=\$d bash ${SANDBOX_PREFLIGHT_SCRIPT} --json | grep -q '\"status\": \"ok\"'" \
       || { echo "SEED FAIL: Cluster Agent profile ${profile} is not usable in the shell sandbox (missing files, or kubectl/preflight through the proxy failed)" >&2; exit 1; }
     echo "    profile usable: kubeconfig at the profile home in ${SHELL_SANDBOX_POD}; kubectl via proxy and preflight ok"
@@ -273,7 +278,7 @@ if [ -n "${AGENT_HOST_CONTEXT:-}" ]; then
         test -s \$d/USER.md && test -s \$d/kubeconfig.yaml; chmod ${PROFILE_HOME_MODE} \$d; \
         mkdir -p .kubeconfigs && cp \$d/kubeconfig.yaml \$k && chmod ${KUBECONFIG_FILE_MODE} \$k; \
         sed -i \"s#^KUBECONFIG=.*#KUBECONFIG=/opt/data/\$k#\" \$d/.env; grep -q \"^KUBECONFIG=/opt/data/\$k\" \$d/.env; \
-        KUBECONFIG=/opt/data/\$k kubectl get --raw=/readyz >/dev/null; \
+        KUBECONFIG=/opt/data/\$k kubectl version >/dev/null; \
         KUBECONFIG=/opt/data/\$k HERMES_HOME=/opt/data/\$d bash /opt/data/scripts/cluster_preflight.sh --json | grep -q '\"status\": \"ok\"'" \
       || { echo "SEED FAIL: Cluster Agent profile ${profile} is not usable (missing files, or kubectl/preflight through the proxy failed)" >&2; exit 1; }
     echo "    profile usable: kubeconfig pinned at /opt/data/${kubeconfig_rel}; kubectl via proxy and preflight ok"

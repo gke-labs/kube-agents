@@ -958,6 +958,9 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions(t *testing.T) {
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}}
+	// The live object holds every condition this pass would write, the
+	// chat-less install's NoChatPlatform included, or the pass has a write.
+	setNoChatPlatformCondition(agent, noChatPlatformMsg(agent), now)
 	counter := &statusWriteCounter{}
 	scheme := setupScheme()
 	base := fake.NewClientBuilder().
@@ -1035,6 +1038,7 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 			LastTransitionTime: now,
 		},
 	}
+	setNoChatPlatformCondition(agent, noChatPlatformMsg(agent), now)
 	counter := &statusWriteCounter{}
 	scheme := setupScheme()
 	base := fake.NewClientBuilder().

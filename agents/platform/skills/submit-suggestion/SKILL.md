@@ -217,6 +217,12 @@ manifests or infrastructure definitions.
 
 Generate or edit the files **inside the returned `workspace`**.
 
+When modifying an existing Kubernetes object, edit the file that declares it in place. When
+creating a new Kubernetes object (such as a `PodDisruptionBudget` for a `Deployment` or a
+`NetworkPolicy` for a `Namespace`), write it to a new, standalone file in that same directory.
+Never append a new object to an existing manifest file. If that directory uses Kustomize, add the
+new filename to `resources:` in `kustomization.yaml` in the same pull request.
+
 `git` here holds no credential and cannot reach a forge; it works on the
 working copy and nothing else, and `submit` is what sends the result.
 

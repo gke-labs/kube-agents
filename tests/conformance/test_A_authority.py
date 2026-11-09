@@ -469,10 +469,52 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
                     h.task_confinement.confine(argv, None, None)
         self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
 
-    def test_A3_the_profile_role_reaches_the_exec_route_alone(self) -> None:
+    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
-        reached = [prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles]
-        self.assertEqual(["/v1/exec"], reached)
+        reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
+        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
+        # The relay has no per-task target check, so a profile worker reaches
+        # only the servers whose tools name no cluster: Developer Knowledge's
+        # document reads. The gke server, whose tools take a project and
+        # cluster as arguments, stays out, and so does every write. Driven
+        # through the decision the handler makes (mcp_relay_decision).
+        cp = h.credential_proxy
+        self.assertEqual(
+            {"developer_knowledge": frozenset({"get_documents", "search_documents"})},
+            h.mcp_policy.PROFILE_SERVER_TOOLS,
+        )
+
+        def call(name):
+            return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        in_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE, task=object())
+        no_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE)
+        chat = cp.Principal(workload="w", role=cp.CALLER_ROLE_CHAT)
+
+        for server, message in (("gke", call("get_k8s_resource")), ("gke", listing),
+                                ("developer_knowledge", call("answer_query"))):
+            with self.subTest(server=server, message=message):
+                decision, _ = cp.mcp_relay_decision(in_task, server, message)
+                self.assertFalse(decision.allowed)
+        decision, offered = cp.mcp_relay_decision(in_task, "developer_knowledge", call("search_documents"))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(frozenset({"get_documents", "search_documents"}), offered)
+        self.assertEqual(frozenset(), cp.mcp_relay_decision(in_task, "gke", listing)[1])
+        decision, _ = cp.mcp_relay_decision(no_task, "developer_knowledge", call("search_documents"))
+        self.assertEqual((False, cp.RULE_TASK_CREDENTIAL), (decision.allowed, decision.rule_id))
+        # And the handler takes its decision from there, not from the table.
+        source = h.text("credential_proxy")
+        handler = source[source.index("def _handle_mcp_relay"):]
+        handler = handler[: handler.index("\n    def ", 1)]
+        self.assertIn("mcp_relay_decision(principal, server_name, message)", handler)
+        self.assertNotIn("mcp_policy.evaluate(", handler)
+        self.assertIn("decision.rule_id == mcp_policy.METHOD_TOOLS_LIST", handler)
+        self.assertIn("filter_tools_list(server_name, upstream.body, offered)", handler)
+        # The chat role keeps the table's whole offer.
+        self.assertIsNone(cp.mcp_relay_decision(chat, "gke", call("get_cluster"))[1])
 
 
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
@@ -1118,6 +1160,100 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "subject; an executor that can write there can end its own task and "
             "have the record read as infrastructure",
         )
+
+    SUBMIT_PROBE = "a2a.submit.cluster.read.top.task-0001"
+
+    def test_A3_the_submit_subject_has_exactly_one_writer(self) -> None:
+        """A profile task's `…submit` is written by the gateway and nobody else.
+
+        The submission is where a profile task's grant enters the task plane:
+        the gateway mints it against the profile it resolved, with the
+        requester's tier and the target in scope, and the dispatcher admits
+        what arrives there. A second writer could submit a task under a grant
+        it didn't mint, or fill a profile's queue with work nobody asked for.
+        The dispatcher reads the subject through its durables and holds no
+        publish on it; no session or profile worker derives one.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.SUBMIT_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a profile's submit "
+                "subject; a worker that can write there can start tasks of its own",
+            )
+        dispatcher = self._dispatcher_identity()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on a profile's submit subject")
+
+    # The ways the tree spells each subject: the library helpers, their
+    # prefix constants and the literal. An executor's or the dispatcher's
+    # grant written through any of them is a second writer.
+    SUBMIT_SPELLINGS = ("TaskSubmitSubject", "SubmitSubjectPrefix", ".submit", "a2a.submit")
+    STOP_SPELLINGS = ("DispatchStopSubject", "DispatchStopPrefix", "a2a.stop")
+
+    @staticmethod
+    def _dispatcher_identity() -> str:
+        """`dispatcherIdentity`'s body: the dispatcher authenticates through
+        the callout, so no served config carries its grants."""
+        return h.go_function_body(h.text("a2a_dispatcher"), "dispatcherIdentity")
+
+    # The dispatcher's reads of the stop record: its subscription on each
+    # profile's records (the `stops` list) and the direct get it catches up
+    # with after a restart. Reads don't count as writers.
+    DISPATCHER_STOP_READS = ("$JS.API.DIRECT.GET.", "stops = append(stops,")
+
+    @classmethod
+    def _dispatcher_writes(cls) -> str:
+        """`dispatcherIdentity`'s body without its reads of the stop record
+        and without comments, so a spelling left in it is a write."""
+        lines = cls._dispatcher_identity().splitlines()
+        return "\n".join(
+            line
+            for line in lines
+            if not line.lstrip().startswith("//") and not any(read in line for read in cls.DISPATCHER_STOP_READS)
+        )
+
+    STOP_PROBE = "a2a.stop.cluster.task-0001"
+
+    def test_A3_the_stop_record_has_exactly_one_writer(self) -> None:
+        """A profile task's stop record is written by the gateway and nobody else.
+
+        The dispatcher drops a queued task, or cancels a held one, when its
+        stop record appears, without reading the task's `…in`. A second
+        writer could stop another requester's task. The dispatcher's own
+        publish on `a2a.dispatch.*.*.*` doesn't reach the record's root,
+        `a2a.stop`, and no session or profile worker derives a grant there.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.STOP_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a stop record; "
+                "a worker that can write there can stop other requesters' tasks",
+            )
+        dispatcher = self._dispatcher_writes()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a publish grant on the stop record")
+        # The reads left out above are only reads while their list stays on
+        # the subscribe side: the stop subjects can't be spliced into the
+        # publish list.
+        body = self._dispatcher_identity()
+        publish = body[body.index("publish:") : body.index("subscribe:")]
+        self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"

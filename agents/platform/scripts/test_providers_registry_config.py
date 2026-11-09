@@ -87,7 +87,7 @@ class ConfigurationFileTest(_ConfigCase):
         )
         self.assertEqual(
             [{"provider": "testforge", "host": "git.example.com", "token_path": "", "read_token_path": "",
-              "ca_file": "", "ca_source": "", "allowed_paths": ("/acme/",)}],
+              "ca_file": "", "ca_source": "", "identity": "", "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
 
@@ -99,6 +99,21 @@ class ConfigurationFileTest(_ConfigCase):
         self.assertEqual("/t/read-token", registry_module.load_forge_entries()[0]["read_token_path"])
         [forge] = providers.Registry().forges
         self.assertEqual("/t/read-token", forge.read_token_path)
+
+    def test_an_identity_is_one_login_or_the_build_stops(self):
+        # The login a forge's token acts as, for a token that cannot name its
+        # own account. A Bitbucket Cloud uuid keeps its braces; a space, a
+        # newline or a non-string is refused by name, as the operator's
+        # schema refuses it.
+        self.configure({"forges": [{"provider": "testforge", "host": "git.example.com",
+                                    "identity": " {0f3b2c1d-aaaa} "}]})
+        self.assertEqual("{0f3b2c1d-aaaa}", registry_module.load_forge_entries()[0]["identity"])
+        for bad in ("two words", "a\nb", "", 7, "x" * 256):
+            with self.subTest(identity=bad):
+                self.configure({"forges": [{"provider": "testforge", "host": "git.example.com", "identity": bad}]})
+                with self.assertRaises(ValueError) as caught:
+                    registry_module.load_forge_entries()
+                self.assertIn("identity", str(caught.exception))
 
     def test_github_refuses_allowed_paths_rather_than_ignoring_them(self):
         # Review round 2: accepted and never enforced, it read as narrowing

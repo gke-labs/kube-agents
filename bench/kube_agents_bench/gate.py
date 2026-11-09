@@ -71,6 +71,7 @@ from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench import chat_shape
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
     MODE_NEXT,
@@ -167,7 +168,7 @@ def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) 
 #: verdict. 0 green and 1 red are the literals they have always been.
 SUITE_EXIT_NOT_EVALUATED = 2
 
-#: The build-log word for a case the inject lane could not grade (rung
+#: The verdict word for a case the inject lane could not grade (rung
 #: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
 #: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
 #: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
@@ -223,12 +224,18 @@ REP_TIMING_TURN1_KEY = "turn1_s"
 # collector reads `0.0` as unknown.
 REP_TIMING_DECIMALS = 1
 # The keys of the `rep N tokens:` line, which the collector
-# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS) parses the same way:
-# the record's top-level counts, and the flag, printed only when set, that
-# says they are short of what the run billed.
+# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS and
+# _REP_TOKENS_SPLIT_KEYS) parses the same way: the record's top-level counts,
+# then its prompt split (cache reads, cache writes, reasoning) when its
+# `input` excludes cache reads, and the flag, printed only when set, that
+# says they are short of what the run billed. The split keys come after
+# `total`, so a line without them reads as it always did.
 REP_TOKENS_INPUT_KEY = "input"
 REP_TOKENS_OUTPUT_KEY = "output"
 REP_TOKENS_TOTAL_KEY = "total"
+REP_TOKENS_CACHED_KEY = "cached"
+REP_TOKENS_CACHE_WRITE_KEY = "cache_write"
+REP_TOKENS_REASONING_KEY = "reasoning"
 REP_TOKENS_PARTIAL_FIELD = "partial=1"
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
@@ -357,7 +364,7 @@ def _bootstrap_admitted() -> frozenset[str]:
 
 
 def _label(case: dict[str, Any]) -> str:
-    """The build-log word for a case verdict.
+    """The verdict word printed for a case.
 
     Four labels, not two, because the rate rules create a state a two-label
     scheme cannot say. UNSTABLE is a case that failed repetitions -- but not
@@ -390,7 +397,7 @@ def _label(case: dict[str, Any]) -> str:
 
 
 def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
-    """The agent's final report as one build-log line, or "" when it said nothing.
+    """The agent's final report as one grading line, or "" when it said nothing.
 
     Control characters and lone surrogates become spaces and whitespace is
     collapsed to single spaces, so the line is one printable line whatever
@@ -547,14 +554,25 @@ def _cmd_case(args: argparse.Namespace) -> int:
                 (REP_TOKENS_INPUT_KEY, rep.input_tokens),
                 (REP_TOKENS_OUTPUT_KEY, rep.output_tokens),
                 (REP_TOKENS_TOTAL_KEY, token_count(rep.total_tokens)),
+                (REP_TOKENS_CACHED_KEY, rep.cached_tokens),
+                (REP_TOKENS_CACHE_WRITE_KEY, rep.cache_write_tokens),
+                (REP_TOKENS_REASONING_KEY, rep.reasoning_tokens),
             )
             if value is not None
         )
         if counts:
             partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
             print(f"  rep {rep.index} tokens: {counts}{partial}")
+        # The delivered reply's shape under chat_shape.KEYS, a flag as 1 or
+        # 0, for the eval dashboard to collect. Reported, never scored; no line
+        # for a run that delivered nothing.
+        if rep.shape:
+            shape = " ".join(
+                f"{key}={int(rep.shape[key])}" for key in chat_shape.KEYS if key in rep.shape
+            )
+            print(f"  rep {rep.index} shape: {shape}")
         # The agent's own words, one line under the grading line (after the
-        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
+        # timing, tokens and shape lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing
@@ -1031,9 +1049,10 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
     if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
         # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
-        # the today lane's periodic on main has no PULL_NUMBER and grades an
-        # install rolled back from next over the api transport. Its key reads
-        # today, and today's window measures a fresh today install.
+        # a today-lane run on main (none runs today) would have no PULL_NUMBER
+        # and grade an install rolled back from next over the api transport.
+        # Its key would read today, and today's window measures a fresh today
+        # install.
         print(
             f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
             "the today lane grades a rolled-back install, which is not what "

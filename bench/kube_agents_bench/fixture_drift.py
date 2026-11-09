@@ -90,8 +90,7 @@ ROLES_KEY = "fixture_roles"
 #: Said in place of the scan's detail when a drifted role carries none.
 NO_DETAIL = "no detail recorded"
 #: How much of a role's first drift line the reason carries. The reason is
-#: printed on every repetition's grading line, inside a block
-#: ``hack/ci-eval-pr.sh`` keeps under PIPE_BUF; the whole detail is in the
+#: printed on every repetition's grading line; the whole detail is in the
 #: report, which the job keeps as an artifact.
 DETAIL_MAX_CHARS = 200
 # How old the published hourly scan may be and still count: the same three

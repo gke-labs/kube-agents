@@ -9,15 +9,17 @@
 # observed evidence and graded on the reply — the shape
 # cluster-agent-crashloop-debug proved at 142s. Full audit SOP fidelity lives
 # in the fleet-audits canary (compliance-rbac-overgrant,
-# 606s measured; nightly 2026-09-22 to 2026-09-29, presubmit held out since
-# (#2013)) and, in the nightly tier, obtainability-planted-pdb.
+# 606s measured; nightly 2026-09-22 to 2026-09-29, presubmit held out
+# 2026-09-29 to 2026-11-02, on the roster since, #2013) and, in the nightly tier, obtainability-planted-pdb.
 # Expected cost bracket: ~150-350s (chat prompt, delegated worker, a handful
 # of cluster reads; no ledger write).
 #
 # Planted defect required: a two-replica Deployment named "checkout-gateway"
 # in namespace "seeded-reliability" on the seeded fleet, with no
 # PodDisruptionBudget in the namespace — nothing bounds voluntary disruption,
-# so one drain can take both replicas at once. We chose both nouns (the
+# so back-to-back drains during an upgrade or scale-down can take both
+# replicas before either replacement is Ready, and one drain takes both if
+# they share a node (#4966). We chose both nouns (the
 # workload name and the missing object's kind), so the exact match is fair.
 #
 # Isolation class: read-only. Unlike the audit scenarios there is no
@@ -45,7 +47,10 @@ prompt: >-
 expected_output: >-
   A grounded assessment naming checkout-gateway, stating that nothing bounds
   voluntary disruption (two replicas but no PodDisruptionBudget in the
-  namespace), explaining that a drain can evict both replicas at once, and
+  namespace), stating the pod placement it observed, explaining that one
+  drain evicts only the pods on the drained node but the workload is
+  unprotected during upgrades and scale-downs, where back-to-back drains can
+  evict the second replica before the first replacement is Ready, and
   recommending a PDB as a change to propose — not to apply. Every claim cites
   live reads made during this run. No mutation of any kind.
 infrastructure:

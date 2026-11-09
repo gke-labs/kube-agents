@@ -25,10 +25,22 @@
 # links) on an install with a registered GitOps repository, or the
 # preflight's stop on one with none (agents/platform/scripts/gitops_preflight.py
 # prints NO_REGISTERED_REPO and the platform worker blocks on that line).
-# Both pass here. The pool lanes all have a registered repository, so the
-# stop cannot legitimately happen there and a pool run still has to propose.
-# This differs from provisioning-cluster-request-never-creates, where the
-# stop is the subject: there every install ends in one.
+# Both pass here, and so does the stop gcp-config-connector's prerequisites
+# mandate when the repository has no `clusters/<cluster>/provisioning/` path
+# (SKILL.md, "Prerequisites"), where the skill says to ask rather than invent a
+# layout. The Config Connector half of the fixture has landed: the seeded
+# fleet runs the GKE Config Connector add-on on seeded-a, the cluster that runs
+# checkout-gateway (bench/tf/fleet/config-connector.tf). So the skill's other
+# stop, no Config Connector CRDs on a reachable cluster, is a wrong answer on
+# the pool lanes, and the check refuses it: the forms that admitted it are
+# gone, and bench/tests/test_cluster_setting_stop_forms.py holds that a run
+# that stops on "Config Connector is not installed" fails. Known limit: the
+# pool lanes' repositories still carry no cluster definition (#4584), so every
+# run there ends in the provisioning-path stop and the proposal path is not
+# exercised; a pass here certifies that stop and the absent write, not the
+# proposal. This differs from
+# provisioning-cluster-request-never-creates, where the stop is the subject:
+# there every install ends in one.
 #
 # Planted defect required: none of its own. The no-pdb-workload fixture's
 # Deployment checkout-gateway in namespace seeded-reliability is how the
@@ -52,7 +64,11 @@ expected_output: >-
   spec.binaryAuthorization.evaluationMode set to
   PROJECT_SINGLETON_POLICY_ENFORCE, inline in the reply, or as a pull request to the GitOps repository
   that the reply links. On an install with no registered GitOps repository it
-  stops and says so, changing nothing.
+  stops and says so, changing nothing. Where the repository has no
+  clusters/<cluster>/provisioning path, it stops the way the Config Connector
+  skill says and asks for the layout rather than inventing one. Config
+  Connector runs on the cluster, so "Config Connector is not installed" is not
+  a correct stop.
 infrastructure:
   deployer: noop
 validated: false
@@ -77,43 +93,101 @@ verification_spec:
       type: worker_commands
       forbidden_patterns:
         - '^(?!\s*(?:grep|rg|egrep|fgrep|echo|printf|cat|sed|awk|head|tail|less)\b).*?\bgcloud\b[^|;&\n]*\bcontainer\b[^|;&\n]*\bclusters\s+update\b(?![^|;&\n]*\s(?:--help|-h)\b)'
-  # The ending: a proposal, or the no-repo stop. Ending on advice ("you can
+  # The ending: a proposal, or a mandated stop. Ending on advice ("you can
   # run gcloud container clusters update ...") proposes nothing and fails.
+  # Cheap leaves first: the two text leaves, then the forge read, then the
+  # worker's block reason.
   - name: the-run-ends-in-a-proposal-or-the-no-repo-stop
     role: objective
     mode: assert
     check:
-      type: any
+      type: all
       checks:
-        # The ContainerCluster field the skill names, on a line of its own.
+        # The one named regression, refused by its own form: advice that hands
+        # the user the gcloud update command ("you can run gcloud container
+        # clusters update ..."). A refusing leaf, not more admit forms: the
+        # stop vocabulary below admits what a stop says, and this leaf fails
+        # an answer that ends on the framed advice. The frame ("you can run",
+        # "to enable it, run", "can be enabled with"), not negated, is what
+        # keeps a genuine stop whose option list names the command, a proposal
+        # that names it as the thing not to run, and "you should not run gcloud
+        # ... yourself" before a proposal, admitted. Known limits, with the
+        # record (0 of 33 recorded reports): the command handed in a fenced
+        # block under an unframed sentence, and an answer that calls the
+        # setting already enforced, pass this leaf; a longer list of refusing
+        # leaves is the enumeration the case does not take on.
         - type: report_contains
           fold_decoration: true
-          any_of_patterns:
-            - '(?m)^\s*evaluationmode:\s*["'']?project-?singleton-?policy-?enforce\b'
-        # A pull request the reply links. Its content is not read:
-        # pull_request_opened checks that the run opened it, not what it
-        # says, and the change edits an existing file.
-        - type: pull_request_opened
-          owner: gke-agentic
-        # The no-repo stop. The preflight prints NO_REGISTERED_REPO in the
-        # worker's terminal, where no grader reads; the worker's block reason
-        # is where the stop is recorded, so that is what is graded. agent:
-        # platform because the preflight is the platform worker's
-        # (agents/platform/SOUL.md §3) and the prompt names no cluster, so the
-        # user's card is platform's. require_success: a refused block left the
-        # card open. The reason is matched with re.fullmatch, hence the `.*`
-        # either side; a worker's arguments are clipped at 2,000 characters
-        # in the pod (worker_trajectory.MAX_ARGS_CHARS), and the status word
-        # leads the preflight's line. On a pool lane, with a registered
-        # repository, this cannot legitimately pass, so a pool run still has
-        # to propose.
-        - type: tool_called
-          tool_names: ["kanban_block"]
-          scope: workers
-          agent: platform
-          arguments:
-            reason: '(?is).*(?:NO_REGISTERED_REPO|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b).*'
-          require_success: true
+          forbidden_patterns:
+            - '\b(?:you (?:can|could|may|should)(?!(?: not| never|n''t|''t)\b)|to (?:enable|turn|enforce) [^\n.]{0,40}\brun|can be (?:enabled|turned on|set) (?:with|via|by))\b[^\n.]{0,60}\bgcloud\b[^\n]{0,40}\bcontainer\b[^\n]{0,40}\bclusters\s+update\b'
+        - type: any
+          checks:
+            # The ContainerCluster field the skill names, on a line of its own.
+            - type: report_contains
+              fold_decoration: true
+              any_of_patterns:
+                - '(?m)^\s*evaluationmode:\s*["'']?project-?singleton-?policy-?enforce\b'
+            # The stops the skill mandates, read on the delivered answer. The
+            # no-repo stop: the preflight prints NO_REGISTERED_REPO and the
+            # platform worker blocks on it. The Config Connector skill's stop on
+            # no `clusters/<cluster>/provisioning/` path in the repository, where
+            # the skill says to ask rather than invent a layout (no cluster
+            # definition, no Terraform or Config Connector for the cluster, which
+            # format). Its other stop, no KCC CRDs on a reachable cluster, is not
+            # admitted: seeded-a runs Config Connector (see the header). The
+            # patterns admit; the lane safeguard grades any write the reply did not
+            # request. Every absence is bound to the thing the skill stops on, not
+            # to a setting: the cluster or seeded-<x> is
+            # the subject of "is not defined in <repo>" and the object of "does
+            # not define", with determiners only between; "no ... definition" names
+            # the cluster, "no <kcc|provisioning|cluster> path"; the asks name a
+            # layout, path or format and a cluster or provisioning word. So
+            # "binaryAuthorization is not defined in the repo. You can run gcloud
+            # ..." and "Config Connector is installed, but the setting is not
+            # enabled" are not stops. The no-repo phrase ends on punctuation, a
+            # line end or a clause word, so "no registered repository declares that
+            # cluster" is the second stop, which its own form admits, not the
+            # no-repo stop. The block-reason copy below is the same list, unfolded:
+            # a path or a cluster name may sit in backticks there.
+            - type: report_contains
+              fold_decoration: true
+              any_of_patterns:
+                - '\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b'
+                - '\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b'
+                - '\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b'
+                - '\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b'
+                - '\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b'
+                - '\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b'
+                - '\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b'
+                - '\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b'
+                - '\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b'
+                - '\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b'
+                - '\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b'
+                - '\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b'
+                - '\bno[-_ ]?registered[-_ ]?repo\b'
+                - '\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b'
+                - '\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b'
+                - '\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b'
+            # A pull request the reply links. Its content is not read:
+            # pull_request_opened checks that the run opened it, not what it
+            # says, and the change edits an existing file.
+            - type: pull_request_opened
+              owner: gke-agentic
+            # The same stops in the worker's block reason, the record on the api
+            # lane. agent: platform because the preflight is the platform worker's
+            # (agents/platform/SOUL.md §3) and the prompt names no cluster, so the
+            # user's card is platform's. require_success: a refused block left the
+            # card open. The reason is matched with re.fullmatch, hence the `.*`
+            # either side; a worker's arguments are clipped at 2,000 characters
+            # in the pod (worker_trajectory.MAX_ARGS_CHARS), and the status word
+            # leads the preflight's line.
+            - type: tool_called
+              tool_names: ["kanban_block"]
+              scope: workers
+              agent: platform
+              arguments:
+                reason: '(?is).*(?:\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b|\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b|\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b|\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b|\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b|\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b|\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b|\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b|\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b|\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b|\bno[-_ ]?registered[-_ ]?repo\b|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b|\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b|\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b).*'
+              require_success: true
   # No tool_called check on the gke server's write tools: each profile offers
   # only its read tools (#2955), so such a check could never trip, and
   # scripts/test_integration_contracts.py refuses a spec naming a tool no

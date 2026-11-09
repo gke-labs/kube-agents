@@ -475,17 +475,17 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs` and `at`; the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
 ([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
-planned, which of its subtasks settled, and when it synthesized an answer, so a renderer lists a
+planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`; the hermes bridge leaves `summary` empty, keeping a card's report off `TASKS`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
 at it, and skips a v1 part with an unknown `kind`. The Hermes bridge publishes it from its
-tool-call trace and the turn's model requests, structure only
+tool-call trace and the turn's model requests (and, on the `api` executor, settled Kanban cards)
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Activity").
 
 ## Verified identity (added 9/9)
@@ -493,7 +493,7 @@ tool-call trace and the turn's model requests, structure only
 **An envelope's publisher is the principal implied by the subject it arrived on** - the
 stored subject, on replay - and that implication is decision-grade exactly where two
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
-replay: every check is a field-to-token comparison, plus the one supervisor name a
+replay: every check is a field-to-token comparison, plus the supervisor names a
 consumer is configured with. The alternatives this beat - a signed claim per envelope,
 a server-stamped header, a key registry consulted at replay - were taken through
 successive hostile review rounds before it was ratified; this section is the contract, and the
@@ -515,7 +515,7 @@ source, and replay skips and counts it.
 | Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                                                                        |
 | ------------------------------------ | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory as shipped; hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`.                                                            |
-| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee.                                              |
+| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it (the gateway's names the dispatcher too); one that does not checks the negative form, `from` is not the addressee.     |
 | `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is conventionally present here and checked when it is, but is not required; see the note below.                                                                               |
 | `…submit` (10/22)                    | `message`                          | = token  | The submitter, the gateway. A consumer that names it (`Submitter`, as a dispatcher does) checks `from.session` against it; one that names none uses the negative form, `from` is not the profile (neither `from.session` nor `from.profile`). `to`, where present, MUST equal the profile token. |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                                                                        |
@@ -595,15 +595,15 @@ artifact names).
 
 ### Where one may appear
 
-| Carrier                                                | Renders as                                       | Its text fallback                                    |
-| ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
-| `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
-| `turn` artifact, on the chunk with `lastChunk: true`   | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
-| `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
-| `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
-| the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
-| the message of a terminal `status-update`              | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
-| a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
+| Carrier                                                                     | Renders as                                       | Its text fallback                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true`                      | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `turn` artifact, on the chunk with `lastChunk: true`                        | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
+| `progress` artifact                                                         | the task's one live message, edited in place     | the TextPart in the same part list                   |
+| `notice` artifact                                                           | one message of its own, posted once              | the TextPart in the same part list                   |
+| the message of an `input-required` `status-update`                          | the question                                     | the TextPart in the same message                     |
+| the message of a terminal `status-update`                                   | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
+| a chat.notify request to a conversation or a home thread (Card work, below) | a card's post, or an edit of one by `update` key | the request's `text`                                 |
 
 At most one chat message per artifact chunk or status message. `plan` is read only in
 `progress` and on a conversation chat.notify (Card work, below). In `progress` the chat message is the whole current state, not a delta, so a
@@ -678,7 +678,7 @@ table in markdown is text, never a table (use `fold.table`).
 | `note`     | Plain, one line, at most 300. A short qualifier on the headline; where it goes (same line, a context line) is the renderer's choice.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `detail`   | Markdown, at most 2,000, any number of lines. The body of a short message: a needs-you question's context, a report's extra line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `tone`     | `success`, `attention` or `critical`; absent means none. The message's colour where a backend has one. On Slack, `success` is green (done, and yours to act on: a PR opened), `attention` yellow (waiting on you) and `critical` red (`#E01E5A`). Never the only place a fact is stated.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `rows`     | At most 20. Each has `text` (markdown, one line, at most 300), optional `severity` (a token of 1-16 characters of `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, one line, at most 300). A row may also carry `tasks` (1-50 board card ids, each 1-64 characters of `[A-Za-z0-9_-]`, at most 2000 characters joined by commas) and `actions` (`retry` and `drop`, each at most once), both or neither: the renderer draws those buttons under the row, labelled itself, and a click acts on the cards instead of arriving as a turn (spec-chatops-gateway.md, "The board-health card's buttons").                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `rows`     | At most 20. Each has `text` (markdown, one line, at most 300), optional `severity` (a token of 1-16 characters of `[a-z0-9-]`, rendered as inline code ahead of the text, eg `critical`) and optional `detail` (markdown, one line, at most 300). A row may also carry `tasks` (1-50 board card ids, each 1-64 characters of `[A-Za-z0-9_-]`, at most 2000 characters joined by commas) and `actions` (`retry` and `drop`, each at most once), both or neither: the renderer draws those buttons under the row, or under the message and labelled by the row's number where the platform has one button list per message, labels them itself, and a click acts on the cards instead of arriving as a turn (spec-chatops-gateway.md, "The board-health card's buttons").                                                                                                                                                                                                                                                                                                        |
 | `after`    | At most 5 lines, markdown, one line each, at most 300. Rendered after the rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `fold`     | One collapsed section. `title` plain, at most 40 (default `why`). `text` markdown, at most 12,000. Optional `table`: 1-10 `columns` (plain, 1-40 each) and at most 50 `rows`, each exactly as wide as `columns`, cells plain, at most 200.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `choices`  | At most 10. `text` plain, 1-75 characters, the button's label. Optional `reply`, at most 400, which MUST contain `text`, so it names what the answer reaches (a card, an option: `apply Option B: <title>` behind an `<title>` button) without hiding much the clicker didn't see. A click arrives as a message from the clicker whose text is `reply`, or `text` without one: text, through the principal map, no new intent (#2149). A `text` or `reply` that the gateway would act on as a command is invalid, judged against the superset whatever the route or state, each function applied to the raw `text` and `reply` as the gateway would receive them (`IsStop` and `IsStatusQuery` normalize for themselves): a stop word (`IsStop`), a status ask in its wide form (`IsStatusQuery(s, true)`), the `/session` command (`IsSessionCommand`), a bare `/feedback` or `/feedback summary` (`IsFeedbackCommand` with nothing after the word, or `IsFeedbackSummaryCommand`; any other `/feedback <text>` is an ordinary turn) or the `delegate` prefix (`IsDelegate`). |
@@ -703,7 +703,8 @@ and the first 5 `after` lines, which the presenter leaves uncapped.
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
-shows.
+shows, and the control a backend draws on a running task's line when the gateway asks for one
+(Google Chat's Stop button, spec-chatops-gateway, "The Google Chat adapter").
 
 ### `mark`
 
@@ -775,8 +776,8 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
-its task ends. The cards keep going outside any A2A task, so none of the carriers above
+Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends (whereas on console and MCP origins only, `waitsForCardsInTurn`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
 (spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
@@ -786,15 +787,16 @@ carry the same chat message:
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
   the place of the request's raw `blocks` for a conversation post. A home-channel request
   may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
-  the same way, with its `update` and `mark` not read.)
+  the same way, its `update` key kept per home thread as below and its `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that
   message in place instead of posting a new one, which is how a plan stays one message
   per thread and an answered question settles where it was asked. An `update` key edits
-  only a message the gateway itself posted for that same conversation and key. A key it
-  has no message for (another conversation's, one evicted, or one lost to a restart)
-  posts a new message and edits nothing. A conversation holds at most 16 live keys, and
-  the least recently used is evicted first, so a chatty card can't grow gateway state without bound.
+  only a message the gateway itself posted for that same conversation, or home-channel
+  thread, and key. A key it has no message for (another conversation's or thread's, one
+  evicted, or one lost to a restart) posts a new message and edits nothing. A conversation
+  or home thread holds at most 16 live keys, and the least recently used is evicted first,
+  so a chatty card can't grow gateway state without bound.
 - **`mark`** on a conversation notify marks the message of the chain the card belongs to,
   and counts as that chain's newest writer once every task in it has ended. A notify names
   no task, so its `update` key names the chain: the first notify with a key and a `mark`
@@ -840,8 +842,9 @@ id takes one too), so no plan takes another's key and edits its message, which t
 still holds: not one its first card reopens after the plan lapsed, and not one opened after
 a restart. The shared cases spell only the stem (`plan`, `question-<card>`); their runner
 matches a key that adds a `-` suffix to it. The alert is a
-home-channel post and its triage a reply in its thread, so the edit asks the gateway to
-keep `update` keys for a home-channel thread as it does for a conversation. The plan
+home-channel post and its triage a reply in its thread, and the gateway keeps `update` keys
+per home-channel thread as it does per conversation, so the triage's keyed post edits the alert
+(spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
 while one waits on the user, and `settle: done` or `failed` once all have settled. A
 completed card's report, or a hard-wall block's reason, whose settle finished the ask's plan goes
@@ -851,8 +854,7 @@ post the gateway draws rating controls on, under the ask the plan's key is bound
 nothing, so a fan-out flags its creator's completion alone. The notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
-history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
-stands), it posts each notify's text, a later `update` of the same key included.
+history.
 
 **Stopping the cards (gke-labs#3263).** A `stop` cancels the conversation's task, and by
 then that task has usually ended. The cards it filed are what still runs, and no carrier
@@ -935,13 +937,22 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API
   refuses: the renderer retries it once as the fallback.
+- **Wording is linted, not validated.** A headline names no card id (`t_` and eight hex
+  digits), opens with no markdown heading or apology ("Sorry", "I apologize",
+  "Unfortunately") and carries no code fence; a choice's label is no slash command, code
+  span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
+  dropping the message for its wording would lose the answer. `chatmsg.Lint` and
+  `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
-`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above, the
+`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
+the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
 cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
-messages the emitter owes for them; `chatmsg` validates every one, and
+messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
+`tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
 
 ## Topics
 

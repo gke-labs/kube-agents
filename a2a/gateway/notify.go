@@ -46,14 +46,19 @@ const (
 	// posts arrive a few at a time; a full queue is a sender in a loop, and
 	// is refused at once rather than left to time out.
 	notifyQueueDepth = 32
-	// notifyStopGrace bounds how long Stop waits for the worker to finish the
-	// post in flight and refuse the rest, inside the pod's 30s termination
-	// grace period.
+	// notifyStopGrace bounds how long Stop waits, in all, for the worker to
+	// finish the post in flight and refuse the rest and for a refused-post
+	// keep in flight to land, inside the pod's 30s termination grace period.
 	notifyStopGrace = 20 * time.Second
 	// notifyStoppingRefusal is the answer to a request the gateway will not
-	// post because it is stopping. A refusal (exit 1 at the CLI), never
-	// silence: silence reads as "may have posted" and is not retried.
+	// post because it is stopping. A refusal marked Retry (route-unavailable,
+	// exit 4 at the CLI, which a sender waits out), never silence: silence
+	// reads as "may have posted" and is not retried.
 	notifyStoppingRefusal = "the gateway is stopping; not posted"
+	// notifyRecordUnreadable answers a conversation request whose session
+	// record couldn't be read in time. Transient, like the stopping refusal,
+	// and says nothing about whether the conversation exists.
+	notifyRecordUnreadable = "the conversation's record couldn't be read in time; not posted"
 	// notifyEmptyText answers an empty request: nothing to post.
 	notifyEmptyText = "text is empty"
 	// The backoff between attempts to bind the route when the first fails
@@ -72,6 +77,12 @@ const (
 	// notifyNoHome refuses a home-channel post on an install that names no
 	// home channel: the route then serves conversation requests only.
 	notifyNoHome = "no home channel is configured; only a request naming a conversation is posted"
+	// notifyNoHomeKept is the same refusal on a route that keeps refused
+	// home posts (notify_refused.go), answered by the keeper once the store
+	// has the post; the reply also carries Kept, which the a2a CLI turns
+	// into its own exit status so a sender that re-sends on failure (the
+	// drift digest, the data-volume warning) treats the post as handled.
+	notifyNoHomeKept = "no home channel is configured; the gateway keeps the post for one digest once a home channel is set; only a request naming a conversation is posted now"
 	// notifyHomeRefused answers a home post whose channel Slack refuses now
 	// (homeVerify): the word is one the operator matches.
 	notifyHomeRefused = "home channel refused: %s"
@@ -83,18 +94,26 @@ const (
 	notifyNoConversations = "this route does not post into conversations"
 	// notifyConversationRefused is the one refusal for a conversation the
 	// request may not post into, whatever the reason: no session record, a
-	// context id that does not match, or a record that cannot be read.
+	// context id that does not match, or a record that doesn't decode. A
+	// record that couldn't be read in time gets notifyRecordUnreadable.
 	notifyConversationRefused = "not a live conversation with that context"
-	// notifyUpdateKeysMax is the spec's cap on a conversation's live update
-	// keys (spec-a2a-payloads.md, "Card work after the task ends"): past
-	// it the least recently used key is forgotten, and a later request with
-	// it posts anew. notifyUpdateConversationsMax bounds the conversations
-	// the keys are kept for, the least recently used forgotten first, so
-	// the store is bounded however many conversations the agent works in.
+	// notifyUpdateKeysMax is the spec's cap on a conversation's, or a home
+	// thread's, live update keys (spec-a2a-payloads.md, "Card work after
+	// the task ends"): past it the least recently used key is forgotten,
+	// and a later request with it posts anew. notifyUpdateConversationsMax
+	// bounds the conversations and home threads together that the keys are
+	// kept for, the least recently used forgotten first, so the store is
+	// bounded however many conversations the agent works in and alerts it
+	// raises (a storm of alerts evicts a conversation's keys, and its next
+	// keyed request posts anew, as the spec allows).
 	notifyUpdateKeysMax          = 16
 	notifyUpdateConversationsMax = 1024
 	// notifyUpdateKeyMax bounds an update key, which the sender picks.
 	notifyUpdateKeyMax = 128
+	// notifyHomeKeyPrefix fronts a home thread's entry in the update table,
+	// where conversations are keyed by their own prefixed ids, so a home
+	// thread's keys and a conversation's never share an entry.
+	notifyHomeKeyPrefix = "home:"
 )
 
 // notifyMentionPattern and notifyMentionElements are what blocksMention
@@ -155,6 +174,19 @@ type notifyChatPoster interface {
 // says where the value came from (homePostHint).
 var homePostChannelErrors = []string{"channel_not_found", "is_archived", "not_in_channel"}
 
+// errNotifyNoTextEdit is editKeyedWith's answer when the layout did not
+// land and no text edit was allowed (the text does not fit one message):
+// the message is left as it was and the caller posts the text in chunks.
+var errNotifyNoTextEdit = errors.New("the layout did not land and the text does not fit one message")
+
+// notifyChatEditor is the optional half a backend that edits a home-channel
+// message in place adds: the message a keyed home request last posted on a
+// thread, laid out or as text. SlackAdapter and GoogleChatAdapter implement
+// it; a keyed home request to any other backend posts anew.
+type notifyChatEditor interface {
+	EditNotifyMessage(home, thread, message string, m OutMessage) error
+}
+
 // Notifier answers chat.notify requests for one backend.
 type Notifier struct {
 	subject string
@@ -173,6 +205,9 @@ type Notifier struct {
 	// post; a check that cannot be made posts as before.
 	homeVerify func(ctx context.Context, home string) (refused string, err error)
 	poster     notifyPoster
+	// backend names the route's backend on the posts it keeps
+	// (notify_refused.go): lib's NotifyPlatform name.
+	backend string
 	// threadOK is the backend's test that a requested thread may be
 	// replied on. The home channel is the bound either way: Chat's thread
 	// names its space, so it is checked against the home space (inHome);
@@ -200,8 +235,8 @@ type Notifier struct {
 	mu       sync.Mutex
 	stopping bool
 
-	// updates is where a conversation request's update key last posted
-	// (notifyUpdates). Only the worker reads or writes it.
+	// updates is where a conversation request's, or a home thread's, update
+	// key last posted (notifyUpdates). Only the worker reads or writes it.
 	updates notifyUpdates
 	// metrics counts the chat messages conversation requests carry; nil
 	// counts nothing (a Notifier armed without the gateway's
@@ -214,6 +249,29 @@ type Notifier struct {
 	// conversation's marks draw in the order their posts landed.
 	marks     chan notifyMarkJob
 	marksOnce sync.Once
+
+	// kept keeps the home posts refused for want of a home channel
+	// (notify_refused.go). storeMu orders the store's read-modify-writes
+	// (a keep against the digest's clear) and is held across store I/O, so
+	// only the keeper and the digest goroutines take it; keptMu guards the
+	// flags alone and is never held across I/O, so the delivery goroutine
+	// reads them without waiting on the store (lock order storeMu, then
+	// keptMu). keptWG counts the goroutines for Stop. keptPrimed says the
+	// count left by an earlier process has been read, keptPriming that the
+	// read is in flight; keptPending that a digest is owed to the next home
+	// channel this route sees, keptDigesting that one is on its way.
+	kept          refusedStore
+	storeMu       sync.Mutex
+	keptMu        sync.Mutex
+	keptWG        sync.WaitGroup
+	keptPrimed    bool
+	keptPriming   bool
+	keptPending   bool
+	keptDigesting bool
+	// keeps queues the refused home posts for the one keeper goroutine
+	// (keepWork), bounded like jobs; keepDone closes when it has drained.
+	keeps    chan keepJob
+	keepDone chan struct{}
 }
 
 // notifyMarkJob is one conversation mark waiting to be drawn.
@@ -236,7 +294,7 @@ func NewGchatNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 		log = slog.Default()
 	}
 	n := &Notifier{subject: lib.NotifySubjectGchat, home: home, poster: poster, log: log,
-		convPrefix: gchatKeyPrefix}
+		convPrefix: gchatKeyPrefix, backend: lib.NotifyPlatformGchat}
 	n.threadOK = inHome
 	return n, nil
 }
@@ -256,7 +314,7 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 		log = slog.Default()
 	}
 	n := &Notifier{subject: lib.NotifySubjectSlack, home: home, poster: poster, log: log,
-		convPrefix: slackKeyPrefix}
+		convPrefix: slackKeyPrefix, backend: lib.NotifyPlatformSlack}
 	n.threadOK, n.threadTS = slackThreadOK, slackThreadTS
 	return n, nil
 }
@@ -336,6 +394,7 @@ func (n *Notifier) homeState() (home, source string) {
 func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	n.jobs = make(chan notifyJob, notifyQueueDepth)
 	n.done = make(chan struct{})
+	n.startKeeper()
 	sub, err := client.SubscribeCore(n.subject, n.handle)
 	if err != nil {
 		return nil, fmt.Errorf("notify: %w", err)
@@ -343,6 +402,10 @@ func (n *Notifier) Start(client *lib.Client) (lib.Subscription, error) {
 	go n.work()
 	home, source := n.homeState()
 	n.log.Info("chat.notify route armed", "subject", n.subject, "home", home, "homeSource", source, "conversations", n.ServesConversations())
+	// What an earlier process refused is read now, and digested at once
+	// when this start already has a home channel (the CR's, or a projected
+	// one), else at the first home request that finds one.
+	n.primeKept()
 	return &notifierSub{sub: sub, n: n}, nil
 }
 
@@ -435,11 +498,37 @@ func (s *notifierSub) Stop() {
 		s.n.drainRefusing()
 		s.n.mu.Lock()
 		close(s.n.jobs)
+		// The keeper drains what is queued and exits; a later Start arms a
+		// new one, so the closed queue is let go of here.
+		keepDone := s.n.keepDone
+		if s.n.keeps != nil {
+			close(s.n.keeps)
+			s.n.keeps = nil
+		}
 		s.n.mu.Unlock()
+		// One grace for both waits, inside the pod's termination grace: an
+		// instant, not a one-shot channel, so the second wait keeps whatever
+		// the first left.
+		end := time.Now().Add(notifyStopGrace)
 		select {
 		case <-s.n.done:
-		case <-time.After(notifyStopGrace):
+		case <-time.After(time.Until(end)):
 			s.n.log.Warn("chat.notify worker did not finish before shutdown", "grace", notifyStopGrace)
+		}
+		// A keep or a digest in flight finishes inside its own store
+		// timeout; wait for it so a refused post is not lost to the exit.
+		kept := make(chan struct{})
+		go func() {
+			s.n.keptWG.Wait()
+			if keepDone != nil {
+				<-keepDone
+			}
+			close(kept)
+		}()
+		select {
+		case <-kept:
+		case <-time.After(time.Until(end)):
+			s.n.log.Warn("a refused-post keep did not finish before shutdown", "grace", notifyStopGrace)
 		}
 	})
 }
@@ -466,13 +555,17 @@ func (n *Notifier) handle(m *nats.Msg) {
 	}
 	req, home, refusal := n.validate(m.Data)
 	if refusal != nil {
+		if refusal.Kept {
+			n.keepRefused(req, answer)
+			return
+		}
 		answer(*refusal)
 		return
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopping {
-		answer(n.refuse(notifyStoppingRefusal))
+		answer(n.refuseRetry(notifyStoppingRefusal))
 		return
 	}
 	job := notifyJob{req: req, answer: answer, home: home}
@@ -490,7 +583,7 @@ func (n *Notifier) work() {
 	defer close(n.done)
 	for job := range n.jobs {
 		if n.isStopping() {
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 			continue
 		}
 		n.post(job)
@@ -503,7 +596,7 @@ func (n *Notifier) drainRefusing() {
 	for {
 		select {
 		case job := <-n.jobs:
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 		default:
 			return
 		}
@@ -570,13 +663,29 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 	home, source := n.homeState()
 	if home == "" {
 		n.log.Debug("notify refused: no home channel", "homeSource", source)
+		if n.kept != nil && req.Thread == "" {
+			// Answered by handle from the keep itself (keepRefused): Kept is
+			// a promise the store has to have made good on first. Only a
+			// top-level post is kept: a reply into a thread of the channel
+			// (a follow-up, a card's note) is not a proactive post the digest
+			// should count, and its thread is gone with the channel.
+			r := lib.NotifyReply{Error: notifyNoHomeKept, Kept: true}
+			return req, "", &r
+		}
 		return refuse(notifyNoHome)
 	}
+	// A home channel this route has: the digest owed to it posts beside
+	// this request (the projected file arriving is seen here, not by an
+	// event).
+	n.digestKept(home)
 	if req.Thread != "" && !n.threadOK(req.Thread, home) {
 		return refuse(fmt.Sprintf("thread %q is not a thread of the home channel", req.Thread))
 	}
 	if req.Thread != "" && n.threadTS != nil {
 		req.Thread = n.threadTS(req.Thread)
+	}
+	if utf8.RuneCountInString(req.Update) > notifyUpdateKeyMax {
+		return refuse(fmt.Sprintf("the update key is longer than %d characters", notifyUpdateKeyMax))
 	}
 	if len(req.Blocks) > 0 {
 		if _, ok := n.poster.(notifyBlocksPoster); !ok {
@@ -591,6 +700,9 @@ func (n *Notifier) validate(data []byte) (lib.NotifyRequest, string, *lib.Notify
 		}
 		if kind := blocksInteractive(blocks); kind != "" {
 			return refuse("blocks carry an interactive element (type " + kind + "); the gateway answers clicks only on the buttons it draws, so strip it")
+		}
+		if req.Update != "" {
+			return refuse("a request with blocks takes no update key; the gateway edits chat messages and text by key, not Block Kit")
 		}
 	}
 	return req, home, nil
@@ -652,7 +764,13 @@ func (n *Notifier) post(job notifyJob) {
 		have, err := n.conv.ConversationContext(ctx, job.req.Conversation)
 		if err != nil {
 			n.log.Warn("notify: session record unreadable", "conversation", job.req.Conversation, "err", err)
-			n.reply(job, n.refuse(notifyConversationRefused))
+			if errors.Is(err, errRecordUndecodable) {
+				// One key's fault, which waiting won't fix and which the
+				// sender learns nothing from: the one refusal.
+				n.reply(job, n.refuse(notifyConversationRefused))
+				return
+			}
+			n.reply(job, n.refuseRetry(notifyRecordUnreadable))
 			return
 		}
 		if have == "" || have != job.req.ContextID {
@@ -661,7 +779,7 @@ func (n *Notifier) post(job notifyJob) {
 			return
 		}
 		if n.isStopping() {
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 			return
 		}
 	}
@@ -691,7 +809,7 @@ func (n *Notifier) post(job notifyJob) {
 		n.postBlocks(job)
 		return
 	}
-	if job.req.Conversation == "" && len(job.req.Chat) > 0 && n.postHomeChat(job) {
+	if job.req.Conversation == "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postHome(job) {
 		return
 	}
 	if job.req.Conversation != "" && len(job.req.Chat) > 0 {
@@ -907,46 +1025,133 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 	return true
 }
 
-// postHomeChat answers a home-channel request that carries a chat message
-// (the cron relay's fleet-audit card, the first inventory's) when the backend lays
-// one out, and reports whether it did. The chat message is read and validated
-// as a conversation request's is; one that breaks a rule is dropped whole,
-// logged and counted, and so is one the backend refuses, and post then sends
-// the text as it always has. The update key and the mark are not read on a
-// home post.
-func (n *Notifier) postHomeChat(job notifyJob) bool {
-	poster, ok := n.poster.(notifyChatPoster)
-	if !ok {
+// postHome answers a home-channel request that carries a chat message (the
+// cron relay's fleet-audit card, the first inventory's, a triage card's plan)
+// or an update key (the event watcher's alert, the triage that edits it), and
+// reports whether it did. The chat message is read and validated as a
+// conversation request's is; one that breaks a rule is dropped whole, logged
+// and counted, and so is one the backend refuses, and the text stands. A key
+// is one message per home thread, as it is per conversation
+// (spec-a2a-payloads.md, "Card work after the task ends"), in the same table
+// and under the same bounds: a keyed request edits the message its key last
+// posted on the thread, laid out or as text, and posts one message when the
+// key has none there (another thread's, one forgotten, one lost to a
+// restart, a backend that does not edit) or the message can no longer be
+// edited. A keyed message is one message, so its text goes as text only
+// when it fits one chunk: a keyed request whose text is longer and whose
+// layout does not land (none, refused, or a backend without one) is not
+// answered here, and post sends the text in chunks, unkeyed, as it did
+// before this route read keys. A keyed request with no thread starts one
+// and binds its key to it, so the request that edits it names that thread.
+// An unkeyed request whose chat message the backend lays out is one
+// message; otherwise it is not answered here either. The mark is not read
+// on a home post: it is drawn on an ask's plan, which a home thread has
+// none of.
+func (n *Notifier) postHome(job notifyJob) bool {
+	home, thread, key := job.home, job.req.Thread, job.req.Update
+	m := OutMessage{Text: job.req.Text}
+	if len(job.req.Chat) > 0 {
+		reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
+		if len(reading.Problems) > 0 {
+			n.metrics.chatMessage(chatInvalid)
+			for _, p := range reading.Problems {
+				n.log.Warn("notify: "+chatDroppedWhat(chatmsg.Notify, reading),
+					"home", home, "rule", truncateRunes(p.Error(), chatProblemMax))
+			}
+		}
+		m.Chat = layoutOf(reading)
+	}
+	poster, lays := n.poster.(notifyChatPoster)
+	if m.Chat != nil && !lays {
 		n.metrics.chatMessage(chatTextOnly)
+		m.Chat = nil
+	}
+	if key == "" {
+		if m.Chat == nil {
+			return false
+		}
+		message, landed, err := poster.PostNotifyMessage(home, thread, m)
+		if !n.chatOutcome(home, err) {
+			return false
+		}
+		n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
+		n.log.Info("notify posted", "home", home, "thread", landed, "message", message, "chat", true)
+		return true
+	}
+	text := OutMessage{Text: m.Text}
+	fits := utf8.RuneCountInString(m.Text) <= discordChunk
+	if m.Chat == nil && !fits {
 		return false
 	}
-	reading := chatmsg.ReadNotify(job.req.Text, job.req.Chat)
-	if len(reading.Problems) > 0 {
-		n.metrics.chatMessage(chatInvalid)
-		for _, p := range reading.Problems {
-			n.log.Warn("notify: "+chatDroppedWhat(chatmsg.Notify, reading),
-				"home", job.home, "rule", truncateRunes(p.Error(), chatProblemMax))
+	var textEdit *OutMessage
+	if fits {
+		textEdit = &text
+	}
+	if editor, edits := n.poster.(notifyChatEditor); edits && thread != "" {
+		if message, ok := n.updates.get(notifyHomeKeyPrefix+thread, key); ok {
+			edit := func(m OutMessage) error { return editor.EditNotifyMessage(home, thread, message, m) }
+			edited, err := n.editKeyedWith(edit, home, []any{"home", home, "thread", thread, "message", message}, m, textEdit)
+			if errors.Is(err, errNotifyNoTextEdit) {
+				return false
+			}
+			if err != nil {
+				n.reply(job, lib.NotifyReply{Error: "edit failed: " + err.Error()})
+				return true
+			}
+			if edited {
+				n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: thread})
+				n.log.Info("notify edited", "home", home, "thread", thread, "message", message, "update", key)
+				return true
+			}
 		}
 	}
-	m := layoutOf(reading)
-	if m == nil {
-		return false
+	var message, landed string
+	var err error
+	if m.Chat != nil {
+		message, landed, err = poster.PostNotifyMessage(home, thread, m)
+		if !n.chatOutcome(home, err) {
+			if !fits {
+				return false
+			}
+			message, landed, err = n.poster.PostNotify(home, thread, text.Text)
+		}
+	} else {
+		message, landed, err = n.poster.PostNotify(home, thread, text.Text)
 	}
-	message, landed, err := poster.PostNotifyMessage(job.home, job.req.Thread, OutMessage{Text: job.req.Text, Chat: m})
-	if !n.chatOutcome(job.home, err) {
-		return false
+	if err != nil {
+		n.log.Error("notify post failed", "home", home, "thread", thread, "update", key, "err", err, "hint", n.homePostHint(err))
+		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+		return true
+	}
+	if landed == "" {
+		landed = thread
+	}
+	if landed != "" {
+		n.updates.put(notifyHomeKeyPrefix+landed, key, message)
 	}
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: landed})
-	n.log.Info("notify posted", "home", job.home, "thread", landed, "message", message, "chat", true)
+	n.log.Info("notify posted", "home", home, "thread", landed, "message", message, "update", key, "chat", m.Chat != nil)
 	return true
 }
 
 // editKeyed edits a keyed message to m, laid out when the adapter lays it
 // out and as text otherwise, and reports whether an edit landed.
 func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) (bool, error) {
+	edit := func(m OutMessage) error { return n.conv.EditMessage(conversation, message, m) }
+	return n.editKeyedWith(edit, conversation, []any{"conversation", conversation}, m, &text)
+}
+
+// editKeyedWith is editKeyed through edit, the backend's edit of the one
+// message. where names the conversation or home channel for the outcome
+// count, scope is what the log says of the message's place, and text is the
+// edit made when the layout does not land, or nil when none may be (the
+// text does not fit one message): then a refused layout leaves the message
+// as it was and the answer is errNotifyNoTextEdit, and a gone message
+// reports no edit, as a failed text edit does, so the caller posts anew.
+func (n *Notifier) editKeyedWith(edit func(OutMessage) error, where string, scope []any, m OutMessage, text *OutMessage) (bool, error) {
 	var layoutErr error
 	if m.Chat != nil {
-		layoutErr = n.conv.EditMessage(conversation, message, m)
+		layoutErr = edit(m)
 		if isTransientEdit(layoutErr) {
 			// Neither a refusal nor a gone message: a rate limit or an
 			// outage. A text edit now would strip the card's layout and
@@ -954,28 +1159,41 @@ func (n *Notifier) editKeyed(conversation, message string, m, text OutMessage) (
 			// once more and, failing again, the message is left as it is
 			// and the request answered with the error; the key stays, so
 			// the sender's next request edits it.
-			layoutErr = n.conv.EditMessage(conversation, message, m)
+			layoutErr = edit(m)
 			if isTransientEdit(layoutErr) {
-				n.log.Warn("notify: the keyed edit failed twice; the message is left as it was", "conversation", conversation, "err", layoutErr)
+				n.log.Warn("notify: the keyed edit failed twice; the message is left as it was", append(scope, "err", layoutErr)...)
 				return false, layoutErr
 			}
 		}
 		if layoutErr == nil || errors.Is(layoutErr, ErrTextOnly) {
-			if n.chatOutcome(conversation, layoutErr) {
+			if n.chatOutcome(where, layoutErr) {
 				return true, nil
 			}
 		}
 	}
-	if err := n.conv.EditMessage(conversation, message, text); err != nil {
+	if errors.Is(layoutErr, ErrMessageGone) {
+		// The message itself is gone: the layout was not what failed, so
+		// nothing is counted refused, no text edit is tried on it, and the
+		// request posts anew.
+		n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", layoutErr)...)
+		return false, nil
+	}
+	if text == nil {
+		if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
+			n.chatOutcome(where, layoutErr)
+		}
+		return false, errNotifyNoTextEdit
+	}
+	if err := edit(*text); err != nil {
 		// The message itself cannot be edited (gone, or the API failing):
 		// the layout was not what failed, so nothing is counted refused,
 		// and the request posts anew.
-		n.log.Warn("notify: editing the keyed message failed; posting a new one", "conversation", conversation, "err", err)
+		n.log.Warn("notify: editing the keyed message failed; posting a new one", append(scope, "err", err)...)
 		return false, nil
 	}
 	if layoutErr != nil && !errors.Is(layoutErr, ErrTextOnly) {
 		// The text edit landed where the layout did not.
-		n.chatOutcome(conversation, layoutErr)
+		n.chatOutcome(where, layoutErr)
 	}
 	return true, nil
 }
@@ -1005,11 +1223,11 @@ func (n *Notifier) chatOutcome(conversation string, err error) bool {
 	return false
 }
 
-// notifyUpdates remembers, per conversation, the message each update key
-// last posted: at most notifyUpdateKeysMax keys a conversation and
-// notifyUpdateConversationsMax conversations, the least recently used
-// forgotten first, so a plan edited all along outlives the questions filed
-// after it.
+// notifyUpdates remembers, per conversation or home thread (keyed
+// notifyHomeKeyPrefix+thread), the message each update key last posted: at
+// most notifyUpdateKeysMax keys an entry and notifyUpdateConversationsMax
+// entries, the least recently used forgotten first, so a plan edited all
+// along outlives the questions filed after it.
 // Process memory, so a restart forgets every key and the next request with
 // one posts anew, as the spec allows. Only the notifier's one worker uses
 // it, so it takes no lock.
@@ -1206,6 +1424,14 @@ func (n *Notifier) homePostHint(err error) string {
 func (n *Notifier) refuse(reason string) lib.NotifyReply {
 	n.log.Warn("notify refused", "reason", reason)
 	return lib.NotifyReply{Error: reason}
+}
+
+// refuseRetry is a refusal the sender should wait out rather than count
+// against the destination (lib.NotifyReply.Retry).
+func (n *Notifier) refuseRetry(reason string) lib.NotifyReply {
+	r := n.refuse(reason)
+	r.Retry = true
+	return r
 }
 
 // gatewayConversations is the gateway's NotifyConversations: session records

@@ -24,7 +24,7 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
 **This repository's lints** read the same file for fields devops-bench discards: `domain`,
-`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
+`fixtures`, `owner`, `expected_fail`, `tool_calls_optional`, `writes_alone`, `audit_streams` and `scope_exclude`. Those are ours. A typo in any of them cannot fail a run, which is
 exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
@@ -70,8 +70,11 @@ first line of
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
 only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
-`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
+`hack/eval/api-lane-exclusions.txt`. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
+`observe=<seconds>`, is the same stop sent while the opening turn still runs, `after` seconds after
+the harness first sees it working; a run whose stopped turn filed no card passes. The harness
+writes two entries for either case, `harness_stop_sent` and `harness_cards_stopped`, and the case's
+`tool_called` objectives name them.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted
@@ -81,16 +84,19 @@ the reply turn's answer is the deliverable, and the harness writes `harness_push
 for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
 as well.
 
-`expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
-case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
-carries a `verification_spec` (see the gate, below), so write it for the reader of a
-trend line rather than for a merge decision.
+`expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
+carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
+a pull request's run does not score. It never gates a case that carries a
+`verification_spec` (see the gate, below), so write it for the reader of a trend line
+rather than for a merge decision.
 
 `infrastructure` selects the deployer. `deployer: noop` provisions nothing and costs the
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
-and costs a multi-minute provision on every pull request. `hack/ci-eval-pr.sh` reads
-`infrastructure.deployer` out of the file text to classify a crashed run, so keep it on
-one line.
+and costs what that stack takes to apply and destroy on every pull request, minutes for a
+cluster and seconds for a single alert policy. `task_stack` in `hack/ci-eval-pr.sh` reads
+`infrastructure.stack` out of the file text for the infra lock and the nightly halves, so
+keep it on one line; `bench-gate` reads `deployer` through a YAML parse
+(`bench/kube_agents_bench/cases.py`) to classify a crashed run.
 
 `documentation` carries reference documents and the per-constraint `critical` flags the
 checklist metric scores. It is judged, not exact.
@@ -103,12 +109,16 @@ it is discussed below in its own right.
 
 `fixtures` is a list of fixture role slugs from `bench/tf/fleet/fixtures.json` — the
 seeded defects the case depends on. (`docs/designs/fleet-fixtures.yaml` overlays the
-day-N gates and the project-scoped fixtures on that catalogue, and contributes the roles
-that have no cluster slot; it may not rename one.) It is documentation the validator
+day-N gates on that catalogue, and contributes only the roles the catalogue does not
+probe, such as `orphan-disks`; it may not rename one.) It is documentation the validator
 enforces: it makes a case's fixture dependencies greppable, so the fleet owner replacing
 a cluster knows which cases go quiet. The same slugs name a `fleet_resource_property`
 check's `fixture_role:`, and a check naming a role the case does not list is rejected —
-one planted defect, one name, however the case refers to it. Cases address fixtures by
+one planted defect, one name, however the case refers to it. A project-scoped catalogue
+role (`cluster_slot: null`, a Compute Engine object such as `startup-fail-vm`) may appear in
+`fixtures:` but not in `fixture_role:` or `fixture_roles:`: the runner writes no kubeconfig
+and records no slot for it, and the validator refuses it there in a case that is not in
+`FIXTURE_NOT_READY`. Cases address fixtures by
 role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
 the contract for why.
 
@@ -134,6 +144,12 @@ declared outcome, and passing every repetition reds the job until the marker is 
 defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
 boolean: `"false"` is a string, and truthy, and the validator rejects it.
 `.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
+`writes_alone` is for a case that requests no pull request but whose wrong answer may open one
+the reply never names: the lane runs it alone in its second phase and marks the write
+safeguard's window exclusive, so any write in the window is charged to it
+(`bench/kube_agents_bench/lane.py`). A bare YAML boolean, `false` by default; devops-bench
+ignores the key.
 
 `tool_calls_optional` is for a case a correct agent can answer without calling a tool: a
 first-turn greeting, a reply that names a command. `bench-gate`'s rung 3 otherwise reads an empty
@@ -294,7 +310,7 @@ the repetition's reply, or its or its workers' call that created the write, name
 a case wraps it in `none` to say the agent wrote nothing it was not asked for,
 and both lanes append exactly that entry to every case they run), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from the worker log of each card the front agent filed before the harness
-purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory, and with `after_result_pattern` set from every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; the required patterns and runs also read a logged card's tagged calls; with `after_result_pattern` set, the check reads every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
 command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
@@ -334,7 +350,8 @@ card for anything else), or, with `cap`, one of the first-run cap's two (#3702):
 `cards_for_first_cap_profiles` (cards for exactly the carded profiles: the sweep marker's
 `carded=` set when it has one, else the first `cap` profiles by name) and
 `past_cap_clusters_sweep_audited` (every roster cluster outside that set shown in the sandbox's
-`INVENTORY.raw.md` as audited by the sweep itself).
+`INVENTORY.raw.md` as audited by the sweep itself, with at least one workload listed or one finding
+line on a row scanned in full, so an audit relayed empty does not pass).
 
 `bootstrap_handoff` reads both ends of the sweep's hand-off to the prioritization stage. Its
 `require` is `raw_report_has_findings_block` (the sandbox's own `inventory_findings.py` parses
@@ -360,7 +377,11 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+grade an edit to them by its effect. With `target: gateway` it execs into the agent container
+instead and diffs each skill directory the image's platform template ships (and its A2A
+overlay: every one when the profile carries the overlay's manifest, else each one the profile
+holds a name for) against the gateway's platform profile copy, the one `skill_manage` writes; entries beside them that no template ships (Hermes' own files, a skill
+authored under a new name) are reported, not failed, and no lane sets either target aside. A stack that runs Python in the sandbox does it as
 root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
 no `__pycache__` in the reference tree for this check to read as an edit. The check
 still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
@@ -368,8 +389,11 @@ Session KV server in the agent pod and passes when every row in `finding_ids`, u
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
-the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
-finding in its `document` whose id contains it. `report_store_reply`, in its own module
+the run started (or, with `since_state_file`, since the `fired_at` a case's stack recorded in that
+JSON file in the agent container, for a scheduled run the stack fired and waited out before the
+turn; an unreadable file is `status: "error"`), with `status` when it gives one, with each key of `required_envelope` equal to the
+value given (`required_envelope: {precheck: unchanged}` reads the envelope's own key), and, for each
+`required_finding_phrases` entry, a finding in its `document` whose id contains it. `report_store_reply`, in its own module
 (`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
 install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
 and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
@@ -423,8 +447,9 @@ filed is read from the trajectory, as far as the capture reached it) — a route
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
 pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
 log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
-arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
-never sees a command chained behind another, and the quotes stay, so a listed word the command
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern or
+run never sees a command chained behind another (a required pattern or run also reads that
+card's tagged calls as typed, so it does), and the quotes stay, so a listed word the command
 splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
@@ -453,10 +478,11 @@ Only coverage fails on absence. A spec with no catastrophic safeguard emits no
 correctness key either, and coverage is what catches it.
 
 The floor is `DETERMINISTIC_CORRECTNESS_FLOOR` in the same script, `"1.0"` today: every
-declared objective is meant to hold outright. `OutcomeValidity` and `ChecklistScore` are
-recorded on every run and gate nothing on a spec-carrying case — a judged score that
-drops is a trend to read, not a merge to block. `VerificationRecoverable` is emitted but
-is not in the gate.
+declared objective is meant to hold outright. `OutcomeValidity` is recorded on every run,
+and `ChecklistScore` on a run of a case whose `expected_output` carries bullets, except a
+pull request's; neither gates a spec-carrying case — a judged score that drops is a trend
+to read, not a merge to block.
+`VerificationRecoverable` is emitted but is not in the gate.
 
 Three shapes of absence are failures rather than green:
 
@@ -525,8 +551,9 @@ reason and what would close it. An entry there is a debt with a name on it.
 ## Registration
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
-job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
-Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
+`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
+runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
@@ -551,6 +578,11 @@ seat, or because what they grade is not one of the core journeys the presubmit g
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
+
+The one exception is a case with `suite: certification` in its task file: it registers in
+`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+in the presubmit or nightly files
+([`bench/README.md`](../../bench/README.md#certification-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
@@ -577,7 +609,7 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
-written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
+written as a mention or not a login, an `expected_fail:`, `tool_calls_optional:` or `writes_alone:`
 that is not a bare YAML boolean, a `resource_property` or `fleet_resource_property` check that
 compares a known boolean field such as `spec.suspend` to the string `"true"` or `"false"` under
 `op: eq` or `ne` (the string never compares equal to the API's boolean, so the check asserts

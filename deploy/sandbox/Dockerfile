@@ -83,9 +83,49 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
+# kubectl 1.34 is the floor: the kube-proxy kubeconfigs (entrypoint.sh
+# write_kube_proxy_kubeconfig) name the cluster in the server URL's path,
+# `${KUBE_PROXY_URL}/clusters/<ctx>`, and `kubectl get --raw` before 1.34
+# replaced that path with the raw path (client-go's `Request.RequestURI` set
+# `pathPrefix = locator.Path`; since v0.34.0 it goes through `AbsPath`). On 1.32
+# every --raw read reached the proxy with no cluster in it (#4739), which the
+# proxy now refuses. The pin is 1.35 rather than the floor because the fleet runs
+# GKE 1.35 and 1.36 (REGULAR's default), and kubectl is supported within one
+# minor of the server: 1.34 would be outside it for 1.36. Keep it within one
+# minor of the fleet. check_kubectl_base_path.py below fails the build for a
+# kubectl that drops the path, smoke-test.sh section 5 proves it against the
+# running image, and tests/test_sandbox_kubectl_pin.py holds the pin at or above
+# the floor.
+ARG KUBECTL_VERSION=1.35.10
+ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
+COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    case "${ARCH}" in \
+      amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
+      arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
+      *) echo "no kubectl checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+    esac && \
+    curl -sSLf --retry 8 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
+    install -d -m 0755 /usr/local/libexec && \
+    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
+    echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - && \
+    chmod 0755 /usr/local/libexec/kubectl && \
+    python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl && \
+    rm /tmp/check_kubectl_base_path.py && \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
+      '  case " $* " in' \
+      '  *" --context"*)' \
+      '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
+      '    ;;' \
+      '  esac' \
+      'fi' \
+      'exec /usr/local/libexec/kubectl "$@"' \
+      >/usr/local/bin/kubectl && \
+    chmod 0755 /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz --no-same-owner -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
@@ -96,21 +136,22 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # is set (`pkg/clusters/broker.go`: `BrokerFromEnv` sets `ShellMode: true`), so
 # `leeway report` (`v0.1.3+`) leaves `Cluster.Config = nil` and
 # `fetchViaKubectl` (`pkg/report/collector.go`) shells out to the sandbox's
-# `kubectl` credential-proxy shim on `PATH` (`/opt/credential-proxy/bin/kubectl`,
-# governed by `KUBECTL_READ_VERBS`) rather than dialing the Kubernetes API
-# server directly through `client-go`. Pinned and checked against the
-# release's SHA256SUMS, per architecture; a version bump moves the hashes and
-# the `leeway version` check in deploy/sandbox/smoke-test.sh with it.
-ARG LEEWAY_VERSION=0.1.3
-ARG LEEWAY_SHA256_AMD64=26380a054ae1e5291f915f3965705c5d4198aeec611c42db843fd0ddbea06854
-ARG LEEWAY_SHA256_ARM64=850d8b9cd8d745898f41d139c1284db0aa88c6b9a42a5a95e758f59b58a8bb5b
+# stock `kubectl` on `PATH` (`/usr/local/bin/kubectl`, which reaches
+# `<name>-kube-proxy` over HTTPS with the sandbox's credential-free kubeconfig)
+# rather than dialing the Kubernetes API server directly through `client-go`.
+# Pinned and checked against the release's SHA256SUMS, per architecture; a
+# version bump moves the hashes and the `leeway version` check in
+# deploy/sandbox/smoke-test.sh with it.
+ARG LEEWAY_VERSION=0.1.5
+ARG LEEWAY_SHA256_AMD64=f241671cf5a6e6b642fda5238b31ea3283e8dcb7aa6b9782358f268515e71d8a
+ARG LEEWAY_SHA256_ARM64=6282ea89eeb9af23a50ac4f9f06bcf135206ff93f3beda9efa96cf94144ccc5c
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \
       arm64) LEEWAY_SHA256="${LEEWAY_SHA256_ARM64}" ;; \
       *) echo "no leeway checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/leeway.tar.gz \
       "https://github.com/go-steer/leeway/releases/download/v${LEEWAY_VERSION}/leeway_v${LEEWAY_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${LEEWAY_SHA256}  /tmp/leeway.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/leeway.tar.gz --no-same-owner -C /usr/local/bin leeway && \
@@ -137,7 +178,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) TOFU_SHA256="${OPENTOFU_SHA256_ARM64}" ;; \
       *) echo "no OpenTofu checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/tofu.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/tofu.tar.gz \
       "https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${TOFU_SHA256}  /tmp/tofu.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/tofu.tar.gz --no-same-owner -C /usr/local/bin tofu && \
@@ -430,6 +471,7 @@ RUN groupadd --gid 1001 hermes && \
     usermod -p '*' hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh && \
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.kube && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.kubeconfigs
 
 # The credential-aware CLIs: symlinks to one client that forwards argv to the
@@ -523,12 +565,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          managed-repository config (`get_managed_github_repos`,
 #                          `is_valid_repo_slug`, `validate_repo_org`), which every
 #                          skill checks a `--repo` against before it acts. Its
-#                          leased clone is still used from here by the two skills
-#                          that read a whole tree — inspect-repository and
-#                          fleet-upgrade-verification's api_deprecation_scan, both
-#                          `ensure_workspace(..., lease=...)` — and by fleet-audit's
+#                          leased clone is still used from here by the skill
+#                          that reads a whole tree, inspect-repository
+#                          (`ensure_workspace(..., lease=...)`), by fleet-audit's
 #                          audit_report, whose directory-mode fallback still
-#                          reaches for it; the content mode it runs in does not.
+#                          reaches for it (the content mode it runs in does not),
+#                          and by fleet-upgrade-verification's api_deprecation_scan
+#                          only when CREDENTIAL_PROXY_URL is not set.
 #                          Every working copy that *proposes* a change goes
 #                          through `vcs_client`
 #   gitops_preflight.py    the one-line answer a PR-writing skill or SOUL.md is to run
@@ -563,18 +606,19 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          imports it at load
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
-#                          refusal. `vcs.py`, `forge.py` and submit-suggestion all
-#                          go through it, and it is the only thing in this image
-#                          that composes a `/v1/vcs/<verb>` request. Other scripts
+#                          refusal. `vcs.py`, `forge.py`, submit-suggestion,
+#                          inspect-repository and fleet-upgrade-verification's
+#                          api_deprecation_scan all go through it, and it is
+#                          the only thing in this image that composes a
+#                          `/v1/vcs/<verb>` request. Other scripts
 #                          here -- github_token_refresh, gke_endpoint,
-#                          inspect-repository, fleet-audit,
-#                          fleet-upgrade-verification -- do reach the proxy
-#                          directly, for its other routes, not for a forge verb
+#                          fleet-audit -- do reach the proxy directly, for its
+#                          other routes, not for a forge verb
 #   workspace_paths.py     the workspace protocol's path validator, imported by
-#                          inspect-repository to re-check every name at the point
-#                          it becomes a write. The broker's content_workspace
-#                          delegates to this same file, so the two ends cannot
-#                          drift into disagreeing about what is under `.git`
+#                          fleet-audit's audit_report to check each path prefix
+#                          before it asks for a copy. The broker delegates to
+#                          this same file, so the two ends cannot drift into
+#                          disagreeing about what is under `.git`
 #   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
 #   cluster_preflight.sh   the Cluster Agent's first command on every kanban task
@@ -595,6 +639,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          for Cluster Agent domain audits (#3285)
 #   audit_certificates.py  single-pass cert-manager CRD, Certificate, Issuer, and GKE
 #                          ManagedCertificate collector (#3285)
+#   workload_triage.py     the Cluster Agent's workload-triage-scan reader: one
+#                          pass over pods, controllers and Warning events; reads
+#                          current-context locally via credential_proxy_client,
+#                          its kubectl reads go through the same wrapper, and it
+#                          is here for the same reason as stall_report.py
+#   kcc_fleet_audit.py     batched parallel Config Connector (KCC) CRD and custom
+#                          resource auditor for Cluster Agent KCC audits (#3142)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -644,6 +695,8 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/audit_storage.py \
      agents/platform/scripts/audit_networking.py \
      agents/platform/scripts/audit_certificates.py \
+     agents/platform/scripts/workload_triage.py \
+     agents/platform/scripts/kcc_fleet_audit.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \
@@ -780,10 +833,10 @@ RUN set -e; \
 # which is not on the build PATH either, so a hit below still means a native
 # binary arrived by some other route.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl; do \
-        ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
-    done && \
-    for binary in gcloud kubectl gh git; do \
+    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
+    test -x /usr/local/bin/kubectl && \
+    test ! -e /opt/credential-proxy/bin/kubectl && \
+    for binary in gcloud gh git; do \
         if command -v "${binary}" >/dev/null 2>&1; then \
             echo "unexpected credential-aware CLI in the sandbox image: ${binary}" >&2; \
             exit 1; \

@@ -84,10 +84,11 @@ session and the conversation key; a key naming a whole DM or space rather than a
 up), and frames the report ahead of the user's words with the hook's
 notice and token list.
 
-With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report sends a
+With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report, and under
+`spec.mode: next` the Google Chat leg too, sends a
 headline in place of the report (`slack_audit_report.py`, called from
 `relay_cron_report`), provided a chat id or a Slack
-home channel is known, the job's `skills` (a list or one string, or the legacy `skill`) include
+home channel is known (or the leg is one the gateway routes, which holds its home channel), the job's `skills` (a list or one string, or the legacy `skill`) include
 `fleet-audit`, the message ends
 with a link to an issue in a managed repository, and enough of the posts' budget is
 left to read that issue. The headline reads that issue if it is open and labelled
@@ -143,7 +144,7 @@ and neither has that section, so the line is not posted for it. A fleet-audit jo
 at runtime, and a mid-run `report_to_chat`, still post the model's text, and the line
 still applies to them.
 
-Every other report (Google Chat, one that does not end with
+Every other report (Google Chat under `today`, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
 flag off) is posted unchanged. A job whose `deliver` value claims
@@ -175,12 +176,13 @@ which leaves the other half for the sends to every platform: the Block Kit post
 stops short of it with room left for the text send, and when too little is left to
 read the ledger the report goes out as text in one send.
 
-Under `spec.mode: next` the gateway holds Slack and the broker's relay is gone, so the
-same card goes to the gateway as a `kube-agents.chat/v1` message instead
+Under `spec.mode: next` the gateway holds the chat platform, Slack or Google Chat, and the
+broker's relay is gone, so the same card goes to the gateway, for whichever leg it routes,
+as a `kube-agents.chat/v1` message instead
 (`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
 gateway lays it out, buttons included, as it lays out a card's post in a conversation.
 The text headline rides beside it as the fallback the gateway posts when the message
-breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
+breaks a rule or the platform refuses it; the leg's own fallbacks above are unchanged.
 
 A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
 no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
@@ -195,11 +197,14 @@ of the ledger card.
 `kanban-board-health`'s report gets a card of its own when the stuck tasks are all it
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
 beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
-only when its text is the report being relayed, with the flag on and a channel known.
+only when its text is the report being relayed, with the flag on and a channel known (or the
+leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
 under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
-(`chat_from_card`), with Retry and Drop under each row; its outcomes, and the report going
-out as text where the card does not post, are the audit card's. A tap on either is no turn:
+(`chat_from_card`), with Retry and Drop under each row on Slack and, on Google Chat, under
+the message and labelled by the row's number (`a2a/gateway/slack_board.go`,
+`a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
+card's. A tap on either is no turn:
 it unblocks or archives the row's cards through session-kv's `POST /v1/board/actions` and
 edits the row
 ([the job's section](../../agents/platform/cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)).
@@ -466,7 +471,8 @@ The experimental
 flag re-homes the gateway onto the platform profile, so the agent that answers a
 reply in a report's thread is the Platform Agent rather than the Chat Agent.
 The relay route itself is unaffected: `hermes send` still does the posting, apart
-from a Slack fleet-audit headline posted as Block Kit (above). What changes is
+from a fleet-audit headline posted as Block Kit on Slack, or as a chat message through the
+gateway (above). What changes is
 whether anything reaches the route at all. Two things, both worth stating rather
 than discovering.
 
@@ -534,8 +540,8 @@ exactly as before, and the index only runs where the hook previously did nothing
 Google Chat opens a thread around every top-level message, so the thread name on
 an inbound payload cannot say whether the user posted at top level or replied
 inside a real thread. Chat's `message.threadReply` flag does say (it is true only
-for a reply in a thread; the `mode: next` gateway reads it, per
-`spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
+for a reply in a thread; the `mode: next` gateway reads it to mark a top-level ask and keys every DM
+message by its thread, per `spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
 the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
 than in the thread. Both writers of that counter live in the gateway process. A
@@ -639,13 +645,18 @@ profile's — then per-platform environment signals for an install neither file
 describes.
 
 An install with no chat route gets no send at all: when the managed scope turns
-every platform off and nothing routes one through the gateway — a `next` install
-whose only chat platform is held by the gateway with no home channel, or an
-install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
-platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
-channel (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
-exists when no platform can be named.
+every platform off and nothing routes one through the gateway — an install with
+neither Google Chat nor Slack, or one whose home channel is malformed, which routes
+nothing — the relay answers 502 without posting, and the detail says that no route
+exists. A `next` install whose only chat platform is held by the gateway with no home
+channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
+sends, and the gateway refuses the post and keeps it for the digest it posts once a
+home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
+the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
+says the post is kept, is in the gateway's and the session server's logs. A pod
+rendered before the operator routed it still answers the platform-naming detail
+(`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
@@ -742,7 +753,8 @@ standalone sender: the relayed stand-in, when `GOOGLE_CHAT_RELAY_URL` is set,
 drops a dressed marker with the Slack sender's predicate, and upstream's, on an
 install without the relay, carries no such guard; no roster job uses `"all"`.
 
-The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`.
+The fleet-audit prompts carry one sentence that tells the worker to pass `--scheduled` to `finish`
+(and, where the SOP runs the gate, to `precheck`).
 That sentence controls silence, not delivery: a prompt without it only makes the job noisier
 ([ledger design §7.5](fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening)).
 

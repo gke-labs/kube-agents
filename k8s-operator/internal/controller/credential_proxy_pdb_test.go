@@ -57,7 +57,7 @@ func reconcileProxyWithFake(t *testing.T, agent *agentv1alpha1.PlatformAgent, se
 		WithInterceptorFuncs(interceptors).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if err := r.reconcileCredentialProxy(ctx, agent, brokerTestPolicyHash, nil, true); err != nil {
+	if err := r.reconcileCredentialProxy(ctx, agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
 		t.Fatalf("reconcileCredentialProxy: %v", err)
 	}
 	key := types.NamespacedName{Name: credentialProxyName(agent), Namespace: agent.Namespace}
@@ -129,7 +129,7 @@ func TestTheCredentialProxyBudgetAndEveryOtherBudgetAreDisjoint(t *testing.T) {
 	}
 	proxyPods := labels.Set(dep.Spec.Template.Labels)
 
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	platformPDB := buildPlatformPDB(agent)
 	others := []struct {

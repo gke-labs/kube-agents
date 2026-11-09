@@ -33,6 +33,7 @@ from drifting apart.
 
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
 from kube_agents_bench import pushed_report, scope_exclude, stop_hook
+from kube_agents_bench.lane import requested_pull_requests as _lane_requested_pull_requests
 
 __all__ = [
     "CASE_KEYS",
@@ -68,7 +70,10 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``) -- and ``task_version``, a
+#   ``scope_exclude.py``), ``writes_alone`` (read by ``lane.py``), ``suite``
+#   (``certification``: the case runs on the certification lane only, read by
+#   scripts/validate_bench_cases.py against hack/eval/certification-cases.txt)
+#   -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
 #   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
@@ -80,7 +85,7 @@ DEVOPS_BENCH_CASE_KEYS = (
 REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
-        "audit_streams", scope_exclude.KEY, "task_version",
+        "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
@@ -235,6 +240,17 @@ class CaseSpec:
     run evidence, beside the billed tokens and latency every case needs.
     Absent means False."""
 
+    requested_pull_requests: int = 0
+    """How many pull requests the case's own requesting checks ask for (leaves
+    of a type in ``lane.REQUESTING_CHECK_TYPES``). The infra carve-out in
+    ``scoring.classify_rep`` fires only when this is non-zero: an empty report
+    on an infra-ended rep mischarges a *requested* pull request as unrequested,
+    but on a case that requested none a write is a genuine forbidden action and
+    still blocks. A case that requests a pull request only through the lane
+    ``requesting:`` listing (its own checks ask for none) is not distinguished
+    here: the scorer is pinned to the ``bench/`` tree and cannot read the lane
+    file, so its infra-ended rep still blocks (tracked in #4778)."""
+
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
     """Every leaf check in a subtree, in order (a leaf that is not a mapping
@@ -358,6 +374,10 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     directory. Raises :class:`CaseSpecError` on anything the scorer cannot
     grade honestly — a missing file, a document that is not a mapping, or a
     declared id that disagrees with the directory.
+
+    The case's ``requested_pull_requests`` is the count of its own requesting
+    checks. A lane-only ``requesting:`` listing is not read here; see that
+    field's note.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -425,7 +445,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name = str(name_raw).strip() if name_raw is not None else case_id
 
     trace_blind, negated_trace_blind, worker_blind = _transport_blind_checks(spec)
-
     return CaseSpec(
         case_id=case_id,
         name=name,
@@ -439,4 +458,5 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         negated_trace_blind_checks=negated_trace_blind,
         worker_blind_checks=worker_blind,
         tool_calls_optional=tool_calls_optional,
+        requested_pull_requests=_lane_requested_pull_requests(spec),
     )

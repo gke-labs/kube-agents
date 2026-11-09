@@ -230,7 +230,7 @@ func a2aSeedStreamConfigs() []jetstream.StreamConfig {
 }
 
 // a2aProvisionLikeTheScript seeds a test bus with what the provision Job
-// creates: the streams above and five KV buckets.
+// creates: the streams above and six KV buckets.
 func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 	t.Helper()
 	_, js := a2aConnectAs(t, url, "seed", seedPassword)
@@ -249,11 +249,17 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 			t.Fatalf("provision bucket %s as seed: %v", bucket, err)
 		}
 	}
-	// `nats kv add feedback --ttl=720h`: the one bucket with a max age.
+	// `nats kv add feedback --ttl=720h` and `nats kv add people --ttl=720h`:
+	// the two buckets with a max age.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
 		Bucket: "feedback", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 67108864, TTL: 720 * time.Hour,
 	}); err != nil {
 		t.Fatalf("provision bucket feedback as seed: %v", err)
+	}
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
+		Bucket: "people", History: 1, Replicas: 1, Storage: jetstream.FileStorage, MaxBytes: 33554432, TTL: 720 * time.Hour,
+	}); err != nil {
+		t.Fatalf("provision bucket people as seed: %v", err)
 	}
 	// `nats kv add PROFILE_LEASES`: the dispatcher's leases, no TTL.
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{
@@ -853,6 +859,11 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 
 	t.Run("the wildcard this replaces let the bridge delete the directory", func(t *testing.T) {
 		before := strings.Replace(conf, a2aNATSConfGrantLines(a2aBridgeJetStreamGrants()), fmt.Sprintf(a2aNATSConfGrantLine, "$JS.API.>"), 1)
+		// Also widen the account export/import in the negative-control config so
+		// putting $JS.API.> back into bridge's user permissions tests the user
+		// grant rather than the account export list.
+		before = strings.Replace(before, `{ service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }`, `{ service: "$JS.API.>", accounts: [ APP, CONSOLE ] }`, 1)
+		before = strings.Replace(before, `{ service: { account: TRUSTED, subject: "$JS.API.INFO" } }`, `{ service: { account: TRUSTED, subject: "$JS.API.>" } }`, 2)
 		if before == conf {
 			t.Fatal("could not put $JS.API.> back into the bridge block; the control is gone")
 		}
@@ -1051,5 +1062,97 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 		default:
 			t.Errorf("unexpected violation after the restart: %s", line)
 		}
+	}
+}
+
+// TestJetStreamStoreMigrationFromAPPToTRUSTED verifies that a store moved from
+// `jetstream/APP` to `jetstream/TRUSTED` (the move the startup script makes;
+// TestTheBusStartupScriptMovesTheStoreOnce runs the script itself) keeps a
+// bus provisioned under the single-account layout, where `APP` owned
+// `jetstream: enabled`: its streams, messages, consumers and KV entries are
+// all readable under the three-account layout (`TRUSTED`, `CONSOLE`, `APP`).
+func TestJetStreamStoreMigrationFromAPPToTRUSTED(t *testing.T) {
+	creds := a2aFullCreds("a", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	seedPW := string(creds.Data["seed-password"])
+	gatewayPW := string(creds.Data["gateway-password"])
+	bridgePW := string(creds.Data["bridge-password"])
+
+	// Build a pre-upgrade config in which APP holds `jetstream: enabled` (by
+	// renaming TRUSTED -> OLD_JS in the rendered config, then renaming APP
+	// -> LEGACY_APP and OLD_JS -> APP so seed and gateway provision
+	// directly under `/data/jetstream/APP`).
+	legacyConf := strings.Replace(conf, "  TRUSTED {\n    jetstream: enabled", "  OLD_JS {\n    jetstream: enabled", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: TRUSTED", "account: OLD_JS")
+	legacyConf = strings.ReplaceAll(legacyConf, "accounts: [ TRUSTED ]", "accounts: [ OLD_JS ]")
+	legacyConf = strings.Replace(legacyConf, "  APP {\n", "  LEGACY_APP {\n", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: APP", "account: LEGACY_APP")
+	legacyConf = strings.ReplaceAll(legacyConf, "[ APP, CONSOLE ]", "[ LEGACY_APP, CONSOLE ]")
+	legacyConf = strings.ReplaceAll(legacyConf, "[ APP ]", "[ LEGACY_APP ]")
+	legacyConf = strings.Replace(legacyConf, "  OLD_JS {\n    jetstream: enabled", "  APP {\n    jetstream: enabled", 1)
+	legacyConf = strings.ReplaceAll(legacyConf, "account: OLD_JS", "account: APP")
+	legacyConf = strings.ReplaceAll(legacyConf, "accounts: [ OLD_JS ]", "accounts: [ APP ]")
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	store := t.TempDir()
+	url := "nats://127.0.0.1:" + strconv.Itoa(port)
+
+	first, _ := a2aStartRenderedServerAt(t, legacyConf, port, store)
+	a2aProvisionLikeTheScript(t, url, seedPW)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, gw := a2aConnectAs(t, url, "gateway", gatewayPW)
+	if _, err := gw.Publish(ctx, "a2a.tasks.platform.migrated-1.in", []byte(`{"kind":"message","text":"survives-upgrade"}`)); err != nil {
+		t.Fatalf("publish before migration: %v", err)
+	}
+	kvBefore, err := gw.KeyValue(ctx, "session-state")
+	if err != nil {
+		t.Fatalf("open session-state before migration: %v", err)
+	}
+	if _, err := kvBefore.Put(ctx, "conv-1", []byte(`{"pod":"session-1"}`)); err != nil {
+		t.Fatalf("put session-state before migration: %v", err)
+	}
+	first.Shutdown()
+	first.WaitForShutdown()
+
+	appDir := filepath.Join(store, "jetstream", a2aAccountApp)
+	trustedDir := filepath.Join(store, "jetstream", a2aAccountControl)
+	if _, err := os.Stat(appDir); err != nil {
+		t.Fatalf("expected legacy store at %s: %v", appDir, err)
+	}
+	if err := os.Rename(appDir, trustedDir); err != nil {
+		t.Fatalf("migrating %s -> %s: %v", appDir, trustedDir, err)
+	}
+
+	second, _ := a2aStartRenderedServerAt(t, conf, port, store)
+	defer func() {
+		second.Shutdown()
+		second.WaitForShutdown()
+	}()
+
+	_, gwAfter := a2aConnectAs(t, url, "gateway", gatewayPW)
+	kvAfter, err := gwAfter.KeyValue(ctx, "session-state")
+	if err != nil {
+		t.Fatalf("open session-state after migration: %v", err)
+	}
+	entry, err := kvAfter.Get(ctx, "conv-1")
+	if err != nil || string(entry.Value()) != `{"pod":"session-1"}` {
+		t.Fatalf("session-state entry after migration = %v, %v", entry, err)
+	}
+
+	_, bridgeAfter := a2aConnectAs(t, url, "bridge", bridgePW)
+	tasksAfter, err := bridgeAfter.Stream(ctx, "TASKS")
+	if err != nil {
+		t.Fatalf("open TASKS from APP after migration: %v", err)
+	}
+	msg, err := tasksAfter.GetLastMsgForSubject(ctx, "a2a.tasks.platform.migrated-1.in")
+	if err != nil || string(msg.Data) != `{"kind":"message","text":"survives-upgrade"}` {
+		t.Fatalf("TASKS message from APP after migration = %+v, %v", msg, err)
 	}
 }

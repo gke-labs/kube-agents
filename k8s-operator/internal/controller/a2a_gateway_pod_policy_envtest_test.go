@@ -65,7 +65,7 @@ func TestTheGatewayPodPolicyHoldsGatewayPodsToTheSessionShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	applyGatewayPodPolicy(ctx, t, admin)
+	applyAdmissionPolicyFile(ctx, t, admin, gatewayPodPolicyFile)
 
 	ns := gatewayPodPolicyNamespace
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}})
@@ -313,9 +313,11 @@ func impersonatedClient(t *testing.T, cfg *rest.Config, ns, sa string) client.Cl
 	return c
 }
 
-func applyGatewayPodPolicy(ctx context.Context, t *testing.T, c client.Client) {
+// applyAdmissionPolicyFile creates every object in a config/admission policy
+// file, as the chart applies its generated copy.
+func applyAdmissionPolicyFile(ctx context.Context, t *testing.T, c client.Client, path string) {
 	t.Helper()
-	raw, err := os.ReadFile(gatewayPodPolicyFile)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}

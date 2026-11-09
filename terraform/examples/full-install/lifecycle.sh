@@ -34,6 +34,20 @@
 #      destructive replacement under -auto-approve. `guard_gsa_identity` refuses
 #      the apply before Terraform runs. The release namespace is ForceNew the
 #      same way; `guard_release_namespace` refuses a move on apply and destroy.
+#      So is the Standard cluster's initial_node_count, which standard_node_count
+#      feeds and a `TF_VAR_standard_node_count` line in install.env reaches;
+#      `guard_standard_node_count` refuses a changed count on apply. The two
+#      Standard pools' machine type and boot disk are not ForceNew, but a
+#      change to them recreates every node of the pool in place, and the
+#      sizing inputs that decide them (sizing_profile, standard_*, gvisor_*)
+#      reach the apply as `TF_VAR_` lines too: a lost line resolves the small
+#      profile and shrinks a fleet host's nodes under -auto-approve.
+#      `guard_node_pool_shape` refuses an apply whose resolved shape differs
+#      from the pool in state unless a sizing input names the change: the
+#      pool's own explicit input, or, for an attribute no explicit input
+#      decided at the last apply, a profile other than the one that apply
+#      recorded (two root outputs), since a kept profile names none and a
+#      changed one names nothing about an attribute an explicit line set.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -154,9 +168,19 @@ readonly SCOPE_OVERRIDE_FILE="$SCOPE_RESOLVER_MODULE_DIR/scope_resolver_lifecycl
 # State addresses the guards below read. The cluster has three spellings:
 # one per mode, plus the index-less autopilot address a state predating the
 # mode switch still carries until its first plan renames it.
+readonly STANDARD_CLUSTER_ADDRESS="module.gke_cluster.google_container_cluster.standard[0]"
+# The gVisor pool, the other resource whose node shape the sizing inputs
+# decide; guard_node_pool_shape reads both.
+readonly GVISOR_POOL_ADDRESS="module.gke_cluster.google_container_node_pool.gvisor[0]"
+# The node_config attributes the sizing inputs set on each pool, spelled as
+# the module's inputs and outputs spell them (<pool>_<attribute>). A change
+# to any of them is an in-place update GKE carries out by recreating every
+# node of the pool.
+NODE_POOL_SHAPE_ATTRS=(machine_type disk_size_gb disk_type)
+readonly NODE_POOL_SHAPE_ATTRS
 CLUSTER_ADDRESSES=(
   "module.gke_cluster.google_container_cluster.autopilot[0]"
-  "module.gke_cluster.google_container_cluster.standard[0]"
+  "$STANDARD_CLUSTER_ADDRESS"
   "module.gke_cluster.google_container_cluster.autopilot"
 )
 readonly CLUSTER_ADDRESSES
@@ -219,6 +243,11 @@ readonly HELM_UNINSTALL_TIMEOUT="10m"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 readonly STATE_LOCK_MESSAGE_PATTERN='(Acquiring|Releasing) state lock\.'
+# What `terraform output -raw <name>` prints when the state records other
+# outputs but not that one: the shape of a state from before the output was
+# declared. tf_recorded_output reads it as "not recorded"; a state with no
+# output at all exits 0 and prints nothing, which reads the same way.
+readonly OUTPUT_NOT_RECORDED_PATTERN='Output "[^"]*" not found|could not be found in the state'
 # The drift-pubsub module's three resources. Unlike the stockout trio they are
 # NOT adopted -- guard_drift_adoption refuses an apply that would import them,
 # and says there why. Their names are read from the composition's
@@ -357,21 +386,65 @@ ensure_init() {
 #
 # A variable nobody set and whose default is null -- agent_service_account_id
 # in a hand-written tfvars -- prints as `tostring(null)` (a typed null; older
-# releases print `null`). Callers want "unset", not that spelling: read as a
+# releases print `null`, and an unset number or bool prints `tonumber(null)`
+# or `tobool(null)`). Callers want "unset", not that spelling: read as a
 # name, it made guard_gsa_identity refuse every apply whose tfvars left the
 # variable alone, which is what broke the autopush deploys after #1309.
-tfvar() {
+tfvar() { tf_expr "var.$1"; }
+
+# A gke-cluster module output, by its name. console evaluates an output from
+# the configuration alone when nothing in its expression needs the state,
+# which is how guard_node_pool_shape reads the shape the module resolves from
+# sizing_profile and the explicit inputs without this script carrying a copy
+# of the profile table.
+tf_module_output() { tf_expr "module.gke_cluster.$1"; }
+
+tf_expr() {
   local out value
-  if ! out=$(echo "var.$1" | terraform console 2>&1); then
+  if ! out=$(echo "$1" | terraform console 2>&1); then
     printf '%s\n' "$out" >&2
-    warn "could not evaluate var.$1 (see the terraform error above)"
+    warn "could not evaluate $1 (see the terraform error above)"
     exit 1
   fi
   value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
-    null | "tostring(null)") value="" ;;
+    null | "tostring(null)" | "tonumber(null)" | "tobool(null)") value="" ;;
   esac
   printf '%s\n' "$value"
+}
+
+# A root output of this composition as the last apply recorded it, by name.
+# Root outputs persist in state where a module's do not, which is how
+# guard_node_pool_shape reads the sizing_profile the pools were last applied
+# under. Empty when the state does not record the output (one from before it
+# was declared, or one with no output at all); any other failure is the
+# backend's and fatal, as tf_expr's is, so a profile is never read as a
+# first setting because the state could not be read.
+#
+# stderr is captured apart from the value rather than merged into it, as
+# guard_minter_key reads gcloud: `-raw` prints the value alone on stdout, and
+# anything Terraform writes to stderr on a read that still exits 0 -- TF_LOG
+# set in the operator's shell, a provider or backend warning -- would
+# otherwise be read back as part of the recorded profile, which the guard
+# compares whole, so a kept profile would read as a changed one and the
+# refusal it exists for would be skipped.
+tf_recorded_output() {
+  local out err_file read_rc=0 read_err
+  err_file=$(mktemp)
+  out=$(terraform output -no-color -raw "$1" 2>"$err_file") || read_rc=$?
+  read_err=$(cat "$err_file")
+  rm -f "$err_file"
+  if [[ $read_rc -eq 0 ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if grep -qE "$OUTPUT_NOT_RECORDED_PATTERN" <<<"$read_err"; then
+    printf '\n'
+    return 0
+  fi
+  printf '%s\n' "$read_err" >&2
+  warn "could not read output $1 from the state (see the terraform error above)"
+  exit 1
 }
 
 # The state list is read once and matched in memory. Piping it straight into
@@ -423,6 +496,29 @@ in_tainted() { grep -Fxq "$1" <<<"$TAINTED_LIST"; }
 state_attr() {
   terraform state show -no-color "$1" 2>/dev/null |
     sed -n "s/^ *$2 *= *\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+# The same for a number attribute, which state show prints bare
+# (`initial_node_count = 1`); state_attr's pattern wants the quotes a string
+# carries and would read it as absent.
+state_number_attr() {
+  terraform state show -no-color "$1" 2>/dev/null |
+    sed -n "s/^ *$2 *= *\([0-9][0-9]*\) *$/\1/p" | head -1
+}
+
+# The recorded value, string or number, of an attribute inside a resource's
+# first node_config block, for guard_node_pool_shape. Scoped to the block
+# because the cluster resource repeats the names: cluster_autoscaling's
+# auto_provisioning_defaults carries a disk_type of its own, and the
+# node_pool block repeats the whole node_config. state show prints the nested
+# blocks after the attributes, sorted, so the first node_config block is the
+# resource's own.
+node_config_attr() {
+  terraform state show -no-color "$1" 2>/dev/null |
+    awk -v attr="$2" '
+      /^ *node_config \{/ { in_block = 1; next }
+      in_block && $1 == attr && $2 == "=" { gsub(/"/, "", $3); print $3; exit }
+    '
 }
 
 # terraform import configures every provider, and the helm provider here is built
@@ -832,6 +928,126 @@ guard_release_namespace() {
   exit 1
 }
 
+# initial_node_count on google_container_cluster is ForceNew on the cluster
+# itself, and the composition forwards standard_node_count to it, so a
+# `TF_VAR_standard_node_count` line in install.env reaches a cluster that
+# already exists: the front doors source install.env with `set -a` and apply
+# under -auto-approve, and the plan a changed count produces is the cluster's
+# destroy and recreate, with the release, the gVisor pool and the agent's
+# state on it. Same shape as guard_release_namespace. A live default pool is
+# resized with gcloud; the input is the count the cluster was created with.
+guard_standard_node_count() {
+  load_state
+  local addr="$STANDARD_CLUSTER_ADDRESS"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(state_number_attr "$addr" initial_node_count)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  desired=$(tfvar standard_node_count)
+  [[ "$recorded" == "$desired" ]] && return 0
+
+  warn "standard_node_count resolved to '$desired', but this state's cluster was created with $recorded node(s) per zone ($addr)."
+  warn "initial_node_count is ForceNew on google_container_cluster: applying now would plan the cluster's DESTRUCTION and"
+  warn "recreation under -auto-approve, with the release, the gVisor pool and the agent's state on it."
+  warn "Set TF_VAR_standard_node_count=$recorded in install.env (the count the cluster was created with; drop the line when"
+  warn "that is the default, 1), or set standard_node_count in terraform.tfvars for a hand-driven apply. Resize a live"
+  warn "default pool with 'gcloud container clusters resize <cluster> --node-pool default-pool --num-nodes <n>' instead."
+  exit 1
+}
+
+# machine_type, disk_size_gb and disk_type on both Standard pools are not
+# ForceNew, but the provider updates them in place by having GKE recreate
+# every node of the pool, and the sizing inputs that decide them reach a live
+# cluster the way standard_node_count does: the installer writes none of them
+# into terraform.tfvars, so they are `TF_VAR_` lines in install.env that every
+# front door sources with `set -a` and applies under -auto-approve. A line
+# lost between runs -- a second operator's clone, a value exported in the
+# shell for the first run only -- resolves the small profile, and the plan for
+# a fleet host is every node of both pools onto e2-standard-4, after which the
+# proxy fits on none of them. The resolved shape is read from the module's
+# outputs, so the profile table lives in the module alone. Refused unless a
+# sizing input asks for the change: the pool's own explicit input, set to
+# anything (the module resolves the attribute to it), or sizing_profile set
+# to a profile other than the one the last apply recorded, which the
+# composition keeps as a root output for this read. A profile merely set is
+# not an opt-in: kept beside a lost explicit line it names no change and the
+# resolved shape is the profile's own, so the same lost-line case would walk
+# through; and the same holds when a later release gives a profile a new
+# shape. Nor is a changed profile an opt-in for an attribute an explicit
+# line decided: the profile names the shape of what a profile decides, and
+# the explicit line, lost in the same run, is the case above with a profile
+# change beside it. The composition records which inputs were set at the
+# last apply as a second root output, and an attribute recorded there whose
+# input is now unset is refused before the profile is consulted. A blank
+# line counts as unset, as the module reads it. Same shape as
+# guard_standard_node_count.
+guard_node_pool_shape() {
+  load_state
+  local profile="" profile_recorded="" profile_read=false
+  local inputs_recorded="" inputs_read=false
+  local pool addr label attr recorded resolved explicit gvisor_enabled
+  for pool in standard gvisor; do
+    case "$pool" in
+      standard) addr="$STANDARD_CLUSTER_ADDRESS"; label="the default pool" ;;
+      gvisor)   addr="$GVISOR_POOL_ADDRESS";      label="the gVisor pool" ;;
+    esac
+    in_state "$addr" || continue
+    # A gVisor pool in state whose flag is off is a teardown, not a resize:
+    # the apply destroys it and recreates no node, so its shape is not read.
+    # State first, as guard_pubsub_subscription reads its flags: in_state is
+    # the list in memory, tfvar a console round trip. Assigned rather than
+    # compared inline, for the `set -e` reason given there.
+    if [[ "$pool" == "gvisor" ]]; then
+      gvisor_enabled=$(tfvar enable_gvisor_node_pool)
+      [[ "$gvisor_enabled" == "true" ]] || continue
+    fi
+    for attr in "${NODE_POOL_SHAPE_ATTRS[@]}"; do
+      recorded=$(node_config_attr "$addr" "$attr")
+      [[ -n "$recorded" ]] || continue
+      resolved=$(tf_module_output "${pool}_${attr}")
+      [[ "$recorded" == "$resolved" ]] && continue
+      explicit=$(tfvar "${pool}_${attr}")
+      [[ -n "$explicit" ]] && continue
+      # Read once, as the profile below is: an input the last apply had set
+      # and this run has not is the lost line itself, whatever the profile.
+      if [[ "$inputs_read" == "false" ]]; then
+        inputs_recorded=$(tf_recorded_output node_pool_shape_inputs)
+        inputs_read=true
+      fi
+      if [[ " $inputs_recorded " == *" ${pool}_${attr} "* ]]; then
+        warn "${pool}_${attr} resolved to '$resolved', but this state's cluster runs $label on '$recorded' ($addr), a shape the last apply set"
+        warn "through TF_VAR_${pool}_${attr}, and no such line reaches this run. A sizing_profile other than the recorded one names the shape of"
+        warn "what a profile decides, not of an attribute an explicit line decided, so it does not ask for this change. Applying now would"
+        warn "recreate EVERY node of $label onto the resolved shape under -auto-approve. Put back TF_VAR_${pool}_${attr}=${recorded} in"
+        warn "install.env to keep it; to resize deliberately, name the shape you want (TF_VAR_${pool}_${attr}=${resolved}), or set it in"
+        warn "terraform.tfvars for a hand-driven apply."
+        exit 1
+      fi
+      if [[ "$profile_read" == "false" ]]; then
+        profile=$(tfvar sizing_profile)
+        [[ -n "$profile" ]] && profile_recorded=$(tf_recorded_output sizing_profile)
+        profile_read=true
+      fi
+      [[ -n "$profile" && "$profile" != "$profile_recorded" ]] && continue
+      warn "${pool}_${attr} resolved to '$resolved', but this state's cluster runs $label on '$recorded' ($addr), and no sizing input asks for the change."
+      if [[ -n "$profile" ]]; then
+        warn "sizing_profile is '$profile', the profile the last apply recorded, so it names no change: the shape in state came from a"
+        warn "TF_VAR_${pool}_${attr} line that is no longer set beside it, or from a profile this version renders differently."
+      fi
+      warn "The sizing inputs reach the apply as TF_VAR_ lines in install.env, which the installer never writes into terraform.tfvars, so a lost"
+      warn "or blanked profile line resolves the small profile, and a lost explicit line the profile's shape. Applying now would"
+      warn "recreate EVERY node of $label onto the resolved shape under -auto-approve. Put back the line the pool was built with"
+      warn "(TF_VAR_sizing_profile=<profile>, or TF_VAR_${pool}_${attr}=${recorded}) to keep it; to resize deliberately, name the shape you want"
+      warn "(TF_VAR_${pool}_${attr}=${resolved}, or a TF_VAR_sizing_profile other than the one the last apply recorded), or set it in"
+      warn "terraform.tfvars for a hand-driven apply."
+      exit 1
+    done
+  done
+}
+
 # account_id on google_service_account.agent is ForceNew, and the resource
 # carries neither create_before_destroy nor prevent_destroy. If a custom
 # override line in install.env goes missing, the next apply resolves
@@ -1138,9 +1354,21 @@ forget_unmanaged_cluster_kms() {
 # exactly the wedge above, so refuse. PERMISSION_DENIED or a transient API error
 # means the guard could not ask, which is not evidence that the key is missing:
 # warn and proceed rather than blocking an apply on the guard's own blind spot.
+#
+# A key with no ENABLED version is refused either way, but there are two causes
+# with different fixes. A key never imported needs the GitHub App private key.
+# A key whose versions are DESTROY_SCHEDULED -- what any destroy of the key
+# leaves, a raw `terraform destroy` or an apply with enable_github_minter =
+# false -- needs only a restore. The guard runs before adopt_kms so a refused
+# apply changes no state, so it names that restore rather than a re-import:
+# adopt-kms for a key out of state (it restores what it imports), and the
+# gcloud restore for a key still in state, which adopt_kms leaves alone. A key
+# whose versions are only DISABLED -- what a restore leaves before its enable --
+# needs only the gcloud enable, in state or out of it: the guard then passes,
+# and adopt_kms imports a key that is out of state.
 guard_minter_key() {
   [[ "$(tfvar enable_github_minter)" == "true" ]] || return 0
-  local project location keyring key versions list_err err_file reason="" list_rc=0
+  local project location keyring key versions list_err err_file reason="" list_rc=0 scheduled="" disabled=""
   project=$(tfvar project_id)
   location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
   keyring=$(tfvar github_minter_kms_keyring)
@@ -1157,7 +1385,7 @@ guard_minter_key() {
   rm -f "$err_file"
 
   if [[ $list_rc -ne 0 ]]; then
-    if ! printf '%s' "$list_err" | grep -qiE "$MINTER_KEY_ABSENT_PATTERN"; then
+    if ! grep -qiE "$MINTER_KEY_ABSENT_PATTERN" <<<"$list_err"; then
       warn "could not verify Cloud KMS signing key '$location/$keyring/$key' for GitHub minter ($list_err)."
       warn "Proceeding with apply, but note that the minter requires an ENABLED imported private key to pass readiness."
       return 0
@@ -1165,14 +1393,43 @@ guard_minter_key() {
     reason="does not exist yet"
   elif [[ -z "$(head -1 <<<"$versions")" ]]; then
     reason="has no ENABLED version"
+    # A failed query leaves its list empty: a failed scheduled query moves on
+    # to the DISABLED one, and a failed DISABLED query keeps the import advice.
+    scheduled=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+      --location "$location" --project "$project" \
+      --filter='state=DESTROY_SCHEDULED' --format='value(name)' 2>/dev/null) || scheduled=""
+    if [[ -z "$(head -1 <<<"$scheduled")" ]]; then
+      disabled=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+        --location "$location" --project "$project" \
+        --filter='state=DISABLED' --format='value(name)' 2>/dev/null) || disabled=""
+    fi
   else
     return 0
   fi
 
   warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' $reason."
   warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
-  warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
-  warn "or set enable_github_minter = false in terraform.tfvars."
+  if [[ -n "$(head -1 <<<"$scheduled")" ]]; then
+    warn "Its versions are scheduled for destruction, as a destroy of the key leaves them."
+    warn "Restore them rather than re-importing the key; a restore works only until their destruction time."
+    load_state
+    if in_state "$MINTER_KMS_KEY_ADDRESS"; then
+      warn "The key is still in Terraform state, so restore each version with gcloud, then apply again:"
+      warn "  gcloud kms keys versions restore <version> --key $key --keyring $keyring --location $location --project $project"
+      warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    else
+      warn "Run './lifecycle.sh adopt-kms' in terraform/examples/full-install, which imports the key"
+      warn "back and restores and re-enables those versions, then apply again."
+    fi
+  elif [[ -n "$(head -1 <<<"$disabled")" ]]; then
+    warn "Its versions are disabled, as a restore leaves them."
+    warn "Enable each version with gcloud rather than re-importing the key, then apply again:"
+    warn "  gcloud kms keys versions enable <version> --key $key --keyring $keyring --location $location --project $project"
+    warn "If a version was disabled on purpose, for example a revoked App key, import the new App key into this key and set githubMinter.kms.keyVersion to its version in extra_helm_values instead."
+  else
+    warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
+    warn "or set enable_github_minter = false in terraform.tfvars."
+  fi
   exit 1
 }
 
@@ -1653,6 +1910,8 @@ case "${1:-}" in
     guard_gsa_identity
     guard_kms_identity
     guard_release_namespace
+    guard_standard_node_count
+    guard_node_pool_shape
     guard_pubsub_subscription
     guard_drift_adoption
     forget_unmanaged_cluster_kms
@@ -1717,7 +1976,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,87p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,101p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

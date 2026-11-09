@@ -33,6 +33,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -70,6 +71,9 @@ import (
 const PlatformAgentControllerName = fieldOwner
 
 const (
+	// a2aPendingRequeue is how soon a pass comes back while the A2A stack is
+	// still coming up or its gateway is held or waking.
+	a2aPendingRequeue      = 30 * time.Second
 	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
 	// usageStatusReprobeInterval is how long a CR stays marked as served by a
 	// CRD without status.usage before the Ready writer probes again (see
@@ -238,11 +242,55 @@ const (
 	// leaves Ready alone: chat works, and some installs want no posts.
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
+	// The condition reporting that a next install has no chat platform at
+	// all, so nothing the agent raises unprompted reaches anyone in chat and
+	// its findings are read from the repository and the report store. The
+	// counterpart of HomeChannelUnset for the install that chose no chat;
+	// informational, written and cleared with it, not Degraded (#4055).
+	noChatPlatformConditionType = "NoChatPlatform"
+	noChatPlatformReason        = "NoChatPlatform"
+	// noChatPlatformMessageFormat takes where the audit findings go: with a
+	// GitOps repository registered they reach it as well as the report
+	// store; with none, the report store alone. The audits are what the
+	// store holds; an alert's triage still runs on the board, and the other
+	// scheduled reports have no store of their own.
+	noChatPlatformMessageFormat = "Neither Google Chat nor Slack is enabled (spec.mode next), so the agent's proactive posts -- " +
+		"alerts, drift reports, scheduled reports -- have no chat to go to. Its audit findings %s; alerts are still triaged " +
+		"on the board, and other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, " +
+		"or read the volume with kubectl exec. Enable spec.integration.slack or spec.integration.googleChat " +
+		"(SLACK_* or GOOGLE_CHAT_* in install.env) to deliver them in chat."
+	noChatPlatformWithRepo = "stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests)"
+	noChatPlatformNoRepo   = "stay in the report store on the data volume alone, since no GitOps repository is registered"
+	// The condition reporting that spec.harness.experimental.shellSandbox.image
+	// pins an image other than the one this operator runs
+	// (operatorShellSandboxImage). The pin survives every upgrade of the
+	// operator and the agent, and a sandbox older than the agent fails each
+	// kubectl call at the credential proxy with a refusal that names neither
+	// the pin nor the image (#4966). Informational, like NoChatPlatform: a
+	// deliberate pin to a mirror or a test build is allowed, so it leaves Ready
+	// alone and is written only in that state.
+	shellSandboxImagePinnedConditionType = "ShellSandboxPinned"
+	shellSandboxImagePinnedReason        = "ImageDiffersFromOperator"
+	// shellSandboxImagePinnedMessageFormat takes the pinned image and the
+	// operator's own.
+	shellSandboxImagePinnedMessageFormat = "spec.harness.experimental.shellSandbox.image pins %s, but this operator runs %s. " +
+		"A sandbox older than the agent fails its kubectl calls at the credential proxy with a policy refusal. " +
+		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
-	// install.env key and what the field holds.
+	// install.env key, what the field holds, and where the posts go
+	// meanwhile (one of the two sentences below).
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
-		"proactive posts -- alerts, drift reports, scheduled reports -- have nowhere to go and are dropped; " +
+		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
 		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
+	// homeChannelUnsetKept is the meanwhile when the gateway's backend is the
+	// install's only chat platform: the agent still sends, the gateway
+	// refuses and keeps (a2a/gateway/notify_refused.go).
+	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
+	// homeChannelUnsetToSlack is the meanwhile on a Chat-and-Slack install:
+	// the agent is not routed to Chat (a2aGchatHomeRouted), so the posts go
+	// to the Slack Hermes platform, which delivers them only where Slack's
+	// own home channel is set; the operator cannot see one set from chat.
+	homeChannelUnsetToSlack = "go to the Slack Hermes platform meanwhile, which delivers them only if Slack has a home channel"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -375,15 +423,21 @@ const (
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
 	// ValidateCredentialProxyResources, so the override is ignored and the
-	// proxy Deployment is rendered at the operator's default resources.
+	// proxy Deployment is rendered at the sizing profile's row.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
-	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonInvalidAgentAPIAuthResources: the CR's
 	// spec.deployment.agentAPIAuth.resources fails ValidateAgentAPIAuthResources,
 	// so the override is ignored and the agent-api-auth sidecar is rendered at
-	// the operator's default resources.
+	// the sizing profile's row.
 	conditionReasonInvalidAgentAPIAuthResources = "InvalidAgentAPIAuthResources"
-	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidAgentAPIAuthResourcesMsgFmt          = "Invalid spec.deployment.agentAPIAuth.resources (%s); the override is ignored and the agent-api-auth sidecar runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
+	// conditionReasonInvalidShellSandboxResources: the CR's
+	// spec.harness.experimental.shellSandbox.resources fails
+	// ValidateShellSandboxResources, so the override is ignored and the shell
+	// StatefulSet is rendered at the sizing profile's row.
+	conditionReasonInvalidShellSandboxResources = "InvalidShellSandboxResources"
+	invalidShellSandboxResourcesMsgFmt          = "Invalid spec.harness.experimental.shellSandbox.resources (%s); the override is ignored and the shell sandbox runs at the sizing profile's row (the operator's defaults under small) until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -440,9 +494,10 @@ type PlatformAgentReconciler struct {
 	prunedUsageStatus sync.Map
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
-	// the proposal readings as one (usageNewerFieldReadings),
-	// lastHumanActiveTime, and each counter after the first schema by its
-	// name -- the last poll in which the usage counters poller wrote the field
+	// the proposal readings as one (usageNewerFieldReadings), the two people
+	// readings as one (usageNewerFieldPeople), the nine origin readings as one
+	// (usageNewerFieldOrigins), lastHumanActiveTime, and each
+	// counter after the first schema by its name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
 	// the first-schema counters and not every later field. A record per field
 	// because each suppresses the writes it covers for the interval and the
@@ -451,9 +506,29 @@ type PlatformAgentReconciler struct {
 	// gauges' publish reads them on every reconcile, at any age, to hold the
 	// pruned fields' samples back (heldUsageFields). Cleared per field by an
 	// echo that carries it, per CR by the poller's sweep of departed CRs and
-	// when the CR is deleted. Under prunedNewerFieldsMu.
+	// when the CR is deleted. updateStatusReady also records status.inference
+	// here (inferenceNewerField, through noteInferenceEcho) when the Ready
+	// write's echo drops the block, reads it through inferencePruned, and
+	// clears it when an echo carries the pair. Under prunedNewerFieldsMu.
 	prunedNewerFieldsMu sync.Mutex
 	prunedNewerFields   map[string]map[string]time.Time
+	// prunedSizingTier records, per CR, the last write of
+	// status.effectiveSizingTier whose echo came back without the field: a
+	// served CRD that predates it. resolveSizingTier's write gate treats ""
+	// as settled while the record is fresh (usageStatusReprobeInterval), so an
+	// operator rolled ahead of its CRD writes and logs the tier once per
+	// interval rather than on every pass. Keyed by ObjectKey, value time.Time;
+	// cleared by an echo that carries the field, and when the CR is deleted.
+	prunedSizingTier sync.Map
+
+	// steppedBackAt records, per CR, when resolveSizingTier last stepped the
+	// sizing latch back from a pod admission refused on a quota
+	// (sizingRefusedStep); the gate measures no step up for
+	// sizingStepBackHoldInterval after it (sizingStepBackHeld). Keyed by
+	// ObjectKey, value time.Time; cleared when the CR is deleted. In memory
+	// by design: a restart forgets the hold and measures on the next settled
+	// pass.
+	steppedBackAt sync.Map
 
 	// credentialProxyWarningsLogged records, per CR, the spec generation whose
 	// credential-proxy resources warnings reconcileCredentialProxy last logged,
@@ -468,6 +543,19 @@ type PlatformAgentReconciler struct {
 	// overrides change independently.
 	agentAPIAuthWarningsLogged sync.Map
 
+	// shellSandboxWarningsLogged records, per CR, the spec generation whose
+	// shell-sandbox resources warnings reconcileShellSandbox last logged, so
+	// each generation logs them once. Keyed by ObjectKey, value int64; cleared
+	// when the CR is deleted. Its own gate, as the two above: the overrides
+	// change independently.
+	shellSandboxWarningsLogged sync.Map
+
+	// a2aChartPodsWarned records, per CR, the spec generation and the
+	// chart-pods Warning last reported (a2aQuotaAgent), so each generation and
+	// reason warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarning; cleared when the CR is deleted.
+	a2aChartPodsWarned sync.Map
+
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
 	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
@@ -480,6 +568,15 @@ type PlatformAgentReconciler struct {
 	// with no entry was not read by this process yet, and the status writers
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
+
+	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
+	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
+	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
+	// Keyed by the Lease's ObjectKey; cleared when the CR is deleted.
+	gatewayLeaseSeen   sync.Map
+	gatewayLeaseGoneAt sync.Map
+	// gatewayLeaseHold overrides a2aGatewayLeaseRecreateHold; tests only.
+	gatewayLeaseHold time.Duration
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -526,6 +623,17 @@ type PlatformAgentReconciler struct {
 	imageVolumeResolved bool
 	clusterImageVolumes bool
 
+	// autopilot caches whether the cluster is GKE Autopilot, which picks the
+	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
+	// The cluster type cannot change under a running operator, so only an
+	// authoritative probe sets autopilotResolved; a failed one is retried, and
+	// meanwhile the proxy keeps the cluster type it was rendered for, from its
+	// cluster-type annotation or, without one, its requests; else Standard
+	// (liveCredentialProxyAutopilot).
+	autopilotMu       sync.Mutex
+	autopilotResolved bool
+	autopilot         bool
+
 	// APIServerIP configures the Kubernetes API server control-plane egress CIDR
 	// for generated NetworkPolicy manifests.
 	APIServerIP string
@@ -549,6 +657,10 @@ type PlatformAgentReconciler struct {
 	// for the usage counters poller (usage_counters_poller.go); empty, as
 	// under `make run` off the cluster, renders no such rule.
 	OperatorNamespace string
+
+	// calloutStatus reads an auth callout pod's /status for the
+	// A2AIdentityMapApplied condition (#4487); nil is the HTTP reader.
+	calloutStatus calloutStatusReader
 
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
@@ -582,6 +694,23 @@ type PlatformAgentReconciler struct {
 // Without the enumeration verbs a cached Secret read cannot be added by accident.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// `dispatchjobtemplates` are the dispatcher Job admission policy's params in
+// <ns>-profiles (agentprofile_job_template.go), which the operator alone
+// writes; no Role it renders grants the kind, and the built-in admin and edit
+// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// run that defaults a Job template (defaultedJobTemplate), which stores
+// nothing. ClusterRole rules, not Roles: the profile namespace is created at
+// runtime, and RBAC escalation prevention stops the operator granting itself
+// a Role there with verbs it does not already hold. No watch: every read goes
+// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
+// 2026-10-31 (#3655 PR 6).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// `get` on the dispatcher Job admission policy and its binding: before the
+// dispatcher gets its Jobs Role, the operator checks both are in the cluster
+// as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
+// watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
@@ -688,6 +817,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// than leaving a mistyped agentRef silently statusless forever.
 			r.markOrphanedPlugins(ctx, req.Namespace, req.Name)
 			usageMetrics.forget(req.Namespace, req.Name)
+			inferenceMetrics.forget(req.Namespace, req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -698,6 +828,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// means unknown, not idle, so that field's sample is held back, the whole
 	// block or field by field as the writers recorded it (heldUsageFields).
 	usageMetrics.publishPhase(instance)
+	inferenceMetrics.publish(instance)
 	usageMetrics.publishUsageExcept(instance, r.heldUsageFields(instance))
 
 	log.Info("Reconciling PlatformAgent", "name", instance.Name, "namespace", instance.Namespace)
@@ -945,18 +1076,34 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 10b. Reconcile the shell sandbox before the credential proxy, and both before
+	// 10a. Resolve the sizing tier the three sized containers render at, and
+	// write it to status with the SizingCappedByQuota condition, before the
+	// sandbox, the broker and the gateway below read renderedSizingTier. Above
+	// the renders rather than in the Ready writer so the status says what the
+	// pods run even when a later step of this pass fails, and so a pass that
+	// parks Degraded below still leaves the latch where this pass moved it.
+	if err := r.resolveSizingTier(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 10b. Grant the broker and kube-proxy the one verb they need to authenticate
+	// their callers, and reconcile kube-proxy before the shell sandbox so the TLS
+	// CA Secret and proxy Service exist before the shell mounts and dials them.
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
+	otlpDisabled := otlpSource == otlpSourceNone
+	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 10c. Reconcile the shell sandbox before the credential proxy, and both before
 	// the workload that connects to them. Neither client blocks on the proxy — the
 	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
 	// on a first install this order means the sandbox's ServiceAccount exists
 	// before the broker starts authenticating callers against it.
 	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// 10c. Grant the broker the one verb it needs to authenticate its callers,
-	// before anything that runs it.
-	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -969,7 +1116,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, mcpIdentityOwned); err != nil {
+	// And the scope publisher's, for the same reason (scopePublisherIdentityOwned).
+	scopeIdentityOwned, err := r.scopePublisherIdentityOwned(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	owned := brokerCallerOwnership{mcp: mcpIdentityOwned, scope: scopeIdentityOwned}
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash, agentPlugins, owned); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -1011,9 +1164,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
-	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
-	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
+	// The home-channel record, read once per pass: the projection in the
+	// A2A render and both condition writers take this value, so the file
+	// and the condition never disagree within one pass.
+	homeRec, err := r.homeChannelRecordFor(ctx, instance)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1055,14 +1213,22 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance); err != nil {
+		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		// No callout, so no claim about its map: the condition goes.
+		removed := a2aIdentityMapRemoved
+		a2aState.calloutMap = &removed
 	}
+	// The record travelled into the render (the projection) and travels on
+	// the state to every status writer below, the failed and parked paths
+	// included, so the file and the condition follow one read. The failed
+	// render path returns a state of its own, so it is set here too.
+	a2aState.homeRecord = homeRec
 
 	// The version this pass rendered, for the deferred write at 2d. Empty on
 	// every path that did not get here, where the write reads it back off the
@@ -1155,15 +1321,37 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that darkened its gateway, the A2AGateway condition is kept until the
 	// scaled-up replica is ready, and the pass that clears it should not
 	// depend on the Deployment's status event alone.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking) {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	// busHeld shares it for the gateway's reason: the bus waits on the
+	// callout's rollout, and the pass that sees it finish has to happen.
+	// calloutMap shares it too: a map the callouts are still loading, or
+	// pods that didn't answer, changes nothing the operator watches when it
+	// settles, so the pass that sees it settle has to be scheduled.
+	if a2aNext && a2aState.wantsRequeue() {
+		requeue := a2aPendingRequeue
+		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
 	// which triggers no reconcile of its own, so poll while the condition
 	// stands rather than leave it until an unrelated event (rbac_selfcheck.go).
 	if rbacDegraded {
-		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
+		requeue := rbacReprobeInterval
+		// A held-back Lease recreate is due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
+		if a2aState.busPodRequeue > 0 {
+			requeue = min(requeue, a2aState.busPodRequeue)
+		}
+		if credentialProxyExecShort(instance) {
+			requeue = min(requeue, credentialProxyExecShortRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1194,15 +1382,41 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
+	// A sizing step back's hold ends at a time (sizingStepBackHoldInterval),
+	// and the settled lower row sends no event for it, so the pass that
+	// measures the step again is scheduled for the hold's end.
+	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
+	// The scope publisher's next run, or the moment its document goes stale:
+	// Jobs are not watched, so the pass that starts the run and the pass
+	// that turns ScopeResolved False have to be asked for.
+	if a2aNext && a2aState.scopeRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
+	}
+	// A deleted gateway Lease whose recreate is being held back: nothing
+	// else wakes the pass that creates it.
+	if a2aNext && a2aState.leaseRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
+	}
+	// A bus pod stuck on an old revision inside its grace period: the pass
+	// that replaces it has to be asked for, since pods are not watched.
+	if a2aNext && a2aState.busPodRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
+	}
+	// An exec tier short of its count: the scheduler's verdict lands on a pod,
+	// which is not watched, so the pass that reads it has to be asked for.
+	if credentialProxyExecShort(instance) {
+		requeueAfter = min(requeueAfter, credentialProxyExecShortRequeue)
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
-// pruned-status probe: the interval while a record is held for this CR. With no
+// pruned-status probe: the interval while a record is held for this CR, the
+// whole usage block's or status.inference's. With no
 // record it returns the secret re-read's interval, the ceiling the caller
 // already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) {
+	if r.usageStatusPruned(agent) || r.inferencePruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1274,14 +1488,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
 		//
-		// The dispatcher's pod-read binding there is removed, for the
-		// ClusterRoleBinding's reason above: left behind, anyone who later
-		// creates a ServiceAccount of the dispatcher's name inherits pod read
-		// in that namespace. A failure is logged and never holds the
-		// finalizer, under the profile-namespace rule (#3827 settles what a
-		// refused delete should do).
+		// The dispatcher's warm pools there go, with their CA bundle copy
+		// (their pods hold bus and broker tokens), and so does its pod-read
+		// binding, for the ClusterRoleBinding's reason above: left behind,
+		// anyone who later creates a ServiceAccount of the dispatcher's name
+		// inherits pod read in that namespace. A failure is logged and never
+		// holds the finalizer, under the profile-namespace rule (#3827
+		// settles what a refused delete should do).
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
-			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
@@ -1323,8 +1538,11 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
+		r.forgetA2AGatewayLease(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -2238,12 +2456,19 @@ func minterHeldMessage(cmName string, held []string) string {
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
 //
-// A managed repository's policy is default.yaml with the repository list replaced by every
-// same-org managed repository (renderRepoPolicy). A context repository's policy is default.yaml
-// reduced to minterReadScope, listing every same-org context repository (renderReadOnlyPolicy):
-// the broker mints from it for its own clone and nothing else, so a private context repository
-// is readable without a write token ever covering it. A repository in both lists is managed and
-// keeps the write rendering. A default.yaml without the read scope renders no context policies.
+// A managed repository's policy is default.yaml with the repository list replaced by that one
+// repository (renderRepoPolicy). A context repository's policy is default.yaml reduced to
+// minterReadScope, listing that one repository (renderReadOnlyPolicy): the broker mints from it
+// for its own clone and nothing else, so a private context repository is readable without a
+// write token ever covering it. A repository in both lists is managed and keeps the write
+// rendering. A default.yaml without the read scope renders no context policies.
+//
+// One repository per key, not the whole list in every key. Each key used to carry every same-org
+// repository of its kind, which made the ConfigMap quadratic in the repository count: with the
+// chart's default.yaml it crossed the API server's 1 MiB object limit near 119 managed
+// repositories, and from there no repository could be onboarded. The broker mints a write token
+// per repository to match (agents/platform/scripts/github_token_refresh.py), as it always has
+// for read and sweep tokens.
 //
 // Key ownership contract:
 // The operator owns every <repo>.yaml key for an active managed or context repository (including
@@ -2323,20 +2548,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	// ConfigMap JSON, and CodeQL (go/allocation-size-overflow) flags their sum
 	// as an allocation size that untrusted input could overflow.
 	expected := make(map[string]string)
-	writeContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for _, bareRepo := range allBareRepos {
-		expected[bareRepo+minterPolicyKeySuffix] = writeContent
+		expected[bareRepo+minterPolicyKeySuffix] = renderRepoPolicy(baseTemplate, []string{bareRepo})
 	}
-	if len(contextBareRepos) > 0 {
-		readContent, ok := renderReadOnlyPolicy(baseTemplate, contextBareRepos)
+	for _, bareRepo := range contextBareRepos {
+		readContent, ok := renderReadOnlyPolicy(baseTemplate, []string{bareRepo})
 		if !ok {
 			logger.Info("skipping context_repos in minter policy sync; default.yaml has no read-only scope",
 				"scope", minterReadScope, "repos", contextBareRepos)
-		} else {
-			for _, bareRepo := range contextBareRepos {
-				expected[bareRepo+minterPolicyKeySuffix] = readContent
-			}
+			break
 		}
+		expected[bareRepo+minterPolicyKeySuffix] = readContent
 	}
 
 	updated := false
@@ -2461,7 +2683,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		r.agentAPIAuthWarningsLogged.Store(apiAuthKey, agent.Generation)
 	}
 	if apiAuthRefusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", apiAuthRefusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, apiAuthRefusal)
 		gatewayAgent = agent.DeepCopy()
@@ -2646,7 +2868,37 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
-	sts := buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
+	if _, err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+		return err
+	}
+
+	// The resources override is checked here as well as at admission, because
+	// the chart installs with the webhook off. Rendered, a request above its
+	// limit is refused by the API server as Invalid, which
+	// applyShellSandboxStatefulSet reads as an immutable-field change and
+	// answers by deleting the running sandbox. Refused, the override is ignored
+	// rather than the StatefulSet withheld: it is rendered at the operator's
+	// default resources, so the image, the settings hash and the keys keep
+	// flowing, and updateStatusReady reports the refusal as Degraded. The
+	// warnings are logged once per spec generation, with the same in-memory
+	// gate reconcileCredentialProxy uses and for the reasons given there.
+	refusal, warnings := shellSandboxResourcesRefusal(agent)
+	key := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.shellSandboxWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range warnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.shellSandboxWarningsLogged.Store(key, agent.Generation)
+	}
+	rendered := agent
+	if refusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.harness.experimental.shellSandbox.resources; the shell sandbox is rendered at the sizing profile's row",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidShellSandboxResources, refusal)
+		rendered = agent.DeepCopy()
+		rendered.Spec.Harness.Experimental.ShellSandbox.Resources = nil
+	}
+	sts := buildShellSandboxStatefulSet(rendered, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
 	objs := []client.Object{
 		buildShellSandboxServiceAccount(agent),
 		buildShellSandboxService(agent),
@@ -3018,7 +3270,7 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // and the sandbox's wrapped CLIs both dial the Service, and neither has any
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
-func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, mcpIdentityOwned bool) error {
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, owned brokerCallerOwnership) error {
 	objs := []client.Object{buildCredentialProxyService(agent)}
 	// The resources override is checked here as well as at admission, because
 	// the chart installs with the webhook off. Rendered, an override under the
@@ -3050,7 +3302,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	}
 	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the sizing profile's row",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
 		rendered = agent.DeepCopy()
@@ -3069,11 +3321,30 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, mcpIdentityOwned, profiles)
+	autopilot, determined := r.clusterAutopilot()
+	recorded := true
+	if !determined {
+		if autopilot, recorded, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
+			return err
+		}
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
+	// The annotation records a cluster type, so only a definite answer, or the
+	// annotation it carries forward, writes one; a guess from the requests is
+	// rendered but not recorded, or the next failed check would read it back
+	// as fact.
+	if !recorded {
+		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
+	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
 	objs = append(objs, proxy)
+	// The exec tier is derived from this render, copied before the apply: the
+	// apply decodes the server's merged object into proxy, which carries
+	// fields other managers set on the broker, such as a rollout restart's
+	// annotation, and the tier would take them as its own.
+	execBase := proxy.DeepCopy()
 	// The budget after the Deployment whose pods it selects, as the callout's
 	// and the verifier's are.
 	objs = append(objs, buildCredentialProxyPDB(agent))
@@ -3098,7 +3369,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
-	return nil
+	return r.reconcileCredentialProxyExecTier(ctx, agent, execBase, profiles)
 }
 
 // applyCredentialProxyDeployment applies the broker's Deployment, recreating it
@@ -3510,78 +3781,7 @@ func (r *PlatformAgentReconciler) reconcileNetworkPolicy(ctx context.Context, ag
 		return nil
 	}
 
-	var apiTargets []string
-	if r.APIServerIP != "" {
-		apiTargets = append(apiTargets, r.APIServerIP)
-	}
-
-	var k8sSvc corev1.Service
-	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
-		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
-			apiTargets = append(apiTargets, ip)
-		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
-	}
-
-	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
-	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
-	endpointsReader := client.Reader(r.Client)
-	if r.APIReader != nil {
-		endpointsReader = r.APIReader
-	}
-
-	var k8sEndpoints corev1.Endpoints
-	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
-		for _, subset := range k8sEndpoints.Subsets {
-			for _, addr := range subset.Addresses {
-				if addr.IP != "" {
-					apiTargets = append(apiTargets, addr.IP)
-				}
-			}
-		}
-	} else if !errors.IsNotFound(err) {
-		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
-	}
-
-	parseCIDRTarget := func(annotationName, raw string) {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return
-		}
-		// normalizeCIDRTarget, not a local parse: it takes the address family from
-		// the address rather than the mask width, so an IPv4-mapped IPv6 block is
-		// measured against the IPv4 floor it will actually print as.
-		// ::ffff:a00:0/104 used to clear the /48 IPv6 floor here and land in the
-		// list as 10.0.0.0/8; it is now rejected, while ::ffff:a00:0/108 still
-		// passes because /108 is the IPv4 /12 that is exactly the floor.
-		ipNet, ok := normalizeCIDRTarget(raw, true)
-		if !ok {
-			logf.FromContext(ctx).Info("Ignoring CIDR in annotation: unparseable, or broader than the /12 (IPv4) or /48 (IPv6) floor", "annotation", annotationName, "cidr", raw)
-			return
-		}
-		apiTargets = append(apiTargets, ipNet.String())
-	}
-
-	appendCIDRs := func(sourceName, rawList string) {
-		if rawList == "" {
-			return
-		}
-		cidrs := strings.Split(rawList, ",")
-		if len(cidrs) > maxCIDRsPerAnnotation {
-			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
-			cidrs = cidrs[:maxCIDRsPerAnnotation]
-		}
-		for _, cidr := range cidrs {
-			parseCIDRTarget(sourceName, cidr)
-		}
-	}
-
-	if agent.Annotations != nil {
-		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
-		appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
-	}
-	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+	apiTargets := r.apiServerEgressTargets(ctx, agent, true)
 
 	// 1. Reconcile or clean up companion FQDNNetworkPolicy (networking.gke.io/v1alpha1) on GKE Dataplane V2 clusters
 	fqdnEnabled := isFQDNNetworkPolicyEnabled(agent)
@@ -4202,18 +4402,33 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// The home-channel advisory rides here too: a rendered stack parked
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
-	homeMsg := homeChannelUnsetMessage(agent)
+	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
+	noChatMsg := noChatPlatformMsg(agent)
+	// So does the sandbox pin: an old sandbox is a likely cause of the park.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
-		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) {
+		noChatPlatformConditionCurrent(agent, noChatMsg) &&
+		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
+		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
+		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
+		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
+		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live)) &&
-			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered)
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
+			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
+			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
+			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
+			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
+			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
+			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
 		return nil
 	}
@@ -4222,7 +4437,13 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
+	setNoChatPlatformCondition(agent, noChatMsg, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
+	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -4413,6 +4634,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
+	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
+	execRefusal := ValidateCredentialProxyExec(agent, nil)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -4477,6 +4700,21 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonInvalidAgentAPIAuthResources
 		degradedMsg = fmt.Sprintf(invalidAgentAPIAuthResourcesMsgFmt, agentAPIAuthRefusal)
+	} else if sandboxResourcesRefusal != "" {
+		// The third resource refusal, ranked after the two above for the same
+		// reason: the shell runs at the operator's defaults, so Ready and the
+		// phase keep what the workload says, and a reason reporting lost
+		// function must not be masked by it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidShellSandboxResources
+		degradedMsg = fmt.Sprintf(invalidShellSandboxResourcesMsgFmt, sandboxResourcesRefusal)
+	} else if len(execRefusal) > 0 {
+		// The exec tier's refusal, after the three above for the same reason:
+		// the tier is not rendered and every command goes to the stateful
+		// broker, so Ready and the phase keep what the workload says.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidCredentialProxyExec
+		degradedMsg = fmt.Sprintf(invalidExecTierReplicasMsgFmt, execRefusal[0].Detail)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
@@ -4516,11 +4754,20 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// its message so a changed count is one write.
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	execReadyUnchanged := credentialProxyExecReadyCurrent(agent, execReady)
 
-	// The home-channel advisory, from the spec alone, compared on its message
-	// for the same reason EventWatcher's is.
-	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
+	// The home-channel advisory, from the spec and the record this pass read,
+	// compared on its message for the same reason EventWatcher's is.
+	homeChannelUnsetMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
+	// Its counterpart for the install with no chat platform, same shape.
+	noChatPlatformMsgNow := noChatPlatformMsg(agent)
+	noChatPlatformUnchanged := noChatPlatformConditionCurrent(agent, noChatPlatformMsgNow)
+	// The sandbox image pin, the same class: from the spec and the operator's
+	// own image, compared on its message.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
+	sandboxPinnedUnchanged := shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
@@ -4545,6 +4792,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
+	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
+	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
+	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
+	gatewayElectedUnchanged := gatewayElectedConditionCurrent(agent, gatewayElected)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
 	// recorded on this pass, compared on its message like VolumesDropped.
@@ -4566,6 +4818,19 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
+	// The install's default model, read from its LiteLLM config. A negative clears
+	// both fields; a failed read keeps the pair the status carries, so a transient
+	// error never blanks it. Gated like activeInterfaces while the served CRD
+	// prunes the block.
+	newInference := agent.Status.Inference
+	switch model, read := r.readInferenceModel(ctx, agent); read {
+	case inferenceReadFound:
+		newInference = &agentv1alpha1.InferenceStatus{Provider: model.Provider, Model: model.Model}
+	case inferenceReadNegative:
+		newInference = &agentv1alpha1.InferenceStatus{}
+	}
+	inferenceUnchanged := r.inferencePruned(agent) || inferenceStatusEqual(agent.Status.Inference, newInference)
+
 	// Check if anything actually changed. The generation is in the list so that
 	// a spec edit which changes nothing derived here still gets one write:
 	// without it the status would keep describing the previous generation and
@@ -4586,14 +4851,19 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		(r.usageStatusPruned(agent) || slices.Equal(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
+		inferenceUnchanged &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
+		noChatPlatformUnchanged &&
+		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
+		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
+		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4620,6 +4890,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// through as read: Update sends the whole status, so leaving them alone
 	// here is what keeps them intact once something does write them.
 	agent.Status.Usage.ActiveInterfaces = newActiveInterfaces
+	agent.Status.Inference = newInference
 
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
@@ -4665,19 +4936,32 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
+	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
+	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
+	// Copied before the write: decoding the response may reuse the pointer's target.
+	var wroteInference *inferenceModel
+	if newInference != nil {
+		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
+	}
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return newPhase, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
+	r.noteInferenceEcho(ctx, agent, wroteInference)
 	return newPhase, nil
 }
 
@@ -4757,29 +5041,142 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 	}
 }
 
-// forgetUsageStatus drops the CR's pruning record when the CR goes away, so the
-// map does not keep an entry per deleted name for the life of the process.
+// forgetUsageStatus drops the CR's pruning records when the CR goes away, so the
+// maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
+	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
 	delete(r.prunedNewerFields, usagePollKey(agent))
 	r.prunedNewerFieldsMu.Unlock()
 }
 
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
-// spec, or "" when the condition is to be absent: the next stack holds no chat
-// backend, or the one it holds has a home channel. A malformed home channel is
-// not this condition's: the gateway refuses it at start and says so.
-func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent) string {
+// spec and the home-channel record, or "" when the condition is to be absent:
+// the next stack holds no chat backend, or the one it holds has a home
+// channel, from the CR or admitted from the record. A malformed home channel
+// is not this condition's: the gateway refuses it at start and says so. On
+// Slack with the CR field empty the base sentence carries at most one more:
+// why the record did not stand in (manual, not an id, refused), or
+// that a mention sets it.
+func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	switch {
 	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
+		meanwhile := homeChannelUnsetKept
+		if slackEnabled(agent) {
+			meanwhile = homeChannelUnsetToSlack
+		}
 		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)")
+			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile)
 	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
-		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
-			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)")
+		if rec.channel != "" {
+			return ""
+		}
+		msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
+			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", homeChannelUnsetKept)
+		switch {
+		case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
+			return msg + homeChannelUnsetManualSuffix
+		case rec.recorded == homeChannelRecordMalformed:
+			return msg + homeChannelUnsetMalformedSuffix
+		case rec.recorded != "" && rec.refused != "":
+			return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.recorded, rec.refused)
+		case rec.refused != "":
+			return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.refused)
+		}
+		return msg + homeChannelUnsetLearnSuffix
 	}
 	return ""
+}
+
+// noChatPlatformMsg is the NoChatPlatform condition's message for this spec,
+// or "" when the condition is to be absent: the install is not on the next
+// stack, or has a chat platform (HomeChannelUnset then says what a missing
+// home channel costs).
+func noChatPlatformMsg(agent *agentv1alpha1.PlatformAgent) string {
+	if renderMode(agent, "gateway") != ModeNext || googleChatEnabled(agent) || slackEnabled(agent) {
+		return ""
+	}
+	where := noChatPlatformNoRepo
+	if agent.Spec.Integration != nil {
+		if ri, err := agent.Spec.Integration.ResolveGit(); err == nil && len(ri.Accepted(agentv1alpha1.RepositoryRoleGitOps)) > 0 {
+			where = noChatPlatformWithRepo
+		}
+	}
+	return fmt.Sprintf(noChatPlatformMessageFormat, where)
+}
+
+// noChatPlatformConditionCurrent reports whether the NoChatPlatform condition
+// already says msg, where "" means the condition is to be absent.
+func noChatPlatformConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, noChatPlatformConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == noChatPlatformReason && existing.Message == msg
+}
+
+// setNoChatPlatformCondition writes the NoChatPlatform condition, or removes
+// it when msg is "". The caller does the API write.
+func setNoChatPlatformCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, noChatPlatformConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               noChatPlatformConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             noChatPlatformReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// shellSandboxImagePinnedMsg is the ShellSandboxPinned condition's message,
+// or "" when the condition is to be absent: the CR pins no sandbox image, or
+// pins the one the operator runs anyway.
+func shellSandboxImagePinnedMsg(agent *agentv1alpha1.PlatformAgent) string {
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.Image == "" {
+		return ""
+	}
+	own := operatorShellSandboxImage()
+	if spec.Image == own {
+		return ""
+	}
+	return fmt.Sprintf(shellSandboxImagePinnedMessageFormat, spec.Image, own)
+}
+
+// shellSandboxImagePinnedConditionCurrent reports whether the
+// ShellSandboxPinned condition already says msg, where "" means the
+// condition is to be absent.
+func shellSandboxImagePinnedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == shellSandboxImagePinnedReason && existing.Message == msg
+}
+
+// setShellSandboxImagePinnedCondition writes the ShellSandboxPinned
+// condition, or removes it when msg is "". The caller does the API write.
+func setShellSandboxImagePinnedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               shellSandboxImagePinnedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             shellSandboxImagePinnedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
 }
 
 // homeChannelUnsetConditionCurrent reports whether the HomeChannelUnset
@@ -5113,7 +5510,10 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // the usage poll (its four groups share three distinct selectors, every
 // usageCountersPollInterval), one per reconcile while the CR has plugins, and
 // three more per reconcile while the agent is not Ready — five of those where
-// the A2A stack renders. Each is namespace-scoped and label-selected
+// the A2A stack renders — one per reconcile while the exec tier is short
+// of its count (credentialProxyExecUnschedulablePod), and one Get of the bus
+// pod per reconcile while a bus replica is not on the StatefulSet's update
+// revision (replaceStuckA2ANATSPod). Each is namespace-scoped and label-selected
 // server-side, and controller-runtime leaves client-side rate limiting off
 // (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
 // nothing of the operator's own.
@@ -5474,9 +5874,9 @@ const (
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded
-// condition, which is not gated on the render.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool) bool {
+// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded and
+// CredentialProxyExecReady conditions, which are not gated on the render.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
 		agent.Status.Phase != "Degraded" ||
@@ -5484,7 +5884,8 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		existing.Reason != reason ||
 		existing.Message != message ||
 		existing.ObservedGeneration != agent.Generation ||
-		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) {
+		!dataVolumeExpansionConditionCurrent(agent, dataVolumeMsg, dataVolumeKnown) ||
+		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
 	if !rendered {
@@ -5573,14 +5974,19 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown) {
+	// CredentialProxyExecReady on every park, rendered or not: the tier is
+	// applied before the egress allowlist refusal parks unrendered, and a park
+	// can last days (ShellSandboxKeysMissing). The read reports the tier as it
+	// stands in the cluster, so it is true on any pass.
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
-		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown)
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady)
 	}) {
 		return nil
 	}
@@ -5603,6 +6009,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	return r.Status().Update(ctx, agent)
 }
@@ -5673,7 +6080,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.NetworkPolicy{}).
-		Owns(&policyv1.PodDisruptionBudget{})
+		Owns(&policyv1.PodDisruptionBudget{}).
+		// The A2A gateway's Lease, so a deletion is seen and the Lease
+		// recreated (ensureA2AGatewayLease). The cache holds only Leases
+		// carrying a2aGatewayLeaseLabel (ManagerCacheOptions).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(a2aGatewayLeaseEvents))
 
 	enqueueAgentsInNamespace := func(ctx context.Context, namespace string) []reconcile.Request {
 		var list agentv1alpha1.PlatformAgentList
@@ -5835,6 +6246,13 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 			}),
 			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				return liteLLMConfigMapRequests(ctx, obj, enqueueAgentsInNamespace)
+			}),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
 		).
 		Named("platformagent").
 		Complete(r)
@@ -6044,6 +6462,70 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 		r.imageVolumeResolved = true
 	}
 	return supported
+}
+
+// clusterAutopilot reports whether the cluster is GKE Autopilot, from
+// discovery (isGKEAutopilot), and reuses an authoritative answer. An answer
+// discovery could not give is (false, false) and is asked again on the next
+// reconcile; the caller decides what to render meanwhile
+// (liveCredentialProxyAutopilot).
+func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined bool) {
+	r.autopilotMu.Lock()
+	defer r.autopilotMu.Unlock()
+	if r.autopilotResolved {
+		return r.autopilot, true
+	}
+	autopilot, determined = isGKEAutopilot(r.DiscoveryClient)
+	if !determined {
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type it was last rendered for, else Standard, until discovery answers.")
+		return false, false
+	}
+	r.autopilot = autopilot
+	r.autopilotResolved = true
+	return autopilot, true
+}
+
+// liveCredentialProxyAutopilot picks the cluster type to render the proxy at
+// while discovery cannot say: the one the running proxy was last rendered for.
+// Rendering the Standard requests over a proxy running at the Autopilot ones
+// would restart it (its Deployment is Recreate), and again once discovery
+// answers. The type is read from credentialProxyClusterTypeAnnotation, which
+// holds across a CR edit and an operator upgrade that moves the defaults. A
+// Deployment an older operator wrote has no annotation, so the type is then
+// the one whose requests, for this CR, the proxy already carries. The requests
+// are still computed from the current CR, so an edit made meanwhile is
+// applied. With no proxy yet, or one matching neither render, it is Standard:
+// a smaller request than Autopilot wants delays the broker's CPU, where a
+// larger one than a Standard node can fit leaves it Pending.
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+	live := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+	}
+	switch live.Annotations[credentialProxyClusterTypeAnnotation] {
+	case credentialProxyClusterTypeAutopilot:
+		return true, true, nil
+	case credentialProxyClusterTypeStandard:
+		return false, true, nil
+	}
+	for _, c := range live.Spec.Template.Spec.Containers {
+		if c.Name != credentialProxyContainerName {
+			continue
+		}
+		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true, renderedSizingTier(rendered)).Requests
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			have, ok := c.Resources.Requests[name]
+			wantQ := want[name]
+			if !ok || have.Cmp(wantQ) != 0 {
+				return false, false, nil
+			}
+		}
+		return true, false, nil
+	}
+	return false, false, nil
 }
 
 type pluginFailure struct {
@@ -6411,4 +6893,88 @@ func agentProfileWatchPlan(mapErr error, denied []string) (watch, unreadable boo
 		return false, true
 	}
 	return mapErr == nil, false
+}
+
+// apiServerEgressTargets is the Kubernetes API server's addresses for an
+// egress rule: the configured IP, the default/kubernetes Service VIP, its
+// Endpoints, and the API server CIDR annotation and override, in that order.
+// withCustom also takes the custom egress CIDR annotation, between the
+// annotation and the override, which is the agent's own policy's list; the
+// scope publisher's policy asks for the API server alone.
+func (r *PlatformAgentReconciler) apiServerEgressTargets(ctx context.Context, agent *agentv1alpha1.PlatformAgent, withCustom bool) []string {
+	var apiTargets []string
+	if r.APIServerIP != "" {
+		apiTargets = append(apiTargets, r.APIServerIP)
+	}
+
+	var k8sSvc corev1.Service
+	if err := r.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sSvc); err == nil {
+		if ip := strings.TrimSpace(k8sSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+			apiTargets = append(apiTargets, ip)
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Service ClusterIP", "error", err)
+	}
+
+	// Use APIReader (live non-cached reader) for default/kubernetes Endpoints to avoid
+	// starting an unconstrained cluster-wide Endpoints informer / watch cache.
+	endpointsReader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		endpointsReader = r.APIReader
+	}
+
+	var k8sEndpoints corev1.Endpoints
+	if err := endpointsReader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, &k8sEndpoints); err == nil {
+		for _, subset := range k8sEndpoints.Subsets {
+			for _, addr := range subset.Addresses {
+				if addr.IP != "" {
+					apiTargets = append(apiTargets, addr.IP)
+				}
+			}
+		}
+	} else if !errors.IsNotFound(err) {
+		logf.FromContext(ctx).Info("Failed to discover default/kubernetes Endpoints", "error", err)
+	}
+
+	parseCIDRTarget := func(annotationName, raw string) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return
+		}
+		// normalizeCIDRTarget, not a local parse: it takes the address family from
+		// the address rather than the mask width, so an IPv4-mapped IPv6 block is
+		// measured against the IPv4 floor it will actually print as.
+		// ::ffff:a00:0/104 used to clear the /48 IPv6 floor here and land in the
+		// list as 10.0.0.0/8; it is now rejected, while ::ffff:a00:0/108 still
+		// passes because /108 is the IPv4 /12 that is exactly the floor.
+		ipNet, ok := normalizeCIDRTarget(raw, true)
+		if !ok {
+			logf.FromContext(ctx).Info("Ignoring CIDR in annotation: unparseable, or broader than the /12 (IPv4) or /48 (IPv6) floor", "annotation", annotationName, "cidr", raw)
+			return
+		}
+		apiTargets = append(apiTargets, ipNet.String())
+	}
+
+	appendCIDRs := func(sourceName, rawList string) {
+		if rawList == "" {
+			return
+		}
+		cidrs := strings.Split(rawList, ",")
+		if len(cidrs) > maxCIDRsPerAnnotation {
+			logf.FromContext(ctx).Info("Truncating CIDR list to max allowed CIDRs", "source", sourceName, "max", maxCIDRsPerAnnotation, "total", len(cidrs))
+			cidrs = cidrs[:maxCIDRsPerAnnotation]
+		}
+		for _, cidr := range cidrs {
+			parseCIDRTarget(sourceName, cidr)
+		}
+	}
+
+	if agent.Annotations != nil {
+		appendCIDRs(AnnotationAPIServerCIDR, agent.Annotations[AnnotationAPIServerCIDR])
+		if withCustom {
+			appendCIDRs(AnnotationCustomEgressCIDRs, agent.Annotations[AnnotationCustomEgressCIDRs])
+		}
+	}
+	appendCIDRs("KUBERNETES_API_SERVER_CIDR", r.APIServerCIDROverride)
+	return apiTargets
 }

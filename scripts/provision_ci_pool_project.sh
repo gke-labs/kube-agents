@@ -356,8 +356,8 @@ fi
 # A bare `grep "${PROJECT_ID}"` also matches comments and any longer project ID
 # that contains this one as a prefix.
 CI_DEPLOY="${REPO_ROOT}/hack/ci-deploy.sh"
-if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null \
-     | grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\""; then
+if ! grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\"" \
+     <<<"$(awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null)"; then
   echo "⚠️ ${PROJECT_ID} is not mapped in hack/ci-deploy.sh." >&2
   echo "   Add to gitops_repo_for_project():" >&2
   echo "       ${PROJECT_ID}) echo \"${GITOPS_REPO}\" ;;" >&2
@@ -389,6 +389,9 @@ gcloud services enable \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   dns.googleapis.com \
+  apikeys.googleapis.com \
+  secretmanager.googleapis.com \
+  generativelanguage.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -614,7 +617,7 @@ seed_gitops_file() {
   local path="$1" message="$2" content="$3" what="$4" read_error
   if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
     return 0
-  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  elif grep -q "${GITOPS_NOTE_ABSENT_PATTERN}" <<<"${read_error}"; then
     echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
     gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
       -f message="${message}" \
@@ -698,6 +701,12 @@ if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_
 fi
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
+
+# ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
+echo -e "\n==> [Step 1.6] Minting the project's Gemini Developer API key..."
+# Per project so each leased project gets its own quota window; the same script repairs an already-registered project, which must not be re-provisioned.
+# Step 1 already enabled its three APIs (REQUIRED_APIS); the script enables them again, which is a no-op.
+"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

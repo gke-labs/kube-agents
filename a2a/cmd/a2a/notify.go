@@ -47,18 +47,29 @@ var errNotifyOutcomeUnknown = errors.New("outcome unknown")
 
 // notifyExitRouteUnavailable is the exit status for "the route is not there
 // right now": nothing subscribes on the subject (the gateway is restarting,
-// or its route is not armed) or the bus cannot be reached. Nothing was posted,
-// and unlike a refusal it says nothing about the destination, so a caller that
-// counts failures against a chat can wait instead (the kanban notifier's
-// stand-in does). Every other failure exits 1.
+// or its route is not armed), the bus cannot be reached, or the gateway
+// refused with retry (it is stopping, or couldn't read the conversation's
+// record in time). Nothing was posted, and unlike a plain refusal it says
+// nothing about the destination, so a caller that counts failures against a
+// chat can wait instead (the kanban notifier's stand-in does). Every other
+// failure exits 1.
 const notifyExitRouteUnavailable = 4
 
 // errNotifyRouteUnavailable marks the failure main reports with
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
+// notifyExitKept is the exit status for a home post the gateway refused for
+// want of a home channel and kept for the digest it posts once one is set
+// (NotifyReply.Kept). Nothing was posted now, and nothing is lost: a sender
+// that re-sends on failure treats the post as handled.
+const notifyExitKept = 5
+
+// errNotifyKept marks the failure main reports with notifyExitKept.
+var errNotifyKept = errors.New("kept for the digest")
+
 // notifyUpdateMax bounds an --update key. The gateway keeps at most 16 per
-// conversation (spec-a2a-payloads, "Card work after the task ends"); the
+// conversation or home thread (spec-a2a-payloads, "Card work after the task ends"); the
 // senders pick short ones (plan-<card>-<serial>, question-<card>-<serial>,
 // alert-<event session>).
 const notifyUpdateMax = 128
@@ -72,7 +83,7 @@ gateway's conversation key, and the context id its tasks carry): the gateway
 posts only into a live conversation whose session record has that context.
 --chat-file names a kube-agents.chat/v1 object to lay the post out with, the
 text being its fallback; --update names the message: a later notify with the
-same key, in the same conversation, edits that message instead of posting.
+same key, in the same conversation or home thread, edits that message instead of posting.
 --answer-to, with --conversation, names the plan whose ask the post answers,
 by its update key: the gateway draws the rating controls on it.
 --reply-to names the gateway task whose turn filed the work the post reports
@@ -80,8 +91,11 @@ on; the console passes it on so its client can join the post to that turn.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
-did not answer in time (the post may still land), and 4 when the route is not
-there right now (nothing answering, or the bus unreachable; nothing posted).
+did not answer in time (the post may still land), 4 when the route is not
+there right now (nothing answering, the bus unreachable, or a refusal the
+gateway marks retry; nothing posted), and 5 when the gateway refused a home
+post for want of a home channel and kept it for the digest it posts once one
+is set (nothing posted now).
 `
 
 func runNotify(args []string) error {
@@ -225,6 +239,14 @@ func runNotify(args []string) error {
 		return fmt.Errorf("notify: unreadable answer: %w", err)
 	}
 	fmt.Println(string(msg.Data))
+	if answer.Kept {
+		return fmt.Errorf("notify: the gateway posted nothing: %s: %w", answer.Error, errNotifyKept)
+	}
+	if answer.Error != "" && answer.MessageID == "" && answer.Retry {
+		// Nothing was posted and the same request may land later: the same
+		// exit as no route, which a sender waits out.
+		return fmt.Errorf("notify: the gateway posted nothing, for now: %s: %w", answer.Error, errNotifyRouteUnavailable)
+	}
 	if answer.Error != "" && answer.MessageID == "" {
 		return fmt.Errorf("notify: the gateway posted nothing: %s", answer.Error)
 	}

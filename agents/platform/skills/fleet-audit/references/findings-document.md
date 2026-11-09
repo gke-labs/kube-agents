@@ -233,7 +233,7 @@ field, and publishes nothing:
   one declares an object you observed on the target cluster** before writing beside it. A `grep` for
   a name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
   until you have read it. In directory mode that search is a `grep` over the clone; in content mode
-  it is the `grep` subcommand, which the broker runs over its own checkout, and `fetch` to read the
+  it is the `grep` subcommand, which searches a snapshot of the repository, and `fetch` to read the
   hits it named.
   **The parent directory must already exist in the repository**; if no sibling
   can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
@@ -241,7 +241,7 @@ field, and publishes nothing:
   you: it validates the shape of a path, not whether anything reconciles it, and it will create
   missing parents and commit the file happily. A manifest in a directory the deploying tool does not
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
-  then returns next run as `pr-merged-persists`, where neither documented explanation fits.
+  then returns next run as `pr-merged-persists`, where none of the documented explanations fits.
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
   can revert a patch to the live object), or else the `namespace_directory` for a new object (with
@@ -327,7 +327,8 @@ pinned a replica count in Terraform on purpose was getting the same `no-hpa` fin
 until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
 §4a, the pilot) has two halves. The harness reads every repository in `declared_intent_repos` for
 OKF notes whose frontmatter carries a `declares:` list — items of `{check, namespace, object}` plus
-an optional `cluster`, `object` as `Kind/name` — within the paths each repository's
+an optional `cluster` and an optional `expires` (`YYYY-MM-DD`, UTC, the last day the item stands),
+`object` as `Kind/name` — within the paths each repository's
 `.kube-agents/intent.yaml` names, and `finish` moves every finding one covers here itself: a
 case-blind lookup on `(check, cluster, namespace, object)`, then on the fleet-wide
 `(check, namespace, object)`, compared as the finding id is (`deployment/api` joins `Deployment/api`),
@@ -335,7 +336,11 @@ the finding's `cluster` and `title` kept and the note's `repo`, `path` and title
 Two slugs name both a posture and a fault, and the join moves only the posture: for
 `hpa-cannot-scale` the `min == max` shape, read off the severity the SOP fixes for it (`major`); for
 `netpol-missing` the `Namespace/<ns>` shape. A declaration matching the `minor` dangling-target fault
-or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied.
+or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied. An item whose `expires`
+has passed moves nothing: the finding it covered stays under `findings` with a _Declared intent
+expired_ line in its ledger block naming the note and the date, unless a standing item covers it; a
+hand-written entry's `declaration.expires` is held to the format, and refused by `finish` when it had
+lapsed on the day the run started; a later reopening holds the format only.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other
@@ -400,7 +405,7 @@ What `finish` does with it:
 
 Where the sha comes from is the SOP's §4a, and it is the same for the harness and the worker: in
 content mode `list`, `grep` and `fetch` print it for the GitOps repository and
-`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`inspect_repository.py clone` prints it for a context copy; in directory mode it is
 `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that `clone` named for
 the context copy.
 

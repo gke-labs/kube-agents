@@ -14,7 +14,8 @@
 # defect, answered from observed evidence and graded on the reply. Full
 # audit SOP fidelity lives in the fleet-audits canary
 # (compliance-rbac-overgrant, 606s measured 2026-08-26; nightly 2026-09-22
-# to 2026-09-29, presubmit held out since (#2013)) and, in the nightly tier,
+# to 2026-09-29, presubmit held out 2026-09-29 to 2026-11-02, on the roster
+# since (#2013)) and, in the nightly tier,
 # upgrade-readiness-lagging-cluster.
 # Expected cost bracket: ~150-350s.
 #

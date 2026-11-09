@@ -67,7 +67,8 @@ CREATE TABLE task_runs (
     id INTEGER PRIMARY KEY,
     task_id TEXT NOT NULL,
     outcome TEXT,
-    error TEXT
+    error TEXT,
+    summary TEXT
 );
 """
 
@@ -1380,6 +1381,392 @@ class CloseNoTurnChatTest(unittest.TestCase):
             self.assertEqual(opened, [pathlib.Path("/custom/path.db")])
 
 
+# --- The fifth fix: the budget hand-off (gke-labs/kube-agents#4902) ----------
+# Upstream's _resolve_budget_fallback asks the model for a closing summary and
+# charges the card timed_out; the summary went nowhere. These drive the module
+# functions the finalize_turn insert calls to persist it.
+
+SUMMARY = "Checked the CronJob spec and the last three jobs.\n\nStill to do: read the pod logs."
+
+
+def closed_by_budget(rows, outcome="timed_out", summary=None):
+    """A board after upstream's budget charge: ``rows`` are
+    ``(id, status, run_id)``; the card carries no current run any more and the
+    worker's run row is closed ``outcome``."""
+    conn = board([(tid, status) for tid, status, *_ in rows])
+    for tid, _status, *run in rows:
+        if run:
+            conn.execute(
+                "INSERT INTO task_runs (id, task_id, outcome, summary) VALUES (?, ?, ?, ?)",
+                (run[0], tid, outcome, summary),
+            )
+    return conn
+
+
+class BudgetHandoffTextTest(unittest.TestCase):
+    def test_the_models_closing_summary_is_the_handoff(self):
+        self.assertEqual(kge.budget_handoff_text(SUMMARY, []), SUMMARY)
+
+    def test_newlines_survive_but_padding_does_not(self):
+        self.assertEqual(kge.budget_handoff_text("  " + SUMMARY + "\n\n", None), SUMMARY)
+
+    def test_without_a_summary_the_last_assistant_text_stands_in(self):
+        messages = [
+            {"role": "assistant", "content": "Looking at the CronJob."},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "spec..."},
+            {"role": "assistant", "content": [{"type": "text", "text": "The schedule is wrong."}]},
+            {"role": "user", "content": "nudge", "_kanban_stop_synthetic": True},
+        ]
+        self.assertEqual(kge.budget_handoff_text(None, messages), "The schedule is wrong.")
+        self.assertEqual(kge.budget_handoff_text("", messages), "The schedule is wrong.")
+
+    def test_with_nothing_to_persist_the_text_says_so(self):
+        self.assertEqual(kge.budget_handoff_text(None, []), kge.BUDGET_HANDOFF_NO_TEXT)
+        self.assertEqual(kge.budget_handoff_text(None, None), kge.BUDGET_HANDOFF_NO_TEXT)
+        self.assertEqual(
+            kge.budget_handoff_text(None, [{"role": "assistant", "content": "   "}]),
+            kge.BUDGET_HANDOFF_NO_TEXT,
+        )
+
+    def test_the_text_is_bounded_on_a_word_so_a_trailing_url_stays_whole(self):
+        long = ("word " * 900) + "https://github.com/gke-labs/kube-agents/pull/5100"
+        clipped = kge.budget_handoff_text(long, [])
+        self.assertLessEqual(len(clipped), kge.BUDGET_HANDOFF_MAX_CHARS)
+        self.assertNotIn("https://github.com/gke-labs/kube-agents/pull/51", clipped[:-10])
+        self.assertTrue(clipped.endswith("[…]"), clipped[-20:])
+        self.assertNotRegex(clipped, r"wor\s*\[…\]$")
+
+    def test_a_malformed_transcript_is_not_fatal(self):
+        self.assertEqual(kge.budget_handoff_text(None, ["not a dict", None, 3]), kge.BUDGET_HANDOFF_NO_TEXT)
+
+    # handle_max_iterations never returns an empty string: a failed call
+    # returns its own "couldn't summarize" line and leaves the request as the
+    # newest row. The request text is what tells the two apart.
+    REQUEST = "You've reached the maximum number of tool-calling iterations allowed. Summarise."
+    CANNED = "I reached the iteration limit and couldn't generate a summary."
+
+    def test_a_summary_the_call_produced_is_the_handoff(self):
+        messages = [
+            {"role": "assistant", "content": "Looking at the CronJob."},
+            {"role": "user", "content": self.REQUEST},
+            {"role": "assistant", "content": SUMMARY},
+        ]
+        self.assertEqual(
+            kge.budget_handoff(SUMMARY, messages, self.REQUEST),
+            (SUMMARY, kge.HANDOFF_SOURCE_SUMMARY),
+        )
+
+    def test_a_failed_summary_call_hands_off_the_last_real_answer_instead(self):
+        messages = [
+            {"role": "assistant", "content": "Looking at the CronJob."},
+            {"role": "assistant", "content": [{"type": "text", "text": "The schedule is wrong."}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "spec..."},
+            {"role": "user", "content": self.REQUEST},
+        ]
+        for canned in (self.CANNED, "I reached the maximum iterations (3) but couldn't summarize. Error: 429"):
+            with self.subTest(canned=canned):
+                self.assertEqual(
+                    kge.budget_handoff(canned, messages, self.REQUEST),
+                    ("The schedule is wrong.", kge.HANDOFF_SOURCE_TRANSCRIPT),
+                )
+
+    def test_a_failed_summary_call_with_no_earlier_answer_says_so(self):
+        messages = [{"role": "user", "content": "task"}, {"role": "user", "content": self.REQUEST}]
+        self.assertEqual(
+            kge.budget_handoff(self.CANNED, messages, self.REQUEST),
+            (kge.BUDGET_HANDOFF_NO_TEXT, kge.HANDOFF_SOURCE_NONE),
+        )
+
+    def test_without_the_request_text_nothing_is_judged_failed(self):
+        messages = [{"role": "user", "content": self.REQUEST}]
+        self.assertEqual(kge.budget_handoff(self.CANNED, messages, None), (self.CANNED, kge.HANDOFF_SOURCE_SUMMARY))
+        self.assertFalse(kge.summary_call_failed(messages, ""))
+
+    def test_the_sources_are_reported(self):
+        self.assertEqual(kge.budget_handoff(SUMMARY, [], None)[1], kge.HANDOFF_SOURCE_SUMMARY)
+        self.assertEqual(
+            kge.budget_handoff(None, [{"role": "assistant", "content": "partial"}], None),
+            ("partial", kge.HANDOFF_SOURCE_TRANSCRIPT),
+        )
+        self.assertEqual(kge.budget_handoff(None, [], None)[1], kge.HANDOFF_SOURCE_NONE)
+
+
+class BudgetHandoffCommentTest(unittest.TestCase):
+    def test_it_names_the_run_the_budget_and_carries_the_text(self):
+        body = kge.budget_handoff_comment(run_id=28, api_call_count=150, max_iterations=150, text=SUMMARY)
+        self.assertIn("Run 28", body)
+        self.assertIn("150/150", body)
+        self.assertTrue(body.endswith(SUMMARY))
+
+    def test_it_describes_and_does_not_instruct(self):
+        """The retry worker reads it under the card's comments."""
+        body = kge.budget_handoff_comment(run_id=28, api_call_count=3, max_iterations=3, text="t")
+        framing = body[: body.rindex("t")].lower()
+        for verb in ("you must", "you should", "do not", "call kanban"):
+            self.assertNotIn(verb, framing)
+
+    def test_it_avoids_the_phrases_upstream_parses(self):
+        body = kge.budget_handoff_comment(run_id=None, api_call_count=3, max_iterations=3, text="t")
+        self.assertNotIn("protocol violation", body)
+        self.assertIn("Run ?", body)
+
+    def test_it_says_what_the_charge_did_to_the_card(self):
+        """A counted failure retries; the one that tripped the limit blocked
+        the card, and the comment must not promise a retry there."""
+        counted = kge.budget_handoff_comment(run_id=28, api_call_count=3, max_iterations=3, text="t")
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.OUTCOME], counted)
+        self.assertNotIn("blocked", counted)
+        tripped = kge.budget_handoff_comment(
+            run_id=28, api_call_count=3, max_iterations=3, text="t", outcome=kge.TRIPPED_OUTCOME
+        )
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.TRIPPED_OUTCOME], tripped)
+        self.assertIn("blocked", tripped)
+        self.assertNotIn("retry limit", tripped)
+        for body in (counted, tripped):
+            self.assertNotIn("next attempt", body)
+            self.assertIn("next worker on this card", body)
+
+    def test_it_says_where_the_text_came_from(self):
+        for source, lead in kge.HANDOFF_ORIGINS.items():
+            with self.subTest(source=source):
+                body = kge.budget_handoff_comment(
+                    run_id=28, api_call_count=3, max_iterations=3, text="t", source=source
+                )
+                self.assertIn(lead, body)
+        default = kge.budget_handoff_comment(run_id=28, api_call_count=3, max_iterations=3, text="t")
+        self.assertIn(kge.HANDOFF_ORIGINS[kge.HANDOFF_SOURCE_SUMMARY], default)
+        unknown = kge.budget_handoff_comment(run_id=28, api_call_count=3, max_iterations=3, text="t", source="?")
+        self.assertIn(kge.HANDOFF_ORIGINS[kge.HANDOFF_SOURCE_SUMMARY], unknown)
+
+
+def persistable(**overrides):
+    kwargs = dict(
+        task_id="t_80ff98c9",
+        iteration_limit_fallback=True,
+        interrupted=False,
+        failed=False,
+        goal_mode=False,
+        cron_run=False,
+        delegated_child=False,
+    )
+    kwargs.update(overrides)
+    return kge.should_persist_budget_handoff(**kwargs)
+
+
+class ShouldPersistBudgetHandoffTest(unittest.TestCase):
+    def test_the_customer_shape_is_persisted(self):
+        self.assertTrue(persistable())
+
+    def test_only_the_budget_path_is_this_functions_business(self):
+        """The other exits are the backstop's; they carry no summary."""
+        self.assertFalse(persistable(iteration_limit_fallback=False))
+
+    def test_an_interrupt_and_a_failed_turn_are_not(self):
+        self.assertFalse(persistable(interrupted=True))
+        self.assertFalse(persistable(failed=True))
+
+    def test_a_non_worker_is_never_touched(self):
+        self.assertFalse(persistable(task_id=None))
+        self.assertFalse(persistable(task_id=""))
+
+    def test_the_board_writes_exclusions_apply(self):
+        self.assertFalse(persistable(goal_mode=True))
+        self.assertFalse(persistable(cron_run=True))
+        self.assertFalse(persistable(delegated_child=True))
+
+    def test_goal_mode_defaults_to_the_environment(self):
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_GOAL_MODE": "1"}):
+            self.assertFalse(persistable(goal_mode=None))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERMES_KANBAN_GOAL_MODE", None)
+            self.assertTrue(persistable(goal_mode=None))
+
+
+class PersistBudgetHandoffTest(unittest.TestCase):
+    def _persist(self, conn, run_id=28, comments=None, text=SUMMARY, author="platform"):
+        closable = ClosableConn(conn)
+        com = comments or CommentRecorder()
+        did = kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=run_id, api_call_count=150, max_iterations=150,
+            text=text, author=author, connect=lambda: closable, add_comment=com,
+        )
+        return did, com, closable
+
+    def _summary(self, conn, run_id=28):
+        return conn.execute("SELECT summary FROM task_runs WHERE id = ?", (run_id,)).fetchone()[0]
+
+    def test_the_summary_lands_on_the_run_upstream_closed_and_a_comment_follows(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        did, com, closable = self._persist(conn)
+        self.assertTrue(did)
+        self.assertEqual(self._summary(conn), SUMMARY)
+        task_id, author, body = com.calls[0]
+        self.assertEqual((task_id, author), ("t_80ff98c9", "platform"))
+        self.assertIn("150/150", body)
+        self.assertTrue(body.endswith(SUMMARY))
+        self.assertTrue(closable.closed)
+
+    def test_a_charge_that_tripped_the_breaker_still_gets_the_handoff(self):
+        """gave_up is the outcome upstream books on the attempt that trips the
+        breaker; the card is blocked and the hand-off is what the operator reads."""
+        conn = closed_by_budget([("t_80ff98c9", "blocked", 28)], outcome="gave_up")
+        did, com, _ = self._persist(conn)
+        self.assertTrue(did)
+        self.assertEqual(self._summary(conn), SUMMARY)
+        body = com.calls[0][2]
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.TRIPPED_OUTCOME], body)
+        self.assertNotIn("retry limit", body)
+        # And the counted outcome keeps its own framing.
+        _, com, _ = self._persist(closed_by_budget([("t_80ff98c9", "ready", 28)]))
+        self.assertIn(kge.HANDOFF_CONSEQUENCES[kge.OUTCOME], com.calls[0][2])
+
+    def test_a_run_closed_by_something_else_is_left_alone(self):
+        """The worker blocked its card, carried on, and only then exhausted the
+        budget: upstream's charge closed the newer run, not this one, and the
+        hand-off would describe a run that ended on its own terms."""
+        conn = closed_by_budget([("t_80ff98c9", "running", 28)], outcome="blocked")
+        did, com, _ = self._persist(conn)
+        self.assertFalse(did)
+        self.assertIsNone(self._summary(conn))
+        self.assertEqual(com.calls, [])
+
+    def test_a_run_still_open_is_left_alone(self):
+        """Upstream's charge did not land (it logs and continues); a summary on
+        an open run would hand off a run that has not ended."""
+        conn = closed_by_budget([("t_80ff98c9", "running", 28)], outcome=None)
+        did, com, _ = self._persist(conn)
+        self.assertFalse(did)
+        self.assertEqual(com.calls, [])
+
+    def test_a_run_that_already_carries_a_summary_is_not_overwritten(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)], summary="earlier hand-off")
+        did, com, _ = self._persist(conn)
+        self.assertFalse(did)
+        self.assertEqual(self._summary(conn), "earlier hand-off")
+        self.assertEqual(com.calls, [])
+
+    def test_no_run_id_means_no_write(self):
+        did, com, closable = self._persist(closed_by_budget([("t_80ff98c9", "ready", 28)]), run_id=None)
+        self.assertFalse(did)
+        self.assertEqual(com.calls, [])
+        self.assertFalse(closable.closed, "the board is not even opened")
+
+    def test_a_missing_run_row_means_no_write(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        did, com, _ = self._persist(conn, run_id=99)
+        self.assertFalse(did)
+        self.assertEqual(com.calls, [])
+
+    def test_a_failed_comment_leaves_the_summary_standing(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        did, _, _ = self._persist(conn, comments=CommentRecorder(raises=True))
+        self.assertTrue(did)
+        self.assertEqual(self._summary(conn), SUMMARY)
+
+    def test_the_comment_is_written_after_the_summary(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        seen = []
+
+        class OrderedComments(CommentRecorder):
+            def __call__(self, c, *a):
+                seen.append(c.execute("SELECT summary FROM task_runs WHERE id = 28").fetchone()[0])
+                return super().__call__(c, *a)
+
+        self._persist(conn, comments=OrderedComments())
+        self.assertEqual(seen, [SUMMARY])
+
+    def test_the_connection_is_closed_even_when_the_write_raises(self):
+        closable = ClosableConn(closed_by_budget([("t_80ff98c9", "ready", 28)]))
+        closable.execute = mock.Mock(side_effect=sqlite3.OperationalError("database is locked"))
+        did = kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=1, max_iterations=1, text="t",
+            author="platform", connect=lambda: closable, add_comment=CommentRecorder(),
+        )
+        self.assertFalse(did)
+        self.assertTrue(closable.closed)
+
+    def test_the_author_falls_back_when_no_profile_is_set(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HERMES_PROFILE", None)
+            did, com, _ = self._persist(closed_by_budget([("t_80ff98c9", "ready", 28)]), author=None)
+        self.assertTrue(did)
+        self.assertEqual(com.calls[0][1], kge.BUDGET_HANDOFF_COMMENT_AUTHOR)
+        with mock.patch.dict(os.environ, {"HERMES_PROFILE": "platform"}):
+            _, com, _ = self._persist(closed_by_budget([("t_80ff98c9", "ready", 28)]), author=None)
+        self.assertEqual(com.calls[0][1], "platform")
+
+    def test_a_summary_naming_a_pull_request_url_is_saved_without_a_comment(self):
+        """check_respawn_guard holds a card whose recent comments name a PR
+        URL (active_pr) for a day; the run summary is not read by it."""
+        pr_text = "I was reviewing https://github.com/gke-labs/kube-agents/pull/5100 and had read the diff."
+        pattern = re.compile(r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        com = CommentRecorder()
+        did = kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=150, max_iterations=150,
+            text=pr_text, author="platform", connect=lambda: ClosableConn(conn), add_comment=com,
+            withhold_comment=lambda t: bool(pattern.search(t)),
+        )
+        self.assertTrue(did)
+        self.assertEqual(self._summary(conn), pr_text)
+        self.assertEqual(com.calls, [])
+        # A text without one still gets its comment through the same predicate.
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        com = CommentRecorder()
+        kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=150, max_iterations=150,
+            text=SUMMARY, author="platform", connect=lambda: ClosableConn(conn), add_comment=com,
+            withhold_comment=lambda t: bool(pattern.search(t)),
+        )
+        self.assertEqual(len(com.calls), 1)
+
+    def test_the_source_reaches_the_comment(self):
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        com = CommentRecorder()
+        kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=150, max_iterations=150,
+            text="partial", author="platform", connect=lambda: ClosableConn(conn), add_comment=com,
+            source=kge.HANDOFF_SOURCE_TRANSCRIPT,
+        )
+        self.assertIn(kge.HANDOFF_ORIGINS[kge.HANDOFF_SOURCE_TRANSCRIPT], com.calls[0][2])
+
+    def test_the_text_goes_through_the_board_redactor_before_the_run_write(self):
+        """complete_task's summary and add_comment's body are redacted by the
+        prologue apply_credential_redaction gives them; the run summary this
+        module writes with its own UPDATE is a board writer too."""
+        token_text = "Read the secret: ya29.A0ARrdaM-token; the CronJob image tag is wrong."
+        conn = closed_by_budget([("t_80ff98c9", "ready", 28)])
+        com = CommentRecorder()
+        seen = []
+
+        def redact(text):
+            seen.append(text)
+            return text.replace("ya29.A0ARrdaM-token", "[REDACTED]")
+
+        did = kge.persist_budget_handoff(
+            task_id="t_80ff98c9", run_id=28, api_call_count=150, max_iterations=150,
+            text=token_text, author="platform", connect=lambda: ClosableConn(conn), add_comment=com,
+            redact=redact,
+        )
+        self.assertTrue(did)
+        self.assertEqual(seen, [token_text])
+        self.assertEqual(self._summary(conn), token_text.replace("ya29.A0ARrdaM-token", "[REDACTED]"))
+        self.assertNotIn("ya29.", self._summary(conn))
+        self.assertNotIn("ya29.", com.calls[0][2])
+
+    def test_a_write_that_fails_is_logged_at_warning(self):
+        closable = ClosableConn(closed_by_budget([("t_80ff98c9", "ready", 28)]))
+        closable.execute = mock.Mock(side_effect=sqlite3.OperationalError("database is locked"))
+        with self.assertLogs(kge.logger, level="WARNING") as logs:
+            did = kge.persist_budget_handoff(
+                task_id="t_80ff98c9", run_id=28, api_call_count=1, max_iterations=1, text="t",
+                author="platform", connect=lambda: closable, add_comment=CommentRecorder(),
+            )
+        self.assertFalse(did)
+        self.assertTrue(any("budget hand-off" in line for line in logs.output), logs.output)
+
+
 # The applier is exercised against a miniature of the five real files, in the
 # shape v2026.9.14 gives them: the turn loop's phases are helpers that return a
 # verdict, and the loop copies the verdict's fields back into its locals. The
@@ -1574,10 +1961,10 @@ def _assigned_value(fn, name):
     return None
 
 
-def budget_predicates(finalizer_source):
+def budget_predicates(finalizer_source, call="_kanban_should_record_missing"):
     """``(upstream, inserted)``: upstream's ``budget_exhausted`` value in
     ``_resolve_budget_fallback`` and the ``iteration_limit_fallback=`` the
-    inserted call passes, both unparsed so layout does not count."""
+    inserted ``call`` passes, both unparsed so layout does not count."""
     tree = ast.parse(finalizer_source)
     defs = {
         n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -1585,7 +1972,7 @@ def budget_predicates(finalizer_source):
     upstream = _assigned_value(defs["_resolve_budget_fallback"], "budget_exhausted")
     inserted = None
     for n in ast.walk(defs["finalize_turn"]):
-        if isinstance(n, ast.Call) and ast.unparse(n.func) == "_kanban_should_record_missing":
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == call:
             for k in n.keywords:
                 if k.arg == "iteration_limit_fallback":
                     inserted = ast.unparse(k.value)
@@ -1720,6 +2107,74 @@ class ApplierTest(unittest.TestCase):
         # upstream's _resolve_budget_fallback binds to budget_exhausted against
         # the iteration_limit_fallback= the insert passes, both unparsed.
         upstream, inserted = budget_predicates(self._apply_all()["finalizer"])
+        self.assertIsNotNone(upstream)
+        self.assertEqual(inserted, upstream)
+
+    def test_the_budget_handoff_runs_after_the_fallback_and_before_the_leak_check(self):
+        """The hand-off needs the run upstream's charge just closed and the
+        summary _resolve_budget_fallback just obtained; the leak check after
+        it excludes the budget path and must stay independent of it."""
+        finalizer = self._apply_all()["finalizer"]
+        self.assertLess(
+            finalizer.index("_resolve_budget_fallback(\n"),
+            finalizer.index("_kanban_should_persist_handoff("),
+        )
+        self.assertLess(
+            finalizer.index("_kanban_should_persist_handoff("),
+            finalizer.index("_kanban_should_record_missing("),
+        )
+        self.assertLess(
+            finalizer.index("_kanban_persist_budget_handoff("),
+            finalizer.index("_kanban_should_record_missing("),
+        )
+
+    def test_the_budget_handoff_passes_the_summary_the_transcript_and_the_run(self):
+        finalizer = self._apply_all()["finalizer"]
+        block = finalizer[finalizer.index("if _kanban_budget_handoff:") :]
+        self.assertIn(
+            "_kanban_budget_handoff_of(\n                final_response, messages, _kube_summary_request\n            )",
+            block,
+        )
+        self.assertIn("MAX_ITERATIONS_SUMMARY_REQUEST as _kube_summary_request", block)
+        self.assertIn("_RESPAWN_GUARD_PR_URL_RE as _kube_respawn_guard_pr_url_re", block)
+        call = block[block.index("_kanban_persist_budget_handoff(") :]
+        call = call[: call.index("):")]
+        self.assertIn("text=_kanban_handoff_text", call)
+        self.assertIn("source=_kanban_handoff_source", call)
+        self.assertIn("withhold_comment=lambda _t: bool(_kube_respawn_guard_pr_url_re.search(_t))", call)
+        self.assertIn("redact=_kube_redact_store_text", call)
+        self.assertIn("run_id=_kube_worker_run_id()", call)
+        self.assertIn("api_call_count=api_call_count", call)
+        self.assertIn("max_iterations=agent.max_iterations", call)
+        self.assertIn("connect=_kube_kanban_connect", call)
+        self.assertIn("add_comment=_kb.add_comment", call)
+
+    def test_the_board_redactor_is_imported_but_its_absence_is_not_fatal(self):
+        """agent/credential_redaction.py is installed by a later Dockerfile
+        step than this patch's build gate, so the import is guarded."""
+        block = self._apply_all()["finalizer"]
+        block = block[block.index("if _kanban_budget_handoff:") :]
+        block = block[: block.index("_kanban_persist_budget_handoff(")]
+        self.assertIn("from agent.credential_redaction import (", block)
+        self.assertIn("redact_store_text as _kube_redact_store_text", block)
+        guard = block[block.index("from agent.credential_redaction import (") :]
+        self.assertIn("except ImportError:", guard)
+        self.assertIn("_kube_redact_store_text = None", guard)
+
+    def test_a_handoff_that_did_not_land_is_logged_not_silent(self):
+        block = self._apply_all()["finalizer"]
+        block = block[block.index("if _kanban_budget_handoff:") :]
+        block = block[: block.index("_kanban_should_record_missing")]
+        self.assertIn("budget hand-off not saved", block)
+        # A worker that completed or blocked on its last iteration reaches the
+        # same line; it must not announce a retry that does not happen.
+        self.assertNotIn("retry starts cold", block)
+        self.assertIn("logger.warning(", block)
+
+    def test_the_handoff_predicate_mirrors_upstreams_too(self):
+        upstream, inserted = budget_predicates(
+            self._apply_all()["finalizer"], call="_kanban_should_persist_handoff"
+        )
         self.assertIsNotNone(upstream)
         self.assertEqual(inserted, upstream)
 

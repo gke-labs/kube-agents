@@ -47,8 +47,9 @@ session record carries that context. A subscription with no thread (a DM,
 or a space as a whole) is not delivered at all: posting it as a new thread in
 the home channel would move text meant for one space into another.
 
-When the route is not there (the gateway restarting, its route unarmed, the
-bus unreachable: ``a2a notify`` exit 4), :func:`resolve` answers no adapter,
+When the route is not there (the gateway restarting or stopping, its route
+unarmed, the bus unreachable, a record it couldn't read in time: ``a2a notify``
+exit 4), :func:`resolve` answers no adapter,
 which is upstream's disconnected-adapter path: skipped without a claim and
 without spending the failure budget. It learns this from a probe (an empty
 notify, which an armed gateway refuses at once) that the collector's pre-claim
@@ -115,7 +116,9 @@ logger = logging.getLogger(__name__)
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The platform whose gateway conversations a card can report back to
 # (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
-# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
+# home channel or not; A2A_NOTIFY_PLATFORM above is home posts, rendered with a
+# home channel or when the backend is the install's only chat platform (the
+# gateway then keeps a refused post for its digest).
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # The operator's projection of the home channel, mounted in the agent pod
 # (agents/platform/scripts/chat_notify.py keeps the same three names).
@@ -126,9 +129,14 @@ HOME_FILE_PLATFORM = "slack"
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
 # request and did not answer (the post may still land, so it is not re-sent),
-# and the route is not there right now (nothing posted).
+# and the route is not there right now, including a refusal the gateway marks
+# retry (nothing posted).
 NOTIFY_OUTCOME_UNKNOWN = 3
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# The gateway refused a home post for want of a home channel and kept it for
+# the digest it posts once one is set: nothing posted now, nothing lost, so
+# the send is not retried and spends no failure budget.
+NOTIFY_KEPT = 5
 # How long `a2a notify` waits for the gateway's answer, passed explicitly so
 # the send timeout below can be derived from it.
 NOTIFY_WAIT_SECONDS = 60
@@ -230,6 +238,24 @@ def _on_event_loop() -> bool:
     except RuntimeError:
         return False
     return True
+
+
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose cards the stand-in lays out (kanban_notifier.CHAT_UX_PLATFORMS).
+
+    A stand-in exists only where the gateway serves the platform, so a Google
+    Chat one is always under ``spec.mode: next``, where the gateway renders the
+    message. Read when a send runs, as the notifier module is elsewhere; an
+    image without it lays out Slack's alone, as before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return tuple(kanban_notifier.CHAT_UX_PLATFORMS)
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return (SLACK_PLATFORM,)
 
 
 def routed_platform() -> str:
@@ -598,7 +624,7 @@ def _folds_into_row(conn: Any, sub: dict) -> bool:
         except ImportError:  # Unit tests import the patch modules flat.
             import kanban_notifier
             import kanban_progress_lines
-        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+        if not kanban_notifier.chat_ux_on(sub.get("platform")):
             return False
         params = (
             sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
@@ -823,7 +849,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
 
         ``update`` names the message: a later send with the same key, in the
-        same conversation, edits it in place.
+        same conversation or home-channel thread, edits it in place.
         """
         extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
         return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
@@ -837,7 +863,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         meta = metadata or {}
         chat = meta.get(CHAT_METADATA_KEY)
         update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
-        if chat is None and self.platform.value == SLACK_PLATFORM:
+        if chat is None and self.platform.value in _chat_ux_platforms():
             chat = _failure_chat(content)
         argv, path = [], ""
         if isinstance(chat, dict) and str(content or "").strip():
@@ -906,6 +932,9 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"a2a notify: {exc}")
         if proc.returncode == NOTIFY_OUTCOME_UNKNOWN:
             logger.warning("chat.notify: no answer in time for %s; treating as sent", chat_id)
+            return SendResult(success=True)
+        if proc.returncode == NOTIFY_KEPT:
+            logger.warning("chat.notify: kept by the gateway for its digest (no home channel) for %s; treating as sent", chat_id)
             return SendResult(success=True)
         if proc.returncode == NOTIFY_ROUTE_UNAVAILABLE:
             self.mark_route_down()

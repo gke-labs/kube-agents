@@ -12,7 +12,7 @@
 #                         and reports the ones a person made outside git
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
-# run in the same pod. It is the same variable and the same three values
+# run in the same pod. It is the same variable and the same four values
 # credential_proxy.py's resolve_role() reads; this script decides which
 # processes to launch and that function decides which halves of the runtime to
 # serve. `broker` is the credential pod: Envoy and the credential runtime, which
@@ -22,7 +22,9 @@
 # the Hermes gateway on the same loopback. None of those is a credential path
 # the agent container can drive, which is the point of the split. `combined` is
 # the sidecar arrangement and stays the default so an image paired with an older
-# operator behaves as it did.
+# operator behaves as it did. `exec` is the exec tier's pod
+# (docs/designs/credential-broker-exec-tier.md): Envoy and the credential
+# runtime, as in `broker`, and no watcher or detector.
 #
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
@@ -59,7 +61,7 @@ readonly SIGNAL_EXIT_BASE=128
 # defaulted here. Two defaults that have to agree is a way for them not to.
 export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"
 case "${CREDENTIAL_PROXY_ROLE}" in
-  combined | broker | api-proxy) ;;
+  combined | broker | api-proxy | exec) ;;
   *)
     echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
     exit 1
@@ -105,6 +107,12 @@ readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 # the turn, so an event offered while the gateway boots would rest on the
 # daemon's retries, which give up after a bounded wait.
 readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
+
+# The address every listener in the baked Envoy config binds, which start_envoy
+# rebinds to the address the operator passes (0.0.0.0 in the broker Pod, so the
+# Pod IP answers). Named so the rewrite and the check that it reached every
+# listener read the same literal.
+readonly ENVOY_LOOPBACK_ADDRESS=127.0.0.1
 
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
@@ -396,22 +404,33 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # may spend up to 56s (50s drain plus lease release calls), leaving this drain
 # about 4s; resizing it is tracked in #3407. An older operator's `combined`
 # sidecar keeps the 30s default, which 15s fits. The standalone broker pod
-# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so only the
-# runtime drain below runs there. The poll is whole seconds: the drain is
-# bounded by the settle, not by how often it is checked.
+# (CREDENTIAL_PROXY_ROLE=broker) and the exec pod (exec) start no watcher or
+# detector, so only the runtime drain below runs there. The poll is whole
+# seconds: the drain is bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
-# The credential runtime's own drain budget. In the broker role the runtime
+# The credential runtime's own drain budget. In the combined role the runtime
 # leaves on SIGTERM (install_shutdown_handler in
 # agents/platform/scripts/credential_proxy.py): it refuses new Chat event pulls,
 # keeps the settle routes open for its 3s window so the gateway's acks land,
 # hands any unsettled Chat receipt back to Pub/Sub, and exits. Killing it and
 # returning, as terminate() once did, delivered the signal and not that
 # shutdown, because terminate() returning is PID 1 exiting. Ten seconds is the
-# window plus margin, inside the broker pod's 30s default grace with the Envoy
-# kill after it. In the api-proxy role the runtime installs no handler and
-# exits on the signal, so the wait there is one poll.
+# window plus margin, inside a 30s default grace with the Envoy kill after it.
+# In the api-proxy role the runtime installs no handler and exits on the
+# signal, so the wait there is one poll. The broker and exec roles drain longer
+# and wait BROKER_RUNTIME_DRAIN_SECONDS instead (below).
 readonly RUNTIME_DRAIN_SECONDS=10
+# The standalone broker pod's runtime, and an exec pod's, drains longer: it
+# refuses new requests and gives those in flight up to credential_proxy.py's own
+# SHUTDOWN_DRAIN_SECONDS (30s from the signal, the 3s settle inside it), then
+# ends the commands still running, waits its SHUTDOWN_END_WAIT_SECONDS (5s) for
+# their answers, and hands the Chat receipts back
+# (SHUTDOWN_NACK_TIMEOUT_SECONDS, 2s, per relay; two relays). Forty seconds
+# holds those 39s and one poll (tests/test_credential_proxy_drain_budget.py),
+# inside the 45s terminationGracePeriodSeconds the operator gives the broker pod
+# (credentialProxyTerminationGraceSeconds), Envoy's kill after it.
+readonly BROKER_RUNTIME_DRAIN_SECONDS=40
 
 # Where the watcher keeps its dedup snapshots. Without them the cache starts
 # empty on every restart, and an empty cache is not a neutral state: the
@@ -520,8 +539,8 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
 normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 
 # The settle period: how long a failure in the settle family (the crash-loop
-# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
-# last) has to have lasted, by the
+# family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
+# reasons kubelet re-emits while they last) has to have lasted, by the
 # event's own first and last sighting, before the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on
@@ -537,8 +556,8 @@ normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
 # quiet: the watcher sends the Session KV server one k8s-event-followup inject
 # for it, which lands in the alert's thread saying the object has emitted
 # nothing since, so a card read hours later says what was true when. Silence,
-# not recovery: the watcher reads events only and reads no object back, and a
-# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# not recovery: the watcher reads events, and of a Pod only its owner, never
+# its state, and a deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
 # ceiling with margin, so a crash loop still going is never reported quiet
 # between two of its back-offs. Set to 0 to send none.
 readonly WATCHER_QUIET_AFTER_DEFAULT=15m
@@ -559,6 +578,12 @@ normalize_duration WATCHER_QUIET_AFTER "${WATCHER_QUIET_AFTER_DEFAULT}"
 readonly WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT=true
 WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD:-${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}}"
 normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}"
+
+# Alert-exclude rules: a JSON list, passed to the watcher as it is. Events a
+# rule matches open no incident, while their clusters stay in scope for reads.
+# Not normalised here: the watcher parses the list, and a malformed one is
+# logged as an ALERT and ignored there, so it never stops the watcher.
+WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
@@ -656,10 +681,11 @@ wait_for_exit() {
 # SIGTERM the credential runtime alone and wait for it. Not drain_supervised:
 # that sweeps the pid's children first, and the runtime's children are the
 # brokered commands in flight (kubectl, git, gh, gcloud, each in its own
-# session), which the runtime keeps its exec route open for during its settle
-# window so they can finish. A sweep would end them at the first instant of
-# the stop. One still running when the runtime exits dies with the pod, as it
-# did before.
+# session), which the runtime lets finish: in the broker and exec roles it
+# drains them for up to SHUTDOWN_DRAIN_SECONDS and ends the rest itself, with an
+# answer; in the other roles its exec route stays open for the settle window,
+# and one still running when the runtime exits dies with the pod. A sweep would
+# end them at the first instant of the stop.
 drain_runtime() {
   local budget="$1"
   local pid="$2"
@@ -679,7 +705,11 @@ terminate() {
   [[ "${#supervisors[@]}" -eq 0 ]] || drain_supervised "${SHUTDOWN_DRAIN_SECONDS}" "${supervisors[@]}"
 
   # Drained, not just signalled: see RUNTIME_DRAIN_SECONDS and drain_runtime.
-  [[ -z "${runtime_pid}" ]] || drain_runtime "${RUNTIME_DRAIN_SECONDS}" "${runtime_pid}"
+  local runtime_budget="${RUNTIME_DRAIN_SECONDS}"
+  case "${CREDENTIAL_PROXY_ROLE}" in
+    broker | exec) runtime_budget="${BROKER_RUNTIME_DRAIN_SECONDS}" ;;
+  esac
+  [[ -z "${runtime_pid}" ]] || drain_runtime "${runtime_budget}" "${runtime_pid}"
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM
@@ -739,12 +769,39 @@ start_credential_runtime() {
   runtime_pid=$!
 }
 
+# How many times `address: <needle>` occurs in a file, counting occurrences
+# rather than lines so that two listeners written on one line count as two.
+count_listener_addresses() {
+  local file=$1 needle=$2
+  { grep -o -F "address: ${needle}" "${file}" || true; } | wc -l
+}
+
+# Render the baked Envoy config with every listener rebound from loopback to
+# the given address, into the given path, and refuse a render that left any
+# listener behind. The config carries two listeners, the credentialed one and
+# the readiness probe's; a render that moved one and not the other would start
+# an Envoy whose probe, or whose callers, reach a port bound to loopback in a
+# Pod nothing else can reach, which reads as a hang or as never Ready. So the
+# check is a count: as many listener lines name the address afterwards as
+# named loopback before, and at least one did.
+render_envoy_config() {
+  local source=$1 rendered=$2 address=$3
+  local expected rewritten
+  sed "s|address: ${ENVOY_LOOPBACK_ADDRESS//./\\.}|address: ${address}|" "${source}" >"${rendered}"
+  expected=$(count_listener_addresses "${source}" "${ENVOY_LOOPBACK_ADDRESS}")
+  rewritten=$(count_listener_addresses "${rendered}" "${address}")
+  if [[ "${expected}" -eq 0 || "${rewritten}" -ne "${expected}" ]]; then
+    echo "start-services: rewrote ${rewritten} of ${expected} Envoy listener addresses from ${ENVOY_LOOPBACK_ADDRESS} to ${address}; refusing to start Envoy with a listener still bound to loopback" >&2
+    return 1
+  fi
+}
+
 start_envoy() {
   # The baked config binds 127.0.0.1, which is the access control for as long as
   # the broker is a sidecar in the agent's Pod. When the operator puts the broker
-  # in a Pod of its own the listener has to accept the Pod IP, and the config is
-  # baked into the image rather than rendered by the operator -- so the one line
-  # that has to differ is substituted here rather than by shipping two configs
+  # in a Pod of its own the listeners have to accept the Pod IP, and the config
+  # is baked into the image rather than rendered by the operator -- so the lines
+  # that have to differ are substituted here rather than by shipping two configs
   # that would drift. The value is checked against a character class first: it
   # reaches sed, and sed would happily accept a replacement carrying its own
   # delimiter or newline.
@@ -755,11 +812,7 @@ start_envoy() {
       exit 1
     fi
     local rendered=/tmp/envoy-credential-proxy.yaml
-    sed "s|address: 127\.0\.0\.1|address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}|" \
-      "${envoy_config}" >"${rendered}"
-    # A substitution that silently matched nothing would leave the broker bound
-    # to loopback in a Pod nothing else can reach, which reads as a hang.
-    grep -q "address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}" "${rendered}"
+    render_envoy_config "${envoy_config}" "${rendered}" "${CREDENTIAL_PROXY_ENVOY_ADDRESS}" || exit 1
     envoy_config="${rendered}"
   fi
   /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &
@@ -906,7 +959,8 @@ start_event_watcher() {
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
         --settle="${WATCHER_SETTLE}" \
         --quiet-after="${WATCHER_QUIET_AFTER}" \
-        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
+        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" \
+        --alert-exclude="${WATCHER_ALERT_EXCLUDE}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
@@ -1159,9 +1213,10 @@ start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
-if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "exec" ]]; then
   # The same guard as the watcher, and for the same reason: both post to the
-  # Session KV server on this pod's loopback, which the broker pod does not run.
+  # Session KV server on this pod's loopback, which the broker and exec pods do
+  # not run.
   start_event_watcher
   start_drift_detector
 fi

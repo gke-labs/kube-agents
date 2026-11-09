@@ -104,12 +104,88 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed or whose inputs could not decide it on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                                                                                              |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
+| `clusters[].kcc_unready`, `.kcc_unread`    | **read**         | Config Connector on that cluster: `kcc_unready` lists the objects it does not apply, `kcc_unread` says why the read gave no answer (unknown, never healthy), and `kcc_kinds_read` names the kinds a partial read listed. `cluster_status` (read) skips a cluster that is not running; `config_connector_addon` (carried) orders the reads. The paragraph below the table has the rules.                                                                                                    |
 | `clusters[].candidates[]` route fields     | **read**         | `declaration`, `release_declaration`, `namespace_directory` and `reconciler`, each optional. `finish` reads them for the route notes on a `manual` remediation (the issue-ledger design, §6). An absent field is no claim.                                                                                                                                                                                                                                                                 |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the run's `started_at`, which the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                |
-| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. The other two are reserved for a run-over-run comparison; `finish` does not read them today.                                                                                                                                                                                                        |
+| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. `version` is reserved; `checks_revision` is in the precheck's digest (§3.7), so a new collector build is a changed fleet, and `finish` itself does not read either.                                                                                                                                 |
 | `clusters[].autopilot`, `.project`, …      | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap. `single_compute_class` on `candidates[]` is carried here too: fleet fact resolved during enumeration, for SOP §3.24 to copy rather than re-derive into targeted manifest remediation. |
 | `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                                                                                                                            |
+
+`kcc_unready` and `kcc_unread` come from `kcc_health.py`. `kcc_unready` lists the Config Connector
+objects on that cluster whose `Ready` condition is `False`; `kcc_unread` says why the read of that
+cluster gave no answer, which is unknown and never healthy. Each `kcc_unready` entry is `{kind,
+namespace, name, why}`, with `resource` (the object's `spec.resourceID`), `cluster` (a
+`ContainerNodePool`'s `clusterRef`), `location` (the object's `spec.location`) and `project` where
+they are known. `project` is the object's `cnrm.cloud.google.com/project-id` annotation. Without it,
+a kind with `spec.projectRef` takes the project from that reference, or records it as unknown with
+`project_ref`; any other kind takes the same annotation on its namespace, else the namespace's name
+(the issue-ledger design, §6, has the rule). The namespace counts only when the namespaces read
+succeeded and returned that namespace. An empty
+list means the cluster runs Config Connector and nothing there is unready. An object with no `Ready`
+condition yet is left out, and so is one whose reason is `Updating` or `Deleting`: Config Connector
+sets those while it still applies the object.
+
+The read is `kcc_health.read_objects`. Discovery (`kubectl api-resources -o wide`, which needs no
+RBAC grant) finds the Config Connector kinds: a group that ends in `.cnrm.cloud.google.com`, in the
+`gcp` category, with the `list` verb. Then each kind is listed with
+`kubectl get --raw /apis/<group>/<version>/<plural>?limit=500` (`kcc_health.KIND_PAGE_LIMIT`), one
+request per page, following `metadata.continue`, so no reply holds a whole large kind. The
+sandbox's kubectl (1.34 or later, pinned by `tests/test_sandbox_kubectl_pin.py`) keeps the
+kube-proxy's `/clusters/<id>` server path on these reads. Every
+`kubectl` call of the read takes one of `kcc_health.proxy_slots()` slots
+first: the broker's sweep width (`broker_admission.sweep_width`), so no more requests than the
+credential broker admits are in flight in the process across clusters. The compliance collector lists every kind, because
+`kcc-object-wedged` needs them all; on a large hub that read can end `kcc_unread`, as `kubectl get
+gcp -A` can. The drift, patch readiness and stockout collectors list only
+`kcc_health.CONTAINER_KINDS` (`ContainerCluster` and `ContainerNodePool`): their findings are on
+`Cluster/` and `NodePool/` objects, a note names only the finding's own object, and from the agent a
+list request through the proxy takes seconds, so the kinds of a whole install do not fit the time budget. Their
+entries name the kinds read (`kcc_kinds_read`), and when a `DependencyNotReady` message names an
+object of another kind, the note names it and says its state was not read. For these collectors a
+cluster that serves neither container kind gets neither key and is not a host: it holds no object
+their notes can name. A discovery that serves no wanted kind means no Config Connector there for
+that collector. A failed discovery, or a kind that does not list, makes the entry `kcc_unread`,
+unless the kind's CustomResourceDefinition went away after the discovery.
+
+The compliance collector writes `kcc_unready` on each cluster it reads that serves a Config
+Connector kind, and `kcc_unread` on each cluster whose read fails, also when the discovery fails,
+from the read its own `kcc-object-wedged` check makes
+([`compliance_audit_sop.md`](../../agents/platform/governance/compliance_audit_sop.md) §2.12), and
+takes the namespace annotations from its NetworkPolicy read. Its `kcc-object-wedged` record names
+`kubectl get gcp -A -o json`, a command a reader can run that returns the same objects, and carries
+no `output_sha256`, because no single command produced the parallel read's output. The drift, patch
+readiness and stockout collectors, whose fixes can edit a `ContainerCluster` or `ContainerNodePool`
+declaration, read each collected cluster once after their sweep, in a new worker pool of the sweep's
+size, but only with `--config-connector` or while an audit run of their stream is in flight (the
+in-flight note that `audit_report.py start` writes exists and is inside its TTL;
+`kcc_health.read_reason`). The SOP command passes the flag, so the flag forces the read, and the
+note makes the read independent of the model copying the flag. A chat fleet question with no run in
+flight does not read. The top-level `config_connector_read` field records why the read ran: `flag`,
+`in-flight`, or `false`. All three mark a cluster whose `clusters list` record shows the Config Connector
+add-on enabled with `config_connector_addon`, and those clusters are read first. Drift and patch
+readiness fetch credentials for the read; stockout uses the kubeconfig its sweep fetched. When an
+unready object has no project annotation, one `kubectl get namespaces` on that cluster gives the
+namespace annotations; when it fails, the project stays unknown. These reads end
+`kcc_health.RUN_DEADLINE_S` (540 s) after the collector starts, so the manifest prints inside the
+600 s terminal call; an entry whose read cannot start in time gets `kcc_unread`.
+
+Some entries are not read and get neither key: an entry with no project or no location, a
+`project/<id>` entry at location `global`, and an entry whose `cluster_status` is not `RUNNING` or
+`RECONCILING`. The drift and patch readiness collectors record `cluster_status` on every collected
+entry, because drift marks every listed cluster `collected` and patch readiness removes its own
+status field; the stockout and compliance collectors record it on the entries of clusters that are
+not running. An entry with no kubeconfig file gets `kcc_unread`. On a `collected` cluster entry
+that is read, neither key means that the cluster's discovery serves none of the kinds this
+collector reads: for compliance, no Config Connector kind in the `gcp` category; for drift, patch
+readiness and stockout, neither container kind.
+
+`finish` adds a paragraph to any fix whose finding's own object is not ready, and states the stall
+on a merged fix that still reproduces. The possible Config Connector hosts are the entries with
+either key and, when any entry has one, each cluster entry the collector never read or a project
+whose cluster list failed, but not a cluster that is not running. The rules for the hosts and for a
+certain match are in the issue-ledger design
+([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) §6).
 
 Rules for a collector: every enumerated target appears with an `outcome`; a gate failure (zero-byte
 or truncated read) is `outcome: "gate-failed"`, never a shorter candidate list; a candidate is
@@ -140,6 +216,9 @@ Registry repository, and stockout's reservation and quota — which reads `<Kind
 `started_at` is a validation error, exit 2) and applies the following before
 anything is rendered or published. Every rule is scoped to what the manifest covers: a target the
 manifest never enumerated is governed by the ledger design's ordinary roster rules and nothing here.
+
+The `kcc_unready` and `kcc_unread` keys give the Config Connector paragraph, which the issue-ledger
+design §6 ([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md)) describes.
 
 ### 3.1 Cross-check — `cross_check_manifest`
 
@@ -456,7 +535,121 @@ no sweep. Every id on the line, `unpublished_candidates[].id` included, is the l
 (`published_id`: derived, then clipped at `MAX_FINDING_ID`).
 
 They are absent, not empty, on a run without the flag, so the line a stream without a collector
-prints is unchanged.
+prints is unchanged. A run that `precheck` closed (§3.7) carries one more, `precheck: "unchanged"`;
+a `finish` a worker ran never does.
+
+### 3.7 The precheck — `manifest_delta`, `precheck`
+
+A scheduled run of a stream in `COLLECTOR_AUDITS` ran its collector and then had the model read the
+whole SOP, copy the manifest into a findings document and call `finish`, before anything told it the
+fleet had not changed since the previous scheduled run: a 250-turn session per stream per day whose
+answer was `[SILENT]`. `audit_report.py precheck --audit <id> --manifest-file <manifest>
+[--scheduled]` is the gate the governance SOPs run after the collector command and before the
+drafting by hand: every collector stream but `upgrade-retrospective`, whose recorded weeks move
+every run (`PRECHECK_STREAMS` in the fleet-audit test suite pins the set).
+
+`manifest_delta.manifest_digest` is a SHA-256 over the manifest with its volatile keys removed:
+`started_at` and `finished_at` at the top, each command's `command`, `duration_s` and
+`output_sha256` (the `check` and `rc` pairs stay, because §3.1 reads them), and each candidate's
+`excerpt` and `impact`, which the collectors fill with ages (`AGE=12d`), log-window stamps and
+counts that move on a static fleet, and which §3.2 takes from the fresh manifest on a close. An
+`impact` the candidate marks `impact_authoritative` stays: on a check with more than one arm it
+says which arm fired (§3.2), and on `single-zone-nodepool`, `public-control-plane` and
+`upgrade-blocked` nothing else in the candidate does, so an object that moved arm would otherwise
+be closed with the previous arm's title and remediation under this arm's sentence.
+Everything else is in it — every cluster's `outcome`, candidates by identity, severity and their
+route and triage fields,
+`checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config
+Connector keys, and the top-level `checks_revision`, so a new collector build is a changed fleet — as a
+drop-list rather than a keep-list, so a key a collector adds later counts as a change until this
+module names it volatile. Cluster and command order do not count. `manifest_delta.should_run_llm_synthesis(audit_id,
+manifest, now, max_silent_age_seconds=7*86400)` reads
+`/opt/data/scratch/last_scheduled_digest_<audit-id>.json` and answers `(True, "first-run")` with no
+record, `(True, "findings-changed")` when the digest differs or the manifest can never close a run
+(a top-level `error`, a target whose outcome is neither `collected` nor `out-of-scope`, a non-empty
+`checks_unevaluated`), `(True, "periodic-refresh")` when `now - last_full_run_at` reaches the age,
+and `(False, "unchanged")` otherwise.
+
+`finish --scheduled` with a manifest writes that record after it published (`version`, `audit`,
+`digest`, `checks_revision`, `recorded_at`, `last_full_run_at`, and `envelope_finished_at`, the
+`finished_at` of the envelope it stored; a record whose `audit` is another stream's reads as no
+record). It writes none, and removes any, when this run stored no published scheduled envelope.
+`finish` hands the recorder the envelope the store kept, or None when the write failed; the
+recorder reads nothing back from the store, because after a failed write the store's newest
+envelope is an earlier run's, and a record naming it would pair this run's digest with that run's
+document, which the next close would republish over the ledger this run updated. A run diverted
+because its repository was unreachable (`is_diverted`) published nothing, and a digest of its
+manifest would make the next close republish an older document over a fleet that changed. A
+scheduled `finish` that waived the manifest removes it too. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
+`unchanged`, the line is `{"verdict": …, "closed": false, "reason": …}` and the SOP continues. On
+`unchanged` with the flag, when the newest stored envelope of the ledger this run publishes to
+(`stored_scheduled_document`: not diverted, `scheduled: true`, not `ledger_held_open`, this id
+scheme, the run the record's `envelope_finished_at` names, a `document` with a findings list) is
+there, and the open ledger issue
+carries no `/remediate` request still owed an answer (`pending_ledger_requests`: a writer's
+request, `all` included, that no acked or refused marker has answered, read with
+`unanswered_remediate_comments`; a conversation `read_comments` could not read whole, a repository
+`start` found unreachable (the diverted decision keeps its ledger in the store like a forge with no
+issue tracker, but its issue could not be read at all), or any other lookup failure, counts as
+pending, and a lost broker is raised as from any command), `precheck`
+writes that document to `findings_path` and runs `finish --scheduled` on it with this run's
+manifest. The request rule is there because the stored document answers no request: `finish`
+opens a fix only for a `manifest` remediation, so a request on a `manual` finding would otherwise
+wait until the fleet changed; an answered request holds nothing, since the markers are permanent
+and the comment is never edited, and a non-writer's is refused the same on either path. The
+document goes to `finish` with each remediation's note as the worker wrote it
+(`_strip_route_notes`, as after a carry): the route notes and the Config Connector paragraph are
+`finish`'s to write again from this run's manifest, and the note before a cut (`uncut_note`),
+which `validate_findings` drops, would otherwise pass for the worker's own on a finding whose
+excerpt moved and leave the store for good. It also goes without the previous run's
+`declared_intent_searched`, and with each `declared[]` entry's `repo`, `path` and `excerpt` taken
+from the declarations file this run's `start` filed (joined as `apply_declarations` joins):
+`fold_searched_record` unions by slug, so the previous run's `owner/name@sha` would otherwise
+stand in the ledger's search line beside `Declared at` links at this run's sha, and a note the
+owner edited or moved would render as the previous run read it. The stored
+document is the one `finish` left, after the passes that write on it, and the close runs those
+passes again on a workspace `start` has reset, so `stored_document_replay_problem` refuses what
+they could not reproduce, by the rule the carry already applies (`_remediation_may_carry`): a
+finding whose remediation names a file (the worker's `manifest` fix, or a generated one, which
+this run has not written, so the pass would degrade it or refuse the close) or carries a note
+`finish` wrote (`HARNESS_NOTE_MARKS`: a declined fix, which the pass would refuse again for want
+of the decline; a shield, which it would write twice); a document with `postures_withheld`; a
+`declared[]` entry whose declaration this run's `start` did not file again (`read_declarations`,
+joined on `_declaration_key`), which the close would otherwise keep silent after the owner removed
+or narrowed it; and, where the document owes the declared-intent step, a run record whose own
+`searched` does not cover every repository the step names, since the document's search record is
+the previous run's and would hide a repository this run's `start` could not read. Each is a full
+run, so a stream whose findings carry such a remediation does not take the saving until it is
+closed or declined by a person; a pre-mutation copy of the document in the envelope would widen
+the gate to them and is not made here. Nothing in §3.1–§3.6 or the ledger design changes:
+the cross-check holds the stored document to the fresh manifest, the delta and the scheduled
+baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finish`'s, plus
+`precheck: unchanged`, and the stored envelope carries the same key
+([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2); the record keeps its
+`last_full_run_at`, so a static fleet is still drafted in full once a week. A `finish` that
+rejects the stored document puts the findings file back as it was and reports `closed: false`
+with the rejection, and a close that dies on anything else puts it back and fails as any command
+does; on either the stream's in-flight note stays, since the run goes on and the SOP's own
+`finish` releases it, and only a close that published releases it. A newer on-demand run, a run
+that held the ledger open (its stored document is the empty set the held-open comment measured the
+ledger against, and a replay would hold the ledger again and post the comment again on every
+unchanged day, instead of the full run the comment asks for), a store with nothing, a document
+from another scheme, a record of another run, a pending request or a document the close cannot
+run `finish` on again are reasons to run in full, never errors. An
+on-demand run never passes the flag, so it is never closed from a stored document.
+
+What a close waives, by design: the SOP steps after the collector. On the stockout and cost
+streams some sub-conditions are checked by hand rather than by the collector, and a closed run
+republishes the previous document, whose `checks_run` attests them as that run ran them; a change
+only such a step would catch is seen on the weekly full run (`periodic-refresh`), and those two SOPs
+say so in their precheck step. Two shapes the digest does not see either, because the arm or the
+content lives in a candidate's `excerpt` alone: `public-control-plane` when the DNS endpoint opens
+or closes beside an open IP endpoint (the impact is the IP arm's either way), and
+`fleet-consistency-drift` when a split cluster's set of diverging facets, or a facet's cohort
+baseline, moves at the same severity. Both change how a cluster that already fails the check
+fails, not whether; a key the collector declares as a candidate's non-prose identity would close
+them and is not made here. The weekly refresh is the bound on everything the digest does not
+see.
 
 ## 4. The waiver — `--no-collector-manifest <reason>`
 

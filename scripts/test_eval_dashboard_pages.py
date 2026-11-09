@@ -904,6 +904,19 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_a_lane_run_that_records_where_it_lives_links_the_console_browser(self):
+        """gcs_base (the lanes' own bucket, which Deck cannot read) turns the
+        row's build link into the Console's bucket browser; a night's
+        log_url still wins, and a record without either keeps Spyglass."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600/"
+        lane_run = dict(data["runs"][0], build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED", gcs_base=base)
+        data["runs"].append(lane_run)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-moved", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/", page)
+
     def test_the_gitlab_lane_has_its_own_section_outside_the_gates_numbers(self):
         """A tier-gitlab run is listed under "GitLab lane" with its own
         Spyglass link and never among the gate's runs; without one the
@@ -932,6 +945,49 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("1 night on record: 1 green, 0 not", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/2097282860221206700"', page)
         self.assertIn("1 run on record: 0 green, 1 not", page, "the night is not among the lane's pull-request runs")
+
+    def test_the_self_managed_forges_share_a_section_each_row_naming_its_forge(self):
+        """The GHES and GitLab CE lanes (kube-agents#3682) share one
+        "Self-managed lanes" section beside the GitLab one, saying how each is
+        run until one has a run; their rows name their forge, so a red says
+        which broke. The GitLab lane's nights are listed per nightly job."""
+        app = dom_text(self.index)
+        self.assertIn("Self-managed lanes", app)
+        self.assertNotIn(">GHES lane<", app)
+        self.assertIn("No run on record", app)
+        for job in ("pull-kube-agents-smoke-test-ghes", "pull-kube-agents-smoke-test-gitlab-ce"):
+            self.assertIn(f"/test {job}", app)
+        self.assertIn("No scheduled run on record", app)
+        self.assertIn("once a week", app)
+        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
+        data = copy.deepcopy(self.data)
+        base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
+        data["runs"] += [
+            dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
+            dict(base, build_id="2097282860221206802", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"),
+            dict(base, build_id="2097282860221206803", tier="gitlab-ce", job="ci-kube-agents-eval-nightly-gitlab-ce-next", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/2097282860221206803"),
+            dict(base, build_id="2097282860221206801", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"),
+        ]
+        out = render_to(pathlib.Path(self.tmp.name) / "lanes", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800"', page)
+        self.assertNotIn('href="run.html#build=2097282860221206800"', page, "not the gate's")
+        # One table each for the pull-request and the scheduled runs, each row naming its forge.
+        self.assertIn("<th>Forge</th>", page)
+        self.assertIn("<td>GitLab CE</td>", page)
+        self.assertIn("<td>GHES</td>", page)
+        self.assertIn("Scheduled runs", page)
+        self.assertIn("GHES 1 run, 0 green; GitLab CE 1 run, 1 green", page)
+        # Each scheduled row names its job, so a retired nightly's night reads as its own.
+        self.assertIn("<th>Job</th>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
+        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        self.assertIn("1 night on record: 0 green, 1 not", page)
+        self.assertIn("No night of", page)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):
         """Ceiling reps sit under their own key in `reps` (#1874). The card's
@@ -1226,11 +1282,9 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Smoke gate is healthy", app)
         sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
         self.assertIn(sentence, app)
-        # The 🐢 message's own link lands on this headline, not on a
-        # synthetic past incident: a `since` at the note's GREEN start would.
-        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
-        self.assertEqual(fragment, "#view=agent")
-        linked = dom_text(out / "index.html", fragment=fragment)
+        # The bare agent view lands on this headline, not on a synthetic past
+        # incident: a `since` at the note's GREEN start would.
+        linked = dom_text(out / "index.html", fragment="#view=agent")
         self.assertIn("Smoke gate is healthy", linked)
         self.assertIn(sentence, linked)
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
@@ -1519,6 +1573,21 @@ class BrowserTest(unittest.TestCase):
         hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", fragment=f"#{hand_written}"))
+
+    def test_a_run_that_records_where_it_lives_links_its_build_and_transcripts_there(self):
+        """The run page's build link opens the Console's bucket browser and a
+        transcript link the object itself, for a run with gcs_base; the
+        Spyglass link under the old bucket is gone from that page."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/"
+        moved = [r for r in data["runs"] if r["build_id"] == "2097282860221206528"]
+        self.assertEqual(len(moved), 1)
+        moved[0]["gcs_base"] = base
+        out = render_to(pathlib.Path(self.tmp.name) / "moved", data, health=health_doc())
+        app = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
+        self.assertIn("storage.cloud.google.com/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")
@@ -1951,7 +2020,7 @@ class NotEvaluatedVerdictTest(unittest.TestCase):
 
 # --- the Scenarios page -----------------------------------------------------
 
-SCENARIO_KEY = {"setup_id": "claude-opus-5-5-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
+SCENARIO_KEY = {"setup_id": "other-model-kubeagents-mcp", "scoring_version": "v1", "judge_model": "gemini-3.1-pro-preview", "fleet": 1, "verifiers": 1, "mode": "next"}
 SCENARIO_OLD_KEY = dict(SCENARIO_KEY, setup_id="gemini-3-1-pro-preview-kubeagents-mcp", mode=None)
 SCENARIO_LEAD_IN = "critical requirements:\n- The reply names the cluster.\n  It cites a live read.\n- It says nothing else.\n"
 # The window's clock in the unit tests: records on Sep 1-10 at 05:00Z, the
@@ -2206,7 +2275,7 @@ class ScenariosPageTest(unittest.TestCase):
         app = dom_text(self.page, fragment="#view=scenarios")
         self.assertIn("<h1>What kube-agents can do</h1>", app)
         self.assertNotIn("How reliable is each test?", app)
-        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability">How reliable is each test</a><a href="cases.html#view=scenarios" class="on">What kube-agents can do</a></nav><div class="sec head"><h1>What kube-agents can do</h1>', app)
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability">How reliable is each test</a><a href="cases.html#view=scenarios" class="on">What kube-agents can do</a><a href="cases.html#view=domains">Domain coverage</a></nav><div class="sec head"><h1>What kube-agents can do</h1>', app)
         self.assertIn("<li><b>Proven</b>: 90% or better over the scenario's repetitions in the last 7 days at the current build, at least 6 of them. 90% is the same bar that lets a scenario guard every pull request.</li>", app)
         self.assertIn("<li><b>Proving</b>: fewer than 6 repetitions at the current build in the window, or 70% to 90% over them.", app)
         self.assertIn("3 scenarios in 2 domains · <b>1</b> proven · <b>1</b> proving · <b>1</b> in development.", app)
@@ -2247,7 +2316,7 @@ class ScenariosPageTest(unittest.TestCase):
     def test_view_switch_domain_filter_and_empty_checkout(self):
         table = dom_text(self.page)
         self.assertIn("<h1>How reliable is each test?</h1>", table, "the table is the page's default view")
-        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability" class="on">How reliable is each test</a><a href="cases.html#view=scenarios">What kube-agents can do</a></nav><div class="sec head"><h1>How reliable is each test?</h1>', table)
+        self.assertIn('<nav class="subnav"><a href="cases.html#view=reliability" class="on">How reliable is each test</a><a href="cases.html#view=scenarios">What kube-agents can do</a><a href="cases.html#view=domains">Domain coverage</a></nav><div class="sec head"><h1>How reliable is each test?</h1>', table)
         self.assertNotIn('<details class="card"', table)
         self.assertIn("<h1>How reliable is each test?</h1>", dom_text(self.page, fragment="#view=nonesuch"), "an unknown view is the table")
         titled = dom_html(self.page, fragment="#view=scenarios")
@@ -2283,6 +2352,76 @@ class ScenariosPageTest(unittest.TestCase):
         index = dom_text(self.out / "index.html")
         self.assertIn('What kube-agents can do: <a href="cases.html#view=scenarios">scenarios</a>', index)
         self.assertNotIn('class="scn"', index)
+
+
+def scorecard_doc():
+    """understudies.py's scorecard: a covered domain with a ready understudy,
+    an uncovered one past its exception with none ready, and one whose
+    store and issues were not read."""
+    def study(case, passed, graded, state, held_out=False):
+        return {"case": case, "passed": passed, "graded": graded, "nights": 7, "rate": passed / graded, "meets_bar": passed / graded >= 0.9 and graded >= 20,
+                "held_out": held_out, "store": {"state": state, "runs": graded, "passes": passed}}
+    return {"schema_version": 1, "generated_at": "2026-09-08T14:00:00Z", "bar": {"rate": 0.9, "min_runs": 20, "nights": 14},
+            "store_read": True, "nightly_red_read": True, "domains": [
+                {"slug": "cost", "name": "Cost", "owner": "alice", "backup": "bob", "seats": ["proven-case"], "uncovered_since": None, "days_uncovered": None,
+                 "allowlist_issue": None, "held_out": None, "expired_days": None, "nightly_red": {"open": 2, "oldest_days": 5},
+                 "understudies": [study("proving-case", 21, 21, "would-admit")], "candidates": 1, "understudy_ready": True},
+                {"slug": "reliability", "name": "Reliability", "owner": "<b>carol</b>", "backup": None, "seats": [], "uncovered_since": "2026-08-30", "days_uncovered": 9,
+                 "allowlist_issue": 3120, "held_out": "demoted-case", "expired_days": 2, "nightly_red": {"open": 0, "oldest_days": None},
+                 "understudies": [study("demoted-case", 18, 21, "collecting", held_out=True), study("historical-case", 3, 3, "none")], "candidates": 2, "understudy_ready": False},
+                {"slug": "upgrades", "name": "Upgrades", "owner": None, "backup": None, "seats": [], "uncovered_since": None, "days_uncovered": None,
+                 "allowlist_issue": None, "held_out": None, "expired_days": None, "nightly_red": None, "understudies": [], "candidates": 0, "understudy_ready": None},
+            ]}
+
+
+@unittest.skipUnless(chrome(), "headless Chrome not found")
+class DomainsPageTest(unittest.TestCase):
+    """The Cases page's domain view (#3968 6d) from understudies.py's scorecard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(cls.tmp.name)
+        scenario_checkout(root)
+        (root / "scorecard.json").write_text(json.dumps(scorecard_doc()))
+        with unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
+            cls.out = render_to(root, scenario_data(), health=health_doc("GREEN"), extra_args=["--scorecard", str(root / "scorecard.json")])
+            cls.bare = render_to(root / "bare", scenario_data(), health=health_doc("GREEN"), extra_args=["--repo-root", str(root)])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_brief_carries_the_scorecard_only_when_given(self):
+        self.assertEqual(json.loads((self.out / "brief.json").read_text())["scorecard"], scorecard_doc())
+        self.assertIsNone(json.loads((self.bare / "brief.json").read_text())["scorecard"])
+
+    def test_one_row_per_domain(self):
+        app = dom_text(self.out / "cases.html", fragment="#view=domains")
+        self.assertIn('<a href="cases.html#view=domains" class="on">Domain coverage</a></nav><div class="sec head"><h1>Domain coverage</h1>', app)
+        self.assertIn("<b>1</b> of 3 domains have a presubmit seat · <b>1</b> have an understudy ready.", app)
+        self.assertIn('<tr><td class="nm">cost</td><td>@alice <span class="mut">backup @bob</span></td><td><span class="pill p-pass">yes</span> <span class="mut"><a href="cases.html#proven-case">proven-case</a></span></td><td class="num">—</td><td class="num">2 <span class="mut">oldest 5 days</span></td><td><span class="pill p-pass">yes</span></td><td><div><a href="cases.html#proving-case">proving-case</a> <span class="mut hint"', app)
+        self.assertIn(">21/21 over 7 nights · store would-admit, 21/21</span></div>", app)
+        self.assertIn('<td class="num">9 days · <a href="https://github.com/gke-labs/kube-agents/issues/3120">#3120</a> <span class="pill p-fail">exception expired 2 days ago</span></td><td class="num">0</td><td><span class="pill p-partial">no</span></td>', app)
+        self.assertIn("held out: demoted-case", app)
+        self.assertIn(">3/3 over 7 nights · no store record at the current key</span></div>", app, "a read store with no record at the key says so in words")
+        # Hover notes: marked as such, and inside a table the stylesheet's tooltip rule reaches.
+        self.assertIn('<span class="mut hint" data-tip="nightly record over the last 14 nights; the bar is 90% over at least 20 graded runs, met">21/21 over 7 nights', app)
+        self.assertIn('<span class="mut hint" data-tip="still runs on the presubmit as a held-out seat', app)
+        self.assertIn('<table class="rel domains">', app)
+        css = render.PAGE_TEMPLATE.read_text()
+        self.assertIn("table.domains [data-tip]:hover::after", css)
+        self.assertIn("table.rel.domains { overflow:visible; }", css, "the table's rounded clip would cut a note off")
+        self.assertIn("@&lt;b&gt;carol&lt;/b&gt;", app, "an owner is escaped")
+        self.assertIn('<td class="nm">upgrades</td><td><span class="mut">none on record</span></td>', app)
+        self.assertIn('<td class="num"><span class="mut">start not recorded</span></td><td class="num"><span class="mut">not read</span></td><td><span class="mut">store not read</span></td><td><span class="mut">none on the nightly matrix</span></td>', app)
+        self.assertIn("<title>kube-agents · domain coverage</title>", dom_html(self.out / "cases.html", fragment="#view=domains"))
+
+    def test_without_a_scorecard_the_view_says_so(self):
+        app = dom_text(self.bare / "cases.html", fragment="#view=domains")
+        self.assertIn("<h1>Domain coverage</h1>", app)
+        self.assertIn("The scorecard was not computed for this refresh", app)
+        self.assertNotIn("<table", app.split("<h1>Domain coverage</h1>")[1].split('<div class="foot">')[0])
 
 
 if __name__ == "__main__":

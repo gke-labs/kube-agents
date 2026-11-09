@@ -10,6 +10,10 @@
 #   - templates/a2a-gateway-pod-admission-policy.yaml is config/admission/a2a-gateway-pod-policy.yaml,
 #     verbatim, wrapped in the kube-agents.a2aGatewayPodPolicyEnabled helper, which the operator's
 #     A2A_GATEWAY_POD_POLICY env is set from too.
+#   - templates/web-console-cr-admission-policy.yaml is config/admission/web-console-cr-policy.yaml,
+#     verbatim, wrapped in the kube-agents.webConsoleCRPolicyEnabled helper.
+#   - templates/a2a-dispatcher-job-admission-policy.yaml is config/admission/a2a-dispatcher-job-policy.yaml,
+#     likewise, under kube-agents.a2aDispatcherJobPolicyEnabled and A2A_DISPATCHER_JOB_POLICY.
 #   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
 #     the cert-manager objects), so it is compared rather than rewritten:
 #     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
@@ -17,9 +21,10 @@
 # And one derived file whose source is NOT under config/:
 #   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
 #     renders, which the chart's quota preflight cannot compute for itself. It is summed
-#     from the operator's golden manifest for the default example CR, not from config/ and
-#     not from a live render, so the golden is what you edit: change the operator, re-bless
-#     the golden, then sync. Syncing before re-blessing regenerates the old numbers.
+#     from the operator's golden manifests for the default example CR (platformagent.yaml,
+#     and platformagent-next.yaml for what spec.mode: next adds), not from config/ and
+#     not from a live render, so the goldens are what you edit: change the operator, re-bless
+#     the goldens, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -32,6 +37,10 @@ VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
 readonly GATEWAY_POD_VAP_SRC=k8s-operator/config/admission/a2a-gateway-pod-policy.yaml
 readonly GATEWAY_POD_VAP_TPL=charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_SRC=k8s-operator/config/admission/web-console-cr-policy.yaml
+readonly WEB_CONSOLE_CR_VAP_TPL=charts/kube-agents/templates/web-console-cr-admission-policy.yaml
+readonly DISPATCHER_JOB_VAP_SRC=k8s-operator/config/admission/a2a-dispatcher-job-policy.yaml
+readonly DISPATCHER_JOB_VAP_TPL=charts/kube-agents/templates/a2a-dispatcher-job-admission-policy.yaml
 readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
 readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
 readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
@@ -162,6 +171,51 @@ else
   mv "$tmp" "$GATEWAY_POD_VAP_TPL"
 fi
 
+# The web console's PlatformAgent policy: the same shape, under its own helper, which
+# also holds it to the installs where the console's ServiceAccount and its Role on the
+# CR render. Verbatim: the policy selects the console by its name's suffix, so there is
+# nothing release-scoped to substitute.
+[[ -f "$WEB_CONSOLE_CR_VAP_SRC" ]] || fail "admission policy source missing: $WEB_CONSOLE_CR_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.webConsoleCRPolicyEnabled" . }}'
+  echo "# GENERATED from $WEB_CONSOLE_CR_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.webConsoleCRPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30, with the web console and its'
+  echo '# environment page on.'
+  cat "$WEB_CONSOLE_CR_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$WEB_CONSOLE_CR_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $WEB_CONSOLE_CR_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$WEB_CONSOLE_CR_VAP_TPL"
+fi
+
+# The dispatcher's Job policy: the gateway's shape, under its own helper, which the
+# operator's A2A_DISPATCHER_JOB_POLICY is rendered from (the operator runs Job mode only
+# under it).
+[[ -f "$DISPATCHER_JOB_VAP_SRC" ]] || fail "admission policy source missing: $DISPATCHER_JOB_VAP_SRC"
+tmp=$(mktemp)
+{
+  echo '{{- if include "kube-agents.a2aDispatcherJobPolicyEnabled" . }}'
+  echo "# GENERATED from $DISPATCHER_JOB_VAP_SRC — do not edit by hand; run \`make chart-sync\`."
+  echo '# Rendered where kube-agents.a2aDispatcherJobPolicyEnabled (_helpers.tpl) holds: the'
+  echo '# admissionPolicy values gate, on Kubernetes >= 1.30. The operator'"'"'s A2A_DISPATCHER_JOB_POLICY'
+  echo '# is set from the same helper.'
+  cat "$DISPATCHER_JOB_VAP_SRC"
+  echo '{{- end }}'
+} >"$tmp"
+
+if $check; then
+  diff -u "$DISPATCHER_JOB_VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $DISPATCHER_JOB_VAP_SRC"; }
+  rm -f "$tmp"
+else
+  mv "$tmp" "$DISPATCHER_JOB_VAP_TPL"
+fi
+
 # Webhooks: compared, not generated. The failure message is deliberately not fail(),
 # because `make chart-sync` does not touch this template; the fix is a hand edit.
 # The script exits 1 on drift and 2 when it could not run (no helm, no PyYAML,
@@ -183,8 +237,8 @@ if $check; then
   footprint_rc=0
   python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
   if [[ $footprint_rc -eq 1 ]]; then
-    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
-    echo "       $FOOTPRINT_SRC is a golden, so re-bless it before syncing:" >&2
+    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC or its next-mode sibling (see the diff above)." >&2
+    echo "       Both are goldens, so re-bless them before syncing:" >&2
     echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
     echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
     echo "       unrelated -update flag of its own that exits 0 and leaves this golden stale." >&2
@@ -192,7 +246,7 @@ if $check; then
   elif [[ $footprint_rc -ne 0 ]]; then
     exit "$footprint_rc"
   fi
-  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC."
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC and its next-mode sibling."
 else
   echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
   echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."

@@ -901,6 +901,16 @@ func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (
 	return ts, thread, nil
 }
 
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the message ts on channel's thread, edited in place,
+// its question tracked under the thread's key as PostNotifyMessage tracks it.
+func (s *SlackAdapter) EditNotifyMessage(channel, thread, messageID string, m OutMessage) error {
+	if !slackIsHomeChannelID(channel) {
+		return fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	return s.EditMessage(slackConversationID(slackChannelTypeChannel, channel, thread), messageID, m)
+}
+
 // slackIsHomeChannelID reports a public ("C...") or private ("G...")
 // channel id: a prefix letter and upper-case letters or digits after it. A
 // DM ("D...") is not a home channel.
@@ -1587,6 +1597,9 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 		if threadTS == "" {
 			threadTS = m.TimeStamp
 		}
+		if s.answerSetHome(author, slackConversationID(m.ChannelType, m.Channel, threadTS), text) {
+			return InboundMessage{}, false
+		}
 		return InboundMessage{
 			Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 			Kind:         "dm",
@@ -1640,6 +1653,9 @@ func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageE
 	// thread on every reply, so a restart or an expired mark changes nothing.
 	botRooted := isReply && parentUserID != "" && parentUserID == s.botUserID
 	if isReply && !mentioned && !botRooted && !s.isSessionThread(ctx, m.Channel, threadTS) {
+		return InboundMessage{}, false
+	}
+	if s.answerSetHome(author, slackConversationID(m.ChannelType, m.Channel, threadTS), text) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{

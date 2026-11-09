@@ -26,8 +26,8 @@ the JSON hand-off -- so those are what this module pins. In particular:
    admitted case that lost every repetition to infrastructure, or every case
    lost -- and reds on a case result the loop never wrote: unaccounted work
    is not a pass, and it is not weather either.
-3. **The `Task <id> Result: [...]` line keeps its shape**, because people and
-   scripts grep build logs for it.
+3. **The `Task <id> Result: [...]` line keeps its shape**, because the dashboard
+   collector and people grep the grading artifact for it.
 4. **The environment carries every threshold**, since all of them are meant
    to be tuned against observed movement on main.
 5. **`record` is the only writer, and only on main.** It refuses with
@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-from kube_agents_bench import evidence_store, gate
+from kube_agents_bench import chat_shape, evidence_store, gate
 from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
@@ -287,6 +287,7 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
 REPORT_PREFIX = "  rep 1 report: "
 TIMING_PREFIX = "  rep 1 timing: "
 TOKENS_PREFIX = "  rep 1 tokens: "
+SHAPE_PREFIX = "  rep 1 shape: "
 
 
 def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
@@ -402,6 +403,7 @@ _API_TOKENS = {
     "front_door": {"input": 10, "cached": 100, "cache_write": 50, "reasoning": 0, "output": 7, "total": 167},
     "workers": {"input": 8, "total": 274986, "by_agent": {}, "unbilled": []},
 }
+_API_LINE = "input=18 output=1867 total=275153 cached=128562 cache_write=144706 reasoning=261"
 _INJECT_TOKENS = {
     "input": 60468, "cached": None, "cache_write": None, "reasoning": None, "output": 79,
     "total": 151969, "children": {"input": 91204, "output": 218, "total": 91422},
@@ -411,18 +413,28 @@ _INJECT_TOKENS = {
 @pytest.mark.parametrize(
     ("tokens", "expected"),
     [
-        (_API_TOKENS, TOKENS_PREFIX + "input=18 output=1867 total=275153"),
+        (_API_TOKENS, TOKENS_PREFIX + _API_LINE),
+        (
+            {key: value for key, value in _API_TOKENS.items() if key not in ("front_door", "workers")},
+            TOKENS_PREFIX + _API_LINE,
+        ),
+        # The front door's row was not read: `input` is the envelope's prompt
+        # total, and `cached` the workers' alone, so no split is printed.
+        (
+            {**_API_TOKENS, "front_door": {**_API_TOKENS["front_door"], "cached": None}},
+            TOKENS_PREFIX + "input=18 output=1867 total=275153",
+        ),
         (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=151969"),
         ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         (
             {**_API_TOKENS, "workers": {**_API_TOKENS["workers"], "unbilled": [{"session": "s1"}]}},
-            TOKENS_PREFIX + "input=18 output=1867 total=275153 partial=1",
+            TOKENS_PREFIX + _API_LINE + " partial=1",
         ),
         ({**_INJECT_TOKENS, "workers": None}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         ({"input": None, "output": 0, "total": 0}, TOKENS_PREFIX + "output=0 total=0"),
         ({"input": True, "output": 1.5, "total": 40}, TOKENS_PREFIX + "total=40"),
     ],
-    ids=["api", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
+    ids=["api", "api-no-workers", "api-front-door-unsplit", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
 )
 def test_the_tokens_line_follows_the_timing_line(kanban_task, make_run, tmp_path, capsys, tokens, expected):
     """The dashboard reads each repetition's token counts from `rep N
@@ -443,6 +455,54 @@ def test_no_tokens_line_when_the_record_has_no_count(kanban_task, make_run, tmp_
     run_case(kanban_task, [_tokened_run(make_run, tokens)], tmp_path / "case.json")
     printed = capsys.readouterr().out
     assert "  rep 1: " in printed and TOKENS_PREFIX not in printed
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        (
+            {"opens_on_verdict": False, "apology": True, "bot_messages": 3,
+             "words_before_answer": 7, "answer_words": 240},
+            SHAPE_PREFIX + "opens_on_verdict=0 apology=1 bot_messages=3 words_before_answer=7 answer_words=240",
+        ),
+        ({"answer_words": 24, "opens_on_verdict": True}, SHAPE_PREFIX + "opens_on_verdict=1 answer_words=24"),
+    ],
+    ids=["every-key", "keys-in-order-and-missing-left-out"],
+)
+def test_the_shape_line_follows_the_tokens_line(kanban_task, make_run, tmp_path, capsys, shape, expected):
+    """The dashboard reads each repetition's reply shape from `rep N shape:`,
+    a shape the collector's `rep N:` match skips. Reported, never graded."""
+    run = make_run("kanban_red_1")
+    (run / "shape.json").write_text(json.dumps(shape), encoding="utf-8")
+    run_case(kanban_task, [run], tmp_path / "case.json")
+    lines = capsys.readouterr().out.splitlines()
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
+    assert lines[graded + 2].startswith(TOKENS_PREFIX)
+    assert lines[graded + 3] == expected
+    assert lines[graded + 4].startswith(REPORT_PREFIX)
+
+
+def test_no_shape_line_without_a_shape(kanban_task, make_run, tmp_path, capsys):
+    run_case(kanban_task, [make_run("kanban_red_1")], tmp_path / "case.json")
+    printed = capsys.readouterr().out
+    assert "  rep 1: " in printed and SHAPE_PREFIX not in printed
+
+
+def test_the_eval_dashboard_reads_back_the_shape_line_this_prints(kanban_task, make_run, tmp_path, capsys, monkeypatch):
+    """The contract with scripts/eval_dashboard: what chat_shape measures,
+    bench-gate prints and the collector parses must round-trip, so a renamed
+    key or a changed flag spelling fails here instead of emptying the
+    Nightly page's column and the digest's reply-shape line."""
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    from eval_dashboard import collect, nightly
+
+    shape = chat_shape.measure("Let me check.\n**Two pods are OOMKilled.** Want me to raise the limit?")
+    run = make_run("kanban_red_1")
+    (run / "shape.json").write_text(json.dumps(shape), encoding="utf-8")
+    run_case(kanban_task, [run], tmp_path / "case.json")
+    (task,) = collect.parse_build_log(capsys.readouterr().out)["tasks"]
+    assert task["reps"][0]["shape"] == shape
+    assert nightly.shape_rollup(task["reps"])["opens_on_verdict"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1083,9 +1143,9 @@ def test_record_writes_a_today_key_without_a_mode(tmp_path):
 
 
 def test_record_refuses_to_run_on_the_today_lane(tmp_path, monkeypatch, capsys):
-    """The today lane's periodic grades an install rolled back from next over
-    the api transport: its key reads today, but today's window measures a
-    fresh today install. The shell keeps it out; this is the second guard."""
+    """A today-lane run on main, if one ran, would grade an install rolled
+    back from next over the api transport: its key would read today, but
+    today's window measures a fresh today install. The shell keeps it out; this is the second guard."""
     monkeypatch.setenv("EVAL_ROLLBACK_LANE", "1")
     store = store_with(tmp_path)
     assert run_record(store, case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])) == 2

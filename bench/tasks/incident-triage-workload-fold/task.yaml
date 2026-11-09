@@ -4,10 +4,11 @@
 #
 # The event watcher deduplicates on (object UID, reason), so each replica's
 # BackOff is a new incident to it and reaches the session daemon's inject
-# route on its own. With INCIDENT_WORKLOAD_DEDUP_SECONDS on (hack/ci-deploy.sh
-# sets it for the eval install), the daemon admits the first and records the
-# other two with `duplicate_of` pointing at it; without it each opens a triage
-# card, a chat alert and an alert-budget claim of its own.
+# route on its own. With INCIDENT_WORKLOAD_DEDUP_SECONDS on (on by default at
+# an hour; hack/ci-deploy.sh sets it to 150 s for the eval install so one
+# case's window does not reach the next repetition), the daemon admits the
+# first and records the other two with `duplicate_of` pointing at it; at 0
+# each opens a triage card, a chat alert and an alert-budget claim of its own.
 #
 # The stack is autoops-warning-event-triage's, at three replicas and under its
 # own namespace and workload name: two cases on one name share the daemon's
