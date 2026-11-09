@@ -674,7 +674,11 @@ minutes after the block; cards blocked before this job existed are covered on it
 `recompute_ready`, and gets no record. A
 **Kubernetes** condition names a pod or a deployment on a cluster and clears when the pod is
 `Ready` or the deployment `Available`, read with one `kubectl get -o json` through the shell
-sandbox on the per-cluster kubeconfig `stall-watch` keeps there. Record one on the pod:
+sandbox on the per-cluster kubeconfig `stall-watch` keeps there; the credentials are fetched by
+`stall-watch`'s rule, once a day per cluster (the stamps live in
+`profiles/platform/cron/kanban_block_recheck.json`) or when a read says the kubeconfig itself is
+the problem. The resource is stored as kubectl is given it (`deployment/web`; a plural or padded
+spelling is normalised, a second `/` or an empty name refused). Record one on the pod:
 
 ```bash
 PLATFORM_AGENT_HOME=/opt/data python3 /opt/data/scripts/kanban_block_recheck.py \

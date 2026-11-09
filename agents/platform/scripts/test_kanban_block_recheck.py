@@ -166,12 +166,20 @@ class RecordConditionTests(Board):
 
     def test_an_unknown_resource_kind_or_a_missing_field_is_refused(self):
         self.card("t_k", kind="needs_input", event="blocked")
-        with self.assertRaises(ValueError):
-            kbr.record_condition(self.conn, "t_k", {**K8S, "resource": "configmap/x"}, now=NOW)
+        for resource in ("configmap/x", "deployment", "pod/   ", "deployment/web/extra", "podssss/web", "/web", "pod/"):
+            with self.assertRaises(ValueError, msg=resource):
+                kbr.record_condition(self.conn, "t_k", {**K8S, "resource": resource}, now=NOW)
         with self.assertRaises(ValueError):
             kbr.record_condition(self.conn, "t_k", {k: v for k, v in K8S.items() if k != "namespace"}, now=NOW)
-        with self.assertRaises(ValueError):
-            kbr.record_condition(self.conn, "t_k", {**K8S, "resource": "deployment"}, now=NOW)
+
+    def test_the_resource_is_stored_as_the_kind_and_name_it_names(self):
+        """Validated after the strip, stored as validated: a padded or plural spelling
+        becomes the one kubectl is given."""
+        self.card("t_k", kind="needs_input", event="blocked")
+        for given, stored in ((" deployment/web ", "deployment/web"), ("deployments/web", "deployment/web"),
+                              ("Pods/web-1", "pod/web-1")):
+            rec = kbr.record_condition(self.conn, "t_k", {**K8S, "resource": given}, now=NOW)
+            self.assertEqual(json.loads(rec["condition"])["resource"], stored, given)
 
     def test_only_a_blocked_card_takes_a_condition(self):
         self.card("t_r", status="ready")
@@ -267,6 +275,44 @@ class RecheckTests(Board):
         self.assertIsNone(self.record("t_1"))
         self.assertEqual(len(lines), 1)
 
+    def test_a_person_s_retry_during_the_read_spends_no_automatic_retry(self):
+        """Retry writes `unblocked` and no new block event, so the block-event check
+        alone would let the job write a `retried` event on a card already gone."""
+        self.card("t_k", kind="needs_input", event="blocked")
+        kbr.record_condition(self.conn, "t_k", K8S, now=NOW - HOUR)
+
+        def kube(condition):
+            self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = 't_k'")
+            self.event("t_k", "unblocked", {}, NOW)
+            return deployment(True)
+
+        self.assertEqual(self.run_recheck(kube=kube), [])
+        self.assertEqual(self.unblocked, [])
+        self.assertEqual(self.events, [])
+        self.assertIsNone(self.record("t_k"))
+
+    def test_the_two_ends_are_not_said_about_a_card_that_moved_on(self):
+        self.card("t_l", kind="transient", event="blocked", at=NOW - 5 * HOUR, title="Limit")
+        self.event("t_l", kbr.EVENT_KIND, {"outcome": kbr.OUTCOME_RETRIED}, NOW - 4 * HOUR)
+        self.event("t_l", "gave_up", {"failures": 2}, NOW - 2 * HOUR)
+        self.card("t_e", kind="needs_input", event="blocked", title="Expiry")
+        kbr.record_condition(self.conn, "t_e", K8S, now=NOW - 3 * HOUR, expires_at=NOW - HOUR)
+        # A card ahead of them in the run whose slow read is when both leave
+        # `blocked` (a Drop, a Retry).
+        self.card("t_0", kind="needs_input", event="blocked", title="first")
+        kbr.record_condition(self.conn, "t_0", K8S, now=NOW - 9 * HOUR)
+
+        def kube(condition):
+            self.conn.execute("UPDATE tasks SET status = 'archived' WHERE id = 't_e'")
+            self.conn.execute("UPDATE tasks SET status = 'ready' WHERE id = 't_l'")
+            self.conn.commit()
+            return deployment(False)
+
+        self.assertEqual(self.run_recheck(kube=kube), [])
+        self.assertEqual(self.events, [])
+        self.assertIsNone(self.record("t_l"))
+        self.assertIsNone(self.record("t_e"))
+
     def test_the_two_ends_are_said_once(self):
         self.card("t_l", kind="transient", event="blocked", at=NOW - 5 * HOUR, title="Limit")
         self.event("t_l", kbr.EVENT_KIND, {"outcome": kbr.OUTCOME_RETRIED}, NOW - 4 * HOUR)
@@ -348,10 +394,12 @@ class RecheckTests(Board):
         self.assertEqual(len(self.events), 1)
 
     def test_the_sandbox_read_is_the_cluster_s_kubectl_get(self):
-        """The default ``kube``: one credential fetch and one ``kubectl get -o json``."""
-        runs = []
+        """The default ``kube``: one ``kubectl get -o json`` on stall-watch's per-cluster
+        kubeconfig; a credential fetch only when no stamp says it was fetched within
+        the day, and the stamp is written so the next check does not fetch again."""
+        runs, stamps = [], {}
 
-        class Stall:
+        class Stall(FakeStall):
             @staticmethod
             def fetch_credentials(project, cluster, location):
                 runs.append(("creds", project, cluster, location))
@@ -362,13 +410,37 @@ class RecheckTests(Board):
                 runs.append(("run", tuple(argv), kubeconfig))
                 return type("P", (), {"returncode": 0, "stdout": json.dumps(deployment(True)), "stderr": ""})()
 
-        self.assertEqual(kbr.kube_get(K8S, stall=Stall), deployment(True))
+        self.assertEqual(kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW), deployment(True))
         self.assertEqual(runs[0], ("creds", "p", "c", "us-central1"))
         self.assertEqual(runs[1], ("run", ("kubectl", "get", "deployment/web", "-n", "shop", "-o", "json"),
                                    "/home/hermes/.kubeconfigs/x.yaml"))
+        self.assertEqual(list(stamps), [kbr.cluster_key(K8S)])
+        kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW + HOUR)
+        self.assertEqual([r[0] for r in runs], ["creds", "run", "run"])
+        kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW + 2 * kbr.CREDENTIALS_REFRESH_SECONDS)
+        self.assertEqual([r[0] for r in runs], ["creds", "run", "run", "creds", "run"])
+
+    def test_a_read_the_kubeconfig_could_not_serve_fetches_once_and_retries(self):
+        runs, stamps = [], {kbr.cluster_key(K8S): kbr.stamp(NOW - HOUR)}
+
+        class Stall(FakeStall):
+            @staticmethod
+            def fetch_credentials(project, cluster, location):
+                runs.append("creds")
+                return "k"
+
+            @staticmethod
+            def run_sandbox(argv, *, timeout, kubeconfig=None, stdin=None):
+                runs.append("run")
+                if runs.count("creds") == 0:
+                    return type("P", (), {"returncode": 1, "stdout": "", "stderr": "credential proxy: kubeconfig stub missing"})()
+                return type("P", (), {"returncode": 0, "stdout": json.dumps(deployment(True)), "stderr": ""})()
+
+        self.assertEqual(kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW), deployment(True))
+        self.assertEqual(runs, ["run", "creds", "run"])
 
     def test_a_not_found_read_is_the_sentinel_and_another_failure_raises(self):
-        class Stall:
+        class Stall(FakeStall):
             code, err = 1, 'Error from server (NotFound): deployments.apps "web" not found'
 
             @staticmethod
@@ -379,10 +451,44 @@ class RecheckTests(Board):
             def run_sandbox(cls, argv, *, timeout, kubeconfig=None, stdin=None):
                 return type("P", (), {"returncode": cls.code, "stdout": "", "stderr": cls.err})()
 
-        self.assertIs(kbr.kube_get(K8S, stall=Stall), kbr.NOT_FOUND)
+        stamps = {kbr.cluster_key(K8S): kbr.stamp(NOW)}
+        self.assertIs(kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW), kbr.NOT_FOUND)
         Stall.err = "Unable to connect to the server: dial tcp: i/o timeout"
         with self.assertRaises(RuntimeError):
-            kbr.kube_get(K8S, stall=Stall)
+            kbr.kube_get(K8S, stall=Stall, stamps=stamps, now=NOW)
+
+    def test_the_stamps_file_round_trips_and_an_unreadable_one_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deep" / "stamps.json"
+            self.assertEqual(kbr.load_stamps(path), {})
+            kbr.save_stamps(path, {"p/l/c": kbr.stamp(NOW)})
+            self.assertEqual(kbr.load_stamps(path), {"p/l/c": kbr.stamp(NOW)})
+            path.write_text("not json", encoding="utf-8")
+            self.assertEqual(kbr.load_stamps(path), {})
+
+
+class FakeStall:
+    """The two stall_watch helpers the policy reads, as the real module spells them."""
+
+    CREDENTIALS_REFRESH_SECONDS = 24 * 3600
+    REFETCH_SIGNALS = ("credential proxy: kubeconfig",)
+
+    @staticmethod
+    def kubeconfig_path(project, cluster, location):
+        return "k"
+
+    @staticmethod
+    def credentials_current(record, now):
+        import datetime as _dt
+
+        if not record:
+            return False
+        age = _dt.datetime.fromisoformat(now) - _dt.datetime.fromisoformat(record)
+        return _dt.timedelta(0) <= age < _dt.timedelta(seconds=FakeStall.CREDENTIALS_REFRESH_SECONDS)
+
+    @staticmethod
+    def refetch_repairs(exc):
+        return any(signal in str(exc) for signal in FakeStall.REFETCH_SIGNALS)
 
 
 class MainTests(Board):

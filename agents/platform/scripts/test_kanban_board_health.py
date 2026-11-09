@@ -1197,16 +1197,43 @@ class BreakerParkedTests(unittest.TestCase):
         self.assertEqual([(tid, diag["data"]["age_hours"], entry["title"]) for tid, diag, entry in items],
                          [("t_g", 30.0, "Triage x")])
 
-    def test_a_fresh_trip_a_comment_or_an_unblock_since_leaves_it_out(self):
-        for since in ({"kind": "commented", "created_at": self.NOW - 3600},
-                      {"kind": "unblocked", "created_at": self.NOW - 3600}):
-            with tempfile.TemporaryDirectory() as tmp:
-                db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
-                                      {"task_id": "t_g", **since}])
-                self.assertEqual(self.parked(db), [], since)
+    def test_a_fresh_trip_or_an_unblock_since_leaves_it_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "unblocked", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
         with tempfile.TemporaryDirectory() as tmp:
             db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 3600}])
             self.assertEqual(self.parked(db), [])
+
+    def test_the_comment_the_harness_writes_after_the_trip_does_not_hide_it(self):
+        """A failed turn's charge and the budget hand-off both comment on the card
+        right after `gave_up`; the card is no less parked for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "commented", "payload": {"author": "platform"},
+                                   "created_at": self.NOW - 30 * 3600}])
+            self.assertEqual([tid for tid, _d, _e in self.parked(db)], ["t_g"])
+
+    def test_a_breaker_trip_after_a_question_reads_stopped_not_paused(self):
+        """`block_kind` survives an unblock, so the card's row keys off its newest
+        block event, a `gave_up`, the way the re-check job resolves it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "blocked", "payload": {"kind": "needs_input"}, "created_at": 1},
+                        {"task_id": "t_g", "kind": "unblocked", "created_at": 2},
+                        {"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2}, "created_at": 3}],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual(context["t_g"]["kind"], "gave_up")
+        tasks = kbh.stuck_tasks([("t_g", {"data": {"age_hours": 30}}, {})], context, now=self.NOW)
+        self.assertFalse(tasks[0]["person"])
 
     def test_the_report_adds_it_once_beside_the_engine_s_cards(self):
         with tempfile.TemporaryDirectory() as tmp:

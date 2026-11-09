@@ -23,7 +23,10 @@ condition kinds:
   implies (:data:`PREDICATE_BY_KIND`): a pod is ``Ready``, a deployment is
   ``Available``. Read with one ``kubectl get -o json`` through the shell
   sandbox, the route ``stall_watch.py`` uses, since the agent container carries
-  no kubectl. Recorded through :func:`record_condition`, or ``--watch`` on this
+  no kubectl; the credentials are fetched by ``stall_watch``'s rule, once a day
+  per cluster or when a read says the kubeconfig is the problem, with the
+  stamps in :data:`STAMPS_FILE_NAME` beside the digest's record. Recorded
+  through :func:`record_condition`, or ``--watch`` on this
   script's command line on the pod; letting the worker record it when it
   blocks is a tool-text change and a follow-up (#5260).
 
@@ -60,9 +63,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import gitops_workspace
@@ -100,10 +105,27 @@ SECONDS_PER_HOUR = 3600
 #: The object kinds a condition may name, and what "cleared" means for each.
 PREDICATE_BY_KIND = {"pod": "Ready", "deployment": "Available"}
 RESOURCE_SEPARATOR = "/"
+#: A kind may be spelled in the plural kubectl also accepts (``pods/web``).
+RESOURCE_PLURAL_SUFFIX = "s"
 K8S_FIELDS = ("project", "location", "cluster", "namespace", "resource")
 CONDITION_TRUE = "True"
 KUBECTL_TIMEOUT_SECONDS = 60
 KUBECTL_GET_ARGV = ("kubectl", "get")
+#: Credentials follow ``stall_watch``'s rule: the per-cluster kubeconfig it keeps
+#: in the sandbox is reused while this job's own stamp of the last fetch is
+#: younger than a day (``stall_watch.CREDENTIALS_REFRESH_SECONDS``, mirrored
+#: here), or until a read says the kubeconfig itself is the problem
+#: (``stall_watch.refetch_repairs``), after which one fetch and one retry. A
+#: ``get-credentials`` is a real gcloud run at the credential proxy every time
+#: and buys nothing after the first. The stamps live beside the digest's record.
+CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
+PROFILES_DIR = "profiles"
+PLATFORM_PROFILE = "platform"
+CRON_DIR = "cron"
+STAMPS_FILE_NAME = "kanban_block_recheck.json"
+STAMPS_TMP_SUFFIX = ".tmp"
+STAMPS_KEY = "credentials"
+CLUSTER_KEY_SEPARATOR = "/"
 #: What kubectl prints for an object that is not there; a read that says so
 #: is an answer (the condition holds), not a failure.
 NOT_FOUND_MARKER = "(NotFound)"
@@ -268,15 +290,26 @@ def derive_records(conn: sqlite3.Connection, *, now: int) -> list[str]:
     return recorded
 
 
-def resource_kind(resource: str) -> str:
-    """``deployment`` of ``deployment/web``; ValueError for a kind this job cannot judge."""
-    kind, sep, name = str(resource or "").partition(RESOURCE_SEPARATOR)
-    kind = kind.lower().rstrip("s") if kind.lower() not in PREDICATE_BY_KIND else kind.lower()
-    if not sep or not name or kind not in PREDICATE_BY_KIND:
+def normalise_resource(resource) -> str:
+    """``<kind>/<name>`` as kubectl is given it: the kind lower-case and singular,
+    the name as written. ValueError for a kind this job cannot judge, a missing
+    or padded name, or a second ``/``."""
+    text = str(resource or "").strip()
+    kind, sep, name = text.partition(RESOURCE_SEPARATOR)
+    kind = kind.lower()
+    if kind not in PREDICATE_BY_KIND and kind.endswith(RESOURCE_PLURAL_SUFFIX) and kind[:-1] in PREDICATE_BY_KIND:
+        kind = kind[:-1]
+    if (not sep or kind not in PREDICATE_BY_KIND or not name or name != name.strip()
+            or RESOURCE_SEPARATOR in name or any(ch.isspace() for ch in name)):
         raise ValueError(
             f"resource must be <kind>/<name> with kind one of {sorted(PREDICATE_BY_KIND)}, got {resource!r}"
         )
-    return kind
+    return f"{kind}{RESOURCE_SEPARATOR}{name}"
+
+
+def resource_kind(resource: str) -> str:
+    """``deployment`` of ``deployment/web``."""
+    return normalise_resource(resource).partition(RESOURCE_SEPARATOR)[0]
 
 
 def validate_condition(condition: dict) -> dict:
@@ -291,8 +324,10 @@ def validate_condition(condition: dict) -> dict:
     missing = [field for field in K8S_FIELDS if not str(condition.get(field) or "").strip()]
     if missing:
         raise ValueError(f"a {CONDITION_K8S} condition needs {', '.join(missing)}")
-    resource_kind(condition["resource"])
-    return {"kind": CONDITION_K8S, **{field: str(condition[field]).strip() for field in K8S_FIELDS}}
+    stored = {"kind": CONDITION_K8S, **{field: str(condition[field]).strip() for field in K8S_FIELDS}}
+    # Validated as stored: the resource kubectl is given is the one checked here.
+    stored["resource"] = normalise_resource(stored["resource"])
+    return stored
 
 
 def record_condition(conn: sqlite3.Connection, task_id: str, condition: dict, *, now: int,
@@ -342,13 +377,73 @@ def _stall_watch():
     return stall_watch
 
 
-def kube_get(condition: dict, *, stall=None):
-    """The object a ``k8s`` condition names, as kubectl's JSON; :data:`NOT_FOUND`
-    when the cluster says so; RuntimeError for any other failure."""
-    stall = stall or _stall_watch()
-    kubeconfig = stall.fetch_credentials(condition["project"], condition["cluster"], condition["location"])
+def cluster_key(condition: dict) -> str:
+    return CLUSTER_KEY_SEPARATOR.join((condition["project"], condition["location"], condition["cluster"]))
+
+
+def stamp(now: int) -> str:
+    """A fetch time as ``stall_watch.credentials_current`` reads one."""
+    return datetime.fromtimestamp(int(now), timezone.utc).isoformat()
+
+
+def stamps_path(home: Path) -> Path:
+    return home / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / STAMPS_FILE_NAME
+
+
+def load_stamps(path: Path) -> dict:
+    """The per-cluster fetch stamps; empty (so the next check fetches) when missing or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    stamps = data.get(STAMPS_KEY) if isinstance(data, dict) else None
+    return {str(k): str(v) for k, v in stamps.items()} if isinstance(stamps, dict) else {}
+
+
+def save_stamps(path: Path, stamps: dict) -> None:
+    """Write the stamps atomically; a write that fails costs one more fetch next run."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + STAMPS_TMP_SUFFIX)
+        tmp.write_text(json.dumps({STAMPS_KEY: stamps}, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("%s: could not save the credential stamps at %s: %r", JOB_ID, path, exc)
+
+
+def _kubectl_get(stall, condition: dict, kubeconfig: str):
     argv = [*KUBECTL_GET_ARGV, condition["resource"], "-n", condition["namespace"], "-o", "json"]
-    proc = stall.run_sandbox(argv, timeout=KUBECTL_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+    return stall.run_sandbox(argv, timeout=KUBECTL_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+
+
+def kube_get(condition: dict, *, stall=None, stamps: dict | None = None, now: int | None = None):
+    """The object a ``k8s`` condition names, as kubectl's JSON; :data:`NOT_FOUND`
+    when the cluster says so; RuntimeError for any other failure.
+
+    One ``kubectl get`` on the cluster's kubeconfig. Credentials are fetched
+    first only when ``stamps`` holds no fetch within the day for the cluster,
+    and once more when the read fails for a reason ``stall_watch`` knows a
+    fetch repairs; ``stamps`` is updated in place.
+    """
+    stall = stall or _stall_watch()
+    stamps = {} if stamps is None else stamps
+    now = int(time.time()) if now is None else int(now)
+    key = cluster_key(condition)
+    where = (condition["project"], condition["cluster"], condition["location"])
+    fetched = False
+    if not stall.credentials_current(stamps.get(key), stamp(now)):
+        kubeconfig = stall.fetch_credentials(*where)
+        stamps[key] = stamp(now)
+        fetched = True
+    else:
+        kubeconfig = stall.kubeconfig_path(*where)
+    proc = _kubectl_get(stall, condition, kubeconfig)
+    if proc.returncode != 0 and not fetched:
+        failure = RuntimeError((proc.stderr or "").strip())
+        if NOT_FOUND_MARKER not in str(failure) and stall.refetch_repairs(failure):
+            kubeconfig = stall.fetch_credentials(*where)
+            stamps[key] = stamp(now)
+            proc = _kubectl_get(stall, condition, kubeconfig)
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
         if NOT_FOUND_MARKER in stderr:
@@ -404,15 +499,37 @@ def _mark(conn: sqlite3.Connection, task_id: str, now: int, outcome: str, detail
     conn.commit()
 
 
-def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unblock=None, append_event=None) -> list[str]:
+def _still_this_block(conn: sqlite3.Connection, rec) -> bool:
+    """Whether the card is still ``blocked`` by the block the record describes.
+
+    Re-read before every write: a slow cluster read earlier in the run is time
+    enough for a person's Retry (an ``unblocked`` event, the card ``ready``), a
+    Drop, or a worker's new block. A record that no longer holds is dropped.
+    """
+    row = conn.execute(TASK_STATUS_SQL, (rec["task_id"],)).fetchone()
+    latest = latest_block_event(conn, rec["task_id"])
+    if row is not None and row["status"] == BLOCKED_STATUS and (
+            latest is None or latest[0] == int(rec["block_event_id"])):
+        return True
+    conn.execute(DELETE_SQL, (rec["task_id"],))
+    conn.commit()
+    return False
+
+
+def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unblock=None, append_event=None,
+            stamps_path: Path | None = None) -> list[str]:
     """One run: derive, evaluate what is due, retry what cleared. Returns the lines to say.
 
     ``kube``, ``unblock`` and ``append_event`` default to the sandbox read and
-    Hermes' own writers; a test stands them in. One card's failure is logged
-    and does not stop the rest.
+    Hermes' own writers; a test stands them in. ``stamps_path`` is where the
+    credential stamps persist between runs (none: this run only). One card's
+    failure is logged and does not stop the rest.
     """
     now = int(time.time()) if now is None else int(now)
-    kube = kube or kube_get
+    stamps = load_stamps(stamps_path) if stamps_path else {}
+    if kube is None:
+        def kube(condition, _stamps=stamps):
+            return kube_get(condition, stamps=_stamps, now=now)
     unblock = unblock or _default_unblock
     append_event = append_event or _default_append_event
     derive_records(conn, now=now)
@@ -428,6 +545,8 @@ def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unbl
             title = title_row["title"] if title_row else ""
             event_payload = {"condition": condition, "checked_at": now, "block_event_id": rec["block_event_id"]}
             if rec["expires_at"] is not None and now > int(rec["expires_at"]):
+                if not _still_this_block(conn, rec):
+                    continue
                 _mark(conn, task_id, now, OUTCOME_EXPIRED, "")
                 append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_EXPIRED})
                 lines.append(ended_line(title, condition, EXPIRED_LINE))
@@ -442,19 +561,14 @@ def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unbl
             if not cleared:
                 _mark(conn, task_id, now, OUTCOME_STILL_BLOCKED, detail)
                 continue
+            if not _still_this_block(conn, rec):
+                continue
             if auto_retries(conn, task_id) >= MAX_AUTO_RETRIES_PER_CARD:
                 _mark(conn, task_id, now, OUTCOME_RETRY_LIMIT, detail)
                 append_event(conn, task_id, {**event_payload, "outcome": OUTCOME_RETRY_LIMIT, "detail": detail})
                 lines.append(ended_line(title, condition, RETRY_LIMIT_LINE))
                 continue
-            # The block this record describes must still be the card's current
-            # one: a slow cluster read earlier in the loop is time enough for a
-            # person's Retry and a worker's new block.
             latest = latest_block_event(conn, task_id)
-            if latest is not None and latest[0] != int(rec["block_event_id"]):
-                conn.execute(DELETE_SQL, (task_id,))
-                conn.commit()
-                continue
             blocked_at = latest[2] if latest else now
             # The event goes first, so the once-per-card bound holds even if the
             # unblock lands and this process dies before a second write. An
@@ -471,6 +585,8 @@ def recheck(conn: sqlite3.Connection, *, now: int | None = None, kube=None, unbl
             logger.info("%s: retried %s (%s)", JOB_ID, task_id, detail)
         except Exception as exc:  # noqa: BLE001 — one card must not stop the rest
             logger.warning("%s: could not re-check %s: %r", JOB_ID, task_id, exc)
+    if stamps_path:
+        save_stamps(stamps_path, stamps)
     return lines
 
 
@@ -540,7 +656,8 @@ def main(argv=None, *, conn: sqlite3.Connection | None = None, now: int | None =
             rec = record_condition(conn, args.watch, condition, now=now, expires_at=expires_at)
             print(f"{args.watch}: re-checking {rec['condition']} every run until {rec['expires_at']}")
             return 0
-        for line in recheck(conn, now=now, kube=kube, unblock=unblock, append_event=append_event):
+        for line in recheck(conn, now=now, kube=kube, unblock=unblock, append_event=append_event,
+                            stamps_path=stamps_path(agent_home()) if own else None):
             print(line)
         return 0
     finally:

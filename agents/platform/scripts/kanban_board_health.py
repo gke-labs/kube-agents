@@ -326,17 +326,20 @@ GHOST_CLAIMS_SQL = """
 """
 
 # What the engine's JSON does not carry about a blocked card: its title, and
-# its kind as the last `blocked` event recorded it (`kanban_db.block_task`
-# writes `{"reason": ..., "kind": ...}` as the event payload).
+# its kind as the last block event recorded it: a `blocked` event's payload
+# (`kanban_db.block_task` writes `{"reason": ..., "kind": ...}`), or a breaker
+# trip's `gave_up`, which writes no `blocked` event and leaves `tasks.block_kind`
+# as an earlier block set it (a `needs_input` a person cleared would otherwise
+# read "Paused" on a card the breaker stopped).
 BLOCKED_TASKS_SQL = """
     SELECT id, title, block_kind
       FROM tasks
      WHERE status = 'blocked'
 """
 BLOCKED_EVENTS_SQL = """
-    SELECT task_id, payload
+    SELECT task_id, kind, payload
       FROM task_events
-     WHERE kind = 'blocked'
+     WHERE kind IN ('blocked', 'gave_up')
      ORDER BY created_at, id
 """
 BLOCKED_CHILDREN_SQL = """
@@ -370,10 +373,13 @@ RECHECK_LINES = {
 RECHECK_FIELDS = ("check_after", "last_checked_at", "last_outcome")
 STATUS_SENTENCE_SEPARATOR = " "
 # A card the circuit breaker parked: `blocked`, with a `gave_up` event as its
-# newest stop and nothing said on it since. The engine's `stuck_in_blocked`
-# rule keys off a `blocked` event, which a breaker trip never writes, and goes
-# quiet after any `unblocked` event, which the re-check job's retry writes, so
-# these rows come from here. The same stale age as the engine's default.
+# newest block or unblock. The engine's `stuck_in_blocked` rule keys off a
+# `blocked` event, which a breaker trip never writes, and goes quiet after any
+# `unblocked` event, which the re-check job's retry writes, so these rows come
+# from here. A comment does not clear a row: the harness itself comments on
+# the card right after the trip (the failed turn's charge, the budget
+# hand-off), and a person who has dealt with it has Retry and Drop. The same
+# stale age as the engine's default.
 BLOCKED_STALE_HOURS = 24
 BREAKER_PARKED_SQL = """
     SELECT t.id, t.title, e.created_at
@@ -381,7 +387,7 @@ BREAKER_PARKED_SQL = """
       JOIN task_events e ON e.id = (
            SELECT id FROM task_events
             WHERE task_id = t.id
-              AND kind IN ('blocked', 'gave_up', 'unblocked', 'commented')
+              AND kind IN ('blocked', 'gave_up', 'unblocked')
             ORDER BY id DESC LIMIT 1)
      WHERE t.status = 'blocked'
        AND e.kind = 'gave_up'
@@ -472,12 +478,16 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
         for row in conn.execute(BLOCKED_EVENTS_SQL):
             if row["task_id"] not in tasks:
                 continue
+            # Events arrive oldest first, so the last kind wins; a breaker trip
+            # is its own kind, as the re-check job resolves it.
+            if row["kind"] == _recheck.GAVE_UP_KIND:
+                tasks[row["task_id"]]["kind"] = _recheck.GAVE_UP_KIND
+                continue
             try:
                 payload = json.loads(row["payload"] or "{}")
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
-                # Events arrive oldest first, so the last kind wins.
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
         try:

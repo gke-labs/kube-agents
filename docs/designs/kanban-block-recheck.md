@@ -71,8 +71,14 @@ pod is `Ready`, a deployment is `Available`.
 ```
 
 The job reads it with one `kubectl get <resource> -n <namespace> -o json` through the shell sandbox,
-on the per-cluster kubeconfig `stall_watch.py` keeps there (`fetch_credentials`, `run_sandbox`): the
-agent container carries no kubectl. An object the cluster says is not there holds the block (the
+on the per-cluster kubeconfig `stall_watch.py` keeps there (`run_sandbox`): the agent container
+carries no kubectl. Credentials follow `stall_watch`'s own rule: `fetch_credentials` runs when the
+job's stamp of the cluster's last fetch (`profiles/platform/cron/kanban_block_recheck.json`) is a
+day old or missing, and once more when a read fails for a reason `refetch_repairs` says a fetch
+repairs; otherwise the kubeconfig is reused, because a `get-credentials` is a real gcloud run at the
+credential proxy that buys nothing after the first. The resource is validated after the strip and
+stored as kubectl is given it (`deployment/web`; a plural or padded spelling is normalised, a second
+`/` or an empty name refused), so the value checked is the value kept. An object the cluster says is not there holds the block (the
 named object never becomes Ready); a read that fails for any other reason is recorded as `unknown`
 and retried on the next run. A `k8s` condition is recorded with `--watch` on the script's command
 line on the pod, or through `record_condition`; without an expiry it stops after a week
@@ -99,11 +105,13 @@ has passed and whose `expires_at` has not:
 The job opens the board the way the Session KV server's card stop does: a plain connection with
 Hermes' PRAGMAs and a three-second busy timeout, not `kanban_db_connect.connect`, whose first call in
 a process takes a cross-process init lock, probes the whole file and runs the migrations, a cost
-with no benefit four times an hour on a board the dispatcher initialised. Before the unblock it
-re-reads the card's newest block event and drops the record when that event is not the one it
-describes: a slow cluster read earlier in the run is time enough for a person's Retry and a worker's
-new `needs_input` block. The `retried` event is written before the unblock, so the once-per-card
-bound holds even if the process dies between the two writes.
+with no benefit four times an hour on a board the dispatcher initialised. Before every write (the
+expiry, the retry limit, the retry) it re-reads the card's status and its newest block event and
+drops the record when the card is no longer `blocked` by the block the record describes: a slow
+cluster read earlier in the run is time enough for a person's Retry (an `unblocked` event and no new
+block), a Drop, or a worker's new `needs_input` block, and none of those may cost the card its one
+automatic retry or earn a stale "still blocked" line. The `retried` event is written before the
+unblock, so the once-per-card bound holds even if the process dies between the two writes.
 
 Bounds, so a retry cannot spin:
 
@@ -130,9 +138,13 @@ breaker trip writes `gave_up` and no `blocked` event, so a breaker-parked card n
 the rule goes quiet after any `unblocked` event, which this job's retry writes, so a `transient` card
 the job retried and the breaker then parked would have left the digest for good. The digest now
 reads breaker-parked cards from the board itself (`kanban_board_health.breaker_parked`: `blocked`,
-a `gave_up` as the newest of its block, unblock and comment events, a day old or more) and lists
-them beside the engine's, once each, as "Stopped N days ago before finishing." with the record's
-sentence.
+a `gave_up` as the newest of its block and unblock events, a day old or more) and lists them beside
+the engine's, once each, as "Stopped N days ago before finishing." with the record's sentence. A
+comment does not clear such a row: the harness comments on the card right after the trip (the
+failed turn's charge, the budget hand-off), and a person who has dealt with the card has Retry and
+Drop. The row's kind follows the card's newest block event too, a `gave_up` included, because
+`tasks.block_kind` survives an unblock and a card that once needed input would otherwise read
+"Paused" after the breaker stopped it.
 
 ## What this slice does not do
 
