@@ -870,8 +870,12 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on
 # current images is `Script "startup-script" failed with error: exit status 1`.
-# The script exits 1 on every boot, so the line is on the console from the
-# first boot onward, with no age gate. The audit reads the project, not a
+# The script exits 1 on every boot, and the guest prints the line once per
+# boot. The serial buffer keeps about 1 MiB, and this VM's guest agent logs
+# two errors an hour (it has no service account), so the line rotates out
+# about three weeks after a boot. hack/fleet_reconcile.py resets the VM after
+# each reconcile to print it again, and the fixture-state scan reads the
+# console for it (fixtures.json, startup-fail-vm). The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
 # account: the VM does nothing but fail. The name leads with `startup-fail-`
 # so the case can grade `/startup-fail-`, which only the finding's object path
