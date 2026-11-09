@@ -28,7 +28,9 @@ checked against the shell that ships (lifted out of the script) with
   - it sits with the ledger reset: before it, so a `finish` the grace waits
     for lands in the ledger the reset then retires rather than opening a
     fresh one the next `start` would carry; before devops-bench, inside the
-    task and stream locks, gated on the case writing a ledger.
+    task and stream locks, over the ledger stream of a case that writes one
+    and over each declared stream of a case that grades from the report
+    store; the reset alone stays gated on the ledger.
 """
 
 import os
