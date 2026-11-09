@@ -368,7 +368,7 @@ graded critical, the defect it catches, leaves no such row.
 
 ## When a fixture goes away
 
-Two ways a fixture stops being assertable, and both are worth designing a case around.
+Three ways a fixture stops being assertable, and all are worth designing a case around.
 
 A cleanup sweep deletes it. One `orphan-pd-` deletion costs the cost case a month, because
 the recreated disk starts its 30-day clock over. The clusters carry
@@ -387,7 +387,12 @@ clusters leave two, under the floor. It is a clean, self-clearing outage rather 
 answer, but it is a day of red: schedule such a replacement when the drift case can be quiet,
 or announce the gap.
 
-Neither of these is a reason for a case to hedge. A case that tolerates its fixture being
+A third way is slower and needs no one to act. The startup-fail VM prints its failure line
+once per boot, and its serial buffer rotates the line out about three weeks later. The
+reconcile resets the VM each time it reaches a project, and the `serial_contains` assertion in
+the fixture scan reads a buffer without the line as drift.
+
+None of these is a reason for a case to hedge. A case that tolerates its fixture being
 absent cannot tell "the agent missed it" from "it was not there", which is the same defect
 as a safeguard that cannot tell absent from unreachable. Declare the dependency in
 `fixtures:`, assert the planted noun specifically, and let the case go red when its

@@ -207,7 +207,7 @@ fixtures:
       A standalone e2-micro, startup-fail-<prefix>, whose startup script
       exits 1 on every boot. The guest agent prints the failure line once
       per boot, and the serial buffer rotates it out within about three
-      weeks, so the daily reconcile resets the VM to print it again.
+      weeks, so each reconcile resets the VM to print it again.
 
   - role: world-open-ingress
     slot: null # Project-scoped, in var.zone; not attached to any cluster.

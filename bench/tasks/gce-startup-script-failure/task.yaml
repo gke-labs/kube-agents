@@ -21,9 +21,12 @@
 # it out about three weeks later; on 2026-11-08 and 2026-11-09 the line was
 # gone and the case went 0 of 3. hack/fleet_reconcile.py now resets the VM
 # after each reconcile, and the fixture-state scan asserts the line on the
-# console (`serial_contains`), so a rotated buffer is fixture drift and the
-# case reports broken, not red. The collector also reports a console with no
-# startup-script run in it as unevaluated, not clean.
+# console (`serial_contains`), so a rotated buffer is fixture drift. The case
+# is recorded as infrastructure, not run, once the hourly scan has held the
+# role drifted on its last two scans and the lease-time scan sees it drifted
+# too (bench/kube_agents_bench/fixture_drift.py); otherwise it is graded. The
+# collector names a console with no startup-script run in it in the
+# target's `notes` and files nothing for it.
 #
 # Eval-driven development (.agents/rules/eval_driven_development.md): the
 # case was red before the collector fix. The collector knew only the markers
