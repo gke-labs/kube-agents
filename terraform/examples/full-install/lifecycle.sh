@@ -1385,7 +1385,7 @@ guard_minter_key() {
   rm -f "$err_file"
 
   if [[ $list_rc -ne 0 ]]; then
-    if ! printf '%s' "$list_err" | grep -qiE "$MINTER_KEY_ABSENT_PATTERN"; then
+    if ! grep -qiE "$MINTER_KEY_ABSENT_PATTERN" <<<"$list_err"; then
       warn "could not verify Cloud KMS signing key '$location/$keyring/$key' for GitHub minter ($list_err)."
       warn "Proceeding with apply, but note that the minter requires an ENABLED imported private key to pass readiness."
       return 0

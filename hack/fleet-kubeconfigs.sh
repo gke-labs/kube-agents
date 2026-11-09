@@ -474,7 +474,7 @@ _fleet_refuse_opt_in_under_prow() {
 # An OAuth2 bearer token is a run of unreserved characters; anything else is
 # gcloud's stderr leaked into stdout.
 _fleet_bare_token() {
-  [ -n "$1" ] && ! printf '%s' "$1" | LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]'
+  [ -n "$1" ] && ! LC_ALL=C grep -q '[^A-Za-z0-9._~+/=-]' <<<"$1"
 }
 
 # Refuse to write kubeconfigs that would carry the caller's own credential.

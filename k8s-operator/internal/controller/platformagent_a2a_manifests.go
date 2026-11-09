@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -4074,15 +4075,17 @@ const (
 	// hand in a release with platformAgent.enabled=false (#4883).
 	a2aChartPodsConfigMapName = "a2a-quota-chart-pods"
 	a2aChartPodsConfigMapKey  = "pods"
-	// a2aDefaultChartPods stands in when neither that annotation nor the
-	// chart's ConfigMap gives a usable count (a PlatformAgent in a namespace
-	// with no chart release, or an unreadable value): the chart's default
-	// release, the operator and two LiteLLM replicas, and a surge pod for each
-	// of the two Deployments. It errs high for a CR in a namespace with no
-	// chart pods, which only loosens the bound. A hand-written CR beside a
-	// chart release that runs the operator (platformAgent.enabled=false) gets
-	// the release's count from the ConfigMap in the operator's namespace
-	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
+	// a2aDefaultChartPods stands in when neither that annotation, the chart's
+	// ConfigMap nor the chart's workloads give a usable count (a PlatformAgent
+	// in a namespace with no chart release, or an unreadable value): the
+	// chart's default release, the operator and two LiteLLM replicas, and a
+	// surge pod for each of the two Deployments. It errs high for a CR in a
+	// namespace with no chart pods, which only loosens the bound. A
+	// hand-written CR beside a chart release that runs the operator
+	// (platformAgent.enabled=false) gets the release's count from the
+	// ConfigMap in the operator's namespace (#4883); one in any other
+	// namespace, from the chart's workloads there (#5006).
+	// tests/test_quota_preflight.py ties it to a default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
@@ -4091,8 +4094,9 @@ const (
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
 	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
-	// operator does not use a chart-pods count it finds, from the annotation or
-	// the ConfigMap, once per spec generation and reason (a2aQuotaAgent): the
+	// operator does not use a chart-pods count it finds, from the annotation, the
+	// ConfigMap or the chart's workloads, once per spec generation and reason
+	// (a2aQuotaAgent): the
 	// quota then counts a2aDefaultChartPods, which can sit below what the
 	// namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
@@ -4167,10 +4171,11 @@ func a2aParseChartPods(raw string, present bool, source string) (int64, string) 
 // The operator reads the chart's ConfigMap from its own namespace only
 // (r.OperatorNamespace, from POD_NAMESPACE through the downward API): the
 // release that runs the operator and its chart pods there, with a
-// PlatformAgent written by hand beside them. A chart ConfigMap in any other
-// namespace is not read, and the quota counts the default. It is read
-// uncached (a2aReader), like the rest of this path's bookkeeping, and goes
-// through the annotation's parse, cap and Warning.
+// PlatformAgent written by hand beside them. It is read uncached
+// (a2aReader), like the rest of this path's bookkeeping. In any other
+// namespace the operator counts the chart's workloads there instead
+// (a2aChartWorkloadPods, #5006), and a chart ConfigMap there is not read.
+// Either count goes through the annotation's parse, cap and Warning.
 func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
 	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
 		_, why := a2aChartPodsCount(agent)
@@ -4179,9 +4184,21 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}
 	cm := &corev1.ConfigMap{}
 	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
-		// Outside the operator's namespace the count is not read. The lookup
-		// only decides whether to say so, so no answer from it can fail the
-		// reconcile.
+		// Outside the operator's namespace the count comes from the chart's
+		// workloads there. No lookup here can fail the reconcile: a failed
+		// List counts the default and says why.
+		pods, found, err := r.a2aChartWorkloadPods(ctx, agent.Namespace)
+		source := fmt.Sprintf("the chart's Deployments and StatefulSets in namespace %s (the PlatformAgent carries no %s annotation)", agent.Namespace, a2aChartPodsAnnotation)
+		if err != nil {
+			return agent, fmt.Sprintf("%s could not be listed (%v); the session quota counts the default of %d chart pods instead", source, err, a2aDefaultChartPods), nil
+		}
+		if found {
+			raw := strconv.FormatInt(pods, 10)
+			_, why := a2aParseChartPods(raw, true, source)
+			return a2aWithChartPods(agent, raw), why, nil
+		}
+		// With no chart workloads here, a chart ConfigMap is the one sign of a
+		// release whose count the quota cannot use: say so.
 		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
 			return agent, "", nil
 		}
@@ -4205,6 +4222,13 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 		return agent, fmt.Sprintf("%s is missing; the session quota counts the default of %d chart pods instead", source, a2aDefaultChartPods), nil
 	}
 	_, why := a2aParseChartPods(raw, present, source)
+	return a2aWithChartPods(agent, raw), why, nil
+}
+
+// a2aWithChartPods is a copy of agent carrying raw as the chart-pods
+// annotation, so every sizing function reads one figure. The CR itself is
+// never changed.
+func a2aWithChartPods(agent *agentv1alpha1.PlatformAgent, raw string) *agentv1alpha1.PlatformAgent {
 	sized := agent.DeepCopy()
 	annotations := sized.GetAnnotations()
 	if annotations == nil {
@@ -4212,19 +4236,83 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 	}
 	annotations[a2aChartPodsAnnotation] = raw
 	sized.SetAnnotations(annotations)
-	return sized, why, nil
+	return sized
+}
+
+// a2aChartWorkloadSelector picks the chart's own Deployments and
+// StatefulSets: every one carries both labels through kube-agents.labels.
+// This operator's workloads carry its field owner as managed-by, so they are
+// not counted here; they are in a2aStandingPods.
+var a2aChartWorkloadSelector = client.MatchingLabels{
+	labelManagedBy: managedByHelm,
+	labelPartOf:    partOfKubeAgents,
+}
+
+// a2aChartWorkloadPods counts the chart's pods in namespace from its
+// workloads there (#5006), for a PlatformAgent outside the operator's
+// namespace with no chart-pods annotation. found is false when the namespace
+// holds no chart workloads. It reads the manager's cache, which holds both
+// kinds already (the controller owns them), so it adds no API call.
+func (r *PlatformAgentReconciler) a2aChartWorkloadPods(ctx context.Context, namespace string) (pods int64, found bool, err error) {
+	var deployments appsv1.DeploymentList
+	if err := r.List(ctx, &deployments, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	var statefulSets appsv1.StatefulSetList
+	if err := r.List(ctx, &statefulSets, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	return a2aChartWorkloadsCount(deployments.Items, statefulSets.Items), len(deployments.Items)+len(statefulSets.Items) > 0, nil
+}
+
+// a2aChartWorkloadsCount is the chart's pod count from its workloads, as
+// kube-agents.chartQuotaPods computes it from values: each workload's
+// replicas, and each Deployment's rollout surge pods. tests/test_quota_preflight.py
+// holds the two equal over rendered charts.
+func a2aChartWorkloadsCount(deployments []appsv1.Deployment, statefulSets []appsv1.StatefulSet) int64 {
+	var n int64
+	for i := range deployments {
+		n = a2aSatAdd(n, int64(ptr.Deref(deployments[i].Spec.Replicas, 1)))
+		n = a2aSatAdd(n, a2aDeploymentSurgePods(&deployments[i]))
+	}
+	for i := range statefulSets {
+		n = a2aSatAdd(n, int64(ptr.Deref(statefulSets[i].Spec.Replicas, 1)))
+	}
+	return n
+}
+
+// a2aDeploymentSurgePods is how many pods a rollout of d can add: its
+// maxSurge against its replicas, a percentage rounded up (Kubernetes' 25%
+// when unset), never past the replicas (so none at zero replicas), and none
+// for Recreate (#4876).
+func a2aDeploymentSurgePods(d *appsv1.Deployment) int64 {
+	replicas := int(ptr.Deref(d.Spec.Replicas, 1))
+	if d.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		return 0
+	}
+	surge := intstr.FromString("25%")
+	if ru := d.Spec.Strategy.RollingUpdate; ru != nil && ru.MaxSurge != nil {
+		surge = *ru.MaxSurge
+	}
+	v, err := intstr.GetScaledValueFromIntOrPercent(&surge, replicas, true)
+	if err != nil || v < 0 || v > replicas {
+		v = replicas
+	}
+	return int64(v)
+}
+
+// a2aSatAdd adds two non-negative counts, stopping at math.MaxInt64.
+func a2aSatAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // a2aChartPods is the count a2aChartPodsCount reads.
 func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	n, _ := a2aChartPodsCount(agent)
 	return n
-}
-
-// a2aChartPodsDiscard is why a2aChartPodsCount discarded the annotation, or "".
-func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
-	_, why := a2aChartPodsCount(agent)
-	return why
 }
 
 // a2aStandingPods is every pod the operator keeps running for agent in next

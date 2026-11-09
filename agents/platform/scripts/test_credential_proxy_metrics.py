@@ -386,7 +386,6 @@ def _budgeted_executor(case, admits, metrics, max_output_bytes=1024):
     )
     limit = (
         credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-        + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
         + admits * per_request
     )
     floor = min(admits, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)

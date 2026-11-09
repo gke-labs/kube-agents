@@ -769,6 +769,26 @@ chat session's turn ends when it delegates, so a session parent keeps the chatop
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
 finished turn's `…in`.
 
+**Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
+`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?}}`: the
+agents that turn's requester may delegate to, `platform` first and then each AgentProfile whose card
+admits them, by the same checks a delegation meets (the target's list and the A2A door's own-list
+rule, for the requester and everyone else whose text reached the session, and the card's tiers). A
+wake carries none, since it runs without the tool. A profile's entry carries its card's routing
+blurb and the parameters the card declares (`{"name", "required"?}`). The session's delegate tool
+names them, so the model is told what it can address. The part is a hint, not a grant: the gateway
+checks the delegation again when it arrives. It rides every turn, so a reused pod keeps up with
+profiles added and removed, and its presence is the marker: a turn with one has exactly the agents
+listed, and a turn with none reads as `platform` only.
+
+- A name is an addressee (a subject token). A description is one line of at most 200 bytes, cut by
+  the gateway. A parameter is named like a task parameter, at most 16 a target.
+- A list has at most 32 targets, and its object encodes to at most 16 KiB, so the session pod can hand it to its
+  tool server in one environment variable. The gateway stops before either bound and sets
+  `truncated`; a card whose parameters break the rules is left out.
+- A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
+  the turn carried none.
+
 ### Card work after the task ends
 
 **A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks

@@ -69,8 +69,9 @@ import math
 import re
 
 try:
-    from eval_dashboard import tiers
+    from eval_dashboard import links, tiers
 except ImportError:  # run as a script from scripts/eval_dashboard/
+    import links  # type: ignore[no-redef]
     import tiers  # type: ignore[no-redef]
 
 # The report page render.py writes and the digest links to.
@@ -132,10 +133,13 @@ NIGHT_START_GRACE = datetime.timedelta(minutes=15)
 # Where Prow's Spyglass shows a periodic's build and its artifacts. The
 # collector records it per nightly run (``runs[].log_url``, SCHEMA.md) from
 # the build directory it listed, so the link follows whichever bucket the
-# nightly logs to. A nightly record without the field predates it and was
-# read from the bucket the nightly used before 2026-09-15, the cluster
-# default gs://kube-agents-prow; a periodic's build lives under logs/<job>/
-# there, with no pull request in the path.
+# nightly logs to; a run in a bucket Deck cannot read also records the
+# directory (``runs[].gcs_base``) and links the Cloud Console (links.py), as
+# does a record whose ``log_url`` is a Spyglass link into such a bucket. A
+# nightly record without either field predates them and was read from the
+# bucket the nightly used before 2026-09-15, the cluster default
+# gs://kube-agents-prow; a periodic's build lives under logs/<job>/ there,
+# with no pull request in the path.
 LEGACY_SPYGLASS_LOGS_ROOT = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 # The other periodics of a split night (module docstring): the writers
@@ -350,10 +354,23 @@ def expected_cases(data: dict) -> list[str]:
     return sorted(out)
 
 
+def console_base(run: dict) -> str | None:
+    """The ``gs://`` directory a run's links open in the Console: its
+    ``gcs_base``, or the directory behind a ``log_url`` that is a Spyglass
+    link into a private bucket (links.py); None for a run Spyglass renders."""
+    base = run.get("gcs_base")
+    if isinstance(base, str) and base.startswith(links.GS_SCHEME):
+        return base
+    return links.private_gcs_base(run.get("log_url"))
+
+
 def build_url(run: dict) -> str | None:
     build = run.get("build_id")
     if not isinstance(build, str) or not build.isdigit():
         return None
+    base = console_base(run)
+    if base:
+        return links.console_url(base)
     recorded = run.get("log_url")
     if isinstance(recorded, str) and recorded.startswith("https://"):
         return recorded
@@ -363,7 +380,12 @@ def build_url(run: dict) -> str | None:
 
 def transcript_url(run: dict, case: str) -> str | None:
     base = build_url(run)
-    return f"{base}/{TRANSCRIPT_ARTIFACT.format(case=case)}" if base else None
+    if not base:
+        return None
+    directory = console_base(run)
+    if directory:
+        return links.console_object_url(directory, TRANSCRIPT_ARTIFACT.format(case=case))
+    return f"{base}/{TRANSCRIPT_ARTIFACT.format(case=case)}"
 
 
 # --------------------------------------------------------------------------

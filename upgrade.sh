@@ -1057,7 +1057,7 @@ remote_release_tag_commit() {
 # object name is self-verifying — a checkout cannot hold a different tree under
 # the same SHA — so it needs no second opinion from the remote.
 ref_is_commit_sha() {
-  printf '%s' "${1:-}" | grep -Eq '^[0-9a-fA-F]{40}$'
+  grep -Eq '^[0-9a-fA-F]{40}$' <<<"${1:-}"
 }
 
 verify_local_source_ref() {

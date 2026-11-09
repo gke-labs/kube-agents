@@ -40,10 +40,6 @@ RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 RESULT_SUCCESS = "SUCCESS"
-# Why a lane's scheduled jobs are off: the digest says it in place of their
-# runs, so a turned-off job never reads as red or missed. Drop it when the
-# jobs are in Prow.
-FORGE_WEEKLY_OFF = "not in Prow yet; the weekly jobs wait on the Vertex quota"
 CADENCE_NIGHTLY = "nightly"
 CADENCE_WEEKLY = "weekly"
 # How old a scheduled job's newest run may be and still be "last" night's or
@@ -57,7 +53,9 @@ SECTION_TITLES = {SECTION_GITLAB: "GitLab lane", SECTION_SELF_MANAGED: "Self-man
 # Each forge lane as the Brief names it, with its section, the cadence of its
 # scheduled jobs, and its jobs: the pull-request job, and the scheduled jobs
 # in the order the section lists them. A job the lane's runs name and this
-# table does not is listed after these.
+# table does not is listed after these. A lane whose scheduled jobs are paused
+# may carry ``off``, the reason, which the digest and the Brief say in place
+# of their runs, so a paused job never reads as red or missed.
 LANES = {
     tiers.TIER_GITLAB: {
         "title": "GitLab lane",
@@ -72,7 +70,6 @@ LANES = {
         "cadence": CADENCE_WEEKLY,
         "job": "pull-kube-agents-smoke-test-ghes",
         "nightly_jobs": ("ci-kube-agents-eval-weekly-ghes-next",),
-        "off": FORGE_WEEKLY_OFF,
     },
     tiers.TIER_GITLAB_CE: {
         "title": "GitLab CE lane",
@@ -80,7 +77,6 @@ LANES = {
         "cadence": CADENCE_WEEKLY,
         "job": "pull-kube-agents-smoke-test-gitlab-ce",
         "nightly_jobs": ("ci-kube-agents-eval-weekly-gitlab-ce-next",),
-        "off": FORGE_WEEKLY_OFF,
     },
 }
 # The digest line on the forge lanes' scheduled jobs (digest_line).
@@ -125,7 +121,9 @@ def lane_run(run: dict) -> dict:
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "log_url": run.get("log_url") if isinstance(run.get("log_url"), str) else None,
-        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
+        # Also set for a night whose Spyglass log_url is into a private bucket
+        # (a record from before gcs_base): the row links the Console instead.
+        "gcs_base": nightly.console_base(run),
         "started": run.get("started"),
         "finished": run.get("finished"),
         "duration_s": run.get("duration_s") if isinstance(run.get("duration_s"), (int, float)) else None,
