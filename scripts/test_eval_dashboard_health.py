@@ -576,6 +576,8 @@ class Storm(unittest.TestCase):
             # happens to end at the cap.
             ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (no executor took task task-7b on devops-", "no executor took task [id] on…"),
             ("KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is no-github-writes-the-case-did-not-request, charged for no more writes than the case's 1 requested pull request(s) because the empty report could not name them (xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx)", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            # The cut right after a ")" of the detail's own is still a cut.
+            ('the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-93cb2a3275225fb7 on devops-bench-0123456789ab/case-12345678/1 sat queued (submitted, never working)', "task [id] on [run]/case-12345678/[rep] sat queued (submitted, never…"),
             (RETRIES, ""),
             ("the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-4 ended failed: the executor's own failure (bridge-shutdown) (reason: x))", "the executor's own failure (bridge-shutdown)"),
             (EMPTY_RECORD, "the record is not evidence of a real agent run: the trajectory is empty: the…"),
@@ -608,8 +610,11 @@ class Storm(unittest.TestCase):
             self.assertIn(fragment, harness, fragment)
         self.assertIn('f"(reason: {exchange.fold.terminal_reason or \'none given\'})"', harness)
         self.assertIn('_RUN_ID_PREFIX = "devops-bench-"', harness)
-        # The collector keeps 300 characters: the wrappers plus the longest
-        # executor token must fit, or the shell arrives cut and unpeelable.
+        # The collector keeps 300 characters: the scorer's usual wrapper and
+        # the harness's prefix plus the longest executor token must fit, or
+        # the shell arrives cut and unpeelable. (The 260-character safeguard
+        # wrapper leaves 40, which a real task id fills; that is the
+        # collector's cap, and the words then end in "…".)
         transport = (root / "inject_transport.py").read_text(encoding="utf-8")
         tokens = re.findall(r'^REASON_[A-Z_]+ = "([a-z-]+)"$', transport, re.M)
         self.assertTrue(tokens)

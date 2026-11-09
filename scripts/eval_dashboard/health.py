@@ -868,25 +868,21 @@ def storm_cause(rep: dict) -> str:
     text = text.strip()
     if text.rstrip(")") == SCORER_NO_DETAIL:
         return ""
-    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
-    # that lands in the words leaves a bare fragment, and in the run id an
-    # unreduced one: the cut word goes and the ellipsis says so. A reason at
-    # the cap that still ends on a ")" is read as whole.
-    cut_by_collector = (
-        len(reason) >= collect.REP_REASON_MAX_CHARS
-        and whole
-        and bool(text)
-        and not detail.rstrip().endswith(SCORER_WRAPPER_CLOSE)
-    )
     # The wrapper's own close, when the wrapper opened one and the collector's
     # cut did not take it: the one ")" more than the detail opened.
-    if (
+    wrapper_closed = bool(
         wrapper
         and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
         and text.endswith(SCORER_WRAPPER_CLOSE)
         and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
-    ):
+    )
+    if wrapper_closed:
         text = text[: -len(SCORER_WRAPPER_CLOSE)]
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still carries the wrapper's close is whole.
+    cut_by_collector = len(reason) >= collect.REP_REASON_MAX_CHARS and whole and bool(text) and not wrapper_closed
     text = periodics.quotable(text)
     if len(text) > STORM_CAUSE_MAX_CHARS:
         head = text[:STORM_CAUSE_MAX_CHARS]
