@@ -586,6 +586,7 @@ func TestOnlyAConsoleOrA2ADoorTurnWaitsForItsCardsInTurn(t *testing.T) {
 	}{
 		{"console:tab-1", true},
 		{"a2a:caller-1:ctx-9", true},
+		{"a2a::google:caller-2:ctx-9", true},
 		{"inject:eval-1", false},
 		{"gchat:spaces/A/threads/B", false},
 		{"slack:C0HOME/1712.0001", false},

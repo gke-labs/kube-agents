@@ -620,10 +620,11 @@ func TestWithNote(t *testing.T) {
 }
 
 // A turn that files a card ends at its acknowledgement unless it came from
-// the console or MCP: neither a chat turn whose route the store refused nor a
-// turn with no chat conversation (the eval inject lane) holds its task open
-// while the card runs. Holding them dropped the agent's own report of the
-// card's result from the answer (#5170).
+// the console, MCP or the A2A door: neither a chat turn whose route the store
+// refused nor a turn with no chat conversation (the eval inject lane) holds
+// its task open while the card runs. Holding them dropped the agent's own
+// report of the card's result from the answer (#5170); the A2A door holds
+// again (#5180).
 func TestAPI_OnlyAConsoleOrA2ADoorTurnHoldsItsTaskWhileItsCardRuns(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not on PATH; the kanban fixture needs it")
@@ -687,7 +688,7 @@ c.commit()
 					t.Fatalf("read the console task: %v", err)
 				}
 				if got.Final {
-					t.Fatalf("a console turn ended while its card runs: %+v", got.State)
+					t.Fatalf("a %s turn ended while its card runs: %+v", tc.name, got.State)
 				}
 				return
 			}
