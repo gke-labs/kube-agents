@@ -5472,9 +5472,10 @@ spec:
                           type: object
                       type: object
                     scaleToZero:
-                      description:
-                        ScaleToZero scales the deployment replicas to 0 when
-                        true (useful for saving costs during idle periods).
+                      description: |-
+                        ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+                        While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+                        condition False with reason ScaledToZero; clearing it restores the normal phases.
                       type: boolean
                     sidecarVolumes:
                       description: |-
@@ -12139,9 +12140,10 @@ spec:
                   format: int64
                   type: integer
                 phase:
-                  description:
-                    Phase is the overall state (Pending, Provisioning, Ready,
-                    Degraded, Failed).
+                  description: |-
+                    Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+                    Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+                    Ready condition then reads False with reason ScaledToZero.
                   type: string
                 profileSubmitMaxAgeSeconds:
                   description: |-

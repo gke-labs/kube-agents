@@ -8639,8 +8639,8 @@ func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
 		if n != c.want || (why == "") != c.used {
 			t.Errorf("%q: (%d, %q), want %d used=%v", c.raw, n, why, c.want, c.used)
 		}
-		if a2aChartPods(agent) != n || a2aChartPodsDiscard(agent) != why {
-			t.Errorf("%q: the wrappers disagree with a2aChartPodsCount", c.raw)
+		if a2aChartPods(agent) != n {
+			t.Errorf("%q: a2aChartPods disagrees with a2aChartPodsCount", c.raw)
 		}
 	}
 }
@@ -8791,8 +8791,8 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			if tc.annotation != nil {
 				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
 			}
-			if why := a2aChartPodsDiscard(agent); (why != "") != (tc.want > 0) {
-				t.Fatalf("a2aChartPodsDiscard = %q", why)
+			if _, why := a2aChartPodsCount(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsCount's reason = %q", why)
 			}
 			scheme := setupScheme()
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
