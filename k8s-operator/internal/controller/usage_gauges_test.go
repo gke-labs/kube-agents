@@ -32,6 +32,7 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 		ToolExecutionsTotal:             5,
 		ChatMessagesInboundTotal:        2,
 		NegativeFeedbackTotal:           1,
+		PositiveFeedbackTotal:           6,
 		ClustersRegistered:              ptr.To(int64(3)),
 		ClustersMonitored:               ptr.To(int64(1)),
 		RemediationsMergedTotal:         ptr.To(int64(4)),
@@ -202,7 +203,7 @@ func TestUsageGauges_PublishEveryFieldOfTheStatus(t *testing.T) {
 	g := newUsageGauges(reg)
 	agent := gaugeTestAgent()
 	g.publishUsage(agent)
-	for field, want := range map[string]float64{"toolExecutionsTotal": 5, "chatMessagesInboundTotal": 2, "negativeFeedbackTotal": 1, "eventsIngestedTotal": 0, "clustersRegistered": 3, "clustersMonitored": 1} {
+	for field, want := range map[string]float64{"toolExecutionsTotal": 5, "chatMessagesInboundTotal": 2, "negativeFeedbackTotal": 1, "positiveFeedbackTotal": 6, "eventsIngestedTotal": 0, "clustersRegistered": 3, "clustersMonitored": 1} {
 		if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", field)); got != want {
 			t.Errorf("%s = %v, want %v", field, got, want)
 		}
@@ -396,7 +397,7 @@ func samplesOfAgent(t *testing.T, vec *prometheus.GaugeVec, namespace string) in
 // PlatformAgent writer constant is in usagePhases. A literal returned or
 // compared elsewhere is outside it.
 func TestUsageGauges_PhasesAreConstantsTheVocabularyCarries(t *testing.T) {
-	for _, p := range []string{provisioningPhase, readyPhase, degradedPhase} {
+	for _, p := range []string{provisioningPhase, readyPhase, pausedPhase, degradedPhase} {
 		if !slices.Contains(usagePhases, p) {
 			t.Errorf("usagePhases lacks the writer constant %q", p)
 		}

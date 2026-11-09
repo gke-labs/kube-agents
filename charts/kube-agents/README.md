@@ -1214,7 +1214,8 @@ ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
 another host or change the account it acts as, add a forge with a credential, add a GitHub forge at a new host, or
-change the install's GitHub host.
+change the install's GitHub host. While the `PlatformAgent` has a forge the operator
+refuses, the console may not add, remove or reorder forges until an administrator fixes it.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1299,15 +1300,17 @@ on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted 
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
 pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
-`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap below applies)
+`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it, unless the ConfigMap or workloads below apply)
 and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`, and instead renders
 the same count in a ConfigMap, `a2a-quota-chart-pods`, in the release namespace, which the
-operator reads for a next-mode one written by hand there. The operator reads it from its own namespace only, so a hand-written
-CR elsewhere needs the annotation itself. An annotation on the CR still wins. A count past
-the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
-`A2AQuotaChartPodsDiscarded` Warning naming it. The operator reads the ConfigMap on each
-reconcile but doesn't watch it, so a changed count reaches the quota on the next reconcile,
-which can be the operator's periodic one.
+operator reads for a next-mode one written by hand there. The operator reads it from its own namespace only. For a
+hand-written CR in any other namespace, such as beside a release with `operator.enabled=false`, it counts the chart's
+Deployments and StatefulSets there (those labelled `app.kubernetes.io/managed-by: Helm` and
+`app.kubernetes.io/part-of: kube-agents`) at their replicas and rollout surge pods, as the chart does. An annotation on
+the CR still wins. A count past the cap of 64, unreadable, or missing from the ConfigMap counts 5 instead and records an
+`A2AQuotaChartPodsDiscarded` Warning naming it, as does a failed read of the workloads. The operator reads the
+ConfigMap and the workloads on each reconcile but doesn't watch them, so a changed count reaches the quota on the next
+reconcile, which can be the operator's periodic one.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.

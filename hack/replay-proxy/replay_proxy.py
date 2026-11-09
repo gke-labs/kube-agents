@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import queue
 import re
@@ -149,6 +150,16 @@ DROPPED_REQUEST_HEADERS = {
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"}
 MODEL_GROUP_HEADER = "x-litellm-model-group"
 ATTEMPTED_FALLBACKS_HEADER = "x-litellm-attempted-fallbacks"
+MODEL_NAME_HEADER = "x-litellm-model-name"
+ATTEMPTED_RETRIES_HEADER = "x-litellm-attempted-retries"
+# Sent on a stream too, as 0.0, before the cost is known: read on a
+# non-streamed response only.
+RESPONSE_COST_HEADER = "x-litellm-response-cost"
+# LiteLLM's cost in a usage block, a stream's final chunk included.
+USAGE_COST = "cost"
+COMPLETION_DETAILS = "completion_tokens_details"
+USAGE_REASONING_TOKENS = "reasoning_tokens"
+USAGE_CACHE_WRITE_TOKENS = "cache_creation_input_tokens"
 NO_FALLBACKS = "0"
 
 READ_CHUNK_BYTES = 65536
@@ -400,11 +411,45 @@ def usage_tokens(usage: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
     cached = details.get("cached_tokens") if isinstance(details, dict) else None
     if cached is None:
         cached = usage.get("cache_read_input_tokens")
+    completion_details = usage.get(COMPLETION_DETAILS) or {}
     return {
         F.PROMPT_TOKENS: usage.get(F.PROMPT_TOKENS),
         F.CACHED_TOKENS: cached,
         F.COMPLETION_TOKENS: usage.get(F.COMPLETION_TOKENS),
+        F.REASONING_TOKENS: (
+            completion_details.get(USAGE_REASONING_TOKENS) if isinstance(completion_details, dict) else None
+        ),
+        F.CACHE_WRITE_TOKENS: usage.get(USAGE_CACHE_WRITE_TOKENS),
     }
+
+
+def _cost(value: Any) -> Optional[float]:
+    """A finite, non-negative number of dollars from a number or a numeric string, else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return None
+    return cost if math.isfinite(cost) and cost >= 0 else None
+
+
+def litellm_cost(usage: Optional[Dict[str, Any]], headers: Dict[str, str], streamed: bool) -> Optional[float]:
+    """LiteLLM's cost for the request: usage.cost, else the cost header of a non-streamed response."""
+    if isinstance(usage, dict) and usage.get(USAGE_COST) is not None:
+        return _cost(usage[USAGE_COST])
+    if streamed:
+        return None
+    return _cost(headers.get(RESPONSE_COST_HEADER))
+
+
+def attempted_retries(headers: Dict[str, str]) -> Any:
+    """x-litellm-attempted-retries as an int when it parses, else as sent (None when absent)."""
+    value = headers.get(ATTEMPTED_RETRIES_HEADER)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return value
 
 
 def answer_view(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -956,9 +1001,23 @@ class ShadowProxy:
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
             **self.served_fields(served),
         }
+        if served is None:
+            entry[F.LITELLM_MODEL_NAME] = upstream["headers"].get(MODEL_NAME_HEADER)
+            entry[F.LITELLM_ATTEMPTED_RETRIES] = attempted_retries(upstream["headers"])
+            entry[F.LITELLM_COST_USD] = litellm_cost(upstream["usage"], upstream["headers"], bool(body.get(F.STREAM)))
+        else:
+            # The request never reached LiteLLM: no model behind it, no retries,
+            # and no cost, whatever the recording's usage block says.
+            entry[F.LITELLM_MODEL_NAME] = None
+            entry[F.LITELLM_ATTEMPTED_RETRIES] = None
+            entry[F.LITELLM_COST_USD] = None
         if served is not None:
             entry[F.SERVED_VIA] = upstream.get("served_via")
         entry.update(usage_tokens(upstream["usage"]))
+        if served is not None:
+            # The recording's reasoning and cache writes, billed when it was recorded, not now.
+            entry[F.REASONING_TOKENS] = None
+            entry[F.CACHE_WRITE_TOKENS] = None
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
         if entry[F.TOKENS_ESTIMATED]:
             entry[F.PROMPT_TOKENS] = request_bytes // BYTES_PER_TOKEN

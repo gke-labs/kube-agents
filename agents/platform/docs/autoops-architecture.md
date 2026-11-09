@@ -147,8 +147,8 @@ a different constant rather than a different path.
 The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<escaped JSON>"}`, and
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
-flapping guard, a two-minute settle period for the crash-loop family and kubelet's `host IP unknown`
-config error (a back-off that clears sooner, or a DaemonSet pod's `host IP unknown` as its node is
+flapping guard, a two-minute settle period for the crash-loop family, kubelet's `host IP unknown`
+config error and Config Connector's `DependencyNotReady` and `Unmanaged` (a back-off that clears sooner, or a DaemonSet pod's `host IP unknown` as its node is
 deleted, is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
 watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread and on its triage card (the card alone on an install without chat).
@@ -398,10 +398,15 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules, a flapping guard and a settle period. The deployed watcher forwards eight reasons, which
-  `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
-  `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
-  `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's
+  rules, a flapping guard and a settle period. The deployed watcher forwards seventeen reasons, which
+  `deploy/shared/start-services.sh` passes as `--reason` (`EVENT_WATCHER_REASONS`) and no environment
+  variable overrides: `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`,
+  `ImagePullBackOff`, `ErrImagePull`, `OOMKilled`, `FailedScheduling`, and the nine reasons Config
+  Connector records on a managed resource it cannot apply (`UpdateFailed`, `DeleteFailed`,
+  `DependencyNotReady`, `DependencyNotFound`, `DependencyInvalid`, `ManagementConflict`,
+  `Unmanaged`, `PreActuationTransformFailed`, `PostActuationTransformFailed`; the watcher's
+  [README](../../../k8s-operator/cmd/k8s-event-watcher/README.md) rule 1 is canonical for the
+  list). The same list admits two more, cluster-autoscaler's
   `TriggeredScaleUp` and `NotTriggerScaleUp`, which the watcher records against the pod and never
   forwards: a `FailedScheduling` is held while a scale-up for its pod is in progress, passed at any
   count once the autoscaler has declined to help, and otherwise held until its fifth repeat and
@@ -415,7 +420,7 @@ The GKE-events path is live end to end:
   Standard cluster is a fault and still opens a card, and a real workload draws a node-auto-provisioning
   verdict within seconds, which takes it out of the hold.
   `WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD=false` reports them.
-  The eleven-entry `defaultReasons` in the watcher's `filter.go` — which does include
+  The twenty-entry `defaultReasons` in the watcher's `filter.go` — which does include
   `Evicted` — applies only when `--reason` is left unset, so it does not describe an install.
   `Decide` matches the wire reason exactly and before canonicalization, so a reason absent from
   that list produces nothing at all: no session, no card, no report.
@@ -432,8 +437,9 @@ The GKE-events path is live end to end:
 
 The controller-stall path is live on the same spine. `stall-watch`, a cron script on the Platform
 Agent's roster, finds controllers that stopped making progress without erroring — a state that
-raises no event on the watcher's list — and sends a `controller-stall` inject per namespace with a
-new stall. From the session onward it is the path above: the alert, the card to that cluster's
+mostly raises no event on the watcher's list; a Config Connector resource that cannot apply can
+reach both paths, the event watcher through the Warning it records and the stall watch through
+its `Ready` condition — and sends a `controller-stall` inject per namespace with a new stall. From the session onward it is the path above: the alert, the card to that cluster's
 Cluster Agent (which runs `gke-stall-detection`), the triage in the alert's thread, the approval and
 the PR ([design](../../../docs/designs/stall-watch-inject.md)).
 

@@ -42,6 +42,18 @@ func TestFilterDecide(t *testing.T) {
 			wantGate: gateReason,
 		},
 		{
+			// A Config Connector resource that cannot apply records only this
+			// event; the default list carries it so the event path hears it.
+			name:     "default config accepts a Config Connector reconcile failure",
+			event:    TriageEvent{Key: EventKey{Reason: "UpdateFailed"}, Namespace: "config-control", Count: 1},
+			wantGate: gateAccepted,
+		},
+		{
+			name:     "default config does not accept a Config Connector normal state",
+			event:    TriageEvent{Key: EventKey{Reason: "UpToDate"}, Namespace: "config-control"},
+			wantGate: gateReason,
+		},
+		{
 			name:       "filters out excluded namespace",
 			excludedNS: []string{"kube-system"},
 			event:      TriageEvent{Key: EventKey{Reason: "CrashLoopBackOff"}, Namespace: "kube-system"},
@@ -581,5 +593,22 @@ func TestFilterDecideScaleUpMarks(t *testing.T) {
 				t.Errorf("Decide(%+v) = %q; want %q", tc.event, gate, tc.wantGate)
 			}
 		})
+	}
+}
+
+// TestDefaultReasonsCarryEveryConfigConnectorFailure: the shipped default
+// list carries each reconcile-failure reason Config Connector's monitoring
+// guide lists, and none of its normal states.
+func TestDefaultReasonsCarryEveryConfigConnectorFailure(t *testing.T) {
+	defaults := stringSet(defaultReasons)
+	for _, reason := range []string{"UpdateFailed", "DeleteFailed", "DependencyNotReady", "DependencyNotFound", "DependencyInvalid", "ManagementConflict", "Unmanaged", "PreActuationTransformFailed", "PostActuationTransformFailed"} {
+		if _, ok := defaults[reason]; !ok {
+			t.Errorf("defaultReasons lacks Config Connector's %s", reason)
+		}
+	}
+	for _, reason := range []string{"Updating", "UpToDate", "Deleting", "Deleted"} {
+		if _, ok := defaults[reason]; ok {
+			t.Errorf("defaultReasons carries Config Connector's normal state %s", reason)
+		}
 	}
 }
