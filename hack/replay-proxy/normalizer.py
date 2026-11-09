@@ -1364,13 +1364,13 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
 class KeyContext:
     """What besides the request goes into the key: the LiteLLM setup and the normalizer."""
 
-    model_behaviour_checksum: str
+    litellm_config_checksum: str
     litellm_image: str
     normalizer_version: str = NORMALIZER_VERSION
 
     def as_dict(self) -> Dict[str, str]:
         return {
-            "model_behaviour_checksum": self.model_behaviour_checksum,
+            "litellm_config_checksum": self.litellm_config_checksum,
             "litellm_image": self.litellm_image,
             "normalizer_version": self.normalizer_version,
         }
