@@ -1161,6 +1161,100 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             "have the record read as infrastructure",
         )
 
+    SUBMIT_PROBE = "a2a.submit.cluster.read.top.task-0001"
+
+    def test_A3_the_submit_subject_has_exactly_one_writer(self) -> None:
+        """A profile task's `…submit` is written by the gateway and nobody else.
+
+        The submission is where a profile task's grant enters the task plane:
+        the gateway mints it against the profile it resolved, with the
+        requester's tier and the target in scope, and the dispatcher admits
+        what arrives there. A second writer could submit a task under a grant
+        it didn't mint, or fill a profile's queue with work nobody asked for.
+        The dispatcher reads the subject through its durables and holds no
+        publish on it; no session or profile worker derives one.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.SUBMIT_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a profile's submit "
+                "subject; a worker that can write there can start tasks of its own",
+            )
+        dispatcher = self._dispatcher_identity()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on a profile's submit subject")
+
+    # The ways the tree spells each subject: the library helpers, their
+    # prefix constants and the literal. An executor's or the dispatcher's
+    # grant written through any of them is a second writer.
+    SUBMIT_SPELLINGS = ("TaskSubmitSubject", "SubmitSubjectPrefix", ".submit", "a2a.submit")
+    STOP_SPELLINGS = ("DispatchStopSubject", "DispatchStopPrefix", "a2a.stop")
+
+    @staticmethod
+    def _dispatcher_identity() -> str:
+        """`dispatcherIdentity`'s body: the dispatcher authenticates through
+        the callout, so no served config carries its grants."""
+        return h.go_function_body(h.text("a2a_dispatcher"), "dispatcherIdentity")
+
+    # The dispatcher's reads of the stop record: its subscription on each
+    # profile's records (the `stops` list) and the direct get it catches up
+    # with after a restart. Reads don't count as writers.
+    DISPATCHER_STOP_READS = ("$JS.API.DIRECT.GET.", "stops = append(stops,")
+
+    @classmethod
+    def _dispatcher_writes(cls) -> str:
+        """`dispatcherIdentity`'s body without its reads of the stop record
+        and without comments, so a spelling left in it is a write."""
+        lines = cls._dispatcher_identity().splitlines()
+        return "\n".join(
+            line
+            for line in lines
+            if not line.lstrip().startswith("//") and not any(read in line for read in cls.DISPATCHER_STOP_READS)
+        )
+
+    STOP_PROBE = "a2a.stop.cluster.task-0001"
+
+    def test_A3_the_stop_record_has_exactly_one_writer(self) -> None:
+        """A profile task's stop record is written by the gateway and nobody else.
+
+        The dispatcher drops a queued task, or cancels a held one, when its
+        stop record appears, without reading the task's `…in`. A second
+        writer could stop another requester's task. The dispatcher's own
+        publish on `a2a.dispatch.*.*.*` doesn't reach the record's root,
+        `a2a.stop`, and no session or profile worker derives a grant there.
+        """
+        writers = sorted(
+            builder
+            for builder, grants in self._rendered_publish_grants().items()
+            if any(self._subject_matches(g, self.STOP_PROBE) for g in grants)
+        )
+        self.assertEqual(["gateway"], writers)
+        derivation = self._session_publish_derivation()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a stop record; "
+                "a worker that can write there can stop other requesters' tasks",
+            )
+        dispatcher = self._dispatcher_writes()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a publish grant on the stop record")
+        # The reads left out above are only reads while their list stays on
+        # the subscribe side: the stop subjects can't be spliced into the
+        # publish list.
+        body = self._dispatcher_identity()
+        publish = body[body.index("publish:") : body.index("subscribe:")]
+        self.assertNotIn("stops", publish, "the dispatcher's stop-record subscription list reaches its publish grants")
+
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
     NOTIFY_CONSOLE_PROBE = "chat.notify.console"

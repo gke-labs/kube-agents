@@ -23,8 +23,10 @@ The declarative subagent framework (its own doc) owns profile-addressed delegati
 the dispatcher, Jobs, `AgentProfile`s. This doc stops at the session boundary, with one
 amendment (8/31): the Delegate flow below hands a single task to a fresh
 gateway-spawned session worker, which stays inside the session model - the worker is an
-incarnation of the conversation's own session, not a profile executor - and a second
-(9/25): "Sessions by default" below, where the session itself delegates.
+incarnation of the conversation's own session, not a profile executor - a second
+(9/25): "Sessions by default" below, where the session itself delegates - and a third
+(10/28): "Routing to AgentProfiles" below, the gateway's half of profile dispatch. The
+dispatcher, its queues and the workers are `docs/designs/spec-profiles-dispatch.md`'s.
 
 ## The gateway holds no model
 
@@ -445,8 +447,9 @@ stopped; a straggler from a retired incarnation, an event after the active task 
 request from a turn the human stopped (whichever of the two the gateway handled first) is ignored
 and logged under one rule (`delegation.stale`),
 never relayed - a different rule from a part that fails to parse, is blank, or is over the text cap,
-which is ignored and logged separately (`delegation.malformed`). Only `platform` can be the
-addressee today.
+which is ignored and logged separately (`delegation.malformed`). The addressee is `platform`
+or an AgentProfile, resolved, scoped and minted as "Routing to AgentProfiles" says; anything
+else is refused (`delegation.target`).
 Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is its parent's plus
 one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
 rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
@@ -641,6 +644,69 @@ paid.
 
 What this costs is pods: one per live conversation, bounded by the session cap and the
 idle TTL. That is the figure to measure before the default flips.
+
+## Routing to AgentProfiles (added 10/28)
+
+A turn or a delegation can name an AgentProfile instead of `platform` or the conversation's
+session: the console frame's `addressee` and `parameters`, or a delegate request's. Chat doors
+don't name one; their turns go to the conversation's route. The gateway does the four steps of
+`spec-profiles-dispatch.md`, "Addressing", before the conversation's route moves, so a refusal
+leaves the record as it was:
+
+1. **Resolve.** The gateway knows the profiles from their cards on `DIRECTORY`: it subscribes
+   to `a2a.agents.*`, then reads each subject's newest card with a direct get, and a card the
+   subscription saw first is never overwritten by the read. A profile whose card declares
+   `project`, `location` and `cluster` parameters takes a cluster target. A profile pinned to a
+   cluster (`clusterRef`) takes only that cluster, and gets its own cluster's parameters when it
+   is addressed with none; a profile that takes a target yields to the one profile pinned to
+   it; two profiles pinned to one cluster is refused rather than guessed between; a profile
+   that takes no target refuses one.
+2. **Scope.** The target is checked against the install's `spec.scope`, from the `scope.json`
+   the operator mounts into the gateway pod (`A2A_SCOPE_FILE`), read per task. An exclusion
+   refuses, and `exclude.projects` matches as the reconcile does: an ID or a shell-style glob
+   over IDs, with a project number matching only an equal entry. The install's own project
+   (`A2A_MANAGEMENT_PROJECT`, from `spec.harness.projectId`) is always in scope, and an
+   `exclude.projects` entry matching it is ignored. A declared project list admits only its
+   projects. Under a folder or organization
+   scope the gateway can't resolve membership yet, so a target whose project the list
+   doesn't name is refused: "not excluded" isn't "in scope". An install that declares no scope
+   (`present: false`) draws no boundary, as the platform agent reads it, so only exclusions
+   apply; a missing or unreadable file refuses every target.
+3. **Mint.** The grant names the resolved profile, the requester's tier and the target as its
+   scope (`project/P/location/L/cluster/C`, or the install's namespace with no target), with
+   the dispatcher as its delegate, because the dispatcher is the one verifier caller for a
+   profile task. Until the PlatformAgent's membership mapping exists, every person at any door
+   is `read`, and a requester with no identity is refused; no trigger submits through the
+   gateway yet, so nothing is minted `unattended`. A delegated profile child runs at its
+   parent's tier when the parent is a profile task, and at its requester's otherwise. A profile
+   task can't delegate to `platform`, whose child would be minted at the install's tier and
+   scope.
+4. **Submit.** The submission goes on `a2a.submit.<profile>.<tier>.<kind>.<task>`, on the `PROFILE_SUBMITS` stream, `top`
+   for a client's turn and `child` for a delegation, with the parameters as a `taskParameters`
+   part. The gateway is the subject's one writer. Steers, a stop and follow-ups go to the task's
+   own `a2a.tasks.<profile>.<task>.in`.
+
+A refusal at any step posts its reason (a turn's "not started", a delegation's "delegation
+refused") and submits nothing. A turn naming a profile while the conversation has a task running is refused rather than
+steered into that task. A profile task may delegate in turn, under the same checks as a session
+turn except the incarnation's author set, since a warm worker is reset between tasks. Like a
+session turn, it delegates once: a second request from the same task is dropped as a repeat,
+because nothing yet tells a new request from a redelivered one. A child's
+end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
+reads while it waits open, and the parent holds the conversation again, so a stop or a steer
+reaches it. A session parent is woken as before. A top-level profile task's own end is its
+chain's end, delegated or not. A stop while the child runs cancels the child and every profile
+task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
+`{"v":1,"taskId":…}` on `a2a.stop.<profile>.<task>` in the `DISPATCH_STOPS` stream, for the
+dispatcher, which has no read on `.in`. The gateway is the record's one writer, and a task
+addressed to platform or a session gets none. The stream and the dispatcher's reader aren't
+built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
+queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
+published while the gateway's connection was down is picked up, and a profile no longer on
+`DIRECTORY` is forgotten. The delegate tool
+the worker adapter serves still offers no `parameters`, so a session can delegate to a pinned
+profile or one that takes no target; offering the field is text the model reads and lands with
+its own eval case.
 
 ## Session lifecycle
 
@@ -2400,8 +2466,9 @@ without one), looking again every minute for 30 minutes so that a provision Job 
 upgraded gateway started still turns it on, then stopping, so a NATS server that never grants the
 gateway the bucket does not log a refused request every minute; and the gateway's user is the only reader and writer of its
 records by grant (provision and seed hold STREAM.INFO on it, which can list the keys: task id and rater). It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
-conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
-the rating.
+conversation and the rating, never the text; `answer_feedback_total` carries only the platform, the
+rating and what kind of message was rated (`answer`: `reply` for the chain's own answer, `card` for a
+card's report that settled the ask, `other` when no session record names the rated task).
 
 An answer whose layout is already at Slack's 50-block cap posts laid out without the controls. The
 answered line a click or typed reply leaves on an answer's question goes above the controls, which
@@ -2510,7 +2577,9 @@ already (the `web` read surface), so the door is on the bus too, and the identit
 the one every other writer here has.
 
 **Transport.** Core NATS, no stream. The browser publishes a frame -
-`{"messageId","text","kind"}`, `kind` defaulting to `text` - to `chat.console.<token>.in`;
+`{"messageId","text","kind"}`, `kind` defaulting to `text`, with an optional `addressee` and
+`parameters` that send the turn to an AgentProfile ("Routing to AgentProfiles") - to
+`chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
@@ -2814,7 +2883,7 @@ text, so nothing a chat user or an executor sends can mint a series:
 | `kubeagents_a2a_gateway_chat_messages_total`         | `outcome`: `rendered`, `text_only`, `refused`, `invalid`                                                                                         | Each `kube-agents.chat/v1` message the gateway hands an adapter, and each it drops, on the relay and on a conversation notify ("Chat messages" under the Slack adapter): laid out by the backend; posted as its text by a backend that renders none; refused by a backend that does (too large for it, or its API said no) and posted as its text; or, under `invalid`, dropped for a broken rule with the text standing, or a bad `mark` dropped alone with the layout still rendering. Counted per hand-over, so a live message laid out again on each progress artifact counts each time.                                                                                                                                                   |
 | `kubeagents_a2a_gateway_notify_marks_dropped_total`  | none                                                                                                                                             | Conversation notify marks dropped because they name no chain (no `update` key bound to one) while a chain runs in the conversation ("Chat messages" under the Slack adapter).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `kubeagents_a2a_gateway_messages_inbound_total`      | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`                                                                                 | Each chat message the gateway accepted as a turn, counted in `handleInbound` before the sender is verified, so a message from a sender the principal map does not know counts, as the `chat_metrics` plugin counts the Hermes-side ingress before its allowlist; the doors' turns (inject, a2a, a2a-google) are programs' and are not counted. The operator's usage poller reads it into `status.usage.chatMessagesInboundTotal` beside the plugin's series.                                                                                                                                                                                                                                                                                   |
-| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`                                                | Each rating a verified sender gave an answer ("Answer feedback" under the Slack adapter), counted before the 👎's record is written, so a rating the bucket could not keep still counts; a rating changed counts again.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `kubeagents_a2a_gateway_answer_feedback_total`       | `platform`: `googlechat`, `slack`, `discord`, `console`, `other`; `rating`: `up`, `down`, `other`; `answer`: `reply`, `card`, `other`            | Each rating change a verified sender made on an answer ("Answer feedback" under the Slack adapter): a first rating, or a flip between 👍 and 👎, counted once the record is kept, so a repeated rating and one the bucket could not keep are not counted; `answer` is `card` when a card's report settled the ask (`TaskRef.CardsAnswer`), `reply` for the chain's own answer, and `other` when no session record names the rated task (unreadable or reaped).                                                                                                                                                                                                                                                                                 |
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter

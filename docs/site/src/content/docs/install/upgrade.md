@@ -488,6 +488,9 @@ cluster that cannot grow to three nodes, set the chart value
 `platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the switch: once the
 bus exists, its server count cannot change.
 
+With Google Chat or Slack on, a full run prints the chat setup checklist for the mode it applied
+after "Upgrade Complete!", so the app steps that mode needs are on the screen after the switch.
+
 ### Google Chat
 
 With Google Chat enabled, Google Chat takes the A2A gateway under `next`. Each top-level

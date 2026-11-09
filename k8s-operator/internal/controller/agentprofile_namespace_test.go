@@ -83,6 +83,7 @@ func TestBuildProfileQuota(t *testing.T) {
 		{"no warm workers", profileTunedAgent(ptr.To(5), ptr.To(0)), []agentv1alpha1.AgentProfile{readOnly}, 0 + 1 + 5},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
 			q := buildProfileQuota(tc.agent, tc.profiles)
 			if q.Namespace != "test-ns-profiles" || q.Name != "test-agent-profile-quota" {
 				t.Errorf("quota at %s/%s, want test-ns-profiles/test-agent-profile-quota", q.Namespace, q.Name)
@@ -97,6 +98,34 @@ func TestBuildProfileQuota(t *testing.T) {
 				t.Errorf("the quota carries owner references %v; one can't point across namespaces", q.OwnerReferences)
 			}
 		})
+	}
+}
+
+// Where Job mode can run, a task's slot frees once its Job is deleted, while
+// that Job's pod may still be in its deletion grace period, which the pods
+// quota counts: the next Job's pod would then be refused. The quota adds a
+// second ceiling's worth for one terminating Job pod per slot, but only with
+// the chart's Job policy signal and a profile allowing the unattended tier.
+func TestTheProfileQuotaCoversTerminatingJobPods(t *testing.T) {
+	readOnly := testAgentProfile("test-ns", "a")
+	unattended := testAgentProfile("test-ns", "c", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierUnattended}
+	})
+	agent := profileTunedAgent(ptr.To(5), ptr.To(1))
+	pods := func(profiles ...agentv1alpha1.AgentProfile) int64 {
+		q := buildProfileQuota(agent, profiles)
+		return q.Spec.Hard.Pods().Value()
+	}
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	if got, want := pods(readOnly, unattended), int64(1*1+1+2*5); got != want {
+		t.Errorf("Job mode on, an unattended profile: pods = %d, want %d (a warm pool and its surge, and the ceiling twice)", got, want)
+	}
+	if got, want := pods(readOnly), int64(1*1+1+5); got != want {
+		t.Errorf("Job mode on, no unattended profile: pods = %d, want %d", got, want)
+	}
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	if got, want := pods(readOnly, unattended), int64(1*1+1+5); got != want {
+		t.Errorf("no Job policy signal: pods = %d, want %d (unattended tasks have no worker)", got, want)
 	}
 }
 

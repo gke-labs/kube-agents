@@ -873,7 +873,7 @@ inject_target() {
       note "svc/${INJECT_NAME} has no selector; forwarding to the service" >&2
     elif ! pods="$(k_read get pods -l "${selector%,}" -o name)"; then
       note "listing the pods svc/${INJECT_NAME} selects failed; forwarding to the service" >&2
-    elif printf '%s\n' "${pods}" | grep -qxF "pod/${holder}"; then
+    elif grep -qxF "pod/${holder}" <<<"${pods}"; then
       echo "pod/${holder}"
       return 0
     else
@@ -1011,7 +1011,7 @@ wait_bridges_consuming() {
   while :; do
     missing=""
     for sidecar in ${BUS_SIDECARS}; do
-      if ! k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null | grep -qF "${BRIDGE_CONSUMING_LOG_MSG}"; then
+      if ! grep -qF "${BRIDGE_CONSUMING_LOG_MSG}" <<<"$(k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null)"; then
         missing="${missing} ${sidecar}"
       fi
     done

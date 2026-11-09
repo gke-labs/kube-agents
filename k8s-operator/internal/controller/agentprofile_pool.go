@@ -283,6 +283,17 @@ func profileWorkerResetPaths(mounts []corev1.VolumeMount, volumes []corev1.Volum
 	return paths
 }
 
+// profileWorkerToolsProblem says why a profile's worker pod, a pool's or a
+// Job's, would never schedule, or "": past profileWorkerAutopilotToolLimit
+// tools with image volumes off, its ephemeral request passes Autopilot's 10Gi.
+func profileWorkerToolsProblem(p *agentv1alpha1.AgentProfile, imageVolumes bool) string {
+	if n := len(p.Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
+		return fmt.Sprintf("AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
+			p.Name, n, profileWorkerAutopilotToolLimit)
+	}
+	return ""
+}
+
 // profilePoolName is the warm pool Deployment for one (profile, tier).
 func profilePoolName(profile, tier string) string {
 	return "agentprofile-" + profile + "-" + tier
@@ -354,8 +365,12 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 // reconcileProfilePools renders a warm pool for every admitted profile's
 // interactive tiers, with the CA bundle they mount, and removes this agent's
 // pools that no longer have a profile or tier. Only with the dispatcher, which
-// is the pools' only source of work.
-func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution) error {
+// is the pools' only source of work. keepBundle says dispatcher Jobs may still
+// mount the bundle (Job mode signalled, even if revoked, since a revoke leaves
+// running Jobs to finish; or a gate-off sweep that didn't finish): it is then
+// kept even with no pool. bundleCopied says the caller copied the bundle this
+// pass (before publishing Job templates), so it isn't copied again.
+func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, bundleCopied, keepBundle bool) error {
 	imageVolumes := r.imageVolumeSupported(agent)
 	var pools []*appsv1.Deployment
 	var errs []error
@@ -376,23 +391,29 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 			// never schedule. The pool isn't applied, and the error names the
 			// profile, like a pool the API server refuses (which stays
 			// wanted too, so an earlier pool isn't swept).
-			if n := len(profiles[i].Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
-				errs = append(errs, fmt.Errorf("the warm pool %s: AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
-					pool.Name, profiles[i].Name, n, profileWorkerAutopilotToolLimit))
+			if problem := profileWorkerToolsProblem(&profiles[i], imageVolumes); problem != "" {
+				errs = append(errs, fmt.Errorf("the warm pool %s: %s", pool.Name, problem))
 				continue
 			}
 			pools = append(pools, pool)
 		}
 	}
 	if len(want) == 0 {
+		if keepBundle {
+			return r.deleteProfilePoolsExcept(ctx, agent, nil)
+		}
 		// Nothing left to mount the bundle copy either.
 		return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
 	}
 	// The CA bundle the pools mount, copied before the pools that need it.
 	// A copy that fails skips the pool applies (they would mount nothing)
 	// but not the sweep, which needs nothing from it.
-	if err := r.copyProfileCABundle(ctx, agent); err != nil {
-		errs = append(errs, err)
+	var copyErr error
+	if !bundleCopied {
+		copyErr = r.copyProfileCABundle(ctx, agent)
+	}
+	if copyErr != nil {
+		errs = append(errs, copyErr)
 	} else {
 		// One pool the API server refuses (a profile whose requests exceed
 		// its limits, a webhook) doesn't hold up the others or the sweep: a
