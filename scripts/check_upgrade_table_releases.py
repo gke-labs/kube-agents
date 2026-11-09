@@ -7,13 +7,12 @@ The "Breaking changes in recent releases" table labels each row with the release
 first meets the change in. A pull request writes that label when it merges, naming the release
 its author expects next, and a release cut from an earlier commit leaves the label wrong. Once a
 release is tagged, this check finds the commit that added each row labelled with it (the oldest
-commit whose diff adds a table row with the change text in its change cell, after the last commit
-that removed such a row) and requires the tag to contain
-that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
+commit whose diff adds a release or `pending` row whose change cell is the change text, after the
+last commit that removed such a row) and requires the tag to contain that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
 to the release branch). A row whose release has no tag yet is not checked. Nor is a row for a
 release tagged before the table itself was added: those rows were written afterwards, about
 releases that had already shipped. A row no commit can be found for is reported, not passed. The
-change text is the row's key: a cell that keeps its text and loses a prefix still traces to the row's
+change text is the row's key: a cell that keeps its text and loses a `#<number>: ` prefix still traces to the row's
 first commit, and a cell reworded after its release traces to the rewording commit.
 
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
@@ -42,11 +41,12 @@ TABLE_HEADING = "### Breaking changes in recent releases"
 # A table row: `| <release> | <change> | ...`. The change cell is the row's stable name.
 ROW = re.compile(r"^\| (?P<release>\d+\.\d+\.\d+)\s*\| (?P<change>[^|]+?)\s*\|", re.MULTILINE)
 # A table line in a diff: `git log -G` lists the commits that add or remove one. A commit counts as
-# adding a row only when one of its added lines holds the change text in its second (change) cell, so
-# the same words in prose or in another cell do not stand in for the row; the first cell may still say
-# `pending`, and a row whose cell later lost a prefix still traces to its start.
+# adding a row only when one of its added lines is a release row (or one still labelled `pending`)
+# whose change cell is the change text, after an optional `#<number>: ` prefix that later cells
+# dropped. So the same words in prose, in another table or inside a longer cell do not stand in for
+# the row, and a row whose cell later lost the prefix still traces to its start.
 DIFF_TABLE_LINE = r"^\| "
-TABLE_LINE = re.compile(r"^\| [^|]*\| (?P<change>[^|]+?)\s*\|")
+TABLE_LINE = re.compile(r"^\| (?:pending|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
@@ -111,7 +111,7 @@ def page_diff(commit: str) -> list[str]:
 
 
 def holds(diff: list[str], sign: str, change: str) -> bool:
-    return any(line.startswith(sign) and (m := TABLE_LINE.match(line[1:])) and change in m["change"] for line in diff)
+    return any(line.startswith(sign) and (m := TABLE_LINE.match(line[1:])) and m["change"] == change for line in diff)
 
 
 def row_commit(change: str) -> str | None:

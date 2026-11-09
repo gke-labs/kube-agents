@@ -186,6 +186,25 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.repo.tag("1.0.0")
         self.assertEqual(self.repo.check(), (0, ""))
 
+    def test_removing_a_longer_row_that_holds_the_change_text_leaves_the_row_traced(self):
+        self.repo.commit("feat: b", row=row("1.0.0", "change b"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: b2", row=row("1.1.0", "change b extended"))
+        self.repo.rows.remove(row("1.1.0", "change b extended"))
+        self.repo.write_page()
+        self.repo.commit("revert: b2")
+        self.assertEqual(self.repo.check(), (0, ""))
+
+    def test_another_tables_second_cell_does_not_stand_in_for_the_row(self):
+        self.repo.prose = "| Key | Where to read it |\n| --- | --- |\n| `K` | change k |\n\n"
+        self.repo.write_page()
+        self.repo.commit("docs: a key table")
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: k", row=row("1.0.0", "change k"))
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('"change k"', err)
+
     def test_a_row_added_as_pending_and_labelled_after_the_cut_traces_to_its_first_commit(self):
         self.repo.commit("feat: p", row=row("pending", "change p"))
         self.repo.tag("1.0.0")
