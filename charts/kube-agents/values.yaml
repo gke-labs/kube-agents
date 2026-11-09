@@ -1382,7 +1382,7 @@ platformAgent:
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
-    # refuses a memory limit below 672Mi (two commands at once), a request
+    # refuses a memory limit below 544Mi (two commands at once), a request
     # above its limit, a
     # negative quantity, a zero limit, claims, and any resource name other than cpu, memory and
     # ephemeral-storage, whether or not its webhook is enabled: the reconciler

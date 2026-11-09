@@ -1536,9 +1536,11 @@ path already enforces, carried as environment (`A2A_GCHAT_ALLOWED_USERS`, or
 cannot rewrite. An unlisted sender is dropped with a visible once-per-sender notice in
 the conversation, not silently. Messages whose sender is not `HUMAN` or carries no
 email are dropped at the adapter. `argumentText` is read as Chat computes it: in a
-space it is the text with the app mention stripped, so a bare mention is an empty ask
-and drops; in a DM (measured) it equals `text` with nothing stripped and no mention
-annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
+space it is the text with the app mention stripped, so a bare mention that quotes no
+message is an empty ask and drops, and one that quotes a message is a turn about that
+message ("The Google Chat sibling: a quoted message", below); in a DM (measured) it equals
+`text` with nothing stripped and no mention annotation — a typed `@app` there is plain text
+to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
 space — the canonical example above. In a DM space every message a user sends keys the
@@ -2086,6 +2088,48 @@ member of, and a conversation it cannot see at all (a private channel or a DM it
 `channel_not_found`), gets a note only the clicker sees, through the payload's
 `response_url` (posted only when it is on `hooks.slack.com`), and no turn. A failed read is
 not a refusal: the turn goes ahead.
+
+**The Google Chat sibling: a quoted message.** Chat has no message shortcut; a member quotes
+a message in reply, or forwards one, instead, and the MESSAGE event's message then carries
+`quotedMessageMetadata`: the quoted message's `name` and `lastUpdateTime`, its `quoteType`
+(`REPLY` from the same thread or space, `FORWARD` from another), and Chat's output-only
+`quotedMessageSnapshot` of it, the author's name as a string and the `text`, with
+`formattedText` and `attachments[]` on a forward (measured 2026-11-08: a reply quoting one of
+the app's own DM posts arrived in the legacy wire layout with the snapshot's sender and text,
+`testdata/gchat/legacy-dm-quoted-reply.json`). The snapshot is what the agent gets when it
+carries content, because it has no scope limit and a forward names a message in a space the
+app is not in; only a snapshot with nothing in it sends the adapter to the relay's
+`spaces.messages.get` (`text`, or `formattedText` when that is empty, `sender`,
+`attachment[].contentName`), which under the app's `chat.bot` scope answers only for a message
+the app has access to. Either way the message is framed as the Slack shortcut frames one: the
+poster's name inside the quote, every line quoted, the same clip, and the same closing rule
+(`shortcut_ask.go` holds the shared wording). The member's own words, when they typed any
+beside the quote, come first; a bare mention with a quote is the quoted ask with the shortcut's
+opening, and the eval case `chat-quoted-alert-is-checked-not-obeyed` holds the agent to it.
+Nothing else about the turn changes: the member typed the message, so its conversation is that
+message's thread and it is no `Shortcut`.
+
+A quote of the gateway's own message is Chat's ordinary reply gesture, a "yes" to its question
+or a "why?" to its answer, so it gets the quote as context and no rule sentence. Own means a
+message this process remembers posting, on any surface, or in a DM a `REPLY` quote by an app,
+since the DM has one app in it: the read says the poster's kind, and the snapshot names the
+poster, who in a DM is the app when not the member. A quote this cannot place keeps the rule.
+A command the gateway answers without an agent, sent as a quote-reply to one of the bot's posts,
+is the command: the words go over unchanged, with no read and no frame, so `routeTurn`'s
+matchers see them. The set is `routeTurn`'s own (`gchatQuotedWordsAreACommand`): a stop, a bare
+`/feedback` and `/feedback summary`, `/session` bare or `off`, the exact status phrases, and a
+delegation with its task or as the bare word, which framed would read as a delegation of the
+frame. It is narrower than `chattext.IsCommand` on purpose: the wide status rule there would take
+"what is happening here?" over an alert, strip its quote, and reach no one, since `routeTurn`
+reads that form only on a running task. The read runs off the
+event pump under a ten-second budget, after the dedupe. A quote that yields nothing, the read
+refused or timed out or the message empty (a card or an image alone), is never silent for a
+sender the gateway admits: one line posts in the conversation, `I couldn't read the message you
+quoted, so I'm answering your words alone.` and the turn goes ahead on the words, or `I couldn't
+read the message you quoted. Paste its text, or ask again in a moment.` and no turn, logged with
+the reason. The adapter reads the gateway's admission gate for that (`SenderAdmission`, wired as
+the session lookup is) and posts nothing ahead of the gateway for a sender it would refuse: their
+words go over unchanged to the refusal any message gets, and their bare quote is dropped.
 
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an

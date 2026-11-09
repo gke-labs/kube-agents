@@ -42,7 +42,7 @@ under NO_REGISTERED_REPO.
 
 With --list it prints both registries instead, for reading rather than
 gating: `managed_repos` (swept, audited, sent pull requests) and
-`context_repos` (read for declared intent only, never written):
+`context_repos` (read-only: declared intent and diagnosis, never written):
 
     MANAGED: <repo> ... | none | none usable (<n> registered, unusable: ...)
     CONTEXT: <host/path>[@<ref>] ... | none           exit 0, or 5 if unreadable

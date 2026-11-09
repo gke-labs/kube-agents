@@ -624,8 +624,8 @@ The arithmetic behind `6`:
   waiting on its own children gives its slot back but stays resident, so the process count can sit
   above six; the 8Gi limit leaves room for about fourteen workers at that size.
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
-  request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
-  fixed reserves. At its default 2Gi limit that is 9 at once
+  request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
+  reserve for the broker and Envoy. At its default 2Gi limit that is 10 at once
   (`credentialProxyAdmittedRequests` in
   `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
   the old 1Gi it was 4.
@@ -938,7 +938,7 @@ The default requests are 500m CPU and 1Gi of memory, and on GKE Autopilot 2 CPU 
 
 The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet, or pick a [`sizingProfile`](#specdeployment) row that raises it. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares.
 
-**What the operator refuses.** A memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the sizing profile's row (the operator's defaults under `small`) rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
+**What the operator refuses.** A memory limit below 544Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the sizing profile's row (the operator's defaults under `small`) rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
 
 **What admission adds.** Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns, using the Autopilot default requests on every cluster type, when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only.
 
@@ -1401,7 +1401,7 @@ The fleet audit does not need `--repo`, because the operator also writes the val
 
 An existing entry counts as present when it names the same repository on `github.com` in another spelling — a `.git` suffix, a remote, a run of `/` after the host — but not in another case, since the agent's `--repo` checks compare the spelling (so the declared spelling is added beside it). Nor does it count on `www.github.com` or `ssh.github.com`, with or without a scheme, nor under a `type` other than the forge's provider, nor in a spelling with two `@`, nor one over 256 characters, since the agent reads none of those. Reconciliation only adds, and keeps every existing entry as written, so removing a repository means removing it from the CR _and_ editing the ConfigMap.
 
-**The two lists.** `managed_repos` is read-write. `context_repos` names repositories the agent reads for declared intent — a Terraform repository an audit consults before it reports a posture as a finding — and never writes to; an administrator may also add entries to it by hand.
+**The two lists.** `managed_repos` is read-write. `context_repos` names repositories the agent reads and never writes to. An audit consults them for declared intent before it reports a posture as a finding. A diagnosis reads them to find the file that defines a value when the fix is not in a managed repository ([Write scope shapes a diagnosis](/kube-agents/concepts/declarative-workflow/#write-scope-shapes-a-diagnosis)). An administrator may also add entries to it by hand.
 
 An entry may add `"ref": "<branch>"` to read a branch other than the remote's default. A `ref` is kept when it is made of letters, digits, `.`, `_`, `/`, `-` and, after the first character, `@`, and passes git's branch-name rules (no `..`, `@{`, `//` or `.lock` component, no leading `-`).
 
@@ -1432,7 +1432,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
-`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
+`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.positiveFeedbackTotal`,
 `usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
@@ -1554,7 +1554,7 @@ record. Under a served CRD that predates `status.usage` they accumulate in the
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
 later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.

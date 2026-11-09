@@ -125,7 +125,9 @@ def lane_run(run: dict) -> dict:
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "log_url": run.get("log_url") if isinstance(run.get("log_url"), str) else None,
-        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
+        # Also set for a night whose Spyglass log_url is into a private bucket
+        # (a record from before gcs_base): the row links the Console instead.
+        "gcs_base": nightly.console_base(run),
         "started": run.get("started"),
         "finished": run.get("finished"),
         "duration_s": run.get("duration_s") if isinstance(run.get("duration_s"), (int, float)) else None,
