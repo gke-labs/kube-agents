@@ -106,7 +106,7 @@ In interactive mode, `install.sh` prompts for the path to the `.pem` file if the
 For automated CI/CD pipelines, release automation, or production environments where runners do not handle raw private keys, pre-provision the Cloud KMS key upfront following the official [GitHub Token Minter documentation](https://github.com/abcxyz/github-token-minter) and the [Google Cloud KMS key import guide](https://cloud.google.com/kms/docs/importing-a-key):
 
 1. **Pre-provision Cloud KMS Key & Import Private Key:**
-   Follow the upstream [GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to configure your Cloud KMS keyring and key, and import your GitHub App's private key. On a new install, `kube-agents` expects the key ring `<cluster>-minter-keyring` and key `<cluster>-minter-key` in your cluster's region, so pass the names you pre-provisioned with `--kms-keyring` and `--kms-key`. A key you pre-provision yourself carries no owner labels, so also set `MINTER_SHARED_KEY=<keyring>/<key>` in `install.env` to tell the installer to adopt it.
+   Follow the upstream [GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to configure your Cloud KMS keyring and key, and import your GitHub App's private key. On a new install, `kube-agents` expects the key ring `<cluster>-minter-keyring` and key `<cluster>-minter-key` in your cluster's region, so pass the names you pre-provisioned with `--kms-keyring` and `--kms-key`. A key you pre-provision yourself carries no owner labels. Naming it with both flags (or `KMS_KEYRING` and `KMS_KEY` in `install.env`) tells the installer to adopt it as this install's own, and the apply labels it.
 
 2. **Deploy `kube-agents` without `.pem`:**
    Once the key holds an `ENABLED` version in Cloud KMS, invoke `install.sh` without `--github-pem-path`:
@@ -130,7 +130,7 @@ The deployment requires the following variables in `install.env` or via CLI flag
 - `GITHUB_PEM_PATH` (`--github-pem-path`) — path to `.pem` (Path 1 only; omitted when key is pre-provisioned).
 - `KMS_KEYRING` (`--kms-keyring`) — Cloud KMS keyring name (default `<cluster>-minter-keyring` on a new install; an existing install keeps the name it has).
 - `KMS_KEY` (`--kms-key`) — Cloud KMS key name (default `<cluster>-minter-key` on a new install, likewise).
-- `MINTER_SHARED_KEY` — a key the install shares on purpose, as `<keyring>/<key>`. The installer won't adopt a key another install owns, or one with no owner labels, unless this names it.
+- `MINTER_SHARED_KEY` — a key the install shares on purpose, as `<keyring>/<key>`. The installer won't adopt a key another install's owner labels claim unless this names it. A key with no owner labels is adopted as this install's own when `KMS_KEYRING` and `KMS_KEY` name it, and is refused otherwise.
 
   `GITOPS_ORG` and `GITOPS_REPO` were previously named `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
   deprecation warning.

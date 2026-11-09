@@ -853,10 +853,10 @@ Flags for AI Agents & Automation:
                                 and the installer restarts the minter so it reads the CA
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
-  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
-                                currently github-token-minter-keyring)
-  --kms-key=KEY                 Cloud KMS Key Name for token minter (default: DEFAULT_KMS_KEY,
-                                currently github-token-minter-key)
+  --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default on a new install:
+                                <cluster>-minter-keyring; an install with a minter keeps its own)
+  --kms-key=KEY                 Cloud KMS Key Name for token minter (default on a new install:
+                                <cluster>-minter-key; an install with a minter keeps its own)
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
@@ -3377,7 +3377,9 @@ apply_minter_name_defaults() {
 # Says whose minter key the interview's key ring and key name, when it exists,
 # isn't in this install's state and isn't this install's own (#3504), and asks
 # before adopting it: a yes records MINTER_SHARED_KEY for that one key, which
-# lifecycle.sh's adoption step honours. Without a terminal to ask at, refuses
+# lifecycle.sh's adoption step honours. A key with no owner labels whose names
+# were given explicitly is adopted as this install's own (MINTER_ADOPT_KEY).
+# Without a terminal to ask at, refuses
 # here, before anything is provisioned, rather than at the apply. A key that is
 # absent or can't be described is left to lifecycle.sh's own check.
 confirm_minter_key_owner() {
@@ -3394,6 +3396,16 @@ confirm_minter_key_owner() {
        return 0 ;;
   esac
   [ "$owner" = "${cluster}/${namespace}" ] && return 0
+  # A key with no owner labels that this run was named explicitly (KMS_KEYRING
+  # and KMS_KEY, from install.env, the environment or the flags) is a choice,
+  # not the silent default adoption the labels exist to stop: it is adopted as
+  # this install's own, and the apply labels it. Labels win over a name: a key
+  # another install's labels claim is refused below whatever named it.
+  if [ -z "$owner" ] && [ "${PARAM_KMS_KEYRING_GIVEN:-false}" = "true" ] && [ "${PARAM_KMS_KEY_GIVEN:-false}" = "true" ]; then
+    print_info "Cloud KMS key ${ring}/${key} carries no owner labels and was named explicitly, so this install adopts it as its own; the apply labels it."
+    export MINTER_ADOPT_KEY="${ring}/${key}"
+    return 0
+  fi
   if [ -n "$owner" ]; then
     print_warning "Cloud KMS key ${ring}/${key} belongs to install ${owner} (its owner labels), not this one (${cluster}/${namespace})."
   else

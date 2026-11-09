@@ -165,7 +165,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             # In an `if`, as the call site's `|| exit 1` is: install.sh's ERR trap
             # would otherwise abort the shell on the refusal's return 1.
             + 'if confirm_minter_key_owner ring key us-central1 p cluster-b; then rc=0; else rc=1; fi; '
-            + 'echo "rc=$rc shared=${MINTER_SHARED_KEY:-}"'
+            + 'echo "rc=$rc shared=${MINTER_SHARED_KEY:-} adopt=${MINTER_ADOPT_KEY:-}"'
         )
         return self._run_install_func(script, env=env)
 
@@ -194,6 +194,42 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
     def test_a_key_already_in_this_state_needs_no_question(self):
         proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring|key|gsa")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """Naming the key is a choice, not the silent default adoption: adopted, and labelled at the apply."""
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=0 shared= adopt=ring/key", proc.stdout, proc.stderr)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertNotIn("adopt=ring/key", proc.stdout)
+
+    def test_half_a_name_is_not_an_explicit_choice(self):
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
+    def test_an_environment_rebuild_adopts_its_own_unlabelled_key(self):
+        """rc and nightly: uninstall, then install.sh -y from render_install_env.sh's file.
+
+        The state holds no minter after the uninstall, and the project-wide key
+        has no labels from before them; the rendered file names it, so it is adopted.
+        """
+        rendered = self._empty_install_env.parent / "rendered.env"
+        render = subprocess.run(
+            [str(_REPO_ROOT / "scripts/release/render_install_env.sh"), str(rendered)],
+            capture_output=True, text=True,
+            env={"PATH": os.environ["PATH"], "GCP_PROJECT_ID": "p", "GCP_REGION": "us-central1",
+                 "GKE_CLUSTER_NAME": "cluster-b", "GITHUB_APP_ID": "12345",
+                 "GITOPS_ORG": "o", "GITOPS_REPO": "r"})
+        self.assertEqual(render.returncode, 0, render.stderr)
+        proc = self._run_install_func(
+            "tf_state_minter_names() { printf '||'; }; "
+            "minter_key_owner() { return 0; }; PARAM_NON_INTERACTIVE=true; "
+            'if confirm_minter_key_owner "$KMS_KEYRING" "$KMS_KEY" us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            'echo "rc=$rc adopt=${MINTER_ADOPT_KEY:-}"',
+            env={"KUBE_AGENTS_INSTALL_ENV": str(rendered)})
+        self.assertIn("rc=0 adopt=github-token-minter-keyring/github-token-minter-key", proc.stdout, proc.stderr)
 
     def test_both_interview_arms_check_the_key_owner(self):
         """A -y run takes the non-interactive arm, which must refuse another install's key too."""

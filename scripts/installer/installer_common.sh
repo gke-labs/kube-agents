@@ -4143,7 +4143,9 @@ minter_derived_names() {
   local cluster=$1 gsa prefix hash
   gsa="${cluster}-minter"
   if [ "${#gsa}" -gt "$MINTER_GSA_ID_MAX_LEN" ]; then
-    hash="$(printf '%s' "$cluster" | shasum -a 256 | cut -c1-"$MINTER_GSA_HASH_LEN")"
+    # python3 rather than shasum, which needs perl: slim images lack it.
+    hash="$(python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:int(sys.argv[2])])' \
+      "$cluster" "$MINTER_GSA_HASH_LEN")"
     prefix="${cluster:0:$MINTER_GSA_CLUSTER_PREFIX_LEN}"
     prefix="${prefix%-}"
     gsa="${prefix}-${hash}-minter"
@@ -5610,6 +5612,11 @@ write_tfvars_from_state() {
     fi
     if [ -n "${KMS_KEY:-}" ]; then
       echo "github_minter_kms_key = $(hcl_str "${KMS_KEY}")"
+    fi
+    # An unlabelled minter key this run named explicitly, which lifecycle.sh
+    # adopts as this install's own and the apply labels (confirm_minter_key_owner).
+    if [ -n "${MINTER_ADOPT_KEY:-}" ]; then
+      echo "github_minter_adopt_unlabelled_kms_key = $(hcl_str "${MINTER_ADOPT_KEY}")"
     fi
     # The one minter key lifecycle.sh may adopt from another install, or from
     # outside any install, as <keyring>/<key> (#3504). Unset adopts only this

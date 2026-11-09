@@ -665,7 +665,10 @@ readonly MINTER_OWNER_NAMESPACE_LABEL="kube-agents-namespace"
 # GitOps-off run here would schedule its versions for destruction, and this
 # install's minter would be granted signing rights on it. A key with no owner
 # labels may be another install's, from before the labels existed, so it is
-# refused too: the operator says so by naming it as shared. A ring whose key
+# refused too, unless github_minter_adopt_unlabelled_kms_key names it: the
+# installer sets that when the key ring and key were named explicitly, and the
+# apply then labels the key as this install's. Labels win over a name: a key
+# another install's labels claim is refused either way. A ring whose key
 # doesn't exist yet holds nothing to protect and is adopted as before. Runs
 # once per call; the ring and the key share the answer.
 guard_minter_adoption() {
@@ -681,7 +684,8 @@ guard_minter_adoption() {
   if ! adoption_target_exists key "projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"; then
     return 0
   fi
-  if ! labels=$(gcloud kms keys describe "$key" --keyring "$keyring" --location "$location"       --project "$project" --format='value(labels)' 2>/dev/null); then
+  if ! labels=$(gcloud kms keys describe "$key" --keyring "$keyring" --location "$location" \
+      --project "$project" --format='value(labels)' 2>/dev/null); then
     warn "Could not read the owner labels of the minter key '$location/$keyring/$key', which exists and is not in this state."
     warn "Refusing to adopt it without knowing whose it is. Check this identity can describe the key (cloudkms.cryptoKeys.get), then apply again."
     exit 1
@@ -699,6 +703,10 @@ guard_minter_adoption() {
   namespace=$(tfvar namespace)
   if [[ "$owner_cluster" == "$cluster" && "$owner_namespace" == "$namespace" ]]; then
     log "adopting the minter key $keyring/$key: its owner labels name this install"
+    return 0
+  fi
+  if [[ -z "$owner_cluster" && -z "$owner_namespace" && "$(tfvar github_minter_adopt_unlabelled_kms_key)" == "$keyring/$key" ]]; then
+    log "adopting the minter key $keyring/$key as this install's own: it carries no owner labels and was named explicitly; this apply labels it"
     return 0
   fi
   if [[ -n "$owner_cluster" || -n "$owner_namespace" ]]; then

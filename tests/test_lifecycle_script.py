@@ -116,6 +116,7 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
                    tfvar_minter_shared_key='""',
+                   tfvar_minter_adopt_key='""',
                    gcloud_key_version="",
                    gcloud_scheduled_version="",
                    gcloud_scheduled_fail=False,
@@ -283,6 +284,9 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"github_minter_shared_kms_key"* ]]; then
         echo '{tfvar_minter_shared_key}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_adopt_unlabelled_kms_key"* ]]; then
+        echo '{tfvar_minter_adopt_key}'
         exit 0
     elif [[ "$expr" == *"namespace"* ]]; then
         echo '{tfvar_namespace}'
@@ -1786,6 +1790,21 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("names it as shared on purpose", proc.stdout)
         self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """The installer names it when KMS_KEYRING and KMS_KEY were given; the apply then labels it."""
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("carries no owner labels and was named explicitly", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
 
     def test_a_shared_key_naming_another_key_adopts_nothing(self):
         """The opt-in names one resource; it isn't a switch that lets any key in."""

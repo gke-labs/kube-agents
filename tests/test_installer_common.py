@@ -551,6 +551,22 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_drift_detector = true", content)
             self.assertNotIn("exported-project", content)
 
+    def test_tfvars_names_the_minter_key_to_adopt_and_to_share(self):
+        """MINTER_ADOPT_KEY (an explicitly named unlabelled key) and MINTER_SHARED_KEY reach lifecycle.sh (#3504)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "7",
+                     "KMS_KEYRING": "ring", "KMS_KEY": "key", "MINTER_ADOPT_KEY": "ring/key",
+                     "MINTER_SHARED_KEY": "other-ring/other-key"},
+                describe_stub=_autopilot_describe_stub(),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('github_minter_adopt_unlabelled_kms_key = "ring/key"', content)
+            self.assertIn('github_minter_shared_kms_key = "other-ring/other-key"', content)
+
     # ── the web console switch ───────────────────────────────────────────────
 
     def test_tfvars_carries_the_web_console_switch(self):
