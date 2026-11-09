@@ -37709,6 +37709,11 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         counted = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids, named=False)
         self.assertIn("40 of them are not confirmed fixed, and the closing comment names them.", counted)
         self.assertNotIn(ids[0], counted)
+        # And the closing comment does name them, with a marker past its cap.
+        many = [{"id": f"c.k.n.d-{i:03d}", "cluster": RETIRED_CLUSTER} for i in range(audit_report.MAX_DELTA_ROWS + 1)]
+        note = "\n".join(audit_report._comment_retired(many))
+        self.assertIn("…and 1 more", note)
+        self.assertIn(f"`{RETIRED_CLUSTER}`: `c.k.n.d-000`", note)
         room = audit_report.MAX_BODY_CHARS - len(counted) - 2 - 100
         live = audit_report.delta_block(["a"]) + "\n" + "x" * (room - len(audit_report.delta_block(["a"])) - 1)
         self.assertGreater(len(named) + 2 + len(live), audit_report.MAX_BODY_CHARS)

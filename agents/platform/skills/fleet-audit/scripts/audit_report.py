@@ -14289,6 +14289,8 @@ def _comment_retired(retired: list[dict]) -> list[str]:
     ]
     for cluster in sorted(by_cluster)[:MAX_SCOPE_ROWS]:
         ids = ", ".join(f"`{_cell(fid)}`" for fid in sorted(by_cluster[cluster])[:MAX_DELTA_ROWS])
+        if len(by_cluster[cluster]) > MAX_DELTA_ROWS:
+            ids += f", _…and {len(by_cluster[cluster]) - MAX_DELTA_ROWS} more_"
         out.append(f"- `{_cell(cluster)}`: {ids}")
     if len(by_cluster) > MAX_SCOPE_ROWS:
         out.append(f"- _…and {len(by_cluster) - MAX_SCOPE_ROWS} more cluster(s)_")
@@ -16353,6 +16355,8 @@ def close_ledger_reads_clean(
     before the body is left as it was.
     """
     payload: dict = {"number": number, "title": issue_title(audit_id, [])}
+    # Read twice below, so never a generator.
+    retired_ids = list(retired_ids)
     if live_body is not None:
         if CLEAN_CLOSE_MARKER in live_body:
             candidates = [live_body]

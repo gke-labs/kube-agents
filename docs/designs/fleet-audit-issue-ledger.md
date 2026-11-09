@@ -115,7 +115,8 @@ One open GitHub issue per audit stream per install, rewritten in place on every 
   The lead of that all-clear and the banner `close_ledger_reads_clean` puts at the top of the
   closed ledger say the same: with a retired finding, neither claims that every finding is gone
   or that all of them are resolved; both count the retired ones as not confirmed fixed, and the
-  banner names their ids.
+  banner names their ids, or counts them alone when the names would push the body past the
+  forge's limit.
   The store ledger applies the same rule; the no-forge record keeps ids with no places, so a run
   with no repository cannot tell such a finding apart and counts it resolved as before. After the
   close, the run changes the title to `0 findings` and puts a
