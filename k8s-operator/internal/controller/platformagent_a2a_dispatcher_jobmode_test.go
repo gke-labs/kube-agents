@@ -45,7 +45,8 @@ import (
 // policy signal set, and the policy, its binding and the profile namespace
 // in place, reconciled through Reconcile. getErr, when set, answers reads of
 // the binding; patchErr, when set and non-nil for an object, answers its
-// apply. statusWrites counts the PlatformAgent's status writes, and
+// apply; deleteErr, when set and non-nil for an object, answers its
+// delete. statusWrites counts the PlatformAgent's status writes, and
 // statusLog has the condition types each of them carried, in order.
 type jobModeFixture struct {
 	r            *PlatformAgentReconciler
@@ -54,6 +55,7 @@ type jobModeFixture struct {
 	req          ctrl.Request
 	getErr       error
 	patchErr     func(client.Object) error
+	deleteErr    func(client.Object) error
 	statusWrites int
 	statusLog    [][]string
 }
@@ -80,6 +82,14 @@ func newJobModeFixture(t *testing.T, objs ...client.Object) *jobModeFixture {
 					}
 				}
 				return fakeServerSideApplyInterceptors().Patch(ctx, cl, obj, patch, opts...)
+			},
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if f.deleteErr != nil {
+					if err := f.deleteErr(obj); err != nil {
+						return err
+					}
+				}
+				return cl.Delete(ctx, obj, opts...)
 			},
 			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if _, isBinding := obj.(*admissionregistrationv1.ValidatingAdmissionPolicyBinding); isBinding && f.getErr != nil {
@@ -496,6 +506,45 @@ func TestARefusedPassLeavesDispatcherJobModeStanding(t *testing.T) {
 				t.Errorf("%s survived the teardown after %s: %+v", dispatcherJobModeCondition, name, got)
 			}
 		})
+	}
+}
+
+// A flip to today whose profile-namespace teardown fails to delete Job
+// mode's resources leaves the condition standing: the Jobs Role is still
+// live, and an absent condition would say Job mode is off. The fence stays
+// as the sentinel, so the next pass retries, and the one that succeeds
+// removes the condition.
+func TestAFailedJobModeTeardownOnTheFlipToTodayLeavesDispatcherJobModeStanding(t *testing.T) {
+	agent := a2aTestAgent()
+	f := newJobModeFixture(t, sandboxKeysSecret(agent))
+	f.mustReconcile(t)
+	f.mustReconcile(t)
+	wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
+	jobsRole := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherJobsRoleName(agent)}
+	f.deleteErr = func(obj client.Object) error {
+		if _, isRole := obj.(*rbacv1.Role); isRole && client.ObjectKeyFromObject(obj) == jobsRole {
+			return apierrors.NewForbidden(rbacv1.Resource("roles"), obj.GetName(), errors.New("refused"))
+		}
+		return nil
+	}
+	a := f.agent(t)
+	a.Spec.Mode = nil
+	if err := f.c.Update(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	f.mustReconcile(t)
+	if err := f.c.Get(context.Background(), jobsRole, &rbacv1.Role{}); err != nil {
+		t.Fatalf("precondition: the failed teardown removed the Jobs Role: %v", err)
+	}
+	wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
+	// The delete goes through on the next pass and the condition goes.
+	f.deleteErr = nil
+	f.mustReconcile(t)
+	if err := f.c.Get(context.Background(), jobsRole, &rbacv1.Role{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("precondition: the retried teardown left the Jobs Role: %v", err)
+	}
+	if got := f.condition(t); got != nil {
+		t.Errorf("%s survived the teardown on the flip to today: %+v", dispatcherJobModeCondition, got)
 	}
 }
 

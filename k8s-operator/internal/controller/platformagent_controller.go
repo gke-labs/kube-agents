@@ -1247,11 +1247,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
-		if err := r.cleanupA2A(ctx, instance); err != nil {
+		tornDown, err := r.cleanupA2AWithJobMode(ctx, instance)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// The dispatcher and its Job mode went with the stack.
-		dispatcherJobMode = jobModeTornDown
+		// The dispatcher and its Job mode went with the stack, unless their
+		// profile-namespace teardown failed: then the Jobs Role and templates
+		// are still live and the condition stays as it was.
+		if tornDown {
+			dispatcherJobMode = jobModeTornDown
+		}
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed
