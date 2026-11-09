@@ -122,6 +122,7 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | `docs/site/src/content/docs/operator/platformagent-fields.md` | `<!-- BEGIN GENERATED: crd-fields-platformagent -->` | The `PlatformAgent` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentprofile-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentprofile -->` | The `AgentProfile` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentplugin-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentplugin -->` | The `AgentPlugin` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
+| `hack/replay-proxy/README.md` | `<!-- BEGIN GENERATED: replay-baseline-metrics -->` | `METRICS` and `CASE_METRICS` in `hack/replay-proxy/baseline_report.py` |
 | `README.md` | `<!-- BEGIN GENERATED: capabilities -->` | The enabled entries of `agents/platform/cron/jobs.json` that carry the `fleet-audit` skill, with the SOP each prompt names, and the skill directories under `agents/platform/skills/`, `agents/cluster/skills/` and `agents/tse/skills/` |
 | `agents/platform/cron/jobs.json` — the SOP length and checks-section line range each governance prompt cites | none: `scripts/generate_sop_geography.py` rewrites the digits in place (`make docs-generate` runs it first) | The `agents/platform/governance/*_sop.md` each prompt names |
 
