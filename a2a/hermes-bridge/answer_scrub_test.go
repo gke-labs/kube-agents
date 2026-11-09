@@ -705,3 +705,53 @@ func TestSeenSecrets_AnEnvEntrysCredentialIsTracked(t *testing.T) {
 		t.Errorf("answer = %q, want the env value redacted", got)
 	}
 }
+
+// A failure's status tails carry what an answer would: a failed CLI run's
+// stdout tail (the answer stream) and an API error's body and error tails
+// are scrubbed as an answer is before they go on TASKS.
+func TestFailureTailsAreScrubbed(t *testing.T) {
+	const word = "quietpasture"
+	t.Run("cli stdout tail", func(t *testing.T) {
+		_, url := startServer(t)
+		startBridge(t, url, script(t, `echo "the password is `+word+`"
+echo "export API_TOKEN=Synth3tic-Pass-0001"
+echo "session_id: 20260925_181506_ab12cd" >&2
+exit 1`))
+		c := gatewayClient(t, url)
+		submit(t, c, "task-fail-tail", "doomed")
+		task := waitTerminal(t, c, "task-fail-tail")
+		reason := terminalReason(t, task)
+		if strings.Contains(reason, word) || strings.Contains(reason, "Synth3tic-Pass-0001") || !strings.Contains(reason, "session: 20260925_181506_ab12cd") {
+			t.Errorf("terminal reason = %q, want the tail scrubbed and the session kept", reason)
+		}
+	})
+	for _, tc := range []struct {
+		name   string
+		handle func(w http.ResponseWriter, r *http.Request, c apiCall)
+	}{
+		{"api 5xx body tail", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "partial answer: the password is "+word)
+		}},
+		{"api unreadable body tail", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			_, _ = io.WriteString(w, `{"choices":[],"note":"password: `+word+`"}`)
+		}},
+		{"api turn error tail", func(w http.ResponseWriter, _ *http.Request, _ apiCall) {
+			w.Header().Set("X-Hermes-Completed", "false")
+			_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"x"},"finish_reason":"error"}],`+
+				`"hermes":{"completed":false,"partial":false,"failed":true,"error":"tool said: the password is `+word+`","error_code":"agent_error"}}`)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			startAPIBridge(t, url, newAPIStub(t, tc.handle), nil)
+			c := gatewayClient(t, url)
+			taskID := "task-tail-" + strings.ReplaceAll(tc.name, " ", "-")
+			submitIn(t, c, taskID, "ctx-tail", "doomed")
+			task := waitTerminal(t, c, taskID)
+			if reason := terminalReason(t, task); task.State != lib.StateFailed || strings.Contains(reason, word) || !strings.Contains(reason, "[redacted]") {
+				t.Errorf("state = %s reason = %q, want failed with the tail scrubbed", task.State, reason)
+			}
+		})
+	}
+}

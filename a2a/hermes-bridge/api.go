@@ -603,8 +603,10 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// on its own. A 4xx ran nothing and publishes nothing.
 			b.publishTurnUsage(run, &apiChatResponse{}, took)
 		}
+		// A body or error tail can carry the answer's own bytes: scrubbed as
+		// an answer is (scrubAnswer), here and in the arms below.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if len(raw) > b.responseCap {
@@ -619,7 +621,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	var out apiChatResponse
 	if err := json.Unmarshal(raw, &out); err != nil || len(out.Choices) == 0 {
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-unreadable - HTTP %d; session: %s%s; body tail: %s",
-			resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
+			resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, string(raw)), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if apiTurnFailed(&out) {
@@ -631,7 +633,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		// ahead of the failed terminal, as the worker adapter's does.
 		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
-			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+			reason, resp.StatusCode, sessionID, turnNote(turn), tail(scrubAnswer(run, out.Hermes.Error), apiBodyTailBytes)), nil)
 		return "", false
 	}
 	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {

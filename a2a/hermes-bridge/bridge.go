@@ -1627,7 +1627,9 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		}
 		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, failureReason(err, stdoutTail.String(), stderr.String())+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
+		// The tails can carry what the answer would (stdout is the answer
+		// stream): scrubbed as an answer is (scrubAnswer).
+		b.finalize(run, lib.StateFailed, failureReason(err, scrubAnswer(run, stdoutTail.String()), scrubAnswer(run, stderr.String()))+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
 	}
 }
 
