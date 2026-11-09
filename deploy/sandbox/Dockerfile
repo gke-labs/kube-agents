@@ -106,7 +106,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
       *) echo "no kubectl checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    curl -sSLf --retry 8 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
     install -d -m 0755 /usr/local/libexec && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
@@ -151,7 +151,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) LEEWAY_SHA256="${LEEWAY_SHA256_ARM64}" ;; \
       *) echo "no leeway checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/leeway.tar.gz \
       "https://github.com/go-steer/leeway/releases/download/v${LEEWAY_VERSION}/leeway_v${LEEWAY_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${LEEWAY_SHA256}  /tmp/leeway.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/leeway.tar.gz --no-same-owner -C /usr/local/bin leeway && \
@@ -178,7 +178,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       arm64) TOFU_SHA256="${OPENTOFU_SHA256_ARM64}" ;; \
       *) echo "no OpenTofu checksum pinned for ${ARCH}" >&2; exit 1 ;; \
     esac && \
-    curl -sSLf --retry 5 --retry-all-errors -o /tmp/tofu.tar.gz \
+    curl -sSLf --retry 8 --retry-all-errors -o /tmp/tofu.tar.gz \
       "https://github.com/opentofu/opentofu/releases/download/v${OPENTOFU_VERSION}/tofu_${OPENTOFU_VERSION}_linux_${ARCH}.tar.gz" && \
     echo "${TOFU_SHA256}  /tmp/tofu.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/tofu.tar.gz --no-same-owner -C /usr/local/bin tofu && \
@@ -644,6 +644,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          current-context locally via credential_proxy_client,
 #                          its kubectl reads go through the same wrapper, and it
 #                          is here for the same reason as stall_report.py
+#   kcc_fleet_audit.py     batched parallel Config Connector (KCC) CRD and custom
+#                          resource auditor for Cluster Agent KCC audits (#3142)
 #   inventory_findings.py  the onboarding ranking card's bridge from
 #                          INVENTORY.raw.md to the findings queue
 #                          (governance/inventory_prioritize_sop.md). `extract`
@@ -694,6 +696,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/audit_networking.py \
      agents/platform/scripts/audit_certificates.py \
      agents/platform/scripts/workload_triage.py \
+     agents/platform/scripts/kcc_fleet_audit.py \
      agents/platform/scripts/inventory_findings.py \
      agents/platform/scripts/findings_queue.py \
      agents/platform/scripts/untrusted_text.py \

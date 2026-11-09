@@ -394,7 +394,7 @@ including:
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
 - background processes or commands that outlive the request;
-- commands exceeding request, output, or timeout limits; and
+- commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
@@ -402,7 +402,31 @@ including:
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
-  `Retry-After`; the session role keeps one slot up to a higher ceiling.
+  `Retry-After`; the session role keeps one slot up to a higher ceiling; and
+- more commands in one session than its budget allows. The wrapper sends the key of
+  the run it belongs to as the request's `sessionId`: the kanban card, else the
+  scheduled run, else the session (`HERMES_KANBAN_TASK`, `HERMES_CRON_RUN`,
+  `HERMES_SESSION_ID`). No process environment crosses the SSH hop into the shell
+  sandbox, so there the ForceCommand recovers the first two from the command's working
+  directory, the card workspace or the run directory the cron workdir patch minted, and
+  a chat turn, which runs from neither, sends no key; the session id reaches the wrapper
+  where the terminal runs in its own pod, the profile and session pods. The broker counts
+  per key: a shell or profile session past `BROKER_SESSION_MAX_TOOL_CALLS`
+  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED` (the scope publisher is
+  a script whose Job sets no key, so its calls are uncounted; a busy reply the wrapper
+  re-sends is not charged, since the retries are one invocation), and any keyed session
+  is refused the same command, on the same cluster, after it failed or was blocked
+  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times with no success of the session's between
+  (counted per command over the session's last eight failing ones, so a loop over two
+  failing commands trips on each), with `403 BROKER_LOOP_BREAKER`;
+  the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
+  carry the defaults and the operator's knobs. A key's counts last as long as the broker remembers it: a
+  scheduled run's key names one execution, a card's names the card, so a card's ceiling
+  and streak span its dispatches on a replica. The key is a loop guard, never an
+  identity: it comes from the body, which the model composes, so no policy decision
+  reads it, a request with no key is uncounted, and the authenticated principal stays
+  the only input to who may do what. Each broker process counts alone, in a bounded
+  LRU of sessions, so an exec tier of N replicas admits about N times the ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -898,20 +922,20 @@ Consequences:
   the output allowance of the slots in use has to fit the budget the broker derives
   from its container's memory limit (`CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES`, a Downward
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
-  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
-  128 MiB for the content workspace's one process tree at a time. At the operator's
-  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits nine
+  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy.
+  At the operator's
+  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
   bound. The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
   defaults per key; raising it raises the admitted count. The caps stay the
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
-  requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
+  requests at once (544 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
   it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
-  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  above the floor, so that the budget engages there too, admitting ten, held to eight by
   the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the

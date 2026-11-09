@@ -215,9 +215,9 @@ layout and are collected from the moment they start running.
       repetition whose `reason` is shown, so the quote and the check beside
       it come from the same run of the agent; nothing is quoted when that
       rep has none (when no rep carries a reason, the first rep with an
-      excerpt is the one the row is about, link included). The PR gate comment carries neither the
-      `reason` nor the excerpt: the pull request is public, and both stay
-      behind the run link.
+      excerpt is the one the row is about, link included). The PR gate comment names no case and
+      carries neither the `reason` nor the excerpt: the pull request is
+      public, and all of it stays behind the run link.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
@@ -595,14 +595,16 @@ what the renderer does with them.
   Nightly report's links follow whichever bucket the nightly logs to.
   Absent on a nightly record means it predates the field and was read from
   the bucket the nightly used before 2026-09-15, `gs://kube-agents-prow`;
-  `nightly.py` links it there.
+  `nightly.py` links it there. A Spyglass link into a private bucket (below)
+  is dead, and `nightly.py` links the Cloud Console for it instead.
 - `runs[].gcs_base` — the build directory the run was read from, as a
   `gs://` URL with its trailing slash, on a run read from a bucket Deck
-  cannot read (`PRIVATE_LOG_BUCKETS`: the smoke lanes'
-  `gs://kube-agents-evals-presubmit-logs`). The pages and the health bot
-  link such a run's build and transcripts in the Cloud Console; a run
-  without the field, in `gs://kube-agents-prow` or from before the field,
-  keeps its Spyglass link, which still renders it.
+  cannot read (`links.PRIVATE_LOG_BUCKETS`: the smoke lanes'
+  `gs://kube-agents-evals-presubmit-logs` and the nightly's
+  `gs://kube-agents-evals-nightly-logs`). The pages, the health bot and the
+  nightly issues link such a run's build and transcripts in the Cloud
+  Console; a run without the field, in `gs://kube-agents-prow` or from
+  before the field, keeps its Spyglass link, which still renders it.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -625,7 +627,8 @@ what the renderer does with them.
   list, else the admitted cases that graded nothing) and a retest-when-
   healthy `do`, and never the "absolute rule tripped" text; `gate_comment.py`
   answers `is_red` false for it and leaves the one-line ⚪ "run not
-  evaluated" comment naming those cases; `render.py` passes the verdict
+  evaluated" comment, which names no case (the pull request is public);
+  `render.py` passes the verdict
   and the list through to `brief.json`, where the run page and the Brief's
   run rows label the run and the Reds tile says how many of the gate's reds
   were not evaluated. A gate case that failed every graded repetition
@@ -1133,7 +1136,9 @@ night has a main part). `newly_failing` and `fixed` are both `[]` on the first n
 when `previous_build` is `null`. `log_url` and `transcript_url` point at
 Spyglass under `logs/<job>/<build>`, a periodic's path, in the bucket the
 run's `runs[].log_url` names (without it: `gs://kube-agents-prow`, the
-bucket before 2026-09-15). The nights are
+bucket before 2026-09-15), or, when that bucket is private
+(`runs[].gcs_base`, or a `log_url` into one), at the Cloud Console's bucket browser and at the
+transcript object itself (`storage.cloud.google.com`). The nights are
 never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
 started inside `RUNNING_MAX_AGE` (14 h 30 m: the longest part's 14-hour
 budget, Prow's grace and a late collector tick to record `finished.json`; the
@@ -1154,9 +1159,10 @@ same under their own tier and jobs (`forge_lane.LANES`). `runs[]` is the
 lane's pull-request runs (`runs[].tier == "gitlab"` with a `pr`) **newest
 first**, the last `RUNS_LISTED` (20), each `{build, job, pr, head_sha,
 project, log_url, gcs_base, started, finished, duration_s, result, eval_verdict, green,
-tasks{pass, fail, infra}}` (a row's build link is `log_url`, else the Console
-browser for `gcs_base`, else Spyglass); `nights[]` the same shape for the lane's nightly
-runs (`pr` null, `log_url` the periodic's Spyglass page), `nightly_job` the
+tasks{pass, fail, infra}}` (a row's build link is the Console browser for
+`gcs_base`, else `log_url`, else Spyglass); `nights[]` the same shape for the lane's nightly
+runs (`pr` null; `log_url` the periodic's Spyglass page, dead for a night that
+records `gcs_base`, which the row links instead), `nightly_job` the
 newest night's job else the default, `night_counts` over every night on
 record (`green` is Prow's `SUCCESS`; `tasks` counts the
 run's task rows by result); `running[]` the lane's `pending_builds` as

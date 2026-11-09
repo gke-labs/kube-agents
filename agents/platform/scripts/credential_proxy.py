@@ -312,21 +312,17 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # the same -- are most of what a wide-scope install's container holds. So a
 # request that runs commands also reserves this much for its children when it
 # is admitted, and the sum of reservations has to fit what is left of the
-# limit after the broker's own resident set and the content workspace's one
-# process tree at a time. One size for every route, because every route can
-# end up running the heavy case (§2.1). The operator's sizing test declares
-# the same four figures under matching names (credential_proxy_manifests.go)
-# and asserts the arithmetic against the rendered limit; change them together.
+# limit after the broker's own resident set. One size for every route, because
+# every route can end up running the heavy case (§2.1). The operator's sizing
+# test declares the same three figures under matching names
+# (credential_proxy_manifests.go) and asserts the arithmetic against the
+# rendered limit; change them together.
 # They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
 # tests/test_credential_proxy_sizing_parity.py.
 MEBIBYTE = 1024 * 1024
 REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
 # The broker process and Envoy: 168 MiB measured, with margin.
 BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
-# The content workspace store serves one verb at a time under its own lock, so
-# at most one of its process trees exists at any moment; that is a fixed term
-# rather than a reservation per verb, and it is one request's worth.
-CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
 # What the broker itself holds per admitted request, as a multiple of the
 # output cap: the two capped stream buffers, their decoded text, the JSON body
 # and its encoding. Charged for the slots in use, not for the cap.
@@ -344,12 +340,12 @@ OUTPUT_COPIES_PER_COMMAND = 6
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
 # (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
-# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# deployed cap): 544 MiB. Declared as a literal so that the copies elsewhere can
 # be compared with it as text. test_credential_proxy.py holds it to the
 # function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
 # the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
 # kube-agents.credentialProxyMemoryFloorBytes.
-CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 570425344
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -517,6 +513,58 @@ ENV_SCOPE_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SCOPE_MAX_CONCURRENT_COMMA
 # it, as it can the session share; the clamp holds whatever value arrives.
 DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = 4
 ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
+# Per-session tool-call bounds on the exec route (#4726). `cron/jobs.json`
+# bounds a background run's turns, but one turn can run a shell loop that
+# sends thousands of commands, or the same failing command over and over, and
+# nothing between the loop and the broker notices. The broker counts commands
+# per `sessionId`, a body field the shim fills from the kanban card, the
+# scheduled run or the session it runs under (credential_proxy_client.
+# CALLER_LABEL_ENV; in the shell sandbox the first two are recovered from the
+# command's cwd by the ForceCommand, since no environment crosses the SSH hop):
+# a loop-guard key, never an authorization input, since the body is the
+# model's to compose. A request with no key in its environment -- a collector
+# an operator runs by hand, a bare curl -- is uncounted; a collector a card or
+# a run launches inherits the key and counts against it. A key's counts last
+# as long as the budget remembers it (SESSION_TOOL_BUDGET_MAX_SESSIONS keys,
+# or the process): a cron run's key names one execution, so its counts end
+# with the run, while a card's key is the card id, so its ceiling and its
+# streak span every dispatch of the card on this replica. The ceiling applies
+# to the background-running roles only (SESSION_BUDGET_CEILING_ROLES), and a
+# chat turn in the shell sandbox runs from no card or run directory and so
+# sends no key, which together keep a conversation out of it; the loop
+# breaker applies to every keyed request. 0 disables each. Both are read once
+# at import, like the issue's shape; spec.deployment.env reaches them.
+ENV_SESSION_MAX_TOOL_CALLS = "BROKER_SESSION_MAX_TOOL_CALLS"
+DEFAULT_SESSION_MAX_TOOL_CALLS = 1500
+ENV_SESSION_MAX_IDENTICAL_FAILURES = "BROKER_SESSION_MAX_IDENTICAL_FAILURES"
+DEFAULT_SESSION_MAX_IDENTICAL_FAILURES = 5
+# How many session keys the budget remembers; the oldest-touched is dropped
+# past it, so memory stays bounded whatever the shim sends.
+SESSION_TOOL_BUDGET_MAX_SESSIONS = 1024
+# How many of a session's failing commands the loop breaker counts at once.
+# Each keeps its own run of failures, so a loop over two or more failing
+# commands trips on each one's own count rather than resetting the other's;
+# the oldest-failed is dropped past this many, so an entry stays bounded
+# whatever the session sends, and any success clears them all.
+SESSION_LOOP_BREAKER_SIGNATURES = 8
+# The field's grammar, the shim's CALLER_LABEL_RE: a body value outside it
+# is a 400, as a malformed kubeconfigContext is.
+SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
+SESSION_ID_FIELD = "sessionId"
+SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
+LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
+# The refusal texts, with the code first so the model's transcript shows the
+# stop in its first words. The shim prints the message as it prints a policy
+# block and exits the policy-blocked code, so the runtime does not read the
+# refusal as a missing executable; its refusal stop halts on the read-only
+# rule's write refusals only, so here the text is the instruction.
+SESSION_BUDGET_EXCEEDED_MESSAGE = (
+    "{code}: session exceeded {limit} tool invocations; summarize current findings and finish the turn."
+)
+LOOP_BREAKER_MESSAGE = (
+    "{code}: identical command failed or was blocked {limit} consecutive times in this session; "
+    "stop retrying this command and report the refusal/error."
+)
 # How long a request waits for admission -- a slot under the slot cap and room
 # under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
@@ -1345,6 +1393,8 @@ RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
+RULE_SESSION_TOOL_BUDGET = "session.tool-budget"
+RULE_SESSION_LOOP_BREAKER = "session.loop-breaker"
 LOG_LEVEL_ENV = "LOG_LEVEL"
 DEFAULT_LOG_LEVEL = "INFO"
 EXIT_STARTUP_FAILURE = 1
@@ -2175,6 +2225,17 @@ INTERACTIVE_ROLES = frozenset({CALLER_ROLE_SESSION})
 # the scope publisher. Every other slot-taking role is interactive, the shell
 # included until a turn token can tell its chat turns from its sweeps.
 BACKGROUND_ROLES = frozenset({CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
+
+# The roles whose sessions take the per-session tool-call ceiling
+# (SessionToolBudget): the shell's cron runs and kanban workers and the
+# profile workers, the model-driven background runs the ceiling exists for.
+# The shell role carries a person's chat turns too, but those arrive with no
+# key (see ENV_SESSION_MAX_TOOL_CALLS) and are not counted; the session pod's
+# role is a conversation by construction and gets the loop breaker only. The
+# scope role is the scope publisher, a script with no model in its loop whose
+# Job sets no key (the operator renders none), so it is uncounted and the
+# ceiling is not its: a bound on it would only cut a large fleet's publish.
+SESSION_BUDGET_CEILING_ROLES = frozenset({CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE})
 
 
 def admission_class(role: str) -> str:
@@ -3069,11 +3130,7 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
     """The smallest container limit at which the budget admits
     BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
     per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
-    return (
-        BROKER_RESIDENT_RESERVE_BYTES
-        + CONTENT_WORKSPACE_RESERVE_BYTES
-        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
-    )
+    return BROKER_RESIDENT_RESERVE_BYTES + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
 
 
 class CommandSlotUnavailable(RuntimeError):
@@ -3835,13 +3892,18 @@ class ResourceWatermarkGate:
 def session_slot_limit_from_env(
     env_name: str = ENV_SESSION_MAX_CONCURRENT_COMMANDS,
     default: int = DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+    minimum: int = 1,
 ) -> int:
-    """A role's concurrent-command bound, from the env or the default.
+    """A role's bound, from the env or the default.
 
-    The session role's by default; the scope role's with its own env name and
-    default. Anything that is not a positive integer falls back to the default
-    with a warning, so a typo narrows rather than opens: the default is the
-    small number, and an unset or broken knob is never "unlimited".
+    The session role's concurrent-command bound by default; the scope role's
+    with its own env name and default; the per-session tool-call bounds with
+    ``minimum=0``, where 0 is a value and means off. Anything that is not an
+    integer of at least ``minimum`` falls back to the default with a warning,
+    so a typo narrows rather than opens: the default is the small number, and
+    an unset or broken knob is never "unlimited". The warning says "not a
+    positive integer" under the default minimum (the phrase the thread-cap and
+    slot-limit tests read) and names the minimum otherwise.
     """
     raw = os.getenv(env_name, "").strip()
     if not raw:
@@ -3849,12 +3911,10 @@ def session_slot_limit_from_env(
     try:
         value = int(raw)
     except ValueError:
-        value = 0
-    if value <= 0:
-        LOGGER.warning(
-            "%s=%r is not a positive integer; using the default of %d",
-            env_name, raw, default,
-        )
+        value = minimum - 1
+    if value < minimum:
+        bound = "a positive integer" if minimum == 1 else "an integer of at least %d" % minimum
+        LOGGER.warning("%s=%r is not %s; using the default of %d", env_name, raw, bound, default)
         return default
     return value
 
@@ -3956,6 +4016,161 @@ class SessionSlots:
         finally:
             with self._lock:
                 self._in_flight -= 1
+
+
+# Read once at import rather than in serve(), because the budget below is a
+# module-level instance the route reads directly (the issue's shape).
+SESSION_MAX_TOOL_CALLS = session_slot_limit_from_env(ENV_SESSION_MAX_TOOL_CALLS, DEFAULT_SESSION_MAX_TOOL_CALLS, minimum=0)
+SESSION_MAX_IDENTICAL_FAILURES = session_slot_limit_from_env(
+    ENV_SESSION_MAX_IDENTICAL_FAILURES, DEFAULT_SESSION_MAX_IDENTICAL_FAILURES, minimum=0
+)
+
+
+class SessionRefusal(NamedTuple):
+    """What the exec route answers when a session's budget refuses a command."""
+
+    code: str
+    rule: str
+    message: str
+
+
+def command_signature(argv: list[str], kubeconfig_context: str | None) -> str:
+    """The loop breaker's signature of a command: a digest of the argv and the
+    kubeconfig context as sent, which is what the budget keeps per session.
+
+    A digest rather than the argv itself, so an entry costs the same whatever
+    the body carried: the exec body may be as large as the broker's
+    max_request_bytes, and a request is recorded as ``blocked`` before any gate
+    has looked at its argv, so the argv is the one caller-sized thing the
+    budget would otherwise hold for up to SESSION_TOOL_BUDGET_MAX_SESSIONS keys.
+    """
+    return hashlib.sha256(json.dumps([argv, kubeconfig_context]).encode("utf-8")).hexdigest()
+
+
+class _SessionCounts:
+    """One session's counts: every call admitted to the gates, and for each of
+    the last SESSION_LOOP_BREAKER_SIGNATURES commands the session failed on
+    since its last success, that command's run of failures (oldest first)."""
+
+    __slots__ = ("total", "failures")
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.failures: collections.OrderedDict[str, int] = collections.OrderedDict()
+
+
+class SessionToolBudget:
+    """Per-session tool-call counts behind the exec route's two session gates.
+
+    ``admit`` is asked once per request after the body parses and before any
+    other gate, with the request's session key and its signature, the
+    ``command_signature`` digest of the argv and kubeconfig context as sent. It
+    counts the call and answers the refusal the
+    route sends, or None. The ceiling refuses a session past ``max_calls``
+    when ``ceiling`` is set (the route sets it for SESSION_BUDGET_CEILING_ROLES).
+    The loop breaker refuses a signature that failed ``max_identical_failures``
+    times in this session with no success of the session's in between.
+    ``record`` is told every terminal outcome once, in the metrics' status
+    vocabulary: ``blocked`` and ``error`` extend the run of failures of the
+    signature they are for, kept per signature for the session's last
+    ``max_signatures`` failing commands (so a loop over two failing commands
+    trips on each one's own count, and the oldest-failed is forgotten past
+    that many); ``success`` clears every run; and ``busy`` and ``abandoned``,
+    which say nothing about the command, leave them alone.
+    ``busy`` also gives the ceiling back the unit ``admit`` charged: the broker
+    never started a busy request and the shim re-sends the same body on its
+    retry schedule, so without the refund a loaded broker would spend several
+    units of the ceiling per command and refuse a run that invoked far fewer.
+    ``abandoned`` keeps its unit: the shim never re-sends after a dropped
+    connection, so whatever follows is a new invocation.
+
+    Sessions are kept in an LRU of ``max_sessions`` keys under one lock: the
+    key is the shim's short text and the signature a fixed-size digest, so an
+    entry costs the same whatever the body carried and the bound is what keeps
+    a caller from growing the broker's memory. A session evicted and seen
+    again starts fresh. One
+    instance per broker process, so each exec-tier replica counts alone.
+    """
+
+    def __init__(
+        self,
+        max_calls: int = SESSION_MAX_TOOL_CALLS,
+        max_identical_failures: int = SESSION_MAX_IDENTICAL_FAILURES,
+        max_sessions: int = SESSION_TOOL_BUDGET_MAX_SESSIONS,
+        max_signatures: int = SESSION_LOOP_BREAKER_SIGNATURES,
+    ) -> None:
+        self.max_calls = max_calls
+        self.max_identical_failures = max_identical_failures
+        self.max_sessions = max_sessions
+        self.max_signatures = max_signatures
+        self._sessions: collections.OrderedDict[str, _SessionCounts] = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def _counts_locked(self, session_id: str) -> _SessionCounts:
+        counts = self._sessions.get(session_id)
+        if counts is None:
+            counts = _SessionCounts()
+            self._sessions[session_id] = counts
+            while len(self._sessions) > self.max_sessions:
+                self._sessions.popitem(last=False)
+        else:
+            self._sessions.move_to_end(session_id)
+        return counts
+
+    def admit(self, session_id: str, signature: str, *, ceiling: bool) -> SessionRefusal | None:
+        with self._lock:
+            counts = self._counts_locked(session_id)
+            counts.total += 1
+            if ceiling and self.max_calls > 0 and counts.total > self.max_calls:
+                return SessionRefusal(
+                    SESSION_BUDGET_EXCEEDED_CODE,
+                    RULE_SESSION_TOOL_BUDGET,
+                    SESSION_BUDGET_EXCEEDED_MESSAGE.format(code=SESSION_BUDGET_EXCEEDED_CODE, limit=self.max_calls),
+                )
+            if self.max_identical_failures > 0 and counts.failures.get(signature, 0) >= self.max_identical_failures:
+                return SessionRefusal(
+                    LOOP_BREAKER_CODE,
+                    RULE_SESSION_LOOP_BREAKER,
+                    LOOP_BREAKER_MESSAGE.format(code=LOOP_BREAKER_CODE, limit=self.max_identical_failures),
+                )
+        return None
+
+    def record(self, session_id: str, signature: str, status: str) -> None:
+        if status == TOOL_STATUS_BUSY:
+            # Never started, and re-sent by the shim as the same invocation:
+            # the unit goes back. A session the LRU has since dropped gets no
+            # entry back, and the count never goes below zero.
+            with self._lock:
+                counts = self._sessions.get(session_id)
+                if counts is not None and counts.total > 0:
+                    counts.total -= 1
+            return
+        if status not in (TOOL_STATUS_BLOCKED, TOOL_STATUS_ERROR, TOOL_STATUS_SUCCESS):
+            return
+        with self._lock:
+            counts = self._counts_locked(session_id)
+            if status == TOOL_STATUS_SUCCESS:
+                counts.failures.clear()
+                return
+            counts.failures[signature] = counts.failures.get(signature, 0) + 1
+            counts.failures.move_to_end(signature)
+            while len(counts.failures) > self.max_signatures:
+                counts.failures.popitem(last=False)
+
+    def streak_of(self, session_id: str, signature: str) -> int:
+        """The session's current run of failures of this command, for the log line."""
+        with self._lock:
+            counts = self._sessions.get(session_id)
+            return counts.failures.get(signature, 0) if counts is not None else 0
+
+
+# One budget per broker process; the exec route reads it through the module so
+# a test can stand in a bounded one. Each exec-tier replica counts alone.
+_SESSION_TOOL_BUDGET = SessionToolBudget()
 
 
 class InFlight:
@@ -8745,9 +8960,7 @@ class CommandExecutor:
         self.memory_limit_bytes = memory_limit_bytes
         self.children_budget_bytes: int | None = None
         if memory_limit_bytes is not None:
-            self.children_budget_bytes = (
-                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
-            )
+            self.children_budget_bytes = memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES
         # Bytes reserved by admitted requests right now; guarded by
         # `_slot_condition` like the slot count, because admission reads both.
         self._reserved_bytes = 0
@@ -13403,6 +13616,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if kubeconfig_context is not None and not isinstance(kubeconfig_context, str):
                 raise ValueError("kubeconfigContext must be a string")
             wants_kubeconfig = bool(payload.get("wantsKubeconfig", False))
+            # The shim's card or session id (SessionToolBudget). A loop-guard
+            # key the body carries, never an identity: absent or "" means an
+            # uncounted caller, and anything outside the grammar is refused
+            # as any other malformed field is.
+            session_id = payload.get(SESSION_ID_FIELD)
+            if session_id == "":
+                session_id = None
+            if session_id is not None and not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)):
+                raise ValueError(f"{SESSION_ID_FIELD} must be a short token of letters, digits, '.', '_', ':' or '-'")
+            # The loop breaker's signature: the command as sent, before a
+            # profile caller's confinement rewrites it, digested so the budget
+            # keeps a fixed-size value per session rather than a body-sized one.
+            session_signature = command_signature(argv, kubeconfig_context)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -13446,6 +13672,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 )
             }
 
+        def count(status: str) -> None:
+            # Every terminal outcome passes here once: the metric's series and
+            # the session's loop-breaker streak read the same status.
+            self.metrics.record_tool(tool_label, subcommand_label, status)
+            if session_id is not None:
+                _SESSION_TOOL_BUDGET.record(session_id, session_signature, status)
+
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
             request_id,
@@ -13455,6 +13688,34 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             _sanitize_for_logging(argv[0]),
             extra=audit(AUDIT_STATUS_STARTED),
         )
+        # The session's two bounds, ahead of every other gate so a refused
+        # command is counted whatever would have refused it next: the ceiling
+        # for the background-running roles, the loop breaker for every role.
+        if session_id is not None:
+            session_refusal = _SESSION_TOOL_BUDGET.admit(
+                session_id, session_signature, ceiling=principal.role in SESSION_BUDGET_CEILING_ROLES,
+            )
+            if session_refusal is not None:
+                LOGGER.warning(
+                    "session %s request_id=%s session=%s role=%s streak=%d",
+                    "ceiling reached" if session_refusal.code == SESSION_BUDGET_EXCEEDED_CODE else "loop broken",
+                    request_id,
+                    _sanitize_for_logging(session_id),
+                    principal.role,
+                    _SESSION_TOOL_BUDGET.streak_of(session_id, session_signature),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=session_refusal.rule),
+                )
+                count(TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": session_refusal.code,
+                        "rule": session_refusal.rule,
+                        "message": session_refusal.message,
+                    },
+                )
+                return
         # Decided once, before any gate: every outcome below is counted under
         # the same two labels. An executable outside the image's allowlist is
         # counted as `other`; one the image has but this route refuses (git)
@@ -13470,7 +13731,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(argv[0]),
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_EXECUTABLE_ALLOWLIST),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13490,7 +13751,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(argv[0]),
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_EXECUTABLE),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13511,7 +13772,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 refused_flag,
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_CALLER_KUBECTL_FLAG),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13545,7 +13806,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "command blocked request_id=%s rule=%s", request_id, denied.rule_id,
                         extra=audit(AUDIT_STATUS_BLOCKED, rule=denied.rule_id),
                     )
-                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    count(TOOL_STATUS_BLOCKED)
                     self._json(
                         HTTPStatus.FORBIDDEN,
                         {
@@ -13564,7 +13825,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     _sanitize_for_logging(str(exc), max_length=256),
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=exc.rule),
                 )
-                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                count(TOOL_STATUS_BLOCKED)
                 # A local-only-shaped command the read-only policy refuses
                 # (#4298) gets the policy gate's own body: its rule, message,
                 # verb and local_render, as if it had reached that gate.
@@ -13597,7 +13858,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     scope_refusal.rule,
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=scope_refusal.rule),
                 )
-                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                count(TOOL_STATUS_BLOCKED)
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {
@@ -13614,7 +13875,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 "command blocked request_id=%s rule=%s", request_id, rule.rule_id,
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=rule.rule_id),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13638,7 +13899,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 "git argument refused request_id=%s", request_id,
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13677,7 +13938,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     _sanitize_for_logging(cwd or "", max_length=256),
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
                 )
-                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                count(TOOL_STATUS_BLOCKED)
                 self._json(
                     HTTPStatus.FORBIDDEN,
                     {
@@ -13696,7 +13957,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                         "git argument refused request_id=%s", request_id,
                         extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_ARGUMENT_REFUSED),
                     )
-                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                    count(TOOL_STATUS_BLOCKED)
                     self._json(
                         HTTPStatus.FORBIDDEN,
                         {
@@ -13724,7 +13985,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
                 )
-                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                count(TOOL_STATUS_BLOCKED)
                 self._json(HTTPStatus.FORBIDDEN, refusal)
                 return
 
@@ -13761,7 +14022,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     # No response is written, so log_request never counts this
                     # request; the invocation and its duration are counted here
                     # or nowhere.
-                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
+                    count(TOOL_STATUS_ABANDONED)
                     self.metrics.observe_duration(
                         tool_label, result.duration_ms / MILLISECONDS_PER_SECOND, admission_class(principal.role)
                     )
@@ -13778,11 +14039,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 # `completed`: the response reports that the broker ran the
                 # command, the counter reports how the command went. A
                 # timeout is exit 124 and counts the same way.
-                self.metrics.record_tool(
-                    tool_label,
-                    subcommand_label,
-                    TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
-                )
+                count(TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR)
                 if result.timed_out:
                     self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT, tool=tool_label)
                 self.metrics.observe_duration(
@@ -13819,7 +14076,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         except CallerHungUp as exc:
             # The exception names what the request was queued for: a slot, or
             # the child memory budget.
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
+            count(TOOL_STATUS_ABANDONED)
             LOGGER.info(
                 "command abandoned request_id=%s: %s; the command was not started",
                 request_id,
@@ -13828,7 +14085,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return
         except CommandSlotUnavailable as exc:
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
+            count(TOOL_STATUS_BUSY)
             LOGGER.warning(
                 "command %s request_id=%s: %s", _busy_phrase(exc), request_id, exc,
                 extra=audit(AUDIT_STATUS_BUSY),
@@ -13859,7 +14116,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(str(exc), max_length=POOL_REFUSAL_LOG_LENGTH),
                 extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_SCOPED_SA_UNMAPPED_SCOPE),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            count(TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -13882,7 +14139,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 _sanitize_for_logging(str(exc), max_length=256),
                 extra=audit(AUDIT_STATUS_REJECTED),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
+            count(TOOL_STATUS_ERROR)
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         except Exception as exc:
@@ -13892,7 +14149,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 type(exc).__name__,
                 extra=audit(AUDIT_STATUS_FAILED),
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
+            count(TOOL_STATUS_ERROR)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "credential proxy command execution failed"},

@@ -101,6 +101,8 @@ The chart's quota check counts the `spec.mode: next` additions in the capacity r
 
 Two next-mode workloads run only behind an operator flag, and the check counts each while its flag is set. With `A2A_MCP_DOOR=true` (the chart's `operator.mcpServer.enabled`, or an `operator.extraEnv` entry), the MCP server adds one pod at the console's size (100m CPU and 128Mi memory, limits 500m and 256Mi). With `A2A_DISPATCHER_IMAGE` set through `operator.extraEnv`, the profile dispatcher adds one pod (50m CPU and 64Mi memory, limits 500m and 256Mi). Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
 
+The scope publisher's Job runs in the release namespace too, one pod at a time every 15 minutes (50m CPU and 192Mi memory, limits 500m and 512Mi). It runs where the gateway pod admission policy is on and `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope, and the check counts it then.
+
 The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The apply shows no chart notes; `helm get notes kube-agents -n <NAMESPACE>` prints the same figures afterwards.
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 9
@@ -117,8 +119,10 @@ NATS adds a 40 GiB JetStream persistent volume claim (bringing the total to 5 cl
 totalling 142 GiB of `requests.storage`), and the operator renders a namespace-wide
 `ResourceQuota` on `pods` of `maxSessions` plus a headroom it derives: the pods it
 runs for the agent (one more with `A2A_MCP_DOOR=true`, for the MCP server, and one more with `A2A_DISPATCHER_IMAGE` set, for the profile dispatcher, and two more for the A2A gateway's standby and its rollout's surge pod under the election), the chart's own pods in the namespace with the surge pods
-each one's rollout can add, from its `maxSurge` (the chart stamps them on the `PlatformAgent`; 5
-without the chart), and 7 for the operator's rollout surges, the provisioning and
+each one's rollout can add, from its `maxSurge` (the chart stamps them on the `PlatformAgent`, or for one
+written by hand in an operator-only release puts them in an `a2a-quota-chart-pods`
+ConfigMap in the operator's namespace, and for one written by hand in another namespace
+are counted from the chart's workloads there; 5 without the chart), and 7 for the operator's rollout surges, the provisioning and
 scope-publishing Jobs and the gateway's count-then-create overshoot (36 pods by
 default, from `spec.harness.tuning.maxSessions: 10`, 42 with Hindsight and the
 GitHub minter),

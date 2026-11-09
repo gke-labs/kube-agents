@@ -48,8 +48,8 @@ First-time environment scan, compiled at 2026-10-20 12:00 UTC from the per-clust
 ## Machine-Readable Findings
 
 ```findings
-{"check": "readonly-root-fs", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "storefront", "title": "storefront runs with a writable root filesystem", "namespace": "web", "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes", "severity_hint": "low"}
-{"check": "probes-startup", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "search-api", "title": "search-api has no startupProbe", "namespace": "web", "detail": "Add a startupProbe so a slow start is not read as a failed liveness check", "severity_hint": "low"}
-{"check": "no-resourcequota", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "jobs", "title": "Namespace jobs has no ResourceQuota or LimitRange", "namespace": "jobs", "detail": "Add a ResourceQuota and a LimitRange to jobs", "severity_hint": "low"}
-{"check": "managed-prometheus", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "prod-east", "title": "Managed Service for Prometheus is not enabled on prod-east", "detail": "Enable Managed Service for Prometheus so workload metrics are collected", "severity_hint": "low"}
+{"check": "readonly-root-fs", "project": "onboarding-posture-prod", "location": "us-east1", "cluster": "prod-east", "object": "storefront", "title": "storefront runs with a writable root filesystem", "namespace": "web", "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes", "severity_hint": "low"}
+{"check": "probes-startup", "project": "onboarding-posture-prod", "location": "us-east1", "cluster": "prod-east", "object": "search-api", "title": "search-api has no startupProbe", "namespace": "web", "detail": "Add a startupProbe so a slow start is not read as a failed liveness check", "severity_hint": "low"}
+{"check": "no-resourcequota", "project": "onboarding-posture-prod", "location": "us-east1", "cluster": "prod-east", "object": "jobs", "title": "Namespace jobs has no ResourceQuota or LimitRange", "namespace": "jobs", "detail": "Add a ResourceQuota and a LimitRange to jobs", "severity_hint": "low"}
+{"check": "managed-prometheus", "project": "onboarding-posture-prod", "location": "us-east1", "cluster": "prod-east", "object": "prod-east", "title": "Managed Service for Prometheus is not enabled on prod-east", "detail": "Enable Managed Service for Prometheus so workload metrics are collected", "severity_hint": "low"}
 ```

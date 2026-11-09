@@ -1179,9 +1179,92 @@ def _append_final(result: AgentResult, sections: list[str]) -> None:
     if not sections:
         return
     current = str(result.metadata.get("final_message") or "")
-    add = [s for s in sections if s.split("\n", 1)[-1].strip() not in current]
-    if add:
-        result.metadata["final_message"] = "\n\n".join(filter(None, [current, *add]))
+    folded = _fold_sections(current, sections)
+    if folded != current:
+        result.metadata["final_message"] = folded
+
+
+# The section headers a thread receives as a message of its own (a card's
+# result, a paused card's question). An artifact is a file read back from the
+# pod, so a router that quotes one has not relayed a message.
+_RELAYED_SECTION_PREFIXES = (
+    _RESULT_SECTION.partition("{tid}")[0],
+    _QUESTION_SECTION.partition("{tid}")[0],
+)
+# A delivered header on a line of its own: the text after it, blank lines
+# skipped, is the body it attributes.
+_DELIVERED_HEADER_LINE = re.compile(
+    r"(?:\A|\n)(?P<header>(?:Result of delegated task \S+|Question from delegated task \S+"
+    r"|Artifact [^\n]* produced by delegated task \S+):)[ \t]*\n"
+)
+
+
+def _attributed(current: str, header: str, body: str) -> bool:
+    """Whether ``body`` already stands under ``header`` in ``current``."""
+    return any(
+        m.group("header") == header and current[m.end() :].lstrip().startswith(body)
+        for m in _DELIVERED_HEADER_LINE.finditer(current)
+    )
+
+
+def _relayed_at(prose: str, body: str) -> int:
+    """Where ``prose`` relays ``body`` on lines of its own, or -1.
+
+    The match starts a line (indentation allowed) and ends one, so a short
+    result never claims part of the router's own sentence: ``done`` is not
+    the relay in ``abandoned``, nor ``3`` in ``has 3 clusters``. The last
+    such occurrence is the relay.
+    """
+    at = prose.rfind(body)
+    while at >= 0:
+        before, after = prose[:at].rstrip(" \t"), prose[at + len(body) :].lstrip(" \t")
+        if (not before or before.endswith("\n")) and (not after or after.startswith("\n")):
+            return at
+        at = prose.rfind(body, 0, at)
+    return at
+
+
+def _fold_sections(current: str, sections: list[str]) -> str:
+    """``current`` with each delivered section in it once, under its header.
+
+    A router that relays a card's result (or its question) verbatim already
+    has the section's body in its message; dropping the section there, as
+    the artifact rule does, would leave the worker's answer with no
+    ``Result of delegated task`` header, and a check that reads the card's
+    own answer through that header would miss it. The relayed text is lifted
+    out of the router's prose and delivered as its section instead, after
+    the prose, so the router's words stay contiguous and ahead of every
+    section, and the answer is attributed once and quoted once. A relay is
+    the body on lines of its own (``_relayed_at``); a body woven into the
+    router's sentence is left there and its section is appended in full.
+    Only the prose ahead of the first delivered section is searched, so a
+    card whose answer repeats part of an earlier card's never cuts into that
+    card's section, and the longest body is lifted first, so a card whose
+    answer is part of another card's never cuts into that card's relay. A
+    body already under its own header is left alone. An artifact already
+    quoted anywhere is not appended again.
+    """
+    first = _DELIVERED_HEADER_LINE.search(current)
+    prose = current if first is None else current[: first.start()]
+    delivered = "" if first is None else current[first.start() :].strip()
+    parts = [(section, *section.partition("\n")[::2]) for section in sections]
+    pending = [(section, header, body.strip()) for section, header, body in parts if body.strip()]
+    moved = False
+    for section, header, body in sorted(pending, key=lambda part: -len(part[2])):
+        if not header.startswith(_RELAYED_SECTION_PREFIXES) or _attributed(current, header, body):
+            continue
+        at = _relayed_at(prose, body)
+        if at >= 0:
+            prose = "\n\n".join(filter(None, [prose[:at].rstrip(), prose[at + len(body) :].strip()]))
+            moved = True
+    appended = [
+        section.rstrip()
+        for section, header, body in pending
+        if not _attributed(current, header, body) and (header.startswith(_RELAYED_SECTION_PREFIXES) or body not in current)
+    ]
+    if not moved and not appended:
+        return current
+    return "\n\n".join(filter(None, [prose, delivered, *appended]))
 
 
 def _append_delivered(
@@ -1206,9 +1289,7 @@ def _append_delivered(
         for tid, text in delivered_results(observed, task_ids).items()
         if tid not in questions
     ] + [_QUESTION_SECTION.format(tid=tid, text=text) for tid, text in questions.items()]
-    sections = [s for s in all_sections if s.split("\n", 1)[1].strip() not in result.output]
-    if sections:
-        result.output = "\n\n".join(filter(None, [result.output, *sections]))
+    result.output = _fold_sections(result.output, all_sections)
     _append_final(result, all_sections)
 
 

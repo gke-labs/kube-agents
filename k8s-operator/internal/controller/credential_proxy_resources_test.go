@@ -183,7 +183,7 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 
 	// A byte count just under 2Gi rounds the CPU request down to the 250m
 	// step below it, so the pair stays in the band and draws no band warning.
-	// 672Mi gives 656m before the step, which Autopilot would round up to
+	// 544Mi gives 531m before the step, which Autopilot would round up to
 	// 750m and then raise the memory to 768Mi, over the CR's limit.
 	justUnderAgent := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2147483647")},
@@ -191,7 +191,7 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 	justUnder := justUnderAgent.Spec.Deployment
 	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true, sizingTierSmall).Requests, corev1.ResourceCPU, "1750m")
 	atFloor := proxyAgentWithResources(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("544Mi")},
 	}).Spec.Deployment
 	assertQuantity(t, resolveCredentialProxyResourcesFor(atFloor, true, sizingTierSmall).Requests, corev1.ResourceCPU, "500m")
 	// Under 256Mi the step still leaves 250m, Autopilot's smallest request.
@@ -445,9 +445,9 @@ func TestCredentialProxyOverrideDoesNotAliasTheCR(t *testing.T) {
 
 // TestCredentialProxyBudgetArithmeticAtTheDefaults pins the numbers the design
 // quotes (docs/designs/credential-proxy-child-memory-budget.md §2.2 and §2.5):
-// a request costs 176 MiB at the 8 MiB cap, the 2Gi default admits nine
-// ((2048 - 192 - 128) / 176 = 9.8), the slot cap holds that to eight, and the
-// floor that admits two is 672 MiB.
+// a request costs 176 MiB at the 8 MiB cap, the 2Gi default admits ten
+// ((2048 - 192) / 176 = 10.5), the slot cap holds that to eight, and the
+// floor that admits two is 544 MiB.
 func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	const mib = 1 << 20
 	if credentialProxyOutputCapBytes != 8*mib {
@@ -457,8 +457,8 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("request cost = %d MiB, want 176", got/mib)
 	}
 	defaultLimit := resource.MustParse(credentialProxyMemoryLimit)
-	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got != 9 {
-		t.Errorf("the default limit admits %d requests, want 9", got)
+	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got != 10 {
+		t.Errorf("the default limit admits %d requests, want 10", got)
 	}
 	// The kanban default runs six workers, each of which may hold a brokered
 	// command. What the proxy admits at once is the smaller of its memory
@@ -471,8 +471,8 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	if admitted < defaultKanbanMaxInProgress {
 		t.Errorf("the proxy admits %d commands at once at its defaults (memory budget or slot cap of %d, whichever is smaller), fewer than the %d kanban workers the default cap runs", admitted, slotCap, defaultKanbanMaxInProgress)
 	}
-	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
-		t.Errorf("floor = %d MiB, want 672", got/mib)
+	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 544*mib {
+		t.Errorf("floor = %d MiB, want 544", got/mib)
 	}
 	// GKE Autopilot without bursting sets a container's limits equal to its
 	// requests, so there the broker reads the request as its limit: the
@@ -481,8 +481,8 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	// has to clear the floor on its own, or the budget is off and the broker admits by slot alone, with the
 	// out-of-memory exposure the budget exists to remove.
 	autopilotRequest := resource.MustParse(credentialProxyAutopilotMemoryRequest)
-	if got := credentialProxyAdmittedRequests(autopilotRequest.Value(), credentialProxyOutputCapBytes); got != 9 {
-		t.Errorf("at the Autopilot memory request the proxy admits %d requests, want 9: that is the figure on Autopilot without bursting", got)
+	if got := credentialProxyAdmittedRequests(autopilotRequest.Value(), credentialProxyOutputCapBytes); got != 10 {
+		t.Errorf("at the Autopilot memory request the proxy admits %d requests, want 10: that is the figure on Autopilot without bursting", got)
 	}
 	defaultRequest := resource.MustParse(credentialProxyMemoryRequest)
 	if floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); defaultRequest.Value() < floor {
@@ -498,7 +498,7 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("the floor admits %d requests, want %d", got, credentialProxyMinimumAdmittedRequests)
 	}
 	if got := credentialProxyAdmittedRequests(credentialProxyResidentReserveBytes, credentialProxyOutputCapBytes); got != 0 {
-		t.Errorf("a limit below the fixed reserves admits %d requests, want 0", got)
+		t.Errorf("a limit at the resident reserve admits %d requests, want 0", got)
 	}
 }
 

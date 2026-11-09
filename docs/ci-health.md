@@ -102,7 +102,11 @@ archive alongside until that leaves the window; the pool-pressure check and step
 read the new bucket only, so a green from before the move is not reused and the pool gauge's window
 fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
 the dashboard's and the health bot's build links open that directory in the Cloud Console for a
-project reader; a run in the old bucket keeps its Prow link, which still renders it.
+project reader; a run in the old bucket keeps its Prow link, which still renders it. The nightly's
+bucket (`gs://kube-agents-evals-nightly-logs`) is private the same way, so the Nightly report's
+and the nightly issues' run and transcript links open the Console too; for a record whose Prow
+link points into it, the Nightly report, the nightly issues and the lane rows link the Console
+instead (`nightly.console_base` via `links.private_gcs_base`), the data unchanged.
 
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -628,21 +632,20 @@ leaves one comment on each pull request (the newest red run per pull request
 when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
-- a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
-  the run failed with no gate case failing all of its repetitions (an absolute
-  check, or a truncated log);
+- a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
+  with no gate case failing all of its repetitions (an absolute check, or a
+  truncated log);
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
-  the gate is healthy and the failed case passes on other pull requests' recent
-  runs, that it looks specific to this pull request; a mix says both, with
-  counts;
-- a table of the failed cases — result as `passed / total reps`, and how many
-  other pull requests the case is failing on right now;
-- no grading text: the check's reason and the agent's words stay on the
-  dashboard's run page, behind the link, since the pull request is public;
-- how many cases passed, the run's wall clock and pool project, and links: the
-  build log, `run.html#build=<build id>` on the dashboard, and the incident
-  brief when there is an incident.
+  the gate is healthy and what failed passes on other pull requests' recent
+  runs, that it looks specific to this pull request; a mix says both;
+- the run's wall clock and links: the build log, `run.html#build=<build id>`
+  on the dashboard, and the incident brief when there is an incident.
+
+The pull request is public, so the comment names no case and prints no count,
+reason or agent text: which cases failed, how many repetitions, why, and on
+which pool project are on the dashboard's run page behind the link, for a
+project reader. The incident brief link carries no case names either.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
@@ -677,27 +680,28 @@ case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
 2 and Prow recorded a `FAILURE`; a build Prow aborted after the suite's line
 carries the field and gets no comment, like any abort — is not a red to the tick: the collector
 recorded the suite's `outcome` on the run (`runs[].eval_outcome`,
-`SCHEMA.md`), so the comment names the cases the suite listed in
-`runs[].not_evaluated` and says nothing about the change is implied:
+`SCHEMA.md`), so the comment says that cases were lost to infrastructure,
+without naming them (the pull request is public; the run page behind the
+link has the list), and that nothing about the change is implied:
 
 ```text
 ### ⚪ Smoke gate: run not evaluated
 
-> `security-overgrant-probe` lost every repetition to infrastructure before
-> the agent could be graded. The suite could certify nothing, so Prow reports
-> the run red; nothing was graded for it and nothing about your change is
-> implied. Retest once the environment is healthy. [Details →](run.html#build=<build id>)
+> Some cases lost every repetition to infrastructure before the agent could
+> be graded. The suite could certify nothing, so Prow reports the run red;
+> nothing was graded for them and nothing about your change is implied.
+> Retest once the environment is healthy. [Details →](run.html#build=<build id>)
 
-Ran 27 min on evals-11 · build log
+Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so instead of naming them.
-While `health.json`'s condition is `storm` it adds "a quota storm is declared
-on the gate right now" and links the brief. A gate case that failed every
-graded repetition on the same run (the dashboard's roster can be newer than
-the branch's) is named in a second sentence, with its transcript to read
-before retesting; the heading stays ⚪, because the suite is the verdict's
-owner.
+When every recorded case was lost the box says so. While `health.json`'s
+condition is `storm` it adds "a quota storm is declared on the gate right
+now" and links the brief, with no case names in the link. A gate case that
+failed every graded repetition on the same run (the dashboard's roster can be
+newer than the branch's) gets a second sentence, unnamed, pointing at the
+transcripts to read before retesting; the heading stays ⚪, because the suite
+is the verdict's owner.
 
 The second is a lost pod (the build node went away under the job, #1478), a
 zero-task run:
@@ -750,10 +754,12 @@ comments instead.
 When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
 none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
-`presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
-7:30 AM ET`, with the cases, the window, the class, the incident brief link,
-and the line "Filed automatically by the smoke health bot; edit freely. Fix
-PRs: reference this issue." A human's issue that already names the cases is
+`presubmit-gate`: `Smoke gate outage since Sun 7:30 AM ET`, with the window,
+the class and the incident brief link, and the line "Filed automatically by
+the smoke health bot; edit freely. Fix PRs: reference this issue." The issue
+names no failing case and quotes no evidence line: the repository is public,
+and both are on the brief it links; its first line is a hidden marker
+carrying the case ids, by which the bot re-finds its own issue. A human's issue that already names the cases is
 adopted instead and labelled `presubmit-gate`. One rule for a title: any open
 issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
 whose body also carries a word the condition's own evidence uses ("drift" or
@@ -835,7 +841,7 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case passes every repetition again. It runs every tick before the
+once when the case is clear again. It runs every tick before the
 post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
@@ -855,8 +861,8 @@ is the last 14 nightly dates. A case whose `task.yaml` carries
 
 The issue is labelled `nightly-red`, `domain:<slug>` and `needs-triage`. Its
 body carries a marker naming the case, the domain, the assignee and why, the
-domain owner and backup as @-mentions, each of the three nights with its pass
-count, run link, transcript link and each failing check's reason, and what
+domain owner and backup as @-mentions, each of the three nights with its run
+link and transcript link (into the Cloud Console), and what
 triage decides: a product bug gets a fixer, a priority and a date; a broken
 test is fixed or marked `expected_fail` with the issue linked; an infra
 failure is closed in favour of the infra issue. It is assigned to the case's
@@ -920,8 +926,8 @@ rules). Neither changes the domain streak above.
   that last recorded it, unless the other part was lost that date or has not
   landed yet)
   ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
-  such nights in a row file one issue naming the case and the classifier's
-  reason. A night is skipped, not counted, when the part did not run or was
+  such nights in a row file one issue naming the case, with each night's run
+  and transcript links. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run
   clean: another job's clean build does not vouch for its cases), when it
   predates the case's first recorded night in the last 14 (a case new to the
@@ -1083,9 +1089,9 @@ been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
 or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
 or "start date not recorded" (also for a date that does not parse or is after
 today); why, from the entry
-and the issue it cites; and the candidates. A candidate is a case of the
+and the issue it cites; and the candidates, best first. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
-not on the roster, with its
+not on the roster, ranked by its
 graded repetitions over the last 14 nightly nights (read as [Nightly
 bugs](#nightly-bugs) reads them), whether that record meets the roster's bar
 (90% over at least 20 graded runs; docs/eval-gate-roster.md, "The admission
@@ -1095,7 +1101,10 @@ deadline), what the
 store says at the current next-mode version key (the mode the main nightly grades; today-mode only when the store holds no next-mode records): `would-admit`, `would-demote`,
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
-bar, then by pass rate. The body is edited in place when any of this changes,
+bar, then by pass rate. The issue's table names the candidates in that order
+and nothing more, since the repository is public; the records behind it are
+on the domain scorecard (`cases.html#view=domains`), and the Chat digest line
+carries the best candidate's. The body is edited in place when any of this changes,
 about once a day; its assignees are never touched, and the assignment line of an
 open issue names the assignees GitHub holds, with the owner beside them when
 the owner is not one. The body is the bot's: an edit to it or the title is
@@ -1494,7 +1503,11 @@ grants them (`pool_state_readers`), so a project gets them from its fleet apply 
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default, or before a role joined the list, are one
+project. The bot's own project, `kube-agents-prow`, also needs the API Keys API
+(`apikeys.googleapis.com`) enabled: gcloud bills the `gemini_api_key` check's key listing to the
+caller's project, and with the API off there the refusal names the bot's project, so the check
+reads every pool project as unverified rather than as missing its key (seen on the first scan of
+2026-11-06). Projects applied before that default, or before a role joined the list, are one
 loop, run once by a project owner:
 
 ```bash

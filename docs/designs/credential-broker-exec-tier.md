@@ -91,7 +91,7 @@ and each caller routes to the right one.**
 
 - Slot cap: `DEFAULT_MAX_CONCURRENT_COMMANDS = 8` (`credential_proxy.py:261`). The operator pins
   it, and a CR cannot override it (`platformagent_manifests.go:82`).
-- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default,
+- Child memory budget: (limit − 192 MiB) / 176 MiB per request. That gives 10 at the 2 GiB default,
   on Autopilot without bursting too (limit clamped to the 2 GiB Autopilot request). The smaller of
   the two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
@@ -175,16 +175,16 @@ one pod's CPU is one limit.
 
 ### 3.1 Which routes move
 
-| Route                                                       | Where                                                         | Why                                                                           |
-| ----------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `POST /v1/exec`                                             | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls (§11, question 1, closed); most of the slot-taking load |
-| `GET /v1/exec/admission` (#4084)                            | Exec tier                                                     | Reports the tier's capacity (§3.5)                                            |
-| `/v1/gcp/` Cloud API relay                                  | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls; #4199 moved the reconcile's GKE cluster reads onto it  |
-| `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N    |
-| `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection        |
-| `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                           |
-| `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                         |
-| `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                 |
+| Route                                                       | Where                                                         | Why                                                                                                                                                                        |
+| ----------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/exec`                                             | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state a call depends on (§11, question 1, closed): the per-session tool-call counts are a per-replica LRU, lost without harm on a restart; most of the slot-taking load |
+| `GET /v1/exec/admission` (#4084)                            | Exec tier                                                     | Reports the tier's capacity (§3.5)                                                                                                                                         |
+| `/v1/gcp/` Cloud API relay                                  | Exec tier (and stateful broker while 0 replicas is legal, §9) | No state across calls; #4199 moved the reconcile's GKE cluster reads onto it                                                                                               |
+| `/v1/vcs/<verb>`, `/v1/forge/refresh`, `/v1/github/refresh` | Stateful broker                                               | Keeps one forge-token coalesce cache, so GitHub mints do not multiply by N                                                                                                 |
+| `/v1/chat/*` relays, `/v1/chat/a2a/*` included              | Stateful broker                                               | **Needs one pod:** in-process receipt maps, one Socket Mode connection                                                                                                     |
+| `/v1/exec` for the `scope` role (#4119)                     | Stateful broker                                               | **Needs one pod:** a 2-hour in-memory member window                                                                                                                        |
+| `/v1/mcp/*`, `/v1/pubsub/*`                                 | Stateful broker (first step)                                  | Safe on N pods: no state across calls                                                                                                                                      |
+| `/v1/watcher/*`, `/v1/k8s/*`, `/v1/feedback/submit`         | Stateful broker (first step)                                  | Safe on N pods: `/v1/k8s/*` keeps only a 300 s endpoint cache                                                                                                              |
 
 Two route groups need the single pod: the chat relays' event, ack and nack routes, and the
 `scope` role's `/v1/exec` calls (#4119), whose member window lives in one process. The content
@@ -249,8 +249,12 @@ shim always takes the fallback and nothing reports it.
 ### 3.3 Deployment
 
 - A second Deployment, `<agent>-credential-proxy-exec-tier`, and Service, port 8765. Replicas from a new
-  CR field (§9). Strategy `RollingUpdate`: no exec call keeps state across calls (§11, question
-  1, closed). Step 0's long drain on SIGTERM (§9) lets a stopping replica finish the commands in
+  CR field (§9). Strategy `RollingUpdate`: no exec call keeps state another call depends on (§11,
+  question 1, closed). The one thing a replica remembers between calls is its per-session
+  tool-call counts (`SessionToolBudget`, the ceiling and the loop breaker), a bounded LRU that a
+  restart or a reschedule drops without harm; since each replica counts alone, N replicas admit
+  about N times the per-session ceiling, and the breaker trips per replica. Step 0's long drain
+  on SIGTERM (§9) lets a stopping replica finish the commands in
   flight, while `RollingUpdate` keeps another replica serving. This removes the exec outage
   during an upgrade at 2 or more replicas. A PodDisruptionBudget, set only when replicas are 2 or
   more, guards voluntary evictions such as a node drain; it has no part in a rollout.
@@ -532,7 +536,7 @@ caller presents, and nothing the caller can set alone changes it.
 - Inside a class the order stays arrival order. Interactive requests go ahead of queued background
   requests, within the cap.
 - On Autopilot without bursting the limit equals the request. The broker's Autopilot default
-  request is 2 GiB, so the budget admits 9 and the slot cap holds it to 8. A CR that lowers the
+  request is 2 GiB, so the budget admits 10 and the slot cap holds it to 8. A CR that lowers the
   memory request to 1 GiB would make the budget admit 4, and `B = 2`. So when the tier is on,
   each exec replica requests at least 2 GiB (§3.3), and `B = 6` on every cluster mode.
 - A background request held at `B` waits up to 60 s, as today's queue does, and is then refused
@@ -738,7 +742,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Baseline, one pod | 2, 8, 16, 32 clusters, with a fleet audit that really runs                                                         | Where waits and refusals start, and the sweep's share                                     | 2 and 8 measured, 3 runs each (#4242); 16 and 32 not yet                                                            |
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
-| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 9, slot cap 8)                                     | No burst above the requests                                                               | Not yet                                                                                                             |
+| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 10, slot cap 8)                                    | No burst above the requests                                                               | Not yet                                                                                                             |
 | Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |

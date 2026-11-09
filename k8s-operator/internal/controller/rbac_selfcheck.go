@@ -157,6 +157,15 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
 	// jobs: the mode-next provisioning run is created and swept by the operator.
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
+	// dispatchjobtemplates: the dispatcher Job admission policy's params in
+	// the profile namespace, which the operator alone writes. No watch: read
+	// uncached. podtemplates: create only, the dry run that defaults them.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}},
+	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"create"}},
+	// The dispatcher Job admission policy and its binding, read by name
+	// before the dispatcher gets its Jobs Role (dispatcherJobPolicyInPlace).
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicies"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
+	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicybindings"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	// storageclasses: growDataClaim reads a data claim's class by name.
