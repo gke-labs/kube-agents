@@ -62,8 +62,8 @@ the front door there under `spec.mode: next` too. A `session: fresh` answer carr
 thread context, which next's door does not send, so a case with one stays in
 `hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
-first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
-`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
+`dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
 is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
@@ -315,11 +315,18 @@ command, a log line or a tagged call alike, before the forbidden list reads it, 
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
-line is still graded; or with `required_runs` a script by its basename and the flags that must
+line is still graded (`exempt_grep_patterns: true` does that by the command's
+shell words: it removes only the pattern argument of a command that is one
+grep and nothing else, and refuses a control operator, a redirect other than
+`>` to `/dev/null`, a comment, a substitution and a collapsed chain); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries), `worker_budget` (the turn budget a delegated worker ran under,
+workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
+and none of which may match, an addressee the delegating turn's chain delegated to, read from the
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
+error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+`worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
@@ -454,7 +461,9 @@ splits with an empty quote inside it is one word to the shell and none to the pa
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
-judged metrics receive those entries as the execution trace.
+judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
+delegating turn's chain delegated to, by profile name, from the inject read route's
+`childAddressees`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below

@@ -71,7 +71,10 @@ a source, nor a miss's closest request: pull-request code could have written
 it. A `nightly` line is one no account pull-request code runs as uploaded; it
 is not proof that the night was free of pull-request influence, since a
 presubmit with cluster access in the same pool project could have tampered
-with that night's proxy (hack/replay-proxy/README.md, Limitations).
+with that night's proxy (hack/replay-proxy/README.md, Limitations). A
+`replay-lane` line is the replay lane's: counted, never a source and never a
+request estimated for, since a replayed run says nothing about what a
+presubmit would have hit.
 
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
@@ -143,7 +146,11 @@ import schema as F
 NIGHTLY = "nightly"
 NIGHTLY_UNTRUSTED = "nightly-untrusted"
 PRESUBMIT = "presubmit"
-JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
+# The replay lane's lines (hack/replay-proxy/README.md, "Record and replay"):
+# a replayed run, never a source or a request this analysis estimates for;
+# lane_report.py reads them. Counted, like an untrusted night's.
+REPLAY_LANE = "replay-lane"
+JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT, REPLAY_LANE)
 # The proxy's segment files (spool.py); a directory argument is searched for these.
 LOG_SUFFIX = ".jsonl"
 # Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
@@ -944,6 +951,7 @@ def summarize(
         "presubmit_requests": len(presubmit),
         "nightly_requests": sum(1 for r in records if r.kind == NIGHTLY),
         "nightly_untrusted_requests": sum(1 for r in records if r.kind == NIGHTLY_UNTRUSTED),
+        "replay_lane_requests": sum(1 for r in records if r.kind == REPLAY_LANE),
         "presubmit_prompt_tokens": total_tokens,
         "merge_times_given": len(merged or {}),
         "health": health(records, skipped),

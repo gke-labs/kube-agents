@@ -667,6 +667,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// principals' resources. An exact list means any widening is a review
 	// conversation, which is the only control that actually holds here.
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	var got []string
 	for _, line := range strings.Split(pub, "\n") {
 		line = strings.TrimSpace(line)
@@ -733,6 +742,15 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	sub := rest[strings.Index(rest, "subscribe"):]
 	subDeny := ""
 	if i := strings.Index(sub, "deny"); i >= 0 {
@@ -5054,7 +5072,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, a2aBridgeUser, tc.section)
@@ -5158,6 +5177,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	// The bind on its own pre-created intake (#4173), by exact name.
+	allowedShapes["$JS.API.CONSUMER.INFO.TASKS.bridge-platform"] = true
 	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
 			t.Errorf("bridge holds JetStream API grant %q, which is outside the shapes a2aBridgeJetStreamGrants argues for", grant)
@@ -5376,7 +5397,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, "gateway", tc.section)
@@ -5496,6 +5518,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// The bind on its own pre-created relay (#4173), by exact name.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5520,6 +5544,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+	// A deny overrides an allow, so a subject the allow list covers and the
+	// deny list names is refused all the same.
+	denied, _ := a2aGrantDenials(t, conf, "gateway", "publish")
 
 	// The generated tokens nats.go supplies: an ordered consumer's name is
 	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
@@ -5539,14 +5566,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
 		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
 		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
-		// gateway.Run's event relay: two filter subjects, so nats.go puts
-		// the filter in the body and the subject ends at the durable name.
-		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		// gateway.Run's event relay binds the durable the provision Job
+		// created (#4173): js.Consumer, an INFO on that one name, and never
+		// a create.
+		{"lib.SubscribeDurable relay bind (Precreated)", "$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay"},
 		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
-		// The same durable rebound with ONE filter subject, which is the
-		// shape every install already has on disk and the shape a rebind
-		// goes through: nats.go appends the filter to the API subject.
-		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
 		// gateway.Registry, over the session-state bucket.
 		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
 		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
@@ -5579,6 +5603,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		if !covered {
 			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
 				tc.subject, tc.caller)
+		}
+		for _, d := range denied {
+			if subjectMatches(d, tc.subject) {
+				t.Errorf("the gateway's deny %q refuses %q (%s), which its allow list covers", d, tc.subject, tc.caller)
+			}
 		}
 	}
 }
@@ -6081,7 +6110,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				// CONSUMER.INFO is the bind on its pre-created relay and
+				// names only that durable (TestGatewayHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// The profile cards' start-up read: the subject list and a
 				// direct get per card, no consumer (readDirectory).
@@ -6104,7 +6135,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				// CONSUMER.INFO is the bind on its pre-created intake and
+				// names only that durable (TestBridgeHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
 				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
 		},
@@ -6140,8 +6173,15 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {
-			callout:      true,
-			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
+			callout: true,
+			// Plus CONSUMER.INFO and CONSUMER.CREATE on TASKS, naming only
+			// the two durables it pre-creates (#4173,
+			// TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables).
+			streams: func() map[string][]string {
+				m := a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO")
+				m[a2aTasksStream] = append(m[a2aTasksStream], "CONSUMER.INFO", "CONSUMER.CREATE")
+				return m
+			}(),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
 		"session": {
@@ -8842,4 +8882,17 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// quotedLines are the quoted entries of a rendered permission list, one per
+// line, in order.
+func quotedLines(block string) []string {
+	var out []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			out = append(out, strings.Trim(line, `"`))
+		}
+	}
+	return out
 }

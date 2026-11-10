@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -659,7 +659,8 @@ part, so the edit that fixes the case deletes the entry.
 ## How far the roster's promise reaches
 
 The scope of "a held-out case cannot red a pull request" is rungs 4 and 6 only. Rungs 1–3
-— a forbidden cluster mutation (or an unrequested GitHub write the repetition names), an
+— a forbidden cluster mutation (or an unrequested GitHub write the repetition names; the write
+safeguard's charge of a requested pull request the reply could not name is the one set aside, below), an
 erroring check, a record that is not a real run — stay
 blocking for every case by design, admitted or not: `grade_case` evaluates them before it
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
@@ -857,12 +858,18 @@ it, so a repetition that wrote a pull request or branch the case did not request
 catastrophic safeguard at rung 1, as a cluster mutation is. A repetition that ended on an
 infrastructure failure with an empty reply, whose only catastrophic trip is this write safeguard, and
 whose case requested a pull request, grades infra rather than rung 1 when the safeguard charged no more
-writes than the case requested: the safeguard credits a requested pull request only when the reply names its
+writes, counted with the ones the reply named, than the case requested: the safeguard credits a requested pull request only when the reply names its
 URL, and an infrastructure failure empties the reply, so the pull request the case asked for,
 opened in its own exclusive window, reads as unrequested (#4743). A real forbidden action trips a
 safeguard this carve-out does not name, or this one beside it, and still blocks at rung 1; so does a
 write on a case that requested no pull request, which has no requested write to be mischarged, an extra
-write charged beside the requested one, and a repetition whose reply could name the pull request. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
+write charged beside the requested one, and a repetition whose reply could name the pull request. Three more
+replies cannot name it, and on the same terms the charge alone is set aside while the rest of the ladder
+grades the record: the acknowledgement a repetition holds when the delegation wait ran out with the worker
+still running, which then reaches the ceiling's own infra class; a reply that relays the delegated worker's
+provider rate limit or billing stop on a line of its own; and the acknowledgement the harness graded after it
+could not read the session store. A write the reply did name spent allowance, so a duplicate opened beside
+it still blocks. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
 whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
 push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
 its branch); a write in the window that the repetition does not name is recorded under
@@ -1000,6 +1007,15 @@ the evidence store and publishes no dashboard; its record is its logs bucket. A 
 earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
 The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
 meets are in [`bench/README.md`](../bench/README.md#certification-suite).
+
+## The replay lane
+
+`hack/eval/replay-lane-cases.txt` is what the replay lane replays (`EVAL_REPLAY_LANE=true`; the
+[inference-replay design](../examples/inference-replay/eval-design.md), Rollout step 2). Every entry
+is a registered case the inject lane runs, so the nightly has recorded it. The roster above never
+reaches it: the script arms no roster case there, and the lane appends nothing to the evidence
+store and publishes no dashboard. Its record is its report in the shadow bucket
+([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
 
 ## Demoting a flaky case
 

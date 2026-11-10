@@ -722,3 +722,29 @@ func TestAnAgentsGoMemLimitDoesNotReachTheBridge(t *testing.T) {
 		t.Errorf("the bridge's %s resourceFieldRef is missing; the derived limit has nothing to read", a2aBridgeMemoryLimitEnvVar)
 	}
 }
+
+// A bridge declared on the CR binds its pre-created intake durable as the
+// rendered one does (#4173): the bridge principal is refused creating it, so
+// without the flag it would wait out its bind window and exit. Another
+// sidecar gets nothing.
+func TestADeclaredBridgeBindsThePreCreatedIntake(t *testing.T) {
+	got := a2aExecutorSidecarEnv([]corev1.Container{
+		{Name: a2aBridgeContainerName, Image: "example.com/hermes-bridge:v1",
+			Env: []corev1.EnvVar{{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "false"}}},
+		{Name: "log-shipper", Image: "example.com/fluent-bit:v1"},
+	})
+	value := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == a2aBridgeDurablePrecreatedEnvVar {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+	if v, ok := value(got[0]); !ok || v != "true" {
+		t.Errorf("the declared bridge's %s = %q (set %v), want \"true\"", a2aBridgeDurablePrecreatedEnvVar, v, ok)
+	}
+	if v, ok := value(got[1]); ok {
+		t.Errorf("a sidecar that isn't the bridge got %s=%q", a2aBridgeDurablePrecreatedEnvVar, v)
+	}
+}

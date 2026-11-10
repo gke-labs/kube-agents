@@ -1220,7 +1220,7 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
+  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
   child tasks' usage artifacts summed; `usagePartial` when a link's stream could not be read, so
   the sums are short of it; and `usage`, the usage
   artifact's parts summed over the task and, for a delegation chain's root, every wake that
@@ -2171,7 +2171,7 @@ empty list, admits none. When a refused message addressed the
 bot (a DM or a mention), the refusal is logged with the sender's member id, and the sender
 gets one reply in that message's thread, once per workspace and member, saying the bot
 answers only its own workspace and naming the `T…:U…` entry that would admit them. A click on one of the bot's buttons by such a member is
-refused the same way, and shares that once-per-sender notice, in the question's thread. Without a team id from `auth.test` it refuses any
+refused the same way, and shares that once-per-sender notice, in the question's thread. The message shortcut admits a listed guest the same way, with `T…:U…` as the author; it drops an unlisted one with only the log line and no reply. Without a team id from `auth.test` it refuses any
 message that names a workspace, except a guest the list names, and warns once at start. A message that names no workspace
 in either field is taken as our own member's, which rests on Slack setting them on a
 shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
