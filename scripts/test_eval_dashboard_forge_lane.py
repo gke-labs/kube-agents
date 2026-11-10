@@ -86,7 +86,7 @@ class LaneDocumentTest(unittest.TestCase):
         self.assertEqual([(l["section"], l["section_title"], l["cadence"]) for l in lanes], [
             ("gitlab", "GitLab lane", "nightly"), ("self-managed", "Self-managed lanes", "weekly"), ("self-managed", "Self-managed lanes", "weekly"),
         ])
-        self.assertEqual([bool(l["off"]) for l in lanes], [False, True, True], "the page says why a lane's scheduled jobs are off")
+        self.assertEqual([l["off"] for l in lanes], [None, None, None], "no lane's scheduled jobs are paused")
         self.assertEqual([[r["build"] for r in l["runs"]] for l in lanes], [["100"], ["200"], ["300"]])
         self.assertEqual([[e["build"] for e in l["running"]] for l in lanes], [[], ["400"], []])
         self.assertEqual(lanes[2]["counts"], {"on_record": 1, "green": 0, "red": 1})
@@ -116,14 +116,15 @@ class LaneDocumentTest(unittest.TestCase):
 
     def test_the_digest_line_says_last_nights_result_or_that_a_lane_is_off(self):
         now = datetime.datetime(2026, 11, 3, 15, 0, tzinfo=datetime.timezone.utc)
-        off = "off (not in Prow yet; the weekly jobs wait on the Vertex quota)"
+        paused = "the weekly jobs wait on a fix"
+        off = f"off ({paused})"
         data = {"runs": [
             dict(run("10", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),
             dict(run("11", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE"), started="2026-11-03T08:30:00+00:00"),
         ]}
         self.assertEqual(
             forge_lane.digest_line(data, now),
-            f"🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly {off}",
+            "🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly no run on record",
         )
         self.assertIsNone(forge_lane.digest_line(None, now))
         # A lane with a reason reads as off even with a red run, and only its table's jobs are named:
@@ -132,7 +133,8 @@ class LaneDocumentTest(unittest.TestCase):
             dict(run("12", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T10:00:00+00:00"),
             dict(run("13", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T05:00:00+00:00"),
         ]}
-        line = forge_lane.digest_line(red_off, now)
+        with mock.patch.dict(forge_lane.LANES[tiers.TIER_GHES], {"off": paused}), mock.patch.dict(forge_lane.LANES[tiers.TIER_GITLAB_CE], {"off": paused}):
+            line = forge_lane.digest_line(red_off, now)
         self.assertIn(f"GHES weekly, GitLab CE weekly {off}", line)
         self.assertNotIn("red", line.split("·")[-1])
         self.assertNotIn("nightly-ghes-next", line)

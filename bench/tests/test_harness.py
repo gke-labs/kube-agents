@@ -3395,7 +3395,7 @@ def test_a_replayed_turn_supersedes_rather_than_duplicates(
     # found the card still running replayed both earlier messages, and taking
     # that payload whole would put a "still running" restatement per poll in
     # front of the judge.
-    assert result.output == f"I've started this as task {_TASK_ID}.\n\n{_RCA_RESULT}"
+    assert result.output == f"I've started this as task {_TASK_ID}.\n\nResult of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert "is running" not in result.output
 
 
@@ -3806,7 +3806,7 @@ def test_a_card_already_done_in_the_first_reply_skips_the_wait(
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert len(stub_agent.requests) == 1
-    assert result.output == _RCA_RESULT
+    assert result.output == f"Result of delegated task {_TASK_ID}:\n{_RCA_RESULT}"
     assert not result.has_errors()
 
 
@@ -6494,6 +6494,35 @@ def test_settle_delegated_worker_triage_rate_limit_with_worker_actions_stays_gra
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
     assert tool_entry in res.trajectory
+
+
+def test_delivered_results_skips_the_budget_handoff_a_capped_run_left_as_its_summary() -> None:
+    """The image saves a budget-exhausted worker's closing summary on its run
+    (timed_out, or gave_up on the attempt that tripped the limit) as a hand-off
+    for the next worker. It is not the card's answer: a blocked card with one
+    delivers nothing, a ready card between attempts delivers nothing, and a
+    completed run's summary is still delivered as before."""
+    handoff = "I completed steps 1-2; remaining: steps 3-5, then kanban_complete."
+    gave_up = {
+        "task": {"id": "t_1", "status": "blocked", "result": None},
+        "runs": [{"id": 7, "status": "gave_up", "outcome": "gave_up", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(gave_up)}], ["t_1"]) == {}
+    between_attempts = {
+        "task": {"id": "t_1", "status": "ready", "result": None},
+        "runs": [{"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff}],
+    }
+    assert harness.delivered_results([{"result": json.dumps(between_attempts)}], ["t_1"]) == {}
+    completed = {
+        "task": {"id": "t_1", "status": "done", "result": None},
+        "runs": [
+            {"id": 7, "status": "timed_out", "outcome": "timed_out", "summary": handoff},
+            {"id": 8, "status": "done", "outcome": "completed", "summary": "All five steps ran."},
+        ],
+    }
+    assert harness.delivered_results([{"result": json.dumps(completed)}], ["t_1"]) == {
+        "t_1": "All five steps ran."
+    }
 
 
 def test_delivered_results_rate_limit_result_excluded_and_non_string_handled() -> None:

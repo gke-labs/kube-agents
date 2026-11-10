@@ -35,12 +35,14 @@ single shared key's fixed Tier 3 quota was 8,000,000 input tokens per minute for
 (#1097; the diagnosis is on #1184). The move to Vertex was the fix, because Vertex's dynamic
 shared quota had no fixed wall. Vertex is now the wall.
 
-The nightly is three jobs that start together at 00:00 UTC, `ci-kube-agents-eval-nightly`
+The nightly was three jobs that started together at 00:00 UTC, `ci-kube-agents-eval-nightly`
 (`main-a`), `-main-b` and `-writers`, each at task parallelism 6, so 18 concurrent agent turns at
-the peak, close to September's shape. One shared key at 20M TPM is about 2.5 times the ceiling
+the peak, close to September's shape; since the main part runs as five shards and the writers part
+as three thirds it is eight jobs, each on its own project's key: five main shards at parallelism 6
+and three writers thirds whose units run one at a time, so 33 turns at the peak across eight keys and at most 6 on any one. One shared key at 20M TPM is about 2.5 times the ceiling
 that failed; September's load works out near 400k input tokens per minute per concurrent stream,
-which puts 18 streams near 7M. That is headroom, not isolation. A key per project is isolation:
-each nightly leases a different project, so each gets its own 20M window and the three never
+which put 18 streams near 7M. That is headroom, not isolation. A key per project is isolation:
+each nightly leases a different project, so each gets its own 20M window and the eight never
 share a minute. The `-gitlab` nightly at 02:00 and `-gitlab-next` at 04:00 run alone in their
 windows and move on the same mechanism.
 
@@ -67,7 +69,7 @@ folder-level grants above give for every pool project. The repair section names 
 
 ## Goals
 
-- The five nightly periodics' agent model calls reach the Gemini Developer API through LiteLLM,
+- The nightly periodics' agent model calls reach the Gemini Developer API through LiteLLM,
   authenticated by an API key that belongs to the leased pool project.
 - Every pool project, the 40 registered ones and every new one, carries such a key, and the pool
   verifier fails a project without one.
@@ -83,9 +85,9 @@ folder-level grants above give for every pool project. The repair section names 
   were the follow-on the per-project keys made possible. The two Argon smoke presubmits moved on
   2026-11-06 (see the status above).
 - The model. `gemini-4-argon` stays; `MODEL_DEFAULT_NAME` and `AGENT_MODEL_OVERRIDE` do not
-  change on the four jobs that export them. `ci-kube-agents-eval-nightly-gitlab-next` exports
+  change on the jobs that export them. `ci-kube-agents-eval-nightly-gitlab-next` exports
   neither and so runs the deploy's default, `gemini-3.1-pro-preview`; the job-env change gives it
-  the same two exports as its siblings, so the five nightlies agree on the model.
+  the same two exports as its siblings, so every nightly agrees on the model.
 - The evidence-store version key. It names the agent model, the judge, and the harness, not the
   serving path, and none of those change. Nights after the switch pool with nights before it in
   the same window (the call, and why, is under Decisions).
@@ -209,9 +211,9 @@ as the floor and is not re-tuned until the first night's 429 count says otherwis
 
 ### 6. The job env
 
-In `oss-test-infra`, the five eval nightlies export `MODEL_PROVIDER=gemini`:
-`ci-kube-agents-eval-nightly`, `-main-b`, `-writers`, `-gitlab`, `-gitlab-next`. Nothing else in
-the job changes. Rollback is the same five lines back to `vertex_ai`; the per-project keys and
+In `oss-test-infra`, the eval nightlies export `MODEL_PROVIDER=gemini`:
+`ci-kube-agents-eval-nightly`, `-main-b` to `-main-e`, `-writers`, `-writers-b`, `-writers-c`,
+`-gitlab`, `-gitlab-next`. Nothing else in the job changes. Rollback is the same lines back to `vertex_ai`; the per-project keys and
 secrets stay, harmless and ready. The `oss-test-infra` change merges after the repository change
 that reads the secret, and after the 40 repairs: a nightly that leases an unrepaired project with
 the export already set fails at the deploy by design.

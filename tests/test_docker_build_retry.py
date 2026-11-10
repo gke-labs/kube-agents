@@ -59,13 +59,16 @@ def _failure_gate(step_id):
     return f"steps.{step_id}.outcome == 'failure'"
 
 
-def _uses_retried_action(step):
+def _uses_retried_action(step, actions=_RETRIED_ACTIONS):
     # GitHub resolves action owners and names case-insensitively.
-    return str(step.get("uses", "")).lower().startswith(_RETRIED_ACTIONS)
+    return str(step.get("uses", "")).lower().startswith(actions)
 
 
-def check_retries(steps, exempt=_EXEMPT_STEPS):
-    """Return (problems, retried step names) for a job's step list."""
+def check_retries(steps, exempt=_EXEMPT_STEPS, actions=_RETRIED_ACTIONS):
+    """Return (problems, retried step names) for a job's step list.
+
+    `actions` holds the lower-case `owner/name@` prefixes of the retried actions.
+    """
     problems = []
     retried = []
     index = 0
@@ -73,12 +76,12 @@ def check_retries(steps, exempt=_EXEMPT_STEPS):
         step = steps[index]
         name = step.get("name", f"step {index}")
         is_retry = str(step.get("if", "")).endswith(".outcome == 'failure'")
-        if _uses_retried_action(step) and name in exempt:
+        if _uses_retried_action(step, actions) and name in exempt:
             if step.get("continue-on-error") or step.get("id"):
                 problems.append(f"{name}: exempt, so it runs once with no id or continue-on-error")
             index += 1
             continue
-        if not _uses_retried_action(step) or is_retry:
+        if not _uses_retried_action(step, actions) or is_retry:
             index += 1
             continue
         step_id = step.get("id")

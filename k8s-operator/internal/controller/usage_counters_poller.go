@@ -138,13 +138,13 @@ const (
 // eventsIngestedTotal, remediationsProposedTotal, chatMessagesInboundTotal,
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
-// negativeFeedbackTotal, lastActiveTime and lastHumanActiveTime on every
-// PlatformAgent, the two cluster gauges, the six proposal readings, the
-// two people readings (peopleSeen7d, peopleSeen30d), the broker's top
-// tools (topTools) and the nine origin readings (proposalsFromChat to
-// proposalsFromOther), from the broker's, the watcher's, the chat plugin's
-// and the A2A gateway's metrics listeners, as a manager Runnable on the
-// leader, off the reconcile path.
+// negativeFeedbackTotal, positiveFeedbackTotal, lastActiveTime and
+// lastHumanActiveTime on every PlatformAgent, the two cluster gauges, the six
+// proposal readings, the two people readings (peopleSeen7d, peopleSeen30d),
+// the broker's top tools (topTools) and the nine origin readings
+// (proposalsFromChat to proposalsFromOther), from the broker's, the
+// watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
+// manager Runnable on the leader, off the reconcile path.
 // docs/designs/usage-counters-producer.md is the design; the rules the
 // counters follow are in usage_counters_fold.go, the scrape in
 // usage_counters_scrape.go. This file is the loop and the two
@@ -589,6 +589,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	watcherDown := p.noteGatewayReading(cached, gatewayRead)
 	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, watcherDown)
 	volume, volumeKnown := usageDataVolumeForPoll(cached, scraped, gatewayRead, watcherDown)
+	clusterRefs, clusterRefsKnown := usageClusterRefsForPoll(cached, scraped, gatewayRead, watcherDown)
 	misses := p.noteReadings(cached, scraped)
 	readings, readingsKnown := usageReadingsForPoll(cached, scraped, misses)
 	topTools, topToolsKnown := usageTopToolsForPoll(scraped, misses[usageReadingTopTools])
@@ -643,7 +644,10 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if err := p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown, readings, readingsKnown, topTools, topToolsKnown); err != nil {
 		return err
 	}
-	return p.projectDataVolume(ctx, agent, volume, volumeKnown)
+	if err := p.projectDataVolume(ctx, agent, volume, volumeKnown); err != nil {
+		return err
+	}
+	return p.projectScope(ctx, agent, clusterRefs, clusterRefsKnown)
 }
 
 // usageClusterGaugesForPoll is the fleet reading this poll projects, and
@@ -1212,6 +1216,7 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterChatTurnsErrored:      usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
 		usageCounterBackgroundTasksGaveUp: usageStatusFloor(agent.Status.Usage.BackgroundTasksGaveUpTotal),
 		usageCounterNegativeFeedback:      usageStatusFloor(agent.Status.Usage.NegativeFeedbackTotal),
+		usageCounterPositiveFeedback:      usageStatusFloor(agent.Status.Usage.PositiveFeedbackTotal),
 		// sessionsTotal split between the halves (usageStatusSessionsSeed);
 		// the read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        triageSessions,
@@ -1393,6 +1398,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	errored := doc.Totals[usageCounterChatTurnsErrored]
 	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	negative := doc.Totals[usageCounterNegativeFeedback]
+	positive := doc.Totals[usageCounterPositiveFeedback]
 	sessions := usageSessionsTotal(doc.Totals)
 	chatSessions := doc.Totals[usageCounterSessionsChat]
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
@@ -1400,8 +1406,8 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
-	// counter, the errored counter, the background-tasks counter, the
-	// feedback counter, the chat sessions, the proposal readings, the people
+	// counter, the errored counter, the background-tasks counter, the two
+	// feedback counters, the chat sessions, the proposal readings, the people
 	// readings and the origin readings arrived later, each at its own
 	// release, and a CRD at a previous schema prunes some or all of them, so
 	// a difference in one of them alone waits while that field's record is
@@ -1418,6 +1424,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	erroredPruned := p.newerFieldPruned(agent, usageCounterChatTurnsErrored)
 	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
+	positivePruned := p.newerFieldPruned(agent, usageCounterPositiveFeedback)
 	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
 	topToolsPruned := p.newerFieldPruned(agent, usageNewerFieldTopTools)
@@ -1434,7 +1441,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	newerBehind := (!chatPruned && usage.ChatMessagesInboundTotal < chat) ||
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
-		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) ||
+		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) || (!positivePruned && usage.PositiveFeedbackTotal < positive) ||
 		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) || readingsMoved || topToolsMoved
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
@@ -1453,6 +1460,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.ChatTurnsErroredTotal = errored
 	usage.BackgroundTasksGaveUpTotal = background
 	usage.NegativeFeedbackTotal = negative
+	usage.PositiveFeedbackTotal = positive
 	usage.SessionsTotal = sessions
 	// Written only while unpruned, so a patch for another counter does not
 	// carry it and refresh a fresh pruning record.
@@ -1541,6 +1549,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if negative > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterNegativeFeedback, agent.Status.Usage.NegativeFeedbackTotal == negative)
+	}
+	if positive > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterPositiveFeedback, agent.Status.Usage.PositiveFeedbackTotal == positive)
 	}
 	// Gated on !chatSessionsPruned as well, unlike the counters above, so a
 	// fresh pruning record is not refreshed by a patch for another field.

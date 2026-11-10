@@ -20,6 +20,7 @@ decision rather than only that the templates exist.
 import contextlib
 import json
 import math
+import os
 import pathlib
 import re
 import shutil
@@ -42,6 +43,51 @@ _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 
 _HELM = shutil.which("helm")
+_GO = shutil.which("go")
+
+# The release shapes the rendered-manifest oracle checks (#5002, #4876, #4883), and the
+# operator's count from the chart's workloads is held to (#5006).
+_ORACLE_CASES = (
+    [],
+    ["hindsight.enabled=true", "githubMinter.enabled=true",
+     "githubMinter.org=o", "githubMinter.repo=r"],
+    ["litellm.enabled=false"],
+    ["operator.replicaCount=3", "litellm.replicaCount=1"],
+    ["platformAgent.cleanupHook.enabled=false"],
+    ["operator.enabled=false", "hindsight.enabled=true"],
+    ["webConsole.enabled=true"],
+    # The replay proxy, with the values its schema requires (the probe chart drops the
+    # schema, but a real render needs them), at its default replicas and at 5.
+    ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+     "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly"],
+    ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+     "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+     "litellm.replayShadow.replicaCount=5"],
+    ["litellm.replicaCount=0"],
+    # An operator-only release (#4883): no PlatformAgent, so the ConfigMap is the count.
+    ["platformAgent.enabled=false", "hindsight.enabled=true", "githubMinter.enabled=true",
+     "githubMinter.org=o", "githubMinter.repo=r"],
+    # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
+    # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
+    ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
+    ["operator.replicaCount=4", "operator.rollingUpdate.maxSurge=50%"],
+    ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
+    ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
+    # The Hindsight API runs one replica, so only maxSurge 0 tells its list entry apart
+    # from one pinned to 1 or reading the wrong key.
+    ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=0",
+     "hindsight.api.rollingUpdate.maxUnavailable=1"],
+    ["litellm.rollingUpdate.maxSurge=0"],
+    # Past the replicas: a rollout still adds at most the replicas.
+    ["operator.rollingUpdate.maxSurge=100"],
+    # An empty maxSurge takes the template's default, and the replay proxy reads its
+    # own key, not LiteLLM's (each list entry repeats its template's fencepost call).
+    ["litellm.rollingUpdate.maxSurge="],
+    ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+     "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+     "litellm.replayShadow.rollingUpdate.maxSurge=2"],
+)
+
 
 _PROBE_TEMPLATE = """
 {{- if .Values.probe.emitRequirements }}
@@ -380,7 +426,7 @@ class PreflightDecisionTest(unittest.TestCase):
         # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
         under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
         self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
-        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=544Mi"], extra_args=autopilot)
         self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
@@ -1317,49 +1363,46 @@ class PreflightDecisionTest(unittest.TestCase):
         the list the annotation is computed from, so a workload the list misses fails here
         (#3848, #4893: the replay proxy was missed). With operator.enabled=false the operator
         runs elsewhere, and neither counts it."""
-        for sets in (
-            [],
-            ["hindsight.enabled=true", "githubMinter.enabled=true",
-             "githubMinter.org=o", "githubMinter.repo=r"],
-            ["litellm.enabled=false"],
-            ["operator.replicaCount=3", "litellm.replicaCount=1"],
-            ["platformAgent.cleanupHook.enabled=false"],
-            ["operator.enabled=false", "hindsight.enabled=true"],
-            ["webConsole.enabled=true"],
-            # The replay proxy, with the values its schema requires (the probe chart drops the
-            # schema, but a real render needs them), at its default replicas and at 5.
-            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
-             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly"],
-            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
-             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
-             "litellm.replayShadow.replicaCount=5"],
-            ["litellm.replicaCount=0"],
-            # An operator-only release (#4883): no PlatformAgent, so the ConfigMap is the count.
-            ["platformAgent.enabled=false", "hindsight.enabled=true", "githubMinter.enabled=true",
-             "githubMinter.org=o", "githubMinter.repo=r"],
-            # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
-            # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
-            ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
-            ["operator.replicaCount=4", "operator.rollingUpdate.maxSurge=50%"],
-            ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
-            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
-            # The Hindsight API runs one replica, so only maxSurge 0 tells its list entry apart
-            # from one pinned to 1 or reading the wrong key.
-            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=0",
-             "hindsight.api.rollingUpdate.maxUnavailable=1"],
-            ["litellm.rollingUpdate.maxSurge=0"],
-            # Past the replicas: a rollout still adds at most the replicas.
-            ["operator.rollingUpdate.maxSurge=100"],
-            # An empty maxSurge takes the template's default, and the replay proxy reads its
-            # own key, not LiteLLM's (each list entry repeats its template's fencepost call).
-            ["litellm.rollingUpdate.maxSurge="],
-            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
-             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
-             "litellm.replayShadow.rollingUpdate.maxSurge=2"],
-        ):
+        for sets in _ORACLE_CASES:
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
+
+    def test_the_operator_counts_the_chart_workloads_as_the_chart_does(self) -> None:
+        """For a PlatformAgent outside its namespace the operator counts the chart's pods from
+        the chart's Deployments and StatefulSets there (a2aChartWorkloadsCount, #5006). Over
+        every shape the oracle above checks, that count, run in Go on the rendered workloads,
+        must equal the figure the chart stamps. Go is required in CI, where the Python shards
+        set it up; the Go test must report PASS, so a skip there fails this test too."""
+        if not _GO:
+            if os.environ.get("CI"):
+                self.fail("go is not on PATH in CI; this test needs it to run the operator's count")
+            self.skipTest("go is not installed")
+        with tempfile.TemporaryDirectory() as renders:
+            for i, sets in enumerate(_ORACLE_CASES):
+                res = self._render({"probe": {}}, ["platformAgent.mode=next", *sets])
+                self.assertEqual(res.returncode, 0, f"render failed for {sets}:\n{res.stderr}")
+                stamped = None
+                for doc in yaml.safe_load_all(res.stdout):
+                    meta = (doc or {}).get("metadata", {})
+                    if doc and doc.get("kind") == "PlatformAgent":
+                        stamped = (meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"]
+                    if doc and doc.get("kind") == "ConfigMap" and meta.get("name") == "a2a-quota-chart-pods":
+                        stamped = doc["data"]["pods"]
+                self.assertIsNotNone(stamped, f"the chart stamped no count for {sets}")
+                case = pathlib.Path(renders) / f"case-{i:02d}"
+                case.mkdir()
+                (case / "manifest.yaml").write_text(res.stdout)
+                (case / "expected").write_text(str(stamped))
+            go = subprocess.run(
+                [_GO, "test", "./internal/controller/", "-count=1", "-v",
+                 "-run", "^TestChartWorkloadsCountMatchesTheRenderedChart$"],
+                cwd=_ROOT / "k8s-operator", capture_output=True, text=True,
+                env={**os.environ, "KUBE_AGENTS_CHART_RENDERS": renders},
+            )
+        self.assertEqual(go.returncode, 0, f"the operator's count differs from the chart's:\n{go.stdout[-4000:]}\n{go.stderr[-2000:]}")
+        self.assertIn("--- PASS: TestChartWorkloadsCountMatchesTheRenderedChart", go.stdout)
+        self.assertEqual(go.stdout.count("--- PASS: TestChartWorkloadsCountMatchesTheRenderedChart/case-"), len(_ORACLE_CASES))
 
     def test_an_operator_only_release_refuses_a_count_past_the_cap(self) -> None:
         """The ConfigMap carries the annotation's 64-pod cap check (#4883): an operator-only

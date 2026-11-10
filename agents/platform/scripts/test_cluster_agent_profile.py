@@ -902,7 +902,7 @@ class CreateProfileTest(unittest.TestCase):
                      "credential proxy token unavailable: no token file",
                      "credential proxy error (HTTP 502): non-JSON response",
                      "credential proxy throttled: gave up after 2 attempts (HTTP 503): the credential proxy is at "
-                     "its child memory budget (704 MiB in use of 704 MiB) and this request timed out waiting"):
+                     "its child memory budget (704 MiB in use of 832 MiB) and this request timed out waiting"):
             self.assertTrue(cap.NOT_A_CONNECTION_FAILURE_RE.search(shim), shim)
         for not_shim in ("timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)",
                          BUSY_RETRY_LINE):

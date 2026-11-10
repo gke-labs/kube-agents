@@ -227,29 +227,29 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
 
     def test_a_memory_limit_under_the_floor_fails_naming_it(self):
         err = self._render_error([f"{_VALUE_PATH}.limits.memory=512Mi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 672Mi floor", err)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 544Mi floor", err)
 
     def test_a_memory_limit_a_fraction_under_the_floor_fails(self):
         # parseBytes ceils a milli-, micro- or nano-byte figure, which would round half a
-        # byte under the 704,643,072-byte floor up onto it; the operator compares exactly.
-        for value in ("704643071500m", "704643071500000u", "704643071500000000n"):
+        # byte under the 570,425,344-byte floor up onto it; the operator compares exactly.
+        for value in ("570425343500m", "570425343500000u", "570425343500000000n"):
             err = self._render_error([f"{_VALUE_PATH}.limits.memory={value}"])
-            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 672Mi floor", err)
+            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 544Mi floor", err)
 
     def test_a_memory_limit_exactly_at_the_floor_in_millibytes_renders(self):
         # With the request set beside it, so the pair is the one written.
         cr = self._render_cr([
-            f"{_VALUE_PATH}.requests.memory=704643072000m",
-            f"{_VALUE_PATH}.limits.memory=704643072000m",
+            f"{_VALUE_PATH}.requests.memory=570425344000m",
+            f"{_VALUE_PATH}.limits.memory=570425344000m",
         ])
-        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "570425344000m")
 
     def test_a_memory_limit_alone_under_the_default_request_renders(self):
-        # 672Mi clears the floor and sits under the operator's 2Gi default request, which
+        # 544Mi clears the floor and sits under the operator's 2Gi default request, which
         # the operator lowers to the limit (resolveCredentialProxyResources), so the
         # render passes and forwards the limit alone.
-        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "672Mi")
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=544Mi"])
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "544Mi")
         self.assertNotIn("requests", _cr_resources(cr))
 
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
@@ -379,7 +379,7 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         # comparing exactly, refuses it.
         cases = (
             ([f"{_VALUE_PATH}.requests.memory=2147483648.00000001"], "requests.memory", "2147483648.00000001"),
-            ([f"{_VALUE_PATH}.limits.memory=704643071.99999999"], "limits.memory", "704643071.99999999"),
+            ([f"{_VALUE_PATH}.limits.memory=570425343.99999999"], "limits.memory", "570425343.99999999"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=9007199254740992"],
              "limits.memory", "9007199254740992"),
             ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=16Pi"],
@@ -411,15 +411,15 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
 
     def test_a_limit_at_the_floor_renders(self):
-        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=672Mi", f"{_VALUE_PATH}.limits.memory=672Mi"])
-        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "672Mi"}, "limits": {"memory": "672Mi"}})
+        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=544Mi", f"{_VALUE_PATH}.limits.memory=544Mi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "544Mi"}, "limits": {"memory": "544Mi"}})
 
     # The CRD's grammar admits `.5Gi`, `1.Gi` and `500n`, and resource.ParseQuantity
     # reads them, so the render has to read them too: a form it dropped instead would
     # skip the floor and pair checks and install Degraded.
     def test_a_leading_dot_quantity_is_read_and_refused_by_the_floor(self):
         err = self._render_error([f"{_VALUE_PATH}.limits.memory=.5Gi"])
-        self.assertIn(f"{_VALUE_PATH}.limits.memory is .5Gi, under the 672Mi floor", err)
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is .5Gi, under the 544Mi floor", err)
 
     def test_a_trailing_dot_quantity_renders(self):
         cr = self._render_cr(values=_proxy_values({"limits": {"memory": "1.Gi"}}))

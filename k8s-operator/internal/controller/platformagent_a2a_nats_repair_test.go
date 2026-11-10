@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -264,13 +265,10 @@ func TestADeleteThatLosesTheRaceIsNotAnError(t *testing.T) {
 	}
 }
 
-// Through Reconcile: the bus apply calls the repair with the StatefulSet the
-// apply returned, and a pod inside the grace sets the requeue. The fake client
-// does not run the StatefulSet controller, so the apply's return is given the
-// status a server would report: generation observed, one replica, none of it
-// on the update revision. checker, when given, makes the pass RBAC-degraded,
-// whose requeue is rbacReprobeInterval unless something is due sooner.
-func busApplyReplacesAStuckPod(t *testing.T, checker *RBACChecker) {
+// settledStuckPodReconciler is a reconciler through install, with the
+// callout serving and the provision Job done. Its StatefulSet apply returns
+// the status busApplyReplacesAStuckPod describes.
+func settledStuckPodReconciler(t *testing.T, checker *RBACChecker) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
 	t.Helper()
 	agent := a2aTestAgent()
 	stsName := a2aNATSName(agent)
@@ -304,6 +302,21 @@ func busApplyReplacesAStuckPod(t *testing.T, checker *RBACChecker) {
 	reportCalloutServing(t, ctx, cl, agent)
 	completeTheProvisionJob(t, ctx, cl, agent)
 	busGatePass(t, ctx, r, req, "settled")
+	return r, cl, req
+}
+
+// Through Reconcile: the bus apply calls the repair with the StatefulSet the
+// apply returned, and a pod inside the grace sets the requeue. The fake client
+// does not run the StatefulSet controller, so the apply's return is given the
+// status a server would report: generation observed, one replica, none of it
+// on the update revision. checker, when given, makes the pass RBAC-degraded,
+// whose requeue is rbacReprobeInterval unless something is due sooner.
+func busApplyReplacesAStuckPod(t *testing.T, checker *RBACChecker) {
+	t.Helper()
+	agent := a2aTestAgent()
+	stsName := a2aNATSName(agent)
+	r, cl, req := settledStuckPodReconciler(t, checker)
+	ctx := context.Background()
 
 	sts := &appsv1.StatefulSet{}
 	if err := cl.Get(ctx, types.NamespacedName{Name: stsName, Namespace: agent.Namespace}, sts); err != nil {
@@ -353,4 +366,71 @@ func TestARBACDegradedPassStillRequeuesForTheStuckPod(t *testing.T) {
 		t.Fatalf("boot probe: %v", err)
 	}
 	busApplyReplacesAStuckPod(t, checker)
+}
+
+// A bus held for the callout whose pod is stuck past the grace, with no
+// callout replica Ready, is not left until the callout's progress deadline:
+// the pass moves the bus, says so in a Warning event, and replaces the pod.
+// Inside the grace it stays held. The apply's return is given an observed
+// status (settledStuckPodReconciler), so the move and the replacement that a
+// server would make on two passes happen on one here.
+func TestAHeldBusWithAStuckPodMovesAndReplacesThePod(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl, req := settledStuckPodReconciler(t, nil)
+	recorder := r.Recorder.(*record.FakeRecorder)
+	ctx := context.Background()
+	theCalloutIsRolledOut(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "callout rolled out")
+	rendered := busConfigHash(t, ctx, cl, agent)
+	putTheBusOnAPreviousConfig(t, ctx, cl, agent)
+	nextRS := calloutReplicaSet(t, ctx, cl, getCallout(t, ctx, cl, agent), "next", "2")
+	calloutPod(t, ctx, cl, getCallout(t, ctx, cl, agent), nextRS, "callout-next-0", "", false)
+	reportCalloutStatus(t, ctx, cl, agent, 3, 0, 1)
+	for len(recorder.Events) > 0 {
+		<-recorder.Events
+	}
+
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatalf("get the bus StatefulSet: %v", err)
+	}
+	pod := stuckPod(stuckPodOldRevision, false, 0)
+	pod.Namespace = agent.Namespace
+	pod.OwnerReferences[0].UID = sts.UID
+	pod.Status.Conditions[0].LastTransitionTime = metav1.NewTime(time.Now().Add(-30 * time.Second))
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatalf("create the stuck pod: %v", err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "inside the grace")
+	if got := busConfigHash(t, ctx, cl, agent); got != "previous" {
+		t.Fatalf("the bus moved to %q with its pod inside the grace; the rig does not hold to begin with", got)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatalf("the held bus's pod is gone: %v", err)
+	}
+
+	live := &corev1.Pod{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), live); err != nil {
+		t.Fatal(err)
+	}
+	live.Status.Conditions[0].LastTransitionTime = metav1.NewTime(time.Now().Add(-a2aNATSStuckPodGrace - time.Minute))
+	if err := cl.Status().Update(ctx, live); err != nil {
+		t.Fatalf("age the pod: %v", err)
+	}
+	completeTheProvisionJob(t, ctx, cl, agent)
+	busGatePass(t, ctx, r, req, "past the grace")
+	if got := busConfigHash(t, ctx, cl, agent); got != rendered {
+		t.Errorf("the bus config hash = %q with its pod down past the grace, want the rendered %q", got, rendered)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); !errors.IsNotFound(err) {
+		t.Errorf("the stuck pod was not replaced once the bus moved (get: %v)", err)
+	}
+	var reasons []string
+	for len(recorder.Events) > 0 {
+		reasons = append(reasons, strings.Fields(<-recorder.Events)[1])
+	}
+	if !slices.Contains(reasons, a2aBusHoldSkippedReason) || !slices.Contains(reasons, a2aNATSStuckPodReplacedReason) {
+		t.Errorf("events = %v, want %s and %s", reasons, a2aBusHoldSkippedReason, a2aNATSStuckPodReplacedReason)
+	}
 }
