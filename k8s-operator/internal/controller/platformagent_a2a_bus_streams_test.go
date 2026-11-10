@@ -786,6 +786,9 @@ func TestNoVerdictWhileTheServerCountDiffersFromTheCRs(t *testing.T) {
 	if err := rig.cl.Status().Update(context.Background(), live); err != nil {
 		t.Fatal(err)
 	}
+	// The server count is in the Job's spec, so the CR's new count names a new
+	// Job; give it a completed one, so the server count alone holds the verdict.
+	rig.recreateJob(batchv1.JobComplete)
 	rig.serve(3, allStreamsBut("TASKS")...)
 	for i := 0; i < 4; i++ {
 		rig.poll()
