@@ -889,7 +889,7 @@ func TestSeenSecrets_QuotedYAMLStringDataRawFormIsTracked(t *testing.T) {
 func TestSeenSecrets_ALineLeadingKeyWithLaterPairsIsTracked(t *testing.T) {
 	for _, line := range []string{
 		"password: " + synthCardToken + ", host: db.internal",
-		"password: " + synthCardToken + " host: db.internal port: 5432",
+		"password: " + synthCardToken + ", host: db.internal, port: 5432",
 		"password: " + synthCardToken + ", token: " + synthSecretPlain2,
 	} {
 		var s seenSecrets
@@ -898,12 +898,21 @@ func TestSeenSecrets_ALineLeadingKeyWithLaterPairsIsTracked(t *testing.T) {
 			t.Errorf("%q: the value is not tracked; set %q", line, s.values())
 		}
 	}
-	if got, want := scrubInlineSecrets("password: "+synthCardToken+", host: db.internal"), "password: [redacted], host: db.internal"; got != want {
-		t.Errorf("scrubInlineSecrets = %q, want %q", got, want)
-	}
-	// A value with a space in it and no later pair is redacted whole.
-	if got, want := scrubInlineSecrets("password: correct horse battery staple"), "password: [redacted]"; got != want {
-		t.Errorf("scrubInlineSecrets = %q, want %q", got, want)
+	// The value is redacted to the boundary the later pair sets, its pair
+	// separator with it; a value holding a byte the value scanner stops at,
+	// and a passphrase of several words with a colon in it, are redacted
+	// whole.
+	for in, want := range map[string]string{
+		"password: " + synthCardToken + ", host: db.internal": "password: [redacted] host: db.internal",
+		"password: correct horse battery staple":              "password: [redacted]",
+		"password: synth,pass(0001) host: db.internal":        "password: [redacted]",
+		"password: synth)pass>0001, host: db.internal":        "password: [redacted]",
+		"password: correct horse word: battery staple":        "password: [redacted]",
+		"password: open sesame: synthetic phrase 0007":        "password: [redacted]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

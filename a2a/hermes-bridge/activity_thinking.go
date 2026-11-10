@@ -1728,6 +1728,13 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 		default:
 			if sep == ':' && openQuote == "" && closeQuote == "" && lineLeading {
 				lineRest := strings.TrimRight(rest[:lineEndIn(rest)], " \t")
+				if n, ok := firstTokenBeforeLaterPair(lineRest); ok && !strings.ContainsAny(lineRest, "{}") {
+					if redacts(lineRest[:n], "") {
+						rec(matchEnd, matchEnd+n, named)
+						pos = matchEnd + n
+					}
+					continue
+				}
 				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
 					if redacts(lineRest, "") {
 						rec(matchEnd, matchEnd+len(lineRest), named)
@@ -2371,11 +2378,6 @@ func isLineLeadingKVKey(s string, matchStart int) bool {
 	return prefix == "" || prefix == "-"
 }
 
-// hasLaterInlineKVAssignment says whether the rest of a line after a
-// line-leading key holds another pair after the value's first token: a
-// credential key anywhere after it, or a key of any kind straight after
-// it ("password: x, host: y"). The value is then that first token, not the
-// line.
 func hasLaterInlineKVAssignment(lineRest string) bool {
 	ws := strings.IndexAny(lineRest, " \t")
 	if ws < 0 {
@@ -2383,15 +2385,41 @@ func hasLaterInlineKVAssignment(lineRest string) bool {
 	}
 	afterFirstToken := strings.TrimLeft(lineRest[ws:], " \t")
 	if loc := inlineKVSecretPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
-		if inlineSecretKey(afterFirstToken[loc[4]:loc[5]]) {
-			return true
-		}
-		// Any key straight after the first token: unquoted, starting with a
-		// letter, then a colon.
-		c := afterFirstToken[0]
-		return loc[0] == 0 && loc[2] == loc[3] && loc[6] == loc[7] && afterFirstToken[loc[10]] == ':' && (c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z')
+		return inlineSecretKey(afterFirstToken[loc[4]:loc[5]])
 	}
 	return false
+}
+
+// laterPairPattern is a pair straight after a value's first token: an
+// unquoted key starting with a letter, a colon, and the key's own value.
+var laterPairPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*[ \t]*:(.*)$`)
+
+// firstTokenBeforeLaterPair is the length of a line-leading key's value
+// when a pair of any kind follows the value's first token on the line
+// ("password: x, host: y"): that token, a pair separator after it included,
+// so the value is redacted and tracked whole up to the next key. Only when
+// the token, its separator aside, holds none of the bytes the value scanner
+// stops at, and the later key's value is one token or one ending in a pair
+// separator: a passphrase of several words with a colon in it reads as
+// one value.
+func firstTokenBeforeLaterPair(lineRest string) (int, bool) {
+	ws := strings.IndexAny(lineRest, " \t")
+	if ws <= 0 {
+		return 0, false
+	}
+	tok := lineRest[:ws]
+	if v := strings.TrimSuffix(strings.TrimSuffix(tok, ","), ";"); v == "" || strings.ContainsAny(v, `"',;)}]>`) {
+		return 0, false
+	}
+	m := laterPairPattern.FindStringSubmatch(strings.TrimLeft(lineRest[ws:], " \t"))
+	if m == nil {
+		return 0, false
+	}
+	f := strings.Fields(m[1])
+	if len(f) == 0 || len(f) > 1 && !strings.HasSuffix(f[0], ",") && !strings.HasSuffix(f[0], ";") {
+		return 0, false
+	}
+	return ws, true
 }
 
 func isFollowingKVAssignment(rest string) bool {
