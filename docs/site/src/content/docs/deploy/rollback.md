@@ -86,14 +86,27 @@ past that change unless it is given `--allow-breaking-downgrade`. If one ran und
 not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
 the A2A gateway and the agent's bridge fail behind it.
 
-Upgrade forward to the release you came from. That renders the right configuration, but the
-StatefulSet does not replace a pod that never became Ready, and the forward run then waits for the
-agent, which cannot start while the bus is down. While it waits, run the checks below, and delete
-the pod once its `controller-revision-hash` label differs from the StatefulSet's
-`status.updateRevision` (the default agent name is `platform-agent`). The operator can hold the bus
-on its earlier template for up to ten minutes, the auth callouts' rollout deadline, which is well
-inside the run's wait; a pod deleted before then comes back on that template. Once the pod is
-replaced, the run completes:
+Upgrade forward to the release you came from. The operator then replaces the stuck pod: once the
+StatefulSet carries the forward template, it deletes a bus pod that has not been Ready for two
+minutes on an earlier revision, and records an `A2ABusPodReplaced` event on the `PlatformAgent`. The
+forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus.
+The operator does not make a bus that has not been Ready for two minutes wait for callouts that
+cannot become Ready: it moves the bus to the forward template at once and records an
+`A2ABusHoldSkipped` event.
+The bus is back within about two minutes of the forward upgrade, and the callouts follow it.
+
+A forward run in harness or full mode waits for the agent, and completes once the bus is back.
+To see the replacement:
+
+```bash
+kubectl get events -n kubeagents-system --field-selector reason=A2ABusPodReplaced
+```
+
+An operator that predates this repair does not replace the pod. If the pod is still not Ready about
+fifteen minutes after the forward upgrade was applied, run the checks below. Delete the pod once its
+`controller-revision-hash` label differs from the StatefulSet's `status.updateRevision` (the default
+agent name is `platform-agent`); a pod deleted before then comes back on the earlier template. The
+delete is the same one the operator makes, so it is safe with either operator:
 
 ```bash
 kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \

@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"regexp"
@@ -2249,7 +2250,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // the callout keypair would update the config Secret without rolling the
 // StatefulSet, leaving the server trusting an issuer nothing signs with any
 // more — every answer the callout gives refused, on a bus that looks healthy.
-func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys, profiles []string) string {
 	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
@@ -2394,7 +2395,7 @@ accounts {
       { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountControl) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
   }
   # CONSOLE: the web console and MCP server, isolated from both TRUSTED and
   # APP so that neither can reach chat.console.*.in or chat.console.*.confirm.
@@ -2418,7 +2419,7 @@ accounts {
       { stream: { account: TRUSTED, subject: "_INBOX.console-mcp.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountConsole) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountConsole, profiles) + `    ]
   }
   # APP: runtime executors and readers (session, agent, bridge, web, profile-*).
   APP {
@@ -2456,12 +2457,12 @@ accounts {
       { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
     ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountApp) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountApp, profiles) + `    ]
   }
   # $SYS: human operators and monitoring only; no agent authenticates here.
   SYS {
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountSys) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountSys, profiles) + `    ]
   }
 }
 system_account: SYS
@@ -2535,8 +2536,8 @@ authorization {
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) *corev1.Secret {
-	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys)
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -2594,10 +2595,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // one that the kubelet has already written into the mounted directory is not
 // served until the pod restarts. Until a reloader sends the reload signal
 // instead, a renewal rolls the bus once a year.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys)
+	}, keys, profiles)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -2868,13 +2869,20 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 	}
 	if a2aSessionClusterViewEnabled(agent) {
 		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to one pod on one port, and the pod on
+		// widening of this fence, to the broker's pods on one port (the
+		// stateful broker, and the exec tier while it renders), and the pod on
 		// the other end authenticates the token and confers the session
 		// role. The API server stays unreachable from here; kubectl runs
 		// in the broker. Header comment: this IS the design change.
+		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+		// And the exec tier while it renders, on the same port, for the
+		// commands the session pod's shim sends there.
+		if credentialProxyExecTierEnabled(agent) {
+			to = append(to, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+		}
 		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
+			To:    to,
 		})
 	}
 
@@ -4067,15 +4075,17 @@ const (
 	// hand in a release with platformAgent.enabled=false (#4883).
 	a2aChartPodsConfigMapName = "a2a-quota-chart-pods"
 	a2aChartPodsConfigMapKey  = "pods"
-	// a2aDefaultChartPods stands in when neither that annotation nor the
-	// chart's ConfigMap gives a usable count (a PlatformAgent in a namespace
-	// with no chart release, or an unreadable value): the chart's default
-	// release, the operator and two LiteLLM replicas, and a surge pod for each
-	// of the two Deployments. It errs high for a CR in a namespace with no
-	// chart pods, which only loosens the bound. A hand-written CR beside a
-	// chart release that runs the operator (platformAgent.enabled=false) gets
-	// the release's count from the ConfigMap in the operator's namespace
-	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
+	// a2aDefaultChartPods stands in when neither that annotation, the chart's
+	// ConfigMap nor the chart's workloads give a usable count (a PlatformAgent
+	// in a namespace with no chart release, or an unreadable value): the
+	// chart's default release, the operator and two LiteLLM replicas, and a
+	// surge pod for each of the two Deployments. It errs high for a CR in a
+	// namespace with no chart pods, which only loosens the bound. A
+	// hand-written CR beside a chart release that runs the operator
+	// (platformAgent.enabled=false) gets the release's count from the
+	// ConfigMap in the operator's namespace (#4883); one in any other
+	// namespace, from the chart's workloads there (#5006).
+	// tests/test_quota_preflight.py ties it to a default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
@@ -4084,8 +4094,9 @@ const (
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
 	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
-	// operator does not use a chart-pods count it finds, from the annotation or
-	// the ConfigMap, once per spec generation and reason (a2aQuotaAgent): the
+	// operator does not use a chart-pods count it finds, from the annotation, the
+	// ConfigMap or the chart's workloads, once per spec generation and reason
+	// (a2aQuotaAgent): the
 	// quota then counts a2aDefaultChartPods, which can sit below what the
 	// namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
@@ -4160,10 +4171,11 @@ func a2aParseChartPods(raw string, present bool, source string) (int64, string) 
 // The operator reads the chart's ConfigMap from its own namespace only
 // (r.OperatorNamespace, from POD_NAMESPACE through the downward API): the
 // release that runs the operator and its chart pods there, with a
-// PlatformAgent written by hand beside them. A chart ConfigMap in any other
-// namespace is not read, and the quota counts the default. It is read
-// uncached (a2aReader), like the rest of this path's bookkeeping, and goes
-// through the annotation's parse, cap and Warning.
+// PlatformAgent written by hand beside them. It is read uncached
+// (a2aReader), like the rest of this path's bookkeeping. In any other
+// namespace the operator counts the chart's workloads there instead
+// (a2aChartWorkloadPods, #5006), and a chart ConfigMap there is not read.
+// Either count goes through the annotation's parse, cap and Warning.
 func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
 	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
 		_, why := a2aChartPodsCount(agent)
@@ -4172,9 +4184,21 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}
 	cm := &corev1.ConfigMap{}
 	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
-		// Outside the operator's namespace the count is not read. The lookup
-		// only decides whether to say so, so no answer from it can fail the
-		// reconcile.
+		// Outside the operator's namespace the count comes from the chart's
+		// workloads there. No lookup here can fail the reconcile: a failed
+		// List counts the default and says why.
+		pods, found, err := r.a2aChartWorkloadPods(ctx, agent.Namespace)
+		source := fmt.Sprintf("the chart's Deployments and StatefulSets in namespace %s (the PlatformAgent carries no %s annotation)", agent.Namespace, a2aChartPodsAnnotation)
+		if err != nil {
+			return agent, fmt.Sprintf("%s could not be listed (%v); the session quota counts the default of %d chart pods instead", source, err, a2aDefaultChartPods), nil
+		}
+		if found {
+			raw := strconv.FormatInt(pods, 10)
+			_, why := a2aParseChartPods(raw, true, source)
+			return a2aWithChartPods(agent, raw), why, nil
+		}
+		// With no chart workloads here, a chart ConfigMap is the one sign of a
+		// release whose count the quota cannot use: say so.
 		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
 			return agent, "", nil
 		}
@@ -4198,6 +4222,13 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 		return agent, fmt.Sprintf("%s is missing; the session quota counts the default of %d chart pods instead", source, a2aDefaultChartPods), nil
 	}
 	_, why := a2aParseChartPods(raw, present, source)
+	return a2aWithChartPods(agent, raw), why, nil
+}
+
+// a2aWithChartPods is a copy of agent carrying raw as the chart-pods
+// annotation, so every sizing function reads one figure. The CR itself is
+// never changed.
+func a2aWithChartPods(agent *agentv1alpha1.PlatformAgent, raw string) *agentv1alpha1.PlatformAgent {
 	sized := agent.DeepCopy()
 	annotations := sized.GetAnnotations()
 	if annotations == nil {
@@ -4205,19 +4236,83 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 	}
 	annotations[a2aChartPodsAnnotation] = raw
 	sized.SetAnnotations(annotations)
-	return sized, why, nil
+	return sized
+}
+
+// a2aChartWorkloadSelector picks the chart's own Deployments and
+// StatefulSets: every one carries both labels through kube-agents.labels.
+// This operator's workloads carry its field owner as managed-by, so they are
+// not counted here; they are in a2aStandingPods.
+var a2aChartWorkloadSelector = client.MatchingLabels{
+	labelManagedBy: managedByHelm,
+	labelPartOf:    partOfKubeAgents,
+}
+
+// a2aChartWorkloadPods counts the chart's pods in namespace from its
+// workloads there (#5006), for a PlatformAgent outside the operator's
+// namespace with no chart-pods annotation. found is false when the namespace
+// holds no chart workloads. It reads the manager's cache, which holds both
+// kinds already (the controller owns them), so it adds no API call.
+func (r *PlatformAgentReconciler) a2aChartWorkloadPods(ctx context.Context, namespace string) (pods int64, found bool, err error) {
+	var deployments appsv1.DeploymentList
+	if err := r.List(ctx, &deployments, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	var statefulSets appsv1.StatefulSetList
+	if err := r.List(ctx, &statefulSets, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	return a2aChartWorkloadsCount(deployments.Items, statefulSets.Items), len(deployments.Items)+len(statefulSets.Items) > 0, nil
+}
+
+// a2aChartWorkloadsCount is the chart's pod count from its workloads, as
+// kube-agents.chartQuotaPods computes it from values: each workload's
+// replicas, and each Deployment's rollout surge pods. tests/test_quota_preflight.py
+// holds the two equal over rendered charts.
+func a2aChartWorkloadsCount(deployments []appsv1.Deployment, statefulSets []appsv1.StatefulSet) int64 {
+	var n int64
+	for i := range deployments {
+		n = a2aSatAdd(n, int64(ptr.Deref(deployments[i].Spec.Replicas, 1)))
+		n = a2aSatAdd(n, a2aDeploymentSurgePods(&deployments[i]))
+	}
+	for i := range statefulSets {
+		n = a2aSatAdd(n, int64(ptr.Deref(statefulSets[i].Spec.Replicas, 1)))
+	}
+	return n
+}
+
+// a2aDeploymentSurgePods is how many pods a rollout of d can add: its
+// maxSurge against its replicas, a percentage rounded up (Kubernetes' 25%
+// when unset), never past the replicas (so none at zero replicas), and none
+// for Recreate (#4876).
+func a2aDeploymentSurgePods(d *appsv1.Deployment) int64 {
+	replicas := int(ptr.Deref(d.Spec.Replicas, 1))
+	if d.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		return 0
+	}
+	surge := intstr.FromString("25%")
+	if ru := d.Spec.Strategy.RollingUpdate; ru != nil && ru.MaxSurge != nil {
+		surge = *ru.MaxSurge
+	}
+	v, err := intstr.GetScaledValueFromIntOrPercent(&surge, replicas, true)
+	if err != nil || v < 0 || v > replicas {
+		v = replicas
+	}
+	return int64(v)
+}
+
+// a2aSatAdd adds two non-negative counts, stopping at math.MaxInt64.
+func a2aSatAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
 }
 
 // a2aChartPods is the count a2aChartPodsCount reads.
 func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	n, _ := a2aChartPodsCount(agent)
 	return n
-}
-
-// a2aChartPodsDiscard is why a2aChartPodsCount discarded the annotation, or "".
-func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
-	_, why := a2aChartPodsCount(agent)
-	return why
 }
 
 // a2aStandingPods is every pod the operator keeps running for agent in next
@@ -5335,6 +5430,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
 			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
 		}
+		// The exec tier's address, while it renders, for the session pods'
+		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
+		if credentialProxyExecTierEnabled(agent) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
+		}
 	}
 
 	// The Google Chat backend, applied the same way: three slices, empty
@@ -6019,12 +6119,20 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// previous identity map would place it by that map until it next
 	// reconnects. The config Secret is held with the StatefulSet, so a bus
 	// pod restarted for any other reason meanwhile comes back on the config
-	// it was running.
+	// it was running. A bus that is down, its pod not Ready for
+	// a2aNATSStuckPodGrace and no callout replica Ready, does not wait.
 	if stalled := (&appsv1.Deployment{}); r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, stalled) == nil &&
 		a2aCalloutRolloutStalled(stalled, calloutGeneration) {
 		state.calloutStalled = stalled.Name
 	}
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
+	// The profiles the dispatcher writes .supervisor for, for the gateway's
+	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
+	// ones and the ones still draining, the same names as the dispatcher's
+	// grant. A profile the controller refuses gets neither. In the config
+	// and its hash, so a profile admitted, removed or done draining rolls
+	// the bus.
+	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -6034,7 +6142,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		logf.FromContext(ctx).Info("holding the A2A bus on its current config until no auth callout pod of an older spec is left",
 			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
 	} else {
-		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
+		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys, profileNames)
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 			return state, err
 		}
@@ -6830,8 +6938,8 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 
 // a2aCalloutSpecObserved reports whether the copy is at least the Generation
 // this pass applied and the Deployment controller has observed it, so its
-// newest ReplicaSet is the current spec's. The bus asks nothing about
-// readiness: a current replica that is not ready places nobody, and a hold
+// newest ReplicaSet is the current spec's. Readiness never starts a hold on
+// the bus: a current replica that is not ready places nobody, and a hold
 // on it would have no bound (a pod that turns NotReady in place after a
 // rollout never trips the progress deadline, and a callout cannot be ready
 // while the bus it connects to is down). What places a connection by the
@@ -6910,7 +7018,8 @@ func (r *PlatformAgentReconciler) a2aCalloutHasOlderPods(ctx context.Context, de
 // terminating callout pod is still taken to be answering.
 const a2aTerminatingCalloutSlack = 10 * time.Second
 
-// a2aBusGateNow is the clock a2aCalloutHasOlderPods reads; tests set it.
+// a2aBusGateNow is the clock a2aCalloutHasOlderPods and a2aBusWaitsForCallout
+// read; tests set it.
 var a2aBusGateNow = time.Now
 
 // a2aCalloutRolloutStalled reports whether the Deployment controller has given
@@ -6979,6 +7088,16 @@ func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout s
 	})
 }
 
+// a2aBusHoldSkippedReason is the Warning event's reason when the bus moves to
+// a new config without waiting for the auth callout, because the bus pod has
+// not been Ready for a2aNATSStuckPodGrace and no callout replica is Ready.
+const a2aBusHoldSkippedReason = "A2ABusHoldSkipped"
+
+func a2aBusHoldSkippedEventMessage(bus, callout string, down time.Duration) string {
+	return fmt.Sprintf("the bus moved to its new config without waiting for the auth callout Deployment %s, because the bus pod %s%s has not been Ready for %s; connections may be placed by the previous identity map until the callout's rollout finishes",
+		callout, bus, a2aNATSPodOrdinalSuffix, down.Truncate(time.Second))
+}
+
 // a2aDeploymentRevisionAnnotation is the Deployment controller's revision
 // stamp on each ReplicaSet it creates.
 const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
@@ -6996,6 +7115,18 @@ const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
 // reconnects. A rollout the Deployment controller has given up on
 // (a2aCalloutRolloutStalled) does not hold it, so the wait is bounded by the
 // callout's progress deadline.
+//
+// A bus whose pod has not been Ready for a2aNATSStuckPodGrace, while no
+// callout replica is Ready, does not wait either. A callout replica is Ready
+// only while attached to the bus and holding a map, so with none Ready the
+// bus admits no new connection and the rollout cannot finish: the hold would
+// last the whole progress deadline. A Ready callout replica keeps the hold,
+// as a bus pod can fail its probe and still serve. The same holds for a
+// callout spec not yet observed. The cost is the window the stall release also opens: once the bus is back on
+// the new config, a callout pod of an older spec can answer a reconnect, and
+// place it by the identity map that pod holds, until the callout's rollout
+// finishes. A callout pod watches the current map, so that is the previous
+// map only on a pod that refused the current one.
 func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, calloutGeneration int64) (bool, error) {
 	live := &appsv1.StatefulSet{}
 	err := r.Get(ctx, client.ObjectKeyFromObject(sts), live)
@@ -7026,10 +7157,27 @@ func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, age
 		r.recordEvent(agent, corev1.EventTypeWarning, a2aCalloutStalledReason, a2aCalloutStalledEventMessage(callout.Name))
 		return false, nil
 	}
-	if !a2aCalloutSpecObserved(callout, calloutGeneration) {
+	if a2aCalloutSpecObserved(callout, calloutGeneration) {
+		if older, err := r.a2aCalloutHasOlderPods(ctx, callout); err != nil || !older {
+			return false, err
+		}
+	}
+	// A callout replica that is Ready is attached to the bus, so the bus
+	// still serves and the hold stands.
+	if callout.Status.ReadyReplicas > 0 {
 		return true, nil
 	}
-	return r.a2aCalloutHasOlderPods(ctx, callout)
+	down, err := r.a2aNATSPodDownFor(ctx, live, a2aBusGateNow())
+	if err != nil {
+		return false, err
+	}
+	if down == 0 {
+		return true, nil
+	}
+	logf.FromContext(ctx).Info("not holding the A2A bus for the auth callout: the bus pod is not Ready and no callout replica is",
+		"statefulset", live.Name, "notReadyFor", down.Truncate(time.Second))
+	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusHoldSkippedReason, a2aBusHoldSkippedEventMessage(live.Name, a2aCalloutName(agent), down))
+	return false, nil
 }
 
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be

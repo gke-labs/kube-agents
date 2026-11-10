@@ -271,6 +271,51 @@ No board write reaches chat without feeding the guard: ``commented`` is not a
 kind the notifier posts. The ``crashed`` event the charge writes is, and it is
 what tells the thread the run failed.
 
+The fifth fix: an exhausted budget threw its summary away (2026-11-06)
+----------------------------------------------------------------------
+Thirteen of sixteen blocked cards in one customer evaluation died on the
+iteration budget, and the retries started cold every time
+(gke-labs/kube-agents#4902). The path already does most of the work:
+``_resolve_budget_fallback`` (``agent/turn_finalizer.py``) sees the budget
+spent, asks the model for a closing summary and discards any tool call in the
+answer (``_handle_max_iterations``), and charges the card ``timed_out`` through
+``_record_task_failure``. What it never did was keep the summary. The run
+closed with ``summary`` empty, no comment went on the card, ``tasks.result``
+stayed ``NULL``, and the next worker's prompt showed the attempt as one error
+line, ``Iteration budget exhausted (N/M)``.
+
+``persist_budget_handoff`` saves it, from the ``finalize_turn`` insert that
+runs right after that fallback and so has ``final_response`` in hand. The text
+becomes the run's ``summary``, upstream's own hand-off column: ``hermes kanban
+show`` prints it as "Latest summary", and ``build_worker_context`` puts it
+under "Prior attempts on this task" in the retry worker's prompt, which is
+what makes the retry warm. The same text goes on the card as a comment,
+``budget_handoff_comment``, for the thread. ``tasks.result`` stays ``NULL``:
+upstream reserves it for a completion and reads the run summary in its place.
+
+Three guards shape it. The write is conditioned on the worker's own run row
+being closed by the budget charge (``budget_charge_landed``): that charge
+passes no ``expected_run_id``, so a worker that blocked its card, carried on,
+and then ran out of budget finds its own run closed ``blocked`` and the charge
+on somebody else's, and writes nothing. The text is the model's, never a
+rewrite: ``budget_handoff`` takes the summary when the call produced one,
+else the newest assistant row with visible text, else a fixed line saying
+there was none; ``handle_max_iterations`` never returns an empty string (a
+failed call yields its own "couldn't summarize" line), so the transcript, not
+the return value, says whether the call succeeded (``summary_call_failed``).
+And the comment is withheld when the text names a GitHub pull request URL:
+``check_respawn_guard`` reads a card's recent comments for one and holds the
+card for a day as ``active_pr``, which is the opposite of a warm retry; the
+run summary, which that guard does not read, carries the hand-off alone. The
+text also goes through the board redactor (``redact_store_text``, injected by
+the insert) before the summary write, as every other kanban writer's text
+does through ``apply_credential_redaction``'s prologue: a closing summary that
+quotes a token from a tool result must not leave that token in the run row
+``hermes kanban show`` prints and the retry's prompt renders. The 90%
+checkpoint upstream injects already asks a kanban worker for a
+``kanban_comment`` hand-off; this module does not touch that prompt, it covers
+the wall after it.
+
 What is deliberately *not* excluded is the halt nudge. It fires during a cron run
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
 set, and upstream interpolates that id straight into the text — so the run is
@@ -291,6 +336,11 @@ try:  # In the image, /opt/hermes is on sys.path.
     from tools.kanban_ownership import in_cron_run, is_delegated_child
 except ImportError:  # Local unittest discovery: the patches dir is top-level.
     from kanban_ownership import in_cron_run, is_delegated_child
+
+try:  # Installed at /opt/hermes/gateway/kanban_handoff_clip.py by the Dockerfile.
+    from gateway.kanban_handoff_clip import clip_handoff
+except ImportError:  # Local unittest discovery: the patches dir is top-level.
+    from kanban_handoff_clip import clip_handoff
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +479,78 @@ FAILED_TURN_COMMENT_AUTHOR = DETECTOR
 #: The attribute the chat-render site leaves on the CLI object for the
 #: single-query exit in ``cli.py``: the exit code.
 EXIT_CODE_ATTR = "_kube_kanban_exit_code"
+
+#: The outcomes upstream's budget charge (``_record_kanban_budget_exhausted``
+#: in ``agent/turn_finalizer.py``, through ``_record_task_failure``) closes
+#: the worker's run with: ``timed_out``, or ``gave_up`` on the attempt that
+#: trips the breaker. The hand-off is written only onto a run closed by one of
+#: them; any other closed outcome means something else ended this run.
+BUDGET_EXHAUSTED_OUTCOMES = frozenset({OUTCOME, TRIPPED_OUTCOME})
+
+#: Longest hand-off text persisted, as the run summary and in the comment.
+#: ``build_worker_context`` shows a prior attempt's summary capped at 4 KiB
+#: (``_CTX_MAX_FIELD_BYTES``) and a comment at 2 KiB, so more is never read
+#: by the retry; the summary call's own output is far shorter in practice.
+#: Cut with ``clip_handoff``, on whitespace, so a trailing URL stays whole.
+BUDGET_HANDOFF_MAX_CHARS = 4000
+
+#: Stands in when neither the summary call nor the transcript left any
+#: assistant text to hand off. Written anyway: the run then still says, on the
+#: card, that it ended on the budget with nothing to carry forward.
+BUDGET_HANDOFF_NO_TEXT = "the worker produced no summary before the run ended"
+
+#: Where the hand-off text came from: the closing summary the budget fallback
+#: asked for, the newest assistant text in the transcript when that call
+#: failed or was not made, or nothing.
+HANDOFF_SOURCE_SUMMARY = "summary"
+HANDOFF_SOURCE_TRANSCRIPT = "transcript"
+HANDOFF_SOURCE_NONE = "none"
+
+#: The comment the hand-off leaves on the card. It describes and does not
+#: instruct: the retry worker reads it under the card's comments.
+#: ``{consequence}`` is ``HANDOFF_CONSEQUENCES[outcome]``: what the charge did
+#: to the card, which differs between a counted failure and the one that
+#: tripped the limit. ``{origin}`` is one of ``HANDOFF_ORIGINS`` and
+#: ``{text}`` is the model's own text, verbatim, last so a reader who wants
+#: only the hand-off can stop at the framing. "The next worker on this card"
+#: is true for both outcomes: a counted failure's retry, or the run an
+#: unblock starts.
+BUDGET_HANDOFF_COMMENT = (
+    "Run {run} ended on an exhausted iteration budget ({used}/{maximum}). "
+    "{consequence} {origin}\n\n{text}"
+)
+HANDOFF_CONSEQUENCES = {
+    OUTCOME: "The run counts as a failure toward the card's retry limit.",
+    TRIPPED_OUTCOME: (
+        "It was the card's last permitted failure: the card is blocked until "
+        "someone unblocks it."
+    ),
+}
+HANDOFF_ORIGINS = {
+    HANDOFF_SOURCE_SUMMARY: (
+        "Hand-off from the worker's own closing summary, saved for the next "
+        "worker on this card:"
+    ),
+    HANDOFF_SOURCE_TRANSCRIPT: (
+        "The closing summary call produced nothing, so this is the worker's last "
+        "written answer, saved for the next worker on this card:"
+    ),
+    HANDOFF_SOURCE_NONE: "Nothing was left to hand off:",
+}
+
+#: Who the comment is from when the worker has no ``HERMES_PROFILE``.
+BUDGET_HANDOFF_COMMENT_AUTHOR = DETECTOR
+
+#: The shape of a transcript row: its role key, the two roles read here, and
+#: the content-part key a list-shaped ``content`` carries its text under.
+MESSAGE_ROLE_KEY = "role"
+MESSAGE_CONTENT_KEY = "content"
+ASSISTANT_ROLE = "assistant"
+USER_ROLE = "user"
+MESSAGE_TEXT_PART_KEY = "text"
+
+#: Printed for the run when the worker has none.
+UNKNOWN_RUN_ID = "?"
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -1093,3 +1215,308 @@ def close_failed_chat_turn(
     except Exception:
         logger.debug("failed-turn charge for task %s failed", env.get(TASK_ENV), exc_info=True)
     return code
+
+
+def _message_text(content) -> str:
+    """The visible text of an assistant row's ``content``: a string as is, a
+    list of parts by their ``text`` keys joined, anything else nothing."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get(MESSAGE_TEXT_PART_KEY)
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    return ""
+
+
+def _rows(messages) -> list:
+    try:
+        return list(messages) if messages else []
+    except TypeError:
+        return []
+
+
+def _is_row(row, role) -> bool:
+    return isinstance(row, dict) and row.get(MESSAGE_ROLE_KEY) == role
+
+
+def summary_call_failed(messages, summary_request) -> bool:
+    """Whether the budget fallback's summary call left no answer.
+
+    ``handle_max_iterations`` (``agent/chat_completion_helpers.py``) appends
+    the request, ``MAX_ITERATIONS_SUMMARY_REQUEST``, as a user row, and on a
+    usable answer appends that answer as an assistant row after it. It never
+    returns an empty string: two empty answers yield its fixed "couldn't
+    generate a summary" line and an exception its "couldn't summarize. Error:
+    ..." line, so ``final_response`` alone cannot tell a summary from a
+    failure. The transcript can: a failed call leaves the request as the
+    newest row. ``summary_request`` is that text, handed in by the caller so
+    this module stays importable without Hermes; with none, nothing is judged
+    failed.
+    """
+    if not summary_request:
+        return False
+    rows = _rows(messages)
+    if not rows or not _is_row(rows[-1], USER_ROLE):
+        return False
+    return _message_text(rows[-1].get(MESSAGE_CONTENT_KEY)).strip() == str(summary_request).strip()
+
+
+def budget_handoff(final_response, messages=None, summary_request=None):
+    """``(text, source)``: the partial conclusions to persist when the
+    iteration budget ran out, and where they came from.
+
+    ``final_response`` is what ``_resolve_budget_fallback`` left: the summary
+    ``_handle_max_iterations`` asked the model for (any tool call in the
+    answer discarded), or a composed answer a verification gate had withheld.
+    It is the hand-off (``HANDOFF_SOURCE_SUMMARY``) unless it is empty or the
+    transcript shows the summary call failed (``summary_call_failed``); then
+    the newest assistant row in ``messages`` that carries visible text stands
+    in (``HANDOFF_SOURCE_TRANSCRIPT``), so a worker that had already written
+    up part of its findings hands those on rather than Hermes's line about
+    the failed call. Newlines are kept: the summary is prose the retry worker
+    and the operator read. With nothing at all, ``BUDGET_HANDOFF_NO_TEXT``
+    and ``HANDOFF_SOURCE_NONE``. Bounded at ``BUDGET_HANDOFF_MAX_CHARS`` on a
+    whitespace boundary (``clip_handoff``), so a trailing URL stays whole.
+    """
+    rows = _rows(messages)
+    text = "" if summary_call_failed(rows, summary_request) else str(final_response or "").strip()
+    source = HANDOFF_SOURCE_SUMMARY
+    if not text:
+        source = HANDOFF_SOURCE_TRANSCRIPT
+        for row in reversed(rows):
+            if _is_row(row, ASSISTANT_ROLE):
+                text = _message_text(row.get(MESSAGE_CONTENT_KEY)).strip()
+                if text:
+                    break
+    if not text:
+        return BUDGET_HANDOFF_NO_TEXT, HANDOFF_SOURCE_NONE
+    return clip_handoff(text, BUDGET_HANDOFF_MAX_CHARS), source
+
+
+def budget_handoff_text(final_response, messages=None, summary_request=None) -> str:
+    """The text half of :func:`budget_handoff`."""
+    return budget_handoff(final_response, messages, summary_request)[0]
+
+
+def budget_handoff_comment(
+    *,
+    run_id,
+    api_call_count,
+    max_iterations,
+    text,
+    source=HANDOFF_SOURCE_SUMMARY,
+    outcome=OUTCOME,
+) -> str:
+    """The comment body: which run, how much of the budget it used, what the
+    charge did to the card (``outcome``: a counted ``timed_out`` or the
+    ``gave_up`` that blocked it), where the hand-off came from, the hand-off."""
+    return BUDGET_HANDOFF_COMMENT.format(
+        run=run_id if run_id is not None else UNKNOWN_RUN_ID,
+        used=api_call_count,
+        maximum=max_iterations,
+        consequence=HANDOFF_CONSEQUENCES.get(outcome, HANDOFF_CONSEQUENCES[OUTCOME]),
+        origin=HANDOFF_ORIGINS.get(source, HANDOFF_ORIGINS[HANDOFF_SOURCE_SUMMARY]),
+        text=text,
+    )
+
+
+def should_persist_budget_handoff(
+    *,
+    task_id,
+    iteration_limit_fallback,
+    interrupted,
+    failed,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+) -> bool:
+    """Whether this exit is a budget exhaustion whose hand-off this worker may
+    write to the card.
+
+    The mirror image of ``should_record_missing_terminal``: that predicate
+    hands the iteration-budget path off to upstream's own charge, and this one
+    takes only that path. ``iteration_limit_fallback`` is upstream's
+    ``budget_exhausted`` predicate, computed by the caller from the same
+    expression. The exclusions are the module's usual chain; every uncertain
+    answer is ``False``.
+    """
+    if not task_id or not iteration_limit_fallback:
+        return False
+    if interrupted or failed:
+        return False
+    return not card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    )
+
+
+def budget_charge_outcome(conn, task_id: str, run_id):
+    """The outcome upstream's budget charge closed this worker's own run with,
+    or ``None`` when it did not.
+
+    ``_record_kanban_budget_exhausted`` calls ``_record_task_failure`` with no
+    ``expected_run_id``, so it closes whatever run is current. If that was this
+    worker's run, the row is closed with one of ``BUDGET_EXHAUSTED_OUTCOMES``
+    (``timed_out``, or ``gave_up`` on the attempt that tripped the limit) and
+    the hand-off describes it truthfully. Any other outcome on the row
+    (``blocked``, ``completed``) means this run ended on its own terms earlier
+    and the card moved on; an open row means the charge did not land (upstream
+    logs and continues). Both answer ``None``: write nothing.
+    """
+    try:
+        row = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+    except Exception:
+        # A read that fails answers None, as everywhere in this module, but
+        # loudly: the hand-off is lost and the retry starts cold.
+        logger.warning(
+            "budget hand-off for task %s run %s: could not read the run row", task_id, run_id,
+            exc_info=True,
+        )
+        return None
+    if row is None:
+        return None
+    try:
+        outcome = row["outcome"]
+    except (TypeError, IndexError, KeyError):
+        outcome = row[0]
+    outcome = str(outcome or "")
+    return outcome if outcome in BUDGET_EXHAUSTED_OUTCOMES else None
+
+
+def budget_charge_landed(conn, task_id: str, run_id) -> bool:
+    """Whether upstream's budget charge closed this worker's own run."""
+    return budget_charge_outcome(conn, task_id, run_id) is not None
+
+
+def persist_budget_handoff(
+    *,
+    task_id: str,
+    run_id,
+    api_call_count,
+    max_iterations,
+    text: str,
+    connect,
+    add_comment,
+    author=None,
+    source=HANDOFF_SOURCE_SUMMARY,
+    withhold_comment=None,
+    redact=None,
+) -> bool:
+    """Save the hand-off of a run that exhausted its budget. Returns whether
+    the summary landed.
+
+    ``redact`` is ``agent.credential_redaction.redact_store_text``, injected
+    like the other Hermes callables: every other writer that puts worker text
+    on the board (``complete_task``'s ``summary``, ``add_comment``'s ``body``)
+    goes through it, by the prologue ``apply_credential_redaction`` gives
+    them, and the ``UPDATE`` below is a writer too. It runs on the text before
+    the summary write, so the run row never holds a token the comment would
+    have had removed; with none given the text is written as it is.
+
+    Two writes, in this order. First the text becomes the run's ``summary``,
+    the column upstream reserves for a worker's hand-off: ``hermes kanban
+    show`` prints the newest one as the card's "Latest summary"
+    (``latest_summary``), and ``build_worker_context`` renders it under
+    "Prior attempts on this task" in the retry worker's prompt, which is what
+    lets the retry start warm. Then the same text goes on the card as a
+    comment, framed by ``budget_handoff_comment`` with ``source``, for the
+    comment thread an operator or a front-end reads. ``tasks.result`` is left
+    alone: upstream's contract is that it holds a completion's result and
+    stays ``NULL`` otherwise, and the views read the run summary in its place.
+
+    ``withhold_comment`` is a predicate on the text; when it answers ``True``
+    the comment is not written and the summary alone carries the hand-off.
+    The caller passes upstream's respawn-guard pattern for it:
+    ``check_respawn_guard`` (``hermes_cli/kanban_db_dispatch.py``) reads every
+    comment on the card from the last day and holds the card in ``ready``, as
+    ``active_pr``, when one names a GitHub pull request URL. A closing summary
+    of a worker that was reviewing or filing a pull request names that URL as
+    a matter of course, and a comment carrying it would park the card for a
+    day instead of letting the retry start warm. The run summary is not read
+    by that guard.
+
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` and ``add_comment``
+    is ``hermes_cli.kanban_db.add_comment``, both injected. The summary write
+    is conditioned on the row being this worker's run, closed by upstream's
+    charge (``budget_charge_landed``) and carrying no summary yet; the
+    ``UPDATE`` repeats both conditions so a second pass, or a hand-over between
+    the read and the write, changes nothing. The connection is autocommit
+    (``isolation_level=None``), as every ``kanban_db`` connection is, so the
+    single-statement write needs no transaction of its own. A comment that
+    fails to write leaves the summary standing: the summary is the hand-off,
+    the comment is its echo. A write that fails outright is logged at
+    WARNING, as upstream logs its own charge failing: the retry starts cold
+    and the log is the only place that says so.
+
+    With no run id (``HERMES_KANBAN_RUN_ID`` unset or unparseable) nothing is
+    written, for the reason ``record_failed_turn`` gives: without it no row can
+    be told to be this worker's.
+    """
+    if run_id is None:
+        logger.warning(
+            "kanban: task %s exhausted its iteration budget in a worker with no "
+            "run id (HERMES_KANBAN_RUN_ID unset or unparseable); not saving a "
+            "hand-off, because no run row can be told to be this worker's",
+            task_id,
+        )
+        return False
+    if author is None:
+        author = os.environ.get(PROFILE_ENV) or BUDGET_HANDOFF_COMMENT_AUTHOR
+    if redact is not None:
+        text = redact(text)
+    conn = connect()
+    try:
+        outcome = budget_charge_outcome(conn, task_id, run_id)
+        if outcome is None:
+            return False
+        placeholders = ",".join("?" for _ in BUDGET_EXHAUSTED_OUTCOMES)
+        cursor = conn.execute(
+            "UPDATE task_runs SET summary = ? WHERE id = ? AND task_id = ? "
+            "AND summary IS NULL AND outcome IN (" + placeholders + ")",
+            (text, run_id, task_id, *sorted(BUDGET_EXHAUSTED_OUTCOMES)),
+        )
+        if getattr(cursor, "rowcount", 0) != 1:
+            return False
+        try:
+            if withhold_comment is not None and withhold_comment(text):
+                logger.info(
+                    "kanban task %s run %s: budget hand-off saved as the run summary "
+                    "only; the comment is withheld because the text names a pull "
+                    "request URL the dispatcher's respawn guard would hold the card on",
+                    task_id,
+                    run_id,
+                )
+            else:
+                add_comment(
+                    conn,
+                    task_id,
+                    author,
+                    budget_handoff_comment(
+                        run_id=run_id,
+                        api_call_count=api_call_count,
+                        max_iterations=max_iterations,
+                        text=text,
+                        source=source,
+                        outcome=outcome,
+                    ),
+                )
+        except Exception:
+            logger.warning("budget hand-off comment for task %s failed", task_id, exc_info=True)
+        return True
+    except Exception:
+        logger.warning("budget hand-off for task %s run %s failed", task_id, run_id, exc_info=True)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
