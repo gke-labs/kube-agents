@@ -112,6 +112,8 @@ The `spec.mode: next` stack only.
 
 A value outside those lists counts under `other`, and no label carries a task, a conversation or a reason.
 
+A gateway on Slack serves two more gauges, with no labels. `kubeagents_a2a_gateway_slack_connected` is 1 while its Socket Mode connection to Slack is up, and 0 from the moment it drops or starts reconnecting until it is up again. `kubeagents_a2a_gateway_slack_last_event_timestamp_seconds` is when the gateway last received a message, event or button click from Slack, in Unix seconds; it has no sample until the first. A gateway on another backend, and a standby replica, serve neither. A connection down for more than two minutes also turns the gateway's `/readyz` to 503, naming how long it has been down, and connecting again turns it back.
+
 #### Hermes chat metrics
 
 | Series                                         | Labels               | What it counts                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -245,7 +247,7 @@ The chart can turn those gauges into the health cohorts. `platformAgent.healthRu
 
 The rule-evaluator forwards alerts to Managed Prometheus's [managed Alertmanager](https://cloud.google.com/stackdriver/docs/managed-prometheus/rules-managed#managed_alertmanager). That Alertmanager routes them by the `alertmanager` Secret in `gmp-public`, or by the `OperatorConfig`'s `rules.alerting` entry. A Cloud Monitoring alerting policy does not read a `Rules` object, so configure that Secret before turning the rules on.
 
-Recording rules carry the ratios: `kubeagents:platformagent:chat_turns_errored_ratio_1d`, `broker_failure_ratio_1d`, `commands_blocked_ratio_1d`, `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d`. The two proposal ratios read four more recorded series: `proposals_merged_14d`, `proposals_closed_14d` and `proposals_authored_14d`, the window deltas of the readings, and `proposals_fell_14d`, the fall guard, present only while `proposalsAuthored` fell inside the window. The alerts read them and the gauges. Each carries `severity`; every alert but the scrape one carries the agent's `agent_namespace` and `agent`, and the scrape alert carries the `job`.
+Recording rules carry the ratios: `kubeagents:platformagent:chat_turns_errored_ratio_1d`, `broker_failure_ratio_1d`, `commands_blocked_ratio_1d`, `proposals_rejected_ratio_14d` and `proposals_merge_rate_14d`. The two proposal ratios read four more recorded series: `proposals_merged_14d`, `proposals_closed_14d` and `proposals_authored_14d`, the window deltas of the readings, and `proposals_fell_14d`, the fall guard, present only while `proposalsAuthored` fell inside the window. The alerts read them and the gauges. Each carries `severity`; every alert but the scrape and Slack ones carries the agent's `agent_namespace` and `agent`, the scrape alert carries the `job`, and the Slack alert the `namespace` and `job`.
 
 `at_risk`, the install is broken for its users:
 
@@ -254,6 +256,7 @@ Recording rules carry the ratios: `kubeagents:platformagent:chat_turns_errored_r
 - `KubeAgentsChatTurnsErroring`: errored turns over inbound messages above 0.15 in a day, with at least 3 messages.
 - `KubeAgentsBrokerFailing`: broker failures over tool executions above 0.15 in a day, with at least 10 calls.
 - `KubeAgentsBackgroundTasksGivingUp`: 3 or more gave-ups in 7 days.
+- `KubeAgentsSlackDisconnected`: the A2A gateway's `kubeagents_a2a_gateway_slack_connected` at 0 for 5 minutes, so Slack messages are not reaching the agent. It needs the gateway's `<name>-a2a-gateway-monitoring` scrape, and never fires on an install that is not on Slack under `spec.mode: next`.
 
 `friction`, it works but people are not getting value:
 

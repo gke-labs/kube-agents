@@ -311,6 +311,18 @@ type SlackAdapter struct {
 	// (slack_feedback.go); nil in a test that does not fake it.
 	feedback    FeedbackRecorder
 	feedbackAPI slackFeedbackAPI
+
+	// metrics is the gateway's counters, where the pump reports the Socket
+	// Mode connection and each event it receives (SetMetrics); nil counts
+	// nothing.
+	metrics *Metrics
+}
+
+// SetMetrics gives the adapter the gateway's counters, so the Socket Mode
+// connection's state and the last event's time are served beside them and
+// read by the gateway's readiness. Called once, before Run.
+func (s *SlackAdapter) SetMetrics(m *Metrics) {
+	s.metrics = m
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -595,6 +607,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// live — must signal it rather than leak it for the process's lifetime.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// Down from the start until Socket Mode says it is connected, so a
+	// stalled auth.test or a first dial that keeps failing reads as down;
+	// and down again once Run returns, since nothing holds the socket then.
+	s.metrics.slackDown(time.Now())
+	defer func() { s.metrics.slackDown(time.Now()) }()
 	// Under ctx, like everything else Run blocks on: this is the one call
 	// made before the pump exists, and a stalled auth.test with no context
 	// would hold Run — and so realMain — past SIGTERM with nothing logged,
@@ -626,6 +643,18 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// at-least-once, and Slack redelivers it to whoever is still up.
 			if ctx.Err() != nil {
 				return
+			}
+			// The connection's state rides the same channel as the events,
+			// in order: socketmode sends connecting before every dial, the
+			// first and each one after a drop, a ping timeout or Slack's own
+			// disconnect request alike, and connected once the websocket is up.
+			switch evt.Type {
+			case socketmode.EventTypeConnected:
+				s.metrics.slackUp()
+			case socketmode.EventTypeConnecting, socketmode.EventTypeConnectionError, socketmode.EventTypeInvalidAuth:
+				s.metrics.slackDown(time.Now())
+			case socketmode.EventTypeEventsAPI, socketmode.EventTypeInteractive:
+				s.metrics.slackEvent(time.Now())
 			}
 			if evt.Type != socketmode.EventTypeEventsAPI && evt.Type != socketmode.EventTypeInteractive {
 				// Everything that is neither an EventsAPI nor an interactive

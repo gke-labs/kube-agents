@@ -34,6 +34,7 @@ _AT_RISK = {
     "KubeAgentsChatTurnsErroring",
     "KubeAgentsBrokerFailing",
     "KubeAgentsBackgroundTasksGivingUp",
+    "KubeAgentsSlackDisconnected",
 }
 _FRICTION = {
     "KubeAgentsStalledOnboarding",
@@ -44,6 +45,8 @@ _FRICTION = {
     "KubeAgentsScrapeBroken",
 }
 _SCRAPE_ALERT = "KubeAgentsScrapeBroken"
+_SLACK_ALERT = "KubeAgentsSlackDisconnected"
+_A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
 _READING = "kubeagents:platformagent:usage_reading:max"
 
 
@@ -126,6 +129,8 @@ class HealthRulesRenderTest(unittest.TestCase):
             if name == _SCRAPE_ALERT:
                 self.assertIn("up{", rule["expr"], name)
                 continue
+            if name == _SLACK_ALERT:
+                continue
             self.assertIn(_GAUGE_PREFIX, _expand(rule["expr"], records), name)
             self.assertIn(_GROUPING, rule["expr"], f"{name} does not group by the agent's labels")
 
@@ -167,6 +172,24 @@ class HealthRulesRenderTest(unittest.TestCase):
         self.assertTrue(jobs)
         for job in jobs:
             self.assertIn(job, expr, f"the scrape alert does not watch {job}")
+
+    def test_the_slack_alert_reads_the_a2a_gateways_gauge_by_its_scrape_job(self):
+        """The series name is hand-copied from the gateway's metrics.go, and the job
+        is the chart's A2A gateway PodMonitoring; a `max` keeps a standby, which
+        serves no sample, and a stale old pod from deciding it."""
+        import re
+
+        go = _A2A_METRICS_GO.read_text()
+        consts = dict(re.findall(r'^\s*(metricsNamespace|metricsSubsystem|slackConnectedName)\s*=\s*"([a-z_0-9]+)"', go, re.MULTILINE))
+        series = "_".join((consts["metricsNamespace"], consts["metricsSubsystem"], consts["slackConnectedName"]))
+        docs = _render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=7m")
+        agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+        job = f"{agent}-a2a-gateway-monitoring"
+        self.assertIn(job, {d["metadata"]["name"] for d in docs if d.get("kind") == "PodMonitoring"})
+        rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
+        self.assertEqual(f'max by (namespace, job) ({series}{{job="{job}"}}) == 0', rule["expr"])
+        self.assertEqual("7m", rule["for"])
+        self.assertIn("7m", rule["annotations"]["summary"])
 
     def test_vector_matching_names_the_agent_labels(self):
         """Under Managed Prometheus scoping a recorded series carries project, cluster

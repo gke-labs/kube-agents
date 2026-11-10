@@ -1054,6 +1054,9 @@ platformAgent:
       brokerFailureRatio: 0.15
       brokerFailureMinCalls: 10
       backgroundTasksGaveUp7d: 3
+      # How long the A2A gateway's Slack connection reads down before the
+      # alert fires; spec.mode next with Slack only.
+      slackDisconnectedFor: 5m
       # Friction
       stalledOnboardingDays: 5
       stalledOnboardingSilentDays: 30

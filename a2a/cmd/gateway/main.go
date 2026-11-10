@@ -153,8 +153,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// carries a token if it is armed at all.
 	backend := cfg.Backend()
 	// One set of counters for the whole process: the gateway counts what it
-	// relays, the Chat adapter counts its pulls, and the metrics listener
-	// serves both (gateway/metrics.go).
+	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
+	// connection, and the metrics listener serves them all (gateway/metrics.go).
 	metrics := gateway.NewMetrics()
 	var adapter gateway.Adapter
 	switch backend {
@@ -171,6 +171,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		if err == nil {
 			// The allowlist's T…:U… entries: other workspaces' members it serves.
 			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
+			sl.SetMetrics(metrics)
 			adapter = sl
 		}
 	case "":

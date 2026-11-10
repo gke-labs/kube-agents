@@ -4,7 +4,11 @@ The health cohorts as Managed Prometheus rules, one Rules object per install,
 evaluated by the managed rule-evaluator against this namespace's metrics. Every
 alert reads the operator's gauges (usage_gauges.go in k8s-operator), per agent,
 by agent_namespace and agent; the ratios are recorded once and the alerts read
-the recorded series, so a dashboard and an alert see one number.
+the recorded series, so a dashboard and an alert see one number. Two read
+other series: the scrape alert reads `up`, and the Slack alert reads the A2A
+gateway's own connection gauge, by its scrape job, which only a next-mode
+install on Slack serves (a gateway on another backend, or a standby replica,
+serves no sample, so the alert never fires there).
 
 Four rules of PromQL here, each held by tests/test_chart_platform_agent_health_rules.py:
 
@@ -63,6 +67,7 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $fell := "kubeagents:platformagent:proposals_fell_14d" }}
 {{- $times := "kubeagents_platformagent_usage_time_seconds" }}
 {{- $phase := "kubeagents_platformagent_phase" }}
+{{- $slack := "kubeagents_a2a_gateway_slack_connected" }}
 {{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
@@ -133,6 +138,13 @@ spec:
             severity: at_risk
           annotations:
             summary: '{{ $who }}: {{ "{{ $value | printf \"%.0f\" }}" }} background tasks gave up in 7 days'
+        - alert: KubeAgentsSlackDisconnected
+          expr: max by (namespace, job) ({{ $slack }}{job="{{ $agent }}-a2a-gateway-monitoring"}) == 0
+          for: {{ $t.slackDisconnectedFor }}
+          labels:
+            severity: at_risk
+          annotations:
+            summary: "The A2A gateway of {{ "{{ $labels.namespace }}" }}/{{ $agent }} has had no Slack connection for {{ $t.slackDisconnectedFor }}, so Slack messages are not reaching the agent"
     - name: kubeagents-health-friction
       rules:
         - alert: KubeAgentsStalledOnboarding

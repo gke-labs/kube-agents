@@ -885,6 +885,7 @@
                 "brokerFailureRatio",
                 "brokerFailureMinCalls",
                 "backgroundTasksGaveUp7d",
+                "slackDisconnectedFor",
                 "stalledOnboardingDays",
                 "stalledOnboardingSilentDays",
                 "proposalsRejectedMin14d",
@@ -925,6 +926,11 @@
                 },
                 "brokerFailureMinCalls": { "type": "number", "minimum": 0 },
                 "backgroundTasksGaveUp7d": { "type": "number", "minimum": 0 },
+                "slackDisconnectedFor": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?$"
+                },
                 "stalledOnboardingDays": { "type": "number", "minimum": 0 },
                 "stalledOnboardingSilentDays": {
                   "type": "number",
