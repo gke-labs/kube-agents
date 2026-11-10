@@ -550,3 +550,16 @@ func TestScrubInlineSecretsCodeSpanWithACredentialAndMoreWords(t *testing.T) {
 		}
 	}
 }
+
+// A value column headed Base64 or B64, or a header word with a digit after
+// it (Value1), reads the table as a key/value table.
+func TestScrubInlineSecretsTableHeaderWithADigit(t *testing.T) {
+	const v = "quietpasture"
+	for _, h := range []string{"Base64", "B64", "Value1"} {
+		in := "| Key | Status | " + h + " |\n|---|---|---|\n| password | set | " + v + " |\n"
+		want := "| Key | Status | " + h + " |\n|---|---|---|\n| password | set | [redacted] |\n"
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("header %s: scrubInlineSecrets(%q)\n got %q\nwant %q", h, in, got, want)
+		}
+	}
+}

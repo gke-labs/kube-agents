@@ -1999,10 +1999,20 @@ var (
 )
 
 // tableHeaderWords is a header cell's words, the markdown normalised away,
-// in lower case.
+// in lower case: split on anything but a letter or a digit (Base64, B64),
+// and each word with a digit in it again with its digits taken as
+// separators too (Value1, Password2).
 func tableHeaderWords(s string, cell [2]int) []string {
 	n, _ := normalizeMarkdown(s[cell[0]:cell[1]])
-	return strings.FieldsFunc(strings.ToLower(n), func(r rune) bool { return !(r >= 'a' && r <= 'z') })
+	lower := strings.ToLower(n)
+	isLetter := func(r rune) bool { return r >= 'a' && r <= 'z' }
+	words := strings.FieldsFunc(lower, func(r rune) bool { return !isLetter(r) && !(r >= '0' && r <= '9') })
+	for _, w := range words {
+		if strings.IndexFunc(w, func(r rune) bool { return !isLetter(r) }) >= 0 {
+			words = append(words, strings.FieldsFunc(w, func(r rune) bool { return !isLetter(r) })...)
+		}
+	}
+	return words
 }
 
 // tableHeaderIsValue says whether a header names a column of values
