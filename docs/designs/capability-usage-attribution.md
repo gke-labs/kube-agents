@@ -26,6 +26,24 @@ test run:
 The test run is the nightly run on the sized test fleet, which the sized test fleet design
 describes. This design adds the measurement to that run.
 
+## Success criteria
+
+Ten questions define success for this design and the sized test fleet design together. They are
+numbered C1 to C10 in both. This design owns the seven below; the sized test fleet design owns C5,
+C6 and C7 (container headroom, every audit finishing with no crash, and the time to a new install's
+first reports). A criterion is met when the report answers it for M on 7 nights in a row and for L
+on 4 weeks in a row, from runs the two checks under The report mark sound.
+
+| #   | Question                                                           | The report shows                                                                                                                                                                                            |
+| --- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1  | What does kube-agents cost a month on an S, M or L fleet?          | For each size: the monthly model-token cost and memory cost from the monthly estimate, beside the test fleet's own infrastructure cost from the run's cost record, kept apart.                              |
+| C2  | What does each capability cost, a run and a month, at each size?   | The table for each capability: memory and tokens a run, the cost of each unit of work it starts, the month, and the cost a cluster, with a row for each size.                                               |
+| C3  | Which five capabilities use most of the memory and the tokens?     | The overview tables for each size and window: the five largest, Other, the platform base and Unattributed, adding up to 100 %.                                                                              |
+| C4  | How does a new install's first hours compare with a normal day?    | The burst window's and the soak window's totals and rates an hour, side by side for each size, and the first-run flow's one-time cost.                                                                      |
+| C8  | Which capability grows faster than the fleet?                      | The flag on each capability whose cost a cluster rises by more than 20 % from M to L, with both figures.                                                                                                    |
+| C9  | What does one chat question cost, and how long does the user wait? | For each scripted chat question and size: its tokens and cost, and its opening turn's time (`turn1_s`) and the full answer's time (`latency`), as the eval harness records them.                            |
+| C10 | How much model quota does each size need at its peak?              | For each size and window: the highest token rate over any one minute (input, cached input and output tokens a minute), the install's and each of the five largest capabilities', and the requests a minute. |
+
 ## Questions the report answers
 
 For each fleet size and each window:
@@ -239,6 +257,15 @@ unit apart from the count, and a reader multiplies the cost a unit by their own 
 A figure averages the runs of the last 7 nights at M and the last 4 at L, because a run of a
 30-minute watcher happens about four times a night and an audit once. S has no scheduled run, so
 its row stays empty until a run by hand fills it.
+
+**Response time.** The eval harness records each scripted chat question's opening turn's wall-clock
+time (`turn1_s`, from the moment the agent accepts the question to the end of that turn) and the
+whole answer's time (`latency`). The report keeps both with the question's tokens and cost (C9).
+
+**Peak rate.** The sampler reads LiteLLM's token and request counters every 15 seconds, so the report
+gives the highest rate over any one minute in each window (C10). With the per-call tag, the counters
+carry the capability as a label and the peak is per capability too. Without it, a capability's peak
+comes from its sessions' message times and token counts, at the resolution those records have.
 
 **Flags.** The report marks three kinds of row:
 
