@@ -92,6 +92,7 @@ func settleFailed(t0 time.Time, message string, lasted time.Duration, count int)
 
 const (
 	hostIPUnknownEvent = "Error: host IP unknown; known addresses: [{Hostname gk3-wolfram-std-02-pool-1-cc370783-lgp8}]"
+	etcHostsGoneEvent  = "Error: open /var/lib/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: no such file or directory"
 	startErrorEvent    = `Error: failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: "migrate": executable file not found in $PATH: unknown`
 )
 
@@ -104,6 +105,11 @@ func TestSettleAppliesToFailedOnlyForARetriedConfigError(t *testing.T) {
 		want    bool
 	}{
 		{hostIPUnknownEvent, true},
+		{etcHostsGoneEvent, true},
+		{"Error: open /data/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: no such file or directory", true},
+		{"Error: open /etc/hosts: no such file or directory", false},
+		{"Error: open /var/lib/kubelet/pods/6b331da7-6791-4a24-8461-1ee69d50ec0a/etc-hosts: permission denied", false},
+		{"pod quoted it: Error: open /var/lib/kubelet/pods/x/etc-hosts: no such file or directory", false},
 		{startErrorEvent, false},
 		{`Error: secret "db-creds" not found`, false},
 		{"Error: ErrImagePull", false},
@@ -171,6 +177,38 @@ func TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown(t *testing.T) {
 	start.Dispatch(ctx, settleFailed(t0, startErrorEvent, 0, 1))
 	if *startCount != 1 {
 		t.Errorf("a one-shot start error fired %d injects; want 1 on its first sighting", *startCount)
+	}
+}
+
+// TestDispatcherSettleHoldsAnEtcHostsErrorFromADeletedPod is the autopush
+// alert: an Autopilot balloon pod deleted a second after it was created, and
+// kubelet's one Failed writing its etc-hosts two seconds later. It is held and
+// counted self_resolved; the same message repeating past the period is
+// forwarded.
+func TestDispatcherSettleHoldsAnEtcHostsErrorFromADeletedPod(t *testing.T) {
+	t0 := time.Date(2026, 11, 5, 23, 42, 18, 0, time.UTC)
+	ctx := context.Background()
+
+	now := t0
+	disp, m, injectCount := failedDispatcher(t, &now)
+	disp.Dispatch(ctx, settleFailed(t0, etcHostsGoneEvent, 0, 1))
+	if *injectCount != 0 {
+		t.Fatalf("a one-shot etc-hosts error fired %d injects; want 0", *injectCount)
+	}
+	now = t0.Add(2*time.Minute + settleQuietSlack)
+	disp.Sweep(ctx)
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
+	}
+
+	now = t0
+	lasting, _, lastingCount := failedDispatcher(t, &now)
+	for i, lasted := range []time.Duration{0, 30 * time.Second, 90 * time.Second, 130 * time.Second} {
+		now = t0.Add(lasted)
+		lasting.Dispatch(ctx, settleFailed(t0, etcHostsGoneEvent, lasted, i+1))
+	}
+	if *lastingCount != 1 {
+		t.Errorf("an etc-hosts error lasting past the period fired %d injects; want 1", *lastingCount)
 	}
 }
 
