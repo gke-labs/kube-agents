@@ -182,6 +182,12 @@ def _drop_bridge(docs):
     spec["containers"] = [c for c in spec["containers"] if c["name"] != "hermes-bridge"]
 
 
+def _drop_nats_exporter(docs):
+    doc = _find_doc(docs, "StatefulSet", "platformagent-a2a-nats")
+    spec = doc["spec"]["template"]["spec"]
+    spec["containers"] = [c for c in spec["containers"] if c["name"] != "nats-exporter"]
+
+
 def _drop_console_cpu_limit(docs):
     doc = _find_doc(docs, "Deployment", "platformagent-a2a-console")
     for container in doc["spec"]["template"]["spec"]["containers"]:
@@ -625,6 +631,14 @@ class NextModeFootprintTest(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("'console'", message)
         self.assertIn("declares no cpu limit", message)
+
+    def test_a_missing_a2a_container_is_an_error(self):
+        """A golden without one of a workload's listed containers (here the NATS
+        exporter, #4477) must not pass as a smaller footprint."""
+        with _goldens_with(following=_drop_nats_exporter):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("container 'nats-exporter' of StatefulSet/", str(caught.exception))
 
     def test_an_unaccounted_a2a_container_is_an_error(self):
         with _goldens_with(following=_add_callout_container):
