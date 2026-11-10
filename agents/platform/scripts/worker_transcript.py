@@ -289,8 +289,11 @@ BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
 # A shell joins a backslash-newline before it parses, so the detector folds
 # the continuation (and the indentation after it) to one space first; every
-# rule below is segment-bounded and would otherwise see two commands.
-SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+# rule below is segment-bounded and would otherwise see two commands. Only an
+# odd run of backslashes ends in a continuation: in an even run each pair is
+# one literal backslash, and the newline still ends the command. The even
+# part before the continuation is kept (group 1).
+SHELL_CONTINUATION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\\r?\n[ \t]*")
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -997,13 +1000,18 @@ def supplement_redact(
     return value
 
 
+def fold_shell_continuations(command: str) -> str:
+    """``command`` with each backslash-newline continuation (and the indentation
+    after it) folded to one space, as the shell joins it; an escaped backslash
+    before a newline is not a continuation."""
+    return SHELL_CONTINUATION_RE.sub(lambda match: match.group(1) + SHELL_CONTINUATION_FOLD, command)
+
+
 def fold_shell_command(command: str) -> str:
     """A command as the shell would read it: a backslash-newline continuation
     joined to its line, and an escaped space folded to one token character
     (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
-    return SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command).replace(
-        SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD
-    )
+    return fold_shell_continuations(command).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
@@ -1319,7 +1327,7 @@ def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
 
 
 def _command_reads_a_secret(command: str, depth: int) -> bool:
-    folded = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command)
+    folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))

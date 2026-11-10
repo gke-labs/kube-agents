@@ -9715,6 +9715,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
+            # An escaped backslash before the newline is not a continuation, so
+            # the read on the next line is its own command.
+            "echo done\\\\\nkubectl get secret db -o yaml",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
             "kubectl get secret db --output=go-template='{{index .data \"password\"}}'",
             "kubectl get secret db -o json | jq -r '.data.password | @base64d'",
@@ -9862,6 +9865,24 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             [s["preview"] for s in steps if s["kind"] == "tool_result"],
             [session_kv_server.WORKER_STEP_WITHHELD, "pod-a Running", session_kv_server.WORKER_STEP_WITHHELD],
         )
+        self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_a_secret_read_after_an_even_backslash_run_is_withheld(self):
+        # The read sits on its own line after an escaped backslash; the fold
+        # used to join it onto the line above, so its output was served.
+        secret_val = "even-run-secret-hunter2-value"
+        read_args = json.dumps({"command": "echo done\\\\\nkubectl get secret db -o yaml"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-even", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                ("sess-even", "assistant", None, None, [{"id": "c1", "function": {"name": "terminal", "arguments": read_args}}], 102.0, None, None),
+                ("sess-even", "tool", f"done\\\ndata:\n  password: {secret_val}\n", "terminal", None, 103.0, None, "c1"),
+            ],
+            with_tool_call_id=True,
+        )
+        steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
+        self.assertEqual([s["preview"] for s in steps if s["kind"] == "tool_result"], [session_kv_server.WORKER_STEP_WITHHELD])
         self.assertNotIn(secret_val, json.dumps(steps))
 
     def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):

@@ -151,6 +151,29 @@ class TestScrubStepText(unittest.TestCase):
         other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
         self.assertEqual(_scrub("tool_call", other_arg), other_arg)
 
+    def test_only_an_odd_backslash_run_folds_as_a_continuation(self):
+        # Bash reads an odd run before a newline as a continuation and an even
+        # run as literal backslashes, so the newline still ends the command.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a\\\n  b"), "a b")
+        self.assertEqual(fold("a\\\\\n  b"), "a\\\\\n  b")
+        self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\ b")
+        self.assertEqual(fold("a\\\\\\\\\n  b"), "a\\\\\\\\\n  b")
+        self.assertEqual(fold("a\\\r\nb"), "a b")
+        self.assertEqual(fold("a\\\\\r\nb"), "a\\\\\r\nb")
+        # A stored call keeps the line break after an even run.
+        stored = json.loads(_scrub("tool_call", json.dumps({"command": "grep -rn\\\\\nU=x\ncurl \"$U\""})))["command"]
+        self.assertEqual(stored, "grep -rn\\\\\nU=x\ncurl \"$U\"")
+
+    def test_a_secret_read_after_an_even_backslash_run_is_detected(self):
+        # The even run used to fold the newline, so the read joined the line
+        # above and was not seen.
+        for cmd in ("echo done\\\\\nkubectl get secret db -o yaml", "echo done\\\\\\\\\ncat /var/run/secrets/token"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+                self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get pods"))
+
     def test_unquoted_value_after_a_credential_key_is_masked_to_the_line_end(self):
         for line in ("password: one two three", "DB_PASSWORD=one two three", "DB_PASSWORD:  my secret phrase here"):
             with self.subTest(line=line):
