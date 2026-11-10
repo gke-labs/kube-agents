@@ -1052,7 +1052,8 @@ class AnswerMappingTest(unittest.TestCase):
                 "content": json.dumps({"ok": True, "task_id": "t_11111111", "comment_id": 41})}
         mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
         self.assertEqual(mapping.apply_to_answer("posted comment 41"), "posted comment 41")
-        for answer in ("posted comment 41 on the card", "comment #41", '{"comment_id": 41}', "comment_id is 41"):
+        for answer in ("posted comment 41 on the card", "comment #41", '{"comment_id": 41}', "comment_id is 41",
+                       "Comment 41 has been posted", "Comment #41:", "COMMENT 41"):
             self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
         for answer in ("41 pods are pending", "comments 41", "port 41", "comment_id 410", "commented 41 times"):
             self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)

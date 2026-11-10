@@ -829,7 +829,9 @@ class Mapping:
             if re.search(pattern, text):
                 return True
         for value in self.comment_numbers:
-            if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text):
+            # Any case: an answer often starts a sentence or bullet with it ("Comment 41 posted").
+            if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
+                         re.IGNORECASE):
                 return True
         return self.answer_repeats_dropped_count(text)
 
