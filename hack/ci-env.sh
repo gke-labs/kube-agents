@@ -1025,9 +1025,10 @@ start_replay_shadow_collector() {
 # A no-op unless EVAL_REPLAY_LANE=true. Downloads what recent
 # trusted nightlies selected from the shared cache (fetch_cache.py, into
 # REPLAY_LANE_SEED_DIR, with their runs in REPLAY_LANE_NIGHTLY_RUNS) and seeds
-# every proxy pod with it (collect_shadow.py --seed-once); the collector then
-# seeds any pod that replaces one. Returns 1, with the reason, when there is
-# nothing to replay or a pod did not take it: the lane would measure nothing,
+# every live proxy pod with it (collect_shadow.py --seed-once; a pod draining
+# after a rollout is skipped); the collector then seeds any pod that replaces
+# one. Returns 1, with the reason, when there is nothing to replay, no live pod,
+# or a live pod did not take it: the lane would measure nothing,
 # so the caller stops before its cases. Call once AGENT_CLUSTER_CONTEXT is set,
 # before start_replay_shadow_collector.
 prepare_replay_lane_cache() {
@@ -1063,10 +1064,10 @@ prepare_replay_lane_cache() {
     args+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   if ! python3 "${REPLAY_SHADOW_COLLECTOR_SCRIPT}" "${args[@]}" < /dev/null; then
-    echo "ERROR: not every replay proxy pod took the cache (the line above counts them)." >&2
+    echo "ERROR: no live replay proxy pod was running, or one did not take the cache (the lines above count them)." >&2
     return 1
   fi
-  echo "Replay lane: the cache is in every proxy pod; the collector seeds any pod that replaces one."
+  echo "Replay lane: the cache is in every live proxy pod; the collector seeds any pod that replaces one."
   return 0
 }
 

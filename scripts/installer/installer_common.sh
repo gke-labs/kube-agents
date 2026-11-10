@@ -93,6 +93,13 @@ readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+# The least a spend ceiling can be when it is on, in US dollars. The chart
+# splits the amount across the gateway replicas and renders each share with
+# four decimals, refusing a share that rounds to 0; a cent keeps the share above
+# that floor at up to 100 replicas, and the refusal happens here, before any
+# apply, rather than in the Helm render. The chart's values.schema.json and the
+# composition's litellm_budget validation carry the same floor.
+readonly LITELLM_BUDGET_MIN_USD="0.01"
 
 # ─── Data volume size ─────────────────────────────
 # The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
@@ -914,6 +921,21 @@ validate_openai_compatible_inputs() {
 # reaches terraform.tfvars as a bare word HCL cannot parse.
 is_non_negative_integer() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+# LITELLM_BUDGET_USD: a non-negative amount in US dollars, digits with an
+# optional decimal part, 0 meaning no ceiling. The same shape the chart's
+# litellm.budget.usd schema (a number at or above 0) and the composition's
+# litellm_budget validation take; refused here first, for the MODEL_MAX_TOKENS
+# reason.
+is_non_negative_decimal() {
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]
+}
+
+# LITELLM_BUDGET_PERIOD: a LiteLLM duration, a whole number above zero and a
+# unit of s, m, h, d, w or mo, the chart's litellm.budget.period.
+is_valid_litellm_budget_period() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(s|m|h|d|w|mo)$ ]]
 }
 
 # LITELLM_REDACTION_IP_ACTION: what the gateway does with IP literals, the
@@ -5282,6 +5304,31 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
+  # The gateway's spend ceiling, checked for the MODEL_MAX_TOKENS reason. Empty
+  # takes the defaults (0, no ceiling), and the period is read only beside an
+  # amount above zero, as it is in the chart. The amount is compared as text:
+  # 0 and 0.0 both mean off, and the variable reaches terraform.tfvars only
+  # when it is on, so an install without a ceiling keeps the file it had.
+  local litellm_budget_usd="${LITELLM_BUDGET_USD:-$DEFAULT_LITELLM_BUDGET_USD}"
+  local litellm_budget_period="${LITELLM_BUDGET_PERIOD:-$DEFAULT_LITELLM_BUDGET_PERIOD}"
+  if ! is_non_negative_decimal "$litellm_budget_usd"; then
+    print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is not an amount in US dollars. Set a number at or above 0, such as 25 or 2.50, or leave it empty, in install.env."
+    return 1
+  fi
+  local litellm_budget_on="false"
+  if [[ ! "$litellm_budget_usd" =~ ^0+(\.0+)?$ ]]; then
+    litellm_budget_on="true"
+    # Below the floor the chart's per-replica share rounds to nothing and its
+    # render refuses the value at helm_release apply; refused here instead.
+    if awk -v amount="$litellm_budget_usd" -v floor="$LITELLM_BUDGET_MIN_USD" 'BEGIN { exit !(amount + 0 < floor + 0) }'; then
+      print_error "LITELLM_BUDGET_USD='${litellm_budget_usd}' is under ${LITELLM_BUDGET_MIN_USD} USD, the least a ceiling can be when it is on (the chart splits it across the gateway replicas and renders each share with four decimals). Set 0 for no ceiling, or at least ${LITELLM_BUDGET_MIN_USD}, in install.env."
+      return 1
+    fi
+    if ! is_valid_litellm_budget_period "$litellm_budget_period"; then
+      print_error "LITELLM_BUDGET_PERIOD='${litellm_budget_period}' is not a LiteLLM duration. Set a whole number and s, m, h, d, w or mo, such as 1d, or leave it empty, in install.env."
+      return 1
+    fi
+  fi
   # The daily alert ceilings, checked for the MODEL_MAX_TOKENS reason. An
   # empty key is not written, so the agent image keeps its default for that
   # bucket. No install.defaults.env entry exists for these keys, because
@@ -5346,6 +5393,10 @@ write_tfvars_from_state() {
   local scoped_pool_enabled="${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
   if ! is_bool_spelling "$scoped_pool_enabled"; then
     print_error "SCOPED_SA_POOL_ENABLED='${scoped_pool_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ] && ! is_bool_spelling "$DISALLOW_SECRETS_READ"; then
+    print_error "DISALLOW_SECRETS_READ='${DISALLOW_SECRETS_READ}' is neither true nor false. Fix it in install.env."
     return 1
   fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
@@ -5504,6 +5555,13 @@ write_tfvars_from_state() {
     else
       echo "litellm_redaction = { enabled = false }"
     fi
+    # Only while on, so an install without a ceiling keeps the file it had.
+    if [ "$litellm_budget_on" = "true" ]; then
+      echo ""
+      echo "# The gateway's spend ceiling (LITELLM_BUDGET_USD, LITELLM_BUDGET_PERIOD in"
+      echo "# install.env), split across the gateway's replicas by the chart."
+      echo "litellm_budget = { usd = ${litellm_budget_usd}, period = $(hcl_str "$litellm_budget_period") }"
+    fi
     echo ""
     echo "# The scoped service account pool (SCOPED_SA_POOL_ENABLED,"
     echo "# SCOPED_SA_POOL_MAX_ACCOUNTS in install.env): one reader service account per"
@@ -5511,6 +5569,9 @@ write_tfvars_from_state() {
     echo "scoped_pool_enabled      = $(hcl_bool "$scoped_pool_enabled")"
     if [ -n "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" ]; then
       echo "scoped_pool_max_accounts = ${SCOPED_SA_POOL_MAX_ACCOUNTS}"
+    fi
+    if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+      echo "disallow_secrets_read    = $(hcl_bool "$DISALLOW_SECRETS_READ")"
     fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then

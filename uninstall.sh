@@ -929,6 +929,9 @@ main() {
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The gateway's spend ceiling, likewise: the generator refuses an amount or
+  # a period it cannot read, and the gateway goes with the release.
+  export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""
   # The scoped service account pool, likewise: the generator refuses a
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.

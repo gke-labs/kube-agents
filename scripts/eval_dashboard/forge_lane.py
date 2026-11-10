@@ -38,7 +38,7 @@ RUNS_LISTED = 20
 # the nightly's 14-hour budget).
 RUNNING_MAX_AGE = datetime.timedelta(hours=8)
 DEFAULT_JOB = "pull-kube-agents-smoke-test-gitlab"
-DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
+DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab-next"
 RESULT_SUCCESS = "SUCCESS"
 CADENCE_NIGHTLY = "nightly"
 CADENCE_WEEKLY = "weekly"
@@ -62,7 +62,7 @@ LANES = {
         "section": SECTION_GITLAB,
         "cadence": CADENCE_NIGHTLY,
         "job": DEFAULT_JOB,
-        "nightly_jobs": (DEFAULT_NIGHTLY_JOB, "ci-kube-agents-eval-nightly-gitlab-next"),
+        "nightly_jobs": (DEFAULT_NIGHTLY_JOB,),
     },
     tiers.TIER_GHES: {
         "title": "GHES lane",

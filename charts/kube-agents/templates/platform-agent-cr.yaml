@@ -776,6 +776,10 @@ spec:
       audience: {{ $wif.audience | quote }}
       serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
     {{- end }}
+    {{- if kindIs "bool" .Values.platformAgent.security.disallowSecretsRead }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.security.disallowSecretsRead" "path" (list "security") "field" "disallowSecretsRead") }}
+    disallowSecretsRead: {{ .Values.platformAgent.security.disallowSecretsRead }}
+    {{- end }}
   {{- /*
     Rendered whenever the install carries the value, empty lists included, and never
     through compactFields or `with`, which would drop an emptied block: the reconcile

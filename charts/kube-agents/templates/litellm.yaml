@@ -251,7 +251,7 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $fallback := .Values.litellm.fallback | default dict }}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds "budget" .Values.litellm.budget "replicas" .Values.litellm.replicaCount) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
   and cache-marker hooks, the rule file, the two redaction modules, the OAuth2

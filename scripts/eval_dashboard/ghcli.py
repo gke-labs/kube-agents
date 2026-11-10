@@ -1,8 +1,8 @@
 """The one way the health job talks to GitHub: `gh api`, best-effort.
 
-gate_comment.py (the comment on a red pull request) and gate_issue.py (the
-tracking issue an OUTAGE files) both write to GitHub with the workflow's own
-GITHUB_TOKEN, through the `gh` binary the runner already has -- the same
+The health job's writers (the comment on a red pull request, the tracking
+and nightly issues) and the one-off scrub_bot_posts.py write to GitHub with
+the token in GH_TOKEN, through the `gh` binary the runner already has -- the same
 call coverage-comment.yml makes for its sticky comment, so no new dependency
 and no token handling here: `gh` reads GH_TOKEN from the environment and this
 module never sees it.
@@ -32,7 +32,7 @@ CALL_TIMEOUT_S = 60
 # A paginated read comes back one object per line (`--jq '.[]'`), which is
 # what stays valid JSON when gh concatenates pages.
 PAGINATE_JQ = ".[]"
-WRITE_METHODS = ("POST", "PATCH")
+WRITE_METHODS = ("POST", "PATCH", "DELETE")
 DRY_RUN_PREFIX = "--dry-run: would"
 # GitHub's answer to a field it will not take (an assignee who is not a
 # collaborator): gh prints the status to stderr and the JSON body, which

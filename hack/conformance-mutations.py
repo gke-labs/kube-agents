@@ -1580,10 +1580,12 @@ Mutation(
     Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        (
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch",
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch\n      - patch",
+        ),
         "test_D1_no_product_role_can_write_the_identity_table",
-        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
-        "beside the configmaps it already reads",
+        "grant a write verb on secrets in the platform agent's minimal ClusterRole",
     ),
     Mutation(
         "D2-workflow-mode",
@@ -2156,6 +2158,16 @@ Mutation(
         "TokenReview names the singular, so every session pod's kubectl is "
         "refused as an unknown audience -- with both Go suites green, because "
         "each module's test compares its constant to itself",
+    ),
+    Mutation(
+        "C1-session-audience-env-renamed-in-kube-proxy",
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
+         'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the session-audience env var in k8s-api-proxy while "
+        "k8s-operator still renders CREDENTIAL_PROXY_SESSION_AUDIENCE: both Go "
+        "suites pass while session kubectl fails with 401",
     ),
     Mutation(
         "C1-shim-token-env-renamed-in-the-spawner",
