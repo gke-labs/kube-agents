@@ -455,8 +455,9 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 	}
 
 	// Laid out again without choices, the question is closed: a late click
-	// is still a turn, rewritten from the event's own message, never from
-	// the old layout.
+	// is still a turn, and its line goes under what the message shows now
+	// (the layout record the edit left), never under the old question or
+	// the stale copy the client's click carries.
 	if err := a.EditMessage(side, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "settled", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled."}}); err != nil {
 		t.Fatal(err)
 	}
@@ -466,8 +467,8 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 		t.Fatal(reason)
 	}
 	a.InboundVerified(msg.Conversation, msg.MessageID, true)
-	if body := f.call(calls).arguments["body"].(map[string]any); !strings.HasPrefix(body["text"].(string), "*Which cluster?*\n\nTwo clusters run one.") {
-		t.Errorf("late click rewrote from the old layout: %q", body["text"])
+	if body := f.call(calls).arguments["body"].(map[string]any); body["text"] != "*Settled.*\n\n✓ Test Sender: Look at the first one" {
+		t.Errorf("late click rewrote from something other than the settled layout: %q", body["text"])
 	}
 }
 
@@ -658,7 +659,7 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	if pending != 1 || !waiting {
 		t.Fatalf("pending = %d, waiting = %v; want the click held", pending, waiting)
 	}
-	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"}, gchatChatLayout{Text: "*Settled*"})
+	a.trackQuestion(ev.Message.Name, "", &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Settled"})
 	a.mu.Lock()
 	pending, waiting = len(a.uxLocked().pending), a.uxLocked().waiting[ev.Message.Name]
 	a.mu.Unlock()

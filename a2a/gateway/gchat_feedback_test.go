@@ -111,11 +111,11 @@ func TestGchatRatedAnswerEndsWithFeedbackButtons(t *testing.T) {
 	if r := a.ratingOf(name); r.task != "t-root" || r.chosen != "" {
 		t.Errorf("ratingOf = %+v, want t-root unchosen", r)
 	}
-	a.mu.Lock()
-	kept := a.uxLocked().questions[name].layout
-	a.mu.Unlock()
-	if keptJSON, _ := json.Marshal(kept.Widgets); string(keptJSON) != string(raw) {
-		t.Errorf("the remembered question carries\n %s\nwant the layout without rating buttons\n %s", keptJSON, raw)
+	// The record is the layout as sent, rating buttons included.
+	kept, remembered, _ := a.layoutOf(name)
+	sent, _ := json.Marshal(callBody(t, f.call(0))["accessoryWidgets"])
+	if keptJSON, _ := json.Marshal(kept.Widgets); !remembered || string(keptJSON) != string(sent) {
+		t.Errorf("the record carries\n %s\nwant the layout as sent, rating buttons included\n %s", keptJSON, sent)
 	}
 }
 
@@ -1310,13 +1310,13 @@ func TestGchatRatingPatchNeverLandsOverTheAnsweredRewrite(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		a.mu.Lock()
-		_, shown := a.uxLocked().shown[name]
+		_, rewritten := a.uxLocked().lines[name]
 		a.mu.Unlock()
-		if relayCallCount(f) >= 3 && shown {
+		if relayCallCount(f) >= 3 && rewritten {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("relay calls = %d, shown = %v; want the create, two patches and the rewrite on record", relayCallCount(f), shown)
+			t.Fatalf("relay calls = %d, rewritten = %v; want the create, two patches and the rewrite on record", relayCallCount(f), rewritten)
 		}
 		time.Sleep(time.Millisecond)
 	}

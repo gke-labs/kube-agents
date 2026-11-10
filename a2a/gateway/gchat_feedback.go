@@ -446,8 +446,11 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 		// A later tap taken while Rate ran patches after this one, under
 		// the same lock, so this patch never outlives it.
 		if a.rememberTap(message, chosen) {
-			if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
+			layout := a.ratedLayout(snapshot, chosen)
+			if err := a.patchRating(message, layout); err != nil {
 				a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
+			} else {
+				a.rememberLayout(message, layout)
 			}
 		}
 		unlock()
@@ -460,42 +463,30 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	return gchatRatingTaken + value
 }
 
-// ratedLayout is the layout a rating tap patches message ev to, with r's
-// buttons at the end. The adapter's record wins when it has one: (a) a
-// remembered question not yet answered keeps its own layout; (b) an
-// answered one keeps the layout its answer put on it, the answered line
-// included (ux.shown), and, while that rewrite has not landed, takes the
-// event's text and its link buttons only, so a tap never restores the
-// choices the answer removed; (c) any other message, one from before a
-// restart, takes the event's text and its choice and link buttons, in the
-// event's order.
+// ratedLayout is the layout a rating tap patches message ev to: the layout
+// the message shows now with r's buttons at the end in place of the rating
+// buttons it carried, every other button and the text as they are. The
+// base is the adapter's record of the message (gchat_layout.go) when it
+// has one, which the answered rewrite and a board tap write too, so a tap
+// keeps the answered line and a tapped row's line; it is the event's copy
+// of the message, text and buttons, for one it has no record of (posted
+// before a restart). An answered message loses its choice buttons either
+// way: a tap taken before the answered rewrite lands, or after a restart
+// lost it, never restores the choices the answer removed.
 func (a *GoogleChatAdapter) ratedLayout(ev *gchatEvent, r gchatRating) gchatChatLayout {
 	a.mu.Lock()
 	ux := a.uxLocked()
 	answered := ux.answered[ev.Message.Name]
-	shown, recorded := ux.shown[ev.Message.Name]
-	q, remembered := ux.questions[ev.Message.Name]
+	base, remembered := ux.layouts[ev.Message.Name]
 	a.mu.Unlock()
-	switch {
-	case answered && recorded:
-		return gchatChatLayout{Text: shown.Text, Widgets: gchatWithRating(shown.Widgets, r)}
-	case remembered && !answered:
-		return gchatChatLayout{Text: q.layout.Text, Widgets: gchatWithRating(q.layout.Widgets, r)}
+	if !remembered {
+		base = gchatEventLayout(ev.Message)
 	}
-	var buttons []map[string]any
-	for _, w := range ev.Message.AccessoryWidgets {
-		for _, b := range w.ButtonList.Buttons {
-			kind := classifyGchatButton(b)
-			if kind == gchatButtonLink || (kind == gchatButtonChoice && !answered) {
-				buttons = append(buttons, gchatButtonWidget(b))
-			}
-		}
-	}
-	var widgets []map[string]any
-	if len(buttons) > 0 {
-		widgets = []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
-	}
-	return gchatChatLayout{Text: ev.Message.Text, Widgets: gchatWithRating(widgets, r)}
+	widgets := gchatWithoutButtons(base.Widgets, func(b map[string]any) bool {
+		function := gchatButtonFunction(b)
+		return function == gchatFeedbackFunction || (answered && function == gchatChatFunction)
+	})
+	return gchatChatLayout{Text: base.Text, Widgets: gchatWithRating(widgets, r)}
 }
 
 // cloneGchatWidgets is a deep copy of decoded accessory widgets: no slice
