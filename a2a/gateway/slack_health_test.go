@@ -35,15 +35,14 @@ const (
 
 // The Slack gauges serve nothing until a Slack adapter runs, so a gateway on
 // another backend adds no series; then 0 while the socket is down, 1 once it
-// is up, and the last event's time once one arrives.
-func TestTheSlackGaugesServeNoSampleUntilAnAdapterRuns(t *testing.T) {
+// is up, the last event's time once one arrives, and nothing again once the
+// adapter has stopped with its context.
+func TestTheSlackGaugesServeNoSampleUnlessAnAdapterRuns(t *testing.T) {
 	var none *Metrics
-	none.slackDown(time.Now())
+	none.slackDown()
 	none.slackUp()
 	none.slackEvent(time.Now())
-	if got := none.slackDownFor(time.Now()); got != 0 {
-		t.Fatalf("nil metrics slackDownFor = %v", got)
-	}
+	none.slackStopped()
 
 	m := NewMetrics()
 	url := startMetricsServer(t, m)
@@ -52,7 +51,7 @@ func TestTheSlackGaugesServeNoSampleUntilAnAdapterRuns(t *testing.T) {
 		t.Fatalf("a Slack sample with no Slack adapter:\n%s", body)
 	}
 
-	m.slackDown(time.Now())
+	m.slackDown()
 	if v, ok := gaugeValue(t, m, slackConnectedSeries); !ok || v != 0 {
 		t.Fatalf("slack_connected after a drop = %v, %v; want 0", v, ok)
 	}
@@ -64,8 +63,7 @@ func TestTheSlackGaugesServeNoSampleUntilAnAdapterRuns(t *testing.T) {
 	if v, _ := gaugeValue(t, m, slackConnectedSeries); v != 1 {
 		t.Fatalf("slack_connected once up = %v; want 1", v)
 	}
-	at := time.Unix(1_800_000_000, 0)
-	m.slackEvent(at)
+	m.slackEvent(time.Unix(1_800_000_000, 0))
 	if v, ok := gaugeValue(t, m, slackLastEventSeries); !ok || v != 1_800_000_000 {
 		t.Fatalf("last event = %v, %v; want 1800000000", v, ok)
 	}
@@ -79,28 +77,25 @@ func TestTheSlackGaugesServeNoSampleUntilAnAdapterRuns(t *testing.T) {
 			t.Errorf("body lacks %q:\n%s", want, body)
 		}
 	}
-}
 
-// A drop keeps the time it began across the reconnect attempts that follow,
-// so the readiness grace runs from the drop, not from the latest dial.
-func TestASlackDropKeepsTheTimeItBegan(t *testing.T) {
-	m := NewMetrics()
-	start := time.Unix(1_800_000_000, 0)
-	m.slackUp()
-	m.slackDown(start)
-	m.slackDown(start.Add(time.Minute))
-	if got := m.slackDownFor(start.Add(3 * time.Minute)); got != 3*time.Minute {
-		t.Fatalf("down for %v, want 3m", got)
+	m.slackStopped()
+	_, body = scrape(t, http.MethodGet, url+MetricsPath)
+	if strings.Contains(body, "slack_") {
+		t.Fatalf("a Slack sample after the adapter stopped:\n%s", body)
 	}
-	m.slackUp()
-	if got := m.slackDownFor(start.Add(4 * time.Minute)); got != 0 {
-		t.Fatalf("down for %v once up, want 0", got)
+	m.slackDown()
+	if v, ok := gaugeValue(t, m, slackConnectedSeries); !ok || v != 0 {
+		t.Fatalf("slack_connected on a fresh run = %v, %v; want 0", v, ok)
+	}
+	if _, ok := gaugeValue(t, m, slackLastEventSeries); ok {
+		t.Fatal("a fresh run serves the previous run's last event")
 	}
 }
 
 // The pump turns socketmode's connection events into the gauge: down from
 // Run's start, up on connected, an event's time on an Events API delivery,
-// down on the reconnect's connecting, and down once Run has returned.
+// down on the reconnect's connecting, and still down once Run has returned
+// on a failure.
 func TestTheSlackPumpReportsTheConnection(t *testing.T) {
 	srv, unblock := stalledSlackStub(t)
 	a := newTestSlackAdapter(&fakeSlackAPI{})
@@ -144,6 +139,7 @@ func TestTheSlackPumpReportsTheConnection(t *testing.T) {
 		return v == 0
 	})
 
+	// invalid_auth: Run fails with its caller's context still live.
 	unblock()
 	select {
 	case <-returned:
@@ -151,33 +147,34 @@ func TestTheSlackPumpReportsTheConnection(t *testing.T) {
 		t.Fatal("Run never returned")
 	}
 	if v, ok := gaugeValue(t, m, slackConnectedSeries); !ok || v != 0 {
-		t.Fatalf("slack_connected after Run returned = %v, %v; want 0", v, ok)
+		t.Fatalf("slack_connected after Run failed = %v, %v; want 0", v, ok)
 	}
 }
 
-// Readiness ignores a drop inside slackReadyGrace, reports one past it with
-// its length, and reads ready again once the socket is back.
-func TestReadinessReportsASlackDropPastTheGrace(t *testing.T) {
-	g := &Gateway{metrics: NewMetrics()}
-	g.relayBound.Store(true)
-	if ready, reason := g.Readiness(); !ready {
-		t.Fatalf("no Slack adapter: not ready, %q", reason)
-	}
+// A Run ended by its caller's context, as a replica's is when it loses the
+// lease, disarms the gauges, so a standby serves no Slack sample.
+func TestASlackRunEndedByItsContextDisarmsTheGauges(t *testing.T) {
+	srv, _ := stalledSlackStub(t)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	m := NewMetrics()
+	a.SetMetrics(m)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+	a.sm.Events <- socketmode.Event{Type: socketmode.EventTypeConnected}
 
-	g.metrics.slackDown(time.Now())
-	if ready, reason := g.Readiness(); !ready {
-		t.Fatalf("a fresh drop: not ready, %q", reason)
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(ctx, func(InboundMessage) {}) }()
+	waitFor(t, "the gauge to be served", func() bool {
+		_, ok := gaugeValue(t, m, slackConnectedSeries)
+		return ok
+	})
+	cancel()
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run never returned")
 	}
-
-	g.metrics.slackUp()
-	g.metrics.slackDown(time.Now().Add(-slackReadyGrace - time.Minute))
-	ready, reason := g.Readiness()
-	if ready || !strings.Contains(reason, "Slack Socket Mode connection has been down for 3m") {
-		t.Fatalf("a drop past the grace: %v %q", ready, reason)
-	}
-
-	g.metrics.slackUp()
-	if ready, reason := g.Readiness(); !ready {
-		t.Fatalf("reconnected: not ready, %q", reason)
+	if v, ok := gaugeValue(t, m, slackConnectedSeries); ok {
+		t.Fatalf("slack_connected after the lease was lost = %v; want no sample", v)
 	}
 }

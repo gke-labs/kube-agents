@@ -109,14 +109,6 @@ var termWaitBusMax = 60 * time.Second
 // errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
 var errTermBusGaveUp = errors.New("the bus didn't answer")
 
-// slackReadyGrace is how long the Slack connection may be down before
-// Readiness reports it. Socket Mode reconnects on its own: a disconnect Slack
-// requests, or a ping timeout, is back within seconds, and a failing dial
-// backs off for up to five minutes between tries. Past this the socket is
-// not coming back quickly, and the pod reads not ready a few minutes before
-// the slack-disconnected alert fires.
-const slackReadyGrace = 2 * time.Minute
-
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
 const noticeBusUnreachable = "❌ could not reach the bus; try again"
@@ -704,19 +696,14 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // Readiness reports whether Run has bound the event relay, and why not. The
 // adapters and doors start only after the bind, so until then the gateway
 // takes no turns (its chat.notify routes are already up). The metrics
-// listener answers ReadyzPath from it. The bind latches: once bound it stays
-// bound, and a later loss of TASKS is the rebuild path's to recover, as
-// before. The Slack connection does not latch: down for longer than
-// slackReadyGrace reads not ready, and connected again reads ready.
+// listener answers ReadyzPath from it. It latches: once bound it stays ready,
+// and a later loss of TASKS is the rebuild path's to recover, as before.
 func (g *Gateway) Readiness() (bool, string) {
 	if g.termWaiting.Load() {
 		if g.termWaitBus.Load() {
 			return false, "waiting for the bus: the gateway's term can't start while JetStream isn't answering"
 		}
 		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
-	}
-	if down := g.metrics.slackDownFor(time.Now()); down > slackReadyGrace {
-		return false, fmt.Sprintf("the Slack Socket Mode connection has been down for %s", down.Round(time.Second))
 	}
 	if g.relayBound.Load() {
 		return true, "ready"

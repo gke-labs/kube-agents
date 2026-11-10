@@ -885,7 +885,6 @@
                 "brokerFailureRatio",
                 "brokerFailureMinCalls",
                 "backgroundTasksGaveUp7d",
-                "slackDisconnectedFor",
                 "stalledOnboardingDays",
                 "stalledOnboardingSilentDays",
                 "proposalsRejectedMin14d",

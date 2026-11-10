@@ -2922,11 +2922,7 @@ CrashLoopBackOff). A standby answers 200 once it is connected and has read
 the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
 as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
 replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the
-leader's own `/readyz` still names the wait. A Slack gateway's `/readyz` also answers 503 while
-its Socket Mode connection has been down for longer than `slackReadyGrace`, two minutes (`the Slack
-Socket Mode connection has been down for 2m30s`), and 200 again once it reconnects; this one does
-not latch. Socket Mode reconnects on its own within seconds of a requested disconnect or a ping
-timeout, so a drop that outlasts the grace is one a person should look at. The Deployment's progress
+leader's own `/readyz` still names the wait. Its progress
 deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
 read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
 while the gateway keeps waiting and the CR keeps reading `Provisioning`.
@@ -2948,15 +2944,20 @@ text, so nothing a chat user or an executor sends can mint a series:
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
-that fell. A Slack gateway adds two unlabelled gauges, set by the adapter's event pump from
-socketmode's own connection events, which share the channel with the envelopes and so arrive in
-order: `kubeagents_a2a_gateway_slack_connected`, 0 from Run's start and from every `connecting`
-(each dial, the first and every reconnect), 1 on `connected`, and 0 again once Run returns; and
-`kubeagents_a2a_gateway_slack_last_event_timestamp_seconds`, the time of the last Events API or
-interactive envelope. Neither serves a sample until a Slack adapter runs, so a gateway on another
-backend, and a standby, add nothing to the chart's `KubeAgentsSlackDisconnected` alert, which reads
-the gauge's `max` by scrape job. Every series is created at zero, so a `rate()` over a state that has not happened reads 0
-rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
+that fell. Every counter is created at zero, so a `rate()` over a state that has not happened
+reads 0 rather than no data. A Slack gateway adds two unlabelled gauges that are not: set by the
+adapter's event pump from socketmode's own connection events, which share the channel with the
+envelopes and so arrive in order. `kubeagents_a2a_gateway_slack_connected` is 0 from Run's start
+and from every `connecting` (each dial, the first and every reconnect) and 1 on `connected`;
+`kubeagents_a2a_gateway_slack_last_event_timestamp_seconds` is the time of the last Events API or
+interactive envelope. Neither serves a sample until a Slack adapter runs, and both are disarmed
+when Run ends with its context, as it does on a replica that loses the lease, so a gateway on
+another backend and a standby add nothing to the chart's `KubeAgentsSlackDisconnected` alert,
+which reads the gauge's `max` by scrape job. A Run that ends in a failure (an `invalid_auth`)
+leaves the gauge at 0 until the process exits. The Slack connection does not feed `/readyz`: a
+Slack outage would otherwise take the pod, which also serves the doors, out of Ready, the
+`PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover, since the
+lease rather than readiness picks the leader. A pull carries at most one event today, so `gchat_events_received_total`
 equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
 pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
 and `events` flat; a refused relay shows `failed` rising.

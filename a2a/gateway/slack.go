@@ -319,8 +319,8 @@ type SlackAdapter struct {
 }
 
 // SetMetrics gives the adapter the gateway's counters, so the Socket Mode
-// connection's state and the last event's time are served beside them and
-// read by the gateway's readiness. Called once, before Run.
+// connection's state and the last event's time are served beside them.
+// Called once, before Run.
 func (s *SlackAdapter) SetMetrics(m *Metrics) {
 	s.metrics = m
 }
@@ -581,6 +581,22 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 // sweepLoop. So "Run returned" means the pump is finished — not that the
 // gateway is.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	// Down from the start until Socket Mode says it is connected, so a
+	// stalled auth.test or a first dial that keeps failing reads as down.
+	// Once Run returns nothing holds the socket: ended by its caller's
+	// context (a replica that lost the lease, or a shutdown), the gauges are
+	// disarmed, since this replica is no longer the one to report Slack;
+	// ended by a failure, they read down. Registered first so it runs last,
+	// after the pump below has exited and can write no state after it.
+	parent := ctx
+	s.metrics.slackDown()
+	defer func() {
+		if parent.Err() != nil {
+			s.metrics.slackStopped()
+			return
+		}
+		s.metrics.slackDown()
+	}()
 	// Deferred calls run LIFO, so the order these two are REGISTERED in is
 	// the reverse of the order they run in, and it matters: wg.Wait is
 	// registered first so that it runs last, after cancel has told the pump
@@ -607,11 +623,6 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	// live — must signal it rather than leak it for the process's lifetime.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// Down from the start until Socket Mode says it is connected, so a
-	// stalled auth.test or a first dial that keeps failing reads as down;
-	// and down again once Run returns, since nothing holds the socket then.
-	s.metrics.slackDown(time.Now())
-	defer func() { s.metrics.slackDown(time.Now()) }()
 	// Under ctx, like everything else Run blocks on: this is the one call
 	// made before the pump exists, and a stalled auth.test with no context
 	// would hold Run — and so realMain — past SIGTERM with nothing logged,
@@ -652,7 +663,7 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			case socketmode.EventTypeConnected:
 				s.metrics.slackUp()
 			case socketmode.EventTypeConnecting, socketmode.EventTypeConnectionError, socketmode.EventTypeInvalidAuth:
-				s.metrics.slackDown(time.Now())
+				s.metrics.slackDown()
 			case socketmode.EventTypeEventsAPI, socketmode.EventTypeInteractive:
 				s.metrics.slackEvent(time.Now())
 			}

@@ -61,7 +61,7 @@ Disabling Google Chat afterwards, with no other backend configured, leaves the g
 
 Under `next` the A2A gateway serves Prometheus counters on a metrics-only port, 9096 (container port `a2a-metrics`, set by `A2A_METRICS_PORT`), which the chart's `<name>-a2a-gateway-monitoring` `PodMonitoring` scrapes behind `platformAgent.podMonitoring`; the metrics are listed on [Observability](/kube-agents/concepts/observability/). The gateway's NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway does, eval door or no door. It admits the `gke-gmp-system` namespace and the operator's own pods to that port and nothing else, the operator because its usage poller reads the gateway's inbound-message counter into `status.usage.chatMessagesInboundTotal`.
 
-The same port answers `/readyz`, which the gateway Deployment's readinessProbe reads every 5 seconds: 503, with the reason, until the gateway has bound its event relay, which on a fresh install waits for the provisioning Job's `TASKS` stream. On Slack it also answers 503 while the gateway's Socket Mode connection has been down for more than two minutes. The kubelet's probe comes from the node, which the policy does not govern.
+The same port answers `/readyz`, which the gateway Deployment's readinessProbe reads every 5 seconds: 503, with the reason, until the gateway has bound its event relay, which on a fresh install waits for the provisioning Job's `TASKS` stream. The kubelet's probe comes from the node, which the policy does not govern.
 
 ## `spec.harness`
 

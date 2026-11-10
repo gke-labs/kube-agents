@@ -86,10 +86,12 @@ const (
 	// connection, 1 while the websocket is up and 0 from a drop or a
 	// reconnect until it is up again; slackLastEventName is when the adapter
 	// last received an event or a click from Slack. Neither serves a sample
-	// until a Slack adapter runs (slackCollector), so a gateway on another
-	// backend, and a standby replica, add nothing to a max over the install.
+	// unless a Slack adapter runs (slackCollector): a gateway on another
+	// backend never arms them, and a replica whose adapter stopped with its
+	// context, as on losing the lease, disarms them, so neither adds to a max
+	// over the install.
 	slackConnectedName = "slack_connected"
-	slackConnectedHelp = "1 while the Slack adapter's Socket Mode connection is up, 0 from a drop or a reconnect until it is up again; no sample until a Slack adapter runs."
+	slackConnectedHelp = "1 while the Slack adapter's Socket Mode connection is up, 0 from a drop or a reconnect until it is up again; no sample unless a Slack adapter runs."
 	slackLastEventName = "slack_last_event_timestamp_seconds"
 	slackLastEventHelp = "When the Slack adapter last received an event or an interactive payload from Slack, in seconds since the unix epoch; no sample until the first."
 
@@ -223,20 +225,18 @@ type Metrics struct {
 	// peopleSource is the people desk's count, set once the count is on;
 	// unset, the people gauge serves no sample.
 	peopleSource atomic.Pointer[peopleCount]
-	// slack is the Slack adapter's connection, which the slack gauges serve
-	// and Gateway.Readiness reads.
+	// slack is the Slack adapter's connection, which the slack gauges serve.
 	slack slackConn
 }
 
 // slackConn is the Slack adapter's Socket Mode connection as the adapter last
-// reported it, under mu. armed is set once a Slack adapter runs; downSince is
-// when the connection last went from up (or from the adapter's start) to
-// down, zero while it is up; lastEvent is when the last event arrived, zero
-// before the first.
+// reported it, under mu. armed is set while a Slack adapter runs; up is
+// whether its socket is connected; lastEvent is when the last event arrived,
+// zero before the first.
 type slackConn struct {
 	mu        sync.Mutex
 	armed     bool
-	downSince time.Time
+	up        bool
 	lastEvent time.Time
 }
 
@@ -254,21 +254,21 @@ func (c *slackCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.lastEvent
 }
 
-// Collect emits the connection gauge once a Slack adapter runs, and the last
+// Collect emits the connection gauge while a Slack adapter runs, and the last
 // event's time once one has arrived.
 func (c *slackCollector) Collect(ch chan<- prometheus.Metric) {
 	sc := &c.m.slack
 	sc.mu.Lock()
-	armed, down, last := sc.armed, !sc.downSince.IsZero(), sc.lastEvent
+	armed, up, last := sc.armed, sc.up, sc.lastEvent
 	sc.mu.Unlock()
 	if !armed {
 		return
 	}
-	up := 1.0
-	if down {
-		up = 0
+	connected := 0.0
+	if up {
+		connected = 1
 	}
-	ch <- prometheus.MustNewConstMetric(c.connected, prometheus.GaugeValue, up)
+	ch <- prometheus.MustNewConstMetric(c.connected, prometheus.GaugeValue, connected)
 	if !last.IsZero() {
 		ch <- prometheus.MustNewConstMetric(c.lastEvent, prometheus.GaugeValue, float64(last.UnixNano())/float64(time.Second))
 	}
@@ -405,30 +405,38 @@ func (m *Metrics) setPeopleSource(fn peopleCount) {
 	m.peopleSource.Store(&fn)
 }
 
-// slackDown records the Slack connection as down from now: the adapter has
-// started and not yet connected, or Socket Mode is reconnecting. A connection
-// already down keeps the time it went down.
-func (m *Metrics) slackDown(now time.Time) {
-	if m == nil {
-		return
-	}
-	m.slack.mu.Lock()
-	defer m.slack.mu.Unlock()
-	if !m.slack.armed || m.slack.downSince.IsZero() {
-		m.slack.downSince = now
-	}
-	m.slack.armed = true
+// slackDown records the Slack connection as down: the adapter has started and
+// not yet connected, Socket Mode is reconnecting, or the adapter's Run failed.
+func (m *Metrics) slackDown() {
+	m.slackSet(true, false)
 }
 
 // slackUp records the Slack connection as up.
 func (m *Metrics) slackUp() {
+	m.slackSet(true, true)
+}
+
+// slackStopped disarms the Slack gauges: the adapter's Run ended because its
+// context did, a replica that lost the lease or a gateway shutting down, so
+// the replica holds no socket and is not the one to report it. The next Run
+// arms them again from down.
+func (m *Metrics) slackStopped() {
 	if m == nil {
 		return
 	}
 	m.slack.mu.Lock()
 	defer m.slack.mu.Unlock()
-	m.slack.armed = true
-	m.slack.downSince = time.Time{}
+	m.slack.armed, m.slack.up, m.slack.lastEvent = false, false, time.Time{}
+}
+
+// slackSet records whether a Slack adapter runs and whether its socket is up.
+func (m *Metrics) slackSet(armed, up bool) {
+	if m == nil {
+		return
+	}
+	m.slack.mu.Lock()
+	defer m.slack.mu.Unlock()
+	m.slack.armed, m.slack.up = armed, up
 }
 
 // slackEvent records an event or an interactive payload received from Slack.
@@ -439,20 +447,6 @@ func (m *Metrics) slackEvent(now time.Time) {
 	m.slack.mu.Lock()
 	defer m.slack.mu.Unlock()
 	m.slack.lastEvent = now
-}
-
-// slackDownFor is how long the Slack connection has been down at now: zero
-// while it is up, and while no Slack adapter runs.
-func (m *Metrics) slackDownFor(now time.Time) time.Duration {
-	if m == nil {
-		return 0
-	}
-	m.slack.mu.Lock()
-	defer m.slack.mu.Unlock()
-	if !m.slack.armed || m.slack.downSince.IsZero() {
-		return 0
-	}
-	return now.Sub(m.slack.downSince)
 }
 
 // Handler serves the registry in the Prometheus text format.

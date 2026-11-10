@@ -47,6 +47,10 @@ _FRICTION = {
 _SCRAPE_ALERT = "KubeAgentsScrapeBroken"
 _SLACK_ALERT = "KubeAgentsSlackDisconnected"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
+# Thresholds added after the schema's required list, which the template
+# defaults instead, so `helm upgrade --reuse-values` from a release without
+# them keeps rendering.
+_OPTIONAL_THRESHOLDS = {"slackDisconnectedFor"}
 _READING = "kubeagents:platformagent:usage_reading:max"
 
 
@@ -191,6 +195,14 @@ class HealthRulesRenderTest(unittest.TestCase):
         self.assertEqual("7m", rule["for"])
         self.assertIn("7m", rule["annotations"]["summary"])
 
+    def test_a_thresholds_block_without_the_slack_window_still_renders(self):
+        """What `--reuse-values` from an older release hands the template: the key
+        absent. A null in --set deletes it from the merged values."""
+        docs = _render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=null")
+        rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
+        self.assertEqual("5m", rule["for"])
+        self.assertEqual("5m", yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"]["slackDisconnectedFor"], "the template's default and values.yaml's must agree")
+
     def test_vector_matching_names_the_agent_labels(self):
         """Under Managed Prometheus scoping a recorded series carries project, cluster
         and namespace labels the inline `max by` sides do not, so a bare `and` or
@@ -287,7 +299,7 @@ class HealthRulesRenderTest(unittest.TestCase):
         declared = set(yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"])
         read = set(re.findall(r"\$t\.([A-Za-z0-9]+)", (_CHART / "templates" / "platform-agent-health-rules.yaml").read_text()))
         self.assertEqual(declared, set(thresholds["properties"]), "schema properties differ from values.yaml")
-        self.assertEqual(declared, set(thresholds["required"]), "every threshold is required when the rules are on")
+        self.assertEqual(declared - _OPTIONAL_THRESHOLDS, set(thresholds["required"]), "every threshold but the defaulted ones is required when the rules are on")
         self.assertEqual(read, declared, "the template reads a threshold values.yaml does not declare, or declares one it never reads")
 
     def test_no_increase_remains_on_a_reading_field(self):

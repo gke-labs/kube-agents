@@ -664,7 +664,8 @@ a release that predates `operator.metrics` renders with the listener off until t
 
 `platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
 `Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
-operator's gauges, and the recording rules for their ratios; the alerts are listed on
+operator's gauges (plus one over the A2A gateway's Slack connection gauge and one over the scrape
+jobs' `up`), and the recording rules for their ratios; the alerts are listed on
 [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
 Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
 into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
@@ -675,7 +676,9 @@ sample floor is a value under `platformAgent.healthRules.thresholds`, with its d
 string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
 the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
-block and the template says so when it is missing. The rules read the operator's scrape, so
+block and the template says so when it is missing. `slackDisconnectedFor` is the exception: it is
+optional and defaults to `5m`, so a `--reuse-values` upgrade from a release without it keeps
+rendering. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
 `proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
