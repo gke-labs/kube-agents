@@ -1894,8 +1894,8 @@ spec:
               path: /healthz
               port: cred-health
             initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 5
+            periodSeconds: 3
+            timeoutSeconds: 2
           resources:
             limits:
               cpu: "2"

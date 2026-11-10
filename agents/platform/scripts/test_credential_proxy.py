@@ -10213,6 +10213,29 @@ class GracefulDrainTest(unittest.TestCase):
                 self.assertFalse(handler._refused_while_draining(method))
                 self.assertEqual({}, captured)
 
+    def test_a_draining_exec_pod_fails_its_readiness_probe(self):
+        # The readiness probe reads /healthz. An exec pod that drains answers
+        # 503, so the Service stops sending it new connections and a caller at
+        # one replica falls back to the stateful broker; the broker, which
+        # rolls with Recreate, and any pod that does not drain answer ok.
+        cases = (
+            (credential_proxy_client.EXEC_ROLE, True, HTTPStatus.SERVICE_UNAVAILABLE,
+             credential_proxy.HEALTHZ_DRAINING_PAYLOAD),
+            (credential_proxy_client.EXEC_ROLE, False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", True, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+            ("broker", False, HTTPStatus.OK, credential_proxy.HEALTHZ_PAYLOAD),
+        )
+        for role, draining, status, payload in cases:
+            with self.subTest(role=role, draining=draining), \
+                    mock.patch.object(CredentialProxyHandler, "broker_role", role):
+                if draining:
+                    CredentialProxyHandler.draining.set()
+                else:
+                    CredentialProxyHandler.draining.clear()
+                handler, captured = self._handler(credential_proxy.HEALTHZ_PATH)
+                handler.do_GET()
+                self.assertEqual((status, payload), (captured.get("status"), captured.get("payload")))
+
     def test_a_pull_with_a_query_is_still_an_open_route(self):
         CredentialProxyHandler.draining.set()
         handler, _ = self._handler("/v1/chat/slack/events?timeout=20")
