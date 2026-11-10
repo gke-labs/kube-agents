@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import pathlib
 import shutil
 import subprocess
@@ -458,6 +459,35 @@ class HelmClusterProfileTest(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("allowedTiers", proc.stderr)
+
+
+class AgentProfileFieldGuardTest(unittest.TestCase):
+    """helm upgrade doesn't apply crds/, so an AgentProfile CRD from before
+    yieldToPinned would prune it and the generic cluster profile would stop
+    handing pinned clusters' tasks to their pinned profiles, with no error.
+    `lookup` is empty under `helm template`, so the guard is pinned as text, as
+    CrdGuardTest pins kube-agents.crdFieldGuard."""
+
+    def setUp(self):
+        self.template = (_CHART / "templates" / "profiles.yaml").read_text()
+        helpers = (_CHART / "templates" / "_helpers.tpl").read_text()
+        body = re.search(r'\{\{- define "kube-agents.agentProfileFieldGuard" -\}\}\n(.*?)\n\{\{- end \}\}', helpers, re.DOTALL)
+        self.assertIsNotNone(body, "kube-agents.agentProfileFieldGuard is missing from _helpers.tpl")
+        self.guard = body.group(1)
+
+    def test_the_cluster_profile_guards_yield_to_pinned(self):
+        self.assertRegex(
+            self.template,
+            r'\{\{- include "kube-agents.agentProfileFieldGuard" \(dict "value" "profiles.cluster.enabled" "field" "yieldToPinned"\) \}\}\n\s*yieldToPinned: true',
+        )
+
+    def test_the_guard_reads_the_installed_agentprofile_crd(self):
+        self.assertIn('lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "agentprofiles.kubeagents.x-k8s.io"', self.guard)
+        self.assertIn("{{- if .storage -}}", self.guard)
+        self.assertIn('{{- if not (hasKey $props .field) -}}', self.guard)
+        for want in ("installed AgentProfile CRD predates it", "helm upgrade does not update CRDs",
+                     "charts/kube-agents/crds/", "upgrade.sh", "prunes the field silently"):
+            self.assertIn(want, self.guard)
 
 
 if __name__ == "__main__":

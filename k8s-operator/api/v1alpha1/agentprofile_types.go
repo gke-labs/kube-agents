@@ -94,7 +94,8 @@ type AgentProfileSpec struct {
 	// pinned to the task's target cluster (clusterRef), when there is one.
 	// Set it on the generic cluster agent, whose pinned profiles are its
 	// per-cluster variants. Leave it unset on a specialist: a task addressed
-	// to one by name keeps its own persona on a pinned cluster.
+	// to one by name keeps its own persona on a pinned cluster. It has no
+	// effect on a pinned profile, or on one that takes no target.
 	// +optional
 	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 

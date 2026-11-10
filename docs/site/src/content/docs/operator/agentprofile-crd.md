@@ -90,7 +90,9 @@ Writing an `AgentProfile` grants a bus identity, so treat create and update on `
 
 `allowedTiers` lists the tiers the profile may run at, `read` and `unattended`. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
 
-`yieldToPinned` hands a task addressed to this profile to the profile pinned (`clusterRef`) to its target cluster, when there is one. Set it on a generic profile whose pinned profiles are its per-cluster variants, as the chart does for `cluster`. A specialist leaves it unset and keeps the tasks addressed to it by name, pinned cluster or not.
+`yieldToPinned` hands a task addressed to this profile to the profile pinned (`clusterRef`) to its target cluster, when there is one. Set it on a generic profile whose pinned profiles are its per-cluster variants, as the chart does for `cluster`. A specialist leaves it unset and keeps the tasks addressed to it by name, pinned cluster or not. It has no effect on a pinned profile, or on one that takes no target.
+
+Before `yieldToPinned`, every profile that takes a target handed off to a pinned profile: a generic profile you created yourself, not the chart's, needs `yieldToPinned: true` for its pinned profiles to keep receiving its tasks. The chart refuses to render its `cluster` profile against an AgentProfile CRD that predates the field, since the API server would drop it silently; apply `charts/kube-agents/crds/` first, as `upgrade.sh` does.
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
 

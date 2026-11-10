@@ -35,7 +35,7 @@ Every field of the `AgentProfile` resource's `spec` and `status`, generated from
 | `clusterRef.projectId` | `string` | yes |  | min length `1` |  |
 | `clusterRef.cluster` | `string` | yes |  | min length `1` |  |
 | `clusterRef.location` | `string` | yes |  | min length `1` |  |
-| `yieldToPinned` | `boolean` | no |  |  | YieldToPinned hands a task addressed to this profile to the profile pinned to the task's target cluster (clusterRef), when there is one. Set it on the generic cluster agent, whose pinned profiles are its per-cluster variants. Leave it unset on a specialist: a task addressed to one by name keeps its own persona on a pinned cluster. |
+| `yieldToPinned` | `boolean` | no |  |  | YieldToPinned hands a task addressed to this profile to the profile pinned to the task's target cluster (clusterRef), when there is one. Set it on the generic cluster agent, whose pinned profiles are its per-cluster variants. Leave it unset on a specialist: a task addressed to one by name keeps its own persona on a pinned cluster. It has no effect on a pinned profile, or on one that takes no target. |
 | `lifecycle` | `object` | yes |  |  | Lifecycle bounds one task's wall clock and how long the finished Job lingers. |
 | `lifecycle.activeDeadlineSeconds` | `integer` | yes |  | min `1` | ActiveDeadlineSeconds is the hard ceiling on one task's wall clock, enforced by Kubernetes from Job spawn. |
 | `lifecycle.ttlSecondsAfterFinished` | `integer` | yes |  | min `0` | TTLSecondsAfterFinished is how long a finished Job lingers for inspection before garbage collection. |

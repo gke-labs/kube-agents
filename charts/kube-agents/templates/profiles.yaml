@@ -82,6 +82,7 @@ spec:
   {{- /* A profile pinned to the task's cluster is a per-cluster variant of
   this one, so it takes the task. tse and other specialists don't set this:
   addressed by name, they keep their own persona on a pinned cluster. */}}
+  {{- include "kube-agents.agentProfileFieldGuard" (dict "value" "profiles.cluster.enabled" "field" "yieldToPinned") }}
   yieldToPinned: true
   parameters:
     - name: project
