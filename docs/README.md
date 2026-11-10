@@ -63,7 +63,7 @@ kube-agents/
 │   └── tse/                                       Optional GKE Support Agent (tse) template:
 │       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and capability card
 │       ├── persona/                               the same agent in the persona format
-│       │                                          (a2a/lib/persona), not yet run
+│       │                                          (a2a/lib/persona), image persona-tse
 │       └── skills/                                support-escalation-bundle SKILL.md
 ├── a2a/docs/                                      design notes kept beside the A2A
 │                                                  bus Go module they describe
