@@ -5418,6 +5418,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// destination.
 		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
 
+		// The earned-autonomy switches (POST_MERGE_CHECK off|silent|report,
+		// AUTOMERGE off|practice|on, DIAL off|on), read by
+		// agents/platform/scripts/kubeagents_switches.py, which takes any
+		// value it does not know as "off". Each only turns on a feature of
+		// the agent's own, and adds no path, destination or credential. The
+		// shell sandbox gets them too, normalised (autonomySwitchEnv).
+		envPostMergeCheck: {},
+		envAutomerge:      {},
+		envDial:           {},
+
 		// The idle policy's two thresholds, in days
 		// (agents/chat/scripts/cron_idle_policy.py): after this many days
 		// without a chat message the dispatcher holds the Platform Agent's

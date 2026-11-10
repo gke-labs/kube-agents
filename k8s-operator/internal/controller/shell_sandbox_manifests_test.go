@@ -697,6 +697,53 @@ func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
 	}
 }
 
+// The earned-autonomy switches reach the sandbox pod only when
+// spec.deployment.env carries them, as one of each switch's known values:
+// anything else, a quoted literal included, arrives as "off", and a valueFrom
+// does not arrive at all.
+func TestShellSandboxAutonomySwitchEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent, name string) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == name {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	for _, name := range []string{envPostMergeCheck, envAutomerge, envDial} {
+		if _, ok := read(shellSandboxTestAgent(), name); ok {
+			t.Errorf("%s is set on the sandbox container with no spec.deployment.env entry; the entrypoint writes off for it", name)
+		}
+	}
+	cases := []struct{ name, value, want string }{
+		{envPostMergeCheck, "silent", "silent"},
+		{envPostMergeCheck, " REPORT ", "report"},
+		{envPostMergeCheck, "on", "off"},
+		{envAutomerge, "practice", "practice"},
+		{envAutomerge, "on", "on"},
+		{envAutomerge, "\"on\"", "off"},
+		{envDial, "On", "on"},
+		{envDial, "true", "off"},
+		{envDial, "", "off"},
+	}
+	for _, c := range cases {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: c.name, Value: c.value}}}
+		if got, ok := read(agent, c.name); !ok || got != c.want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", c.name, got, ok, c.value, c.want)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envAutomerge,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret, envAutomerge); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envAutomerge)
+	}
+}
+
 // The audits' auto-promotion switch reaches the sandbox pod only when
 // spec.deployment.env carries it, and with the value given: finish runs here,
 // and an operator who set it on the agent would otherwise have set it on a

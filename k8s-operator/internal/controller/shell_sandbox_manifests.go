@@ -118,6 +118,13 @@ const (
 	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
 	// root-owned file the script reads before the session's variable (#3439).
 	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+	// The earned-autonomy switches, each off unless spec.deployment.env names
+	// one of its other values. Forwarded for the same reason and in the same
+	// way as the audits' switch, and read by
+	// agents/platform/scripts/kubeagents_switches.py.
+	envPostMergeCheck = "KUBEAGENTS_POST_MERGE_CHECK"
+	envAutomerge      = "KUBEAGENTS_AUTOMERGE"
+	envDial           = "KUBEAGENTS_DIAL"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -590,6 +597,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			}
 		}
 	}
+	env = append(env, autonomySwitchEnv(agent)...)
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)
@@ -1285,4 +1293,39 @@ func buildShellSandboxClientKeyMount() corev1.VolumeMount {
 		MountPath: shellSandboxClientKeyPath,
 		ReadOnly:  true,
 	}
+}
+
+// autonomySwitchValues lists the values each earned-autonomy switch may take
+// besides "off", its default.
+var autonomySwitchValues = map[string][]string{
+	envPostMergeCheck: {"silent", "report"},
+	envAutomerge:      {"practice", "on"},
+	envDial:           {"on"},
+}
+
+// autonomySwitchEnv returns the earned-autonomy switches spec.deployment.env
+// sets, each normalised to one of its known values and anything else to "off",
+// so the bytes on the pod are the operator's: a literal with a quote or a
+// backslash would stop the sandbox entrypoint before sshd starts, and a
+// valueFrom could name a credential this pod must never hold. An unset switch
+// is left out; the entrypoint writes "off" for it.
+func autonomySwitchEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	if agent.Spec.Deployment == nil {
+		return nil
+	}
+	var env []corev1.EnvVar
+	for _, name := range []string{envPostMergeCheck, envAutomerge, envDial} {
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name != name || v.ValueFrom != nil {
+				continue
+			}
+			value := strings.ToLower(strings.TrimSpace(v.Value))
+			if !slices.Contains(autonomySwitchValues[name], value) {
+				value = "off"
+			}
+			env = append(env, corev1.EnvVar{Name: name, Value: value})
+			break
+		}
+	}
+	return env
 }

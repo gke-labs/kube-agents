@@ -1542,6 +1542,25 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesAutonomySwitches(t *testing.T) {
+	// The pr_opened plugin and the agent's own scripts read the switches from
+	// the agent container's environment (kubeagents_switches.py); off the
+	// allowlist, a spec.deployment.env entry reaches only the shell sandbox.
+	for _, name := range []string{envPostMergeCheck, envAutomerge, envDial} {
+		got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: name, Value: "on"}})
+		if len(got) != 1 || got[0].Name != name || got[0].Value != "on" {
+			t.Errorf("expected %s=on to pass, got %#v", name, got)
+		}
+		got = safeSandboxEnvOverrides([]corev1.EnvVar{{
+			Name:      name,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "n"}},
+		}})
+		if len(got) != 0 {
+			t.Errorf("a ValueFrom %s must not pass, got %#v", name, got)
+		}
+	}
+}
+
 // dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
 // the platform container's env, in order.
 func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
