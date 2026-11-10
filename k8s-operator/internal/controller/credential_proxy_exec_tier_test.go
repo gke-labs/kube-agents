@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -289,10 +291,10 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	if !c.Resources.Requests.Memory().Equal(wantMem) || !c.Resources.Limits.Memory().Equal(wantMem) {
 		t.Errorf("memory %v/%v, want 2Gi/2Gi", c.Resources.Requests.Memory(), c.Resources.Limits.Memory())
 	}
-	// Ephemeral storage stays the broker's: a namespace quota on it refuses a
-	// pod that declares none.
-	if !c.Resources.Limits.StorageEphemeral().Equal(*bc.Resources.Limits.StorageEphemeral()) || c.Resources.Limits.StorageEphemeral().IsZero() {
-		t.Errorf("ephemeral-storage limit %v, want the broker's %v", c.Resources.Limits.StorageEphemeral(), bc.Resources.Limits.StorageEphemeral())
+	// Ephemeral storage is the tier's own, and declared: a namespace quota on
+	// it refuses a pod that declares none.
+	if want := resource.MustParse(credentialProxyExecTierEphemeralStorageLimit); !c.Resources.Limits.StorageEphemeral().Equal(want) {
+		t.Errorf("ephemeral-storage limit %v, want the tier's %v", c.Resources.Limits.StorageEphemeral(), want)
 	}
 	if broker.Spec.Template.Labels["kubeagents.x-k8s.io/has-credential-proxy"] != "true" || len(bc.EnvFrom) == 0 {
 		t.Error("deriving the exec tier changed the broker's Deployment")
@@ -730,5 +732,56 @@ func TestARefusedNameGivesCallersNoExecTier(t *testing.T) {
 	profile := testAgentProfile(agent.Namespace, "auditor")
 	if _, set := execTierEnvValue(buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false).Containers[0].Env, credentialProxyExecURLEnv); set {
 		t.Error("the profile worker gets the URL of a refused tier")
+	}
+}
+
+// TestTheExecTierCarriesItsOwnEphemeralStorage pins the tier's own figures: the
+// two emptyDir caps, the watermark gate told the same caps, the limit holding
+// both with room for the layer and the logs, and the broker left at its own.
+func TestTheExecTierCarriesItsOwnEphemeralStorage(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(1)))
+	broker := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+	brokerBefore := broker.DeepCopy()
+	dep := buildCredentialProxyExecTierDeployment(agent, broker)
+
+	sizes := map[string]*resource.Quantity{}
+	for _, v := range dep.Spec.Template.Spec.Volumes {
+		if v.EmptyDir != nil {
+			sizes[v.Name] = v.EmptyDir.SizeLimit
+		}
+	}
+	state, tmp := resource.MustParse(credentialProxyExecTierStateSizeLimit), resource.MustParse(credentialProxyExecTierTmpSizeLimit)
+	for name, want := range map[string]resource.Quantity{credentialProxyStateVolumeName: state, credentialProxyTmpVolumeName: tmp} {
+		if got := sizes[name]; got == nil || !got.Equal(want) {
+			t.Errorf("exec %s sizeLimit = %v, want %v", name, got, want)
+		}
+	}
+	var c *corev1.Container
+	for i := range dep.Spec.Template.Spec.Containers {
+		if dep.Spec.Template.Spec.Containers[i].Name == credentialProxyContainerName {
+			c = &dep.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if c == nil {
+		t.Fatal("exec Deployment has no credential proxy container")
+	}
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	if got, want := env[credentialProxyStateLimitEnv], strconv.FormatInt(state.Value(), 10); got != want {
+		t.Errorf("%s = %q, want %q, the state cap the kubelet evicts on", credentialProxyStateLimitEnv, got, want)
+	}
+	if got, want := env[credentialProxyTmpLimitEnv], strconv.FormatInt(tmp.Value(), 10); got != want {
+		t.Errorf("%s = %q, want %q, the /tmp cap the kubelet evicts on", credentialProxyTmpLimitEnv, got, want)
+	}
+	limit := c.Resources.Limits.StorageEphemeral()
+	both := state.DeepCopy()
+	both.Add(tmp)
+	if limit.Cmp(both) <= 0 {
+		t.Errorf("exec ephemeral-storage limit %v does not hold the two caps (%v) with room for the layer and the logs", limit, &both)
+	}
+	if !equality.Semantic.DeepEqual(broker, brokerBefore) {
+		t.Error("building the exec tier changed the broker's Deployment")
 	}
 }

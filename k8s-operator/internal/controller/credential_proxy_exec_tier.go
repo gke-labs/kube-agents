@@ -39,6 +39,24 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// The exec pods' ephemeral storage, their own and not the broker's (5Gi state,
+// 2Gi /tmp, 8Gi limit). An exec command's output is held in memory, its
+// TMPDIR is on the state volume, and its gcloud writes no log files
+// (GCLOUD_FILE_LOGGING_OFF_ENV in credential_proxy.py), so the state volume
+// holds only the command HOME: gcloud's config, kubeconfigs, and kubectl's
+// discovery cache (about 0.3MiB a cluster, 1.9MiB with the OpenAPI schemas).
+// Measured at the 8-slot cap with file logging on, gcloud's logs alone grew
+// about 386KiB a command, some 3.3GiB a day (#4536); with it off the volume
+// stays at the HOME's size. /tmp is unused. The limit holds both caps and
+// leaves the rest for the writable layer and the logs. Fixed, as cpu and
+// memory are: an override of the broker's ephemeral-storage does not reach
+// the tier.
+const (
+	credentialProxyExecTierStateSizeLimit        = "1Gi"
+	credentialProxyExecTierTmpSizeLimit          = "256Mi"
+	credentialProxyExecTierEphemeralStorageLimit = "2Gi"
+)
+
 // How long an exec pod may take to stop (credential-broker-exec-tier.md §9
 // step 0). RollingUpdate keeps another replica serving while one rolls, so the
 // exec role drains for as long as the longest command it admits
@@ -190,10 +208,9 @@ func credentialProxyExecTierPodPeer(agent *agentv1alpha1.PlatformAgent) networki
 }
 
 // credentialProxyExecTierResources is the broker container's resources with
-// cpu and memory fixed at the tier's figures on both sides. The broker's other
-// keys stay, ephemeral-storage among them: the tier's emptyDirs are the
-// broker's, and a namespace quota on ephemeral-storage refuses a pod that
-// declares none.
+// cpu and memory fixed at the tier's figures on both sides, and
+// ephemeral-storage at the tier's own limit: a namespace quota on
+// ephemeral-storage refuses a pod that declares none.
 func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1.ResourceRequirements {
 	out := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
 	for name, q := range broker.Requests {
@@ -206,7 +223,20 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 		list[corev1.ResourceCPU] = resource.MustParse(credentialProxyExecTierCPU)
 		list[corev1.ResourceMemory] = resource.MustParse(credentialProxyExecTierMemory)
 	}
+	// Declared on the limit, as the broker's is, so the API server defaults
+	// the request to it; a request the broker's override set follows it.
+	out.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+	if _, ok := out.Requests[corev1.ResourceEphemeralStorage]; ok {
+		out.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+	}
 	return out
+}
+
+// credentialProxyExecTierLimitBytes is a size, in bytes, for the broker's
+// watermark gate (credentialProxyStateLimitEnv, credentialProxyTmpLimitEnv).
+func credentialProxyExecTierLimitBytes(size string) string {
+	q := resource.MustParse(size)
+	return strconv.FormatInt(q.Value(), 10)
 }
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
@@ -281,9 +311,21 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	spec := &dep.Spec.Template.Spec
 	volumes := spec.Volumes[:0]
 	for _, v := range spec.Volumes {
-		if !dropped[v.Name] {
-			volumes = append(volumes, v)
+		if dropped[v.Name] {
+			continue
 		}
+		// The tier's own caps (credentialProxyExecTierStateSizeLimit): the
+		// broker's are sized for its vcs scratch, which an exec pod never
+		// holds.
+		if v.EmptyDir != nil {
+			switch v.Name {
+			case credentialProxyStateVolumeName:
+				v.EmptyDir.SizeLimit = ptr.To(resource.MustParse(credentialProxyExecTierStateSizeLimit))
+			case credentialProxyTmpVolumeName:
+				v.EmptyDir.SizeLimit = ptr.To(resource.MustParse(credentialProxyExecTierTmpSizeLimit))
+			}
+		}
+		volumes = append(volumes, v)
 	}
 	spec.Volumes = append(volumes, corev1.Volume{
 		Name: credentialProxyExecTierReplicasVolume,
@@ -304,6 +346,14 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 			}
 			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
 				continue
+			}
+			// The watermark gate measures each scratch volume against the
+			// figure the kubelet evicts it on: the tier's own caps.
+			switch e.Name {
+			case credentialProxyStateLimitEnv:
+				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit)
+			case credentialProxyTmpLimitEnv:
+				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit)
 			}
 			env = append(env, e)
 		}
