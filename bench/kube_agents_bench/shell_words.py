@@ -36,7 +36,7 @@ _SHELL_EVAL = "eval"
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
 # `printf` is text the command prints, wherever the `echo` stands (`nohup echo bash -c ...` is
 # the wrapper running `echo`), and the string after its `-c` is not run.
-_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
+_SHELL_EXEC_WRAPPERS = frozenset(("timeout", "nohup", "env", "time", "nice", "ionice", "stdbuf", "setsid", "sudo", "exec", "command", "xargs", "watch", "flock", "chroot"))
 # A wrapper that takes a positional ahead of the command it runs (`flock <lock> cmd`,
 # `chroot <root> cmd`): that one word is the wrapper's own, whatever it looks like.
 _SHELL_WRAPPER_POSITIONALS = {"flock": 1, "chroot": 1}

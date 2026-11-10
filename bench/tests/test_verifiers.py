@@ -7670,9 +7670,9 @@ def _run_objective(command: str) -> str:
         (f"KUBECONFIG=/opt/data/.kubeconfigs/x python3 {_SCRIPT_PATH} --readiness", True),
         (f"env PYTHONUNBUFFERED=1 python3 {_SCRIPT_PATH} --readiness", True),
         (f"nohup python3 {_SCRIPT_PATH} --readiness --output /tmp/r.json &", True),
-        (f"time python3 {_SCRIPT_PATH} --readiness", False),
-        (f"time -p python3 {_SCRIPT_PATH} --readiness", False),
-        (f"/usr/bin/time python3 {_SCRIPT_PATH} --readiness", False),
+        (f"time python3 {_SCRIPT_PATH} --readiness", True),
+        (f"time -p python3 {_SCRIPT_PATH} --readiness", True),
+        (f"/usr/bin/time python3 {_SCRIPT_PATH} --readiness", True),
         ("python3 -W ignore fleet_upgrade_report.py --readiness", True),
         ("uv run --python 3.14 fleet_upgrade_report.py --readiness", True),
         (f'bash -lc "python3 {_SCRIPT_PATH} --readiness"', True),
@@ -8138,17 +8138,47 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null python3 f.py --readiness") == [
         (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("setsid -w python3 f.py --readiness") == [
+        (["setsid", "-w", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --wait python3 f.py --readiness") == [
+        (["setsid", "--wait", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --wai python3 f.py --readiness") == [
+        (["setsid", "--wai", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
         (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("setsid -wf python3 f.py --readiness") == [
         (["setsid", "-wf", "python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("setsid -w -V python3 f.py --readiness") == [
+        (["setsid", "-w", "-V", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -w --version python3 f.py --readiness") == [
+        (["setsid", "-w", "--version", "python3", "f.py", "--readiness"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("sudo -ubob python3 f.py --readiness") == [
         (["sudo", "-ubob", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("sudo -gbin python3 f.py --readiness") == [
         (["sudo", "-gbin", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -V python3 f.py --readiness") == [
+        (["sudo", "-V", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --version python3 f.py --readiness") == [
+        (["sudo", "--version", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("time python3 f.py --readiness") == [
+        (["time", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("time -p python3 f.py --readiness") == [
+        (["time", "-p", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("/usr/bin/time python3 f.py --readiness") == [
+        (["/usr/bin/time", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo --backg python3 f.py --readiness") == [
         (["sudo", "--backg", "python3", "f.py", "--readiness"], False),
@@ -8451,6 +8481,18 @@ def test_worker_commands_required_run_succeeded_flag():
     res_clipped_failed = v.verify(5.0)
     assert res_clipped_failed.status == "fail"
     assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_clipped_failed.reason
+
+    # A clipped call that exited non-zero does not fold into gaps for uncredited succeeded: true runs,
+    # so conclusive fail verdicts are not downgraded to error.
+    traj_unclosed_failed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_2", "args": {"raw": '{"command": "kubectl get nodes ...[clipped 40 chars]'}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_unclosed_failed, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_unclosed_failed = v.verify(5.0)
+    assert res_unclosed_failed.status == "fail"
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_unclosed_failed.reason
+    assert "the pod clipped a worker terminal call's arguments" not in res_unclosed_failed.reason
 
     # A clipped exit-0 match beside an earlier failed unclipped match remains inconclusive (error status, not conclusive fail).
     traj_failed_then_clipped = [

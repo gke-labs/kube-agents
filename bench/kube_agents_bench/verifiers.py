@@ -2595,7 +2595,7 @@ class WorkerRun(BaseModel):
     to ensure the call's exit status faithfully reflects the command, the command segment must run
     alone on its line; connectives at depth 0 such as preceding or following ``&&``, ``||``, ``|``,
     ``;``, ``&``, or newlines, leading negation (``!``), or detaching, loop, or non-propagating
-    wrappers such as ``setsid`` without ``-w``, ``sudo -b``, ``watch``, ``xargs``, or ``flock``,
+    wrappers such as ``setsid`` without ``-w``, ``sudo -b``, ``watch``, ``xargs``, ``flock``, or ``time``,
     do not credit exit; lone assignment command substitutions propagate exit status when the inner
     command runs alone; a required run with ``succeeded: true`` and no worker trajectory to read is
     not credited)."""
@@ -2659,11 +2659,10 @@ _SUDO_VAL_OPTS = {
     "--command-timeout", "--other-user", "--host", "--role", "--type",
 }
 _SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
-_SUDO_VAL_LESS_FLAGS = set("AbBEHiKknNPSsVv")
+_SUDO_VAL_LESS_FLAGS = set("AbBEHinNPSsv")
 _SUDO_LONG_VAL_LESS_OPTS = {
-    "--askpass", "--bell", "--help", "--login",
-    "--remove-timestamp", "--reset-timestamp",
-    "--non-interactive", "--stdin", "--shell", "--version", "--validate",
+    "--askpass", "--bell", "--login",
+    "--non-interactive", "--stdin", "--shell", "--validate",
     "--set-home", "--preserve-groups", "--no-update",
 }
 _SETSID_VAL_LESS_FLAGS = set("cwf")
@@ -2688,7 +2687,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
             idx += 1
             continue
         base = os.path.basename(word)
-        if base in ("watch", "xargs", "flock"):
+        if base in ("watch", "xargs", "flock", "time"):
             return True
         if base == "setsid":
             idx += 1
@@ -2717,6 +2716,9 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                             saw_w = True
                         idx += 1
                         continue
+                    return True
+                elif w.startswith("-"):
+                    return True
                 if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
                 idx += 1
@@ -3592,8 +3594,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         if withheld and uncredited_succeeded:
             gaps.append("the pod withheld a worker terminal call's arguments")
         clipped_unmatched = False
-        for _, _, cmd, _, _, is_clipped in traj_calls:
-            if not is_clipped:
+        for _, _, cmd, _, call_succeeded, is_clipped in traj_calls:
+            if not is_clipped or not call_succeeded:
                 continue
             argv_entries = _shell_argvs_with_exit_propagation(cmd)
             if any(
