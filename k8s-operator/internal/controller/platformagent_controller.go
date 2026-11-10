@@ -3337,12 +3337,9 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	autopilot, determined := r.clusterAutopilot()
-	recorded := true
-	if !determined {
-		if autopilot, recorded, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
-			return err
-		}
+	autopilot, recorded, err := r.credentialProxyAutopilot(ctx, agent)
+	if err != nil {
+		return err
 	}
 	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
 	// The annotation records a cluster type, so only a definite answer, or the
@@ -6531,6 +6528,19 @@ func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined
 	return autopilot, true
 }
 
+// credentialProxyAutopilot is the cluster type the credential proxy is rendered
+// at: discovery's answer, or, while discovery cannot give one, the type the
+// running proxy was last rendered for (liveCredentialProxyAutopilot). recorded
+// reports whether the type is one to write to the proxy's cluster-type
+// annotation. The render and the sizing reads (sizingAutopilot) both use it,
+// so sizing measures and compares the proxy at the requests it runs at.
+func (r *PlatformAgentReconciler) credentialProxyAutopilot(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+	if autopilot, determined := r.clusterAutopilot(); determined {
+		return autopilot, true, nil
+	}
+	return r.liveCredentialProxyAutopilot(ctx, agent)
+}
+
 // liveCredentialProxyAutopilot picks the cluster type to render the proxy at
 // while discovery cannot say: the one the running proxy was last rendered for.
 // Rendering the Standard requests over a proxy running at the Autopilot ones
@@ -6543,7 +6553,7 @@ func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined
 // applied. With no proxy yet, or one matching neither render, it is Standard:
 // a smaller request than Autopilot wants delays the broker's CPU, where a
 // larger one than a Standard node can fit leaves it Pending.
-func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
 	live := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
 		if errors.IsNotFound(err) {
@@ -6561,7 +6571,7 @@ func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Conte
 		if c.Name != credentialProxyContainerName {
 			continue
 		}
-		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true, renderedSizingTier(rendered)).Requests
+		want := renderedCredentialProxyResourcesAt(agent.Spec.Deployment, true, renderedSizingTier(agent)).Requests
 		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 			have, ok := c.Resources.Requests[name]
 			wantQ := want[name]

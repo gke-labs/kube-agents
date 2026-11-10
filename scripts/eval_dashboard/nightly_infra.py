@@ -60,11 +60,6 @@ STOPPED_CUT = "ended before its verdict after {took} (result {result}); {recorde
 STOPPED_CLEAN = "ran to its verdict (result {result}); {recorded} cases recorded"
 UNKNOWN = "unknown"
 UNKNOWN_WALL_CLOCK = "an unknown wall clock"
-ABSENT_REASON = "no line for the case: the {part} part ran to its verdict and recorded nothing for it"
-INFRA_REASON = "{infra} of {reps} repetitions infrastructure{ceiling}: {reason}"
-CEILING_NOTE = " ({ceiling} at the delegation ceiling)"
-NO_REASON = "(no reason recorded)"
-REASON_MAX_CHARS = nightly.REASON_MAX_CHARS
 
 
 def window_dates(data: dict, lookback: int) -> set[datetime.date]:
@@ -202,20 +197,13 @@ def case_homes(parts: dict[str, list[dict]]) -> dict[str, tuple[str, datetime.da
     return out
 
 
-def infra_reason(task: dict) -> str:
-    counts = classify.rep_counts(task)
-    reps = sum(counts.values())
-    reason = classify.first_reason(task)[:REASON_MAX_CHARS] or NO_REASON
-    ceiling = CEILING_NOTE.format(ceiling=counts["ceiling"]) if counts["ceiling"] else ""
-    return INFRA_REASON.format(infra=counts["infra"] + counts["ceiling"] + counts["fixture"], reps=reps, ceiling=ceiling, reason=reason)
-
-
 def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[str, str] | None = None) -> dict[str, list[dict]]:
     """``{case: [verdict, ...]}``, oldest first, over the eligible nights
     (module docstring). A verdict is ``{date, started, finished, build, job,
-    run_url, transcript_url, state, reason}``, the build being the one that
+    run_url, transcript_url, state}``, the build being the one that
     recorded the case (the night's own when none did); ``state`` is infra,
-    absent or graded.
+    absent or graded. No verdict carries the classifier's reason: the issue
+    filer is the only reader and its text is public.
 
     Each date reads the case from whichever part recorded it (a case that
     changed lanes, or one both parts ran), and is skipped when that part's
@@ -283,13 +271,13 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
                 continue
             task, run = night["tasks"].get(case, (None, night["run"]))
             if task is None:
-                state, reason = STATE_ABSENT, ABSENT_REASON.format(part=part)
+                state = STATE_ABSENT
             elif classify.outcome_of(classify.rep_counts(task)) == classify.OUTCOME_INFRA:
-                state, reason = STATE_INFRA, infra_reason(task)
+                state = STATE_INFRA
             elif classify.outcome_of(classify.rep_counts(task)) is None:
                 continue
             else:
-                state, reason = STATE_GRADED, None
+                state = STATE_GRADED
             out.setdefault(case, []).append({
                 "date": night["date"],
                 "started": run.get("started"),
@@ -300,7 +288,6 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
                 # An absent case has no transcript: the build recorded nothing.
                 "transcript_url": None if state == STATE_ABSENT else nightly.transcript_url(run, case),
                 "state": state,
-                "reason": reason,
             })
     return out
 

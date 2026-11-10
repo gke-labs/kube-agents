@@ -359,11 +359,22 @@ class ScopeArgumentRetryTest(unittest.TestCase):
         lookup = [t.format("111") for t in SHAPE_PROJECT_NAME]
         self._run([self._refused()], argv=lookup)
         self.assertTrue(pub._scope_argument_wait.probe_refused)
+        self.assertEqual({"111"}, pub._scope_argument_wait.refused)
+
+    def test_a_refused_probe_is_recorded_until_a_later_probe_of_it_answers(self):
+        probe = [t.format("team-project") for t in SHAPE_PROBE]
+        self._run([self._refused()], argv=probe)
+        self.assertEqual({"team-project"}, pub._scope_argument_wait.refused)
+        with mock.patch.object(pub.subprocess, "run", side_effect=subprocess.TimeoutExpired([], 12)), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            pub.broker_run(probe, check=True, timeout=12)
+        self.assertEqual(set(), pub._scope_argument_wait.refused)
 
     def test_a_refused_source_lookup_is_not_taken_for_a_refused_probe(self):
         answered = subprocess.CompletedProcess([], 0, "[]", "")
         self._run([self._refused(), answered])
         self.assertFalse(pub._scope_argument_wait.probe_refused)
+        self.assertEqual(set(), pub._scope_argument_wait.refused)
 
     def test_another_refusal_of_a_probe_is_not_taken_for_a_lost_member(self):
         probe = [t.format("team-project") for t in SHAPE_PROBE]
@@ -371,6 +382,7 @@ class ScopeArgumentRetryTest(unittest.TestCase):
             pub._scope_argument_wait.reset()
             self._run([self._refused(stderr)], argv=probe)
             self.assertFalse(pub._scope_argument_wait.probe_refused, stderr)
+            self.assertEqual(set(), pub._scope_argument_wait.refused, stderr)
 
     def test_the_window_is_the_runs_not_each_lookups(self):
         clock = FakeClock()
@@ -1043,6 +1055,80 @@ class BuildDocumentTest(unittest.TestCase):
             broker, {}, _scope(metricsScopes=["scope-p"]), previous,
             flip_on=self._is_probe, script={"777": ["answer", "fail"]})
         self.assertEqual(self._rows(document)["mon-proj-a"], previous["projects"][0])
+
+    def test_a_kept_sources_member_whose_probe_timed_out_reads_unreachable(self):
+        # A declared source the broker never names (gave_up) starts the recovery pass. The
+        # folder's second lookup fails, so its first answer is kept, and `p-slow` times out
+        # on both probes. No refusal named it: the row says `unreachable`, not the previous `ok`.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "p-slow", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["p-slow", "team-a"]}, timeouts={"p-slow"})
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(
+                broker, {FOLDER_B: 10_000}, _scope(folders=["111111111111", "222222222222"]), previous,
+                script={FOLDER_A: ["answer", "fail"]})
+        self.assertEqual(1, self._recoveries(logged))
+        rows = self._rows(document)
+        self.assertEqual(rows["p-slow"]["outcome"], "unreachable")
+        self.assertEqual(rows["team-a"]["outcome"], "ok")
+
+    def test_a_kept_sources_member_whose_probe_failed_in_the_client_reads_unreachable(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "p-reset", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["p-reset"]})
+        document, _ = self._build_through_client(
+            broker, {FOLDER_B: 10_000}, _scope(folders=["111111111111", "222222222222"]), previous,
+            script={FOLDER_A: ["answer", "fail"], "p-reset": ["fail", "fail"]})
+        self.assertEqual(self._rows(document)["p-reset"]["outcome"], "unreachable")
+
+    def test_a_member_whose_refused_probe_then_timed_out_reads_unreachable(self):
+        # The first probe is refused as not declared; the recovery pass records the member
+        # again, and its second probe times out. The last answer is the run's answer.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        with mock.patch.object(pub, "log") as logged:
+            document, _ = self._build_through_client(
+                broker, {}, _scope(folders=["111111111111"]), previous,
+                flip_on=self._is_probe, script={"team-a": ["answer", "timeout"]})
+        self.assertEqual(1, self._recoveries(logged))
+        self.assertEqual(self._rows(document)["team-a"]["outcome"], "unreachable")
+
+    def test_a_kept_metrics_scopes_member_whose_naming_timed_out_reads_unreachable(self):
+        # As the refused naming above, but the naming call times out: no refusal named the
+        # number, so the previous row does not stand in.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "numbers": {"777": "mon-proj-a"},
+                    "projects": [{"id": "mon-proj-a", "via": ["metricsScopes/scope-p"], "outcome": "ok",
+                                  "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(scopes={"scope-p": ["777"]}, names={"777": "mon-proj-a"}, timeouts={"777"})
+        document, _ = self._build_through_client(
+            broker, {FOLDER_B: 10_000}, _scope(folders=["222222222222"], metricsScopes=["scope-p"]), previous,
+            script={"scope-p": ["answer", "fail"]})
+        self.assertEqual(self._rows(document)["mon-proj-a"]["outcome"], "unreachable")
+
+    def test_a_probed_member_whose_naming_was_refused_reads_its_own_probe(self):
+        # The folder lists the member, so its own probe decides its row: a client failure
+        # reads `unreachable`, although the naming of its number by a Metrics Scope was refused.
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "numbers": {"777": "mon-proj-a"},
+                    "projects": [{"id": "mon-proj-a", "via": [FOLDER_A, "metricsScopes/scope-p"], "outcome": "ok",
+                                  "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["mon-proj-a"]}, scopes={"scope-p": ["777"]}, names={"777": "mon-proj-a"})
+        with mock.patch.object(rec, "_list_budget_seconds", return_value=pub.SCOPE_RECOVERY_MIN_SECONDS - 1):
+            document, _ = self._build_through_client(
+                broker, {}, _scope(folders=["111111111111"], metricsScopes=["scope-p"]), previous,
+                script={"777": ["refuse"], "mon-proj-a": ["fail"]})
+        self.assertEqual(self._rows(document)["mon-proj-a"]["outcome"], "unreachable")
+
+    def test_a_refused_probe_keeps_its_previous_row_without_a_recovery_pass(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}]}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]})
+        with mock.patch.object(pub, "log") as logged, \
+                mock.patch.object(rec, "_list_budget_seconds", return_value=pub.SCOPE_RECOVERY_MIN_SECONDS - 1):
+            document, _ = self._build_through_client(broker, {}, _scope(folders=["111111111111"]), previous,
+                                                     flip_on=self._is_probe)
+        self.assertEqual(0, self._recoveries(logged))
+        self.assertEqual(self._rows(document)["team-a"], previous["projects"][0])
 
     def test_the_recovery_pass_waits_for_nothing_after_an_earlier_wait(self):
         # A source refused and then caught up leaves the run's retry window open; a source the

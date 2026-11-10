@@ -759,6 +759,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS

@@ -426,7 +426,7 @@ class PreflightDecisionTest(unittest.TestCase):
         # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
         under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
         self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
-        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=544Mi"], extra_args=autopilot)
         self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:

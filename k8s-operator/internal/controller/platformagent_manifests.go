@@ -1230,7 +1230,7 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
 // measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
 // gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
-// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// resident without holding a slot. The credential proxy's 2Gi default admits ten
 // brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
 // eight, shared with the listing pools).
 // TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
@@ -5240,6 +5240,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// destination or credential.
 		"CRON_IDLE_HIBERNATE_DAYS": {},
 		"CRON_IDLE_THROTTLE_DAYS":  {},
+
+		// The catch-up policy's step, in minutes
+		// (agents/chat/scripts/cron_catch_up_policy.py): after a pause the
+		// dispatcher skips a model-run cron job's catch-up when it is a whole
+		// period late and releases the rest this far apart. Parsed as a whole
+		// number; `0` turns the policy off and anything else means the
+		// default. Like the two above it changes only when jobs already on
+		// the roster run, by moving their next_run_at in the profile's own
+		// store, and adds no job, path, destination or credential.
+		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
