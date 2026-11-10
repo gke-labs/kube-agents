@@ -488,7 +488,7 @@ class DeliveryToConversationTest(unittest.TestCase):
 
     def test_no_home_is_said_beside_listed_summaries(self):
         oobe.write_state(self.d, {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_DONE: True})
-        with mock.patch.object(bootstrap_delivery, "_lost_audits", return_value=[("compliance-audit", False)]):
+        with mock.patch.object(bootstrap_delivery, "_lost_audits", return_value=[bootstrap_delivery.LostRun("compliance-audit", False, 1.0)]):
             note = bootstrap_delivery._audits_note(self.d, False, home=False)
         self.assertIn("not posted to the chat: `compliance-audit`.", note)
         self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
@@ -3369,7 +3369,180 @@ class FirstRunAuditsTest(unittest.TestCase):
                 ):
                     # No relay record, so each outcome is read as it stands.
                     got = bootstrap_delivery._lost_audits(("compliance-audit",), {"compliance-audit": runs}, {}, None)
-                    self.assertEqual(got, [("compliance-audit", False)] if listed else [])
+                    self.assertEqual([(r.audit, r.crashed) for r in got], [("compliance-audit", False)] if listed else [])
+
+    # --- the re-send stage ------------------------------------------------------
+
+    def _roster(self, names: dict[str, str]) -> None:
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        (cron / oobe.ROSTER_FILE).write_text(
+            json.dumps({"jobs": [{"id": job_id, "name": name} for job_id, name in names.items()]}), encoding="utf-8"
+        )
+
+    def _resend(self, home: str, answers=None, now: float | None = None) -> list[tuple[urllib.request.Request, dict]]:
+        """One tick of the re-send stage with the projected home channel ``home``; the relay's requests, decoded.
+
+        ``answers`` is what each request gets, in order: a dict the relay answers with, or an exception to raise;
+        the last one repeats.
+        """
+        answers = list(answers or [{"status": "delivered"}])
+        requests: list[tuple[urllib.request.Request, dict]] = []
+
+        def urlopen(request, timeout=None):
+            requests.append((request, json.loads(request.data.decode("utf-8"))))
+            answer = answers.pop(0) if len(answers) > 1 else answers[0]
+            if isinstance(answer, BaseException):
+                raise answer
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = json.dumps(answer).encode("utf-8")
+            return response
+
+        env = {bootstrap_delivery.SESSION_KV_AUTH_ENV: "kv-key", bootstrap_delivery.FINDINGS_ENDPOINT_ENV: "http://relay.test"}
+        with (
+            mock.patch.object(chat_notify, "home_file_value", return_value=home),
+            mock.patch.object(urllib.request, "urlopen", urlopen),
+            mock.patch.dict(os.environ, env),
+        ):
+            bootstrap_delivery.resend_lost_summaries(self.d, time.time() if now is None else now)
+        return requests
+
+    def _stage_log(self) -> str:
+        try:
+            return (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
+    def _lost_first_run(self, audit: str = "fleet-wide-cost-analysis", age: float = 600) -> float:
+        """A first-run ``audit`` whose run was claimed ``age`` seconds ago with its summary refused; its claim time.
+
+        The sweep and the stage's mark come before the run, so the onboarding window holds it whatever ``age``.
+        """
+        now = time.time()
+        self._filed(now - age - 120)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: [audit], oobe.STATE_MARKS: {audit: now - age - 60}})
+        self._run(audit, now - age, bootstrap_delivery.DELIVERY_FAILED)
+        # The relay's database exists, with no row for the audit: nothing was posted.
+        with sqlite3.connect(self.relay_db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
+                         "run TEXT NOT NULL, posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (profile, job_id))")
+        return now - age
+
+    def test_a_lost_summary_waits_while_no_home_channel_is_projected(self):
+        self._lost_first_run()
+        self.assertEqual(self._resend(""), [])
+        self.assertFalse((self.d / bootstrap_delivery.RESENT_FILE).exists())
+        self.assertEqual(self._stage_log(), "")
+
+    def test_a_lost_summary_is_re_sent_through_the_relay_once_the_home_channel_is_projected(self):
+        claimed = self._lost_first_run()
+        self._roster({"fleet-wide-cost-analysis": "Fleet-wide cost analysis"})
+        requests = self._resend("C0123")
+        self.assertEqual(len(requests), 1)
+        request, body = requests[0]
+        self.assertEqual(request.full_url, "http://relay.test" + bootstrap_delivery.CRON_REPORTS_PATH)
+        self.assertEqual(request.get_header("Authorization"), "Bearer kv-key")
+        self.assertEqual(body["job_id"], "fleet-wide-cost-analysis")
+        self.assertEqual(body["profile"], oobe.PLATFORM_PROFILE)
+        self.assertEqual(body["title"], "Fleet-wide cost analysis")
+        # The scheduler-leg key, so the relay reads the audit's own record and posts that, not this text.
+        self.assertEqual(body[bootstrap_delivery.SCHEDULER_LEG_KEY], [])
+        self.assertIn("fleet audits from the report store: fleet-wide-cost-analysis.", body["report"])
+        self.assertIn("re-sent the fleet-wide-cost-analysis summary to the home channel: the relay answered delivered",
+                      self._stage_log())
+        self.assertEqual(bootstrap_delivery._resend_state(self.d),
+                         {"fleet-wide-cost-analysis": {"tries": 1, "posted": True}})
+        # The relay's row, written when it posted, settles the audit: the next tick sends nothing.
+        self._relay("fleet-wide-cost-analysis", claimed + 300)
+        self.assertEqual(self._resend("C0123"), [])
+        # The chain's own state file is not touched: an empty one still means the chain has not started.
+        self.assertNotIn(bootstrap_delivery.RESENT_FILE, oobe.read_state(self.d))
+
+    def test_without_a_roster_name_the_title_is_the_job_id(self):
+        self._lost_first_run()
+        _request, body = self._resend("C0123")[0]
+        self.assertEqual(body["title"], "fleet-wide-cost-analysis")
+
+    def test_a_lost_answer_counts_as_a_try_and_the_relay_record_decides(self):
+        claimed = self._lost_first_run()
+        lost = urllib.error.URLError("timed out")
+        self.assertEqual(len(self._resend("C0123", [lost])), 1)
+        self.assertIn("no answer from the relay, which may have posted", self._stage_log())
+        self.assertEqual(bootstrap_delivery._resend_state(self.d),
+                         {"fleet-wide-cost-analysis": {"tries": 1, "posted": False}})
+        # No row: the relay did not post, and the next tick asks again.
+        self.assertEqual(len(self._resend("C0123", [lost])), 1)
+        # A row: it had posted, and the next tick leaves it alone.
+        self._relay("fleet-wide-cost-analysis", claimed + 300)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_relay_that_keeps_refusing_is_asked_at_most_the_cap(self):
+        self._lost_first_run()
+        def refused():
+            return urllib.error.HTTPError(
+                "http://relay.test", 502, "Bad Gateway", {}, io.BytesIO(b"composed but not delivered to slack")
+            )
+
+        for _ in range(bootstrap_delivery.RESEND_MAX_ATTEMPTS):
+            self.assertEqual(len(self._resend("C0123", [refused()])), 1)
+        self.assertEqual(self._resend("C0123", [refused()]), [])
+        self.assertEqual(self._stage_log().count("the relay answered 502: composed but not delivered to slack"),
+                         bootstrap_delivery.RESEND_MAX_ATTEMPTS)
+
+    def test_a_run_older_than_the_relay_record_window_is_not_re_sent(self):
+        # The relay posts a "did not finish" notice for a record past its age; this stage does not ask for one.
+        for age, sent in ((bootstrap_delivery.RESEND_WINDOW_SECONDS - 60, 1), (bootstrap_delivery.RESEND_WINDOW_SECONDS + 60, 0)):
+            with self.subTest(age=age):
+                self.setUp()
+                self._lost_first_run(age=age)
+                self.assertEqual(len(self._resend("C0123")), sent)
+        self.assertLessEqual(bootstrap_delivery.RESEND_WINDOW_SECONDS, 2 * 60 * 60 - 10 * 60)
+
+    def test_an_answered_re_send_is_settled_when_a_later_run_of_the_audit_failed(self):
+        # A relay row settles the earlier run in _lost_audits only until a later run fails: the row then
+        # reads as that run's notice, and the earlier run is judged by its outcome again. Asking the relay
+        # again would post a "did not finish" notice. The answer settles it instead.
+        claimed = self._lost_first_run(age=900)
+        self._run("fleet-wide-cost-analysis", claimed + 600, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self.assertEqual(len(self._resend("C0123")), 1)
+        self._relay("fleet-wide-cost-analysis", claimed + 660)
+        for _ in range(3):
+            self.assertEqual(self._resend("C0123"), [])
+        self.assertEqual(self._stage_log().count("re-sent the fleet-wide-cost-analysis summary"), 1)
+
+    def test_a_delivered_answer_without_a_relay_row_is_not_asked_again(self):
+        # A relay that cannot tell the job for a fleet audit posts the request text and writes no row.
+        self._lost_first_run()
+        self.assertEqual(len(self._resend("C0123")), 1)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_crashed_run_is_not_re_sent(self):
+        now = time.time()
+        self._filed(now - 3600)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 700}})
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("obtainability-audit", now)  # the relay's database exists
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_lost_summary_outside_the_first_run_chain_is_not_re_sent(self):
+        now = time.time()
+        self._filed(now - 3600)
+        oobe.write_state(self.d, {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self._run("ai-security-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("obtainability-audit", now)
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_without_the_relay_record_nothing_is_re_sent(self):
+        # Without it a post this stage made cannot be told from a lost one; a second copy is the worse loss.
+        self._lost_first_run()
+        self.relay_db.unlink()
+        self.assertEqual(self._resend("C0123"), [])
+
+    def test_a_posted_run_is_not_pending(self):
+        claimed = self._lost_first_run()
+        self._relay("fleet-wide-cost-analysis", claimed + 60)
+        self.assertEqual(bootstrap_delivery.pending_resends(self.d, oobe.read_state(self.d), time.time()), [])
 
     def test_a_run_from_before_the_mark_is_not_the_first_run(self):
         now = time.time()
@@ -3463,6 +3636,12 @@ class FirstRunAuditsTest(unittest.TestCase):
             self.assertIn(column, table)
         self.assertIn(f'os.getenv("{bootstrap_delivery.SESSION_KV_DB_ENV}", '
                       f'"{bootstrap_delivery.DEFAULT_SESSION_KV_DB_PATH}")', server)
+        # The re-send stage's request is the relay plugin's: the route, and the key that marks a delivery leg.
+        self.assertIn(f'@app.post("{bootstrap_delivery.CRON_REPORTS_PATH}"', server)
+        self.assertIn(f'SCHEDULER_LEG_KEY = "{bootstrap_delivery.SCHEDULER_LEG_KEY}"', server)
+        for key in (bootstrap_delivery.REQUEST_JOB_KEY, bootstrap_delivery.REQUEST_PROFILE_KEY,
+                    bootstrap_delivery.REQUEST_TITLE_KEY, bootstrap_delivery.REQUEST_REPORT_KEY):
+            self.assertIn(f'request_data.get("{key}")', server)
 
     def test_the_request_covers_every_shipped_fleet_audit(self):
         # A fleet audit added to the roster, or to the first-run chain, needs a request the note can send.

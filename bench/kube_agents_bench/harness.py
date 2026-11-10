@@ -458,6 +458,14 @@ _INJECT_DEFAULT_TIMEOUT = "1800"
 # the marker above; ``test_scoring.py`` asserts the two strings agree.
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
+# The note on a record's errors when the session store could not be read and the
+# delegation wait fell back to the trajectory's cards, so the record may hold the
+# acknowledgement in place of the delegated answer. ``scoring.py`` matches it to
+# excuse the write safeguard's charge of the requested pull request on such a
+# record, and duplicates the literal for the reason the markers above give;
+# ``test_scoring.py`` asserts the two agree.
+DELEGATION_FALLBACK_NOTE = "the delegation wait fell back to the trajectory's cards"
+
 # Where hermes keeps per-card state in the agent's data volume. A card's
 # attachments hold the files its worker produced -- the deliverable itself on a
 # task that asks for a written report -- and its log holds the worker's whole
@@ -2749,6 +2757,7 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
         errors=[],
         metadata={
             "transport": TRANSPORT_INJECT,
+            "child_addressees": None if fold.child_addressees is None else list(fold.child_addressees),
             "final_message": fold.deliverable,
             "task_id": exchange.task_id,
             "conversation": exchange.conversation,
@@ -2878,6 +2887,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
+            child_addressees=result.metadata.get("child_addressees"),
         )
         _write_chat_shape(result)
         return result
@@ -3685,6 +3695,8 @@ class KubeAgentsHarness(AgentHarness):
                     exchange.fold.usage = settled.fold.usage
                     exchange.fold.child_usage = settled.fold.child_usage
                     exchange.fold.usage_partial = settled.fold.usage_partial
+                if timed_out and settled is not None and settled.fold.child_addressees is not None:
+                    exchange.fold.child_addressees = settled.fold.child_addressees
             return timed_out, stop_pending
 
         def _stop_word(task: inject.InjectTask, stop_pending: bool) -> str:
@@ -4278,8 +4290,8 @@ class KubeAgentsHarness(AgentHarness):
         if read is None:
             result.errors.append(
                 f"the session store for {session_id} could not be read "
-                f"{_MAX_TRANSPORT_FAILURES} times running; the delegation wait fell back to the "
-                "trajectory's cards, so a delegated answer may be graded on the acknowledgement"
+                f"{_MAX_TRANSPORT_FAILURES} times running; {DELEGATION_FALLBACK_NOTE}, so a "
+                "delegated answer may be graded on the acknowledgement"
             )
             return False
         if not read.session_found or not read.card_ids:

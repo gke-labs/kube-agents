@@ -1073,5 +1073,89 @@ class AnswerMappingTest(unittest.TestCase):
         mapping = normalizer.normalize_request({"model": "m", "messages": [text]}, NOW).mapping
         self.assertTrue(mapping.answer_repeats_bare_number("I left a comment: 2 pods are pending"))
 
+class HistorySwapTest(unittest.TestCase):
+    """An answer comes back in the next request's history keyed as apply_to_answer stored it."""
+
+    OP_RECORDED = "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
+    OP_REPLAYED = "1792900340178-5482a62f-d7e3-4c54-bb09-236983a9dfb7"
+
+    @staticmethod
+    def turn(shown, said):
+        return {"model": "m", "messages": [{"role": "user", "content": "go"},
+                                           {"role": "tool", "tool_call_id": "call_1", "content": shown},
+                                           {"role": "assistant", "content": said}]}
+
+    def assert_keys_alike(self, shown, said, recorded, replayed, expected):
+        a = normalizer.normalize_request(self.turn(shown.format(*recorded), said.format(*recorded)), NOW)
+        b = normalizer.normalize_request(self.turn(shown.format(*replayed), said.format(*replayed)), NOW)
+        self.assertEqual(a.messages[2]["content"], expected)
+        self.assertEqual(a.messages, b.messages)
+        self.assertEqual(fp(self.turn(shown.format(*recorded), said.format(*recorded))),
+                         fp(self.turn(shown.format(*replayed), said.format(*replayed))))
+        # The history keys the answer as record mode stored it.
+        asked = dict(self.turn(shown.format(*recorded), ""), messages=self.turn(shown.format(*recorded), "")["messages"][:2])
+        self.assertEqual(normalizer.normalize_request(asked, NOW).mapping.apply_to_answer(said.format(*recorded)), expected)
+
+    def test_a_bare_commit_in_history_keys_the_same_across_runs(self):
+        self.assert_keys_alike("cloned acme/app@{}", "git -C app checkout {}", ("c99b1ab",), ("4f1e414",),
+                               "git -C app checkout ⟦COMMIT_1⟧")
+
+    def test_a_commit_equal_to_a_bound_uuids_segment_never_splits_it(self):
+        # apply_to_answer's order: the bound uuid is looked up before the
+        # bare-commit swap, so the commit equal to its first segment stays inside it.
+        self.assert_keys_alike("cloned acme/app@{0} uid {1}", "uid {1}",
+                               ("11b21f18", "11b21f18-4eef-47ea-8ce1-fbd3c40047b3"),
+                               ("5482a62f", "5482a62f-d7e3-4c54-bb09-236983a9dfb7"),
+                               "uid ⟦UID_1⟧")
+
+    def test_a_bound_suffix_token_outside_its_pattern_keys_the_same(self):
+        self.assert_keys_alike("cloned into /opt/data/scratch/declared-intent-{}; newest operation-{}",
+                               "mv clone-{} old_{}", ("j77z8q6q", self.OP_RECORDED), ("a2_elobt", self.OP_REPLAYED),
+                               "mv clone-⟦TMPNAME_1⟧ old_⟦GKEOP_1⟧")
+
+    def test_the_answer_slot_check_agrees(self):
+        asked = {"model": "m", "messages": self.turn("cloned acme/app@{}", "")["messages"][:2]}
+        identities = set()
+        for sha in ("c99b1ab", "4f1e414"):
+            body = json.loads(json.dumps(asked).replace("{}", sha))
+            identities.add(normalizer.answer_in_context(body, {"role": "assistant", "content": f"checkout {sha}"}, NOW))
+        self.assertEqual(len(identities), 1)
+
+    def test_lookalikes_stay_literal(self):
+        full = "c99b1ab1fee80c1d2e3f40516273849a5b6c7d8e"
+        for shown, said in (
+            # Another commit, a longer and a shorter run, a run inside a word, and too short to be a commit.
+            ("cloned acme/app@c99b1ab", "checkout c99b1ac c99b1ab0 xc99b1ab c99b1a deadbeef1"),
+            # An abbreviation of a bound commit: no exact run, as apply_to_answer reads it.
+            (f"cloned acme/app@{full}", "checkout c99b1ab"),
+            # A bound tail inside a longer word.
+            ("cloned into declared-intent-j77z8q6q", "rm xj77z8q6q j77z8q6qx"),
+        ):
+            with self.subTest(said=said):
+                n = normalizer.normalize_request(self.turn(shown, said), NOW)
+                self.assertEqual(n.messages[2]["content"], said)
+        # Only an assistant message, and only with values bound before it.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "assistant", "content": "checkout c99b1ab"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "cloned acme/app@c99b1ab; at c99b1ab"},
+        ]}, NOW)
+        self.assertEqual(n.messages[0]["content"], "checkout c99b1ab")
+        self.assertEqual(n.messages[1]["content"], "cloned acme/app@⟦COMMIT_1⟧; at c99b1ab")
+
+    def test_a_request_without_such_a_repeat_keys_as_before(self):
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": "work t_11111111 on web-7d4b9c8f6d-x2k9p"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "cloned acme/app@c99b1ab pid 4821 at 10.1.2.3"},
+            {"role": "assistant", "content": "web-7d4b9c8f6d-x2k9p restarted 5m ago, pid 4822, see acme/app@c99b1ab",
+             "tool_calls": [{"id": "call_2", "type": "function", "function": {
+                 "name": "terminal", "arguments": json.dumps({"command": "kubectl get pod web-5f6c7d8b9c-m8n7q"})}}]},
+        ]}, NOW)
+        self.assertEqual(n.messages[2], {
+            "content": "web-⟦POD_1⟧ restarted ⟦AGEm_1⟧ ago, pid ⟦NUM_2⟧, see acme/app@⟦COMMIT_1⟧", "role": "assistant",
+            "tool_calls": [{"function": {"arguments": json.dumps({"command": "kubectl get pod web-⟦POD_2⟧"}, ensure_ascii=False),
+                                         "name": "terminal"}, "id": "⟦OPAQUE_2⟧", "type": "function"}]})
+        self.assertEqual(n.mapping.counts, {"TASK": 1, "POD": 2, "COMMIT": 1, "NUM": 2, "OPAQUE": 2, "IP": 1, "AGEm": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

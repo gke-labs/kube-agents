@@ -81,8 +81,9 @@ jobs:
         run: make docs-check-pr-template
 
       # Each row of the upgrade page's breaking-changes table names the release
-      # an operator first meets the change in. A label written before its
-      # release is cut can name a release that was cut from an earlier commit;
-      # once that release is tagged, the row must be in it.
+      # an operator first meets the change in, or says `pending` until that
+      # release ships. A label written before its release is cut can name a
+      # release that was cut from an earlier commit; once that release is
+      # tagged, the row must be in it, and a `pending` row must be relabelled.
       - name: Upgrade-table rows name a release that contains them
         run: make docs-check-upgrade-releases

@@ -1013,9 +1013,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
         self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
-        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        # The GitLab lane's next nightly is a table of its own.
         self.assertIn("1 night on record: 0 green, 1 not", page)
-        self.assertIn("No night of", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):

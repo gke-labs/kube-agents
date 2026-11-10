@@ -32,8 +32,9 @@ The handler hands one `AuditEvent` per request to an `AuditSink` (`audit.go`) wh
 ends, so a watch or an `exec` session is recorded when it closes. The event holds the caller, the
 cluster, the API server's classification of the request, the outcome (`forwarded`,
 `unauthenticated`, `auth_unavailable` when the TokenReview fails, `refused` with its reason,
-`upstream_error`, `canceled` when the caller gives up, or `aborted` when a response fails
-mid-copy otherwise or an upgrade's 101 cannot be written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
+`upstream_error`, `canceled` when the caller gives up, `throttled` when the in-flight cap
+answered 429, or `aborted` when a response fails mid-copy otherwise or an upgrade's 101 cannot be
+written), the status, the duration, and the response cache's result when the cache handled the request (a `hit` or `coalesced` request never reached the cluster). An upgraded session that breaks off after its 101 is recorded as
 `forwarded`, because the reverse proxy reports nothing about the stream itself. The handler
 puts no body, query or credential in it, but an authentication or transport error is recorded as
 returned. The caller never sees that error, because it can name the upstream. A Secret response
