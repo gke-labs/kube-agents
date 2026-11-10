@@ -90,15 +90,15 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         )
 
     def test_every_task_is_in_exactly_one_place(self):
-        # Presubmit, nightly, FIXTURE_NOT_READY and KNOWN_UNREGISTERED are
-        # four answers to one question; a case with two of them has a stale
-        # one. The shell rejects the presubmit/nightly overlap itself (it
+        # Presubmit, nightly, the certification suite line, FIXTURE_NOT_READY
+        # and KNOWN_UNREGISTERED are five answers to one question; a case with
+        # two of them has a stale one. The shell rejects the presubmit/nightly overlap itself (it
         # would run the case twice a night); the allowlist overlaps are the
         # validator's stale sweep, asserted here as one set rule.
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
-            "certification-cases.txt": set(eval_rosters.certification_cases()),
+            "suite: certification (task files)": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -654,23 +654,45 @@ class TestTheRulesReject(unittest.TestCase):
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
 
-    # -- the certification suite: the roster and the suite line agree --
+    # -- the certification suite: the bare line is the registration --
 
-    def test_a_certification_case_with_its_line_in_the_roster_passes(self):
-        self.assertEqual(self._validate(suite="certification", certification={"made-up-case"}), [])
+    def test_a_certification_case_registers_by_its_line(self):
+        # Registered nowhere else: the line is the registration, so the
+        # "registered nowhere" finding stays quiet.
+        self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
 
-    def test_a_rostered_certification_case_without_the_line_is_reported(self):
-        self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
+    def test_a_suite_spelling_the_lane_does_not_read_is_reported(self):
+        for text in ('id: made-up-case\nsuite: "certification"\n', "id: made-up-case\nsuite: certification  # the page row\n"):
+            with self.subTest(text=text):
+                spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
+                self._only("spelling the lane does not read", text=text + spec, certification=set())
 
-    def test_a_suite_line_outside_the_roster_is_reported_once(self):
-        # Registered nowhere at all: the suite finding names the right file,
-        # and the general registration finding (which would say
-        # nightly-cases.txt) stays quiet.
-        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+    def test_a_crlf_suite_line_is_a_spelling_the_lane_does_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
+            path.parent.mkdir()
+            spec = yaml.safe_dump({**self.VALID, "suite": "certification"})
+            path.write_bytes(spec.replace("\n", "\r\n").encode())
+            problems = validator.validate_case("made-up-case", path, registered=set(), certification=set())
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("spelling the lane does not read", problems[0])
 
-    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+    def test_a_part_line_is_accepted_bare_and_reported_otherwise(self):
+        self.assertEqual(self._validate(suite="certification", certification_part=2, certification=set()), [])
+        self._only("without 'suite: certification'", certification_part=2)
+        self._only("is not a whole number from 1", suite="certification", certification_part="2", certification=set())
+        self._only("is not a whole number from 1", suite="certification", certification_part=0, certification=set())
+        spec = yaml.safe_dump({k: v for k, v in self.VALID.items() if k != "id"})
+        self._only("spelling the lane does not read", text="id: made-up-case\nsuite: certification\ncertification_part: 2  # note\n" + spec, certification=set())
+
+    def test_a_parked_case_may_not_carry_the_suite_line(self):
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
-            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+        with unittest.mock.patch.dict(validator.KNOWN_UNREGISTERED, {"made-up-case": "must not run"}, clear=False):
+            self._only("parked in KNOWN_UNREGISTERED or FIXTURE_NOT_READY", suite="certification", certification=set(), registered=set())
+
+    def test_a_suite_case_in_a_roster_file_is_reported(self):
+        self._only("runs on that lane only", suite="certification", certification={"made-up-case"})
 
     def test_an_unknown_suite_is_reported(self):
         self._only("the only suite is 'certification'", suite="nightly")
@@ -1516,7 +1538,7 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
             validator.FIXTURE_NOT_READY, {"agent-kanban-smoke": "#1 waiting"}, clear=False
         ):
             self.assertIn(
-                "FIXTURE_NOT_READY: agent-kanban-smoke (also in a roster file)",
+                "FIXTURE_NOT_READY: agent-kanban-smoke (also registered: a roster file or the suite line)",
                 validator.stale_allowlist_entries(),
             )
 

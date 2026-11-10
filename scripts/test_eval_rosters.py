@@ -404,62 +404,88 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.blocking_roster())
 
 
-def cases_without_a_suite_line(roster: pathlib.Path, tasks_dir: pathlib.Path) -> list[str]:
-    """Certification-roster cases whose task file lacks `suite: certification`,
-    read as the validator reads it: the parsed top-level key, not a raw line."""
-    return [
-        case for case in eval_rosters.certification_cases(roster)
-        if (yaml.safe_load((tasks_dir / case / "task.yaml").read_text(encoding="utf-8")) or {}).get("suite")
-        != eval_rosters.CERTIFICATION_SUITE
-    ]
+def write_tasks(root: pathlib.Path, tasks: dict[str, str]) -> pathlib.Path:
+    """Scratch task files under `root`/<case>/task.yaml."""
+    for case, body in tasks.items():
+        (root / case).mkdir()
+        (root / case / "task.yaml").write_text(body)
+    return root
 
 
-class CertificationFileTest(unittest.TestCase):
-    """hack/eval/certification-cases.txt: the suite's own lane, in `# part N`
-    sections, disjoint from the presubmit and nightly files."""
+class CertificationSuiteTest(unittest.TestCase):
+    """The certification suite is read from the task files: the bare line
+    `suite: certification` is membership, the bare line `certification_part: N`
+    is the section, and the text read here is held equal to the YAML read the
+    validator makes, since the shell greps the same two lines."""
 
-    def test_the_parts_parser_reads_the_markers_the_shell_reads(self):
-        text = "# header\n./tasks/a-case/task.yaml\n# part 2\n./tasks/b-case/task.yaml # note\n\n#  part 4\n./tasks/c-case/task.yaml\n# part 3\n"
-        self.assertEqual(eval_rosters.parse_certification_parts(text), {1: ["a-case"], 2: ["b-case"], 4: ["c-case"]})
-        self.assertEqual(eval_rosters.parse_certification_parts("# part 1\n"), {})
-        with self.assertRaises(ValueError):
-            eval_rosters.parse_certification_parts("# part 1\na-case\n")
+    def test_the_part_is_the_bare_line_or_one(self):
+        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\ncertification_part: 3\n"), 3)
+        self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n"), 1)
+        for not_the_line in ('certification_part: "2"\n', "certification_part: 2  # note\n", "  certification_part: 2\n", "certification_part: 0\n", "certification_part: 02\n"):
+            with self.subTest(line=not_the_line):
+                self.assertEqual(eval_rosters.certification_part("id: a\nsuite: certification\n" + not_the_line), 1)
 
-    def test_a_line_that_is_not_a_marker_to_the_shell_is_a_comment_here_too(self):
-        # The awk twin in hack/ci-eval-pr.sh: `#` then whitespace, `part`, a
-        # number from 1, nothing else, at the start of the line.
-        for not_a_marker in ("#part 2\n", "  # part 2\n", "# part 0\n", "# part 2 # note\n", "# parts 2\n"):
-            with self.subTest(line=not_a_marker):
-                parts = eval_rosters.parse_certification_parts(not_a_marker + "./tasks/a-case/task.yaml\n")
-                self.assertEqual(parts, {1: ["a-case"]})
+    def test_membership_is_the_bare_line_in_id_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = write_tasks(pathlib.Path(tmp), {
+                "zed-case": "id: zed-case\nsuite: certification\n",
+                "alpha-case": "id: alpha-case\nsuite: certification\ncertification_part: 2\n",
+                "quoted-case": 'id: quoted-case\nsuite: "certification"\n',
+                "noted-case": "id: noted-case\nsuite: certification  # the page row\n",
+                "nested-case": "id: nested-case\nprompt: |\n  x\n  suite: certification\n",
+                "plain-case": "id: plain-case\n",
+            })
+            self.assertEqual(eval_rosters.certification_cases(root), ["alpha-case", "zed-case"])
+            self.assertEqual(eval_rosters.certification_parts(root), {1: ["zed-case"], 2: ["alpha-case"]})
 
-    def test_the_suite_line_check_runs_over_a_scratch_roster(self):
+    def test_a_crlf_file_is_off_the_lane_as_it_is_to_grep(self):
+        # grep sees `suite: certification\r`, not the bare line; the Python
+        # read keeps the `\r` too (newline=""), so the two agree and the
+        # validator's spelling rule is what reports the file.
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            cases = (
-                ("with-line", "id: with-line\nsuite: certification\n"),
-                ("quoted-with-note", 'id: quoted-with-note\nsuite: "certification"  # the page row\n'),
-                ("without-line", "id: without-line\n"),
-                ("line-in-prompt", "id: line-in-prompt\nprompt: |\n  x\nsuite: certification\n".replace("\nsuite:", "\n  suite:")),
-            )
-            for case, body in cases:
-                (root / case).mkdir()
-                (root / case / "task.yaml").write_text(body)
-            roster = root / "certification-cases.txt"
-            roster.write_text("".join(f"./tasks/{case}/task.yaml\n" for case, _ in cases))
-            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line", "line-in-prompt"])
+            (root / "crlf-case").mkdir()
+            (root / "crlf-case" / "task.yaml").write_bytes(b"id: crlf-case\r\nsuite: certification\r\ncertification_part: 2\r\n")
+            (root / "lf-case").mkdir()
+            (root / "lf-case" / "task.yaml").write_bytes(b"id: lf-case\nsuite: certification\n")
+            self.assertEqual(eval_rosters.certification_cases(root), ["lf-case"])
 
-    def test_the_real_file_parses_and_shares_no_case_with_the_other_rosters(self):
+    def test_the_order_is_by_case_id_as_the_shell_sorts(self):
+        # `foo-bar` sorts before `foo` as a path (`-` before `/`) and after it
+        # as an id; both readers sort by id.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = write_tasks(pathlib.Path(tmp), {
+                "foo-bar": "id: foo-bar\nsuite: certification\n",
+                "foo": "id: foo\nsuite: certification\n",
+            })
+            self.assertEqual(eval_rosters.certification_cases(root), ["foo", "foo-bar"])
+
+    def test_the_text_read_agrees_with_the_yaml_read_on_every_task(self):
+        """The grammar rule: what the validator registers by YAML is what the
+        shell greps, on every task file in the tree, for both keys."""
+        for task in sorted(TASKS_DIR.glob("*/task.yaml")):
+            with self.subTest(case=task.parent.name):
+                text = task.read_text(encoding="utf-8")
+                doc = yaml.safe_load(text) or {}
+                self.assertEqual(
+                    doc.get("suite") == eval_rosters.CERTIFICATION_SUITE,
+                    eval_rosters.CERTIFICATION_SUITE_LINE_RE.search(text) is not None,
+                    "the suite key is written in a spelling the lane does not read",
+                )
+                self.assertEqual(
+                    doc.get(eval_rosters.CERTIFICATION_PART_KEY, eval_rosters.CERTIFICATION_DEFAULT_PART),
+                    eval_rosters.certification_part(text),
+                    "the part key is written in a spelling the lane does not read",
+                )
+
+    def test_the_real_tree_shares_no_case_with_the_other_rosters(self):
         certification = eval_rosters.certification_cases()
-        self.assertEqual(sorted(certification), sorted(set(certification)), "a case is listed once")
+        self.assertEqual(certification, sorted(set(certification)), "one entry per case, in id order")
         shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
         self.assertEqual(shared, set(), "a certification case runs on its lane only")
         self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
 
-    def test_every_certification_case_declares_its_suite(self):
-        self.assertEqual(cases_without_a_suite_line(eval_rosters.CERTIFICATION_CASES_FILE, TASKS_DIR), [])
-
-    def test_the_summary_counts_the_file(self):
+    def test_the_summary_counts_the_suite(self):
         got = eval_rosters.summary()
         self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
         self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
