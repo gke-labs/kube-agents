@@ -503,15 +503,18 @@ def apply(actions: list[Action], gh: ghcli.Gh, live: bool, pace_s: float = DEFAU
     for action in actions:
         if action.verb == SKIP and action.kind == KIND_OTHER:
             continue
-        print(describe(action, live, show_bodies))
         if not action.is_write() or not live:
+            print(describe(action, live, show_bodies))
             counts[(action.kind, action.verb)] = counts.get((action.kind, action.verb), 0) + 1
             if action.verb == EDIT:
                 edited_issues.append(action.url)
             continue
+        # The limit is checked before the write is announced: a live line
+        # with no "would" says the write happened, so it must.
         if limit is not None and done >= limit:
             print(f"limit {limit} reached; the rest is left for the next run")
             break
+        print(describe(action, live, show_bodies))
         if done:
             sleep(pace_s)
         if action.verb == DELETE:

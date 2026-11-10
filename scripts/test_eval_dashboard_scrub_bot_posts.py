@@ -409,6 +409,18 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(patched["title"], "Nightly: case-red needs triage")
         self.assertIn("limit 2 reached", out)
 
+    def test_the_limit_is_checked_before_a_live_write_is_announced(self):
+        self.runner = FakeRunner(comments=[comment(i, gate_comment.MARKER + "\nred") for i in range(4)])
+        rc, out = self.run_main("--live", "--pace", "0", "--limit", "2")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.runner.writes()), 2)
+        before_limit = out.split("limit 2 reached; the rest is left for the next run\n")[0]
+        self.assertEqual([line for line in before_limit.splitlines() if line.startswith("delete ")],
+                         ["delete smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1#issuecomment-0",
+                          "delete smoke-gate comment https://github.com/gke-labs/kube-agents/issues/1#issuecomment-1"],
+                         "exactly the two writes sent are announced; the third is not claimed")
+        self.assertIn("    2  delete smoke-gate comment", out)
+
     def test_a_failed_write_is_counted_as_failed_and_three_in_a_row_stop_the_run(self):
         class Refusing(FakeRunner):
             def __call__(self, argv, input=None, **kwargs):
