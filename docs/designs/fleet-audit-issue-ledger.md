@@ -948,9 +948,11 @@ files that name any Config Connector group (`every_kind`), so every kind is inde
 (`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
 `Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
 with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
-index, so the snapshot and each clone are read once. When exactly one file declares the object, the
-paragraph keeps the first sentence "**Config Connector is not applying this file.**" and names that
-file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
+index, so the snapshot and each clone are read once. The fix's file is not the declaration, so the
+paragraph does not say "this file": when exactly one file declares the object, its first sentence
+names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`, or
+"`<path>` in the repository `<repo>`" for a declaration in a context repository).
+Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
 says that more than one file declares the object, or only that the audit names no declaration file
 for it. It never says that no file declares the object: the index skips a file it cannot parse (a
 template, for example), so no search proves an absence. A snapshot that cannot be taken is a
@@ -960,7 +962,12 @@ two declarations. It keeps each other file that declares the same object, whole,
 `KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
 ambiguous. A `gcloud` fix's note is its command, so
 its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
-strip-and-rewrite pattern covers both first sentences.
+strip-and-rewrite pattern covers every form: an exact first sentence (`KCC_STALLED_NOTE_PATTERN`)
+followed by " When the audit ran, Config Connector reported " (`KCC_STALLED_CONTINUATION`), which
+every paragraph `finish` writes goes on with. A worker sentence that only starts the same way stays.
+An earlier release wrote "this file.**" and then "The declaration is `<path>`." for a fix of another
+file. A previous ledger can hold that form, and the carry copies it, so the pattern also accepts
+that sentence (`KCC_STALLED_OLD_DECLARATION_SENTENCE`) before the continuation.
 
 The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
 anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
@@ -974,12 +981,13 @@ The note fits the note cap through `_fit_route_notes`, the route-note pass's fit
 own text is cut, never inside a code block, and the text `finish` wrote stays whole (the Kustomize
 note's own text, the closing text of `degrade_missing_remediations`, the note of
 `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
-goes after the route notes, and one that would push out the reconciler note does not fit. The
+goes after the route notes, and a step that would push out any route note already on the note (a
+location note or the reconciler note) does not fit. The
 Kustomize note's copied file can only become shorter by whole lines, as below. When the
 whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
 when even that core does not fit beside the text `finish` wrote and the note carries a Kustomize
-copied file, that block is made shorter by whole lines, with its fences closed, as
-`_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
+copied file, that block is made shorter by whole lines, with its fences closed, to make room for
+the core and every route note, as `_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
 past the cap, and the log warns that the renderer cuts its end. A cut keeps the whole worker note in
 `uncut_note`, as the route-note pass does, so the carry puts it back once the stall is gone. The
 route-note pass removes a copy of either paragraph from the worker's note before it keeps that note
