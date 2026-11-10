@@ -50,16 +50,22 @@ var (
 	pgpassEntryPattern = regexp.MustCompile(`(?:^|[\s"'\x60=(])(\*|\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9_.-]+):(?:\*|[0-9]{1,5}):((?:[A-Za-z0-9_.$*-]|\\.)+):((?:[A-Za-z0-9_.$*-]|\\.)+):((?:[^\s"'\x60\\]|\\.)+)`)
 	// The host field of an RFC 3339 timestamp, which a time range in an
 	// answer (2026-10-28T03:56:05Z-03:59:15Z) puts where a host would be.
-	timestampHostPattern     = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}$`)
-	cliUserPassPattern       = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+)?)(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern   = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliSpacedPassPattern     = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliLDAPPassPattern       = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliPassphraseArgPattern  = regexp.MustCompile(`(?i)(\s-pass(?:in|out|word)?[ \t]+pass:)([^\s"';|&]+)`)
-	cliLongSecretFlagPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	timestampHostPattern    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}$`)
+	cliUserPassPattern      = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+)?)(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
+	cliAttachedPassPattern  = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliSpacedPassPattern    = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliLDAPPassPattern      = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliPassphraseArgPattern = regexp.MustCompile(`(?i)(\s-pass(?:in|out|word)?[ \t]+pass:)([^\s"';|&]+)`)
+	// A flag's unquoted value never starts with a dash, so a flag with no
+	// value of its own does not take the next flag as its value and hide
+	// that flag's; a value after = or : that does start with one is read
+	// by the Dashed patterns, which take no spaced value.
+	cliLongSecretFlagPattern       = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliLongSecretFlagDashedPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=))(-[^\s"';|&]*)`)
 	// A single-dash long flag (-password x, -Password x, -token=x), the
 	// spelling Go's flag package, Java tools and PowerShell take.
-	cliSingleDashSecretFlagPattern = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliSingleDashSecretFlagPattern       = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliSingleDashSecretFlagDashedPattern = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:))(-[^\s"';|&]*)`)
 	// A flag and its value as separate items of an argument list: JSON or
 	// Python strings ("--db-password", "x") or YAML items (- --db-password
 	// then - x on the next line), as a container's args carry them. A value
@@ -1520,7 +1526,9 @@ func scrubCLISecretFlags(s string, sink secretSink) string {
 	// A flag's value is handed to sink only under a name that names a
 	// credential outright.
 	s = redactNamedSubmatch(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink)
+	s = redactNamedSubmatch(cliLongSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
 	s = redactNamedSubmatch(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink)
+	s = redactNamedSubmatch(cliSingleDashSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
 	argListValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
 	}

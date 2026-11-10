@@ -563,3 +563,23 @@ func TestScrubInlineSecretsTableHeaderWithADigit(t *testing.T) {
 		}
 	}
 }
+
+// A valueless flag just before a credential flag does not take the
+// credential flag as its value, in the long-flag, single-dash, spaced -p/-a
+// and LDAP -w rules; a value after = may still start with a dash.
+func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"app --verbose --password synthetic-pass-0001", "app --verbose --password [redacted]"},
+		{"curl --silent --token synthetic-token-0001 https://api.example.test", "curl --silent --token [redacted] https://api.example.test"},
+		{"java -server -password synthetic-pass-0001", "java -server -password [redacted]"},
+		{"mysql -h db -A -p synthetic-pass-0001", "mysql -h db -A -p [redacted]"},
+		{"ldapsearch -x -W -w synthetic-pass-0001", "ldapsearch -x -W -w [redacted]"},
+		{"app --password=-synthetic-pass-0001", "app --password=[redacted]"},
+		{"app -password=-synthetic-pass-0001", "app -password=[redacted]"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
