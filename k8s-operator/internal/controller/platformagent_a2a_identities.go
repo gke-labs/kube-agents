@@ -166,6 +166,38 @@ type a2aIdentity struct {
 // space and watch every capability as it is minted.
 var capDenyPublish, capDenySubscribe = a2aCapBucketReadDeny()
 
+// a2aTasksFixedDurables are the TASKS durables whose name and filter are
+// fixed, which the provision Job pre-creates (#4173): the gateway's relay
+// and the bridge's intake. Their readers bind to them and create nothing.
+func a2aTasksFixedDurables() []string {
+	return []string{a2aGatewayRelayDurable, a2aBridgeDurable()}
+}
+
+// a2aTasksFixedDurableDenyPublish keeps a principal that may create
+// consumers on TASKS from creating, updating or deleting the pre-created
+// durables. A consumer name is one subject token, so each subject names the
+// durable exactly: the create-or-update form with and without its filter
+// token, the older durable-create form, and delete.
+func a2aTasksFixedDurableDenyPublish() []string {
+	var out []string
+	for _, name := range a2aTasksFixedDurables() {
+		out = append(out,
+			"$JS.API.CONSUMER.CREATE."+a2aTasksStream+"."+name,
+			"$JS.API.CONSUMER.CREATE."+a2aTasksStream+"."+name+".>",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+a2aTasksStream+"."+name,
+			"$JS.API.CONSUMER.DELETE."+a2aTasksStream+"."+name,
+		)
+	}
+	return out
+}
+
+// withTasksFixedDurableDeny is base plus a2aTasksFixedDurableDenyPublish, in
+// a new slice, so a shared base (capDenyPublish) is never written through.
+func withTasksFixedDurableDeny(base []string) []string {
+	out := append([]string(nil), base...)
+	return append(out, a2aTasksFixedDurableDenyPublish()...)
+}
+
 func a2aCapBucketReadDeny() (publish, subscribe []string) {
 	stream := "KV_" + a2aCapBucket
 	return []string{
@@ -311,6 +343,25 @@ const (
 // TestBridgeJetStreamGrantOnARealServer's refused table carries the events
 // publish for an addressee this grant does not name.
 const a2aBridgeAddressee = "platform"
+
+// The TASKS durables the provision Job pre-creates (#4173), as their readers'
+// code spells them. The gateway's event relay (a2a/gateway/gateway.go,
+// relayDurable) binds the two filter subjects together since the supervisor
+// split, holding up to relayMaxAckPending (a2a/gateway/relay.go) unrendered;
+// the bridge's intake (a2a/hermes-bridge/bridge.go, Run) reads its
+// addressee's input. TestTheFixedDurablesMatchTheirReaders holds both
+// against the a2a sources.
+const (
+	a2aGatewayRelayDurable       = "gateway-relay"
+	a2aGatewayEventsFilter       = "a2a.tasks.*.*.events"
+	a2aGatewaySupervisorFilter   = "a2a.tasks.*.*.supervisor"
+	a2aGatewayRelayMaxAckPending = 8192
+)
+
+// a2aBridgeDurable is the bridge's intake durable, and a2aBridgeIntakeFilter
+// its filter: its addressee's input, every task.
+func a2aBridgeDurable() string      { return "bridge-" + a2aBridgeAddressee }
+func a2aBridgeIntakeFilter() string { return "a2a.tasks." + a2aBridgeAddressee + ".*.in" }
 
 // a2aProfileSubmitSubjects is every AgentProfile's submission subject,
 // a2a.submit.<profile>.<tier>.<kind>.<task> (lib.TaskSubmitSubject), on the
@@ -614,8 +665,10 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// a widening of its JetStream grants is the single most likely way
 		// for read on the store to arrive by accident. Pinned by
 		// TestGatewayHoldsNoWholesaleJetStreamAPI so that "it subtracts
-		// nothing" cannot become the argument for deleting it.
-		denyPublish:   capDenyPublish,
+		// nothing" cannot become the argument for deleting it. The second
+		// half keeps it off the TASKS durables the provision Job pre-creates
+		// (#4173), its own relay included: it binds that one.
+		denyPublish:   withTasksFixedDurableDeny(capDenyPublish),
 		denySubscribe: capDenySubscribe,
 	}
 }
@@ -648,8 +701,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 // starter topics.
 //
 // Nothing on the task plane — a provisioner that can publish tasks is a
-// provisioner that can impersonate the fabric. No ack grant at all: it creates
-// no consumers, so provisioning is $JS.API requests and the starter topics are
+// provisioner that can impersonate the fabric. No ack grant at all: the only
+// consumers it creates are the two fixed TASKS durables (#4173), which it never
+// reads from, so provisioning is $JS.API requests and the starter topics are
 // publishes, and nothing here ever acks.
 func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	return a2aIdentity{
@@ -668,9 +722,11 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
 		//
-		// Notably absent: STREAM.DELETE, STREAM.PURGE and the whole
-		// CONSUMER surface. A provisioner that can delete what it created
-		// is a provisioner that can destroy the audit substrate.
+		// Notably absent: STREAM.DELETE, STREAM.PURGE and the CONSUMER
+		// surface beyond the two TASKS durables it pre-creates (#4173),
+		// which it may read and create but not delete. A provisioner that
+		// can delete what it created is a provisioner that can destroy the
+		// audit substrate.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
 			"a2a.topics.agent.platform.topology-skew",
@@ -712,6 +768,17 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
 			"$JS.API.STREAM.INFO.PROFILE_SUBMITS",
 			"$JS.API.STREAM.INFO.DISPATCH_STOPS",
+			// The two TASKS durables it makes (#4173), as natscli 0.1.5's
+			// consumer add asks for them: INFO, then CREATE with the filter
+			// token for one filter and without it for two. CREATE is
+			// create-or-update, which is how the Job brings a durable an older
+			// reader made to its settings. No delete, and no listing.
+			"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + a2aGatewayRelayDurable + ".>",
+			"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
+			"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee + ".>",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{
@@ -1006,8 +1073,10 @@ func bridgeIdentity() a2aIdentity {
 		// bucket and the pair denies nothing today. It is here for the next
 		// widening: see a2aCapBucketReadDeny, and the deny is pinned by
 		// TestBridgeHoldsNoWholesaleJetStreamAPI so that "it subtracts
-		// nothing" cannot become the argument for deleting it.
-		denyPublish:   capDenyPublish,
+		// nothing" cannot become the argument for deleting it. The second
+		// half keeps it off the TASKS durables the provision Job pre-creates
+		// (#4173), its own intake included: it binds that one.
+		denyPublish:   withTasksFixedDurableDeny(capDenyPublish),
 		denySubscribe: capDenySubscribe,
 	}
 }
@@ -1155,6 +1224,8 @@ func webIdentity() a2aIdentity {
 		// (`a2a.stop.>`) are no browser's either: each names a task being
 		// cancelled.
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 
@@ -1231,6 +1302,8 @@ func consoleIdentity() a2aIdentity {
 		// queue group and swallow a share of every verify request. This
 		// password is handed to a browser too (console.go's /config.json).
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 
@@ -1279,6 +1352,8 @@ func consoleMCPIdentity() a2aIdentity {
 			"_INBOX." + a2aConsoleMCPUser + ".>",
 		},
 		denySubscribe: a2aBrowserSubscribeDeny,
+		// Off the TASKS durables the provision Job pre-creates (#4173).
+		denyPublish: withTasksFixedDurableDeny(nil),
 	}
 }
 

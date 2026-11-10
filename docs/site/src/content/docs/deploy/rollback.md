@@ -262,9 +262,16 @@ harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
 skill).
 
-The platform profile's persona files, governance and hindsight configuration are overwritten with
-`N-1`'s copies too, though a governance file only `N` shipped stays, because that overlay prunes
-nothing. The default profile's persona files and the shared scripts are overwritten the same way.
+The platform profile's persona files, governance, hindsight configuration and plugin directories
+are overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
+that overlay prunes nothing. The default profile's persona files and the shared scripts are
+overwritten the same way.
+Its plugin directories depend on `N-1`. A release after `0.27.0` cut from `main` overwrites every
+plugin directory the image ships, except `hermes_otel`, which follows the `cp -ru` rule below. A
+plugin or module only `N` shipped stays, and a plugin's own state files survive, because that copy
+prunes nothing. Releases `0.21.0` to `0.27.0` overwrite `bootstrap_onboarding` only, and `0.20.0`
+and earlier overwrite none, so with those every other default-profile plugin directory follows the
+`cp -ru` rule.
 
 Cron definitions are merged per job id: `N-1`'s image wins every key
 it ships, the scheduler's own state stays, and a job only `N` shipped keeps its entry and keeps
