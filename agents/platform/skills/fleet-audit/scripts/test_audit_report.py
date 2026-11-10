@@ -7813,6 +7813,10 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
             withheld = audit_report.withhold_unsearched_postures(doc, None)
         self.assertEqual(sorted(f["object"] for f in withheld), ["NodePool/regional-web", "NodePool/zonal-batch"])
         self.assertEqual([f["object"] for f in doc["findings"]], ["Quota/us-east1:CPUS"])
+        # The coverage-gap sentence says why a fault sits among the withheld
+        # postures, as it does for the hpa dangling-target fault.
+        gap = audit_report._declared_intent_gap(doc)
+        self.assertIn("single-zone-nodepool at its autoscaling ceiling shares its slug", gap)
 
     def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
         doc = self._doc([])
@@ -7907,6 +7911,65 @@ class TestStockoutDeclaredShapes(HarnessTestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch")])
         self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+
+    def test_a_hand_written_declared_entry_for_a_pool_at_its_ceiling_is_refused_against_the_manifest(self):
+        # A `declared[]` entry carries no excerpt, so the validator cannot tell
+        # the arms apart and lets the entry through; its identity would then
+        # enter `known` and keep the collector's at-ceiling candidate off the
+        # ledger. The manifest is where the entry meets the arm: exit 2.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [full, locked]}]}
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        doc = audit_report.validate_findings(doc, self.STOCKOUT)
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.reject_declared_ceiling_pools(doc, manifest)
+        self.assertIn("declared[]", str(cm.exception))
+        self.assertIn("NodePool/zonal-full", str(cm.exception))
+        self.assertIn(audit_report.CEILING_ARM_MARK, str(cm.exception))
+        # The same entry for the zone-locked pool stands, and a run without a
+        # manifest has nothing to hold the entry to.
+        doc["declared"][0]["object"] = "NodePool/zonal-batch"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, manifest))
+        doc["declared"][0]["object"] = "NodePool/zonal-full"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, None))
+
+    def test_remediate_reads_the_collectors_excerpt_before_judging_the_arm(self):
+        # The worker reworded the excerpt of a declared zone-locked pool.
+        # `finish` adopts the collector's wording before the join and lists the
+        # pool under Declared intent; `remediate` reads the same wording and
+        # refuses the id as declared, instead of opening a pull request for a
+        # posture the ledger calls declared.
+        workspace = self.gitops_root / self.STOCKOUT / "acme__fleet"
+        (workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(workspace)
+        self.patch_attr("repo_root", lambda: workspace)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_run_record(self.STOCKOUT, "acme/fleet", [], searched=[f"acme/fleet@{SEARCH_SHA}"], sources=[])
+        audit_report.write_declarations(self.STOCKOUT, "acme/fleet", [self._declaration("NodePool/zonal-batch")])
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "pool pinned to one zone, autoscaling on, nothing else to fall back to")
+        doc = self._doc([prose])
+        fid = doc["findings"][0]["id"]
+        candidate = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED, "command": "gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json"}
+        manifest_path = self.tmp_path / "manifest_stockout.json"
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate]}]}), encoding="utf-8")
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(doc), "--manifest-file", str(manifest_path), "--finding", fid, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("a repository declaration covers this posture", self.err)
+        self.assertNotIn("opens neither 3.9 arm", self.err)
+        # Through the same call site: a `declared[]` entry the worker wrote for
+        # a pool the manifest reports at its ceiling is refused before the join.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}", "command": candidate["command"]}
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate, full]}]}), encoding="utf-8")
+        written = self._doc([self._quota_finding()])
+        written["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        quota_id = written["findings"][0]["id"]
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(written), "--manifest-file", str(manifest_path), "--finding", quota_id, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared[]: NodePool/zonal-full", self.err)
+        self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):

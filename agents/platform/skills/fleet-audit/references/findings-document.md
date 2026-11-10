@@ -365,7 +365,10 @@ What the shape enforces:
 - **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
   set in `AUDITS`, four for obtainability, two for compliance, six for the patch stream, eight for the waste audit and one for the stockout audit (3.9's zone-locked arm; the at-ceiling arm shares the slug and the join leaves it a finding), and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
-  document that lists it under `declared` publishes nothing.
+  document that lists it under `declared` publishes nothing. One fault the slug alone cannot
+  name is held to the manifest instead: a `single-zone-nodepool` entry written for a pool the
+  collector reports at its autoscaling ceiling exits 2 in `finish` and `remediate` when a manifest
+  is given, since the entry carries no excerpt to tell the arms apart.
 
 ### `declared_intent_searched`
 
@@ -394,8 +397,9 @@ What `finish` does with it:
   declaration covered. A run on which none of the stream's declarable checks ran anywhere owes nothing.
 - **Anything less is no search, and the postures are withheld.** A union of the worker's list and
   `start`'s that misses a repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
-  declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
-  shares its slug with the `min == max` posture and nothing on this side tells them apart, and adds
+  declarable out of the document, the dangling-target `hpa-cannot-scale` fault and the at-ceiling
+  `single-zone-nodepool` arm included because each shares its slug with a posture and nothing on
+  this side tells them apart, and adds
   one `coverage_gaps` sentence naming each withheld entry and the repositories not searched. The
   faults publish, the allow-all `NetworkPolicy/<name>` shape of `netpol-missing` among them, since its
   object tells it apart; `declared[]` entries publish.

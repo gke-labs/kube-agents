@@ -8613,6 +8613,11 @@ def _declared_intent_gap(data: dict) -> str | None:
             f"; a dangling-target {DUAL_SHAPE_CHECK} shares its slug with the "
             "min == max posture and is held back with the postures"
         )
+    if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+        tail += (
+            f"; a {ZONE_ARM_CHECK} at its autoscaling ceiling shares its slug with the "
+            "zone-locked posture and is held back with the postures"
+        )
     return f"declared intent: {what} — {where}{tail}"
 
 
@@ -9213,6 +9218,43 @@ def _is_zone_locked_arm(item: dict) -> bool:
     finding publishes.
     """
     return _item_excerpt(item).startswith(ZONE_LOCKED_ARM_MARK) and not _is_ceiling_arm(item)
+
+
+def reject_declared_ceiling_pools(data: dict, manifest: dict | None) -> None:
+    """Exit 2 on a worker-written `declared[]` entry for a pool the collector reports at its ceiling.
+
+    The validator holds a `declared[]` entry to the slug and the object kind
+    and no further: the entry carries no excerpt, so nothing on it says which
+    arm of 3.9 the worker moved. The manifest does. A candidate for the same
+    identity whose excerpt carries the at-ceiling clause is the fault, and a
+    declared fault exits 2 and publishes nothing (SOP §5) — the same door
+    `apply_declarations` shuts on a finding, held here for the entry the worker
+    wrote by hand, which would otherwise take the candidate's identity into
+    `known` and keep it off the ledger. Run with the manifest before the join,
+    by `finish` and `remediate` alike; without a manifest there is nothing to
+    hold the entry to, as for every other manifest cross-check.
+    """
+    if manifest is None:
+        return
+    declared_pools = {
+        derive_finding_id(entry): entry
+        for entry in data.get("declared") or []
+        if isinstance(entry, dict) and str(entry.get("check", "")) == ZONE_ARM_CHECK
+    }
+    if not declared_pools:
+        return
+    for entry, candidate in _candidates(manifest):
+        if str(candidate.get("check", "")) != ZONE_ARM_CHECK or not _is_ceiling_arm(candidate):
+            continue
+        own = declared_pools.get(_candidate_identity(entry, candidate))
+        if own is None:
+            continue
+        raise ValidationError(
+            f"declared[]: {own.get('object', '')} on {own.get('cluster', '')} is at its autoscaling "
+            f"ceiling in the collector's manifest (`{CEILING_ARM_MARK}` in its excerpt), and that arm "
+            f"of {ZONE_ARM_CHECK} is a fault no declaration excuses (SOP §4a); a declaration covers the "
+            "zone-locked arm alone. Write the pool under `findings` and let `finish` judge the note."
+        )
 
 
 def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) -> dict | None:
@@ -22741,6 +22783,13 @@ def handle_remediate(args: argparse.Namespace) -> None:
             "wrote; an empty path is not the same as running without one."
         )
     manifest = load_manifest(manifest_file, audit_id) if manifest_file is not None else None
+    if manifest is not None:
+        # The same order as `finish`: the join reads the excerpt for 3.9's arm,
+        # so it must read the collector's wording, not the worker's, and a
+        # hand-written `declared[]` entry for a pool at its ceiling is refused
+        # here as it is there.
+        adopt_collector_evidence(data["findings"], manifest)
+        reject_declared_ceiling_pools(data, manifest)
     declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
@@ -24952,6 +25001,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 f"evidence: adopted the collector's command and excerpt for "
                 f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
             )
+        # Before the join: a hand-written `declared[]` entry for a pool the
+        # collector reports at its ceiling is a declared fault, and exits 2.
+        reject_declared_ceiling_pools(data, manifest)
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
