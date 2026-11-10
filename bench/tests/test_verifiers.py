@@ -10737,6 +10737,29 @@ def test_ledger_read_refused_for_permission_leaves_the_error_plain(token, github
     assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
 
 
+def _two_ticket_reply():
+    return f"{_TICKET_REPLY}\nAlso https://github.com/gke-agentic/{_TICKET_REPO}/issues/709"
+
+
+@pytest.mark.parametrize("second", ["issue", "comments"])
+def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_answer(
+    token, gitops_repo, github, second
+):
+    """#708 is rejected while its comment read answered 503; #709 then errors
+    on a 200 that is not the shape asked for, which no failed read explains."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    if second == "issue":
+        github.routes[_ticket_api(709)] = (200, ["not", "an", "object"])
+    else:
+        github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
+        github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
 def test_issue_state_missing_token_is_an_error_naming_the_variable(monkeypatch, github):
     monkeypatch.delenv("BENCH_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)

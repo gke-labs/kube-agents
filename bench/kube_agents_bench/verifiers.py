@@ -4697,6 +4697,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code != 200 or not isinstance(payload, dict):
+                if status_code == 200:
+                    _note_forge_read(False, "answered 200 with a body that is not an object")
                 return done(
                     False,
                     f"unexpected {label} response {status_code} for "
@@ -5108,6 +5110,8 @@ class ForgeIssueStateVerifier(BaseVerifier):
                     status="error",
                 )
             if status_code != 200 or not isinstance(payload, dict):
+                if status_code == 200:
+                    _note_forge_read(False, "answered 200 with a body that is not an object")
                 return done(
                     False,
                     f"unexpected {label} response {status_code} for {slug}; "
@@ -5137,6 +5141,7 @@ class ForgeIssueStateVerifier(BaseVerifier):
             comments: int | None = None
             if self.min_comments:
                 unread: str | None = None
+                reads_before = len(_forge_unavailable.get() or [])
                 try:
                     listed = _issue_comments(
                         url, token, budget, forge, window_start, _ISSUE_COMMENT_PAGES
@@ -5145,6 +5150,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
                     listed, unread = None, f"could not read the comments of {slug}: {exc}; "
                 if listed is None and unread is None:
                     unread = f"the comments of {slug} could not be read ({label} did not answer 200 with a list), so "
+                    if len(_forge_unavailable.get() or []) == reads_before:
+                        # A 200 that is not a list: no failed read explains it.
+                        _note_forge_read(False, "answered 200 with a body that is not a list")
                 # An issue already rejected stays a fail: comments it could not
                 # read change no verdict, and must not make it an error.
                 if unread is not None and not faults:
