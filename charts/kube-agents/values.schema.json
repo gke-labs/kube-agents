@@ -1079,6 +1079,30 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "admission": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "memoryBudgetMiB": {
+                      "type": "integer",
+                      "minimum": 512,
+                      "maximum": 65536
+                    },
+                    "workerRssCapMiB": {
+                      "type": "integer",
+                      "minimum": 256,
+                      "maximum": 65536
+                    },
+                    "queueBoundSeconds": {
+                      "type": "integer",
+                      "minimum": 10,
+                      "maximum": 3600
+                    },
+                    "failClosed": {
+                      "type": "boolean"
+                    }
+                  }
+                },
                 "profiles": {
                   "type": "object",
                   "additionalProperties": false,

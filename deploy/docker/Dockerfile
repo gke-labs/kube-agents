@@ -1307,6 +1307,24 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # the latency block further down. See deploy/docker/patches/kanban_priority.py.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
+#
+# kanban_admission rides this step's COPY and RUN, after the scheduling edits
+# and before the fanout reaper's (which anchors on the same reclaim-phase line
+# and inserts after it): the dispatcher admits workers by the pod's memory
+# budget instead of /proc/meminfo, which under GKE Sandbox reports the sandbox's
+# virtual memory and let the kubelet evict the pod three times at 3.1 to 3.5 GiB
+# against a 2 GiB request (#4760). The tick classifies the container's cgroup v1
+# usage (v2, then its own process tree) against kanban.admission.memory_budget_mib
+# with upstream's own thresholds, fails closed when no counter is readable, stops
+# a worker whose process tree is over worker_rss_cap_mib, and refuses a ready
+# card that waited past queue_bound_seconds for memory or a slot; each refusal
+# blocks the card with the new kind "capacity" and a reason the front door can
+# relay. The module is installed with `install -m 0644` inside the RUN, as
+# kanban_priority.py is, because the agent-base -> platform chain is one layer
+# under the budget scripts/check_image_layers.py enforces. The applier is a
+# no-op on a tree that already carries it. verify_kanban_admission.py drives
+# the applied engine through dispatch_once, on a fixture and on this tree.
+# See the module docstring in deploy/docker/patches/kanban_admission.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
 # kanban_scheduling.py and kanban_children_settled.py are here as the applier's
 # import-time cross-check reads them, not to be installed from here. The former
@@ -1317,6 +1335,9 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/kanban_scheduling.py \
      deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/kanban_priority.py \
+     deploy/docker/patches/kanban_admission.py \
+     deploy/docker/patches/apply_kanban_admission.py \
+     deploy/docker/patches/verify_kanban_admission.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
 RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes_cli/kanban_priority.py && \
@@ -1341,7 +1362,18 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
     test "$(grep -c '_kanban_record_saturation(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c '_kanban_note_waiting(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_priority import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    install -m 0644 /tmp/kanban-scheduling/kanban_admission.py /opt/hermes/hermes_cli/kanban_admission.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_admission.py /opt/hermes && \
+    grep -qF "pressure = _kanban_admission.pressure_level_for_tick(result)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -qF "spawn_budget = _kanban_admission.cap_spawn_budget(result, spawn_budget)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -qF "result.auto_blocked.extend(_kanban_admission.enforce_worker_rss_caps(conn))" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c '_kanban_admission.refuse_overdue_ready(' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "2" && \
+    test "$(grep -c 'from hermes_cli import kanban_admission as _kanban_admission' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    grep -qF '"transient", "capacity"}' /opt/hermes/hermes_cli/kanban_db.py && \
+    test "$(grep -c '    pressure = _memory_pressure_level()' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "0" && \
+    test "$(grep -c '    result.timed_out = enforce_max_runtime(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_admission.py && \
     rm -rf /tmp/kanban-scheduling
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
