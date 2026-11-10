@@ -7,8 +7,8 @@ cluster (`-A`, or a cluster-scoped kind) is charged the peak memory that the cos
 entry, else the sum of its kinds' entries, else the tier's `other` figure. Everything
 else (other verbs, one namespace, named objects, watches, `--raw`) runs unchanged; the
 memory guard bounds it. Nothing is queried or estimated at run time: the table is
-written ahead of time by `scripts/dev/profile_kubectl_costs.py`, which runs each command
-alone against the tier's reference cluster (`.agents/skills/update-kubectl-cost-table`).
+written ahead of time by the cost profiler, which runs each command alone against the
+tier's reference cluster; `.agents/skills/update-kubectl-cost-table` gives the procedure.
 A command charged `other` is recorded in the event log, so the next profile run can add it.
 
 The charge is booked as a reservation: a file named by this process's pid in a directory
