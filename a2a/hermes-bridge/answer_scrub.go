@@ -464,26 +464,36 @@ func (c *toolResultCollector) secretObject(m map[string]any) {
 // text reads one string of a result: as JSON when it is JSON text (read
 // whole, or scanned when cut short), as YAML when it holds a kind: Secret
 // line, and through the shape rules within the scan budget. JSON that
-// parses is read as a structure only, so the shape rules see its strings
-// unescaped.
+// parses is read as a structure, so the shape rules see each of its
+// strings unescaped, and then as text too, so the rules that need a key
+// and its value together see pairs that span fields or items (an env
+// entry's name and value, a flag and its value in an args list, a header
+// list's name and value).
 func (c *toolResultCollector) text(t string, depth int) {
 	if t == "" {
 		return
 	}
+	scan := capBytes(t, toolResultScanCap)
 	if trimmed := strings.TrimSpace(capBytes(t, toolResultParseCap)); depth < toolResultNestDepth && (strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")) {
 		var v any
 		if json.Unmarshal([]byte(trimmed), &v) == nil {
 			c.value(v, depth+1)
+			c.shapeScan(scan)
 			return
 		}
 		if strings.Contains(trimmed, "Secret") {
 			c.jsonSecretScan(trimmed)
 		}
 	}
-	scan := capBytes(t, toolResultScanCap)
 	if strings.Contains(scan, "Secret") && yamlAnySecretKindPattern.MatchString(scan) {
 		c.yamlSecrets(scan)
 	}
+	c.shapeScan(scan)
+}
+
+// shapeScan runs the shape rules over scan, within what is left of the
+// result's scan budget, handing what they catch to shapeCaught.
+func (c *toolResultCollector) shapeScan(scan string) {
 	if c.budget <= 0 {
 		return
 	}

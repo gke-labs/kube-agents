@@ -37,7 +37,7 @@ var (
 	authHeaderKVLeadPattern     = regexp.MustCompile(`(?i)authorization\\?["']?[ \t]*[:=][ \t]*\\?["']?[ \t]*$`)
 	// "Authorization", "<scheme> <credential>": a header setter call or a
 	// header pair in code, the credential redacted whatever its shape.
-	authHeaderPairPattern = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\\?["'][ \t]*,[ \t]*\\?["'](?:(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+)?([^"'\\\r\n]+)`)
+	authHeaderPairPattern = regexp.MustCompile(`(?i)\b(?:proxy-)?authorization\\?["'][ \t]*,[ \t]*(?:\r?\n[ \t]*)?\\?["'](?:(?:Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|NTLM|OAuth|Hawk|AWS4-HMAC-SHA256|Mutual)[ \t]+)?([^"'\\\r\n]+)`)
 	// A URL's password is the userinfo by shape: everything between
 	// scheme://user: and the @ a host follows, whatever bytes it holds (a
 	// sub-delimiter, a path character, a raw @), to the last such @ in the
@@ -67,11 +67,12 @@ var (
 	cliSingleDashSecretFlagPattern       = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
 	cliSingleDashSecretFlagDashedPattern = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:))(-[^\s"';|&]*)`)
 	// A flag and its value as separate items of an argument list: JSON or
-	// Python strings ("--db-password", "x") or YAML items (- --db-password
+	// Python strings ("--db-password", "x", on one line or on two as
+	// kubectl's -o json prints a list) or YAML items (- --db-password
 	// then - x on the next line), as a container's args carry them. A value
 	// never starts with a dash, so a flag with no value of its own does not
 	// take the next flag as its value and hide that flag's.
-	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*["']((?:[^-"'\r\n][^"'\r\n]*)?)["']`)
+	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']((?:[^-"'\r\n][^"'\r\n]*)?)["']`)
 	cliArgListYAMLPattern = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+["']?--?([A-Za-z][A-Za-z0-9_.-]*)["']?[ \t]*\r?\n[ \t]*-[ \t]+["']?([^-"'\r\n#\s](?:[^"'\r\n#]*[^"'\r\n#\s])?)`)
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the password in secret app-db is hunter2", "the

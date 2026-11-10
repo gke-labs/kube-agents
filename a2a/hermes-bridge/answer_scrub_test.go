@@ -660,6 +660,9 @@ func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 		}
 		return lines.String()
 	}
+	// The Secret's own result may add to the shape pool too (the shape
+	// rules read JSON text): the flood is measured from after it.
+	shapeFromSecret := len(s.shape.entries)
 	s.collectToolResult(terminalResult(t, flood(200)))
 	if !s.has(synthSecretPlain) || !s.has(b64(synthSecretPlain)) {
 		t.Fatal("shape-caught values evicted the Secret's value")
@@ -671,7 +674,7 @@ func TestSeenSecrets_EachPoolKeepsItsShare(t *testing.T) {
 	if !s.has(newest) || s.has(oldest) {
 		t.Errorf("shape pool: newest kept %v, oldest kept %v; want true, false", s.has(newest), s.has(oldest))
 	}
-	if n := len(s.shape.entries); n != seenShapeResultEntries {
+	if n := len(s.shape.entries) - shapeFromSecret; n != seenShapeResultEntries {
 		t.Errorf("shape pool holds %d, want one result's allowance %d", n, seenShapeResultEntries)
 	}
 
@@ -1020,6 +1023,46 @@ func TestSeenSecrets_APlaceholderShapedJSONCredentialIsTracked(t *testing.T) {
 	for _, v := range vals {
 		if !s.has(v) {
 			t.Errorf("the set does not track %q", v)
+		}
+	}
+}
+
+// A JSON tool result's credential structures that span several fields or
+// items (a Kubernetes env entry's name and value, a container's flag and
+// value args, a header list's name and value) are tracked from kubectl's
+// -o json as they are from -o yaml, so the answer's bare echo is redacted.
+func TestSeenSecrets_JSONResultsShapePairsAreTracked(t *testing.T) {
+	const envValue, argValue, headerValue = "harborlantern-synthetic", "harborstone-synthetic", "quietpasture-synthetic-hdr"
+	deploy, err := json.MarshalIndent(map[string]any{
+		"kind": "Deployment",
+		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{"containers": []any{map[string]any{
+			"name":    "app",
+			"env":     []any{map[string]any{"name": "DB_PASSWORD", "value": envValue}},
+			"args":    []any{"--verbose", "--db-password", argValue},
+			"command": []any{"curl", "-H", "Authorization", "x"},
+		}}}}},
+		"metadata": map[string]any{"annotations": map[string]any{"headers": "[\n  \"Authorization\",\n  \"" + headerValue + "\"\n]"}},
+	}, "", "    ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, string(deploy)))
+	for _, v := range []string{envValue, argValue, headerValue} {
+		if !s.has(v) {
+			t.Errorf("the set does not track %q from the JSON result", v)
+		}
+	}
+	if got := scrubAnswerText("The app connects with "+envValue+".", &s); got != "The app connects with [redacted]." {
+		t.Errorf("answer = %q, want the env value redacted", got)
+	}
+	// The list rules read a pair split over two lines, as -o json prints it.
+	for in, want := range map[string]string{
+		"\"args\": [\n    \"--db-password\",\n    \"" + synthSecretPlain + "\"\n]": "\"args\": [\n    \"--db-password\",\n    \"[redacted]\"\n]",
+		"[\n    \"Authorization\",\n    \"" + synthSecretPlain + "\"\n]":           "[\n    \"Authorization\",\n    \"[redacted]\"\n]",
+	} {
+		if got := scrubInlineSecrets(in); got != want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", in, got, want)
 		}
 	}
 }
