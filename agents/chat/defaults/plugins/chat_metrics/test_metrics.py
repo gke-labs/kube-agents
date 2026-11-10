@@ -123,6 +123,9 @@ class TurnErrorTest(unittest.TestCase):
 _DISPATCH_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failed_ticks\{board="((?:[^"\\]|\\.)*)",error="([^"]*)"\} (\d+)$', re.M)
 
 
+_AGE_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failing_seconds\{board="((?:[^"\\]|\\.)*)",error="([^"]*)"\} (\d+)$', re.M)
+
+
 class DispatcherFailedTicksTest(unittest.TestCase):
     """The dispatcher's failed-tick streak, by board: a failure adds one, a good
     tick drops the board's series."""
@@ -180,8 +183,55 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         registry.record_dispatch_tick("default", "OperationalError")
         self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
 
+    def test_the_streaks_age_renders_from_its_first_failure_and_grows(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += 125
+        registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += 30
+        self.assertEqual([("default", "OperationalError", "155")], _AGE_LINE.findall(registry.render()))
+
+    def test_the_age_stops_growing_a_grace_after_the_last_failure(self):
+        # Three quick failures, then the dispatcher stops ticking the board: its
+        # age stays below a poll until the stale window drops it.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(3):
+            registry.record_dispatch_tick("default", "OSError")
+            now[0] += 5
+        now[0] += 400
+        grace = int(10 + metrics.DISPATCH_FAILURE_AGE_GRACE_SECONDS)
+        self.assertEqual([("default", "OSError", str(grace))], _AGE_LINE.findall(registry.render()))
+        self.assertLess(grace, 300)
+
+    def test_a_locked_boards_age_keeps_up_with_its_slow_failures(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(3):
+            registry.record_dispatch_tick("default", "OperationalError")
+            now[0] += 125
+        self.assertEqual([("default", "OperationalError", "375")], _AGE_LINE.findall(registry.render()))
+
+    def test_a_good_tick_or_a_stale_restart_starts_the_age_again(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += 200
+        registry.record_dispatch_tick("default", "")
+        self.assertEqual([], _AGE_LINE.findall(registry.render()))
+        registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += 10
+        self.assertEqual([("default", "OperationalError", "10")], _AGE_LINE.findall(registry.render()))
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "0")], _AGE_LINE.findall(registry.render()))
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
     def test_an_idle_registry_renders_the_family_with_no_series(self):
         exposition = metrics.ChatMetrics().render()
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_failing_seconds gauge", exposition)
+        self.assertEqual([], _AGE_LINE.findall(exposition))
         self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
         self.assertEqual([], _DISPATCH_LINE.findall(exposition))
 

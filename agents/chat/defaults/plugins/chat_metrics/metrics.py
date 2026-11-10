@@ -130,6 +130,13 @@ HERMES_PLATFORM_LABELS = {
 KANBAN_DISPATCHER_FAILED_TICKS_METRIC = "kubeagents_kanban_dispatcher_failed_ticks"
 BOARD_LABEL = "board"
 ERROR_LABEL = "error"
+# Beside it, rendered for the same boards: how long each board's streak has
+# lasted, in whole seconds on the registry's monotonic clock, from its first
+# failure to the scrape. The operator sets KanbanDispatcherFailing by the
+# streak's age as well as its ticks (usage_counters_scrape.go's
+# kanbanDispatcherFailingSecondsSeries), so a locked board, whose ticks each
+# wait out the SQLite busy timeout, shows within about one poll.
+KANBAN_DISPATCHER_FAILING_SECONDS_METRIC = "kubeagents_kanban_dispatcher_failing_seconds"
 # A board whose last failure is older than this is dropped at render: the
 # dispatcher stopped ticking it (archived, quarantined as corrupt, or the
 # dispatcher paused), and no good tick will come to end its streak. A failing
@@ -137,6 +144,12 @@ ERROR_LABEL = "error"
 # DEFAULT_BUSY_TIMEOUT_MS) on a locked board, plus the interval, so the window is
 # five of those: a live streak is never this old.
 DISPATCH_FAILURE_STALE_SECONDS = 600.0
+# The streak's age stops growing this long after its last failure: two ticks on
+# a locked board (the 120 s busy timeout and the 5 s interval, twice). A board
+# that keeps failing renews it with each failure; one the dispatcher stopped
+# ticking (archived, quarantined, paused) cannot age into the condition on a
+# few early failures before the stale window drops it.
+DISPATCH_FAILURE_AGE_GRACE_SECONDS = 250.0
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 METRICS_PATH = "/metrics"
@@ -327,7 +340,8 @@ class ChatMetrics:
         self._sessions: dict[str, int] = {}
         self._errored: dict[str, int] = {}
         self._negative: dict[str, int] = {}
-        self._dispatch_failures: dict[str, tuple[int, str, float]] = {}
+        # board -> (failed ticks in a row, last error class, last failure, first failure)
+        self._dispatch_failures: dict[str, tuple[int, str, float, float]] = {}
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -358,11 +372,11 @@ class ChatMetrics:
                 self._dispatch_failures.pop(board, None)
                 return
             now = self._clock()
-            streak, _, at = self._dispatch_failures.get(board, (0, "", 0.0))
+            streak, _, at, began = self._dispatch_failures.get(board, (0, "", 0.0, now))
             if now - at > DISPATCH_FAILURE_STALE_SECONDS:
                 # A streak past the window ended unseen: render had not run to drop it.
-                streak = 0
-            self._dispatch_failures[board] = (streak + 1, error_class, now)
+                streak, began = 0, now
+            self._dispatch_failures[board] = (streak + 1, error_class, now, began)
 
     def record_negative_feedback(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
@@ -376,7 +390,7 @@ class ChatMetrics:
             errored = sorted(self._errored.items())
             negative = sorted(self._negative.items())
             now = self._clock()
-            for board in [b for b, (_, _, at) in self._dispatch_failures.items() if now - at > DISPATCH_FAILURE_STALE_SECONDS]:
+            for board in [b for b, (_, _, at, _) in self._dispatch_failures.items() if now - at > DISPATCH_FAILURE_STALE_SECONDS]:
                 del self._dispatch_failures[board]
             dispatch_failures = sorted(self._dispatch_failures.items())
         lines = [
@@ -426,8 +440,15 @@ class ChatMetrics:
             f"# HELP {KANBAN_DISPATCHER_FAILED_TICKS_METRIC} Consecutive kanban dispatcher ticks that failed on a board, with the class of the last failure; a good tick removes the board's series.",
             f"# TYPE {KANBAN_DISPATCHER_FAILED_TICKS_METRIC} gauge",
         ]
-        for board, (streak, error_class, _) in dispatch_failures:
+        for board, (streak, error_class, _, _) in dispatch_failures:
             lines.append(f'{KANBAN_DISPATCHER_FAILED_TICKS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}",{ERROR_LABEL}="{_label_value(error_class)}"}} {streak}')
+        lines += [
+            f"# HELP {KANBAN_DISPATCHER_FAILING_SECONDS_METRIC} Seconds since the first failure of each board's current kanban dispatcher streak, for the boards in {KANBAN_DISPATCHER_FAILED_TICKS_METRIC}.",
+            f"# TYPE {KANBAN_DISPATCHER_FAILING_SECONDS_METRIC} gauge",
+        ]
+        for board, (_, error_class, at, began) in dispatch_failures:
+            age = min(now, at + DISPATCH_FAILURE_AGE_GRACE_SECONDS) - began
+            lines.append(f'{KANBAN_DISPATCHER_FAILING_SECONDS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}",{ERROR_LABEL}="{_label_value(error_class)}"}} {int(max(0.0, age))}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
