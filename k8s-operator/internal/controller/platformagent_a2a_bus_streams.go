@@ -671,33 +671,48 @@ const (
 	busJobFailed
 )
 
-// provisionJob reads the provision Job the reconcile renders for agent, live.
-// Absent covers a Job the TTL removed or a re-run not yet created, both of
-// which the reconcile creates.
+// provisionJob reads agent's provision Jobs, live, and returns the newest with
+// its state; running when any is still running. The Jobs are found by the
+// provision labels and the CR's controller reference, not by the name the
+// reconcile renders: the name digests the spec, which reads the bus's server
+// count, and a CR read here has no in-memory resolution of that count
+// (resolveA2ABusReplicas), so a CRD that prunes status.busReplicas would name
+// a Job that doesn't exist. Absent covers a Job the TTL removed or a re-run
+// not yet created, both of which the reconcile creates.
 func (p *BusStreamPoller) provisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*batchv1.Job, busJobState, error) {
-	job := &batchv1.Job{}
-	name := buildA2AProvisionJob(agent).Name
-	if err := p.r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, job); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, busJobAbsent, nil
-		}
+	var jobs batchv1.JobList
+	if err := p.r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace),
+		client.MatchingLabels{a2aComponentLabel: "provision", labelPartOf: a2aPartOf}); err != nil {
 		return nil, busJobAbsent, err
 	}
-	if metav1.GetControllerOf(job) == nil || metav1.GetControllerOf(job).UID != agent.UID {
-		return nil, busJobAbsent, nil
-	}
-	for _, cond := range job.Status.Conditions {
-		if cond.Status != corev1.ConditionTrue {
+	var newest *batchv1.Job
+	newestState := busJobAbsent
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if owner := metav1.GetControllerOf(job); owner == nil || owner.UID != agent.UID || job.DeletionTimestamp != nil {
 			continue
 		}
-		switch cond.Type {
-		case batchv1.JobComplete:
-			return job, busJobComplete, nil
-		case batchv1.JobFailed:
-			return job, busJobFailed, nil
+		state := busJobRunning
+		for _, cond := range job.Status.Conditions {
+			if cond.Status != corev1.ConditionTrue {
+				continue
+			}
+			switch cond.Type {
+			case batchv1.JobComplete:
+				state = busJobComplete
+			case batchv1.JobFailed:
+				state = busJobFailed
+			}
+		}
+		if state == busJobRunning {
+			return job, busJobRunning, nil
+		}
+		if newest == nil || newest.CreationTimestamp.Before(&job.CreationTimestamp) ||
+			(newest.CreationTimestamp.Equal(&job.CreationTimestamp) && job.Name > newest.Name) {
+			newest, newestState = job, state
 		}
 	}
-	return job, busJobRunning, nil
+	return newest, newestState, nil
 }
 
 // busServers is the bus StatefulSet's server count, the API default of one

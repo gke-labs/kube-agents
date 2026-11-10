@@ -1020,3 +1020,35 @@ func TestABusWhoseCountTheStatusDoesNotRecordIsStillJudged(t *testing.T) {
 		t.Errorf("condition = %+v, want AllPresent on a one-server bus whose count the status does not record", c)
 	}
 }
+
+// The provision Job is found by its labels and owner, not by the name the
+// reconcile would render from the CR as stored, which can differ from the
+// render the reconcile made (a pruned status.busReplicas): any provision Job
+// of the CR's counts, the newest deciding and a running one gating.
+func TestTheProvisionJobIsFoundByItsLabelsNotItsName(t *testing.T) {
+	agent := busStreamsAgent(1)
+	job := busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete)
+	job.Name = agent.Name + a2aProvisionJobNameInfix + "0ther000"
+	rig := newBusStreamsRig(t, 1, job)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	if !slices.Contains(rig.deleted, job.Name) {
+		t.Errorf("deleted %v, want the CR's completed provision Job %s", rig.deleted, job.Name)
+	}
+}
+
+func TestAnyRunningProvisionJobGatesTheVerdict(t *testing.T) {
+	agent := busStreamsAgent(1)
+	running := busStreamsJob(agent, busStreamsTestNow.Add(-2*time.Hour), "")
+	running.Name = agent.Name + a2aProvisionJobNameInfix + "running0"
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), running)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	for i := 0; i < 4; i++ {
+		rig.poll()
+	}
+	if len(rig.deleted) != 0 {
+		t.Errorf("deleted %v while a provision Job was running", rig.deleted)
+	}
+}
