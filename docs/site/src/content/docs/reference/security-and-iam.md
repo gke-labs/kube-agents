@@ -198,7 +198,9 @@ The [web console](/kube-agents/deploy/web-console/)'s ServiceAccount holds `get`
 
 The source is [`k8s-operator/config/admission/web-console-cr-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/web-console-cr-policy.yaml). The chart installs it with `admissionPolicy.enabled` on Kubernetes 1.30 or later, where the console and its environment page are on. It selects the console by its ServiceAccount name, `<release>-web-console`.
 
-Inside `forges`, it keeps each existing forge's host, port, scheme, provider, `credentialsRef`, `caBundleRef` and `identity`, and the namespace of a forge with a `credentialsRef`. A forge the console adds may carry no `credentialsRef` or `caBundleRef`, and a GitHub forge it adds must sit at a host a GitHub forge already uses. The install's GitHub host, where the broker spends the GitHub App token, stays as it is. While the declaration has a forge the operator refuses in a way that could move that host, the console may not change `forges` at all until an administrator fixes it. Adding a repository on a forge with a credential still widens the paths that forge's token may reach.
+Inside `forges`, it keeps each existing forge's host, port, scheme, provider, `credentialsRef`, `caBundleRef` and `identity`, and the namespace of a forge with a `credentialsRef`. A forge the console adds may carry no `credentialsRef` or `caBundleRef`, and a GitHub forge it adds must sit at a host a GitHub forge already uses. The install's GitHub host, where the broker spends the GitHub App token, stays as it is.
+
+While the declaration has a forge the operator refuses in a way that could move that host, the console may not change `forges` at all until an administrator fixes it. The same holds while GitHub forges name two different CA bundles, because the broker trusts the first one's for that host. Adding a repository on a forge with a credential still widens the paths that forge's token may reach.
 
 ### The operator controller is a separate identity
 
