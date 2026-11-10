@@ -73,6 +73,16 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $slack := "kubeagents_a2a_gateway_slack_connected" }}
 {{- /* Optional, unlike the rest of the block: it postdates the schema's required list, so a --reuse-values upgrade from a release without it keeps rendering. */}}
 {{- $slackFor := $t.slackDisconnectedFor | default "5m" }}
+{{- /*
+The Slack alert is the one window in an expression here, against the
+day-long rule below, on purpose: a gateway whose token Slack rejects exits and
+crash-loops, so its gauge is a 0 between gaps, and a `for` on the instant value
+resets at every gap and never fires. The window's max reads 0 whenever no 1
+landed in it, gaps or not; a standby serves no sample and the leader's 1
+clears it. The cost is the young-series case: a new pod that has never
+connected can fire after `for` alone, which for a pod that never connected is
+true.
+*/}}
 {{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
@@ -144,8 +154,8 @@ spec:
           annotations:
             summary: '{{ $who }}: {{ "{{ $value | printf \"%.0f\" }}" }} background tasks gave up in 7 days'
         - alert: KubeAgentsSlackDisconnected
-          expr: max by (namespace, job) ({{ $slack }}{job="{{ $agent }}-a2a-gateway-monitoring"}) == 0
-          for: {{ $slackFor }}
+          expr: max by (namespace, job) (max_over_time({{ $slack }}{job="{{ $agent }}-a2a-gateway-monitoring"}[{{ $slackFor }}])) == 0
+          for: 1m
           labels:
             severity: at_risk
           annotations:
