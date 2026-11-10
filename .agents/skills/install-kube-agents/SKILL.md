@@ -455,8 +455,12 @@ For CI/CD pipelines and anywhere runners must not handle raw private keys, the k
   --model-provider="gemini" \
   --gitops-org="YOUR_GITHUB_ORG" \
   --gitops-repo="YOUR_GITOPS_REPO" \
-  --github-app-id="YOUR_GITHUB_APP_ID"
+  --github-app-id="YOUR_GITHUB_APP_ID" \
+  --kms-keyring="YOUR_KEY_RING" \
+  --kms-key="YOUR_KEY"
 ```
+
+Pass both KMS flags with the names the operator pre-provisioned. A pre-provisioned key carries no owner labels, and the installer adopts one only when both names are given explicitly.
 
 ### GitHub Enterprise Server
 

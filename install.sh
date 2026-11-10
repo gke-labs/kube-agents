@@ -502,19 +502,20 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 #
 # One exception. An install.env written before per-install names recorded the
 # project-wide default names whether or not the install ever ran a minter, so
-# a default name the file records counts as given only when the file records a
-# GitHub App too. Otherwise an older install turning the minter on would
-# adopt, as its own, the unlabelled default key another install may hold.
+# a default name the file records never counts as given: an older install
+# turning the minter on (by flag, the interview, or a GITHUB_APP_ID added to
+# the file by hand) would otherwise adopt, as its own, the unlabelled default
+# key another install may hold. Named by a flag or the environment, as an
+# environment rebuild names it, the default still counts.
 #
 # Fails closed when the default isn't known yet (a first curl | bash run, before
-# install.defaults.env is on disk): a name the file records then counts only
-# beside a recorded App.
+# install.defaults.env is on disk): a name the file records then doesn't count
+# until settle_minter_names_given reads it again with the defaults loaded.
 minter_name_given() {
   local value=$1 default=$2 file_records=$3
   [ -n "$value" ] || return 1
-  [ -n "$default" ] && [ "$value" != "$default" ] && return 0
   [ "$file_records" != "true" ] && return 0
-  [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ]
+  [ -n "$default" ] && [ "$value" != "$default" ]
 }
 # settle_minter_names_given reads the names again once install.defaults.env is
 # loaded (resolve_shared_defaults): under curl | bash from outside the checkout

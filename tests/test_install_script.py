@@ -210,25 +210,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertIn("rc=1", proc.stdout, proc.stderr)
 
     def test_an_environment_rebuild_adopts_its_own_unlabelled_key(self):
-        """rc and nightly: uninstall, then install.sh -y from render_install_env.sh's file.
+        """rc and nightly: uninstall, then install.sh -y with the names in the environment.
 
-        The state holds no minter after the uninstall, and the project-wide key
-        has no labels from before them; the rendered file names it, so it is adopted.
+        provision_environment.sh exports the project-wide names it gets from
+        minter_environment_names.sh. The state holds no minter after the
+        uninstall, and the key has no labels from before them; named explicitly
+        in the environment, it is adopted.
         """
-        rendered = self._empty_install_env.parent / "rendered.env"
-        render = subprocess.run(
-            [str(_REPO_ROOT / "scripts/release/render_install_env.sh"), str(rendered)],
-            capture_output=True, text=True,
-            env={"PATH": os.environ["PATH"], "GCP_PROJECT_ID": "p", "GCP_REGION": "us-central1",
-                 "GKE_CLUSTER_NAME": "cluster-b", "GITHUB_APP_ID": "12345",
-                 "GITOPS_ORG": "o", "GITOPS_REPO": "r"})
-        self.assertEqual(render.returncode, 0, render.stderr)
         proc = self._run_install_func(
             "tf_state_minter_names() { printf '||'; }; "
             "minter_key_owner() { return 0; }; PARAM_NON_INTERACTIVE=true; "
             'if confirm_minter_key_owner "$KMS_KEYRING" "$KMS_KEY" us-central1 p cluster-b; then rc=0; else rc=1; fi; '
             'echo "rc=$rc adopt=${MINTER_ADOPT_KEY:-}"',
-            env={"KUBE_AGENTS_INSTALL_ENV": str(rendered)})
+            env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key",
+                 "GITHUB_APP_ID": "12345"})
         self.assertIn("rc=0 adopt=github-token-minter-keyring/github-token-minter-key", proc.stdout, proc.stderr)
 
     def _minter_names_given(self, file_text, env=None):
@@ -244,15 +239,13 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             "PROJECT_ID=p\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
         self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
 
-    def test_with_no_defaults_file_a_recorded_name_needs_a_recorded_app(self):
-        """A first curl | bash run has no install.defaults.env yet: fail closed, not open."""
-        script = ('minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
-                  'INSTALL_ENV_RECORDS_GITHUB_APP=true; '
+    def test_with_no_defaults_file_a_recorded_name_waits_for_them(self):
+        """A first curl | bash run has no install.defaults.env yet: a name the file records fails closed, not open."""
+        script = ('minter_name_given my-ring "" true && echo given || echo not-given; '
                   'minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
-                  'INSTALL_ENV_RECORDS_GITHUB_APP=false; '
                   'minter_name_given my-ring "" false && echo given || echo not-given')
         proc = self._run_install_func(script)
-        self.assertEqual(proc.stdout.split()[-3:], ["not-given", "given", "given"], proc.stderr)
+        self.assertEqual(proc.stdout.split()[-3:], ["not-given", "not-given", "given"], proc.stderr)
 
     def test_names_the_file_records_are_settled_once_the_defaults_load(self):
         """curl | bash from outside the checkout: no defaults at source time, so the first reading failed closed."""
@@ -264,7 +257,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
                   'settle_minter_names_given; echo "default_given=$PARAM_KMS_KEYRING_GIVEN"')
         proc = self._run_install_func(script)
         self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
-        # The old project-wide default from the file, with no App recorded, still isn't a choice.
+        # The old project-wide default from the file still isn't a choice.
         self.assertIn("default_given=false", proc.stdout, proc.stderr)
         # And resolve_shared_defaults settles them before it fills the defaults in.
         text = _INSTALL_SH.read_text()
@@ -272,10 +265,11 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertLess(body.index("settle_minter_names_given"),
                         body.index('PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"'))
 
-    def test_default_names_beside_a_recorded_app_are_explicit(self):
+    def test_a_recorded_app_does_not_make_the_file_s_default_names_a_choice(self):
+        """An older install turning the minter on by adding GITHUB_APP_ID to its install.env by hand."""
         proc = self._minter_names_given(
             "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
-        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
 
     def test_names_of_its_own_or_from_the_environment_are_explicit(self):
         proc = self._minter_names_given("KMS_KEYRING=my-ring\nKMS_KEY=my-key\n")

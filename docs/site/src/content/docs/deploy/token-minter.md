@@ -117,7 +117,9 @@ For automated CI/CD pipelines, release automation, or production environments wh
      --gcp-region="us-central1" \
      --gitops-org="YOUR_GITHUB_ORG" \
      --gitops-repo="YOUR_GITOPS_REPO" \
-     --github-app-id="YOUR_GITHUB_APP_ID"
+     --github-app-id="YOUR_GITHUB_APP_ID" \
+     --kms-keyring="YOUR_KEY_RING" \
+     --kms-key="YOUR_KEY"
    ```
 
 ### Install variables
