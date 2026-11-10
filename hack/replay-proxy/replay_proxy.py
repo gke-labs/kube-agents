@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import queue
 import re
@@ -149,6 +150,16 @@ DROPPED_REQUEST_HEADERS = {
 DROPPED_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"}
 MODEL_GROUP_HEADER = "x-litellm-model-group"
 ATTEMPTED_FALLBACKS_HEADER = "x-litellm-attempted-fallbacks"
+MODEL_NAME_HEADER = "x-litellm-model-name"
+ATTEMPTED_RETRIES_HEADER = "x-litellm-attempted-retries"
+# Sent on a stream too, as 0.0, before the cost is known: read on a
+# non-streamed response only.
+RESPONSE_COST_HEADER = "x-litellm-response-cost"
+# LiteLLM's cost in a usage block, a stream's final chunk included.
+USAGE_COST = "cost"
+COMPLETION_DETAILS = "completion_tokens_details"
+USAGE_REASONING_TOKENS = "reasoning_tokens"
+USAGE_CACHE_WRITE_TOKENS = "cache_creation_input_tokens"
 NO_FALLBACKS = "0"
 
 READ_CHUNK_BYTES = 65536
@@ -187,10 +198,9 @@ class Config:
     store_dir: str = DEFAULT_STORE_DIR
     redactor_path: str = DEFAULT_REDACTOR_PATH
     transcript_rules_path: str = DEFAULT_TRANSCRIPT_RULES_PATH
-    # Set at deploy time by the chart: a checksum of the LiteLLM config that
-    # treats the Gemini API and Vertex AI routes as one
-    # (REPLAY_MODEL_BEHAVIOUR_CHECKSUM), and the LiteLLM container image.
-    model_behaviour_checksum: str = UNSET
+    # Set at deploy time from the LiteLLM Deployment's `checksum/config`
+    # pod annotation and its container image.
+    litellm_config_checksum: str = UNSET
     litellm_image: str = UNSET
     # Which job this proxy serves, stamped on every line for the analysis.
     job_kind: str = UNSET
@@ -218,7 +228,7 @@ class Config:
             store_dir=env.get("REPLAY_STORE_DIR", DEFAULT_STORE_DIR),
             redactor_path=env.get("REPLAY_REDACTOR_PATH", DEFAULT_REDACTOR_PATH),
             transcript_rules_path=env.get("REPLAY_TRANSCRIPT_RULES_PATH", DEFAULT_TRANSCRIPT_RULES_PATH),
-            model_behaviour_checksum=env.get("REPLAY_MODEL_BEHAVIOUR_CHECKSUM", UNSET),
+            litellm_config_checksum=env.get("REPLAY_LITELLM_CONFIG_CHECKSUM", UNSET),
             litellm_image=env.get("REPLAY_LITELLM_IMAGE", UNSET),
             job_kind=env.get("REPLAY_JOB_KIND", UNSET),
             job_project=env.get("REPLAY_JOB_PROJECT", UNSET),
@@ -400,11 +410,45 @@ def usage_tokens(usage: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
     cached = details.get("cached_tokens") if isinstance(details, dict) else None
     if cached is None:
         cached = usage.get("cache_read_input_tokens")
+    completion_details = usage.get(COMPLETION_DETAILS) or {}
     return {
         F.PROMPT_TOKENS: usage.get(F.PROMPT_TOKENS),
         F.CACHED_TOKENS: cached,
         F.COMPLETION_TOKENS: usage.get(F.COMPLETION_TOKENS),
+        F.REASONING_TOKENS: (
+            completion_details.get(USAGE_REASONING_TOKENS) if isinstance(completion_details, dict) else None
+        ),
+        F.CACHE_WRITE_TOKENS: usage.get(USAGE_CACHE_WRITE_TOKENS),
     }
+
+
+def _cost(value: Any) -> Optional[float]:
+    """A finite, non-negative number of dollars from a number or a numeric string, else None."""
+    if isinstance(value, bool):
+        return None
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return None
+    return cost if math.isfinite(cost) and cost >= 0 else None
+
+
+def litellm_cost(usage: Optional[Dict[str, Any]], headers: Dict[str, str], streamed: bool) -> Optional[float]:
+    """LiteLLM's cost for the request: usage.cost, else the cost header of a non-streamed response."""
+    if isinstance(usage, dict) and usage.get(USAGE_COST) is not None:
+        return _cost(usage[USAGE_COST])
+    if streamed:
+        return None
+    return _cost(headers.get(RESPONSE_COST_HEADER))
+
+
+def attempted_retries(headers: Dict[str, str]) -> Any:
+    """x-litellm-attempted-retries as an int when it parses, else as sent (None when absent)."""
+    value = headers.get(ATTEMPTED_RETRIES_HEADER)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return value
 
 
 def answer_view(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -534,10 +578,12 @@ class ShadowProxy:
             )
         self.config = config
         self.cache = replay_cache.AnswerCache(config.cache_dir) if config.mode != F.MODE_SHADOW else None
-        # Replay reads a cache another job recorded; its index is built once, at start.
+        # Replay reads a cache another job recorded; its index is built at start,
+        # and again whenever the seed marker changes (refresh_index).
         self.index = replay_cache.PrefixIndex(self.cache.entries()) if config.mode == F.MODE_REPLAY else None
         self.index_empty = not (self.index and self.index.by_prefix)
-        self.key_context = normalizer.KeyContext(config.model_behaviour_checksum, config.litellm_image)
+        self._index_stamp: Optional[int] = self._seed_stamp() if config.mode == F.MODE_REPLAY else None
+        self.key_context = normalizer.KeyContext(config.litellm_config_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
         if config.data_max_bytes > 0:
@@ -638,10 +684,27 @@ class ShadowProxy:
         process, on when the prefix arrived), so it is kept by their digests:
         each turn normalizes only its new answer's prefix, not every earlier one.
         """
+        for variant in self.history_variants(body, messages, digests, first_seen, received):
+            if not self.cache.has_variant(*variant):
+                return False
+        return True
+
+    def history_variants(
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        last_only: bool = False,
+    ):
+        """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
+
+        Memoized by the digests of the prefix, so each answer is normalized once
+        per process. With `last_only`, only the last assistant message's.
+        """
         settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
         chain = normalizer.stable_hash(settings)
+        indices = [i for i, m in enumerate(messages)
+                   if isinstance(m, dict) and m.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE]
+        wanted = set(indices[-1:] if last_only else indices)
         for index, message in enumerate(messages):
-            if isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE:
+            if index in wanted:
                 memo_key = normalizer.stable_hash([chain, digests[index]])
                 with self._variant_lock:
                     variant = self._variants.get(memo_key)
@@ -654,10 +717,8 @@ class ShadowProxy:
                         self._variants[memo_key] = variant
                         while len(self._variants) > VARIANT_MEMO_CAPACITY:
                             self._variants.popitem(last=False)
-                if not self.cache.has_variant(*variant):
-                    return False
+                yield variant
             chain = normalizer.stable_hash([chain, digests[index]])
-        return True
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -825,7 +886,8 @@ class ShadowProxy:
         # fallback's answer or any other unstorable one. Each recording notes its
         # own, so two that answered differently both count, even where the first
         # write of the saved answer won.
-        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+        variant = entry.get(F.ANSWER_VARIANT) or normalizer.answer_variant(normalized, upstream["message"], self.key_context)
+        self.cache.add_variant(*variant)
         slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
         if slots:
             self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
@@ -852,12 +914,35 @@ class ShadowProxy:
             block[F.MISS_REFUSED] = refused
         return block
 
+    def _seed_stamp(self) -> Optional[int]:
+        try:
+            return os.stat(os.path.join(self.config.cache_dir, replay_cache.SEED_MARKER)).st_mtime_ns
+        except OSError:
+            return None
+
+    def refresh_index(self) -> None:
+        """Rebuild the miss index when the cache was seeded since it was built.
+
+        The replay lane seeds the cache after the proxy has started (and again
+        into a pod that replaced one), so an index built only at start would
+        report every miss as `no_saved_request`. Serving never needs this:
+        every lookup reads the cache as it is. Runs on the analysis thread.
+        """
+        stamp = self._seed_stamp()
+        if stamp is None or stamp == self._index_stamp:
+            return
+        self._index_stamp = stamp
+        index = replay_cache.PrefixIndex(self.cache.entries())
+        self.index, self.index_empty = index, not index.by_prefix
+
     def _closest(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
         """The closest saved request and where this one first differs from it."""
-        if self.index_empty:
+        self.refresh_index()
+        index = self.index
+        if self.index_empty or index is None:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
         hashes = entry[F.DIAG_MESSAGE_HASHES]
-        candidates, matched = self.index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
+        candidates, matched = index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
         if not candidates:
             return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
         current = None
@@ -919,7 +1004,7 @@ class ShadowProxy:
             F.SCHEMA: F.LOG_SCHEMA_VERSION,
             F.JOB: self.job(),
             F.NORMALIZER_VERSION: normalizer.NORMALIZER_VERSION,
-            F.MODEL_BEHAVIOUR_CHECKSUM: self.config.model_behaviour_checksum,
+            F.LITELLM_CONFIG_CHECKSUM: self.config.litellm_config_checksum,
             F.LITELLM_IMAGE: self.config.litellm_image,
             F.SCRUBBERS_LOADED: self.scrubber.available,
             F.SCRUBBERS_ERROR: self.scrubber.error,
@@ -945,7 +1030,7 @@ class ShadowProxy:
             F.MODEL: body.get(F.MODEL),
             F.STREAM: bool(body.get(F.STREAM)),
             F.NORMALIZER_VERSION: self.key_context.normalizer_version,
-            F.MODEL_BEHAVIOUR_CHECKSUM: self.key_context.model_behaviour_checksum,
+            F.LITELLM_CONFIG_CHECKSUM: self.key_context.litellm_config_checksum,
             F.LITELLM_IMAGE: self.key_context.litellm_image,
             F.STATUS: upstream["status"],
             F.LATENCY_MS: upstream["latency_ms"],
@@ -956,9 +1041,23 @@ class ShadowProxy:
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
             **self.served_fields(served),
         }
+        if served is None:
+            entry[F.LITELLM_MODEL_NAME] = upstream["headers"].get(MODEL_NAME_HEADER)
+            entry[F.LITELLM_ATTEMPTED_RETRIES] = attempted_retries(upstream["headers"])
+            entry[F.LITELLM_COST_USD] = litellm_cost(upstream["usage"], upstream["headers"], bool(body.get(F.STREAM)))
+        else:
+            # The request never reached LiteLLM: no model behind it, no retries,
+            # and no cost, whatever the recording's usage block says.
+            entry[F.LITELLM_MODEL_NAME] = None
+            entry[F.LITELLM_ATTEMPTED_RETRIES] = None
+            entry[F.LITELLM_COST_USD] = None
         if served is not None:
             entry[F.SERVED_VIA] = upstream.get("served_via")
         entry.update(usage_tokens(upstream["usage"]))
+        if served is not None:
+            # The recording's reasoning and cache writes, billed when it was recorded, not now.
+            entry[F.REASONING_TOKENS] = None
+            entry[F.CACHE_WRITE_TOKENS] = None
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
         if entry[F.TOKENS_ESTIMATED]:
             entry[F.PROMPT_TOKENS] = request_bytes // BYTES_PER_TOKEN
@@ -995,6 +1094,12 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
+            if upstream["message"]:
+                entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+            digests, first_seen = self.diagnosis.first_seen_with_digests(raw_messages, received)
+            prior = list(self.history_variants(body, raw_messages, digests, first_seen, received, last_only=True))
+            if prior:
+                entry[F.PRIOR_ANSWER] = list(prior[0])
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))

@@ -310,6 +310,7 @@ class DelegationCeilingTest(unittest.TestCase):
                 "INFRA_LOCK_DEADLINE=900",
                 'stream_case_count() { echo "${CASES_ON_STREAM}"; }',
                 'stream_stack_wait() { echo "${STACK_WAIT:-0}"; }',
+                "stream_note_count() { echo 1; }",
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=compliance-rbac-overgrant audit_id=compliance-audit streams=compliance-audit has_stack=\n" + computed,
                 "CASES_ON_STREAM=1 STACK_WAIT=0 name=capacity-pinned-pool-probe audit_id= streams= has_stack=\n" + computed,
                 "CASES_ON_STREAM=2 STACK_WAIT=0 name=consistency-drift-outlier audit_id=fleet-consistency-drift streams=fleet-consistency-drift has_stack=\n" + computed,

@@ -290,6 +290,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a Standard seeded cluster with a manual node pool labelled for a
+    # ComputeClass whose auto-creation is off: the lane's Autopilot hosts
+    # refuse the shape, so it is a fleet fixture addressed by role, and
+    # #5143 plants it. #4943 is the sibling ComputeClass gap on the same
+    # host constraint.
+    "ccc-manual-pools-single-rule-unbacked": (
+        "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
+        "whose auto-creation is off; the lane's host clusters are Autopilot"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -427,6 +436,15 @@ FIXTURE_NOT_READY = {
         "install's context_repos, as the case's header gives; no pool install "
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
+    ),
+    "remediation-context-repository-owns-the-fix": (
+        "#5213: needs the three-part fixture its fixture/README.md describes in each "
+        "pool install: a context repository holding the payments chart, registered "
+        "in context_repos at a pinned ref (the registration #4243 also waits for), "
+        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
+        "GitOps repository, and the rendered workload on the agent host; no pool "
+        "install carries them, so the objective fails with the chart repository "
+        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "

@@ -583,6 +583,34 @@ def _tree_bytes(root: Path, stop_past: int) -> int:
     return total
 
 
+def _snapshot_max_bytes(raw: Any) -> int | None:
+    """`maxBytes` of a snapshot request: the bytes the caller unpacks at most, or None.
+
+    A caller that unpacks under a bound of its own sends it, so that a tree
+    whose files pass that bound is refused here, with the entries a caller can
+    ask for one by one, rather than served and then refused by the caller with
+    none. It is compared with the files' own bytes, as the caller counts them,
+    not with the tar's measure, which the install's ceiling bounds.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise WorkspaceError("maxBytes must be a whole number of bytes, 0 or more")
+    return raw
+
+
+def _unpacked_bytes(listing: str) -> int:
+    """The bytes the regular files in ``listing`` unpack to: a symbolic link or a directory has none."""
+    total = 0
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        mode, size, _ = entry.split(" ", 2)
+        if mode != GIT_MODE_SYMLINK and mode not in GIT_MODES_DIRECTORY:
+            total += int(size)
+    return total
+
+
 def _snapshot_paths(raw: Any) -> list[str]:
     """`paths` of a snapshot request: literal repository-relative names, or none.
 
@@ -1164,7 +1192,8 @@ class VcsBroker:
         chosen here by the repository's role (`_snapshot_git`). `ref` is a
         branch or a tag; with none, a pinned base is used, as `clone` does,
         and then the remote's default branch. `paths` narrows the tar to
-        literal repository-relative paths.
+        literal repository-relative paths. `maxBytes` is the caller's own
+        unpack bound (`_snapshot_max_bytes`).
         """
         ref = payload.get("ref")
         if ref is not None:
@@ -1174,6 +1203,7 @@ class VcsBroker:
                     "ref names a revision; a snapshot takes a branch or a tag name"
                 )
         paths = _snapshot_paths(payload.get("paths"))
+        max_unpacked = _snapshot_max_bytes(payload.get("maxBytes"))
         repository, fallback = self.snapshot_source(payload.get("repository"))
         if fallback is not None:
             forge_name, repo, url = fallback
@@ -1240,7 +1270,7 @@ class VcsBroker:
             attributes = clone_dir / SNAPSHOT_ATTRIBUTES_FILE
             attributes.parent.mkdir(parents=True, exist_ok=True)
             attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
-            self._measure_snapshot(git, clone_dir, revision, paths, repo)
+            self._measure_snapshot(git, clone_dir, revision, paths, repo, max_unpacked)
             # `--literal-pathspecs` is GIT_LITERAL_PATHSPECS as a flag: each
             # path is a name, never a glob or pathspec magic.
             argv = [
@@ -1287,6 +1317,7 @@ class VcsBroker:
         size: int,
         entries: list[dict[str, Any]] | None = None,
         revision: str | None = None,
+        over: str | None = None,
     ) -> WorkspaceError:
         """The 413, with the entries one level down when the measure listed them.
 
@@ -1300,16 +1331,17 @@ class VcsBroker:
             fields["entries"] = entries
         if revision:
             fields["revision"] = revision
+        if over is None:
+            over = f"is {size} bytes, over the {self.max_snapshot_bytes}-byte ceiling"
         return WorkspaceError(
-            f"the snapshot of {repo} is {size} bytes, over the "
-            f"{self.max_snapshot_bytes}-byte ceiling. Name `paths` to "
-            "take part of the tree.",
+            f"the snapshot of {repo} {over}. Name `paths` to take part of the tree.",
             status=413,
             **fields,
         )
 
     def _measure_snapshot(
-        self, git: Callable, clone_dir: Path, revision: str, paths: list[str], repo: str
+        self, git: Callable, clone_dir: Path, revision: str, paths: list[str], repo: str,
+        max_unpacked: int | None = None,
     ) -> None:
         """Refuse a tree whose tar would pass the ceiling, before `git archive` writes it.
 
@@ -1333,6 +1365,14 @@ class VcsBroker:
         size = _tar_bytes(listed.stdout or "")
         if size > self.max_snapshot_bytes:
             raise self._snapshot_too_large(repo, size, _snapshot_entries(listed.stdout or "", paths), revision)
+        # The caller's bound, on what it unpacks: past it, the same 413 and
+        # entries, so the caller can ask for the parts that fit.
+        unpacked = _unpacked_bytes(listed.stdout or "")
+        if max_unpacked is not None and unpacked > max_unpacked:
+            raise self._snapshot_too_large(
+                repo, size, _snapshot_entries(listed.stdout or "", paths), revision,
+                over=f"unpacks to {unpacked} bytes, over the {max_unpacked} bytes the caller unpacks at most",
+            )
 
     def snapshot_source(self, repository: Any) -> tuple[Any, tuple[str, str, str] | None]:
         """The repository `snapshot` resolves, and the read outside the host table, if any.

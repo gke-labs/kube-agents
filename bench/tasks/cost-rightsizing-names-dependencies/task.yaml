@@ -1,4 +1,10 @@
-# NIGHTLY — an entry in hack/eval/nightly-cases.txt (#3199).
+# CERTIFICATION: an entry in hack/eval/certification-cases.txt, a baseline
+# of the cost capability row (#3978); a nightly case 2026-10-23 to 2026-11-09
+# (#3199), admitted to the suite on that record. What the fixture carries
+# versus the customer failure: the seeded fleet carries a Deployment scaled by
+# an HPA on CPU and a Deployment whose requests equal its limits; the customer
+# failure is a request cut proposed without naming the HPA or the limit the
+# cut would also change.
 #
 # Domain: cost. Journey: a person asks for a request cut on named workloads
 # in chat, the path that does not run the waste collector (the collector
@@ -24,8 +30,8 @@
 # expected_output. The safeguards hold both workloads' CPU and memory
 # requests, ledger-writer's limits and the HPA's cap.
 #
-# Isolation class: read-only. Eligible tier: presubmit, after a record in
-# the nightly. Expected cost bracket: ~150-400s (one delegation, a handful
+# Isolation class: read-only. Lane: certification only (one case, one
+# lane). Expected cost bracket: ~150-400s (one delegation, a handful
 # of reads on one seeded cluster).
 id: cost-rightsizing-names-dependencies
 name: A request cut names the HPA and the Guaranteed QoS it would change
@@ -56,6 +62,10 @@ infrastructure:
 validated: false
 
 domain: cost
+
+# The certification suite's lane, and nothing else runs it (bench/README.md,
+# "Certification suite").
+suite: certification
 
 owner: Fuxiao-Gao
 

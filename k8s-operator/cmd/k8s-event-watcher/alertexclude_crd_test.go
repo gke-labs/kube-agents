@@ -43,7 +43,7 @@ func TestTheCRDRuleListParsesHere(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rules, err := parseAlertExclude(string(raw))
+	rules, err := parseAlertExclude(alertExcludeFlag, string(raw))
 	if err != nil {
 		t.Fatalf("parseAlertExclude(%s): %v", raw, err)
 	}

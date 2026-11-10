@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -180,6 +181,12 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 	if reading.Clusters == nil || reading.Clusters.Registered != 3 || reading.Clusters.Monitored != 2 {
 		t.Fatalf("clusters = %+v, want 3 registered and 2 monitored", reading.Clusters)
+	}
+	// The series' labels ride along as the triples, in body order, for the
+	// ScopeUndeclared condition.
+	wantRefs := []usageClusterRef{{Name: "a", Project: "p", Location: "l"}, {Name: "b", Project: "p", Location: "l"}, {Name: "c", Project: "p", Location: "l2"}}
+	if !slices.Equal(reading.Clusters.Refs, wantRefs) {
+		t.Fatalf("cluster refs = %+v, want %+v", reading.Clusters.Refs, wantRefs)
 	}
 
 	empty := serveBody(t, http.StatusOK, "# TYPE k8s_event_watcher_events_injected_total counter\n")
@@ -602,6 +609,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterBackgroundTasksGaveUp] != 2 || reading.Samples[usageCounterNegativeFeedback] != 2 {
 		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions, 3 turns errored, 2 cards given up and 2 thumbs-downs", reading.Samples)
 	}
+	// The reaction hook counts no thumbs-up, so the chat listener is not
+	// asked for the positive counter.
+	if _, asked := reading.Samples[usageCounterPositiveFeedback]; asked {
+		t.Fatalf("the chat listener was asked for the thumbs-ups it never serves: %v", reading.Samples)
+	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
 		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
@@ -615,6 +627,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_task_terminals_total{state="failed",source="supervisor"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="rejected",source="gateway"} 1`,
 		`kubeagents_a2a_gateway_task_terminals_total{state="canceled",source="gateway"} 4`,
+		"# TYPE kubeagents_a2a_gateway_answer_feedback_total counter",
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="up"} 6`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="down"} 2`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="other",rating="down"} 1`,
+		`kubeagents_a2a_gateway_answer_feedback_total{platform="slack",rating="other"} 3`,
 		"",
 	}, "\n")
 	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageA2AChatCounters, nil)
@@ -630,10 +647,11 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if _, asked := reading.Samples[usageCounterBackgroundTasksGaveUp]; asked {
 		t.Fatalf("the A2A gateway was asked for the board's counter it never serves: %v", reading.Samples)
 	}
-	// The A2A gateway carries no reactions, so its target is not asked for the
-	// feedback counter: no sample, no idle baseline entry, no field in its Warning.
-	if _, asked := reading.Samples[usageCounterNegativeFeedback]; asked {
-		t.Fatalf("the A2A gateway was asked for the feedback counter it never serves: %v", reading.Samples)
+	// The answer ratings are the feedback counters' family on this pod: down
+	// into the thumbs-downs, up into the thumbs-ups, each over every
+	// platform; a rating outside the two counts into neither.
+	if reading.Samples[usageCounterNegativeFeedback] != 3 || reading.Samples[usageCounterPositiveFeedback] != 6 {
+		t.Fatalf("a2a samples = %v, want 3 thumbs-downs (2 + 1) and 6 thumbs-ups", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)
@@ -1313,5 +1331,64 @@ func TestPodUsageSource_TheOriginsReadingNeedsAFreshReadAge(t *testing.T) {
 				t.Errorf("chat samples = %v, want the counters read beside it", reading.Samples)
 			}
 		})
+	}
+}
+
+// The chat listener's body carries the kanban dispatcher's failing boards; the
+// reading is empty, not nil, for a chat body with none, and nil for every
+// other body. A body past the board ceiling fails the scrape.
+func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
+	chat := func(series ...string) string {
+		return strings.Join(append([]string{
+			"# TYPE kubeagents_chat_messages_inbound_total counter",
+			`kubeagents_chat_messages_inbound_total{platform="slack"} 4`,
+			"# TYPE kubeagents_kanban_tasks_gave_up_total counter",
+			"kubeagents_kanban_tasks_gave_up_total 0",
+			"# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge",
+		}, append(series, "")...), "\n")
+	}
+	scrape := func(body string, counters []string) (usageReading, error) {
+		return newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, body), counters, nil)
+	}
+
+	reading, err := scrape(chat(
+		`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OperationalError"} 61`,
+		`kubeagents_kanban_dispatcher_failed_ticks{board="o\"ps",error="DatabaseError"} 3`,
+	), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	want := []usageDispatcherFailure{{Board: "default", Error: "OperationalError", Ticks: 61}, {Board: `o"ps`, Error: "DatabaseError", Ticks: 3}}
+	if reading.Dispatcher == nil || !reflect.DeepEqual(reading.Dispatcher.Failing, want) {
+		t.Fatalf("dispatcher = %+v, want %+v", reading.Dispatcher, want)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 4 {
+		t.Errorf("samples = %v, want the messages counted from the same body", reading.Samples)
+	}
+
+	reading, err = scrape(chat(), usageChatCounters)
+	if err != nil || reading.Dispatcher == nil || len(reading.Dispatcher.Failing) != 0 {
+		t.Fatalf("idle dispatcher: reading %+v, err %v; want an empty reading", reading.Dispatcher, err)
+	}
+
+	reading, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 9`), usageA2AChatCounters)
+	if err != nil || reading.Dispatcher != nil {
+		t.Fatalf("A2A gateway body: reading %+v, err %v; want none", reading.Dispatcher, err)
+	}
+
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OSError"} 1e20`), usageChatCounters)
+	var hugeErr *usageScrapeError
+	if !errors.As(err, &hugeErr) || hugeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("a streak past int64: err %v, want a sample error", err)
+	}
+
+	many := make([]string, 0, usageDispatcherBoardCeiling+1)
+	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
+		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))
+	}
+	_, err = scrape(chat(many...), usageChatCounters)
+	var scrapeErr *usageScrapeError
+	if !errors.As(err, &scrapeErr) || scrapeErr.Kind != usageScrapeKindSample {
+		t.Fatalf("past the board ceiling: err %v, want a sample error", err)
 	}
 }

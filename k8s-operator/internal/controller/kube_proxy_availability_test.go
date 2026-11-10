@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/labels"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/memlimit"
 )
 
 // Every sandbox kubectl goes through the kube-proxy, so a rollout or a drain
@@ -97,5 +99,39 @@ func TestKubeProxyPDBSelectsTheDeploymentsPods(t *testing.T) {
 	}
 	if pdb.Spec.UnhealthyPodEvictionPolicy == nil || *pdb.Spec.UnhealthyPodEvictionPolicy != policyv1.AlwaysAllow {
 		t.Errorf("unhealthyPodEvictionPolicy = %v, want AlwaysAllow", pdb.Spec.UnhealthyPodEvictionPolicy)
+	}
+}
+
+// The kube-proxy container's GOMEMLIMIT is 85% of its memory limit, both read
+// off the rendered pod, so a later change to the limit cannot leave the
+// runtime's soft limit at the old size, or above the limit.
+func TestTheKubeProxyGoMemLimitIs85PercentOfTheContainerLimit(t *testing.T) {
+	pod := buildKubeProxyDeployment(shellSandboxTestAgent(), "", true, "tls-hash").Spec.Template.Spec
+	if len(pod.Containers) != 1 {
+		t.Fatalf("%d containers; want one", len(pod.Containers))
+	}
+	c := pod.Containers[0]
+	limit, ok := c.Resources.Limits[corev1.ResourceMemory]
+	if !ok {
+		t.Fatal("the kube-proxy container has no memory limit")
+	}
+	var values []string
+	for _, e := range c.Env {
+		if e.Name == memlimit.GoMemLimitEnv {
+			if e.ValueFrom != nil {
+				t.Fatalf("GOMEMLIMIT is a reference, %v; want a value", e.ValueFrom)
+			}
+			values = append(values, e.Value)
+		}
+	}
+	if len(values) != 1 {
+		t.Fatalf("GOMEMLIMIT set %d times (%v); want once", len(values), values)
+	}
+	got, err := parseGoMemLimit(values[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := limit.Value() * 85 / 100; got != want {
+		t.Errorf("GOMEMLIMIT = %q (%d bytes); want 85%% of the %s limit, %d bytes", values[0], got, limit.String(), want)
 	}
 }

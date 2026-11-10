@@ -207,6 +207,17 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))
 
+    def test_the_cluster_gauges_labels_are_the_ones_the_poller_reads_into_the_scope_condition(self):
+        # The watcher's GaugeVec declares its label names in order; the poller reads
+        # three of them by name for the ScopeUndeclared condition's cluster triples.
+        match = re.search(r'clusterUp:\s*prometheus\.NewGaugeVec\(prometheus\.GaugeOpts\{.*?\},\s*\[\]string\{([^}]*)\}\)', _WATCHER_METRICS_GO.read_text(), re.S)
+        assert match, f"clusterUp has no label slice in {_WATCHER_METRICS_GO}"
+        labels = set(_go_words(_WATCHER_METRICS_GO, match.group(1)))
+        self.assertEqual(
+            {_go_const(_SCRAPE_GO, "clusterUpClusterLabel"), _go_const(_SCRAPE_GO, "clusterUpProjectLabel"), _go_const(_SCRAPE_GO, "clusterUpLocationLabel")},
+            labels,
+        )
+
     def test_the_brokers_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("TOOL_INVOCATIONS_METRIC"), _go_const(_SCRAPE_GO, "toolInvocationsSeries"))
 
@@ -267,6 +278,17 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_chat_plugins_negative_feedback_family_is_the_one_the_poller_sums_into_negative_feedback(self):
         self.assertEqual(_py_const("CHAT_FEEDBACK_NEGATIVE_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatFeedbackNegativeSeries"))
 
+    def test_the_a2a_gateways_answer_ratings_are_the_feedback_counters_family(self):
+        """On a next-mode install the A2A gateway's answer ratings feed both feedback
+        counters, split on the rating label: down into negativeFeedbackTotal beside the
+        plugin's family, up into positiveFeedbackTotal."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "answerFeedbackName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aAnswerFeedbackSeries"))
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "labelRating"), _go_const(_SCRAPE_GO, "a2aRatingLabel"))
+        feedback_go = _REPO_ROOT / "a2a" / "gateway" / "feedback.go"
+        self.assertEqual(_go_const(feedback_go, "FeedbackUp"), _go_const(_SCRAPE_GO, "a2aRatingUp"))
+        self.assertEqual(_go_const(feedback_go, "FeedbackDown"), _go_const(_SCRAPE_GO, "a2aRatingDown"))
+
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""
@@ -281,6 +303,11 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_chat_plugins_gave_up_family_is_the_one_the_poller_sums_into_kanban_tasks_gave_up(self):
         self.assertEqual(_py_const("KANBAN_GAVE_UP_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanGaveUpSeries"))
+
+    def test_the_chat_plugins_dispatcher_gauge_is_the_one_the_poller_reads_into_kanban_dispatcher_failing(self):
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILED_TICKS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailedTicksSeries"))
+        self.assertEqual(_py_const("BOARD_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherBoardLabel"))
+        self.assertEqual(_py_const("ERROR_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherErrorLabel"))
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

@@ -91,7 +91,7 @@ and each caller routes to the right one.**
 
 - Slot cap: `DEFAULT_MAX_CONCURRENT_COMMANDS = 8` (`credential_proxy.py:261`). The operator pins
   it, and a CR cannot override it (`platformagent_manifests.go:82`).
-- Child memory budget: (limit − 320 MiB) / 176 MiB per request. That gives 9 at the 2 GiB default,
+- Child memory budget: (limit − 192 MiB) / 176 MiB per request. That gives 10 at the 2 GiB default,
   on Autopilot without bursting too (limit clamped to the 2 GiB Autopilot request). The smaller of
   the two numbers binds.
 - Session role: its own cap of 2, refused at once and not queued (`credential_proxy.py:322`).
@@ -536,7 +536,7 @@ caller presents, and nothing the caller can set alone changes it.
 - Inside a class the order stays arrival order. Interactive requests go ahead of queued background
   requests, within the cap.
 - On Autopilot without bursting the limit equals the request. The broker's Autopilot default
-  request is 2 GiB, so the budget admits 9 and the slot cap holds it to 8. A CR that lowers the
+  request is 2 GiB, so the budget admits 10 and the slot cap holds it to 8. A CR that lowers the
   memory request to 1 GiB would make the budget admit 4, and `B = 2`. So when the tier is on,
   each exec replica requests at least 2 GiB (§3.3), and `B = 6` on every cluster mode.
 - A background request held at `B` waits up to 60 s, as today's queue does, and is then refused
@@ -742,7 +742,7 @@ with an agent image that has the #3933 fix (`f8fc7905`) and the broker at 1 CPU 
 | Baseline, one pod | 2, 8, 16, 32 clusters, with a fleet audit that really runs                                                         | Where waits and refusals start, and the sweep's share                                     | 2 and 8 measured, 3 runs each (#4242); 16 and 32 not yet                                                            |
 | Mixed concurrency | 8, 10, 12, 15 interactive questions during a sweep; interactive command time under a background `gcloud` sweep     | Interactive waits and run time behind background work, today and with §4 (the nice value) | Questions measured at 8 clusters, 3 runs each, without a parallel sweep (#4242); command time under a sweep not yet |
 | Vertical control  | Broker CPU at 2 cores at 8 clusters (`bench/scale/broker-proxy-raised.yaml` on #4242); #4107 ran 4 CPU at 2 and 16 | CPU-bound or slot-bound                                                                   | Measured, 1 run (#4242)                                                                                             |
-| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 9, slot cap 8)                                     | No burst above the requests                                                               | Not yet                                                                                                             |
+| Autopilot         | One point at the 2 CPU / 2 GiB Autopilot default (budget admits 10, slot cap 8)                                    | No burst above the requests                                                               | Not yet                                                                                                             |
 | Mode              | One baseline point in `spec.mode: today`                                                                           | Phase 1 covered `next` only                                                               | Not yet                                                                                                             |
 | Exec tier         | 1, 2 and 3 replicas at 16 and 32 clusters                                                                          | #4082 "Done when": the chosen shape at two or more sizes                                  | Not yet; needs the tier                                                                                             |
 | `kubectl` split   | The baseline points again with #4128's switch on                                                                   | The broker sized without the `kubectl` share, and the k8s-api-proxy's own load            | Not yet; needs #4128                                                                                                |
@@ -871,12 +871,18 @@ cache contract.
        not kill it before the drain and the exit end. Chat receipts still unsettled go back to
        Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
        process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
-       in `credential_proxy.py`, the broker and exec roles).
-     - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
-       `terminationGracePeriodSeconds` longer than the longest command it admits. Today an exec
-       pod runs the broker's 30 s drain inside the broker's 45 s grace period; the longer drain is
-       #4780. A PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or
-       more; at 1 replica it protects nothing.
+       in `credential_proxy.py`, the broker role).
+     - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: it
+       lasts as long as the longest command the pod admits, the 300 s command timeout plus the
+       60 s slot wait, because a request still waiting for a slot at SIGTERM can be admitted. The
+       pod's `terminationGracePeriodSeconds` is 380 s, which holds the 360 s drain, the end wait
+       and the exit. An idle pod still stops after the 3 s settle. A stopping pod keeps its CPU
+       and quota until it exits, so a rollout step whose replacement has no room waits up to that
+       long. At 1 replica, callers get `draining` refusals until the replacement is Ready (for the
+       whole drain when the replacement has no room), not a fallback to the stateful broker. A
+       PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1
+       replica it protects nothing. This half is implemented (`EXEC_SHUTDOWN_DRAIN_SECONDS` in
+       `credential_proxy.py`, `credentialProxyExecTierTerminationGraceSeconds` in the operator).
 1. **Off by default.** New CR field `spec.deployment.credentialProxy.exec.replicas`. The value 0
    (the default) means no exec tier and no `CREDENTIAL_PROXY_EXEC_URL`, so every install behaves
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling
