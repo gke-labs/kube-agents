@@ -26151,6 +26151,34 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertEqual(payload["prs_opened"], [])
         self.assertEqual(self.harness.forge_calls("proposal-create"), [])
 
+    def chat_report_text(self):
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        return "\n".join(str(part.get("text") or "") for part in record["parts"])
+
+    def test_the_chat_report_carries_the_notes_with_the_ledger_line_last(self):
+        """The relay posts this report on a scheduled run, not the model's
+        message, so the notes have to be in it."""
+        self.harness.replies = {"issue-list": issues_view([]), "issue-create": created("issue", "https://github.com/acme/fleet/issues/7")}
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        rc = self.run_finish(make_doc(), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        lines = self.chat_report_text().splitlines()
+        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", lines)
+        self.assertIn("issues/7", lines[-1])
+
+    def test_a_clean_chat_report_with_no_ledger_carries_the_notes(self):
+        self.harness.replies = {"issue-list": issues_view([])}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(f"- {audit_report.NOTES_LEAD}: prod-us-east: {ROTATED_NOTE}", self.chat_report_text())
+
+    def test_a_carried_noted_finding_owes_no_remediation_file(self):
+        """The sweep will not open it, so `finish` does not demand its file."""
+        self.previous_a()
+        doc = make_doc(findings=[make_finding(fid="a", title="Alpha finding")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest())])
+        self.assertEqual(rc, 0, self.err)
+
     def test_a_noted_finding_the_body_cut_for_space_keeps_its_fix_open(self):
         """The previous body cut `a` for space: its id is in the complete
         block, not the rendered one. A noted `a` is still carried, so its
@@ -26170,6 +26198,24 @@ class TestScopeNotesReachTheReader(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertEqual(self.stdout_json()["prs_closed"], [])
         self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        # The rewritten body keeps `a` in its block, so the next run still
+        # carries it.
+        body = self.harness.bodies_for("issue-update")[0]
+        self.assertIn(derived_id(fid="a"), audit_report.parse_delta_block(body))
+
+    def test_a_clean_run_does_not_close_over_a_noted_finding_the_body_cut(self):
+        previous_body = published_body(make_doc(findings=[make_finding(fid="b", title="Bravo finding")]), generated_at=NOW)
+        previous_body += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), derived_id(fid="b")])} -->\n'
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(self.noted_manifest(noted_objects=True))])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
 
     def test_an_omitted_finding_on_a_noted_object_is_held_not_resolved(self):
         """The collector could not see `a`, so a run with other findings does

@@ -1602,6 +1602,21 @@ class ProjectScopedRoleTest(_Harness):
         assert 'instance/startup-fail-* serial_contains "Script \\"startup-script\\" failed with error"' in body, body
         assert "not in the serial port 1 output of startup-fail-seeded (us-central1-a," in body, body
 
+    def test_an_instance_name_with_a_double_hyphen_is_read(self):
+        """GCE allows `--` inside a name; a flag or a newline is still refused."""
+        calls = []
+
+        def run(cmd, timeout):
+            calls.append(cmd)
+            return 0, "boot output", ""
+
+        with mock.patch.object(ffs, "_run", run):
+            self.assertEqual(ffs.read_serial("p", "startup-fail--x", "us-central1-a"), "boot output")
+            for bad in ("--zone=x", "startup-fail-x\n", "1vm"):
+                with self.subTest(bad), self.assertRaises(ffs.Unreadable):
+                    ffs.read_serial("p", bad, "us-central1-a")
+        self.assertEqual(len(calls), 1)
+
     def test_a_rotated_console_does_not_hold_the_wait(self):
         """Only a reboot puts the line back, so a wait would be spent for
         nothing: one pass, then drift."""

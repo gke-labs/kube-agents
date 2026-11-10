@@ -227,6 +227,9 @@ INSTANCE_KIND = "instance"
 SERIAL_PORT = 1
 # A Compute Engine zone as the instance list's `zone` URL ends in it.
 ZONE_RE = re.compile(r"[a-z]+-[a-z]+[0-9]+-[a-z]")
+# A Compute Engine instance name, as GCE defines it: a letter first, and
+# hyphens anywhere inside, `--` included. No flag or shell metacharacter fits.
+INSTANCE_NAME_RE = re.compile(r"[a-z]([-a-z0-9]*[a-z0-9])?")
 # Ops whose subject must be a `node?<selector>`.
 NODE_SELECTOR_ONLY_OPS = frozenset({OP_NODE_CPU_SPARE})
 NODE_KIND = "node"
@@ -554,7 +557,7 @@ def read_serial(project: str, name: str, zone: str) -> str:
     """One instance's serial port 1 output. The name and zone come from the
     instance list; anything outside their shapes is refused rather than put on
     a command line. A failed or empty read is Unreadable."""
-    if not NAME_RE.fullmatch(name) or not ZONE_RE.fullmatch(zone):
+    if not INSTANCE_NAME_RE.fullmatch(name) or not ZONE_RE.fullmatch(zone):
         raise Unreadable(f"instance {name!r} in zone {zone!r} is not a name this script reads")
     cmd = [
         "gcloud", "compute", "instances", "get-serial-port-output", name,

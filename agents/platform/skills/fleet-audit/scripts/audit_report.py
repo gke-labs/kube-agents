@@ -4927,6 +4927,12 @@ def render_chat_report(
         lines.append(
             f"- The collector flagged {len(dropped)} candidate(s) this run's document does not carry."
         )
+    # The targets' notes, before the ledger line, which stays last for the
+    # Slack headline. A `[SILENT]` run posts no report, so its notes stay in
+    # the store.
+    notes = scope_notes(data)
+    if notes:
+        lines.append(f"- {NOTES_LEAD}: " + "; ".join(notes))
     if payload.get("issue_url"):
         lines.append(CHAT_REPORT_LEDGER_LINE.format(url=payload["issue_url"]))
     return "\n".join(lines)
@@ -8287,6 +8293,7 @@ def collector_held_entries(
     exclude: set[str],
     previous_body: str | None,
     preview_from_candidates: bool = False,
+    carried_ids: Iterable[str] = (),
 ) -> list[dict]:
     """The findings the collector still flags that this run must carry, sorted by id.
 
@@ -8342,6 +8349,10 @@ def collector_held_entries(
         clusters = {str(entry.get("name") or "") for entry in _manifest_clusters(manifest)}
         marker_ids, _ = previous_marker_ids(previous_body, flagged, clusters)
         held_ids = [fid for fid in marker_ids if fid in flagged]
+        # A noted id the ledger carried without a rendered row: the body cut
+        # it for space, and `carried_ids` (every id the ledger carried) still
+        # names it. Its identity comes from `noted_objects` below.
+        held_ids += sorted((set(carried_ids) & noted_ids(manifest) & flagged) - set(held_ids))
         respelled = _respelled_rows(previous_body, flagged, clusters)
         # Titles from the rows that recorded a location, not from every
         # heading. `held_row_from_id` renders a heading too -- "<id> (carried
@@ -19619,7 +19630,13 @@ def unwritten_sweep_fixes(
     floor_rank = SEVERITY_RANK[AUTO_PROMOTION_FLOOR]
     unvouched_rank = SEVERITY_RANK[UNVOUCHED_PROMOTION_FLOOR]
     vouched = collector_vouched_findings(findings, manifest)
-    excluded = uncorroborated_findings(findings, manifest) | set(triage_markers(findings, manifest))
+    # The sweep passes over a finding on a noted object too
+    # (`promotion_candidates` `not_visible`), so no file is owed for one.
+    excluded = (
+        uncorroborated_findings(findings, manifest)
+        | set(triage_markers(findings, manifest))
+        | noted_finding_ids(findings, manifest)
+    )
     declared_at = {
         _candidate_identity(entry, candidate): str(
             (candidate.get("declaration") or {}).get("path") or ""
@@ -24197,7 +24214,7 @@ def _finish_store_ledger(
     if delta_known and manifest is not None:
         held_entries, held_dropped = cap_held_entries(
             collector_held_entries(
-                manifest, data, exclude=held_exclude, previous_body=previous_body
+                manifest, data, exclude=held_exclude, previous_body=previous_body, carried_ids=previous_ids
             )
         )
     elif delta_known:
@@ -25683,7 +25700,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     if manifest is not None and not memory_lost:
         held_entries, held_dropped = cap_held_entries(
             collector_held_entries(
-                manifest, data, exclude=held_exclude, previous_body=previous_body
+                manifest, data, exclude=held_exclude, previous_body=previous_body, carried_ids=ledger_ids_known
             )
         )
     elif manifest is None and not memory_lost:
