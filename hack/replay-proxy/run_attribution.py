@@ -53,7 +53,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 import replay_cache
 import schema as F
 
-CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
+CARD_RE = re.compile(r"^t_[0-9a-f]{8}\Z")
 # Hermes' first message to a worker (bench/kube_agents_bench/worker_trajectory.py reads the same).
 WORKER_OPENING_RE = re.compile(r"\Awork kanban task (t_[0-9a-f]{8})\b")
 CREATE_TOOL = "kanban_create"
@@ -101,7 +101,7 @@ STORE_REQUESTS_DIR = os.path.join("store", "requests")
 STORE_BLOBS_DIR = os.path.join("store", "blobs")
 MESSAGES_KEY = "messages"
 # The names the store writes: a request id (uuid4 hex) and a blob (sha256 hex).
-SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}$")
+SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}\Z")
 # An answer's identity in a history: [context, answer] (normalizer.answer_variant).
 ANSWER_PAIR_LENGTH = 2
 TEXT_ENCODING = "utf-8"

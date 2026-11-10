@@ -68,16 +68,16 @@ JSON_SUFFIX = replay_cache.JSON_SUFFIX
 VARIANT_SEPARATOR = "-"
 SEGMENT_SUFFIX = ".jsonl"
 HEX = replay_cache.CACHE_HEX
-SAFE_HEX = re.compile(rf"^{HEX}$")
+SAFE_HEX = re.compile(rf"^{HEX}\Z")
 # A cache object's name under the version prefix: replay_cache.CACHE_REL_RE's
 # layout with each variant flattened to one name, `variants/<context>-<answer>.json`.
 OBJECT_NAME_RE = re.compile(replay_cache.CACHE_LAYOUT_PATTERN.replace(replay_cache.VARIANT_JOINER, re.escape(VARIANT_SEPARATOR)))
-NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}$")
-POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}\Z")
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
 # A build id as a path segment: hack/ci-env.sh's REPLAY_SHADOW_BUILD_RE, which
 # tests/test_ci_replay_shadow.py holds equal to this.
 BUILD_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
-BUILD_RE = re.compile(rf"^{BUILD_PATTERN}$")
+BUILD_RE = re.compile(rf"^{BUILD_PATTERN}\Z")
 # A publish record's fields, read by fetch_cache.py and lane_report.py.
 RECORD_BUILD = "build"
 RECORD_FINAL = "final"
@@ -109,7 +109,7 @@ GCLOUD_TIMEOUT_SECONDS = 300.0
 TEXT_ENCODING = "utf-8"
 UPLOAD_STAGING_PREFIX = "replay-cache-publish-"
 RECORD_STAGING_PREFIX = "replay-cache-record-"
-BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
 
 # Why an answer was not uploaded, beside run_attribution's decisions.
 NO_RECORDING_LINE = "no_recording_line"

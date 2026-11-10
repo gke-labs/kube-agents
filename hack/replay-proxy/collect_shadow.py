@@ -111,7 +111,7 @@ SOURCES = ((LOGS_DIR, SEGMENT_SUFFIX), (STORE_REQUESTS_DIR, JSON_SUFFIX), (STORE
 # machine or an object name: one directory from SOURCES, one plain file name.
 SAFE_NAME = re.compile(
     r"^(?:logs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.open)?"
-    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)$"
+    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)\Z"
 )
 
 # The proxy's saved answers, under the cache directory in the data volume
@@ -119,7 +119,7 @@ SAFE_NAME = re.compile(
 # file is one plain name under one of four directories, variants one level
 # deeper, so a name is checked like the others before it becomes a path.
 DEFAULT_CACHE_SUBDIR = "replay-cache"
-CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CACHE_REL_RE = replay_cache.CACHE_REL_RE
 CACHE_SEED_MARKER = ".seeded"
 # The kept copy on this machine: one directory per pod (its lines and its
@@ -127,7 +127,7 @@ CACHE_SEED_MARKER = ".seeded"
 KEEP_PODS_DIR = "pods"
 KEEP_LOGS_DIR = "logs"
 KEEP_CACHE_DIR = "cache"
-POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
 DEFAULT_PUBLISH_INTERVAL_SECONDS = 300.0
 PUBLISH_THREAD_NAME = "replay-cache-publish"
 # A file being written: the store's, and the collector's own kept copies.
@@ -176,8 +176,8 @@ ERROR_CLASS_OTHER = "other"
 # and REPLAY_SHADOW_BUILD_RE), so no object key this writes holds a `.` or `..`
 # segment: the bucket's IAM conditions match a key's prefix as text, and a
 # downloader that resolved `presubmit/x/../../nightly/` would file it elsewhere.
-BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
-BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
+BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 GCLOUD_ENV = {
     # A composite upload writes and deletes temporary objects, which needs a
     # delete grant the presubmit's identity should not hold.

@@ -314,6 +314,17 @@ class PublishTest(unittest.TestCase):
             with self.subTest(sub=sub, rel=rel):
                 self.assertIsNone(P.object_name(sub, rel))
 
+    def test_names_with_a_trailing_newline_are_refused(self):
+        self.assertIsNone(P.object_name("answers", f"{fp(1)}.json\n"))
+        for pattern, good in ((P.SAFE_HEX, fp(1)), (P.OBJECT_NAME_RE, f"variants/{fp(1)}-{'a' * 16}.json"),
+                              (P.NORMALIZER_VERSION_RE, VERSION), (P.POD_NAME_RE, POD),
+                              (P.BUILD_RE, "1790000000000000000"), (P.BUCKET_RE, BUCKET)):
+            with self.subTest(pattern=pattern.pattern):
+                self.assertTrue(pattern.match(good))
+                self.assertIsNone(pattern.match(good + "\n"))
+        self.assertFalse(P.valid_bucket_and_build(BUCKET + "\n", "1790000000000000000"))
+        self.assertFalse(P.valid_bucket_and_build(BUCKET, "1790000000000000000\n"))
+
     def _records(self):
         out = []
         for name, content in sorted(self.bucket.objects().items()):
