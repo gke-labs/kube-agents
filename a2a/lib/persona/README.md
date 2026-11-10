@@ -87,7 +87,7 @@ started with (`claude-code` or `antigravity`).
 
 [`agents/cluster/persona`](../../../agents/cluster/persona/README.md) is the
 cluster agent in this format: a read-only SRE for the GKE cluster each task
-names, with its skills and the two broker MCP servers it reads.
+names, with its skills and the broker MCP server a profile worker may read.
 
 ## Checking a persona
 
