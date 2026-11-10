@@ -219,7 +219,9 @@ CI enforcement: `make docs-check` runs the same checks as
   and the tag must contain that commit instead. A pull request or merge group
   that removes the text of a `pending` row a release already contains fails: a
   reword needs the new row labelled with that release and a trace entry, and a
-  removal needs a relabel first. A wrong label fails a push to
+  removal needs a relabel first; while an open release candidate (a
+  `staging_*` tag no release contains yet) holds the row, the text stays until
+  the release is tagged. A wrong label fails a push to
   `main` and a pull request that adds or relabels the row or edits its entry;
   on any other pull request it is a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run
