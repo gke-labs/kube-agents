@@ -1066,7 +1066,11 @@ class VcsBroker:
         `baseBranch` is the repository's pinned base, or None when this install
         pins none for it. It is the read a caller with no clone uses to learn
         which branch its proposals must target.
+
+        `writeMode` is the install's write mode (:func:`write_mode`), so a caller
+        learns that branch and proposal writes are refused before it clones.
         """
+        mode = write_mode()[0]
         try:
             forge, repo = self.registry.resolve(payload.get("repository"))
         except ForgeUnsupported as exc:
@@ -1077,9 +1081,11 @@ class VcsBroker:
                 "verbs": [],
                 "missing": [str(exc)],
                 "baseBranch": None,
+                "writeMode": mode,
             }
         answer = forge.capabilities(repo)
         answer["baseBranch"] = self._pinned_base(forge, repo)
+        answer["writeMode"] = mode
         return answer
 
     def clone(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2448,6 +2454,47 @@ WRITE_VERBS = frozenset(
 )
 
 
+# The install's write mode: `writeMode` from the tier CR of #3659, as one
+# install-level setting the broker alone enforces until tiers take it over
+# (same field name and values, so that needs no migration). `propose`, the
+# default, is today's behaviour. `none` is explain-only: the broker refuses
+# PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
+# and labels stay open to it, because an issue is how an audit reports.
+# Read on every request through write_mode(), the one place a second source
+# (a runtime setting) can be added. Today its only source is the broker's env,
+# so on a pod a change applies once the operator has rolled the broker (and the
+# agent pod, which gets the same spec.deployment.env).
+WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
+WRITE_MODE_PROPOSE = "propose"
+WRITE_MODE_NONE = "none"
+WRITE_MODES = (WRITE_MODE_NONE, WRITE_MODE_PROPOSE)
+PROPOSE_VERBS = frozenset(
+    {
+        "publish",
+        "branch-delete",
+        "proposal-create",
+        "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-acknowledge",
+    }
+)
+
+
+def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """The install's write mode and the raw value it was read from.
+
+    Unset or empty is `propose`. A value that is neither mode is `none`: a
+    setting someone wrote to restrict the agent must not lift the restriction
+    because it was misspelt.
+    """
+    raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
+    value = raw.strip().lower()
+    if not value:
+        return WRITE_MODE_PROPOSE, raw
+    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+
+
 # The verbs the HTTP layer answers for a repository this install does not
 # manage. `capabilities` reports what a forge serves and spends no credential.
 # Every other verb, read or write, is refused at the route first: reads used to
@@ -2545,7 +2592,13 @@ __all__ = [
     "ROLE_SELECTED_VERBS",
     "ROLE_UNREGISTERED",
     "UNGATED_VERBS",
+    "PROPOSE_VERBS",
+    "WRITE_MODE_ENV",
+    "WRITE_MODE_NONE",
+    "WRITE_MODE_PROPOSE",
+    "WRITE_MODES",
     "WRITE_VERBS",
+    "write_mode",
     "max_bundle_bytes",
     "route_table",
 ]

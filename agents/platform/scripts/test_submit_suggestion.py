@@ -116,6 +116,8 @@ class FakeBroker:
         # records as the author. Set it to somebody else and the proposals this
         # fake already holds become a stranger's.
         self.viewer = "kube-agents"
+        # The install's write mode, as the broker's `capabilities` reports it.
+        self.write_mode = "propose"
 
     def __call__(self, verb: str, payload: dict) -> dict:
         self.calls.append((verb, dict(payload)))
@@ -202,6 +204,10 @@ class FakeBroker:
         return {"forge": "local", "repo": payload["repository"], "branch": branch, "revision": tip}
 
     # -- collaboration verbs ---------------------------------------------
+
+    def capabilities(self, payload):
+        return {"forge": "local", "repo": payload["repository"], "baseBranch": self.base_branch,
+                "writeMode": self.write_mode}
 
     def identity(self, payload):
         if self.identity_fails_with:
@@ -827,7 +833,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         # however many calls `prepare` makes.
         self.assertEqual(
             [verb for verb, _ in self.broker.calls],
-            ["proposal-list", "proposal-list", "clone", "branch-view", "branch-delete"],
+            ["capabilities", "proposal-list", "proposal-list", "clone", "branch-view", "branch-delete"],
         )
 
     def test_prepare_reuses_a_name_whose_branch_was_merged_whole(self):
@@ -868,8 +874,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
     def test_prepare_is_unbothered_by_a_name_nobody_has_used(self):
         """The ordinary card, and the one the extra lookup must not cost anything.
 
-        One `proposal-list` for the open proposal, one for the name's history,
-        and nothing else across the seam. The open-proposal lookup is the first
+        One `capabilities` for the write mode, one `proposal-list` for the open
+        proposal, one for the name's history, and nothing else across the seam. The open-proposal lookup is the first
         of the two -- it decides which arm `prepare` takes -- and the
         spent-name lookup is the second, which is the whole of what the check
         added here.
@@ -877,7 +883,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         self.prepare()
         self.assertEqual(
             [verb for verb, _ in self.broker.calls],
-            ["proposal-list", "proposal-list", "clone"],
+            ["capabilities", "proposal-list", "proposal-list", "clone"],
         )
 
     def test_prepare_reads_the_base_off_the_open_proposal_not_the_default_branch(self):
@@ -992,6 +998,18 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                     self.run_subject("prepare", "--branch", branch)
                 self.assertIn("could not take the branch", str(caught.exception))
                 self.assertEqual(self.broker.payloads("publish"), [])
+
+    def test_prepare_refuses_an_explain_only_install_before_it_clones(self):
+        self.broker.write_mode = "none"
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            self.run_subject("prepare", "--branch", "platform-agent/scale-web")
+        self.assertEqual("WRITE_MODE_NONE", caught.exception.code)
+        self.assertIn("explain-only", str(caught.exception))
+        self.assertEqual(["capabilities"], [verb for verb, _ in self.broker.calls])
+
+    def test_prepare_goes_ahead_when_the_broker_does_not_report_a_write_mode(self):
+        self.broker.capabilities = lambda payload: {"forge": "local"}
+        self.assertEqual("platform-agent/scale-web", self.prepare()["branch"])
 
     def test_prepare_refuses_a_repository_outside_the_managed_list(self):
         with mock.patch.object(

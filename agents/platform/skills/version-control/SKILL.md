@@ -251,6 +251,11 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   `labels: false`): send the call again without the label option, do not call
   `label ensure`, and find your own proposals by their branch name. `FORGE_IDENTITY_UNKNOWN` means the
   forge cannot say which account this install is: report it.
+- **`WRITE_MODE_NONE` means this install is explain-only.** The broker refuses
+  `publish`, `branch delete` and every proposal write, however you call them;
+  issues and reads still work. `capabilities` reports it as `writeMode: none`,
+  so check before you clone to make a change. Do not retry or look for another
+  path: reply with the change you would make and why.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
   credential side, so there is nothing else to release.
 - **Read `exitCode` and `stderr`.** The read verbs pass git's own exit status

@@ -489,6 +489,27 @@ def clear_spent_branch(repo: str, branch: str, spent: dict, in_the_way: str, bas
     log(f"{spent_named}. Deleted the spent branch at {revision[:12]}; the name is free.")
 
 
+def refuse_an_explain_only_install(repo: str) -> None:
+    """Refuse before anything is cloned when the install's write mode is `none`.
+
+    The broker refuses the `publish` either way (`WRITE_MODE_NONE`); asking
+    `capabilities` first saves cloning and editing a change that cannot be
+    delivered. A broker that does not answer, or is too old to report
+    `writeMode`, leaves the decision to that `publish`.
+    """
+    try:
+        answer = vcs_client.forge("capabilities", {}, repository=repo)
+    except vcs_client.VcsError:
+        return
+    if answer.get("writeMode") == "none":
+        raise vcs_client.VcsError(
+            "this install is explain-only (writeMode: none): it does not push branches or "
+            "open pull requests. Do not retry or find another way to make the change. "
+            "Reply with what you would change and why, so a person can make it.",
+            code="WRITE_MODE_NONE",
+        )
+
+
 def handle_prepare(args) -> int:
     """Bring the repository down and stand on the branch this change goes on.
 
@@ -511,6 +532,7 @@ def handle_prepare(args) -> int:
     # suggestion to whichever one `resolve_repo` happens to answer with.
     repo = args.repo or gitops_workspace.resolve_repo()
     repo = validate_repo(repo)
+    refuse_an_explain_only_install(repo)
 
     proposal = open_proposal(repo, branch)
     if proposal:

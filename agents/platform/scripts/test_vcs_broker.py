@@ -2406,6 +2406,38 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("proposal-claim", vcs_broker.VCS_VERBS)
         self.assertNotIn("proposal-claim", vcs_broker.WRITE_VERBS)
 
+    def test_write_mode_reads_the_two_tier_values_and_fails_closed(self):
+        env = vcs_broker.WRITE_MODE_ENV
+        self.assertEqual("KUBEAGENTS_WRITE_MODE", env)
+        for raw, mode in (
+            (None, "propose"), ("", "propose"), ("  ", "propose"), ("propose", "propose"),
+            ("NONE", "none"), (" none\n", "none"), ("off", "none"), ("read-only", "none"),
+        ):
+            with self.subTest(raw=raw):
+                environ = {} if raw is None else {env: raw}
+                self.assertEqual(mode, vcs_broker.write_mode(environ)[0])
+
+    def test_capabilities_reports_the_write_mode_for_a_served_and_an_unserved_host(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(
+            Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda provider, repo: None
+        )
+        for repository in ("acme/infra", "https://git.example.invalid/a/b"):
+            with self.subTest(repository=repository):
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}):
+                    self.assertEqual("none", broker.capabilities({"repository": repository})["writeMode"])
+                with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: ""}):
+                    self.assertEqual("propose", broker.capabilities({"repository": repository})["writeMode"])
+
+    def test_propose_verbs_are_writes_that_move_a_branch_or_touch_a_proposal(self):
+        self.assertLess(vcs_broker.PROPOSE_VERBS, vcs_broker.WRITE_VERBS)
+        self.assertEqual(
+            {"issue-create", "issue-comment", "issue-update", "issue-close", "label-ensure"},
+            set(vcs_broker.WRITE_VERBS - vcs_broker.PROPOSE_VERBS),
+            "a new write verb must be classified for writeMode: none",
+        )
+
     def test_proposal_claim_refuses_each_failed_forge_check_with_409(self):
         old = (datetime.now(timezone.utc) - timedelta(seconds=vcs_broker.CLAIM_WINDOW_SECONDS + 120))
         ahead = (datetime.now(timezone.utc) + timedelta(seconds=vcs_broker.CLAIM_CLOCK_SKEW_SECONDS + 120))
