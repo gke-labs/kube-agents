@@ -4203,7 +4203,7 @@ if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The certification lane never appends either: its record is the logs
-# bucket, read by the certified-capabilities page per case and model, and
+# bucket, read by the certified-capabilities page per case and release, and
 # none of its cases is on the blocking roster, so the admission window has
 # nothing to decide for them. It reads the store like a presubmit.
 if [ "${EVAL_TIER}" = "certification" ]; then
