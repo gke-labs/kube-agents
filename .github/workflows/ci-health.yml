@@ -672,9 +672,11 @@ jobs:
           ISSUES_REPO: ${{ vars.KUBE_AGENTS_ISSUES_REPO }}
         run: |
           if printf '%s' "$ISSUES_REPO" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
-            echo "valid=true" >> "$GITHUB_OUTPUT"
-            echo "owner=${ISSUES_REPO%%/*}" >> "$GITHUB_OUTPUT"
-            echo "name=${ISSUES_REPO#*/}" >> "$GITHUB_OUTPUT"
+            {
+              echo "valid=true"
+              echo "owner=${ISSUES_REPO%%/*}"
+              echo "name=${ISSUES_REPO#*/}"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "::warning::KUBE_AGENTS_ISSUES_REPO must be owner/name; the issues go to this repository this tick"
             echo "valid=false" >> "$GITHUB_OUTPUT"
