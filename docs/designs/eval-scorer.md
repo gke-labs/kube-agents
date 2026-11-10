@@ -153,7 +153,7 @@ pod instead, by the Hermes session the bridge's `api` executor ran the turn in, 
 can carry the delegated workers' tagged entries and token counts. The scorer treats
 `worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern (the trace records no results) as blind on
-such a record unless it carries the workers, with the exceptions below; any other router-scope `tool_called` is blind only when the
+such a record unless it carries the workers (or, for a `workers`-scope `tool_called` with no `result` pattern, the harness's `harness_no_worker_calls` entry), with the exceptions below; any other router-scope `tool_called` is blind only when the
 door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`: a stopped ask's, and a pushed-report replay's plant entry) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
@@ -198,7 +198,9 @@ half is keyed on what the record carries (`_inject_workers_carried()`). The dele
 this path reads the workers' calls from the pod and puts them on the trajectory tagged with their
 profile, and the harness writes a `harness_worker_capture_gaps` entry when that read could not
 read everything. A `worker_blind_checks` entry grades on an inject record that carries tagged
-worker entries and no such gap entry, and is set aside on any other. Two subsets stay set aside on
+worker entries and no such gap entry, and is set aside on any other, except that a
+`worker_calls_checks` entry (every leaf a `workers`-scope `tool_called` with no `result` pattern)
+grades on zero calls on a record carrying `harness_no_worker_calls` and no worker entry or gap. Two subsets stay set aside on
 a record with the workers: `worker_router_checks`, which also read the router's calls, on a record
 whose marker reports a loss; and `worker_untraced_checks`, which read what the trace never carries
 (a router-scope `result` or `arguments` pattern, or `report_times_in_window`), on every record. A

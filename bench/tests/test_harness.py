@@ -5746,6 +5746,60 @@ def test_settle_records_a_capture_gap_on_the_trajectory(
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
+@pytest.mark.parametrize(
+    "card, entries, commands, summary, expected",
+    [
+        (("done", None), [], [], {}, True),
+        (("blocked", "needs_input"), [], [], {}, True),
+        (("blocked", "dependency"), [], [], {}, True),
+        (("blocked", "capability"), [], [], {}, True),
+        (("blocked", "needs_input", "spawn failed"), [], [], {}, False),
+        (("blocked", "transient"), [], [], {}, False),
+        (("blocked", "capacity"), [], [], {}, False),
+        (("blocked", None), [], [], {}, False),
+        (("archived", None), [], [], {}, False),
+        (("failed", None), [], [], {}, False),
+        (None, [], [], {}, False),
+        (("done", None), [{"name": "kanban_show", "agent": "platform", "task": "t_1"}], [], {}, False),
+        (("done", None), [], [{"task": "t_1", "command": "ls"}], {}, False),
+        (("done", None), [], [], {"clipped": ["calls"], "errors": []}, False),
+    ],
+    ids=[
+        "done", "needs-input", "dependency", "capability", "breaker-after-a-block", "rate-limit-transient", "capacity",
+        "breaker-gave-up", "archived", "failed", "not-on-board", "worker-entry", "worker-command", "capture-gap",
+    ],
+)
+def test_settle_records_cards_closed_with_no_worker_call(
+    card, entries, commands, summary, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: ``_settle`` writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
+    only when every awaited card was closed by an agent (done, or one of
+    ``kanban_block``'s kinds), the read is clean and the capture holds no
+    worker entry or logged command. The platform's own blocks (breaker,
+    rate-limit guardrail, admission) and a gap never earn it."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": ""})
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: list(commands))
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(e) for e in entries], summary=summary),
+    )
+    on_board = (
+        {}
+        if card is None
+        else {"t_1": harness.board.BoardCard(card[0], block_kind=card[1], error=card[2] if len(card) > 2 else None)}
+    )
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1"])] if expected else [])
+    assert harness.worker_trajectory.NO_WORKER_CALLS_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+
+
 @pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
 def test_settle_records_a_read_that_did_not_complete(awaited: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
     """A turn that delegated and whose read returned nothing leaves the gap

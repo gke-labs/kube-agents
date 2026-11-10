@@ -818,6 +818,22 @@ def _result(output: str, names: list[str], tokens: dict, **metadata: object) -> 
     )
 
 
+@pytest.mark.parametrize("wake_marked, answer_marked", [(True, False), (False, True), (True, True)])
+def test_merge_keeps_a_no_worker_calls_entry_only_when_both_turns_carry_one(wake_marked: bool, answer_marked: bool) -> None:
+    """#5371: the entry speaks for the cards of the turn that wrote it."""
+    from kube_agents_bench import worker_trajectory
+
+    def turn(marked: bool, output: str) -> AgentResult:
+        result = _result(output, ["kanban_show"], {})
+        if marked:
+            result.trajectory.append(worker_trajectory.no_worker_calls_entry(["t_1"]))
+        return result
+
+    merged = card_wake.merge(_PLANTED, turn(wake_marked, "[SILENT]"), turn(answer_marked, "Unblocked it."))
+    kept = [e for e in merged.trajectory if e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert len(kept) == (2 if wake_marked and answer_marked else 0)
+
+
 def test_merge_grades_the_wake_reply_and_keeps_both_trajectories() -> None:
     wake = _result("[SILENT]", [], {"input": 10, "output": 1, "total": 11}, session_id="s")
     answer = _result(

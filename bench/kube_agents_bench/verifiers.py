@@ -2005,7 +2005,15 @@ class ToolCalledVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         entries = [entry for entry in snap.trajectory if isinstance(entry, dict)]
-        if self.scope != "router" and not any(entry.get("agent") for entry in entries):
+        # The harness's NO_WORKER_CALLS_ENTRY says the workers ran and made no
+        # call, on a clean capture: grade zero calls instead of an unobservable subject.
+        names = {entry.get("name") for entry in entries}
+        no_worker_calls = (
+            self.scope == "workers"
+            and worker_trajectory.NO_WORKER_CALLS_ENTRY in names
+            and worker_trajectory.GAP_ENTRY not in names
+        )
+        if self.scope != "router" and not no_worker_calls and not any(entry.get("agent") for entry in entries):
             return VerificationResult(
                 success=False,
                 status="error",
