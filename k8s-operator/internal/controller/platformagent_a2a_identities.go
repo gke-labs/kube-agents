@@ -17,6 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+	"sort"
+	"strings"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -371,6 +375,39 @@ const a2aProfileSubmitSubjects = "a2a.submit.*.*.*.*"
 // beside each cancel it sends a profile task, and the dispatcher reads it.
 const a2aDispatchStopSubjects = "a2a.stop.*.*"
 
+// a2aGatewayUser is the gateway's NATS user.
+const a2aGatewayUser = "gateway"
+
+// a2aProfileSupervisorPrefix and a2aProfileSupervisorSuffix spell a profile's
+// supervisor subjects, a2a.tasks.<profile>.*.supervisor: where the dispatcher
+// writes a profile task's terminal failures (lib.TaskSupervisorSubject). The
+// gateway is denied each one (gatewayProfileSupervisorDeny).
+const (
+	a2aProfileSupervisorPrefix = "a2a.tasks."
+	a2aProfileSupervisorSuffix = ".*.supervisor"
+)
+
+// gatewayProfileSupervisorDeny is the gateway's publish deny for each bound
+// profile's supervisor subjects, in name order. The gateway's allow holds
+// a2a.tasks.*.*.supervisor for the sessions it spawns, whose names it mints
+// per incarnation and no grant can enumerate; NATS wildcards match whole
+// tokens, so the profiles are subtracted by name instead, which leaves the
+// dispatcher the one direct publisher there. The list rides nats.conf, so a
+// profile bound or unbound re-renders it and rolls the bus, whether or not the
+// dispatcher runs. A name that isn't one subject token addresses no task and
+// is skipped.
+func gatewayProfileSupervisorDeny(profiles []string) []string {
+	var out []string
+	for _, p := range profiles {
+		if p == "" || strings.ContainsAny(p, ".*> \t\r\n") {
+			continue
+		}
+		out = append(out, a2aProfileSupervisorPrefix+p+a2aProfileSupervisorSuffix)
+	}
+	sort.Strings(out)
+	return slices.Compact(out)
+}
+
 // The operator's own bus principal: its NATS user and inbox owner, and the
 // directory it writes AgentProfile cards to (agentprofile_card.go).
 const (
@@ -467,8 +504,11 @@ func a2aIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 }
 
 // gateway: task requester, chat-session supervisor, session-registry owner.
-// Production scopes supervisor publish to sessions the gateway spawned;
-// statically that collapses to the task-supervisor wildcard.
+// Its supervisor publish is the task-supervisor wildcard, for the sessions it
+// spawns: their names are minted per incarnation, one subject token each, so
+// no static grant can list them. The profiles' supervisor subjects are the
+// dispatcher's alone, and nats.conf denies the gateway each one by name
+// (gatewayProfileSupervisorDeny, applied in renderA2AStaticUsers).
 //
 // The supervisor's terminal goes on `…supervisor`, the executor's events on
 // `…events`, and the gateway holds publish on the first and not the second.
@@ -560,7 +600,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 	)
 
 	return a2aIdentity{
-		user:    "gateway",
+		user:    a2aGatewayUser,
 		account: a2aAccountControl,
 		comment: "task requester, chat-session supervisor, session-registry owner.\n" +
 			"STATIC, and this one is a sequencing fact rather than a property of\n" +

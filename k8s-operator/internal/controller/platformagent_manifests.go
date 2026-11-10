@@ -277,8 +277,19 @@ const (
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
 	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
-	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude when
+	// watcherAlertExcludeFileEnv is unset.
 	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
+	// watcherAlertExcludeFileEnv names the mounted file that holds the same
+	// JSON; start-services.sh passes it as --alert-exclude-file.
+	watcherAlertExcludeFileEnv = "WATCHER_ALERT_EXCLUDE_FILE"
+	// eventWatcherAlertExcludeSuffix names the ConfigMap that holds the
+	// rules, after the agent's name; eventWatcherAlertExcludeKey is its one
+	// key, and the file's name in eventWatcherAlertExcludeMountPath.
+	eventWatcherAlertExcludeSuffix    = "-event-watcher-alert-exclude"
+	eventWatcherAlertExcludeKey       = "rules.json"
+	eventWatcherAlertExcludeVolume    = "event-watcher-alert-exclude"
+	eventWatcherAlertExcludeMountPath = "/etc/kube-agents/event-watcher"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -4457,6 +4468,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watchers' broker token. Here and in no other container of this
 			// Pod: the watcher role is what reaches the fleet through the broker.
 			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
+			// The alert-exclude rules. No subPath: a subPath mount never sees
+			// a change to the ConfigMap.
+			{Name: eventWatcherAlertExcludeVolume, MountPath: eventWatcherAlertExcludeMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4491,16 +4505,57 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
-	// Managed, so reserved by the merge below, only when the list is set: an
-	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
-	// spec.deployment.env, which the watcher read before this field existed.
-	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
-		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	// The rules reach the watcher as a file from a ConfigMap, which the
+	// watcher reads again every minute, so a change to the list applies
+	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
+	// env takes the same key for an image whose entrypoint predates the file.
+	// Both are written whether or not the list is set, so setting the first
+	// rule or removing the last one changes no pod template either. Managed,
+	// so reserved by the merge below, except when the list is empty and
+	// spec.deployment.env sets WATCHER_ALERT_EXCLUDE: that entry, which the
+	// watcher read before this field existed, then applies as it did.
+	if eventWatcherAlertExclude(agent) != "" || !deploymentEnvSets(agent, watcherAlertExcludeEnv) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: watcherAlertExcludeEnv, ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+				Key:                  eventWatcherAlertExcludeKey,
+			}}},
+			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
+		)
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// deploymentEnvSets reports whether spec.deployment.env has an entry named name.
+func deploymentEnvSets(agent *agentv1alpha1.PlatformAgent, name string) bool {
+	if agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEventWatcherAlertExcludeConfigMap holds the alert-exclude rules for the
+// agent-api-auth container, as eventWatcherAlertExclude renders them, or ""
+// for none. It is mounted without subPath and is in no pod-template hash, so
+// the kubelet updates the file in place, usually within a minute, and the
+// watcher puts the change in force on its next read of the file.
+func buildEventWatcherAlertExcludeConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + eventWatcherAlertExcludeSuffix,
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{eventWatcherAlertExcludeKey: eventWatcherAlertExclude(agent)},
+	}
 }
 
 // eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
@@ -5240,6 +5295,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// destination or credential.
 		"CRON_IDLE_HIBERNATE_DAYS": {},
 		"CRON_IDLE_THROTTLE_DAYS":  {},
+
+		// The catch-up policy's step, in minutes
+		// (agents/chat/scripts/cron_catch_up_policy.py): after a pause the
+		// dispatcher skips a model-run cron job's catch-up when it is a whole
+		// period late and releases the rest this far apart. Parsed as a whole
+		// number; `0` turns the policy off and anything else means the
+		// default. Like the two above it changes only when jobs already on
+		// the roster run, by moving their next_run_at in the profile's own
+		// store, and adds no job, path, destination or credential.
+		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

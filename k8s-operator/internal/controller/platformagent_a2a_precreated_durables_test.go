@@ -219,7 +219,7 @@ func TestTheProvisionScriptCreatesTheFixedDurablesAsTheTestsDo(t *testing.T) {
 // consumer add updates it in place, and nobody needs delete.
 func TestAnOlderReadersDurableConvergesToTheProvisionedOne(t *testing.T) {
 	creds := a2aFullCreds("e", "1")
-	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"]))
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -295,7 +295,7 @@ func TestAFailedDurableAddFailsTheRunOnlyWhenTheDurableIsMissing(t *testing.T) {
 // consumer, a per-task durable) still can.
 func TestTheFixedTasksDurablesOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("d", "1")
-	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"]))
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	pw := func(key string) string { return string(creds.Data[key]) }
 
 	s, log := a2aStartRenderedServer(t, conf)

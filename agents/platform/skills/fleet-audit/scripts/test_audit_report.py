@@ -35092,6 +35092,31 @@ class TestStoreLedger(HarnessTestCase):
         self.assertEqual(1, len(self.harness.forge_calls("proposal-close")))
         self.assertIn(proposal["url"], out["summary"])
 
+    def test_a_scoped_install_leaves_another_installs_unlabelled_fix_on_the_store_path(self):
+        # The store ledger on a forge with proposals and labels but no issue
+        # tracker: the stale close is handed the stored ids, so #9, whose id
+        # this install never stored, stays open while this install's own #8
+        # closes.
+        self.forge_is({"forge": "stub", "verbs": PROPOSAL_VERBS, "labels": True})
+        with scoped({audit_report.LEDGER_SCOPE_ENV: "tenant-b"}):
+            self.claim()
+            self.touch(self.NETPOL)
+            doc = make_doc()
+            self.run_once(doc)
+            validated = audit_report.load_findings(audit_report.findings_path_for(AUDIT), AUDIT)
+            ours = self.open_proposal(8, validated)
+            theirs = {**self.open_proposal(9, validated, body_ids=["x"]), "source": "platform-agent/fix-theirs"}
+            self.harness.replies["proposal-list"] = {"proposals": [ours, theirs], "truncated": False}
+            clean = make_doc(findings=[])
+            clean["resolved_because"] = [
+                {**{k: validated["findings"][0][k] for k in ("check", "cluster", "namespace", "object")},
+                 "reason": "kubectl get networkpolicy -n payments now lists default-deny; it was applied on 2026-09-16."}
+            ]
+            out = self.run_once(clean)
+        self.assertEqual(out["prs_closed"], [ours["url"]])
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
     def test_a_clean_run_over_an_unexplained_finding_closes_nothing(self):
         self.claim()
         self.touch(self.NETPOL)
@@ -37301,6 +37326,195 @@ class TestScopedRemediationPrs(ScopedHarnessTestCase):
         self.assertEqual((found or {}).get("number"), 8)
 
 
+class TestUnlabelledPullRequestOfAnotherInstall(ScopedHarnessTestCase):
+    """A pre-upgrade remediation pull request carries no scope label (#5229).
+
+    During a mixed-version window every install that shares the repository
+    reads it as its own. A scoped install's stale close therefore leaves an
+    unlabelled open pull request alone when none of the ids it covers was
+    ever on this install's ledger: it is some other install's fix, and this
+    run never looked for its findings.
+    """
+
+    OURS = "platform-agent/fix-ours"
+    THEIRS = "platform-agent/fix-theirs"
+
+    def close(self, prs, current_ids=frozenset(), **kwargs):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            closed = audit_report.close_stale_remediation_prs(
+                "acme/fleet", AUDIT, prs, set(current_ids), {"a": "Old title"}, {}, NOW, **kwargs
+            )
+        self.err = err.getvalue()
+        return closed
+
+    def theirs(self):
+        return pr(9, self.THEIRS, body=audit_report.delta_block(["x"]))
+
+    def test_an_unlabelled_pull_request_this_install_never_listed_is_left_alone(self):
+        self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.harness.forge_calls("proposal-comment"), [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+        self.assertIn("never listed", self.err)
+
+    def test_one_this_install_listed_is_still_closed(self):
+        ours = pr(8, self.OURS, body=audit_report.delta_block(["a"]))
+        self.assertEqual(self.close([ours], previous_ids=["a"]), [ours["url"]])
+        self.assertTrue(self.harness.forge_calls("proposal-close", number=8))
+
+    def test_one_covering_a_current_finding_is_this_installs(self):
+        # An id this run sees is this install's whatever the ledger listed
+        # before, so the pull request is judged as it always was: the finding
+        # persists, and it stays open for that reason, not for the skip.
+        self.assertEqual(self.close([self.theirs()], {"x"}, previous_ids=["a"]), [])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_orphan_rule_does_not_reach_it_either(self):
+        # On a findings run the branch rule closes a pull request on no
+        # group's branch, and another install's branch is never one of ours.
+        closed = self.close(
+            [self.theirs()], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}
+        )
+        self.assertEqual(closed, [])
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertIn("never listed", self.err)
+
+    def test_a_forge_with_no_labels_skips_nothing(self):
+        # No pull request there carries a scope label, and the listing already
+        # proved each one this install's, so the question does not arise.
+        self.harness.replies["capabilities"] = NO_ISSUES_NO_LABELS
+        theirs = self.theirs()
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": theirs["body"]}}
+        self.assertEqual(self.close([theirs], previous_ids=["a"]), [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+
+    def test_the_shields_close_comes_before_the_skip(self):
+        # A finding in a namespace this install declared is this install's
+        # whatever the ledger listed: the shield closes it, on the
+        # declaration, as it did before (and over a lost memory, where
+        # `previous_ids` is empty).
+        theirs = self.theirs()
+        closed = self.close([theirs], previous_ids=[], shielded_ids={"x"})
+        self.assertEqual(closed, [theirs["url"]])
+        self.assertNotIn("never listed", self.err)
+        self.assertIn("declared", "".join(self.harness.bodies_for("proposal-comment")).lower())
+
+    def test_with_the_labelled_or_unscoped_cases_as_before(self):
+        # This install's own label: the skip is not for it. No scope at all:
+        # the install owns everything on the stream, as before scopes. No
+        # `previous_ids` handed in: the caller has no ledger to judge by.
+        labelled = {**self.theirs(), "labels": [{"name": self.scope.label}]}
+        self.assertEqual(self.close([labelled], previous_ids=["a"]), [labelled["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        with scoped({audit_report.LEDGER_SCOPE_ENV: ""}):
+            self.assertEqual(self.close([self.theirs()], previous_ids=["a"]), [self.theirs()["url"]])
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        self.assertEqual(self.close([self.theirs()]), [self.theirs()["url"]])
+
+    def test_a_clean_run_leaves_another_installs_pre_upgrade_fix_open(self):
+        # End to end: the ledger carried `a`, whose fix is #8; #9 is a fix
+        # some other install opened before scopes for a finding this ledger
+        # never had. The clean run closes #8 and leaves #9 alone.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        a_id = derived_id(fid="a")
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+            "proposal-list": proposals_view(
+                [
+                    pr(8, self.OURS, body=audit_report.delta_block([a_id])),
+                    pr(9, self.THEIRS, body=audit_report.delta_block(["x"])),
+                ]
+            ),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertTrue(self.harness.forge_calls("issue-close", number=42))
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8])
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_id_the_body_cut_counts_as_listed_on_a_seeded_memory(self):
+        # The store was never written for this ledger, so the memory is
+        # seeded from the issue body and holds no document; the ids the body
+        # budget cut live only in its `audit-findings-all` block. A fix for
+        # one of them is this install's and closes as before.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        # No store the harness wrote on the test's behalf: the body the
+        # listing serves is all the run has, as on the first run after an
+        # upgrade that brings in the store.
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        findings_file = self.write_findings(doc)
+        code = BaseTestCase.run_main(
+            self, ["finish", "--audit", AUDIT, "--findings-file", findings_file, "--scheduled"]
+        )
+        self.assertEqual(code, 0, self.err)
+        self.assertIn("seeding this run's memory once", self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    def test_a_held_open_run_over_a_seeded_memory_keeps_the_cut_ids_listed(self):
+        # The run after a seeded, held-open clean run: the store now holds
+        # the seeded body beside that run's own empty document and
+        # `ledger_held_open`, so no stored document names the cut ids; the
+        # body's complete block still does, and the fix for one closes.
+        previous = published_body(make_doc(findings=[make_finding(fid="a")]), generated_at=NOW)
+        previous += f'\n<!-- audit-findings-all: {json.dumps([derived_id(fid="a"), "cut.id"])} -->\n'
+        self.seed_report(previous, ledger_held_open=True)
+        self.harness.replies = {
+            "issue-list": issues_view(
+                [{"number": 42, "url": "https://github.com/acme/fleet/issues/42", "body": previous}]
+            ),
+            "proposal-list": proposals_view([pr(8, self.OURS, body=audit_report.delta_block(["cut.id"]))]),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual([c["number"] for c in self.harness.forge_calls("proposal-close")], [8], self.err)
+        self.assertNotIn("never listed", self.err)
+
+    NETPOL = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def test_a_findings_run_leaves_it_open_where_the_branch_rule_closed_it(self):
+        # The findings branch of `finish`: this install's fix goes to its
+        # group's branch, so #9's branch is no group's and the branch rule
+        # would have closed it as moved; the skip comes first.
+        self.touch(self.NETPOL)
+        self.harness.replies.update(
+            {
+                "identity": {"login": "kube-agents-bot"},
+                "issue-list": {"issues": []},
+                "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+                "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+                "rev-parse --abbrev-ref": "feature-branch\n",
+                "proposal-list": proposals_view([self.theirs()]),
+            }
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-close"), [])
+        self.assertEqual(self.stdout_json()["prs_closed"], [])
+        self.assertIn("PR #9 carries no scope label and covers x", self.err)
+
+    def test_an_old_scheme_body_is_left_open_without_the_never_listed_claim(self):
+        old = pr(9, self.THEIRS, body='<!-- audit-findings: ["x"] -->\n<!-- audit-id-scheme: 0 -->')
+        self.assertEqual(self.close([old], {"a"}, previous_ids=["a"], branch_by_finding={"a": self.OURS}), [])
+        self.assertIn("another id scheme", self.err)
+        self.assertNotIn("never listed", self.err)
+
+
 # --------------------------------------------------------------------------- #
 # Relative ages in finding text are dated to the run (#4901)
 # --------------------------------------------------------------------------- #
@@ -37468,6 +37682,16 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         self.assertIn("closed as completed", comment)
         self.assertIn("Not confirmed fixed: 1 previously reported finding", comment)
         self.assertIn(f"- `{RETIRED_CLUSTER}`: `{self.gone_id()}`", comment)
+        # The lead above that note must not claim what the note takes back.
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        # Nor the banner `close_ledger_reads_clean` puts at the top of the
+        # closed ledger: it names the retired id instead of "all resolved".
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn(audit_report.CLEAN_CLOSE_MARKER, banner)
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("not confirmed fixed", banner)
+        self.assertIn(f"`{self.gone_id()}`", banner)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["resolved"], 1)
@@ -37494,7 +37718,60 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         payload = self.stdout_json()
         self.assertEqual(payload["resolved"], 2)
         self.assertNotIn(audit_report.RETIRED_UNLISTED_KEY, payload)
-        self.assertNotIn("Not confirmed fixed", self.harness.bodies_for("issue-comment")[0])
+        comment = self.harness.bodies_for("issue-comment")[0]
+        self.assertNotIn("Not confirmed fixed", comment)
+        self.assertIn("Every finding previously reported here is gone", comment)
+        banner = self.harness.bodies_for("issue-update")[-1]
+        self.assertIn("all of them are resolved", banner)
+        self.assertNotIn("not confirmed fixed", banner)
+
+    def test_the_banner_names_the_retired_ids(self):
+        # The clean banner with nothing retired is the one it always was.
+        plain = audit_report.clean_close_banner(AUDIT, NOW)
+        self.assertIn("found none of the findings below, so all of them are resolved", plain)
+        self.assertEqual(audit_report.clean_close_banner(AUDIT, NOW, retired_ids=[]), plain)
+        banner = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["z.id", "a.id"])
+        self.assertTrue(banner.startswith(audit_report.CLEAN_CLOSE_MARKER))
+        self.assertNotIn("all of them are resolved", banner)
+        self.assertIn("2 of them are not confirmed fixed", banner)
+        self.assertIn("`a.id`, `z.id`", banner)
+        self.assertIn("retired with the ledger", banner)
+        one = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=["a.id"])
+        self.assertIn("1 of them is not confirmed fixed", one)
+        # The lead of the all-clear comment is conditioned the same way.
+        gone = {"id": "a.id", "cluster": RETIRED_CLUSTER, "check": "c", "object": "o"}
+        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW, retired=[gone])
+        self.assertNotIn("Every finding previously reported here is gone", comment)
+        self.assertIn("closed as completed", comment)
+        self.assertIn("1 finding on a cluster this run listed nowhere is not confirmed fixed", comment)
+        two = audit_report.render_clean_comment(
+            AUDIT, make_doc(findings=[]), NOW, retired=[gone, {**gone, "id": "b.id"}]
+        )
+        self.assertIn("2 findings on a cluster this run listed nowhere are not confirmed fixed", two)
+
+    def test_a_banner_whose_ids_do_not_fit_counts_them_instead(self):
+        # A body near the forge's limit: the named banner would push it over,
+        # so the count-only banner goes on rather than no banner at all.
+        ids = [f"check-{i}.cluster-{i}.ns-{i}.deployment-{i}" for i in range(40)]
+        named = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids)
+        counted = audit_report.clean_close_banner(AUDIT, NOW, retired_ids=ids, named=False)
+        self.assertIn("40 of them are not confirmed fixed, and the closing comment names them.", counted)
+        self.assertNotIn(ids[0], counted)
+        # And the closing comment does name them, with a marker past its cap.
+        many = [{"id": f"c.k.n.d-{i:03d}", "cluster": RETIRED_CLUSTER} for i in range(audit_report.MAX_DELTA_ROWS + 1)]
+        note = "\n".join(audit_report._comment_retired(many))
+        self.assertIn("…and 1 more", note)
+        self.assertIn(f"`{RETIRED_CLUSTER}`: `c.k.n.d-000`", note)
+        room = audit_report.MAX_BODY_CHARS - len(counted) - 2 - 100
+        live = audit_report.delta_block(["a"]) + "\n" + "x" * (room - len(audit_report.delta_block(["a"])) - 1)
+        self.assertGreater(len(named) + 2 + len(live), audit_report.MAX_BODY_CHARS)
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, live, NOW, retired_ids=ids))
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertTrue(body.startswith(counted))
+        # A body that fits with the named banner keeps it.
+        short = audit_report.delta_block(["a"])
+        self.assertTrue(audit_report.close_ledger_reads_clean("acme/fleet", 42, AUDIT, short, NOW, retired_ids=ids))
+        self.assertTrue(self.harness.bodies_for("issue-update")[-1].startswith(named))
 
     def test_a_cluster_in_scope_skipped_holds_the_close_instead(self):
         self.previous_ledger(self.gone())

@@ -45,11 +45,12 @@ grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 the latency line of [The nightly section](#the-nightly-section) when the night carried timing,
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
-the section was skipped. A night can be the builds of up to three periodics
-(the main job, the main-b job when the main part runs as two halves, and the
-writers job), reported as one night: the line names a part that is missing,
+the section was skipped. A night can be the builds of up to eight periodics
+(the main job, the main-b to main-e jobs when the main part runs as five
+shards, the writers job, and the writers-b and writers-c jobs when the
+writers part runs as three thirds), reported as one night: the line names a part that is missing,
 still running or cut short, the night counts as cut short when its main or
-main-b part is, and a night without its main or main-b part gives no verdict on
+main-b to main-e part is, and a night without one of those gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
 line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
@@ -846,8 +847,8 @@ post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
 
-A graded night, for one case, is a night where the part that ran the case (main
-or writers) was not cut off at the job deadline and at least one of the case's
+A graded night, for one case, is a night where the part that ran the case (its
+`nightly.py` part) was not cut off at the job deadline and at least one of the case's
 repetitions was graded. Three kinds of night are skipped, so they neither count
 toward a streak nor break one: a part Prow cut off at the deadline; a night
 where the case was not run or every repetition was infrastructure
@@ -1054,8 +1055,8 @@ plain text. A mentioned person must be a member of the space.
 
 The section is skipped, and the digest carries its one-line nightly summary
 plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
-night started in the last 36 hours, last night's run or either main half
-(main or main-b) still running or missing, no GitHub token, the issues unreadable or their
+night started in the last 36 hours, last night's run or any main shard
+(main, or main-b to main-e) still running or missing, no GitHub token, the issues unreadable or their
 listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
@@ -1185,9 +1186,9 @@ week (below).
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
-when none of its parts was cut off at the job deadline, it has both halves of
-the main matrix it owed (the main part, and the main-b part once that job runs;
-the digest withholds its verdict on a night without either), and it is not a
+when none of its parts was cut off at the job deadline, it has every shard of
+the main matrix it owed (the main part, and the main-b to main-e parts once
+those jobs run; the digest withholds its verdict on a night without one), and it is not a
 night on which nearly every graded case failed; two counted nights
 on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
