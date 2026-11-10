@@ -2171,7 +2171,7 @@ empty list, admits none. When a refused message addressed the
 bot (a DM or a mention), the refusal is logged with the sender's member id, and the sender
 gets one reply in that message's thread, once per workspace and member, saying the bot
 answers only its own workspace and naming the `T…:U…` entry that would admit them. A click on one of the bot's buttons by such a member is
-refused the same way, and shares that once-per-sender notice, in the question's thread. Without a team id from `auth.test` it refuses any
+refused the same way, and shares that once-per-sender notice, in the question's thread. The message shortcut admits a listed guest the same way, with `T…:U…` as the author; it drops an unlisted one with only the log line and no reply. Without a team id from `auth.test` it refuses any
 message that names a workspace, except a guest the list names, and warns once at start. A message that names no workspace
 in either field is taken as our own member's, which rests on Slack setting them on a
 shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on

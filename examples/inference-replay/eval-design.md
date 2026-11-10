@@ -212,8 +212,48 @@ The rules that keep this safe:
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
-  answers into later ones, live or replayed (#1730). Stripping it is a stopgap; fixing #1730 removes
-  the need.
+  answers into later ones, live or replayed (#1730). Its heading goes too, with the blank line
+  before it: whether a view has a digest at all depends on whether the assignee happened to finish
+  another card first, so a view with one keys the same as a view without. What an answer must not
+  repeat from a dropped digest still counts, as for a dropped event below: its keyed numbers,
+  epoch times, ages and dates, and any run of seven or more hex digits it holds outside an
+  identifier (a commit written as plain hex), since no placeholder can bring them up to date.
+  Stripping it is a stopgap; fixing #1730 removes the need.
+- **A card's `queued` events are dropped from the key, like its heartbeats.** The dispatcher adds
+  one when the card waited for a free worker ("Queued: the system is busy", with how many were
+  running), so whether a card has one depends on what else was running. What an answer must not
+  repeat from a dropped heartbeat or queued event still counts. An answer isn't saved if it
+  repeats the event's epoch `created_at` or another keyed number, an age or a date in it, or one
+  of the numbers in its payload (`running`, `limit`, `ahead`). For a payload number, the answer
+  must repeat it either next to its key (`running: 4`) or anywhere in an answer that talks about
+  the queue ("queued", "ahead", "behind", "system is busy"). Refusing every answer that holds the
+  same small number would refuse about one answer in five after a queued card, and none of the
+  64,027 distinct assistant messages stored from the Nov 7 nightlies and presubmits mentions a
+  queued event.
+- **The eval pool project is an identifier.** Every Prow build leases its own GCP project,
+  `kube-agents-evals` or `kube-agents-evals-<n>`, and its name is in 94% of requests (Nov 7 shadow
+  data): the Cluster Agent's profile name (`cluster-kube-agents-evals-31-seeded-a-…`), the front
+  door's list of specialists, the GitOps repository (`gke-agentic/kube-agents-evals-31-infra`) and
+  tool results. So it is bound like a card ID, inside longer names too, and an answer that says
+  `--project=kube-agents-evals-31` is served with this run's project. A numbered name counts
+  wherever no letter or digit comes before it (`xkube-agents-evals-31` stays literal). The bare name
+  also starts names that are the same in every run and belong to no project
+  (`kube-agents-evals-token-minter`, `kube-agents-evals-large-gitops`), so it counts only on its own
+  or before `-infra`, `-seeded`, `-platform` or `-us`, the parts a pool project adds to its own
+  names; anything else stays literal. A name inside a URL counts after a percent-escape too
+  (`project_id%3D%22kube-agents-evals-22%22`). In a run in the bare project, an answer that names
+  one of those constant names still holds the project's name inside it and isn't saved.
+- **Other per-run names are identifiers too:** a repository's commit, written as
+  `owner/repo@<sha>` or in a forge URL (`/blob/<sha>/`), since each pool project's repository has
+  its own history; the fleet audit's clone directory, `declared-intent-` and eight random
+  characters; and a GKE operation ID (`operation-<epoch ms>-<uuid>`), whose type and status stay
+  literal. An answer that quotes a bound commit anywhere is served with this run's commit. One
+  that holds a longer or shorter form of it than the request does (`c99b1ab` for
+  `c99b1ab1fee8…`) isn't saved, since nothing binds that form.
+- **A time of day on its own is left as written.** A bare `13:44` is in 43% of requests, but
+  without a date it can't be turned into how far from now it is: it may be yesterday's, another
+  time zone's, or a duration (`ps` prints CPU time as `0:47`). Any token for it would give
+  different moments, or different durations, one key, so it stays literal and costs those matches.
 - **Where a warning line lands doesn't change the key.** The shell tool mixes a command's errors
   and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
@@ -221,7 +261,9 @@ The rules that keep this safe:
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
-`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds
+`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages; the eval pool
+project, repository commits, the declared-intent clone directory and GKE operation IDs came later,
+from the Nov 7 shadow data. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
 events in one second would otherwise shift every later number. The measurements found two gaps,
 `ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the

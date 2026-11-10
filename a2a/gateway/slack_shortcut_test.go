@@ -214,6 +214,102 @@ func TestSlackShortcutDropsWhatIsNotOurs(t *testing.T) {
 	}
 }
 
+// shortcutFrom is a shortcut payload whose clicker and payload team are set:
+// userTeam on the clicker, team on the payload, either one empty to leave it
+// out.
+func shortcutFrom(t *testing.T, user, userTeam, team, actionTS string) json.RawMessage {
+	t.Helper()
+	var p map[string]any
+	if err := json.Unmarshal(shortcutPayload(t, "C1", "oncall", actionTS, alertMessage()), &p); err != nil {
+		t.Fatal(err)
+	}
+	p["user"] = map[string]any{"id": user, "team_id": userTeam}
+	p["team"] = map[string]any{"id": team}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// A member of another workspace that the allowlist names as "T…:U…" asks
+// through the shortcut as they do by message or click: a turn whose author
+// is that entry, so the gateway's allowlist matches it.
+func TestSlackShortcutFromAListedGuestIsATurn(t *testing.T) {
+	a, hooks := newShortcutAdapter(&fakeSlackAPI{})
+	a.SetAllowedGuests([]string{"T2:U9"})
+	turns := runShortcut(a, shortcutFrom(t, "U9", "T2", "T2", "210.1"))
+	if len(turns) != 1 || turns[0].AuthorID != "T2:U9" || !turns[0].Shortcut {
+		t.Fatalf("turns = %+v, want one shortcut turn authored T2:U9", turns)
+	}
+	if got := a.uxLocked().pending[slackPendingKey(turns[0].Conversation, turns[0].MessageID)].author; got != "T2:U9" {
+		t.Errorf("pending author = %q, want T2:U9, the id the gateway's verdict names", got)
+	}
+	if len(hooks.got()) != 0 {
+		t.Errorf("notes = %+v, want none for an admitted guest", hooks.got())
+	}
+	// Named only by the payload's team, as Slack may send it: matched by it.
+	// A fresh adapter: the message above is already waiting as an ask.
+	a, _ = newShortcutAdapter(&fakeSlackAPI{})
+	a.SetAllowedGuests([]string{"T2:U9"})
+	if turns := runShortcut(a, shortcutFrom(t, "U9", "", "T2", "210.2")); len(turns) != 1 || turns[0].AuthorID != "T2:U9" {
+		t.Errorf("a listed guest named only by team.id: turns = %+v, want one authored T2:U9", turns)
+	}
+}
+
+// After the gateway's word on a listed guest's shortcut: verified, a question
+// the task posts waits on the guest's Home tab, which Slack opens under their
+// member id; refused, the private note names their "T…:U…" entry, as the
+// gateway's own notice does.
+func TestSlackShortcutFromAListedGuestAfterTheVerdict(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	a.SetAllowedGuests([]string{"T2:U9"})
+	turns := runShortcut(a, shortcutFrom(t, "U9", "T2", "T2", "212.1"))
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.trackQuestion(turns[0].Conversation, "106.0", OutMessage{Text: "Raise the limit?",
+		Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Raise the limit?",
+			Choices: []chatmsg.Choice{{Text: "yes"}, {Text: "no"}}}})
+	if got := a.waitingOn("U9"); len(got) != 1 {
+		t.Errorf("the guest's Home tab lists %d questions, want 1", len(got))
+	}
+
+	refused, hooks := newShortcutAdapter(&fakeSlackAPI{})
+	refused.SetAllowedGuests([]string{"T2:U9"})
+	turns = runShortcut(refused, shortcutFrom(t, "U9", "T2", "T2", "212.2"))
+	refused.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
+	if got := hooks.got(); len(got) != 1 || got[0].text != unverifiedNotice(slackBackend, "T2:U9") {
+		t.Errorf("notes = %+v, want the notice naming T2:U9", got)
+	}
+}
+
+// Every other member of another workspace stays refused, with no reply: an
+// unlisted member of the listed guest's workspace, the listed member when the
+// two workspace fields disagree, and any guest under an empty list.
+func TestSlackShortcutFromAnUnlistedGuestIsDropped(t *testing.T) {
+	for name, tc := range map[string]struct {
+		guests                   []string
+		user, userTeam, team, ts string
+	}{
+		"unlisted member of a listed workspace": {[]string{"T2:U9"}, "U8", "T2", "T2", "211.1"},
+		"workspace fields disagree":             {[]string{"T2:U9"}, "U9", "T2", "T3", "211.2"},
+		"the plain member id is listed":         {[]string{"U9"}, "U9", "T2", "T2", "211.3"},
+		"no entries (allow-all)":                {nil, "U9", "T2", "T2", "211.4"},
+	} {
+		api := &fakeSlackAPI{}
+		a, hooks := newShortcutAdapter(api)
+		a.SetAllowedGuests(tc.guests)
+		if turns := runShortcut(a, shortcutFrom(t, tc.user, tc.userTeam, tc.team, tc.ts)); len(turns) != 0 {
+			t.Errorf("%s: turns = %+v, want none", name, turns)
+		}
+		if len(hooks.got()) != 0 || len(api.posted) != 0 {
+			t.Errorf("%s: notes=%+v posts=%+v, want no reply", name, hooks.got(), api.posted)
+		}
+		if n := len(a.uxLocked().pending); n != 0 {
+			t.Errorf("%s: %d pending asks, want none", name, n)
+		}
+	}
+}
+
 // A second shortcut on a message already waiting as an ask is dropped: the
 // pending entry is keyed by the message, so it would take the first's place
 // and its verdict.

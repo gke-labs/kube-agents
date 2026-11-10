@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -658,6 +659,55 @@ type SubscribeConfig struct {
 	// provision Job's TASKS stream can trail by more than the window while a
 	// three-server bus forms). The wait is logged; see startWithRetry.
 	WaitForStream bool
+	// Precreated binds to a durable the operator created and never creates
+	// or updates one (#4173): the subscriber needs no consumer-create grant
+	// for it, and holds none on its name. Until the operator has made it, the
+	// bind waits as WaitForStream waits for the stream.
+	Precreated bool
+}
+
+// ErrPrecreatedBindRefused is a Precreated bind refused because the durable
+// under the name is not the one this subscriber reads: retrying cannot
+// change it, so the bind fails at once.
+var ErrPrecreatedBindRefused = errors.New("pre-created durable refused")
+
+// checkPrecreated refuses a pre-created durable whose stored config is not
+// the one this subscriber would have created: its filters, explicit acks,
+// pull delivery, the MaxAckPending cap when one is set, and no inactivity
+// threshold, which would have the server delete a durable this subscriber
+// never re-creates. The provision Job brings a durable an older reader made
+// to these settings, so one that still differs was made some other way, and
+// would otherwise be bound as found and read with the wrong filter.
+func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
+	want := cfg.filterSubjects()
+	have := got.FilterSubjects
+	if got.FilterSubject != "" {
+		have = []string{got.FilterSubject}
+	}
+	refuse := func(why string) error {
+		return fmt.Errorf("%w: %s on %s %s", ErrPrecreatedBindRefused, cfg.Durable, cfg.Stream, why)
+	}
+	switch {
+	case !slices.Equal(slices.Sorted(slices.Values(have)), slices.Sorted(slices.Values(want))):
+		return refuse(fmt.Sprintf("filters %q, not %q", have, want))
+	case got.AckPolicy != jetstream.AckExplicitPolicy:
+		return refuse(fmt.Sprintf("acks %s, not explicit", got.AckPolicy))
+	case got.DeliverSubject != "":
+		return refuse("is a push consumer")
+	case got.DeliverPolicy != jetstream.DeliverAllPolicy || got.OptStartSeq != 0 || got.OptStartTime != nil:
+		return refuse(fmt.Sprintf("starts at %s, not the start of the stream", got.DeliverPolicy))
+	case got.HeadersOnly:
+		return refuse("delivers headers only")
+	case got.ReplayPolicy != jetstream.ReplayInstantPolicy:
+		return refuse(fmt.Sprintf("replays %s, not instantly", got.ReplayPolicy))
+	case got.MaxDeliver > 0:
+		return refuse(fmt.Sprintf("stops redelivering after %d attempts", got.MaxDeliver))
+	case cfg.MaxAckPending > 0 && got.MaxAckPending != cfg.MaxAckPending:
+		return refuse(fmt.Sprintf("caps unacked deliveries at %d, not %d", got.MaxAckPending, cfg.MaxAckPending))
+	case got.InactiveThreshold > 0:
+		return refuse(fmt.Sprintf("is deleted after %s inactive, and this subscriber never re-creates it", got.InactiveThreshold))
+	}
+	return nil
 }
 
 // filterSubjects is the consumer's filter set, however it was spelled.
@@ -812,7 +862,7 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			}
 			return nil
 		}
-		if errors.Is(err, ErrHeldBindRefused) {
+		if errors.Is(err, ErrHeldBindRefused) || errors.Is(err, ErrPrecreatedBindRefused) {
 			return err
 		}
 		if serverAnswered(err) {
@@ -826,10 +876,12 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		// an attempt on it fails on jetstream's own API timeout, a
 		// context.DeadlineExceeded no error check can tell apart.
 		waitingFor := ""
-		if s.cfg.WaitForStream && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+		if (s.cfg.WaitForStream || s.cfg.Precreated) && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
 			switch {
 			case errors.Is(err, jetstream.ErrStreamNotFound):
 				waitingFor = "stream"
+			case s.cfg.Precreated && errors.Is(err, jetstream.ErrConsumerNotFound):
+				waitingFor = "consumer"
 			case connectionLost(err) || !s.c.Connected():
 				waitingFor = "connection"
 			}
@@ -848,6 +900,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				if waitingFor == "stream" {
 					s.c.log.Warn("still waiting for the stream; nothing has created it",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Warn("still waiting for the durable; the operator creates it",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 				} else {
 					s.c.log.Warn("still waiting for the bus connection to return",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
@@ -856,6 +911,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 				lastLog = now
 				if waitingFor == "stream" {
 					s.c.log.Info("waiting for the stream to be created",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else if waitingFor == "consumer" {
+					s.c.log.Info("waiting for the operator to create the durable",
 						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
 				} else {
 					s.c.log.Info("waiting for the bus connection to return",
@@ -950,6 +1008,19 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 		cons, err := s.held.bind(ctx, js, s.cfg)
 		if err != nil {
 			return err
+		}
+		return s.consume(cons)
+	}
+	if s.cfg.Precreated {
+		cons, err := js.Consumer(ctx, s.cfg.Stream, s.cfg.Durable)
+		if err != nil {
+			return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
+		}
+		if err := s.cfg.checkPrecreated(cons.CachedInfo().Config); err != nil {
+			return err
+		}
+		if s.deferred != nil {
+			s.deferred.bound(cons)
 		}
 		return s.consume(cons)
 	}
