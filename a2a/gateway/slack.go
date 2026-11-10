@@ -814,18 +814,23 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			switch inner := e.InnerEvent.Data.(type) {
 			case *slackevents.MessageEvent:
-				// event_ts is when Slack raised the event, which for an edit
-				// is the edit and not the original message's ts.
+				// The arrival is taken before the filter, which may read from
+				// Slack; the lag is observed only for a message that becomes a
+				// turn, so the bot's own posts and edits, and a redelivery the
+				// dedupe drops, stay out of it. event_ts is when Slack raised
+				// the event, which for an edit is the edit and not the
+				// original message's ts.
+				arrived := time.Now()
 				eventTS := inner.EventTimeStamp
 				if eventTS == "" {
 					eventTS = inner.TimeStamp
 				}
-				s.metrics.slackIngress(time.Now(), eventTS)
 				var parent string
 				if evt.Request != nil {
 					parent = slackParentUserID(evt.Request.Payload)
 				}
 				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
+					s.metrics.slackIngress(arrived, eventTS)
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)

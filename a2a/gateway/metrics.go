@@ -219,8 +219,9 @@ var (
 		consoleBackend: platformConsole,
 	}
 	// metricsSlackAPIMethods are the Slack Web API methods the method label
-	// names; a call to any other (a response_url post, a method added later)
-	// is counted as other.
+	// names; a call to any other (a method added later) is counted as other.
+	// A shortcut's response_url post goes through its own client and is not
+	// timed.
 	metricsSlackAPIMethods = []string{
 		"chat.postMessage", "chat.update", "chat.postEphemeral",
 		"reactions.add", "reactions.remove",

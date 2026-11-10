@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"math"
 	"net/http"
 	"path"
 	"slices"
@@ -74,7 +75,7 @@ func (m *Metrics) slackIngress(now time.Time, ts string) {
 		return
 	}
 	secs, err := strconv.ParseFloat(ts, 64)
-	if err != nil || secs <= 0 {
+	if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) || secs <= 0 {
 		return
 	}
 	lag := float64(now.UnixNano())/float64(time.Second) - secs

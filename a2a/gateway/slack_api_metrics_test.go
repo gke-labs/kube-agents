@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
+	"github.com/slack-go/slack/socketmode"
 )
 
 // histogramCount is how many observations one histogram series holds.
@@ -113,6 +116,8 @@ func TestSlackIngressLagReadsTheEventsTimestamp(t *testing.T) {
 	m.slackIngress(now, "1800000007.500000")
 	m.slackIngress(now, "1800000020.000000")
 	m.slackIngress(now, "not-a-ts")
+	m.slackIngress(now, "NaN")
+	m.slackIngress(now, "Inf")
 	m.slackIngress(now, "")
 	var out dto.Metric
 	if err := m.slackIngressLag.WithLabelValues().(prometheus.Metric).Write(&out); err != nil {
@@ -137,6 +142,43 @@ func TestASlackClickObservesItsIngressLag(t *testing.T) {
 	}
 	if got := out.GetHistogram().GetSampleCount(); got != 1 {
 		t.Fatalf("lag observations after a link click = %d, want 1", got)
+	}
+}
+
+// A message that becomes a turn through the pump is observed once; the bot's
+// own post, which the filter drops, is not.
+func TestTheSlackPumpObservesATurnsIngressLag(t *testing.T) {
+	srv, _ := stalledSlackStub(t)
+	a := newTestSlackAdapter(&fakeSlackAPI{})
+	m := NewMetrics()
+	a.SetMetrics(m)
+	a.sm = socketmode.New(slack.New("xoxb-stub", slack.OptionAPIURL(srv.URL+"/")))
+	for _, msg := range []*slackevents.MessageEvent{
+		slackMsg("im", "D1", "UBOT", "the bot's own post", "499.0", ""),
+		slackMsg("im", "D1", "U1", "hello", "500.0", ""),
+	} {
+		a.sm.Events <- socketmode.Event{
+			Type: socketmode.EventTypeEventsAPI,
+			Data: slackevents.EventsAPIEvent{Type: slackevents.CallbackEvent, InnerEvent: slackevents.EventsAPIInnerEvent{Data: msg}},
+		}
+	}
+	turned := make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() { returned <- a.Run(ctx, func(InboundMessage) { turned <- struct{}{} }) }()
+	select {
+	case <-turned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pump never reached the handler")
+	}
+	cancel()
+	<-returned
+	var out dto.Metric
+	if err := m.slackIngressLag.WithLabelValues().(prometheus.Metric).Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if got := out.GetHistogram().GetSampleCount(); got != 1 {
+		t.Fatalf("lag observations = %d, want the one turn's", got)
 	}
 }
 
