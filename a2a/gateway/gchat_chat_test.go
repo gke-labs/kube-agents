@@ -199,6 +199,62 @@ func TestGchatPostMessageLaysOut(t *testing.T) {
 	}
 }
 
+// A running item's open step that repeats the note its title shows is not
+// drawn: Chat draws the steps in the open, so the queued card's first message
+// read "⚙️ Queued: … / ◌ Queued: …" (seen live 2026-11-10), and every running
+// row's latest note read twice. The same goes for a failed item, whose title
+// is its last note. A complete item keeps every step, and so does one whose
+// title clipped the note: the step is then the only whole copy.
+func TestRenderGchatChatPlanDrawsARunningNoteOnce(t *testing.T) {
+	const queued = "Queued: the system is busy. Your request will start when a worker frees up."
+	// The emitter's title clip is 256, less up to 80 for the card's name in a
+	// plan of several; the step and the note are clipped at 300. Both end on
+	// a letter, since the layout trims a title's trailing space.
+	long240 := strings.TrimSpace(strings.Repeat("abcdefghi ", 24))
+	long260 := strings.TrimSpace(strings.Repeat("abcdefghi ", 26))
+	name80 := strings.Repeat("n", 80)
+	cases := []struct {
+		name string
+		item chatmsg.PlanItem
+		want string
+	}{
+		{"a queued card's opening row", chatmsg.PlanItem{ID: "a", Title: queued, Status: chatmsg.StatusInProgress, Steps: []string{queued}, StepCount: 1, Note: queued},
+			"⚙️ " + queued},
+		{"the first note after it", chatmsg.PlanItem{ID: "a", Title: "Reading the namespaces. · step 2 ▸", Status: chatmsg.StatusInProgress, Steps: []string{queued, "Reading the namespaces."}, StepCount: 2, Note: "Reading the namespaces."},
+			"⚙️ Reading the namespaces. · step 2 ▸\n  ✓ " + queued},
+		{"an open step that is the note", chatmsg.PlanItem{ID: "a", Title: "reading dev", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}, Note: "reading dev"},
+			"⚙️ reading dev\n  ✓ read prod"},
+		{"an open step the title does not show", chatmsg.PlanItem{ID: "a", Title: "Check channels", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}, Note: "read prod"},
+			"⚙️ Check channels\n  ✓ read prod\n  ◌ reading dev"},
+		{"no note sent: the title is compared", chatmsg.PlanItem{ID: "a", Title: "reading dev", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}},
+			"⚙️ reading dev\n  ✓ read prod"},
+		{"no note sent and the title is the card's", chatmsg.PlanItem{ID: "a", Title: "Check channels", Status: chatmsg.StatusInProgress, Steps: []string{"read prod", "reading dev"}},
+			"⚙️ Check channels\n  ✓ read prod\n  ◌ reading dev"},
+		{"the settled card keeps the queued step", chatmsg.PlanItem{ID: "a", Title: "Reviewed all 25 namespaces on seeded-a: nothing to fix", Status: chatmsg.StatusComplete, Steps: []string{queued, "Reading the namespaces."}, StepCount: 2, Result: "Reviewed all 25 namespaces on seeded-a: nothing to fix"},
+			"✅ Reviewed all 25 namespaces on seeded-a: nothing to fix\n  ✓ " + queued + "\n  ✓ Reading the namespaces."},
+		{"a failed card's title is its last note too", chatmsg.PlanItem{ID: "a", Title: "boom", Status: chatmsg.StatusError, Steps: []string{"tried", "boom"}, Note: "boom"},
+			"❌ boom\n  ✓ tried"},
+		{"a long note the title holds whole", chatmsg.PlanItem{ID: "a", Title: long240, Status: chatmsg.StatusInProgress, Steps: []string{long240}, Note: long240},
+			"⚙️ " + long240},
+		{"a long note behind a card's name, which the title clips", chatmsg.PlanItem{ID: "a", Title: name80 + " · " + long240[:170] + "…", Status: chatmsg.StatusInProgress, Steps: []string{long240}, Note: long240},
+			"⚙️ " + name80 + " · " + long240[:170] + "…\n  ◌ " + long240},
+		{"a note longer than a title holds", chatmsg.PlanItem{ID: "a", Title: long260[:255] + "…", Status: chatmsg.StatusInProgress, Steps: []string{"first", long260}, Note: long260},
+			"⚙️ " + long260[:255] + "…\n  ✓ first\n  ◌ " + long260},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &chatmsg.Message{Schema: chatmsg.Schema, Plan: &chatmsg.Plan{Items: []chatmsg.PlanItem{tc.item}}}
+			layout, err := renderGchatChat(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if layout.Text != tc.want {
+				t.Errorf("plan =\n%s\nwant\n%s", layout.Text, tc.want)
+			}
+		})
+	}
+}
+
 func TestGchatEditMessageLaysOutOrClears(t *testing.T) {
 	f := newFakeChatRelay(t)
 	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/S1/messages/M77"}
