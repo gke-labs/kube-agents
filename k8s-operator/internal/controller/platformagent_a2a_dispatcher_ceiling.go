@@ -190,7 +190,7 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear
 		condition.Message = fmt.Sprintf("the profile dispatcher's identity entry for %d profiles is %d bytes, %d%% of the %d bytes one identity-map shard can carry; "+
-			"past it the operator stops running the dispatcher (about 700 profiles at two tiers). Lifting the ceiling is %s", n, size, pct, a2aDispatcherCeilingBytes, dispatcherCeilingIssue)
+			"past it the operator binds no newer profiles (about 700 profiles at two tiers). Lifting the ceiling is %s", n, size, pct, a2aDispatcherCeilingBytes, dispatcherCeilingIssue)
 	default:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonWithin
