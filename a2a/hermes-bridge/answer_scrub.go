@@ -392,7 +392,17 @@ func (c *toolResultCollector) value(v any, depth int) {
 		c.text(t, depth)
 	case map[string]any:
 		secret := false
-		if kind, _ := t["kind"].(string); kind == "Secret" {
+		kind, _ := t["kind"].(string)
+		if items, ok := t["items"].([]any); ok && kind == "SecretList" {
+			// The API server's SecretList leaves kind off its items: each
+			// is a Secret.
+			for _, it := range items {
+				if m, ok := it.(map[string]any); ok && m["kind"] == nil {
+					m["kind"] = "Secret"
+				}
+			}
+		}
+		if kind == "Secret" {
 			c.secretObject(t)
 			secret = true
 		}
@@ -488,7 +498,9 @@ func (c *toolResultCollector) shapeCaught(v string) {
 // kubectl's output a block comes before its own object's kind, so an item
 // cut inside its data is taken as a Secret when every item of its list
 // read before it was one (kubectl get secrets -o json, cut short); a
-// single Secret cut there, with no kind read at all, is not read.
+// single Secret cut there, with no kind read at all, is not read. An item
+// of a SecretList's items is a Secret: the API server's list (kubectl get
+// --raw, a curl through the API proxy) leaves kind off its items.
 func (c *toolResultCollector) jsonSecretScan(t string) {
 	type pair struct {
 		key, value string
@@ -512,14 +524,17 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 		if !f.object || f.owner != nil {
 			return
 		}
+		kind := f.kind
+		if p := f.parent; kind == "" && p != nil && !p.object && p.parent != nil && p.parent.kind == "SecretList" && p.parent.key == "items" {
+			kind = "Secret" // the API server's SecretList leaves kind off its items
+		}
 		if p := f.parent; !cut && p != nil && !p.object {
-			if f.kind == "Secret" {
+			if kind == "Secret" {
 				p.secretItems++
 			} else {
 				p.otherItems++
 			}
 		}
-		kind := f.kind
 		if p := f.parent; cut && kind == "" && p != nil && !p.object && p.secretItems > 0 && p.otherItems == 0 {
 			kind = "Secret"
 		}

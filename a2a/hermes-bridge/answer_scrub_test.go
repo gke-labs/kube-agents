@@ -818,3 +818,26 @@ func TestSeenSecrets_AMoveToAFullSecretPoolKeepsTheValue(t *testing.T) {
 		t.Error("a value over the room left was tracked")
 	}
 }
+
+// A SecretList as the API server sends it (kubectl get --raw, a curl
+// through the API proxy) has kind on the list only; its items are Secrets,
+// read whole and cut short, under any data key.
+func TestSeenSecrets_RawSecretListItemsAreSecrets(t *testing.T) {
+	list := fmt.Sprintf(`{"kind":"SecretList","apiVersion":"v1","metadata":{"resourceVersion":"1"},"items":[`+
+		`{"metadata":{"name":"tls-a","namespace":"prod"},"type":"kubernetes.io/tls","data":{"tls.key":%q}},`+
+		`{"metadata":{"name":"app-db","namespace":"prod"},"type":"Opaque","data":{"password":%q}}]}`,
+		b64(synthSecretPlain), b64(synthSecretPlain2))
+	var whole seenSecrets
+	whole.collectToolResult(terminalResult(t, list))
+	for _, v := range []string{synthSecretPlain, synthSecretPlain2} {
+		if !whole.has(v) {
+			t.Errorf("a raw SecretList item's decoded value %q is not tracked", v)
+		}
+	}
+	cut := list[:strings.Index(list, "app-db")]
+	var c seenSecrets
+	c.collectToolResult(terminalResult(t, cut))
+	if !c.has(synthSecretPlain) {
+		t.Error("a raw SecretList cut short: its whole first item's decoded value is not tracked")
+	}
+}
