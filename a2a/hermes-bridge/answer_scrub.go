@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -711,12 +712,12 @@ func (c *toolResultCollector) yamlScope(lines []string) {
 	}
 }
 
-// yamlScalar is an entry's value: a quoted one's contents, else the value
-// with a trailing comment taken off.
+// yamlScalar is an entry's value: a quoted one's contents, its escapes
+// read (yamlQuoted), else the value with a trailing comment taken off.
 func yamlScalar(v string) string {
 	if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') {
-		if end := strings.IndexByte(v[1:], v[0]); end >= 0 {
-			return v[1 : 1+end]
+		if q, ok := yamlQuoted(v); ok {
+			return q
 		}
 	}
 	if i := strings.Index(v, " #"); i >= 0 {
@@ -727,4 +728,62 @@ func yamlScalar(v string) string {
 
 func yamlIndent(l string) int {
 	return len(l) - len(strings.TrimLeft(l, " \t"))
+}
+
+// yamlEscapes are the one-character escapes of a double-quoted YAML scalar.
+var yamlEscapes = map[byte]string{
+	'0': "\x00", 'a': "\a", 'b': "\b", 't': "\t", '\t': "\t", 'n': "\n", 'v': "\v", 'f': "\f",
+	'r': "\r", 'e': "\x1b", ' ': " ", '"': "\"", '/': "/", '\\': "\\", 'N': "\u0085",
+	'_': "\u00a0", 'L': "\u2028", 'P': "\u2029",
+}
+
+// yamlQuoted is the content of the quoted scalar v opens with: in double
+// quotes with its backslash escapes read, in single quotes with each
+// doubled quote read as one. ok is false when the quote does not close or
+// an escape is not YAML's.
+func yamlQuoted(v string) (string, bool) {
+	var sb strings.Builder
+	if v[0] == '\'' {
+		for i := 1; i < len(v); i++ {
+			if v[i] != '\'' {
+				sb.WriteByte(v[i])
+				continue
+			}
+			if i+1 < len(v) && v[i+1] == '\'' {
+				sb.WriteByte('\'')
+				i++
+				continue
+			}
+			return sb.String(), true
+		}
+		return "", false
+	}
+	for i := 1; i < len(v); i++ {
+		switch v[i] {
+		case '"':
+			return sb.String(), true
+		case '\\':
+			if i+1 >= len(v) {
+				return "", false
+			}
+			i++
+			if e, ok := yamlEscapes[v[i]]; ok {
+				sb.WriteString(e)
+				continue
+			}
+			n := map[byte]int{'x': 2, 'u': 4, 'U': 8}[v[i]]
+			if n == 0 || i+n >= len(v) {
+				return "", false
+			}
+			r, err := strconv.ParseUint(v[i+1:i+1+n], 16, 32)
+			if err != nil || !utf8.ValidRune(rune(r)) {
+				return "", false
+			}
+			sb.WriteRune(rune(r))
+			i += n
+		default:
+			sb.WriteByte(v[i])
+		}
+	}
+	return "", false
 }

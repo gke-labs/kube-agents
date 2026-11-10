@@ -841,3 +841,21 @@ func TestSeenSecrets_RawSecretListItemsAreSecrets(t *testing.T) {
 		t.Error("a raw SecretList cut short: its whole first item's decoded value is not tracked")
 	}
 }
+
+// A quoted stringData value is read with its YAML escapes: a double-quoted
+// one's backslash escapes, a single-quoted one's doubled quotes.
+func TestSeenSecrets_QuotedYAMLStringDataIsUnescaped(t *testing.T) {
+	cases := []struct{ yaml, want string }{
+		{`"synth\"pass\"0001"`, `synth"pass"0001`},
+		{`'synth''pass''0001'`, `synth'pass'0001`},
+		{`"synth\\pass\t0001"`, "synth\\pass\t0001"},
+		{`"synth-pass-0001" # a comment`, "synth-pass-0001"},
+	}
+	for _, tc := range cases {
+		var s seenSecrets
+		s.collectToolResult(terminalResult(t, "apiVersion: v1\nkind: Secret\nmetadata:\n  name: app-db\nstringData:\n  password: "+tc.yaml+"\n"))
+		if !s.has(tc.want) {
+			t.Errorf("stringData %s: %q is not tracked; set %q", tc.yaml, tc.want, s.values())
+		}
+	}
+}
