@@ -209,6 +209,11 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- $dispatcher := (.Values.operator.profileDispatcher | default dict) -}}
+{{- if and (hasKey $dispatcher "enabled") (eq (toString $dispatcher.enabled) "false") (not (hasKey $named "A2A_PROFILE_DISPATCHER")) }}
+- name: A2A_PROFILE_DISPATCHER
+  value: "false"
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -3158,7 +3163,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
-         #3869; the profile dispatcher, #4808). The operator renders each only while
+         #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
+         (operator.profileDispatcher.enabled false) it is still counted, which over-counts
+         by its one pod in the safe direction. The operator renders each only while
          its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
          renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.

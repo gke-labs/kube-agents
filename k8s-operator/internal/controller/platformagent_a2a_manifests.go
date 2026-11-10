@@ -4432,9 +4432,14 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
 	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
 	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// workloads behind an operator flag (the MCP door) come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
+	// (operator.profileDispatcher.enabled in the chart).
+	if a2aDispatcherEnabled() {
+		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
 	// (the builder above renders the one replica it runs before then).

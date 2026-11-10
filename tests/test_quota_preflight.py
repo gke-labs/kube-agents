@@ -1092,42 +1092,27 @@ class PreflightDecisionTest(unittest.TestCase):
         door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
         self.assertEqual(self._requirements(values=door), self._requirements())
 
-    def test_mode_next_counts_the_profile_dispatcher_when_its_image_is_set(self) -> None:
-        """The operator renders the dispatcher, in the release namespace, while
-        A2A_DISPATCHER_IMAGE is non-blank (#4808)."""
-        dispatcher = self._flagged()["dispatcher"]
-        self.assertGreater(dispatcher["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
-        for name, env in (
-            ("an image", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/dispatcher:1"}]),
-            ("padded", [{"name": "A2A_DISPATCHER_IMAGE", "value": " example.com/d:1 "}]),
-            ("by valueFrom", [{"name": "A2A_DISPATCHER_IMAGE",
-                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "image"}}}]),
-            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""},
-                             {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]),
-        ):
-            with self.subTest(name):
-                self._assert_counts(self._flagged_delta(env), dispatcher)
+    def test_mode_next_counts_the_profile_dispatcher_by_default(self) -> None:
+        """The operator renders the dispatcher by default under next, so the next-mode golden
+        carries it, footprint.yaml counts it, and files/flagged-pods.yaml no longer lists it."""
+        footprint = yaml.safe_load((_CHART / "files" / "footprint.yaml").read_text())
+        self.assertIn("a2aDispatcher", footprint["nextMode"])
+        self.assertNotIn("dispatcher", self._flagged())
 
-    def test_the_profile_dispatcher_is_not_counted_without_an_image(self) -> None:
-        for name, env in (
-            ("empty", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
-            ("blank, which the operator trims", [{"name": "A2A_DISPATCHER_IMAGE", "value": "   "}]),
-            ("tab and newline", [{"name": "A2A_DISPATCHER_IMAGE", "value": "\t\n"}]),
-            ("no value", [{"name": "A2A_DISPATCHER_IMAGE"}]),
-            ("a null value", [{"name": "A2A_DISPATCHER_IMAGE", "value": None}]),
-            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"},
-                             {"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
-        ):
-            with self.subTest(name):
-                self.assertEqual(set(self._flagged_delta(env).values()), {0})
+    def test_the_profile_dispatcher_count_does_not_follow_its_image_or_its_switch(self) -> None:
+        """An image override changes nothing it counts, and switching the dispatcher off
+        (operator.profileDispatcher.enabled=false) still counts its one pod: an over-count, in the
+        safe direction, which the chart's values comment states."""
+        base = self._requirements(["platformAgent.mode=next"])
         image = {"operator": {"extraEnv": [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]}}
-        self.assertEqual(self._requirements(values=image), self._requirements())
+        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=image), base)
+        off = {"operator": {"profileDispatcher": {"enabled": False}}}
+        self.assertEqual(self._requirements(["platformAgent.mode=next"], values=off), base)
 
-    def test_mode_next_counts_both_flagged_pods_together(self) -> None:
+    def test_mode_next_counts_the_mcp_server_beside_the_dispatcher(self) -> None:
         pods = self._flagged()
-        env = [{"name": "A2A_MCP_DOOR", "value": "true"},
-               {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
-        self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
+        env = [{"name": "A2A_MCP_DOOR", "value": "true"}]
+        self._assert_counts(self._flagged_delta(env), pods["mcp"])
 
     def _scope_publisher(self) -> dict:
         """files/transient-pods.yaml's entry; TestTheChartCountsTheScopePublishersJobPod holds it to the operator."""

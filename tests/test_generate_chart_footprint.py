@@ -578,7 +578,7 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 850m and 1472Mi."""
+        """The A2A stack's standing requests, provisioning Job aside: 900m and 1536Mi, the profile dispatcher included."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -590,7 +590,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (850, 1472 * _MIB))
+        self.assertEqual((cpu, memory), (900, 1536 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):

@@ -532,6 +532,9 @@ func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) 
 // With them, its entry is the directory and its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
+	// With the dispatcher off: on, the operator also syncs the profiles'
+	// durables, which the dispatcher's tests hold.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	agent := a2aTestAgent()
 	e, ok := renderedMapEntries(t, agent, nil)[a2aOperatorBusUser]
 	if !ok {

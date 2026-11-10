@@ -1607,10 +1607,11 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
 	}
 
-	// And the profile dispatcher, one more while its image is set (#4808).
-	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
-		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	// And the profile dispatcher, on by default (counted above), one fewer
+	// switched off.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), without)
 	}
 }
 
@@ -8642,10 +8643,10 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
 		}
 	})
-	t.Run("the dispatcher", func(t *testing.T) {
-		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
-		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
-			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+	t.Run("the dispatcher switched off", func(t *testing.T) {
+		t.Setenv(a2aProfileDispatcherEnvVar, "false")
+		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
+			t.Fatalf("standing pods with the dispatcher off = %d, want %d", got, base-1)
 		}
 	})
 }

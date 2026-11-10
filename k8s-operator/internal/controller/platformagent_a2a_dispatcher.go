@@ -55,9 +55,13 @@ const (
 	// install a principal and a pod.
 	// a2aDispatcherImageName is its name in the release set, which it is
 	// built and published under already; a2aDispatcherReleaseImage resolves
-	// it, so turning the default on is one line in a2aDispatcherImage.
+	// it.
 	a2aDispatcherImageName   = "a2a-dispatcher"
 	a2aDispatcherImageEnvVar = "A2A_DISPATCHER_IMAGE"
+	// a2aProfileDispatcherEnvVar turns the dispatcher off at "false", the
+	// one value that does; the chart sets it from
+	// operator.profileDispatcher.enabled.
+	a2aProfileDispatcherEnvVar = "A2A_PROFILE_DISPATCHER"
 
 	// a2aDispatcherUser is the dispatcher's NATS user, and so its inbox
 	// prefix and its verifier caller name. The binary spells the same string.
@@ -82,21 +86,25 @@ const (
 	agentProfileWorkerComponent = "agentprofile-worker"
 )
 
-// a2aDispatcherImage is the dispatcher's image: A2A_DISPATCHER_IMAGE, or
-// nothing. It is off by default until profiles dispatch end to end.
-func a2aDispatcherImage() string { return strings.TrimSpace(os.Getenv(a2aDispatcherImageEnvVar)) }
+// a2aDispatcherImage is the dispatcher's image, or nothing when
+// A2A_PROFILE_DISPATCHER turns it off. On by default: the release set's
+// image (a2aDispatcherReleaseImage), with A2A_DISPATCHER_IMAGE the override.
+func a2aDispatcherImage() string {
+	if strings.TrimSpace(os.Getenv(a2aProfileDispatcherEnvVar)) == "false" {
+		return ""
+	}
+	return a2aDispatcherReleaseImage()
+}
 
 // a2aDispatcherReleaseImage is the dispatcher's image as the release set
 // resolves it, the way the verifier's is (a2aReleaseImage), with
-// A2A_DISPATCHER_IMAGE still the override. Nothing calls it yet: rendering
-// the dispatcher by default is a2aDispatcherImage returning this.
+// A2A_DISPATCHER_IMAGE still the override.
 func a2aDispatcherReleaseImage() string {
 	return strings.TrimSpace(a2aReleaseImage(a2aDispatcherImageEnvVar, a2aDispatcherImageName))
 }
 
 // a2aDispatcherEnabled reports whether this operator renders the dispatcher:
-// only when A2A_DISPATCHER_IMAGE is set, so an empty image never renders a
-// Deployment with nothing to pull.
+// unless A2A_PROFILE_DISPATCHER is "false".
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {

@@ -170,6 +170,17 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
+  # profile task to a worker in the profile's warm pool, or runs an unattended
+  # one as a Job. Rendered beside every platformAgent.mode: next PlatformAgent
+  # the operator manages; under "today" the operator renders nothing for it.
+  # false sets A2A_PROFILE_DISPATCHER=false on the controller manager, which
+  # removes the dispatcher's Deployment and its bus principal, so AgentProfiles
+  # then publish cards that nothing dispatches. An A2A_PROFILE_DISPATCHER entry
+  # in extraEnv wins. Its image is the release set's a2a-dispatcher, with
+  # A2A_DISPATCHER_IMAGE (in extraEnv) the override.
+  profileDispatcher:
+    enabled: true
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families

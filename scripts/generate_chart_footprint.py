@@ -104,6 +104,7 @@ _A2A_CALLOUT = "a2aCallout"
 _A2A_VERIFIER = "a2aVerifier"
 _A2A_CONSOLE = "a2aConsole"
 _A2A_GATEWAY = "a2aGateway"
+_A2A_DISPATCHER = "a2aDispatcher"
 _A2A_PROVISION = "a2aProvision"
 _HERMES_BRIDGE = "hermesBridge"
 # The agent container's resources, which the operator copies onto the bridge under
@@ -159,6 +160,9 @@ _A2A_WORKLOADS = {
     _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", "verifier"),
     _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", "console"),
     _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", "gateway"),
+    # On by default; operator.profileDispatcher.enabled=false switches it off, and the
+    # preflight then over-counts its one pod.
+    _A2A_DISPATCHER: (_KIND_DEPLOYMENT, "platformagent-a2a-dispatcher", "dispatcher"),
 }
 
 # Kinds that put pods on a cluster. Every golden document of one of these has to reach the

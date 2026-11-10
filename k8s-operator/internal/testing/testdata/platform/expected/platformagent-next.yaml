@@ -2862,7 +2862,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "97c8c35dd2e8d6af",
+      "version": "1c982ea518e10246",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2970,6 +2970,30 @@ data:
               "_INBOX.verifier.>"
             ]
           }
+        },
+        {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-dispatcher",
+          "user": "dispatcher",
+          "account": "TRUSTED",
+          "grants": {
+            "publish": [
+              "$KV.PROFILE_LEASES.>",
+              "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+              "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
+              "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
+              "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
+              "$JS.FC.KV_PROFILE_LEASES.>",
+              "a2a.dispatch.*.*.*",
+              "a2a.cap.verify.dispatcher",
+              "_INBOX.dispatcher.>"
+            ],
+            "subscribe": [
+              "a2a.dispatch.*.*.*.accept",
+              "a2a.dispatch.*.*.*.lease",
+              "a2a.cap.reply.dispatcher.>",
+              "_INBOX.dispatcher.>"
+            ]
+          }
         }
       ]
     }
@@ -2978,7 +3002,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 97c8c35dd2e8d6af
+    kubeagents.x-k8s.io/a2a-authmap-version: 1c982ea518e10246
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -4770,7 +4794,240 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "36"
+    pods: "37"
+status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: dispatcher
+  name: platformagent-a2a-dispatcher
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  dispatch.json: |-
+    {
+      "version": "7839c8c0ddb1a702",
+      "namespace": "kubeagents-system",
+      "profileNamespace": "kubeagents-system-profiles",
+      "ceiling": 6,
+      "interactiveReserve": 2,
+      "childReserve": 2,
+      "leaseSeconds": 90,
+      "renewSeconds": 20,
+      "restartGraceSeconds": 60,
+      "acceptTimeoutSeconds": 10,
+      "submitRetentionSeconds": 259200,
+      "profiles": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: dispatcher
+  name: platformagent-a2a-dispatch
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: dispatcher
+  name: platformagent-a2a-dispatcher
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resourceNames:
+      - platformagent-a2a-dispatch
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: dispatcher
+  name: platformagent-a2a-dispatcher
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-a2a-dispatcher
+subjects:
+  - kind: ServiceAccount
+    name: platformagent-a2a-dispatcher
+    namespace: kubeagents-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: dispatcher
+  name: platformagent-a2a-dispatcher
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-dispatcher
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/task-signing-key-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-a2a-dispatcher
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: dispatcher
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: DISPATCH_CONFIGMAP
+              value: platformagent-a2a-dispatch
+            - name: A2A_TASK_SIGNING_SEED_FILE
+              value: /var/run/kube-agents/task-signing/seed
+            - name: A2A_TASK_CREDENTIAL_MAX_LIFETIME
+              value: 6h0m0s
+          image: ghcr.io/gke-labs/kube-agents/a2a-dispatcher:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          name: dispatcher
+          ports:
+            - containerPort: 8080
+              name: status
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+            - mountPath: /var/run/kube-agents/task-signing
+              name: task-signing-seed
+              readOnly: true
+          workingDir: /
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-dispatcher
+      volumes:
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - name: task-signing-seed
+          secret:
+            defaultMode: 256
+            items:
+              - key: task-signing-seed
+                path: seed
+            secretName: platformagent-a2a-task-signing-key
 status: {}
 ---
 apiVersion: v1
