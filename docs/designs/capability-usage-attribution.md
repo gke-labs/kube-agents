@@ -35,9 +35,14 @@ For each fleet size and each window:
 2. Which capabilities use the most model tokens, and how many: input, output and cached input.
 3. For one month, how much memory-time and how many tokens each capability uses, and what that
    costs.
+4. For one named capability, for example the stall watch: what one run of it costs on a fleet of
+   size S, M or L, what each piece of work it starts costs, and how both change with the fleet's
+   size.
 
-Every answer is a table whose rows are the five largest capabilities, Other, the platform base and
-Unattributed. The rows add up to 100 % of the measured total.
+Questions 1 to 3 have an overview table whose rows are the five largest capabilities, Other, the
+platform base and Unattributed; the rows add up to 100 % of the measured total. Question 4 has a
+table for every capability, so a capability that is too small for the overview is not hidden in
+Other.
 
 ## Terms
 
@@ -69,9 +74,21 @@ Beyond the rosters, five rows:
 | Memory service  | The Hindsight memory service's own model calls and memory, when the install enables it.                                          |
 | Session Pods    | The Pods that `delegate` and `/session` start under `spec.mode: next`, each under the capability of the session that started it. |
 
-An audit counts under the audit whatever started it, a schedule, the first-run flow or a chat
-request. A kanban card that runs an audit's procedure carries that audit's tag, by the audit id the
-card names. Any other card carries the tag of the session that created it.
+A capability's row holds the work it starts, not only its own run. Three rules carry the tag
+forward:
+
+- **An audit counts under the audit** whatever started it, a schedule, the first-run flow or a chat
+  request. A kanban card that runs an audit's procedure carries that audit's tag, by the audit id
+  the card names.
+- **An inject counts under the capability that raised it.** A script watcher calls no model, but it
+  can start agent work through the Session KV server's inject route. The stall watch
+  (`agents/platform/scripts/stall_watch.py`) hands each new stall episode to that route as a
+  `controller-stall` inject; the server posts the alert and starts a Planning Agent turn, which
+  files one card to the cluster's Cluster Agent, which runs `gke-stall-detection`. Each inject
+  carries its origin's tag (`stall-watch`, `incident-triage` for the event watcher, the drift
+  detector's id), and the turn and the card it starts inherit it. So the stall watch's row holds
+  its sweeps and every investigation they start.
+- **Any other card** carries the tag of the session that created it.
 
 ## Tokens
 
@@ -79,7 +96,7 @@ Every model call carries its capability tag to the LiteLLM gateway. The harness 
 context variable that each session sets when it starts, so calls from several sessions in one
 process each carry their own tag. A patch under `deploy/docker/patches` adds the tag to each
 request's metadata (`extra_body`). The cron ticker sets it from the job id, the kanban worker from
-the card, the chat gateway as `chat`, and the event watcher's sessions as `incident-triage`.
+the card, the chat gateway as `chat`, and the Session KV server from the inject's origin.
 
 The install's LiteLLM has no database, so its spend tracking by tag is not available. Two outputs
 can carry the tag instead. LiteLLM's `custom_prometheus_metadata_labels` setting adds a label from
@@ -193,11 +210,42 @@ The cost of each row:
 
 ## The report
 
-Each run writes `capability-usage.json`, one record for each size, window and capability, with the
-tokens, the memory-time, the estimated share, the peak and the cost. A Markdown report from the same
-file shows, for each size and window, a memory table and a token table, each with the five largest
-capabilities, Other, the platform base and Unattributed, adding up to 100 %. A third table shows
+Each run writes `capability-usage.json`, one record for each size, window and capability, every
+capability included, with the tokens, the memory-time, the estimated share, the peak, the runs and
+units counted, and the cost. A Markdown report from the records has three parts.
+
+**The overview.** For each size and window, a memory table and a token table, each with the five
+largest capabilities, Other, the platform base and Unattributed, adding up to 100 %, and a table of
 the monthly estimate and its cost.
+
+**A table for each capability.** One table a capability, with a row for each size. Its columns:
+
+| Column       | Meaning                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------ |
+| Runs         | The runs measured, over the nights the figure averages.                                                      |
+| Memory a run | The peak, and the memory-time of one run.                                                                    |
+| Tokens a run | Input, cached input and output tokens of one run, without the work it started.                               |
+| Units        | The pieces of work the runs started, and how many: for the stall watch, stall episodes; for an audit, cards. |
+| Cost a unit  | The memory-time and tokens of one unit: one stall investigation, from the inject to the card's end.          |
+| A month      | Runs a month times the cost a run, plus the units a month at the measured rate times the cost a unit.        |
+| A cluster    | The cost a run divided by the size's clusters, to compare sizes and to extrapolate past L.                   |
+
+The two parts matter because a capability's cost has two sources that scale differently. The
+stall watch's sweep reads every cluster, so its cost a run grows with the fleet. Its investigations
+grow with the stalls the fleet has, not with its size; the sized fleet plants 5 failing Pods at M,
+so the measured unit count is the test's, not a real fleet's. The table therefore keeps the cost a
+unit apart from the count, and a reader multiplies the cost a unit by their own fleet's rate.
+
+A figure averages the runs of the last 7 nights at M and the last 4 at L, because a run of a
+30-minute watcher happens about four times a night and an audit once. S has no scheduled run, so
+its row stays empty until a run by hand fills it.
+
+**Flags.** The report marks three kinds of row:
+
+- a capability whose cost a cluster rises from M to L by more than 20 %, which means it grows faster
+  than the fleet;
+- a capability whose peak memory in L is above half of its container's limit;
+- a capability whose figure rests on fewer than three runs.
 
 Two checks guard the numbers. A run that fails either is marked unsound rather than reported:
 
@@ -211,8 +259,10 @@ Each item is its own pull request, after this design merges and the sized test f
 
 1. **Tokens from the session records.** `bench/kube_agents_bench/scale/attribution.py` joins each
    profile's sessions to their capabilities and checks the sum against LiteLLM's counters. No
-   runtime change.
-2. **The process tags and samplers.** `KUBE_AGENTS_CAPABILITY` at each separate process's start,
+   runtime change. A session that an inject started is joined through the inject's record, which
+   names its kind (`controller-stall`, an event, a drift), to the capability that raised it.
+2. **The process tags and samplers.** The Session KV server's tag on each inject-started turn and
+   its card; `KUBE_AGENTS_CAPABILITY` at each separate process's start,
    carried over SSH and checked against the list; the shell sampler and the gateway sampler; the
    broker's and kube-proxy's tag on each request log line.
 3. **The memory report.** The fit to the container figures, the shared-process estimate, the two
