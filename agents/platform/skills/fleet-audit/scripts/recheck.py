@@ -15,9 +15,19 @@ This reads one namespace with one `kubectl get`, runs the same check function
   renders for that check, so the re-check and the daily ledger say the same
   words about the same object.
 - `clean`: the check ran against the target and did not fire.
-- `unchecked`: nothing was judged. The read failed its gate, or the target is
+- `unchecked`: nothing was judged. The read failed its gate, the target is
   not in the audit's scope any more (deleted, scaled to zero, opted out, in a
-  system namespace). A caller reports this as "not re-checked", never as fixed.
+  system namespace), or the cluster is one the audit would not read. A caller
+  reports this as "not re-checked", never as fixed.
+
+The audit's scope applies at both levels. The cluster: a finding whose
+cluster the install's declared scope leaves out (a project outside
+`--scope-projects`, a cluster `--scope-exclude-clusters` names, or a declared
+scope with no flags passed) is refused before anything is read, by the same
+`fleet_scope_args.DeclaredScope` rules the collector applies. The read itself
+always names the finding's own GKE context, so it cannot answer from whatever
+cluster happens to be current. The workload: the S1-S5 filters of
+`collect.normalize_workloads`.
 
 A check that judges the whole cluster is narrowed to the target, so an
 unrelated object elsewhere cannot fail a correct fix. For `no-pdb` those are
@@ -294,6 +304,40 @@ def read_argv(recheck: Recheck, namespace: str, kube_context: str = "") -> list[
     return argv
 
 
+#: The kubectl context gcloud writes for a GKE cluster. The read always names
+#: it, so it can only answer from the finding's own cluster: a kubeconfig that
+#: has no such context fails the read rather than answering from another one.
+GKE_CONTEXT_FORMAT = "gke_{project}_{location}_{name}"
+
+
+def cluster_parts(cluster: str) -> tuple[str, str, str] | None:
+    """`(project, location, name)` from a manifest cluster name
+    (`collect.target_name`), or None when it is not exactly that shape."""
+    parts = cluster.split(collect.QUALIFIED_TARGET_SEPARATOR)
+    return (parts[0], parts[1], parts[2]) if len(parts) == 3 and all(parts) else None
+
+
+def scope_refusal(scope, project: str, location: str, name: str) -> str | None:
+    """Why the collector would not read this cluster, or None when it would.
+
+    The same rules, from the same object (`fleet_scope_args.DeclaredScope`):
+    on an install that declares a scope, a run without the scope flags is
+    refused, and so is a project outside the declared scope
+    (`override_error`, which `collect.discover_fleet` applies to `--project`);
+    a cluster `spec.scope.exclude.clusters` names is dropped before anything is
+    read (`drop_excluded`, as `collect.enumerate_clusters` applies it).
+    """
+    refusal = scope.override_error(project)
+    if refusal:
+        return refusal
+    if not scope.drop_excluded(project, [{"name": name, "location": location}]):
+        return (
+            f"{collect.fleet_scope_args.format_cluster_ref(project, location, name)} is excluded by "
+            "spec.scope.exclude.clusters, so the audit does not read it"
+        )
+    return None
+
+
 def base_answer(target: Target) -> dict:
     """The fields every answer carries, whatever the outcome: the finding's
     identity, its published id, and the budget when one was named."""
@@ -311,6 +355,7 @@ def recheck(
     kubeconfig: str = "",
     kube_context: str = "",
     pr: dict | None = None,
+    scope=None,
 ) -> dict:
     """The answer for one finding, as the JSON the CLI prints.
 
@@ -319,17 +364,48 @@ def recheck(
     finding's pull request record (`state`, `mergedAt`, `labels`), when the
     caller has it; with it the answer carries the ledger state
     `derive_finding_state` gives. Without `run`, the local `kubectl` reads.
+
+    The read is pinned to the finding's cluster. It always names that
+    cluster's GKE context; a `kube_context` that names another is refused;
+    with neither `kube_context` nor `kubeconfig` the per-cluster kubeconfig is
+    fetched the way the collector fetches it (`collect.fetch_credentials`).
+    `scope` is the install's `fleet_scope_args.DeclaredScope`, as the collector
+    is handed it; None reads it as a collector run with no scope flags would,
+    so an install that declares a scope refuses until the caller passes one.
     """
     answer = base_answer(target)
+
+    def unchecked(reason: str) -> dict:
+        return {**answer, "outcome": OUTCOME_UNCHECKED, "evidence": [], "reason": reason}
+
     spec = RECHECKS.get(target.check)
     if spec is None:
-        return {
-            **answer,
-            "outcome": OUTCOME_UNCHECKED,
-            "evidence": [],
-            "reason": f"no on-demand re-check is registered for {target.check!r} (registered: {', '.join(sorted(RECHECKS))})",
-        }
-    argv = read_argv(spec, target.namespace, kube_context)
+        return unchecked(
+            f"no on-demand re-check is registered for {target.check!r} (registered: {', '.join(sorted(RECHECKS))})"
+        )
+    parts = cluster_parts(target.cluster)
+    if parts is None:
+        return unchecked(f"{target.cluster!r} is not <project>/<location>/<name>, so no cluster can be read for it")
+    project, location, name = parts
+    if scope is None:
+        scope = collect.fleet_scope_args.DeclaredScope()
+        scope.set(None, None)
+    refusal = scope_refusal(scope, project, location, name)
+    if refusal:
+        return unchecked(f"{refusal}; nothing was read")
+    expected = GKE_CONTEXT_FORMAT.format(project=project, location=location, name=name)
+    if kube_context and kube_context != expected:
+        return unchecked(
+            f"the context {kube_context!r} does not name the finding's cluster (expected {expected!r}), "
+            "so nothing was read"
+        )
+    if not kube_context and not kubeconfig:
+        fetched, cred_run = collect.fetch_credentials(project, name, location, run=run or collect.default_run)
+        if cred_run.rc != 0:
+            stderr = " ".join((cred_run.stderr or "").split())[: collect.ERROR_EXCERPT_CHARS] or "no stderr"
+            return unchecked(f"get-credentials for {target.cluster} failed (rc={cred_run.rc}: {stderr}), so nothing was read")
+        kubeconfig = str(fetched)
+    argv = read_argv(spec, target.namespace, expected)
     answer["command"] = (f"KUBECONFIG={kubeconfig} " if kubeconfig else "") + shlex.join(argv)
     env = {**os.environ, "KUBECONFIG": kubeconfig} if kubeconfig else dict(os.environ)
     result = (run or collect.default_run)(argv, env=env, timeout=READ_TIMEOUT_S)
@@ -374,14 +450,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--object", required=True, help="the finding's object, e.g. Deployment/checkout")
     parser.add_argument("--budget", default="", help="no-pdb: the PodDisruptionBudget the fix wrote; narrows blocking-pdb to it")
-    parser.add_argument("--kubeconfig", default="", help="kubeconfig for the read; default: kubectl's own")
-    parser.add_argument("--context", default="", dest="kube_context", help="kubectl context for the read")
+    parser.add_argument(
+        "--kubeconfig",
+        default="",
+        help="kubeconfig holding the finding's cluster context; default: fetched per cluster, as the collector does",
+    )
+    parser.add_argument(
+        "--context",
+        default="",
+        dest="kube_context",
+        help="kubectl context for the read; must be the finding's cluster (gke_<project>_<location>_<name>)",
+    )
     parser.add_argument("--merged", action="store_true", help="the finding's fix is merged: add the ledger state")
+    collect.fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
+    scope = collect.fleet_scope_args.DeclaredScope()
+    scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     target = Target(args.check, args.cluster, args.namespace, args.object, args.budget)
     pr = {"state": "MERGED"} if args.merged else None
     try:
-        answer = recheck(target, kubeconfig=args.kubeconfig, kube_context=args.kube_context, pr=pr)
+        answer = recheck(target, kubeconfig=args.kubeconfig, kube_context=args.kube_context, pr=pr, scope=scope)
     except Exception as exc:  # noqa: BLE001 -- a crash is no verdict, and exit 1 would read as one
         answer = {
             **base_answer(target),

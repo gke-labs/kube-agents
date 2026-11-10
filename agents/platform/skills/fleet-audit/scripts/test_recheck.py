@@ -11,9 +11,11 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import collect
+import fleet_scope_args
 import recheck
 
 CLUSTER = "proj/us-central1/fleet-1"
+CTX = "gke_proj_us-central1_fleet-1"
 NS = "shop"
 LABELS = {"app": "checkout"}
 
@@ -61,13 +63,28 @@ class FakeRun:
         return collect.Run(argv, self.rc, self.stdout, self.stderr, 0.0)
 
 
+def no_scope():
+    scope = fleet_scope_args.DeclaredScope()
+    with mock.patch.object(fleet_scope_args, "sandbox_declares_scope", return_value=False):
+        scope.set(None, None)
+    return scope
+
+
+def run_recheck(t, **kwargs):
+    """`recheck.recheck` pinned to the fixture cluster's context, on an
+    install with no declared scope, unless a test says otherwise."""
+    kwargs.setdefault("kube_context", CTX)
+    kwargs.setdefault("scope", no_scope())
+    return recheck.recheck(t, **kwargs)
+
+
 def target(budget="", obj="Deployment/checkout", check="no-pdb"):
     return recheck.Target(check, CLUSTER, NS, obj, budget)
 
 
 class NoPdbTest(unittest.TestCase):
     def test_missing_budget_reproduces_with_the_audits_excerpt(self):
-        answer = recheck.recheck(target(), run=FakeRun([deployment()]), pr={"state": "MERGED"})
+        answer = run_recheck(target(), run=FakeRun([deployment()]), pr={"state": "MERGED"})
         self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
         self.assertEqual(answer["state"], "pr-merged-persists")
         [evidence] = answer["evidence"]
@@ -77,7 +94,7 @@ class NoPdbTest(unittest.TestCase):
 
     def test_the_fixs_budget_reads_clean(self):
         items = [deployment(), pdb(maxUnavailable=1)]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items), pr={"state": "MERGED"})
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items), pr={"state": "MERGED"})
         self.assertEqual(answer["outcome"], recheck.OUTCOME_CLEAN)
         self.assertEqual(answer["state"], "resolved-merged")
         self.assertEqual(answer["budgets"], ["checkout-pdb"])
@@ -85,7 +102,7 @@ class NoPdbTest(unittest.TestCase):
 
     def test_a_budget_that_permits_no_eviction_reproduces_as_blocking_pdb(self):
         items = [deployment(replicas=3), pdb(minAvailable=3)]
-        answer = recheck.recheck(target(), run=FakeRun(items))
+        answer = run_recheck(target(), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
         [evidence] = answer["evidence"]
         self.assertEqual(evidence["check"], "blocking-pdb")
@@ -101,7 +118,7 @@ class NoPdbTest(unittest.TestCase):
             deployment("cart", replicas=2, labels=other),
             pdb("cart-pdb", labels=other, maxUnavailable=0),
         ]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_CLEAN)
         # The whole-cluster check does fire on the other budget: narrowing is
         # what keeps it out of this answer.
@@ -116,7 +133,7 @@ class NoPdbTest(unittest.TestCase):
         items = [deployment(), pdb(maxUnavailable=1), pdb("legacy", maxUnavailable=1)]
         for budget in ("checkout-pdb", ""):
             with self.subTest(budget=budget):
-                answer = recheck.recheck(target(budget), run=FakeRun(items), pr={"state": "MERGED"})
+                answer = run_recheck(target(budget), run=FakeRun(items), pr={"state": "MERGED"})
                 self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
                 self.assertEqual(answer["state"], "pr-merged-persists")
                 [evidence] = answer["evidence"]
@@ -131,7 +148,7 @@ class NoPdbTest(unittest.TestCase):
             pdb("cart-a", labels=other, maxUnavailable=1),
             pdb("cart-b", labels=other, maxUnavailable=1),
         ]
-        self.assertEqual(recheck.recheck(target("checkout-pdb"), run=FakeRun(items))["outcome"], recheck.OUTCOME_CLEAN)
+        self.assertEqual(run_recheck(target("checkout-pdb"), run=FakeRun(items))["outcome"], recheck.OUTCOME_CLEAN)
 
     def test_budget_named_by_the_caller_narrows_blocking_pdb_to_it(self):
         # The fix's budget is fine; a blocking budget elsewhere in the namespace
@@ -143,18 +160,18 @@ class NoPdbTest(unittest.TestCase):
             deployment("cart", labels=other),
             pdb("cart-pdb", labels=other, minAvailable=3),
         ]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items))
         self.assertEqual((answer["outcome"], answer["budgets"]), (recheck.OUTCOME_CLEAN, ["checkout-pdb"]))
 
     def test_autoscaler_floor_is_what_the_budget_is_measured_against(self):
         items = [deployment(replicas=4), pdb(minAvailable=2), hpa(min_replicas=2)]
-        answer = recheck.recheck(target(), run=FakeRun(items))
+        answer = run_recheck(target(), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
         self.assertIn("minReplicas 2", answer["evidence"][0]["excerpt"])
 
     def test_named_budget_absent_but_another_covers_is_unchecked(self):
         items = [deployment(), pdb("someone-elses", maxUnavailable=1)]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items), pr={"state": "MERGED"})
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items), pr={"state": "MERGED"})
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("does not exist", answer["reason"])
         self.assertIn("covered by someone-elses", answer["reason"])
@@ -162,32 +179,32 @@ class NoPdbTest(unittest.TestCase):
 
     def test_named_budget_that_misses_the_pods_is_unchecked_when_another_covers(self):
         items = [deployment(), pdb(labels={"app": "typo"}, maxUnavailable=1), pdb("other", maxUnavailable=1)]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("does not select its pods", answer["reason"])
 
     def test_named_budget_that_misses_the_pods_reproduces_no_pdb(self):
         items = [deployment(), pdb(labels={"app": "typo"}, maxUnavailable=1)]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_REPRODUCES)
         self.assertEqual(answer["evidence"][0]["check"], "no-pdb")
 
     def test_scaled_below_two_with_named_budget_gone_is_unchecked(self):
         items = [deployment(replicas=1)]
-        answer = recheck.recheck(target("checkout-pdb"), run=FakeRun(items))
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun(items))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("not required to have a budget now", answer["reason"])
 
 
 class ScopeAndReadTest(unittest.TestCase):
     def test_absent_workload_is_unchecked(self):
-        answer = recheck.recheck(target(), run=FakeRun([]), pr={"state": "MERGED"})
+        answer = run_recheck(target(), run=FakeRun([]), pr={"state": "MERGED"})
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("was not found", answer["reason"])
         self.assertNotIn("state", answer)
 
     def test_scaled_to_zero_workload_is_unchecked(self):
-        answer = recheck.recheck(target(), run=FakeRun([deployment(replicas=0)]))
+        answer = run_recheck(target(), run=FakeRun([deployment(replicas=0)]))
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("outside the audit's scope", answer["reason"])
 
@@ -199,29 +216,128 @@ class ScopeAndReadTest(unittest.TestCase):
             FakeRun(stdout='{"kind": "List"}'),
         ):
             with self.subTest(stdout=run.stdout, rc=run.rc):
-                answer = recheck.recheck(target(), run=run)
+                answer = run_recheck(target(), run=run)
                 self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
                 self.assertIn("failed its gate", answer["reason"])
 
     def test_unregistered_check_reads_nothing(self):
         run = FakeRun([deployment()])
-        answer = recheck.recheck(target(check="no-hpa"), run=run)
+        answer = run_recheck(target(check="no-hpa"), run=run)
         self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
         self.assertIn("no on-demand re-check is registered", answer["reason"])
         self.assertEqual(run.calls, [])
 
     def test_reads_one_namespace_with_the_callers_kubeconfig_and_context(self):
         run = FakeRun([deployment()])
-        answer = recheck.recheck(target(), run=run, kubeconfig="/tmp/kc", kube_context="ctx")
+        answer = run_recheck(target(), run=run, kubeconfig="/tmp/kc")
         [(argv, env, timeout)] = run.calls
         self.assertEqual(
             argv,
-            ["kubectl", "get", recheck.RECHECKS["no-pdb"].kinds, "-n", NS, "-o", "json", "--context", "ctx"],
+            ["kubectl", "get", recheck.RECHECKS["no-pdb"].kinds, "-n", NS, "-o", "json", "--context", CTX],
         )
         self.assertNotIn("-A", argv)
         self.assertEqual(env["KUBECONFIG"], "/tmp/kc")
         self.assertEqual(timeout, recheck.READ_TIMEOUT_S)
         self.assertTrue(answer["command"].startswith("KUBECONFIG=/tmp/kc kubectl get "))
+
+
+class ClusterPinTest(unittest.TestCase):
+    """The read answers from the finding's cluster, or nothing is judged."""
+
+    def test_a_context_naming_another_cluster_is_refused_before_any_read(self):
+        run = FakeRun([deployment(), pdb(maxUnavailable=1)])
+        answer = run_recheck(target("checkout-pdb"), run=run, kube_context="gke_proj_us-central1_other", pr={"state": "MERGED"})
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
+        self.assertIn("does not name the finding's cluster", answer["reason"])
+        self.assertNotIn("state", answer)
+        self.assertEqual(run.calls, [])
+
+    def test_the_read_always_names_the_findings_context(self):
+        # A caller's kubeconfig whose current context is another cluster still
+        # cannot answer: the read names the finding's own context.
+        run = FakeRun([deployment()])
+        run_recheck(target(), run=run, kube_context="", kubeconfig="/tmp/kc")
+        [(argv, _, _)] = run.calls
+        self.assertEqual(argv[-2:], ["--context", CTX])
+
+    def test_without_context_or_kubeconfig_credentials_are_fetched_per_cluster(self):
+        run = FakeRun([deployment(), pdb(maxUnavailable=1)])
+        with mock.patch.object(
+            collect, "fetch_credentials", return_value=(Path("/kc/fleet-1.yaml"), collect.Run([], 0, "", "", 0.0))
+        ) as fetch:
+            answer = run_recheck(target("checkout-pdb"), run=run, kube_context="")
+        fetch.assert_called_once_with("proj", "fleet-1", "us-central1", run=run)
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_CLEAN)
+        [(argv, env, _)] = run.calls
+        self.assertEqual((env["KUBECONFIG"], argv[-1]), ("/kc/fleet-1.yaml", CTX))
+
+    def test_failed_credentials_are_unchecked(self):
+        run = FakeRun([deployment()])
+        with mock.patch.object(
+            collect, "fetch_credentials", return_value=(Path("/kc/x"), collect.Run([], 1, "", "denied", 0.0))
+        ):
+            answer = run_recheck(target(), run=run, kube_context="")
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
+        self.assertIn("get-credentials", answer["reason"])
+        self.assertEqual(run.calls, [])
+
+    def test_a_cluster_that_is_not_project_location_name_is_unchecked(self):
+        run = FakeRun([deployment()])
+        answer = run_recheck(recheck.Target("no-pdb", "fleet-1", NS, "Deployment/checkout"), run=run)
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
+        self.assertEqual(run.calls, [])
+
+
+class ClusterScopeTest(unittest.TestCase):
+    """The collector's cluster scope, applied before anything is read."""
+
+    def scope(self, projects=None, exclude=None, declared_by_sandbox=False):
+        scope = fleet_scope_args.DeclaredScope()
+        with mock.patch.object(fleet_scope_args, "sandbox_declares_scope", return_value=declared_by_sandbox):
+            scope.set(projects, None, exclude)
+        return scope
+
+    def assert_refused(self, scope, needle):
+        run = FakeRun([deployment(), pdb(maxUnavailable=1)])
+        answer = run_recheck(target("checkout-pdb"), run=run, scope=scope, pr={"state": "MERGED"})
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
+        self.assertIn(needle, answer["reason"])
+        self.assertNotIn("state", answer)
+        self.assertEqual(run.calls, [])
+
+    def test_an_excluded_cluster_is_refused(self):
+        self.assert_refused(self.scope(projects="proj", exclude=CLUSTER), "spec.scope.exclude.clusters")
+
+    def test_an_exclusion_alone_still_applies(self):
+        self.assert_refused(self.scope(exclude=CLUSTER), "spec.scope.exclude.clusters")
+
+    def test_a_project_outside_the_declared_scope_is_refused(self):
+        self.assert_refused(self.scope(projects="other-proj"), "other-proj")
+
+    def test_a_declared_scope_with_no_flags_is_refused(self):
+        self.assert_refused(self.scope(declared_by_sandbox=True), fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR[:40])
+
+    def test_no_scope_argument_reads_the_sandbox_declaration(self):
+        run = FakeRun([deployment()])
+        with mock.patch.object(fleet_scope_args, "sandbox_declares_scope", return_value=True):
+            answer = recheck.recheck(target(), run=run, kube_context=CTX)
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_UNCHECKED)
+        self.assertEqual(run.calls, [])
+
+    def test_a_cluster_inside_the_scope_is_read(self):
+        other = "proj/us-central1/fleet-2"
+        answer = run_recheck(target("checkout-pdb"), run=FakeRun([deployment(), pdb(maxUnavailable=1)]),
+                             scope=self.scope(projects="proj", exclude=other))
+        self.assertEqual(answer["outcome"], recheck.OUTCOME_CLEAN)
+
+    def test_the_cli_passes_the_scope_flags(self):
+        buf = io.StringIO()
+        with mock.patch.object(collect, "default_run", FakeRun([deployment()])), redirect_stdout(buf):
+            rc = recheck.main(
+                ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout",
+                 "--context", CTX, "--scope-projects", "proj", "--scope-exclude-clusters", CLUSTER]
+            )
+        self.assertEqual((rc, json.loads(buf.getvalue())["outcome"]), (2, "unchecked"))
 
 
 class RegistrationTest(unittest.TestCase):
@@ -263,12 +379,12 @@ class AuditParityTest(unittest.TestCase):
         entry = collect.collect_cluster(cluster, checks=specs, collected=collected)
         audit = {(c["check"], c["object"]): c["excerpt"] for c in entry["candidates"]}
 
-        answer = recheck.recheck(target(), run=FakeRun(items))
+        answer = run_recheck(target(), run=FakeRun(items))
         mine = {(e["check"], e["object"]): e["excerpt"] for e in answer["evidence"]}
         self.assertEqual(mine, {k: v for k, v in audit.items() if k == ("blocking-pdb", "PodDisruptionBudget/checkout-pdb")})
         self.assertIn(("blocking-pdb", "PodDisruptionBudget/cart-pdb"), audit)
 
-        web = recheck.recheck(target(obj="Deployment/web"), run=FakeRun(items))
+        web = run_recheck(target(obj="Deployment/web"), run=FakeRun(items))
         self.assertEqual(
             {(e["check"], e["object"]): e["excerpt"] for e in web["evidence"]},
             {("no-pdb", "Deployment/web"): audit[("no-pdb", "Deployment/web")]},
@@ -280,7 +396,7 @@ class MainTest(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.object(collect, "default_run", FakeRun(items)), redirect_stdout(buf):
             rc = recheck.main(
-                ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout", *extra]
+                ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout", "--context", CTX, *extra]
             )
         return rc, json.loads(buf.getvalue())
 
@@ -302,7 +418,7 @@ class MainTest(unittest.TestCase):
             recheck.RECHECKS["no-pdb"] = original._replace(steps=(broken,))
             with mock.patch.object(collect, "default_run", FakeRun([deployment()])), redirect_stdout(buf):
                 rc = recheck.main(
-                    ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout"]
+                    ["--check", "no-pdb", "--cluster", CLUSTER, "--namespace", NS, "--object", "Deployment/checkout", "--context", CTX]
                 )
         finally:
             recheck.RECHECKS["no-pdb"] = original
