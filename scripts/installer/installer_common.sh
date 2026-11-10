@@ -4261,6 +4261,17 @@ minter_name_defaults() {
   fi
   IFS='|' read -r ring key gsa ksa <<<"$names"
   if [ -n "${ring}${key}${gsa}${ksa}" ]; then
+    # A state with no binding yet is an apply that stopped partway. Its KSA is
+    # the derived one when its GSA is, since both came from one run's names:
+    # the shared default here would hand a new install the name #5282 exists
+    # to retire.
+    if [ -z "$ksa" ]; then
+      local derived_gsa derived_ksa
+      IFS='|' read -r _ _ derived_gsa derived_ksa <<<"$(minter_derived_names "$cluster")"
+      if [ -n "$gsa" ] && [ "$gsa" = "$derived_gsa" ]; then
+        ksa="$derived_ksa"
+      fi
+    fi
     printf '%s|%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" \
       "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}" "${ksa:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
     return 0

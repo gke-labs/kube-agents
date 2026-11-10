@@ -3164,6 +3164,12 @@ class InstallerCommonTest(unittest.TestCase):
                          ["github-token-minter-keyring", "github-token-minter-key", "my-minter",
                           "kubeagents-github-minter"])
 
+    def test_a_new_minter_stopped_before_its_binding_keeps_the_derived_ksa(self):
+        """The GSA is this cluster's derived one and no binding exists yet: the KSA is derived too."""
+        state = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "ka-today-1-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[2:], ["ka-today-1-minter", "ka-today-1-github-minter"])
+
     def test_an_install_without_a_minter_in_state_derives_its_names(self):
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
         self.assertEqual(proc.stdout.strip().split("|")[0], "ka-today-1-minter-keyring")

@@ -865,8 +865,10 @@ githubMinter:
   # empty, that Secret must already exist in the release namespace.
   appId: ""
   # KSA/GSA pair for Workload Identity; defaults mirror
-  # terraform/modules/kube-agents-iam, so the binding it creates targets the
-  # KSA the chart renders.
+  # terraform/modules/github-minter, so the binding it creates targets the KSA
+  # the chart renders. The full-install composition sets both from the same
+  # inputs as that module (ksaName from github_minter_ksa_name, which install.sh
+  # makes <cluster>-github-minter on a new install).
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
   # The GSA email allowed to request tokens from any of the three scopes in
