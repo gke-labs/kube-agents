@@ -5893,6 +5893,11 @@ type a2aProvisionState struct {
 	// value, so it has to travel out of the render to the status write.
 	AuthMapVersion string
 
+	// dispatcherJobMode is what the dispatcher step made of Job mode
+	// (reconcileA2ADispatcherWithJobMode), nil when it made nothing of it,
+	// for the DispatcherJobMode condition written on the way out.
+	dispatcherJobMode *metav1.Condition
+
 	// gatewayHeld reports that the gateway Deployment was withheld this
 	// pass because BusCredentialsReady is not yet true. It exists to make
 	// the reconcile poll: the callout Deployment is owned, so its readiness
@@ -6368,7 +6373,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
-	if dispatcherProfileErr, err := r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileFenced, draining); err != nil {
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	state.dispatcherJobMode = jobMode
+	if err != nil {
 		return state, err
 	} else if dispatcherProfileErr != nil {
 		*profileErr = goerrors.Join(*profileErr, dispatcherProfileErr)
@@ -7633,6 +7640,16 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // operator exception to the ownership rule below: the walk deletes only
 // what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	_, err := r.cleanupA2AWithJobMode(ctx, agent)
+	return err
+}
+
+// cleanupA2AWithJobMode is cleanupA2A, also reporting whether the pass tore
+// the dispatcher's Job mode down: true when nothing of the stack was present,
+// or when deleteDispatcherPodsRBAC (the Jobs Role, the Jobs and the
+// DispatchJobTemplates among what it deletes) succeeded. A failure there
+// leaves Job mode's resources live, so the DispatcherJobMode condition stays.
+func (r *PlatformAgentReconciler) cleanupA2AWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (tornDown bool, err error) {
 	// The Lease goes below with the stack; a flip back to next is a first
 	// install for it, not a deletion to hold back.
 	r.forgetA2AGatewayLease(agent)
@@ -7759,7 +7776,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 			continue
 		}
 		if client.IgnoreNotFound(err) != nil {
-			return err
+			return false, err
 		}
 	}
 	// The profile fence is the first write of reconcileA2ANetworkFences and
@@ -7767,12 +7784,12 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	if !anyPresent {
 		fence, err := r.profileFenceRendered(ctx, agent)
 		if err != nil {
-			return err
+			return false, err
 		}
 		anyPresent = fence
 	}
 	if !anyPresent {
-		return nil
+		return true, nil
 	}
 
 	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
@@ -7789,7 +7806,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Its objects are written after the keys Secret, so a render that dies
 	// partway leaves a sentinel too.
 	if err := r.removeScopePublisher(ctx, agent); err != nil {
-		return err
+		return false, err
 	}
 
 	// Then the identity map's shards, before the walk that deletes the
@@ -7797,7 +7814,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// authmap entry). A callout still running keeps serving its last map when
 	// the objects go, so deleting them ahead of its Deployment costs nothing.
 	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
-		return err
+		return false, err
 	}
 
 	// 1. Namespaced objects before the bus (gateway, inject, callout, session identities).
@@ -7805,7 +7822,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// before the bus itself.
 	for _, entry := range r.a2aPreBusTeardown(agent) {
 		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -7846,7 +7863,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// entire NATS bus (Service, NetworkPolicy fences, config Secret, StatefulSet)
 	// still standing and protected, preserving the sentinel to retry next pass.
 	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
-		return err
+		return false, err
 	}
 
 	// 3. Provision Jobs carry a content hash in the name, one per generation
@@ -7855,14 +7872,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// that a pass dying during Job cleanup leaves the bus intact and the
 	// sentinel standing (#2216).
 	if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
-		return err
+		return false, err
 	}
 
 	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
 	// config Secret, ResourceQuota).
 	for _, entry := range r.a2aBusTeardown(agent) {
 		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -7886,7 +7903,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The
 	// early exit above treats its absence as "an earlier pass reached the
 	// end", which is only true while nothing is deleted after it.
-	return r.deleteA2ANATSStatefulSet(ctx, agent)
+	return dispatcherRBACErr == nil, r.deleteA2ANATSStatefulSet(ctx, agent)
 }
 
 // deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
