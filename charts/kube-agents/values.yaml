@@ -1766,6 +1766,9 @@ platformAgent:
     # forges:
     #   - name: github            # what repositories[].forge refers to
     #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #                             # (bitbucket and bitbucket-datacenter forges are declared on the
+    #                             # PlatformAgent resource's spec.integration.forges; the chart does
+    #                             # not render them yet)
     #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
     #                             # Server hostname; required for gitea, which has none
     #     scheme: https           # https (default); http only for gitea on an
