@@ -512,10 +512,8 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
-# AgentProfile durables when the operator renders the dispatcher, which this
-# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
-# does - where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - the AgentProfile
+# dispatcher's durables are on PROFILE_SUBMITS, not TASKS - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -622,14 +620,14 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
 # platformagent_a2a_console.go) and the repository names step 4 pushes the
-# builds under. The AgentProfile dispatcher's image is built and pushed too
-# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
-# set: the dispatcher is off by default until profiles dispatch end to end.
+# builds under, and the AgentProfile dispatcher's (a2aDispatcherImage in
+# platformagent_a2a_dispatcher.go), which runs by default.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -1767,10 +1765,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
-    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
-    # until profiles dispatch end to end, and the lane installs what a
-    # default install does. Its image is still built (step 4) so the build
-    # stays green; setting the override here is how the lane would turn it on.
+    # The AgentProfile dispatcher runs by default, so the lane runs it too,
+    # from this build: unoverridden, the operator derives its image from the
+    # operator's registry, as it would the verifier's.
+    --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
   )
 fi
 

@@ -434,9 +434,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[9].value=true",
         ]
-        # Nothing turns the AgentProfile dispatcher on: it is off by default,
-        # and the lane installs what a default install does.
-        self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
+        # The AgentProfile dispatcher runs by default, so the lane runs it,
+        # at this build's image, under the name the operator reads.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[10].name={go_constant(_A2A_DISPATCHER, 'a2aDispatcherImageEnvVar')}",
+            "--set-string",
+            f"operator.extraEnv[10].value={_AR_REPO}/a2a-dispatcher:{_TAG}",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -591,7 +596,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
         # The gateway's election, on for the lane on this path too.
         self.assertEqual(values[9], "operator.extraEnv[9].value=true")
-        self.assertEqual(len(values), 10, values)
+        # The dispatcher, at the candidate's published image.
+        self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
+        self.assertEqual(len(values), 11, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

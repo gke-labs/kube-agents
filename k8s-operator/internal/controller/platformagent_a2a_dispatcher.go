@@ -828,7 +828,11 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Con
 func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
 	// Past the size one identity-map shard can carry, the map leaves the
 	// dispatcher's entry out, so it is torn down as though switched off; the
-	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381).
+	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381). The
+	// dispatch config is still written: the draining profiles are read from
+	// it, with their deadlines, so the teardown lasts until those drains run
+	// out rather than one pass, and a profile that leaves meanwhile gets a
+	// deadline too.
 	overCeiling := false
 	if a2aDispatcherEnabled() {
 		_, over, cerr := a2aDispatcherCeiling(agent, profiles, draining)
@@ -838,7 +842,14 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 		overCeiling = over
 	}
 	if !a2aDispatcherEnabled() || overCeiling {
-		profileErr, err = r.removeA2ADispatcher(ctx, agent)
+		profileErr, err = r.removeA2ADispatcher(ctx, agent, overCeiling)
+		if overCeiling && err == nil {
+			cm, berr := buildA2ADispatchConfigMap(agent, profiles, draining)
+			if berr == nil {
+				berr = r.applyManaged(ctx, agent, cm)
+			}
+			err = berr
+		}
 		if profileErr == nil && err == nil {
 			jobModeVerdict = jobModeTornDown
 		}
@@ -1043,7 +1054,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the
 // owned objects only if this agent controls them, and the profile namespace's
 // Role and binding only if they carry this agent's labels.
-func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (profileErr error, err error) {
+func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keepDispatchConfig bool) (profileErr error, err error) {
 	// The pools and their bundle go first, whatever the deletes after them
 	// do: their pods hold bus and broker tokens, and nothing dispatches to
 	// them once the dispatcher is off.
@@ -1056,6 +1067,9 @@ func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent
 		if err := r.deleteIfControlled(ctx, agent, obj, types.NamespacedName{Namespace: agent.Namespace, Name: name}); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if keepDispatchConfig {
+		return profileErr, goerrors.Join(errs...)
 	}
 	if err := r.deleteIfControlled(ctx, agent, &corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}); err != nil {
 		errs = append(errs, err)

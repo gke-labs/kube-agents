@@ -429,7 +429,8 @@ leave open:
   `DispatcherCeiling` condition warns at four fifths of the shard budget and reads
   `ProfilesRefused` while any profile is left out. Past the budget anyway, which only draining
   profiles can cause, the operator runs no dispatcher rather than write a map the API server
-  refuses. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
+  refuses. It keeps the dispatch config, with each drain's deadline, so the dispatcher comes back
+  once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
   ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
   target.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -25,11 +26,13 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -262,10 +265,12 @@ func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T)
 	if _, isOver, err := a2aDispatcherCeiling(agent, over, nil); err != nil || isOver {
 		t.Fatalf("with the newest refused, the entry still reads as over the budget (%v)", err)
 	}
-	// Draining profiles past the reserve the cut leaves them.
+	// Draining profiles past the reserve the cut leaves them, each with the
+	// deadline drainingDispatchProfiles gives every one it returns.
+	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
 	for i := 0; i < 600; i++ {
-		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i)})
+		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
 	}
 	if _, isOver, err := a2aDispatcherCeiling(agent, over, draining); err != nil || !isOver {
 		t.Fatalf("600 draining profiles don't push the entry over (%v); the fixture no longer reaches the backstop", err)
@@ -275,5 +280,73 @@ func TestTheDispatcherOutlivesTheCeilingAndOnlyDrainingTearsItDown(t *testing.T)
 	}
 	if err := c.Get(ctx, key, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the dispatcher's Deployment survived an entry past the budget: %v", err)
+	}
+	// The teardown lasts as long as the drains do, not one pass: the
+	// dispatch config keeps the draining profiles, with deadlines, so the
+	// next pass reads the same backstop and the dispatcher stays down.
+	next, err := r.dispatchDraining(ctx, agent, over)
+	if err != nil {
+		t.Fatalf("reading the draining profiles back: %v", err)
+	}
+	if len(next) != len(draining) {
+		t.Fatalf("the pass after the teardown reads %d draining profiles, want %d: the dispatcher would come back while they still drain", len(next), len(draining))
+	}
+	if _, isOver, err := a2aDispatcherCeiling(agent, over, next); err != nil || !isOver {
+		t.Errorf("the pass after the teardown reads as under the budget (%v); the dispatcher would flap", err)
+	}
+	cm := &corev1.ConfigMap{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		t.Fatalf("the teardown deleted the dispatch config: %v", err)
+	}
+	var applied a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
+		t.Fatal(err)
+	}
+	live := map[string]bool{}
+	for _, p := range over {
+		live[p.Name] = true
+	}
+	// Once the drains run out the entry fits and the dispatcher comes back.
+	if gone := drainingDispatchProfiles(&applied, live, time.Now().Add(a2aDrainingWindow+time.Minute)); len(gone) != 0 {
+		t.Errorf("%d draining profiles outlast the drain window, so the teardown would never end", len(gone))
+	}
+}
+
+// A profile refused for a foreign ServiceAccount takes no room under the
+// ceiling on either side: the PlatformAgent renders without it, so the
+// AgentProfile controller has to cut without it too, or the profile at the
+// boundary is rendered by one and refused by the other.
+func TestBothControllersCutAtTheSameProfile(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	profiles := ceilingProfiles(agent, 800)
+	start := metav1.Now()
+	for i := range profiles {
+		profiles[i].CreationTimestamp = metav1.NewTime(start.Add(time.Duration(i) * time.Second))
+	}
+	oldest := &profiles[0]
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Namespace: profileNamespaceOf(oldest),
+		Name:      agentProfileServiceAccountName(oldest, oldest.AllowedTierList()[0]),
+	}}
+	refused := a2aDispatcherCeilingRefused(agent, profiles[1:])
+	if len(refused) == 0 {
+		t.Fatal("800 profiles fit; the fixture no longer crosses the ceiling")
+	}
+	// The newest profile the PlatformAgent binds, which counting the foreign
+	// profile would push out.
+	boundary := profiles[len(profiles)-len(refused)-1].Name
+	if !slices.Contains(a2aDispatcherCeilingRefused(agent, profiles), boundary) {
+		t.Fatalf("%s is bound even with the foreign profile counted; the fixture no longer tests the boundary", boundary)
+	}
+	objs := []client.Object{agent, foreign}
+	for i := range profiles {
+		objs = append(objs, &profiles[i])
+	}
+	h := newProfileHarness(t, objs...)
+	h.reconcile(agent.Namespace, boundary)
+	if c := condition(h.profile(agent.Namespace, boundary), agentv1alpha1.AgentProfileConditionIdentityReady); c.Reason == reasonAgentProfileDispatcherCeiling {
+		t.Errorf("the AgentProfile controller refused %s, which the PlatformAgent renders: %s", boundary, c.Message)
 	}
 }

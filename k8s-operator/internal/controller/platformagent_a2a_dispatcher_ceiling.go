@@ -177,15 +177,15 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		over = true
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = dispatcherCeilingReasonOver
-		condition.Message = fmt.Sprintf("the profile dispatcher's identity entry for %d profiles is %d bytes, over the %d bytes one identity-map shard can carry, "+
-			"so the operator runs no dispatcher and profile tasks aren't dispatched; remove profiles, or switch the dispatcher off "+
-			"(operator.profileDispatcher.enabled: false). Lifting the ceiling is %s", n, size, a2aDispatcherCeilingBytes, dispatcherCeilingIssue)
+		condition.Message = fmt.Sprintf("the profile dispatcher's identity entry for %d profiles, %d of them draining, is %d bytes, over the %d bytes one identity-map shard can carry, "+
+			"so the operator runs no dispatcher, and profile tasks aren't dispatched, until those drains run out. Lifting the ceiling is %s",
+			n, len(draining), size, a2aDispatcherCeilingBytes, dispatcherCeilingIssue)
 	case len(refused) > 0:
 		condition.Status = metav1.ConditionFalse
 		condition.Reason = dispatcherCeilingReasonRefused
 		condition.Message = fmt.Sprintf("the profile dispatcher's identity carries %d profiles before it outgrows one identity-map shard; "+
 			"the %d newer ones aren't bound (the newest refused: %s), and the dispatcher serves the rest. Lifting the ceiling is %s",
-			n, len(refused), refused[len(refused)-1], dispatcherCeilingIssue)
+			n-len(draining), len(refused), refused[len(refused)-1], dispatcherCeilingIssue)
 	case size >= a2aDispatcherWarnBytes:
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear

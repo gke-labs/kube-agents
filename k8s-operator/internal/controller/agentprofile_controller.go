@@ -185,7 +185,14 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
 		return ctrl.Result{}, err
 	}
-	resolution := resolveAgentProfileIdentities(agent, all.Items)[profile.Name]
+	// Resolved over the same set the PlatformAgent renders from, so the two
+	// controllers cut at the same profile. This profile, if foreign, isn't in
+	// it and gets its refusal just below.
+	bound, err := withoutForeignServiceAccounts(ctx, r.Client, all.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resolution := resolveAgentProfileIdentities(agent, bound)[profile.Name]
 	profilesNS := profileNamespaceOf(&profile)
 	if resolution.refused == nil {
 		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)

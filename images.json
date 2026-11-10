@@ -129,7 +129,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
       "tagPolicy": "release",
       "override": "A2A_DISPATCHER_IMAGE",
-      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today.",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, unless `operator.profileDispatcher.enabled` is `false`. Nothing under spec.mode: today.",
       "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
     },
     {
