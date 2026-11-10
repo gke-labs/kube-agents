@@ -31,7 +31,11 @@ to put in a diff otherwise. Three paths lead there:
   (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
   requests only: a finding whose pull request a human closed is reported as `superseded`, never
   re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
-  ([ledger.md](ledger.md)) stays with the write-gated comment.
+  ([ledger.md](ledger.md)) stays with the write-gated comment. A task that asks you to open the
+  audit's fixes is a direct ask for each fix the ledger lists as awaiting `/remediate`, a
+  PodDisruptionBudget `finish` wrote itself included: run `remediate` for them in the same task. On
+  an install whose switch is off, that is the only way they open before a person comments, so do not
+  end the task telling the requester to comment `/remediate`.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 

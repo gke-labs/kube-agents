@@ -22957,6 +22957,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
+                # The worker is told the direct ask still opens these: a task that asked
+                # for the fixes runs `remediate` rather than stopping at the ledger.
+                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 

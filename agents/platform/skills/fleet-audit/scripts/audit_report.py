@@ -2739,6 +2739,18 @@ def sweep_off_reason() -> str:
     """Why no automatic pull request opened, in the ledger's words: the waiver names the run, else the install."""
     return SWEEP_WAIVED_REASON if _SWEEP_WAIVED else SWEEP_OFF_ON_INSTALL_REASON
 
+
+def sweep_off_next_step(noun: str) -> str:
+    """What the worker reads when the sweep opens nothing: the two ways a fix
+    still opens. A worker that read only "`/remediate` requests" stopped at the
+    ledger when its own task had asked for the fixes, and opened nothing."""
+    return (
+        f"the automatic sweep opens nothing. A `/remediate` comment on the ledger opens a {noun}, and so "
+        "does a direct ask: when this task asks you to open fixes, run `remediate --finding <id> "
+        "--manifest-file <the collector manifest>` for each one the ledger lists as awaiting `/remediate`, "
+        "a PodDisruptionBudget `finish` writes itself included. Never post `/remediate` yourself."
+    )
+
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
 # unused on a run without it.
@@ -22343,7 +22355,7 @@ def _handle_finish_dry_run(
     triage_reasons = triage_markers(findings, manifest)
     sweep_on = sweep_enabled_for_run()
     if not sweep_on:
-        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{sweep_off_reason()}: {sweep_off_next_step(noun)}")
     plan = promotion_candidates(
         findings,
         {},
@@ -23775,7 +23787,7 @@ def _plan_remediation_files(
         remediation_prs = []
     sweep_on = sweep_enabled_for_run() and listing_refusal is None
     if not sweep_on and listing_refusal is None:
-        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a proposal.")
+        log(f"{sweep_off_reason()}: {sweep_off_next_step('proposal')}")
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -26342,7 +26354,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
     )
     triage_reasons = triage_markers(findings, manifest)
     if not sweep_on:
-        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: {sweep_off_next_step(noun)}")
     plan = promotion_candidates(
         findings,
         pr_by_finding,
