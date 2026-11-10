@@ -2,7 +2,10 @@ package controller
 
 import (
 	"context"
+	"errors"
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"net"
 	"os"
 	"path/filepath"
@@ -348,5 +351,87 @@ func TestAReloadedDenyRefusesTheGatewayWithoutARestart(t *testing.T) {
 	}
 	if !log.refusedPublish("gateway", profileSupervisor) {
 		t.Fatalf("no publish violation for gateway on %s after the reload; server log: %q", profileSupervisor, log.publishViolations("gateway"))
+	}
+}
+
+// A restart owed at the bound happens before the pass applies the config, so
+// a delete that fails leaves the pending record on the Secret for the next
+// pass rather than dropping it with the restart never done.
+func TestAFailedRestartKeepsThePendingReload(t *testing.T) {
+	agent := a2aTestAgent()
+	refuseDeletes := false
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if _, ok := obj.(*corev1.Pod); ok && refuseDeletes {
+			return errors.New("the API server refused the delete")
+		}
+		return cl.Delete(ctx, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent, chartProfileNamespace(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(),
+		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t0", nil }}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	var sts appsv1.StatefulSet
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &sts); err != nil {
+		t.Fatal(err)
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: sts.Name + a2aNATSPodOrdinalSuffix, Namespace: agent.Namespace,
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID, Controller: ptr.To(true)}},
+	}}
+	if err := cl.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	profile := testAgentProfile(agent.Namespace, "tse")
+	if err := cl.Create(ctx, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	// The reload never lands: move its request past the bound.
+	var secret corev1.Secret
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSConfigSecretName(agent)}
+	if err := cl.Get(ctx, key, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+		t.Fatal("no pending reload after binding a profile")
+	}
+	secret.Annotations[a2aBusReloadRequestedAnnotation] = time.Now().Add(-2 * a2aBusReloadBound).UTC().Format(time.RFC3339Nano)
+	if err := cl.Update(ctx, &secret); err != nil {
+		t.Fatal(err)
+	}
+	refuseDeletes = true
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err == nil {
+		t.Fatal("a refused restart didn't fail the pass")
+	}
+	if err := cl.Get(ctx, key, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if secret.Annotations[a2aBusReloadRequestedAnnotation] == "" {
+		t.Fatal("the pending reload was dropped though its restart failed")
+	}
+	refuseDeletes = false
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); err == nil {
+		t.Fatal("the bus pod wasn't restarted once the delete went through")
+	}
+	if err := cl.Get(ctx, key, &secret); err != nil {
+		t.Fatal(err)
+	}
+	if secret.Annotations[a2aBusReloadRequestedAnnotation] != "" {
+		t.Fatal("the pending reload outlived its restart")
 	}
 }
