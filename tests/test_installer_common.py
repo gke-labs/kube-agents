@@ -6244,6 +6244,7 @@ cluster_mode = "autopilot"
 namespace    = "agents-ns"
 """
 _MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+_FOOTPRINT_PROFILES = _REPO_ROOT / "tests" / "data" / "footprint_profiles.json"
 
 # The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
 # maps them onto the chart.
@@ -6635,24 +6636,41 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
-        # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
-        # next-mode pods the preflight now sums (the A2A gateway's standby among them): the
-        # settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
-        self.assertIn("Pods:                23", proc.stdout)
-        # The tfvars say autopilot, so the credential proxy is counted at the operator's
-        # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
-        # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        5.910 cores", proc.stdout)
-        self.assertIn("Memory requests:     16.39 GiB", proc.stdout)
-        standard = self._run(
-            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
-            tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+        # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
+        # which `make docs-generate` renders from the same chart template with these
+        # tfvars' --set values (held equal to _FOOTPRINT_EXPECTED_SETS below), and docs-check
+        # keeps current. So this checks that the tfvars reach the render under the right
+        # keys and that the installer prints what the notes print, not the arithmetic,
+        # which tests/test_quota_preflight.py pins from hand-kept constants. The tfvars say
+        # autopilot, so the credential proxy is counted at the operator's Autopilot
+        # requests; on standard the same tfvars sum footprint.yaml's.
+        profiles = json.loads(_FOOTPRINT_PROFILES.read_text())["profiles"]
+        for key, output in (("installer-autopilot", proc), ("installer-standard", None)):
+            profile = profiles[key]
+            self.assertEqual(
+                [f"--set {item}" for item in profile["sets"]], _FOOTPRINT_EXPECTED_SETS,
+                f"{key} in {_FOOTPRINT_PROFILES.name} renders other values than the installer passes",
+            )
+            if output is None:
+                output = self._run(
+                    f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+                    tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+                )
+                self.assertIn("rc=0", output.stdout, output.stderr)
+            r = profile["requirements"]
+            gib = 1024**3
+            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            self.assertIn(
+                f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
+                output.stdout, key,
+            )
+        # Autopilot counts the credential proxy higher, so the two profiles differ.
+        self.assertGreater(
+            profiles["installer-autopilot"]["requirements"]["requestsCpu"],
+            profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
-        self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        4.410 cores", standard.stdout)
-        self.assertIn("Memory requests:     15.39 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one

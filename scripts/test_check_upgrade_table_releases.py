@@ -15,6 +15,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().with_name("check_upgrade_table_releases.py")
 PAGE = "docs/site/src/content/docs/install/upgrade.md"
+TRACES = "scripts/upgrade_table_traces.txt"
 HEADING = "### Breaking changes in recent releases\n\n"
 HEADER = "| Release | Change | What an existing install meets |\n| --- | --- | --- |\n"
 
@@ -59,6 +60,11 @@ class Repo:
         self.git("add", "-A")
         self.git("commit", "-q", "-m", message, at=self.tick())
         return self.git("rev-parse", "HEAD").strip()
+
+    def trace(self, *entries: str) -> None:
+        traces = self.root / TRACES
+        traces.parent.mkdir(parents=True, exist_ok=True)
+        traces.write_text("# a comment\n\n" + "".join(f"{entry}\n" for entry in entries), encoding="utf-8")
 
     def tag(self, name: str, commit: str = "HEAD") -> None:
         self.git("tag", "-a", name, "-m", name, commit, at=self.tick())
@@ -136,6 +142,140 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('"change c"', err)
 
+    def test_a_reworded_shipped_row_passes_with_a_trace_to_its_first_commit(self):
+        first = self.repo.commit("feat: r", row=row("1.0.0", "change r"))
+        self.repo.tag("1.0.0")
+        self.repo.reword("change r", "change r, reworded")
+        self.repo.commit("docs: reword r", code=False)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn("upgrade_table_traces.txt", err)
+        self.repo.trace(f"{first}  change r, reworded")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_row_added_after_its_release_passes_with_a_trace_to_the_shipped_change(self):
+        shipped = self.repo.commit("feat: l")
+        self.repo.tag("1.0.0")
+        self.repo.commit("docs: note l", row=row("1.0.0", "change l"), code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push")[0], 1)
+        self.repo.trace(f"{shipped} change l")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_trace_to_a_commit_the_release_does_not_contain_fails(self):
+        self.repo.tag("1.0.0")
+        late = self.repo.commit("feat: l", row=row("1.0.0", "change l"))
+        self.repo.trace(f"{late} change l")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f"does not contain {late[:12]}, the commit {TRACES} names for it", err)
+
+    def test_a_trace_to_an_unknown_commit_fails(self):
+        self.repo.trace("0123456789abcdef0123456789abcdef01234567 an old change")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f"{TRACES}:3: 0123456789abcdef0123456789abcdef01234567 is not a commit in this history", err)
+
+    def test_a_trace_to_a_commit_outside_this_history_fails(self):
+        self.repo.git("checkout", "-q", "-b", "elsewhere")
+        other = self.repo.commit("feat: elsewhere")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.trace(f"{other} an old change")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f"{other} is not a commit in this history or in a release's", err)
+
+    def test_a_trace_to_a_cherry_pick_on_the_release_branch_passes(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: c on main")
+        self.repo.git("checkout", "-q", "-b", "release", base)
+        picked = self.repo.commit("feat: c, cherry-picked")
+        self.repo.tag("1.0.0")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.commit("docs: note c", row=row("1.0.0", "change c"), code=False)
+        self.repo.trace(f"{picked} change c")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_trace_that_is_not_a_full_commit_fails(self):
+        self.repo.commit("feat: t", row=row("1.0.0", "change t"))
+        self.repo.tag("1.0.0")
+        for name in ("1.0.0", "HEAD~1", self.repo.git("rev-parse", "HEAD").strip()[:12]):
+            self.repo.trace(f"{name} change t")
+            code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+            self.assertEqual(code, 1, name)
+            self.assertIn("an entry is `<full 40-character commit> <change text>`", err)
+
+    def test_a_second_trace_for_the_same_row_fails(self):
+        first = self.repo.commit("feat: d", row=row("1.0.0", "change d"))
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{first} change d", f"{first}\tchange d")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('a second entry for "change d"', err)
+
+    def test_a_trace_matches_a_cell_with_extra_spaces(self):
+        shipped = self.repo.commit("feat: s")
+        self.repo.tag("1.0.0")
+        self.repo.commit("docs: note s", row="| 1.0.0 |  change s | x |\n", code=False)
+        self.repo.trace(f"{shipped} change s")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_an_indented_comment_is_a_comment(self):
+        self.repo.trace("   # an indented comment")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_trace_with_no_change_text_fails(self):
+        head = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.trace(head)
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn("an entry is `<full 40-character commit> <change text>`", err)
+
+    def test_a_trace_whose_row_is_gone_fails(self):
+        head = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.trace(f"{head} a row that is not on the page")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn('no row of the table has the change text "a row that is not on the page"', err)
+
+    def test_a_broken_trace_only_warns_a_change_that_edits_neither_file(self):
+        head = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.trace(f"{head} a row that is not on the page")
+        base = self.repo.commit("docs: a broken trace", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.commit("feat: a local change")
+        code, err = self.repo.check()
+        self.assertEqual(code, 0)
+        self.assertIn("warning: scripts/upgrade_table_traces.txt:3", err)
+
+    def test_a_pull_request_that_edits_only_a_trace_fails_on_the_row(self):
+        shipped = self.repo.commit("feat: l")
+        self.repo.tag("1.0.0")
+        self.repo.commit("docs: note l", row=row("1.0.0", "change l"), code=False)
+        self.repo.trace(f"{shipped} change l")
+        base = self.repo.commit("docs: trace l", code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        late = self.repo.commit("feat: a later change")
+        self.repo.trace(f"{late} change l")  # the entry now names a commit 1.0.0 does not contain
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        (self.repo.root / TRACES).unlink()  # removing the entry is an edit to the row too
+        self.assertEqual(self.repo.check()[0], 1)
+
+    def test_a_broken_trace_fails_a_change_that_edits_the_page_or_the_file(self):
+        base = self.repo.git("rev-parse", "HEAD").strip()
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.trace(f"{base} a row that is not on the page")
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertNotIn("warning:", err)
+        broken = self.repo.commit("docs: a broken trace", code=False)  # now in the base
+        self.repo.git("update-ref", "refs/remotes/origin/main", broken)
+        self.repo.commit("feat: g", row=row("2.0.0", "change g"))  # this change edits only the page
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn("a row that is not on the page", err)
+
     def test_a_pending_row_no_release_contains_passes(self):
         self.repo.commit("feat: p", row=row("pending", "change p"))
         self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
@@ -178,6 +318,17 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         code, err = self.repo.check(GITHUB_EVENT_NAME="push")
         self.assertEqual(code, 1)
         self.assertIn('no commit in this history adds the row "change w", so its pending label cannot be checked', err)
+
+    def test_a_reworded_pending_row_fails_once_its_release_contains_the_traced_commit(self):
+        first = self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("1.0.0")
+        self.repo.reword("change q", "change q, reworded")
+        self.repo.commit("docs: reword q", code=False)
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))  # the known limit: it fails open
+        self.repo.trace(f"{first} change q, reworded")
+        code, err = self.repo.check(GITHUB_EVENT_NAME="push")
+        self.assertEqual(code, 1)
+        self.assertIn(f"but 1.0.0 contains {first[:12]}, the commit {TRACES} names for it. Relabel it as 1.0.0.", err)
 
     def test_a_misspelt_release_cell_fails(self):
         for cell in ("`pending`", "Pending", "next"):

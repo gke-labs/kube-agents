@@ -282,8 +282,8 @@ times to produce one.
 The 0.05 the rule shipped with was a guess, and the issue that shipped it
 ([#1493](https://github.com/gke-labs/kube-agents/issues/1493)) said to arm it only after measuring
 how much an unchanged pull request moves the aggregate. Measured on 2026-09-29, read-only, from
-two sources. The summary tables are below; the full measurement, including the 94-row table of
-every presubmit run counted, is in the pull request that set the margin (#2122).
+two sources. The summary tables below are the record of that measurement (#2122 set the margin from it); a
+later measurement goes to the dashboard, not to a pull request body.
 
 **What is compared to what.** The pull request's side is every admitted case's scored
 repetitions pooled: twelve roster cases × three repetitions = 36 units, `infra` and `blocked`
@@ -1124,7 +1124,9 @@ fan-out, as before. `bench-gate record --recorded-manifest` (the `baseline-recor
 keeps that pass from appending a case twice, and the EXIT trap's `report_partial_verdict` tables the
 graded cases into `eval-verdict.md` under a PARTIAL banner and prints a cut-off line that is
 deliberately not a verdict line, so the Nightly report counts the cases and still calls the night
-truncated. The presubmit grades per case too and gets the same table on a deadline kill; its store
+truncated. The presubmit grades per case too and gets the same table on a deadline kill, holding
+the cases graded before the SIGTERM: on a presubmit or batch run the TERM trap stops the stackless
+units and scales LiteLLM to zero at once, since a cancelled run's verdict is discarded. Its store
 stays read-only, as `PULL_NUMBER` and the viewer-only identity already guarantee.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is

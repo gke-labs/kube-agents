@@ -36,8 +36,17 @@ jobs:
           # shallow, tagless clone would fail it.
           fetch-depth: 0
 
-      # Tables that mirror jobs.json, images.json, the skill frontmatter, or
-      # the provisioning scripts must match their source.
+      # The install footprint tables are rendered from the chart. Pinned to
+      # the action commit and helm release chart-check uses (validate.yml), so
+      # the two cannot render the chart differently.
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      # Tables that mirror jobs.json, images.json, the skill frontmatter, the
+      # provisioning scripts, the operator's Go source or the chart must match
+      # their source.
       - name: Generated tables are current
         run: make docs-check-generated
 

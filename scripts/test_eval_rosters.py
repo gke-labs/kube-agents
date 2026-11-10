@@ -236,20 +236,20 @@ PARKED_AFTER_THE_MOVE: list[str] = []
 # (case, the roster line it follows): the file keeps the presubmit file's
 # reporting order.
 ADMITTED_AFTER_THE_SPLIT = [
-    # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
+    # 2026-09-22 (#1023): above the bar on the presubmit since #1626, no collapse.
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
-    # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
+    # 2026-09-22 (#1023): above the bar on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
-    # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
-    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the agent-model key of 10-19, 9/9 since #3145, the store at collecting.
+    # 2026-10-14 (#2016): clean on the three writers nightlies 10-12 to 10-14, the store at would-admit, the presubmit above the bar since #2263 (10-03).
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: clean on the writers nightlies since the model change of 10-19, the nights since #3145 included, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
-    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the agent-model key of 10-19), the store at collecting.
+    # 2026-10-23: clean on the fourteen writers nightlies 10-09 to 10-22, the four since the model change of 10-19 included, the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
-    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the agent-model key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    # 2026-10-26: one miss on the twelve graded main nightlies 10-13 to 10-26, clean since the model change of 10-19 and under spec.mode next, the store at collecting.
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
-    # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
+    # 2026-11-02 (#2013 step 4, #4094): clean on the twelve graded main nightlies 10-20 to 11-02 and at the current next key (the store at collecting), the presubmit above the bar 10-27 to 11-02 with no all-reps collapse.
     ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
-    # 2026-11-02 (#4095): 21/21 on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next (15/15 at the gemini-4-argon key of 10-29), the store at collecting.
+    # 2026-11-02 (#4095): clean on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next, on both sides of the model change of 10-29, the store at collecting.
     ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
@@ -321,7 +321,7 @@ DEMOTED_AFTER_THE_SPLIT = [
     # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
     # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
     # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
-    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (the agent model of the day read seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
@@ -1480,6 +1480,104 @@ class PresubmitWallTimeTest(unittest.TestCase):
         got = eval_rosters.summary()
         self.assertEqual(got["presubmit wall budget, minutes"], eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES)
         self.assertEqual(got["presubmit wall estimate, minutes"], -(-eval_rosters.presubmit_wall_estimate()["total"] // 60))
+
+
+# ─── Roster comments carry the outcome, not the record (#5245) ───────────────
+# .agents/rules/public_surfaces.md: a committed file names a run's outcome and
+# where its record is, nothing from inside it. A roster comment therefore says
+# red, green, a miss, a collapse, above or under the bar, and cites the build;
+# the counts, ratios and judge scores stay on the domain scorecard. Every
+# `hack/eval/*.txt` is read, comment text only.
+ROSTER_COMMENT_FILES = sorted(eval_rosters.EVAL_DIR.glob("*.txt"))
+# A judge reading (`1.0`, `0.8`) stands alone: not inside a version
+# (`1.36.3`, `v0.17.0`, `GKE 1.36`), a section reference (`§1.5`) or a
+# longer number.
+JUDGE_READING_RE = re.compile(r"(?<!GKE )(?<![\w.§])[01]\.\d+(?![\w.])")
+# A result counted in words (`three passes`, `two failed repetitions`, `one
+# repetition failed`); `three repetitions` alone is the run's configuration.
+WORD_NUMBERS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+WORD_COUNT_RE = re.compile(
+    rf"\b({WORD_NUMBERS}) ((failed |passing |scored |graded )repetitions?|passes|misses)\b"
+    rf"|\b({WORD_NUMBERS}) repetitions? (passed|failed|pass|fail)\b")
+RESULT_SHAPES = {
+    "a pass ratio (N/M)": re.compile(r"\b\d+/\d+\b"),
+    "a count of passes (N of M)": re.compile(r"\b\d+ of \d+\b"),
+    "a percentage": re.compile(r"\b\d+(\.\d+)? ?%"),
+    "a judge score name": re.compile(r"OutcomeValidity|Verification(Catastrophic|Coverage)"),
+    "a judge reading": JUDGE_READING_RE,
+    "a repetition count": re.compile(r"\b\d+ (graded |passing )?repetitions?\b"),
+    "a miss count": re.compile(r"\b\d+ misses\b"),
+    "a per-repetition verdict": re.compile(r"passed every|failed every|fails every|nights in a row"),
+    "a count of passes or misses in words": WORD_COUNT_RE,
+}
+# Exact substrings of the comment lines where a number is a budget or
+# infrastructure fact, not a run's result. Short on purpose: a new entry
+# needs the same kind of reason.
+RESULT_SHAPE_ALLOWLIST = {
+    # nightly-budget-history.txt: the share of the deadline the first night used.
+    "used 71% of the budget",
+    # nightly-budget-history.txt: how many cases the deadline reached, a budget fact.
+    "cut the night at 32 of 73",
+    # nightly-budget-history.txt: the infra-lock chain's share of the build's wall clock.
+    "The chain is 72 to 85% of the build, 79% summed",
+    # nightly-cases.txt: the fixture scan over the pool projects, infrastructure.
+    "reads the role healthy on 40 of 40",
+    # blocking-roster.txt: rung 4's definition, a rule constant.
+    "three failed repetitions red the job",
+}
+RESULT_SHAPE_RULE = (
+    "a roster comment states the outcome and cites the run; the numbers are on the "
+    "domain scorecard (.agents/rules/public_surfaces.md)"
+)
+
+
+def roster_comment_lines(text: str):
+    """(line number, comment text) for every comment in a roster file, the
+    parsed markers left out: `# part N` and the nightly's sorted-section marker."""
+    for number, raw in enumerate(text.splitlines(), start=1):
+        if "#" not in raw:
+            continue
+        if eval_rosters.PART_MARKER_RE.match(raw) or raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
+            continue
+        yield number, raw.split("#", 1)[1]
+
+
+def result_shape_findings(path: pathlib.Path, text: str) -> list[str]:
+    findings = []
+    for number, comment in roster_comment_lines(text):
+        if any(allowed in comment for allowed in RESULT_SHAPE_ALLOWLIST):
+            continue
+        for name, pattern in RESULT_SHAPES.items():
+            if pattern.search(comment):
+                findings.append(f"{path.name}:{number}: {comment.strip()!r} carries {name}; {RESULT_SHAPE_RULE}")
+    return findings
+
+
+class RosterCommentsCarryNoResultsTest(unittest.TestCase):
+    def test_no_roster_comment_carries_a_count_ratio_or_score(self):
+        self.assertTrue(ROSTER_COMMENT_FILES, "no hack/eval/*.txt to read")
+        findings = []
+        for path in ROSTER_COMMENT_FILES:
+            findings.extend(result_shape_findings(path, path.read_text(encoding="utf-8")))
+        self.assertEqual(findings, [], "\n".join(findings))
+
+    def test_the_shapes_catch_a_result_and_pass_a_citation(self):
+        caught = result_shape_findings(pathlib.Path("x.txt"), "# 3/3 on build 1\n")
+        self.assertEqual(len(caught), 1, caught)
+        self.assertIn("a pass ratio", caught[0])
+        clean = (
+            "# green on build 2113733214391504896 (2026-10-23); a miss on GKE 1.36.3-gke.1244000,\n"
+            "# SOUL §1.5, v0.17.0, 2026-10-14 (#2016), 40 of 40 pool projects read healthy\n"
+        )
+        self.assertEqual(
+            result_shape_findings(pathlib.Path("x.txt"), clean.replace("40 of 40 pool", "reads the role healthy on 40 of 40 pool")), [])
+        self.assertEqual(result_shape_findings(pathlib.Path("x.txt"), "# part 2\n./tasks/a/task.yaml\n"), [])
+
+    def test_every_allowlist_entry_still_matches_a_line(self):
+        text = "\n".join(p.read_text(encoding="utf-8") for p in ROSTER_COMMENT_FILES)
+        for allowed in RESULT_SHAPE_ALLOWLIST:
+            with self.subTest(allowed=allowed):
+                self.assertIn(allowed, text, "an allowlist entry no roster comment carries any more: delete it")
 
 
 if __name__ == "__main__":
