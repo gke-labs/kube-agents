@@ -59,7 +59,7 @@ commits no customer installs. This document separates the two.
   a repetition whose checks do not apply on the transport it ran on. It is listed and never
   votes.
 - **Declared gap.** A scenario marked `expected_fail: true` in its `task.yaml`
-  ([`bench-case-format.md`](bench-case-format.md), "The fields"). Its roster reason block names
+  ([`bench-case-format.md`](bench-case-format.md), "The fields"). Its task file's header names
   the issue that owns the gap. It is shown as a gap, never as a pass.
 
 ## The rating rule
@@ -145,9 +145,9 @@ item with its cost.
   `hack/ci-deploy.sh` as `RC_COMMIT_SHA`, which installs the published images and builds nothing.
 - **One tree.** The release's commit (the GA tag's parent: the candidate commit whose images the
   release promoted) supplies everything: the published images, the chart, the CRDs, the harness
-  (`bench/`, `hack/ci-eval-pr.sh`), the roster and the cases. The job checks
+  (`bench/`, `hack/ci-eval-pr.sh`) and the suite's cases. The job checks
   the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. A release
-  whose tree has no roster entry is skipped before any lease and reads "No run"; the record
+  whose tree has no suite case is skipped before any lease and reads "No run"; the record
   names one commit. A release's cases grade the skills that release ships, so a certificate
   never mixes `main`'s cases with an older release's skills.
 - **Repetitions.** 30 per build, two builds over two days, pooled into the release's 60-window
@@ -174,7 +174,7 @@ item with its cost.
 ## The roster and case rules
 
 The entry rules are the "Certification suite" section of
-[`bench/README.md`](../../bench/README.md#certification-suite) and the roster's header; this
+[`bench/README.md`](../../bench/README.md#certification-suite) and each case's task file header; this
 document restates none of them. Two rules decided on 2026-11-05 are not in that list yet and
 land with the first case pull requests: a check binds to the planted object, so a ledger check
 names the finding and the object in one finding block (`scope: finding` on
