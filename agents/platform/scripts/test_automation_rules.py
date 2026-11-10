@@ -276,5 +276,48 @@ class TestMain(unittest.TestCase):
         self.assertFalse(out["decision"]["allowed"])
 
 
+class TestWithDeny(unittest.TestCase):
+    LAYOUTS = {
+        "block deny": GOOD + "# trailing comment\n",
+        "no deny": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments:\n        - dev\n        - qa\n# end\n",
+        "empty deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n",
+        "flow empty deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: []\n",
+        "flow deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: [{fix: '*', environments: [prod]}]\n",
+        "flow automerge, no newline": "version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}]}",
+        "deny first, wide dash": "version: 1\nautomerge:\n  deny:\n  -   fix: '*'\n      environments: [prod]\n  allow:\n  - fix: no-pdb\n    environments: [dev]\n",
+        "numeric environment": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: ['1']}]\n",
+    }
+
+    def test_every_layout_gains_exactly_the_deny(self):
+        for name, text in self.LAYOUTS.items():
+            env = "1" if "numeric" in name else "dev"
+            with self.subTest(name):
+                before = ar.parse(text)
+                out = ar.with_deny(text, "no-pdb", env, "x/pull/7 was still broken")
+                after = ar.parse(out)
+                self.assertEqual(after.status, ar.LOADED, after.error)
+                self.assertFalse(ar.decide(after, "no-pdb", env).allowed)
+                self.assertEqual(after.allow, before.allow)
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", (env,)),))
+                # Everything the customer wrote is still there, in order: whole
+                # lines in a block file, characters in a flow one.
+                kept = iter(out.splitlines() if "flow" not in name else out)
+                for piece in text.splitlines() if "flow" not in name else text:
+                    self.assertIn(piece, kept)
+
+    def test_note_is_a_comment_in_block_files(self):
+        out = ar.with_deny(GOOD, "no-pdb", "dev", "x/pull/7\nwas still broken")
+        self.assertIn("    # x/pull/7 was still broken\n    - fix: \"no-pdb\"", out)
+
+    def test_refusals(self):
+        for name, text in {
+            "invalid file": "version: 2\n",
+            "no automerge": "version: 1\n",
+            "null deny keyword": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: ~\n",
+        }.items():
+            with self.subTest(name), self.assertRaises(ar.RulesError):
+                ar.with_deny(text, "no-pdb", "dev")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -603,6 +603,9 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          files entrypoint.sh writes, then the session's variables
 #   automation_rules.py    checks a GitOps checkout's .kube-agents/automation.yaml,
 #                          the checkouts being here; imports kubeagents_switches
+#   post_merge_stepdown.py opens the revert and the rules-file pull request for an
+#                          auto-merged fix still broken after merge; imports
+#                          automation_rules and vcs_client
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -690,6 +693,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
+     agents/platform/scripts/post_merge_stepdown.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \
