@@ -141,6 +141,20 @@ UNREAD_NO_LISTING = "refused as too large, and the refusal named no entries belo
 REPLACEMENT_CHARACTER = "\ufffd"
 UNREAD_NOT_UTF8 = "its name is not UTF-8, so the broker's listing could not name it to ask for"
 UNREAD_NO_MEASURE = "the broker's refusal gave no size for it, so it could not be put in a part"
+# The broker marks an entry whose name its listing could not decode as UTF-8
+# with this field, holding why; the scan lists it as not read and never asks
+# for it. The scan's own U+FFFD check stays for a broker too old to mark it.
+ENTRY_UNNAMED = "unnamed"
+# A batch the broker refuses as a whole with PATH_NOT_FOUND (the branch moved
+# and one of its paths is gone), or as too large with no entries to continue
+# from, is asked for again in two halves, each a snapshot inside
+# NARROW_SNAPSHOT_CAP. The halves wait behind the batches not yet asked for,
+# so one bad name costs the cap's last snapshots and not the rest of the tree.
+# A refused entry that stands alone is listed with its own refusal, and what
+# the cap leaves is listed as past it. Any other refusal (authentication, an
+# unavailable broker, a timeout) is not about one entry, and the batch is
+# listed as not read.
+PATH_NOT_FOUND = "PATH_NOT_FOUND"
 UNREAD_PART_ERROR = "its part could not be unpacked: {error}"
 
 # `[v]MAJOR.MINOR[.PATCH][-gke.BUILD]`: the GKE form Phase 1 prints, and the bare
@@ -490,7 +504,7 @@ def read_repo_in_parts(
     total_bytes = 0
     while pending and not read.stopped:
         for entry in list(pending):
-            reason = _name_refusal(entry["path"])
+            reason = entry.get(ENTRY_UNNAMED) or _name_refusal(entry["path"])
             if reason is None and (isinstance(entry.get("bytes"), bool) or not isinstance(entry.get("bytes"), int)):
                 reason = UNREAD_NO_MEASURE
             if reason is not None:
@@ -506,7 +520,8 @@ def read_repo_in_parts(
                 read.unread.append(
                     {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(limit=limit, env=CEILING_ENV)}
                 )
-        for batch in requests:
+        while requests:
+            batch = requests.pop(0)
             # Checked before the next clone, not only inside `read_tree` after it.
             if len(read.files) >= max_files:
                 read.stopped = STOPPED_MAX_FILES
@@ -528,6 +543,10 @@ def read_repo_in_parts(
                     # The entries below every asked path, whatever the batch's size
                     # (a part can grow past the ceiling when the branch moves).
                     pending.extend(entry for entry in refused.entries if _holds_manifests(entry))
+                elif len(batch) > 1 and refused.code in (PATH_NOT_FOUND, vcs_client.SNAPSHOT_TOO_LARGE):
+                    # After the batches not yet asked for, which are read first.
+                    half = len(batch) // 2
+                    requests.extend([batch[:half], batch[half:]])
                 elif refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
                     read.unread.append(
                         {"path": batch[0]["path"], "reason": UNREAD_NO_LISTING.format(refusal=refused)}
