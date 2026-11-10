@@ -234,6 +234,27 @@ RELAY_FALLBACK_MIN_SECONDS = 1.0
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
 DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+# A `get-credentials` the shim answers itself when the kube-api proxy is in
+# use (`answer_get_credentials_locally`): the broker would run gcloud only for
+# the shim to replace its kubeconfig with a kube-proxy one built from the
+# context name, about half of the gcloud slot time the fleet audits put on the
+# broker (#5444). The flags it understands; any other sends the call to the
+# broker as before. Valued flags take the next token or `=value`.
+GET_CREDENTIALS_LOCAL_VALUED_FLAGS = frozenset({"--location", "--zone", "-z", "--region", "--project"})
+GET_CREDENTIALS_LOCAL_LOCATION_FLAGS = frozenset({"--location", "--zone", "-z", "--region"})
+GET_CREDENTIALS_LOCAL_BARE_FLAGS = frozenset({"--internal-ip", "--dns-endpoint", "--quiet", "-q"})
+# The one relay read that tells a typo from a cluster: the route the Cluster
+# Agent reconcile already uses to ask whether a cluster still exists.
+GET_CREDENTIALS_CHECK_URL = "https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}"
+GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS = 20
+# What gcloud prints on stderr for a get-credentials, and for a cluster it
+# cannot find; the shim prints the same, so a caller reads the same lines.
+GET_CREDENTIALS_FETCHING_LINE = "Fetching cluster endpoint and auth data."
+GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
+GET_CREDENTIALS_NOT_FOUND_LINE = (
+    "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=404, "
+    "message=Not found: projects/{project}/locations/{location}/clusters/{cluster}."
+)
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 SANDBOX_HERMES_UID = 1001
@@ -1357,6 +1378,110 @@ def is_get_credentials(argv: list[str]) -> bool:
     return words[:3] == list(_GET_CREDENTIALS_WORDS)
 
 
+def get_credentials_local_target(argv: list[str]) -> ClusterTarget | None:
+    """The cluster a get-credentials names in full, or None when the shim should not answer it.
+
+    Read from `argv` with `--kubeconfig` already taken off: the command words,
+    one positional cluster name, exactly one location (as `--location`,
+    `--zone`, `-z` or `--region`; `--zone` and `--location` for the same zone
+    name the same context) and `--project`. Any other flag, a second
+    positional, a missing part, or two locations that disagree is None, and the
+    broker answers the call as before.
+    """
+    if not is_get_credentials(argv):
+        return None
+    values: dict[str, list[str]] = {}
+    positionals: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if token.startswith("-"):
+            name, eq, value = token.partition("=")
+            if name in GET_CREDENTIALS_LOCAL_BARE_FLAGS and not eq:
+                index += 1
+                continue
+            if name not in GET_CREDENTIALS_LOCAL_VALUED_FLAGS:
+                return None
+            if not eq:
+                if index + 1 >= len(argv):
+                    return None
+                value = argv[index + 1]
+                index += 1
+            key = "location" if name in GET_CREDENTIALS_LOCAL_LOCATION_FLAGS else name
+            values.setdefault(key, []).append(value)
+            index += 1
+            continue
+        positionals.append(token)
+        index += 1
+    if positionals[:1] and positionals[0] in _GCLOUD_RELEASE_TRACKS:
+        positionals = positionals[1:]
+    if positionals[:3] != list(_GET_CREDENTIALS_WORDS) or len(positionals) != len(_GET_CREDENTIALS_WORDS) + 1:
+        return None
+    locations = set(values.get("location", []))
+    projects = set(values.get("--project", []))
+    if len(locations) != 1 or len(projects) != 1:
+        return None
+    target = ClusterTarget(project=projects.pop(), location=locations.pop(), cluster=positionals[-1])
+    if not all(_GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (target.project, target.location, target.cluster)):
+        return None
+    return target
+
+
+def answer_get_credentials_locally(
+    argv: list[str], destination: Path | None, implicit_destination: bool, session=None
+) -> int | None:
+    """Answer a get-credentials without the broker when the kube-api proxy is in use.
+
+    The kubeconfig the shim writes after a broker call is built from the
+    context name alone (`rewrite_kubeconfig_for_kube_proxy`), so with
+    `KUBE_PROXY_URL` set the broker's gcloud run adds nothing but a check that
+    the cluster exists. That check is one relay read here instead. Returns the
+    exit code: 0 with the kubeconfig written as after a broker call, 1 with
+    gcloud's not-found error for a cluster or location that does not exist.
+    Returns None, and the caller sends the command to the broker as before,
+    when the kube-api proxy is not in use, the argv does not name the cluster
+    in full (`get_credentials_local_target`), or the relay gives any other
+    answer or cannot be reached.
+    """
+    if not os.environ.get("KUBE_PROXY_URL", "").strip():
+        return None
+    target = get_credentials_local_target(argv)
+    if target is None:
+        return None
+    url = GET_CREDENTIALS_CHECK_URL.format(project=target.project, location=target.location, cluster=target.cluster)
+    try:
+        response = (session or ApiSession()).get(url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS)
+    except Exception:  # noqa: BLE001 - any failure here is the broker's call to make
+        return None
+    status = getattr(response, "status_code", None)
+    if status == http.HTTPStatus.NOT_FOUND:
+        print(GET_CREDENTIALS_FETCHING_LINE, file=sys.stderr)
+        print(
+            GET_CREDENTIALS_NOT_FOUND_LINE.format(
+                project=target.project, location=target.location, cluster=target.cluster
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    if status != http.HTTPStatus.OK:
+        return None
+    merge_context_into_default_kubeconfig(target.context_name)
+    generated = build_kube_proxy_kubeconfig(target.context_name)
+    print(GET_CREDENTIALS_FETCHING_LINE, file=sys.stderr)
+    print(GET_CREDENTIALS_GENERATED_LINE.format(cluster=target.cluster), file=sys.stderr)
+    if implicit_destination:
+        land_implicit_kubeconfig(generated)
+    if destination is not None:
+        try:
+            _replace_file(destination, generated)
+        except OSError as exc:
+            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
     """Take the `--kubeconfig` off a get-credentials argv, keeping where it pointed.
 
@@ -1638,9 +1763,11 @@ def execute(
                 "the task's cluster and project are used",
                 file=sys.stderr,
             )
+    get_credentials = False
     try:
         context = ""
         if is_get_credentials(argv):
+            get_credentials = True
             argv, destination = get_credentials_destination(argv)
             implicit_destination = destination is None
         elif argv and argv[0] in KUBECONFIG_AWARE:
@@ -1657,6 +1784,13 @@ def execute(
     except KubeconfigUnreadable as exc:
         print(f"credential proxy: {exc}", file=sys.stderr)
         return 1
+    # With the kube-api proxy in use, a get-credentials that names its cluster
+    # in full needs no broker call; a profile task's stays with the broker,
+    # which holds the task's cluster.
+    if get_credentials and not in_task:
+        answered = answer_get_credentials_locally(argv, destination, implicit_destination)
+        if answered is not None:
+            return answered
 
     request_payload = {
         "requestId": str(uuid.uuid4()),

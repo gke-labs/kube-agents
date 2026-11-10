@@ -3083,3 +3083,125 @@ class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class GetCredentialsAnsweredInTheShimTest(unittest.TestCase):
+    """With the kube-api proxy in use, a get-credentials that names its cluster
+    in full is answered in the shim: one relay read checks the cluster exists,
+    and the kube-proxy kubeconfig is written as after a broker call (#5447).
+    Every other case goes to the broker as before."""
+
+    ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    BASE = ["gcloud", "container", "clusters", "get-credentials", "ka-a"]
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, True)
+        token = self.directory / "token"
+        token.write_text("caller-token", encoding="utf-8")
+        self.env = {
+            "KUBE_PROXY_URL": "https://kube-proxy.kubeagents-system.svc:8443",
+            "KUBE_PROXY_CA_FILE": "/ca.crt",
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(token),
+            credential_proxy_client.TASK_TOKEN_FILE_ENV: "",
+            "KUBECONFIG": "",
+        }
+        defaults = [self.directory / "default-a", self.directory / "default-b"]
+        patcher = patch.object(credential_proxy_client, "_default_kubeconfig_candidates", return_value=defaults)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_shim(self, argv, status=200, raises=None, env=None):
+        relay = Mock()
+        if raises is not None:
+            relay.get.side_effect = raises
+        else:
+            relay.get.return_value = Mock(status_code=status)
+        broker = Mock(return_value=RecordingResponse(json.dumps({"exitCode": 0}).encode("utf-8")))
+        stderr = io.StringIO()
+        landed = Mock()
+        with patch.dict("os.environ", {**self.env, **(env or {})}, clear=False), \
+                patch.object(credential_proxy_client, "ApiSession", return_value=relay) as session, \
+                patch.object(credential_proxy_client, "open_broker_request", broker), \
+                patch.object(credential_proxy_client, "land_implicit_kubeconfig", landed), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute(self.ENDPOINT, argv)
+        return {"code": code, "relay": relay, "session": session, "broker": broker,
+                "stderr": stderr.getvalue(), "landed": landed}
+
+    def test_a_cluster_named_in_full_is_answered_without_the_broker(self):
+        destination = self.directory / "out.yaml"
+        sent = self.run_shim(self.BASE + ["--location", "us-central1-a", "--project", "acme-prod",
+                                          f"--kubeconfig={destination}"])
+        self.assertEqual(0, sent["code"])
+        sent["broker"].assert_not_called()
+        sent["relay"].get.assert_called_once()
+        self.assertEqual(
+            "https://container.googleapis.com/v1/projects/acme-prod/locations/us-central1-a/clusters/ka-a",
+            sent["relay"].get.call_args.args[0],
+        )
+        written = destination.read_text(encoding="utf-8")
+        self.assertIn("server: https://kube-proxy.kubeagents-system.svc:8443/clusters/gke_acme-prod_us-central1-a_ka-a", written)
+        self.assertEqual("gke_acme-prod_us-central1-a_ka-a", credential_proxy_client.read_current_context(written))
+        self.assertIn("kubeconfig entry generated for ka-a.", sent["stderr"])
+        sent["landed"].assert_not_called()
+
+    def test_zone_and_location_for_the_same_cluster_write_the_same_context(self):
+        contexts = []
+        for flag in ("--zone", "--location", "-z", "--region"):
+            destination = self.directory / f"{flag.strip('-')}.yaml"
+            self.run_shim(self.BASE + [flag, "us-central1-a", "--project=acme-prod", "--kubeconfig", str(destination)])
+            contexts.append(credential_proxy_client.read_current_context(destination.read_text(encoding="utf-8")))
+        self.assertEqual({"gke_acme-prod_us-central1-a_ka-a"}, set(contexts))
+
+    def test_a_context_less_call_lands_like_a_broker_answer(self):
+        sent = self.run_shim(self.BASE + ["--location=us-central1-a", "--project=acme-prod"])
+        self.assertEqual(0, sent["code"])
+        sent["broker"].assert_not_called()
+        sent["landed"].assert_called_once()
+        landed = sent["landed"].call_args.args[0]
+        self.assertEqual("gke_acme-prod_us-central1-a_ka-a", credential_proxy_client.read_current_context(landed))
+
+    def test_a_cluster_that_does_not_exist_exits_1_with_gclouds_error(self):
+        destination = self.directory / "out.yaml"
+        sent = self.run_shim(self.BASE + ["--location=us-central1-a", "--project=acme-prod",
+                                          f"--kubeconfig={destination}"], status=404)
+        self.assertEqual(1, sent["code"])
+        sent["broker"].assert_not_called()
+        self.assertFalse(destination.exists())
+        self.assertIn(
+            "ERROR: (gcloud.container.clusters.get-credentials) ResponseError: code=404, "
+            "message=Not found: projects/acme-prod/locations/us-central1-a/clusters/ka-a.",
+            sent["stderr"],
+        )
+
+    def test_any_other_relay_answer_goes_to_the_broker(self):
+        argv = self.BASE + ["--location=us-central1-a", "--project=acme-prod"]
+        for name, kwargs in (("refused", {"status": 403}), ("upstream error", {"status": 500}),
+                             ("unreachable", {"raises": ConnectionError("no route")})):
+            with self.subTest(name):
+                sent = self.run_shim(argv, **kwargs)
+                sent["broker"].assert_called_once()
+
+    def test_the_broker_answers_what_the_shim_cannot_name_in_full(self):
+        cases = {
+            "no kube-api proxy": (self.BASE + ["--location=l1", "--project=p1"], {"KUBE_PROXY_URL": ""}),
+            "no project": (self.BASE + ["--location=us-central1-a"], None),
+            "no location": (self.BASE + ["--project=acme-prod"], None),
+            "two locations": (self.BASE + ["--zone=us-central1-a", "--location=us-east1", "--project=acme-prod"], None),
+            "an unknown flag": (self.BASE + ["--location=us-central1-a", "--project=acme-prod", "--format=json"], None),
+            "two clusters": (self.BASE + ["ka-b", "--location=us-central1-a", "--project=acme-prod"], None),
+        }
+        for name, (argv, env) in cases.items():
+            with self.subTest(name):
+                sent = self.run_shim(argv, env=env)
+                sent["broker"].assert_called_once()
+                sent["relay"].get.assert_not_called()
+
+    def test_a_profile_task_stays_with_the_broker(self):
+        token = self.directory / "task-token"
+        token.write_text("a.b.c", encoding="utf-8")
+        sent = self.run_shim(self.BASE + ["--location=us-central1-a", "--project=acme-prod"],
+                             env={credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token)})
+        sent["broker"].assert_called_once()
+        sent["relay"].get.assert_not_called()
