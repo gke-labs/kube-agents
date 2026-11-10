@@ -463,3 +463,22 @@ func TestScrubInlineSecretsEnvNameValuePairs(t *testing.T) {
 		}
 	}
 }
+
+// A boolean or valueless flag just before a credential flag in an argument
+// list does not take the credential flag as its value: the credential's
+// value is redacted, in a JSON list and in YAML items.
+func TestScrubInlineSecretsArgListFlagBeforeACredentialFlag(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{`"args": ["--verbose", "--db-password", "synthetic-pass-0001"]`,
+			`"args": ["--verbose", "--db-password", "[redacted]"]`},
+		{`"args": ["--include-secrets", "--db-password", "synthetic-pass-0001", "--port", "5432"]`,
+			`"args": ["--include-secrets", "--db-password", "[redacted]", "--port", "5432"]`},
+		{"args:\n  - --verbose\n  - --db-password\n  - synthetic-pass-0001\n",
+			"args:\n  - --verbose\n  - --db-password\n  - [redacted]\n"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}

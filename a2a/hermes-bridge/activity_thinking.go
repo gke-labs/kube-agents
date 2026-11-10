@@ -62,9 +62,11 @@ var (
 	cliSingleDashSecretFlagPattern = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
 	// A flag and its value as separate items of an argument list: JSON or
 	// Python strings ("--db-password", "x") or YAML items (- --db-password
-	// then - x on the next line), as a container's args carry them.
-	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*["']([^"'\r\n]*)["']`)
-	cliArgListYAMLPattern = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+["']?--?([A-Za-z][A-Za-z0-9_.-]*)["']?[ \t]*\r?\n[ \t]*-[ \t]+["']?([^"'\r\n#]*[^"'\r\n#\s])`)
+	// then - x on the next line), as a container's args carry them. A value
+	// never starts with a dash, so a flag with no value of its own does not
+	// take the next flag as its value and hide that flag's.
+	cliArgListJSONPattern = regexp.MustCompile(`["']--?([A-Za-z][A-Za-z0-9_.-]*)["'][ \t]*,[ \t]*["']((?:[^-"'\r\n][^"'\r\n]*)?)["']`)
+	cliArgListYAMLPattern = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+["']?--?([A-Za-z][A-Za-z0-9_.-]*)["']?[ \t]*\r?\n[ \t]*-[ \t]+["']?([^-"'\r\n#\s](?:[^"'\r\n#]*[^"'\r\n#\s])?)`)
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the password in secret app-db is hunter2", "the
 	// password key decodes to hunter2", "the token was abc", "the password
