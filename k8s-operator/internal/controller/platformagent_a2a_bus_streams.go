@@ -500,7 +500,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	now := p.now()
 	record := readBusReprovisionRecord(agent)
 
-	settled, err := p.busSettled(ctx, agent)
+	sts, settled, err := p.busSettled(ctx, agent)
 	if err != nil {
 		return err
 	}
@@ -516,7 +516,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		return nil
 	}
 
-	readings := p.scrapeServers(ctx, agent)
+	readings := p.scrapeServers(ctx, agent, sts)
 	verdict := busStreamsVerdictFor(a2aNATSReplicas(agent), readings)
 	if !verdict.known {
 		streak.missing, streak.misses = nil, 0
@@ -675,20 +675,24 @@ func (p *BusStreamPoller) provisionJob(ctx context.Context, agent *agentv1alpha1
 	return job, busJobRunning, nil
 }
 
-// busSettled reports whether the bus StatefulSet is at rest: the controller
-// has seen its spec, every replica is updated and ready on one revision, and
-// it runs the server count the CR resolves to (not mid-conversion).
-func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+// busSettled reads the bus StatefulSet and reports whether it is at rest: the
+// controller has seen its spec, every replica is updated and ready on one
+// revision, and it runs the server count the CR resolves to (not
+// mid-conversion). Only a StatefulSet this CR controls counts.
+func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*appsv1.StatefulSet, bool, error) {
 	sts := &appsv1.StatefulSet{}
 	if err := p.r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
-		return false, client.IgnoreNotFound(err)
+		return nil, false, client.IgnoreNotFound(err)
+	}
+	if owner := metav1.GetControllerOf(sts); owner == nil || owner.UID != agent.UID {
+		return nil, false, nil
 	}
 	want := int32(a2aNATSReplicas(agent))
 	replicas := int32(1)
 	if sts.Spec.Replicas != nil {
 		replicas = *sts.Spec.Replicas
 	}
-	return sts.Status.ObservedGeneration >= sts.Generation &&
+	return sts, sts.Status.ObservedGeneration >= sts.Generation &&
 		replicas == want &&
 		sts.Status.Replicas == replicas &&
 		sts.Status.ReadyReplicas == replicas &&
@@ -696,9 +700,14 @@ func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.P
 		sts.Status.CurrentRevision == sts.Status.UpdateRevision, nil
 }
 
-// scrapeServers reads every Ready bus pod whose exporter is ready. A pod that
-// can't be read gives an empty reading, which the verdict doesn't count.
-func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []busServerReading {
+// scrapeServers reads the bus pods whose exporter is ready. A pod counts only
+// when the bus StatefulSet controls it (by UID), it runs the StatefulSet's
+// current revision, and it isn't on the host network: the label the list
+// selects by is one any pod in the namespace can carry, and what a pod serves
+// on the port decides whether the operator deletes the provision Job and
+// restarts the gateway pods. At most one reading per replica is kept. A pod
+// that can't be read gives no reading, which the verdict doesn't count.
+func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) []busServerReading {
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
 	var pods corev1.PodList
 	if err := p.r.podReader().List(ctx, &pods, client.InNamespace(agent.Namespace),
@@ -709,8 +718,17 @@ func (p *BusStreamPoller) scrapeServers(ctx context.Context, agent *agentv1alpha
 	var readings []busServerReading
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID {
+			continue
+		}
+		if pod.Labels[appsv1.ControllerRevisionHashLabelKey] != sts.Status.UpdateRevision || pod.Spec.HostNetwork {
+			continue
+		}
 		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" || !usageContainerReady(pod, a2aNATSExporterContainerName) {
 			continue
+		}
+		if len(readings) >= int(sts.Status.Replicas) {
+			break
 		}
 		port, ok := usagePodPort(pod, a2aNATSExporterContainerName, a2aNATSMetricsPortName)
 		if !ok {

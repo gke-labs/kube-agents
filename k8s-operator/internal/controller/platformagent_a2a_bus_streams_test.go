@@ -244,10 +244,18 @@ func busStreamsJob(agent *agentv1alpha1.PlatformAgent, created time.Time, state 
 	return job
 }
 
+const busStreamsTestStatefulSetUID = types.UID("sts-uid-1")
+
 func busStreamsStatefulSet(agent *agentv1alpha1.PlatformAgent, replicas int32, ready int32) *appsv1.StatefulSet {
 	return &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Generation: 2},
-		Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(replicas)},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSName(agent), Namespace: agent.Namespace, Generation: 2, UID: busStreamsTestStatefulSetUID,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent", Name: agent.Name,
+				UID: agent.UID, Controller: ptr.To(true),
+			}},
+		},
+		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To(replicas)},
 		Status: appsv1.StatefulSetStatus{
 			ObservedGeneration: 2, Replicas: replicas, ReadyReplicas: ready, UpdatedReplicas: replicas,
 			CurrentRevision: "r1", UpdateRevision: "r1",
@@ -259,7 +267,11 @@ func busStreamsPod(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.Pod 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: fmt.Sprintf("%s-%d", a2aNATSName(agent), ordinal), Namespace: agent.Namespace,
-			Labels: map[string]string{"app": a2aNATSName(agent)},
+			Labels: map[string]string{"app": a2aNATSName(agent), appsv1.ControllerRevisionHashLabelKey: "r1"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "StatefulSet", Name: a2aNATSName(agent),
+				UID: busStreamsTestStatefulSetUID, Controller: ptr.To(true),
+			}},
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name:  a2aNATSExporterContainerName,
@@ -666,5 +678,64 @@ func TestAFalseConditionMakesTheCRDegraded(t *testing.T) {
 	agent.Spec.Mode = ptr.To("today")
 	if c := busStreamsMissingCondition(agent); c != nil {
 		t.Errorf("busStreamsMissingCondition = %+v under today, want nil", c)
+	}
+}
+
+// The list selects by a label any pod in the namespace can carry, and what a
+// pod serves decides whether the Job is deleted and the gateway restarted. A
+// pod the bus StatefulSet doesn't control, one on an old revision, or one on
+// the host network is not read, so a stand-in claiming every stream is gone
+// moves nothing.
+func TestOnlyTheBusStatefulSetsOwnPodsAreRead(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		alter func(pod *corev1.Pod)
+	}{
+		{"not controlled by the StatefulSet", func(pod *corev1.Pod) { pod.OwnerReferences = nil }},
+		{"controlled by another StatefulSet", func(pod *corev1.Pod) { pod.OwnerReferences[0].UID = "other" }},
+		{"an old revision", func(pod *corev1.Pod) { pod.Labels[appsv1.ControllerRevisionHashLabelKey] = "r0" }},
+		{"on the host network", func(pod *corev1.Pod) { pod.Spec.HostNetwork = true }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := busStreamsAgent(1)
+			impostor := busStreamsPod(agent, 5)
+			impostor.Name = "impostor"
+			tc.alter(impostor)
+			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), impostor)
+			rig.serve(1, a2aProvisionedStreams...)
+			rig.source.bodies[busStreamsAddr(5)] = exporterBody(true, "")
+			// The real server stops answering, so only the impostor could.
+			delete(rig.source.bodies, busStreamsAddr(0))
+			for i := 0; i < 4; i++ {
+				rig.poll()
+			}
+			if len(rig.deleted) != 0 {
+				t.Errorf("deleted %v on an impostor's word", rig.deleted)
+			}
+			if c := rig.condition(); c == nil || c.Reason != busStreamsReasonExporterUnreachable {
+				t.Errorf("condition = %+v, want ExporterUnreachable: the impostor is not a server", c)
+			}
+		})
+	}
+}
+
+// A StatefulSet of the bus's name this CR doesn't control gives no verdict.
+func TestAStatefulSetTheCRDoesNotControlGivesNoVerdict(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	live := &appsv1.StatefulSet{}
+	if err := rig.cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, live); err != nil {
+		t.Fatal(err)
+	}
+	live.OwnerReferences = nil
+	if err := rig.cl.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	rig.serve(1)
+	for i := 0; i < 4; i++ {
+		rig.poll()
+	}
+	if len(rig.deleted) != 0 || rig.source.calls != 0 {
+		t.Errorf("scraped %d times and deleted %v under a StatefulSet the CR does not control", rig.source.calls, rig.deleted)
 	}
 }
