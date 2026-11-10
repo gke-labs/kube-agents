@@ -1,0 +1,221 @@
+{
+  "profiles": {
+    "today-standard": {
+      "label": "`today`, GKE Standard",
+      "sets": [],
+      "autopilot": false,
+      "requirements": {
+        "chartSurgePods": 2,
+        "limitsCpu": 13200,
+        "limitsEphemeral": 15636365312,
+        "limitsMemory": 26709327872,
+        "persistentVolumeClaims": 4,
+        "pods": 9,
+        "requestsCpu": 2756,
+        "requestsEphemeral": 15636365312,
+        "requestsMemory": 12683575296,
+        "requestsStorage": 109521666048,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 3221225472,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": null
+    },
+    "today-autopilot": {
+      "label": "`today`, GKE Autopilot",
+      "sets": [],
+      "autopilot": true,
+      "requirements": {
+        "chartSurgePods": 2,
+        "limitsCpu": 13200,
+        "limitsEphemeral": 15636365312,
+        "limitsMemory": 26709327872,
+        "persistentVolumeClaims": 4,
+        "pods": 9,
+        "requestsCpu": 4256,
+        "requestsEphemeral": 15636365312,
+        "requestsMemory": 13757317120,
+        "requestsStorage": 109521666048,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 3221225472,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": null
+    },
+    "next-standard": {
+      "label": "`next`, GKE Standard",
+      "sets": [
+        "platformAgent.mode=next"
+      ],
+      "autopilot": false,
+      "requirements": {
+        "chartSurgePods": 2,
+        "limitsCpu": 20900,
+        "limitsEphemeral": 15770583040,
+        "limitsMemory": 33688649728,
+        "persistentVolumeClaims": 7,
+        "pods": 20,
+        "requestsCpu": 4206,
+        "requestsEphemeral": 15770583040,
+        "requestsMemory": 15435038720,
+        "requestsStorage": 238370684928,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 3221225472,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 38
+    },
+    "next-autopilot": {
+      "label": "`next`, GKE Autopilot",
+      "sets": [
+        "platformAgent.mode=next"
+      ],
+      "autopilot": true,
+      "requirements": {
+        "chartSurgePods": 2,
+        "limitsCpu": 20900,
+        "limitsEphemeral": 15770583040,
+        "limitsMemory": 33688649728,
+        "persistentVolumeClaims": 7,
+        "pods": 20,
+        "requestsCpu": 5706,
+        "requestsEphemeral": 15770583040,
+        "requestsMemory": 16508780544,
+        "requestsStorage": 238370684928,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 3221225472,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 38
+    },
+    "next-one-server": {
+      "label": "`next` with one NATS server, GKE Standard",
+      "sets": [
+        "platformAgent.mode=next",
+        "platformAgent.harness.tuning.busReplicas=1"
+      ],
+      "autopilot": false,
+      "requirements": {
+        "chartSurgePods": 2,
+        "limitsCpu": 18900,
+        "limitsEphemeral": 15770583040,
+        "limitsMemory": 31541166080,
+        "persistentVolumeClaims": 5,
+        "pods": 18,
+        "requestsCpu": 3706,
+        "requestsEphemeral": 15770583040,
+        "requestsMemory": 14361296896,
+        "requestsStorage": 152471339008,
+        "surgeLimitsCpu": 500,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 3221225472,
+        "surgeRequestsCpu": 100,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 36
+    },
+    "next-hindsight-minter": {
+      "label": "`next` with Hindsight and the GitHub minter, GKE Standard",
+      "sets": [
+        "platformAgent.mode=next",
+        "hindsight.enabled=true",
+        "githubMinter.enabled=true"
+      ],
+      "autopilot": false,
+      "requirements": {
+        "chartSurgePods": 4,
+        "limitsCpu": 26900,
+        "limitsEphemeral": 16978542592,
+        "limitsMemory": 39594229760,
+        "persistentVolumeClaims": 8,
+        "pods": 24,
+        "requestsCpu": 5056,
+        "requestsEphemeral": 16978542592,
+        "requestsMemory": 17985175552,
+        "requestsStorage": 246960619520,
+        "surgeLimitsCpu": 4000,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 4294967296,
+        "surgeRequestsCpu": 500,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 44
+    },
+    "installer-autopilot": {
+      "label": "",
+      "sets": [
+        "platformAgent.storage.size=200Gi",
+        "platformAgent.harness.memory.provider=kube_agents_memory",
+        "platformAgent.harness.hermes.dashboardEnabled=false",
+        "webConsole.enabled=true",
+        "githubMinter.enabled=true",
+        "platformAgent.mode=next"
+      ],
+      "autopilot": true,
+      "requirements": {
+        "chartSurgePods": 5,
+        "limitsCpu": 26400,
+        "limitsEphemeral": 16978542592,
+        "limitsMemory": 37715181568,
+        "persistentVolumeClaims": 8,
+        "pods": 25,
+        "requestsCpu": 6400,
+        "requestsEphemeral": 16978542592,
+        "requestsMemory": 18656264192,
+        "requestsStorage": 569083166720,
+        "surgeLimitsCpu": 4000,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 4294967296,
+        "surgeRequestsCpu": 500,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 46
+    },
+    "installer-standard": {
+      "label": "",
+      "sets": [
+        "platformAgent.storage.size=200Gi",
+        "platformAgent.harness.memory.provider=kube_agents_memory",
+        "platformAgent.harness.hermes.dashboardEnabled=false",
+        "webConsole.enabled=true",
+        "githubMinter.enabled=true",
+        "platformAgent.mode=next"
+      ],
+      "autopilot": false,
+      "requirements": {
+        "chartSurgePods": 5,
+        "limitsCpu": 26400,
+        "limitsEphemeral": 16978542592,
+        "limitsMemory": 37715181568,
+        "persistentVolumeClaims": 8,
+        "pods": 25,
+        "requestsCpu": 4900,
+        "requestsEphemeral": 16978542592,
+        "requestsMemory": 17582522368,
+        "requestsStorage": 569083166720,
+        "surgeLimitsCpu": 4000,
+        "surgeLimitsEphemeral": 1342177280,
+        "surgeLimitsMemory": 4294967296,
+        "surgeRequestsCpu": 500,
+        "surgeRequestsEphemeral": 1342177280,
+        "surgeRequestsMemory": 2147483648
+      },
+      "sessionQuotaPods": 46
+    }
+  }
+}

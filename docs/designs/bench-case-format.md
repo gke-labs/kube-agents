@@ -303,7 +303,7 @@ trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `forge_issue_state` (the state, labels and in-run comments of the issue the reply
 names, read from the forge), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
+repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `changed_paths_only` fails one whose diff changes any path matching none of its listed globs, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds, including whether an added PodDisruptionBudget lets the planted workload drain), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started that
 the repetition's reply, or its or its workers' call that created the write, names
 (a read's arguments do not count), or every one when its window is marked exclusive; it passes on a write, so
@@ -322,7 +322,11 @@ grep and nothing else, and refuses a control operator, a redirect other than
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries), `worker_budget` (the turn budget a delegated worker ran under,
+workers' trajectory entries), `delegated_to` (regular expressions every one of which must match,
+and none of which may match, an addressee the delegating turn's chain delegated to, read from the
+inject read route's `childAddressees`: the profile each child resolved to, or `platform`; an
+error on the api transport, so a case using it is listed in `hack/eval/api-lane-exclusions.txt`),
+`worker_budget` (the turn budget a delegated worker ran under,
 read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
 which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
 capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
@@ -457,7 +461,9 @@ splits with an empty quote inside it is one word to the shell and none to the pa
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
 line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
-judged metrics receive those entries as the execution trace.
+judged metrics receive those entries as the execution trace. `delegated_to` reads only whom the
+delegating turn's chain delegated to, by profile name, from the inject read route's
+`childAddressees`.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below

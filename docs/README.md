@@ -122,6 +122,9 @@ hand-written. Never edit inside the markers — edit the source and regenerate.
 | `docs/site/src/content/docs/operator/platformagent-fields.md` | `<!-- BEGIN GENERATED: crd-fields-platformagent -->` | The `PlatformAgent` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentprofile-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentprofile -->` | The `AgentProfile` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
 | `docs/site/src/content/docs/operator/agentplugin-fields.md` | `<!-- BEGIN GENERATED: crd-fields-agentplugin -->` | The `AgentPlugin` spec and status structs in `k8s-operator/api/v1alpha1/`, read by `scripts/gen_crd_docs.go` |
+| `docs/site/src/content/docs/operator/platformagent-crd.md` | `<!-- BEGIN GENERATED: crd-conditions-platformagent -->` | `platformAgentConditionDocs` in `k8s-operator/internal/controller/condition_docs.go`, read by `scripts/gen_condition_docs.go`; `TestEveryWrittenConditionIsDocumented` holds it complete against the condition types the controller writes |
+| `docs/site/src/content/docs/install/prerequisites.md` | `<!-- BEGIN GENERATED: install-footprint -->` | `kube-agents.quotaRequirements` rendered by `helm template` per install profile, the chart's `files/footprint.yaml`, `files/flagged-pods.yaml` and `files/transient-pods.yaml`, the session quota in the operator's next-mode golden, and `a2a/gateway/spawn.go`, by `scripts/install_footprint.py` |
+| `tests/data/footprint_profiles.json` (whole file) | none | The same profiles' `kube-agents.quotaRequirements` totals, which the installer's footprint summary test reads |
 | `hack/replay-proxy/README.md` | `<!-- BEGIN GENERATED: replay-baseline-metrics -->` | `METRICS` and `CASE_METRICS` in `hack/replay-proxy/baseline_report.py` |
 | `README.md` | `<!-- BEGIN GENERATED: capabilities -->` | The enabled entries of `agents/platform/cron/jobs.json` that carry the `fleet-audit` skill, with the SOP each prompt names, and the skill directories under `agents/platform/skills/`, `agents/cluster/skills/` and `agents/tse/skills/` |
 | `agents/platform/cron/jobs.json` — the SOP length and checks-section line range each governance prompt cites | none: `scripts/generate_sop_geography.py` rewrites the digits in place (`make docs-generate` runs it first) | The `agents/platform/governance/*_sop.md` each prompt names |
@@ -132,7 +135,10 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-generated` — `scripts/generate_sop_geography.py --check` and
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
   line pin no longer matches its source. Needs `go` on `PATH` for the CRD
-  field pages, which `scripts/gen_crd_docs.go` reads from the Go API types.
+  field pages and the PlatformAgent conditions table, which
+  `scripts/gen_crd_docs.go` and `scripts/gen_condition_docs.go` read from the
+  operator's Go source, and `helm` for the install footprint, which
+  `scripts/install_footprint.py` renders from the chart.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
   resolve to **git-tracked** targets; a `#fragment` on a relative link, a
   same-page link or a site route whose target is a tracked Markdown file must
@@ -207,10 +213,15 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-upgrade-releases` — `scripts/check_upgrade_table_releases.py`;
   once a release is tagged, every row of the upgrade page's breaking-changes
   table labelled with it must come from a commit the tag contains (or sit in the
-  tag's own copy of the table). A wrong label fails a push to `main` and a pull
-  request that changes the page; on any other pull request it is a warning. It
-  reads the history and the release tags, so it fails on a shallow or tagless
-  clone; run `git fetch --tags --unshallow` first.
+  tag's own copy of the table). Write `pending` for a new row; it fails once a
+  release contains it, and the message names the release to write. For a
+  reworded shipped row or a row added after its release was tagged,
+  `scripts/upgrade_table_traces.txt` names the commit that shipped the change,
+  and the tag must contain that commit instead. A wrong label fails a push to
+  `main` and a pull request that adds or relabels the row or edits its entry;
+  on any other pull request it is a warning. It reads the history and the
+  release tags, so it fails on a shallow or tagless clone; run
+  `git fetch --tags --unshallow` first.
 
 ### Identifier sources
 
@@ -231,6 +242,7 @@ identifier appears, add its source here.
 | The `spec.deployment.env` names the operator forwards to the agent container, as literal values | `safeSandboxEnvOverrides` in `k8s-operator/internal/controller/platformagent_manifests.go` |
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |
 | The PlatformAgent data volume size default (`spec.storage.size` when absent) | `agentDataStorageSize` in `k8s-operator/internal/controller/platformagent_manifests.go`; `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE` in `install.defaults.env`, the `platform_agent_storage_size` default in `terraform/examples/full-install/variables.tf` and the `platform_agent_default_storage_size` local in its `main.tf` restate it, held equal by `tests/test_platform_agent_storage_size_defaults.py` |
+| The gateway spend ceiling's defaults (`0`, off; `1d`) and the duration grammar its period takes | `DEFAULT_LITELLM_BUDGET_USD` and `DEFAULT_LITELLM_BUDGET_PERIOD` in `install.defaults.env`; `litellm.budget` in `charts/kube-agents/values.yaml`, whose `values.schema.json` pattern `tests/test_litellm_budget.py` holds equal to the copies in `templates/_helpers.tpl`, `scripts/installer/installer_common.sh` and the `litellm_budget` validation in `terraform/examples/full-install/variables.tf` |
 | The broker's vcs clone and snapshot size ceilings (`CREDENTIAL_PROXY_MAX_CLONE_BYTES`, `CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES`) | `DEFAULT_MAX_CLONE_BYTES` and `DEFAULT_MAX_SNAPSHOT_BYTES` in `agents/platform/scripts/vcs_broker.py` |
 | The credential proxy's child memory budget terms (the broker and Envoy resident reserve, the per-request child reserve, the output copies per command, the fewest requests a usable budget admits) | `BROKER_RESIDENT_RESERVE_BYTES`, `REQUEST_CHILD_MEMORY_RESERVE_BYTES`, `OUTPUT_COPIES_PER_COMMAND` and `BUDGET_MINIMUM_ADMITTED_REQUESTS` in `agents/platform/scripts/credential_proxy.py`; the operator's `credentialProxy*ReserveBytes`, `credentialProxyOutputCopiesPerCommand` and `credentialProxyMinimumAdmittedRequests` in `k8s-operator/internal/controller/credential_proxy_manifests.go` must match them, held equal by `tests/test_credential_proxy_sizing_parity.py`, which also holds the three declared copies of the memory floor at the default output cap equal (`CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP`, `credentialProxyMemoryFloorBytesAtDefaultCap` and the chart's `kube-agents.credentialProxyMemoryFloorBytes`; the broker's and the operator's own tests hold theirs to their formula) and the chart's copies of the proxy's default requests and limits (`kube-agents.credentialProxyDefaults` in `charts/kube-agents/templates/_helpers.tpl`) to the operator's |
 | The shell container's default requests and limits, and the sandbox sshd's session and startup limits | `shellSandboxCPURequest`, `shellSandboxMemoryRequest`, `shellSandboxCPULimit` and `shellSandboxMemoryLimit` in `k8s-operator/internal/controller/shell_sandbox_manifests.go` (the `shellSandbox` entry of `charts/kube-agents/files/footprint.yaml` restates them, summed from the default golden by `make chart-sync`); `MaxSessions` and `MaxStartups` in `deploy/sandbox/sshd_config`, which the `CHANNEL_SESSION_LIMIT` and `CHANNEL_STARTUP_LIMIT` constants in `deploy/sandbox/smoke-test.sh` read back from the built image |

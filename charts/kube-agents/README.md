@@ -246,6 +246,12 @@ under every primary alias the same way (the fallback alias carries
 On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
 `thinking` key under every primary alias, which a `reasoningEffort` value replaces
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
+`litellm.budget.usd` (default `0`, meaning none) with `litellm.budget.period`
+(default `1d`) puts a spend ceiling on the gateway, LiteLLM's provider budget
+for the model's provider split evenly across `litellm.replicaCount`; a replica
+whose share is spent refuses model calls until the window ends, and exports the
+remaining share as `litellm_provider_remaining_budget_metric`
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
