@@ -197,11 +197,22 @@ func TestGchatQuestionClosesWithItsLayoutRecord(t *testing.T) {
 	if asked, isOpen := open(a); !asked || !isOpen {
 		t.Fatalf("asked %v open %v after the create, want the question open", asked, isOpen)
 	}
+	// The layout ring outlasts the other rings: uxCap edits of other
+	// messages (a status line's, say) leave the question open.
 	for i := 0; i < uxCap; i++ {
 		a.rememberLayout(fmt.Sprintf("spaces/S1/messages/other-%d", i), gchatChatLayout{Text: "other"})
 	}
+	if _, remembered, _ := a.layoutOf(gchatBoardMessage); !remembered {
+		t.Fatal("the record went after uxCap newer ones; the layout ring has its own cap")
+	}
+	if asked, isOpen := open(a); !asked || !isOpen {
+		t.Fatalf("asked %v open %v after uxCap other edits, want the question still open", asked, isOpen)
+	}
+	for i := uxCap; i < gchatLayoutCap; i++ {
+		a.rememberLayout(fmt.Sprintf("spaces/S1/messages/other-%d", i), gchatChatLayout{Text: "other"})
+	}
 	if _, remembered, _ := a.layoutOf(gchatBoardMessage); remembered {
-		t.Fatal("the record survived uxCap newer ones")
+		t.Fatal("the record survived gchatLayoutCap newer ones")
 	}
 	if asked, isOpen := open(a); asked || isOpen {
 		t.Errorf("asked %v open %v after the record's eviction, want the question closed", asked, isOpen)
@@ -211,5 +222,59 @@ func TestGchatQuestionClosesWithItsLayoutRecord(t *testing.T) {
 	a.forgetLayout(gchatBoardMessage)
 	if asked, isOpen := open(a); asked || isOpen {
 		t.Errorf("asked %v open %v after the record was forgotten, want the question closed", asked, isOpen)
+	}
+}
+
+// A rating tap, then a board tap: the tap's edit builds from the record the
+// rating patch wrote, so the filled rating button stays filled. Without
+// that write the tap would redraw the rating buttons as created, unfilled.
+func TestGchatBoardTapAfterRatingKeepsTheFilledRating(t *testing.T) {
+	a, f, layout := newMixedGchatAdapter(t)
+	if _, reason := a.classify(gchatRatingEvent(t, "up")); !strings.HasPrefix(reason, gchatRatingTaken) {
+		t.Fatalf("rating tap: %q", reason)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 1, gchatBoardMessage)), "up")
+	tapMixedRow1(t, a, layout)
+	body := checkPatch(t, f, 2, gchatBoardMessage)
+	settled := strings.Replace(gchatMixedCardText, "1. *Triage x* · Stopped.\n", gchatMixedRow1Done, 1)
+	checkMixedBody(t, body, settled, "Look at the first one,Skip,board,Retry 2,Drop 2,👍,👎")
+	checkFilled(t, bodyButtons(t, body), "up")
+	if n := relayCallCount(f); n != 3 {
+		t.Errorf("%d relay calls, want the create and two patches", n)
+	}
+}
+
+// A typed reply pending on a question whose layout record went before the
+// reply was verified has no copy of the message to rewrite: its line is
+// posted in the conversation, and the message is not patched.
+func TestGchatTypedReplyWithoutARecordPostsItsLine(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": gchatBoardMessage}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": gchatBoardMessage}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	const conversation = "gchat:dm/spaces/_c2fixtureAA/threads/SIDE"
+	if _, err := a.PostMessage(conversation, OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion()}); err != nil {
+		t.Fatal(err)
+	}
+	reply := InboundMessage{Conversation: conversation, Kind: sessionKindDM, AuthorID: "sender@example.com",
+		MessageID: "spaces/_c2fixtureAA/messages/U2", Text: "the prod-eu one, please"}
+	a.noteTypedAnswer(reply, gchatSender{DisplayName: "Test Sender", Email: "sender@example.com"})
+	a.forgetLayout(gchatBoardMessage)
+	a.InboundVerified(reply.Conversation, reply.MessageID, true)
+	if n := relayCallCount(f); n != 2 {
+		t.Fatalf("%d relay calls, want the create and the posted line", n)
+	}
+	c := f.call(1)
+	body := callBody(t, c)
+	thread, _ := body["thread"].(map[string]any)
+	if c.method != "create" || c.arguments["parent"] != "spaces/_c2fixtureAA" || thread["name"] != "spaces/_c2fixtureAA/threads/SIDE" ||
+		body["text"] != "✓ Test Sender: the prod-eu one, please" {
+		t.Errorf("the posted line = %+v, want a create in the question's thread carrying the answered line", c)
+	}
+	for i := 0; i < relayCallCount(f); i++ {
+		if f.call(i).method == "patch" {
+			t.Errorf("call %d patched the message with no record: %+v", i, f.call(i))
+		}
 	}
 }

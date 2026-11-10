@@ -1928,7 +1928,8 @@ names, or, where the adapter clears the thread (an unthreaded space, a click eve
 thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
 does not answer it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. A question closes with its layout
-record (the record's ring is the busier one, since every edit writes it): the message is then as
+record (the record's ring is the busier one, since every edit writes it, so it holds 4096 messages
+where the question ring holds 512, and a question outlives the edits made around it): the message is then as
 one from before a restart, its buttons answer from the click's copy and a typed reply in its
 thread is a turn of its own; a reply already pending when the record went posts its line in the
 conversation. The questions, answers and layout records

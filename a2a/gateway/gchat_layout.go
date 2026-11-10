@@ -4,6 +4,18 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
+const (
+	// gchatLayoutCap bounds the layout ring, apart from uxCap: every
+	// laid-out create and edit writes this ring, a status line's edits
+	// included, where the question ring takes only messages with choices,
+	// and a question closes with its record (closeUnrecordedLocked), so
+	// the ring must hold a question through the edits made around it
+	// while it waits for its typed reply. Eight times uxCap: a progress
+	// line edits a few times a minute, so this is hours of edits around an
+	// open question, at the cost of a few kilobytes a record.
+	gchatLayoutCap = 8 * uxCap
+)
+
 // The one layout record a Google Chat message has. Every rewrite of a
 // message this process makes (an answered question's rewrite, a rating
 // tap's patch, a board row's edit, an edit on a notify key) reads the
@@ -26,11 +38,11 @@ func (a *GoogleChatAdapter) rememberLayout(message string, layout gchatChatLayou
 }
 
 // rememberLayoutLocked is rememberLayout under the adapter's lock. The
-// ring's eviction closes the question the evicted message asked
-// (closeUnrecordedLocked).
+// ring holds gchatLayoutCap records, and its eviction closes the question
+// the evicted message asked (closeUnrecordedLocked).
 func (ux *gchatUX) rememberLayoutLocked(message string, layout gchatChatLayout) {
 	ux.layouts[message] = layout
-	remember(&ux.layoutsOrder, message, func(k string) {
+	rememberUpTo(&ux.layoutsOrder, message, gchatLayoutCap, func(k string) {
 		delete(ux.layouts, k)
 		ux.closeUnrecordedLocked(k)
 	})
