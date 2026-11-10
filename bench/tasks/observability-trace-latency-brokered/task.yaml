@@ -302,11 +302,13 @@ verification_spec:
       # regex stays exempt. Options end at the first operand, so an `-e`
       # after a file is graded. The card log row joins a second typed line
       # onto the grep with a space, so the grep is graded whole when its
-      # pattern assigns a variable as it expands (`${X:=...}`, `${X=...}`) or
-      # another word on the row reads the last argument (`$_`), which a joined
-      # line could use to read the removed pattern back. A single-quoted
-      # lookalike of either is graded whole too; another read-back
-      # (`declare -p`, `history`) is not seen.
+      # pattern assigns a variable or an array element as it expands
+      # (`${X:=...}`, `${A[0]=...}`), when another word on the row reads the
+      # last argument (`$_`) or a variable through another (`${!x}`), or when
+      # the row holds an ANSI-C quote (`$'...'`): a joined line could use any
+      # of them to read the removed pattern back. A single-quoted lookalike
+      # is graded whole too; another read-back (`declare -p`, `history`) is
+      # not seen.
       # `rg` is not exempt (its `--pre` runs a command per file), and an
       # import probe (`python3 -c "import google.auth"`) is graded as the
       # library it loads. A pip query for a library's presence, `pip show

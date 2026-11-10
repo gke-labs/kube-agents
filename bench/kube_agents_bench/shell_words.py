@@ -101,11 +101,12 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
-# A pattern that assigns a variable as it expands (`${NAME=…}`, `${NAME:=…}`): a word the
-# rendering joined on from the next line can run it (`$NAME`).
-_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
-# A word that reads the last argument of the command before it back (`$_`, `${_}`, `${_:…}`).
-_LAST_ARGUMENT_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_]))")
+# A pattern that assigns a variable or an array element as it expands (`${NAME=…}`,
+# `${NAME:=…}`, `${NAME[0]:=…}`): a word the rendering joined on from the next line can run it.
+_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?:?=")
+# A word that reads the last argument of the command before it back (`$_`, `${_}`, `${_:…}`),
+# or reads a variable through another (`${!NAME}`), which can name `_`.
+_LAST_ARGUMENT_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_])|\{!)")
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -384,6 +385,27 @@ def _command_word_index(
     return None
 
 
+def _has_ansi_c_quote(command: str) -> bool:
+    """Whether the line opens an ANSI-C quote (``$'…'``) outside other quotes: the shell reader
+    keeps its escapes undecoded, so ``$'\\x24_'`` would not read as ``$_``."""
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char == _SHELL_EXPANSION_PREFIX and command.startswith(_SHELL_SINGLE_QUOTE, i + 1):
+            return True
+        elif char in _SHELL_QUOTE_CHARS:
+            quote = char
+        i += 1
+    return False
+
+
 def _without_grep_patterns(command: str) -> str | None:
     """The command line as its shell words joined by spaces, with the grep's pattern argument
     removed (the first positional word, or each ``-e``/``--regexp=`` value when one is given);
@@ -395,9 +417,11 @@ def _without_grep_patterns(command: str) -> str | None:
     (`` + N command(s)``); and no substitution anywhere on it. Options end at the first operand.
     Every other word stays: the options, the file operands and any text the rendering joined
     onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
-    A card log row that joined a second typed line onto the grep is one row here, so a line
-    that reads the removed word back (``$_``, a variable the pattern assigned) is read as an
-    operand: the limit ``exempt_patterns`` had too."""
+    A card log row that joined a second typed line onto the grep is one row here, so the line
+    is also refused when a later word could read the removed word back: a pattern that assigns
+    a variable as it expands, another word that reads the last argument (``$_``) or a variable
+    through another (``${!NAME}``), or an ANSI-C quote (``$'…'``) anywhere, whose escapes can
+    spell either."""
     if _COLLAPSED_CHAIN_RE.search(command):
         return None
     # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
@@ -464,7 +488,7 @@ def _without_grep_patterns(command: str) -> str | None:
     # A card log row joins the next typed line onto the grep, so a word after it can be a
     # command that reads the removed word back: from a variable the pattern assigned, or as
     # the last argument (`$_`). Such a row is graded whole (#5331).
-    if any(_ASSIGNING_EXPANSION_RE.search(words[k]) for k in removed):
+    if any(_ASSIGNING_EXPANSION_RE.search(words[k]) for k in removed) or _has_ansi_c_quote(command):
         return None
     if any(_LAST_ARGUMENT_RE.search(word) for k, word in enumerate(words) if k and k not in removed):
         return None

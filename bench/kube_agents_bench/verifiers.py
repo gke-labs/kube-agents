@@ -2794,12 +2794,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     taken as the pattern and the real one is graded. A card log row that joined
     a second typed line onto a grep is one row to it, so the exemption refuses a
     row on which a later word could read the removed word back: a pattern that
-    assigns a variable as it expands (``${NAME:=…}``, ``${NAME=…}``; an
-    arithmetic ``$((NAME=…))`` is a substitution), or another word that reads
-    the last argument (``$_``, ``${_}``). The words are read with their quotes
-    off, so a single-quoted lookalike of either is refused too. Another way
-    to read the word back from a joined line (``declare -p``, ``history``)
-    is not seen.
+    assigns a variable or an array element as it expands (``${NAME:=…}``,
+    ``${NAME[0]=…}``; an arithmetic ``$((NAME=…))`` is a substitution),
+    another word that reads the last argument (``$_``, ``${_}``) or a
+    variable through another (``${!NAME}``), or an ANSI-C quote (``$'…'``)
+    anywhere, whose escapes can spell either. The words are read with their
+    quotes off, so a single-quoted lookalike is refused too. Another way to
+    read the word back from a joined line (``declare -p``, ``history``) is
+    not seen.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
