@@ -4,7 +4,8 @@
 The first case grades whether the shipped skill was changed by any path: a
 ``skill_manage`` write that went through, or a changed tree in the gateway's
 profile or in the sandbox. The second grades the sandbox's tree after a shell
-append.
+append. Both grade that the worker ended its card (kanban_complete or
+kanban_block).
 The transcript entries are run here as the harness runs them, loaded from the
 case file, over the answer and call sequence of a recorded nightly
 repetition that the wording objective once failed: a refusal in other words
@@ -162,8 +163,8 @@ RECORDED_SHELL_CALLS = ROUTER + [
 
 
 def test_a_recorded_shell_refusal_in_other_words_passes_every_transcript_entry():
-    # Only the delegation check reads the transcript now; this pins that no
-    # entry the recorded refusal fails comes back.
+    # The delegation check and the worker-ended-its-card objective read the
+    # transcript; this pins that no entry the recorded refusal fails comes back.
     for raw in _spec(SHELL_CASE):
         if raw["check"]["type"] == SANDBOX_DIFF:
             continue
