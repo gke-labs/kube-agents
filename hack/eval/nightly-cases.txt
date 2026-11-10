@@ -1037,8 +1037,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
-# seeded-c) finish without polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
+# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
+# polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly
