@@ -313,10 +313,10 @@ def trace_entries(text: str) -> tuple[dict[str, tuple[int, str]], list[str]]:
         parts = stripped.split(None, 1)
         if len(parts) < 2 or not TRACE_COMMIT.match(parts[0]):
             found.append(f"{where}: an entry is `<full 40-character commit> <change text>`")
-        elif parts[1].strip() in entries:
-            found.append(f"{where}: a second entry for \"{parts[1].strip()}\"; keep one")
+        elif change_key(parts[1]) in entries:
+            found.append(f"{where}: a second entry for \"{change_key(parts[1])}\"; keep one")
         else:
-            entries[parts[1].strip()] = (number, parts[0])
+            entries[change_key(parts[1])] = (number, parts[0])
     return entries, found
 
 

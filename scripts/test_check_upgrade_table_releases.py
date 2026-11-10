@@ -491,6 +491,26 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertIn(f'removes the pending row "change j", which 1.0.0 already contains. If you reworded it, '
                       f'label the new row 1.0.0 and name its commit ({first})', err)
 
+    def test_a_trace_entry_copied_from_a_prefixed_cell_matches_its_row(self):
+        shipped = self.repo.commit("feat: j")
+        self.repo.tag("1.0.0")
+        self.repo.commit("docs: note j", row=row("1.0.0", "#12: change j"), code=False)
+        self.repo.trace(f"{shipped} #12: change j")
+        self.assertEqual(self.repo.check(GITHUB_EVENT_NAME="push"), (0, ""))
+
+    def test_a_base_trace_entry_with_a_prefix_is_read_by_the_removal_rule(self):
+        shipped = self.repo.commit("feat: t")
+        self.repo.tag("1.0.0")
+        self.repo.trace(f"{shipped} #12: change t")
+        base = self.repo.commit("docs: note t", row=row("pending", "#12: change t"), code=False)
+        self.repo.git("update-ref", "refs/remotes/origin/main", base)
+        self.repo.rows = [r for r in self.repo.rows if "change t" not in r]
+        self.repo.write_page()
+        (self.repo.root / TRACES).unlink()
+        code, err = self.repo.check()
+        self.assertEqual(code, 1)
+        self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
+
     def test_a_push_does_not_read_a_removed_pending_row(self):
         self._shipped_pending_row()
         self.repo.reword("change q", "change q, reworded")
