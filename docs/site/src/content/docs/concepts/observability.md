@@ -31,7 +31,7 @@ The operator's gateway NetworkPolicy admits the managed collector and the operat
 
 #### What the inference and memory stack exports
 
-- **LiteLLM**: request latency, per-model token counts, error rates.
+- **LiteLLM**: request latency, per-model token counts, error rates, spend (`litellm_spend_metric`, for a model LiteLLM's cost map prices) and, with a spend ceiling set, each gateway pod's remaining share as `litellm_provider_remaining_budget_metric{api_provider}` ([Setting a spend ceiling](/kube-agents/concepts/inference-gateway/#setting-a-spend-ceiling)).
 - **vLLM**: per-request latency histograms, queue depth, and GPU/KV-cache stats when running local models on GPU node pools.
 - **Hindsight**, the Planning Agent's memory store: retrieval and reranking latency (`hindsight_operation_duration_seconds`), HTTP request counts and durations, database pool wait times, and the token spend of its own extraction and consolidation calls (`hindsight_llm_*`, which bill through LiteLLM). Recall latency is dominated by the reranker, so `hindsight_operation_duration_seconds` is the signal to watch; [`docs/designs/memory.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/memory.md) says why. The Postgres StatefulSet exports nothing; the `pgvector/pgvector` image ships no exporter.
 

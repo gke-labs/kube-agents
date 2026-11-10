@@ -618,6 +618,13 @@ type ConversationState struct {
 	Usage        *lib.Usage
 	ChildUsage   *lib.Usage
 	UsagePartial bool
+	// ChildAddressees names whom the chain delegated to: each child task's
+	// addressee under TaskID's root, a profile's name or platform, once
+	// each in the order delegated (chainChildAddressees), empty when it
+	// delegated nothing, nil when the task is unknown. Read from the
+	// record, so it costs no stream read. Only the inject door's read
+	// route carries it, for a harness grading which agent a turn chose.
+	ChildAddressees []string
 }
 
 // chainUsageKey marks a probe's context as asking for

@@ -2986,6 +2986,11 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" LITELLM_REDACTION_IP_ACTION "${LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
   write_env_var "$tmp" LITELLM_REDACTION_IP_ALLOW_CIDRS "${LITELLM_REDACTION_IP_ALLOW_CIDRS:-}"
   write_env_var "$tmp" LITELLM_REDACTION_RULES "${LITELLM_REDACTION_RULES:-}"
+  # The gateway's spend ceiling, install.env only (no flag): recorded so every
+  # later run, which reads the file alone, keeps it. Empty takes the defaults
+  # (0, no ceiling; 1d) in the tfvars generator.
+  write_env_var "$tmp" LITELLM_BUDGET_USD "${LITELLM_BUDGET_USD:-}"
+  write_env_var "$tmp" LITELLM_BUDGET_PERIOD "${LITELLM_BUDGET_PERIOD:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
@@ -5689,17 +5694,16 @@ apply_gitlab_token_secret() {
 
 # github.com presents a certificate the public CAs sign, and the later flag
 # check refuses a CA file with no host. Called by the forge menu's github.com
-# and no-repository answers: an exported GITOPS_CA_FILE is dropped without a
-# word, as the GitLab validator drops one for gitlab.com (a CA file typed for
-# an Enterprise Server host never reaches here: the validator's refusal puts
-# the entry value back); one given by flag is dropped with a line, since
-# refusing it after the whole interview would be the alternative. The CA
-# Secret name goes with it: a recorded forge, org, App or host flag settles
-# the forge before the menu, so the only name here is the default the early
-# flag check derived from an exported host and CA file (a refused attempt
-# at the menu derives none: the validator names the Secret only after it
-# accepts the file), and the later flag check would otherwise report it
-# dropped as a recorded one.
+# and no-repository answers, and by the Enterprise Server answer when the
+# entered host is a github.com spelling: an exported GITOPS_CA_FILE is dropped
+# without a word, as the GitLab validator drops one for gitlab.com (a CA file
+# is never prompted for a github.com host; for an Enterprise Server host, the
+# validator's refusal puts the entry value back); one given by flag is dropped
+# with a line, since refusing it after the whole interview would be the
+# alternative. The CA Secret name goes with it (whether derived from an exported
+# file or named in the environment): a recorded forge, org, App or host flag
+# settles the forge before the menu, and the later flag check would otherwise
+# report it dropped as a recorded one.
 drop_gitops_ca_file_for_github_com() {
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ]; then
     print_info "Dropping --gitops-ca-file '${PARAM_GITOPS_CA_FILE}': this run's GitOps forge is github.com, which uses the public CAs."
@@ -5727,12 +5731,13 @@ ask_gitops_forge() {
   # What the menu was first shown over. An option 2 attempt the validator
   # refuses puts these back, so the next answer -- option 2 again, github.com
   # or no repository -- starts from here and not from the refused host and
-  # CA file. The hostname prompt's default is the host the menu was shown
+  # CA file. The hostname and CA prompts' defaults are what the menu was shown
   # over on the first attempt and nothing after a refusal: prompt_read
-  # substitutes a default for an empty answer, so a refused host offered
+  # substitutes a default for an empty answer, so a refused host or file offered
   # again would make enter resubmit it instead of returning to the menu.
   local host_on_entry="${PARAM_GITOPS_HOST:-}" ca_file_on_entry="${PARAM_GITOPS_CA_FILE:-}"
-  local ghes_host="${PARAM_GITOPS_HOST:-}"
+  local ca_secret_on_entry="${PARAM_GITOPS_CA_SECRET:-}"
+  local ghes_host="${PARAM_GITOPS_HOST:-}" ghes_ca_file="${PARAM_GITOPS_CA_FILE:-}"
   while true; do
     prompt_menu "Where does the GitOps repository live?" \
       "GitHub (github.com)" \
@@ -5765,14 +5770,30 @@ ask_gitops_forge() {
         fi
         PARAM_GITOPS_FORGE="github"
         PARAM_GITOPS_HOST="$ghes_host"
-        # The CA prompt has no default, so empty stays a way to answer "a
-        # public CA signed it" on every pass.
-        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
-          PARAM_GITOPS_CA_FILE=""
-          if [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-          fi
-        fi
+        case "$PARAM_GITOPS_HOST" in
+          github.com|www.github.com|ssh.github.com)
+            drop_gitops_ca_file_for_github_com
+            ;;
+          *)
+            if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+              local ca_prompt="PEM CA file that signed the instance's certificate"
+              if [ -n "$ghes_ca_file" ]; then
+                ca_prompt="$ca_prompt (empty keeps the file; a path replaces it)"
+              elif [ -z "$ca_file_on_entry" ] && [ -n "$PARAM_GITOPS_CA_SECRET" ]; then
+                ca_prompt="$ca_prompt (empty keeps Secret '$PARAM_GITOPS_CA_SECRET'; a path replaces it)"
+              else
+                ca_prompt="$ca_prompt (empty if a public CA signed it)"
+              fi
+              prompt_read "$ca_prompt" PARAM_GITOPS_CA_FILE "$ghes_ca_file"
+              # An empty answer means a public CA signed the certificate: clear
+              # any Secret name the early flag check derived from an exported file.
+              # Leave an operator-named Secret alone if it arrived without a file.
+              if [ -z "$PARAM_GITOPS_CA_FILE" ] && [ -n "$ca_file_on_entry" ]; then
+                PARAM_GITOPS_CA_SECRET=""
+              fi
+            fi
+            ;;
+        esac
         if validate_gitops_forge_flags; then
           # A github.com spelling clears the host: the install is then github.com.
           if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
@@ -5786,9 +5807,11 @@ ask_gitops_forge() {
         # CA file themselves; option 3 does not, and without this it would
         # offer the refused Enterprise Server host as the GitLab host's default.
         ghes_host=""
+        ghes_ca_file=""
         PARAM_GITOPS_HOST="$host_on_entry"
         if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
           PARAM_GITOPS_CA_FILE="$ca_file_on_entry"
+          PARAM_GITOPS_CA_SECRET="$ca_secret_on_entry"
         fi
         has_controlling_tty || exit 1
         ;;

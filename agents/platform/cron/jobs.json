@@ -231,6 +231,22 @@
       "deliver": "chat"
     },
     {
+      "id": "kanban-block-recheck",
+      "name": "Kanban Block Re-check",
+      "schedule": {
+        "kind": "cron",
+        "expr": "7,22,37,52 * * * *",
+        "display": "7,22,37,52 * * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "kanban_block_recheck.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "feedback-prompt",
       "name": "Feedback Prompt",
       "schedule": {

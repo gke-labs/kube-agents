@@ -1319,6 +1319,65 @@ class InstallerCommonTest(unittest.TestCase):
                         self.assertIn("install.env", proc.stderr + proc.stdout)
                         self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
+    # LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD are in SEEDED_INSTALLER_ENV_KEYS,
+    # so a developer's own exported value never reaches these runs.
+    def test_tfvars_carry_litellm_budget_only_while_it_is_on(self):
+        # Off (unset, empty, 0 or 0.0) writes no litellm_budget line at all, so
+        # an install without a ceiling keeps the file it had, whatever a
+        # leftover period says; on, the amount is a bare HCL number and the
+        # period a string, the default 1d when empty.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, None),
+                ({"LITELLM_BUDGET_USD": "0"}, None),
+                ({"LITELLM_BUDGET_USD": "0.0", "LITELLM_BUDGET_PERIOD": "not-a-duration"}, None),
+                ({"LITELLM_BUDGET_USD": "25"}, 'litellm_budget = { usd = 25, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "0.01"}, 'litellm_budget = { usd = 0.01, period = "1d" }\n'),
+                ({"LITELLM_BUDGET_USD": "2.50", "LITELLM_BUDGET_PERIOD": "7d"}, 'litellm_budget = { usd = 2.50, period = "7d" }\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    text = dest.read_text()
+                    if expected is None:
+                        self.assertNotIn("litellm_budget", text)
+                    else:
+                        self.assertIn(expected, text)
+
+    def test_tfvars_refuse_litellm_budget_values_terraform_or_the_chart_would(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it. The period
+        # is checked only beside an amount above zero, as the chart reads it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, key in (
+                ({"LITELLM_BUDGET_USD": "-1"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "$25"}, "LITELLM_BUDGET_USD"),
+                ({"LITELLM_BUDGET_USD": "25."}, "LITELLM_BUDGET_USD"),
+                # Under the floor the chart's per-replica share rounds to nothing
+                # and its render would refuse at the apply; refused here first.
+                ({"LITELLM_BUDGET_USD": "0.005"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.0099"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "0.00009"}, "under 0.01 USD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "1x"}, "LITELLM_BUDGET_PERIOD"),
+                ({"LITELLM_BUDGET_USD": "5", "LITELLM_BUDGET_PERIOD": "0d"}, "LITELLM_BUDGET_PERIOD"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(key, proc.stderr + proc.stdout)
+                    self.assertIn("install.env", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
     # Empty reads as unset, so a developer's own exported value cannot stand in.
     _REDACTION_UNSET = {
         "LITELLM_REDACTION_ENABLED": "",
@@ -6185,6 +6244,7 @@ cluster_mode = "autopilot"
 namespace    = "agents-ns"
 """
 _MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+_FOOTPRINT_PROFILES = _REPO_ROOT / "tests" / "data" / "footprint_profiles.json"
 
 # The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
 # maps them onto the chart.
@@ -6576,24 +6636,41 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
-        # and, since the tfvars say next, the NATS bus's three 40Gi JetStream claims (one per server) and the
-        # next-mode pods the preflight now sums (the A2A gateway's standby among them): the
-        # settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  530 GiB over 8 claims", proc.stdout)
-        self.assertIn("Pods:                25", proc.stdout)
-        # The tfvars say autopilot, so the credential proxy is counted at the operator's
-        # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
-        # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        6.550 cores", proc.stdout)
-        self.assertIn("Memory requests:     17.66 GiB", proc.stdout)
-        standard = self._run(
-            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
-            tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+        # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
+        # which `make docs-generate` renders from the same chart template with these
+        # tfvars' --set values (held equal to _FOOTPRINT_EXPECTED_SETS below), and docs-check
+        # keeps current. So this checks that the tfvars reach the render under the right
+        # keys and that the installer prints what the notes print, not the arithmetic,
+        # which tests/test_quota_preflight.py pins from hand-kept constants. The tfvars say
+        # autopilot, so the credential proxy is counted at the operator's Autopilot
+        # requests; on standard the same tfvars sum footprint.yaml's.
+        profiles = json.loads(_FOOTPRINT_PROFILES.read_text())["profiles"]
+        for key, output in (("installer-autopilot", proc), ("installer-standard", None)):
+            profile = profiles[key]
+            self.assertEqual(
+                [f"--set {item}" for item in profile["sets"]], _FOOTPRINT_EXPECTED_SETS,
+                f"{key} in {_FOOTPRINT_PROFILES.name} renders other values than the installer passes",
+            )
+            if output is None:
+                output = self._run(
+                    f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+                    tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+                )
+                self.assertIn("rc=0", output.stdout, output.stderr)
+            r = profile["requirements"]
+            gib = 1024**3
+            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            self.assertIn(
+                f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
+                output.stdout, key,
+            )
+        # Autopilot counts the credential proxy higher, so the two profiles differ.
+        self.assertGreater(
+            profiles["installer-autopilot"]["requirements"]["requestsCpu"],
+            profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
-        self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        5.050 cores", standard.stdout)
-        self.assertIn("Memory requests:     16.66 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
