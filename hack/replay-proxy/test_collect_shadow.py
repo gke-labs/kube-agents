@@ -736,17 +736,33 @@ class ReplayModeTest(CollectorTestCase):
         # Live when listed, evicted while its copy ran: gone, not a refusal.
         self.cluster.add_pod("proxy-b")
         self.cluster.gone.add("proxy-b")
-        listing = self.collector.pods
-        calls = []
+        seed = self.collector.seed
 
-        def pods():
-            calls.append(None)
-            found = listing()
-            return [pod for pod in found if pod.name != "proxy-b"] if len(calls) > 1 else found
+        def seed_then_delete(pod):
+            took = seed(pod)
+            if not took:
+                del self.cluster.pods[pod]
+            return took
 
-        self.collector.pods = pods
+        self.collector.seed = seed_then_delete
         self.assertEqual(self.collector.seed_all(), (1, 1))
         self.assertIn('"event": "seed_skipped_vanished", "pods": 1', self.out.getvalue())
+
+    def test_a_failed_relisting_counts_every_failed_seed_as_a_refusal(self):
+        # The API server stops answering after proxy-a took the cache: proxy-b's
+        # seed fails and so does the listing that would show whether it went.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        seed = self.collector.seed
+
+        def seed_then_lose_the_api(pod):
+            took = seed(pod)
+            self.cluster.list_pods_fail = not took
+            return took
+
+        self.collector.seed = seed_then_lose_the_api
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
 
     def test_a_live_pod_that_refused_its_seed_still_counts(self):
         self.cluster.add_pod("proxy-b")

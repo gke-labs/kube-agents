@@ -548,11 +548,15 @@ class Collector:
     # --- steps ------------------------------------------------------------
 
     def pods(self) -> List[ProxyPod]:
-        """Every proxy pod whose container is running, draining ones included, by name."""
+        """Every proxy pod whose container is running, draining ones included, by name; none when the listing failed."""
+        return self.listed_pods() or []
+
+    def listed_pods(self) -> Optional[List[ProxyPod]]:
+        """As pods(), but None when the listing itself failed (counted as an error), so a caller can tell it from no pods."""
         proc = self.run("list_pods", self.kubectl + ["get", "pods", "-l", self.selector, "-o", "json"],
                         KUBECTL_TIMEOUT_SECONDS)
         if proc is None:
-            return []
+            return None
         found: Dict[str, bool] = {}
         try:
             for pod in json.loads(proc.stdout).get("items") or []:
@@ -565,7 +569,7 @@ class Collector:
                         found[str(metadata["name"])] = bool(metadata.get(POD_DELETION_FIELD))
         except (ValueError, AttributeError, KeyError, TypeError):
             self.fail("list_pods_parse")
-            return []
+            return None
         return [ProxyPod(name, found[name]) for name in sorted(found)]
 
     def list_files(self, pod: str, with_open: bool) -> List[Tuple[str, int]]:
@@ -768,7 +772,9 @@ class Collector:
 
         A pod whose seed failed is listed again: one deleted while its copy ran
         (an eviction, a node drain) is gone, not a pod that refused the cache,
-        so it leaves both counts. One still live counts as a failure.
+        so it leaves both counts. One still live counts as a failure, and so
+        does every failed pod when that listing itself fails (an unreachable
+        API server is no evidence a pod went).
         """
         listed = self.pods()
         live = [pod.name for pod in listed if not pod.draining]
@@ -777,7 +783,10 @@ class Collector:
         failed = [pod for pod in live if not self.seed(pod)]
         if not failed:
             return len(live), len(live)
-        still_live = {pod.name for pod in self.pods() if not pod.draining}
+        relisted = self.listed_pods()
+        if relisted is None:
+            return len(live), len(live) - len(failed)
+        still_live = {pod.name for pod in relisted if not pod.draining}
         vanished = [pod for pod in failed if pod not in still_live]
         if vanished:
             self.emit({"event": "seed_skipped_vanished", "pods": len(vanished)})
