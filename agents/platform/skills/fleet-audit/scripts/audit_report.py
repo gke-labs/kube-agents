@@ -19405,6 +19405,37 @@ def requested_generated_fixes(
     return fixes
 
 
+def generated_fix_gap(finding: dict, manifest: dict | None) -> str:
+    """Why `requested_generated_fixes` does not take a `manual` `no-pdb`
+    finding, in a refusal's words; empty for any other finding.
+
+    A direct ask that is refused as "not a `manifest`" leaves the worker
+    nothing to act on; naming the missing piece says whether the collector
+    attached no `declaration` to the candidate, withheld its selector, or never
+    produced a candidate the finding joins to."""
+    if str(finding.get("check") or "") != GENERATED_FIX_CHECK:
+        return ""
+    if (finding.get("remediation") or {}).get("kind") != "manual":
+        return ""
+    if manifest is None:
+        return "pass the collector's --manifest-file so this command can write the PodDisruptionBudget finish writes"
+    identity = derive_finding_id(finding)
+    candidate = next(
+        (c for entry, c in _candidates(manifest) if c.get("check") == GENERATED_FIX_CHECK and _candidate_identity(entry, c) == identity),
+        None,
+    )
+    if candidate is None:
+        return f"the collector manifest has no {GENERATED_FIX_CHECK} candidate for {identity}"
+    if candidate.get("pod_selector_withheld"):
+        return f"the collector withheld the workload's selector: {candidate['pod_selector_withheld']}"
+    if not isinstance(candidate.get("declaration"), dict):
+        return (
+            "the collector manifest's candidate for it carries no `declaration`, so there is no "
+            "directory to write its PodDisruptionBudget beside"
+        )
+    return ""
+
+
 def _generated_fix_branches(
     findings: list[dict], manifest: dict | None, generated: dict[str, UnwrittenFix], audit_id: str
 ) -> set[str]:
@@ -22772,14 +22803,8 @@ def handle_remediate(args: argparse.Namespace) -> None:
         if (by_id[fid].get("remediation") or {}).get("kind") != "manifest" and fid not in generated
     ]
     if not_manifest:
-        hint = (
-            f"; for a {GENERATED_FIX_CHECK} finding whose PodDisruptionBudget finish "
-            "writes itself, pass the collector's --manifest-file so this command can "
-            "write it the same way"
-            if manifest is None
-            and any(str(by_id[fid].get("check") or "") == GENERATED_FIX_CHECK for fid in not_manifest)
-            else ""
-        )
+        gaps = {fid: generated_fix_gap(by_id[fid], manifest) for fid in not_manifest}
+        hint = "".join(f"; {fid}: {gap}" for fid, gap in gaps.items() if gap)
         raise ValidationError(
             f"--finding: {', '.join(not_manifest)} do not have a 'manifest' "
             "remediation; only a fix that is a file in this repository can become "

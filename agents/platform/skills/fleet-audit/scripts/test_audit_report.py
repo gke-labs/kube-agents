@@ -38099,6 +38099,19 @@ class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
         manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
         self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
 
+    def test_a_refusal_names_what_the_collector_did_not_find(self):
+        """A direct ask refused as not a `manifest` says why the budget is not written."""
+        cases = {
+            "no declaration": ({"declaration": None}, "candidate for it carries no `declaration`"),
+            "withheld selector": ({"pod_selector_withheld": "other pods match"}, "withheld the workload's selector: other pods match"),
+            "no candidate": ({"object": "Deployment/other"}, "has no no-pdb candidate for"),
+        }
+        for name, (fields, phrase) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
+                self.assertIn(phrase, self.err)
+                self.assertEqual(self.harness.calls, [])
+
     def test_a_manifest_finding_is_untouched_by_the_planner(self):
         """Only a `manual` finding is planned; a worker-written file is opened as written."""
         finding = self.finding()
