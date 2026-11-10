@@ -2245,7 +2245,10 @@ unmentioned Slack reply under one of the bot's own posts, #3246), which is dropp
 info-level log line only and does not count as the sender's notice. A shortcut's
 conversation is a thread under someone else's message, so the gateway posts no notice
 there either (`Shortcut`); the adapter sends it to the clicker alone through the
-shortcut's `response_url`, every time. A silent drop of a real user is a support burden. Per sender, not per
+shortcut's `response_url`, every time. Nor for a press of a Stop button, Slack's or Google
+Chat's: the press asked the bot for nothing, and the notice, which names the presser, would land
+in a thread the channel reads; the press is dropped with the log line, does not count as the
+sender's notice, and their first typed message gets it. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice

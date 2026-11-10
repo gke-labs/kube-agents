@@ -710,9 +710,20 @@ func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 	})
 	line := r.adapter.stopLinesCopy()[0].MessageID
 	before := len(r.adapter.postTextsFor(conv))
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: line + "#t1", Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
-	// The same member's typed message is handled after the press, in
-	// order, and gets the notice: once it is posted, the press is behind us.
+	press := line + "#t1"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: press, Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
+	// The press's verdict reaches the adapter after verifySender has posted
+	// whatever it posts, so once it is observed the press's own posts are on
+	// record: there must be none. (Without the skip, the press would post the
+	// notice here and the typed message below would be silent, which is why
+	// the typed message alone is no proof.)
+	waitFor(t, "the press to be dropped", func() bool {
+		return slices.Contains(r.adapter.verifiedCalls(), press+":false")
+	})
+	if posts := r.adapter.postTextsFor(conv); len(posts) != before {
+		t.Fatalf("an unlisted member's press posted %q", posts[before:])
+	}
+	// The same member's typed message still gets the notice, once.
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: "spaces/S1/messages/M2", Text: "hello"}
 	awaitPostIn(t, r, "the typed message's unverified notice", conv, "I can't verify who you are")
 	posts := r.adapter.postTextsFor(conv)
