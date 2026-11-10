@@ -21,7 +21,8 @@
 #
 # The namespace name is invented, so it is absent by construction on every
 # pool project: nothing under bench/tf/fleet/ creates a `ledger-archive`
-# namespace, and the fleet is read-only (bench/tasks/DRAFTS.md). The slot b
+# namespace, and the fleet is read-only (.agents/rules/
+# eval_driven_development.md, "Finding a case"). The slot b
 # role below stands for its cluster rather than for a planted defect
 # (docs/designs/bench-case-format.md, `fixtures`): `fixture_roles` grounds
 # the objective in the runner having reached slot b, and `{cluster:b}` is
@@ -31,7 +32,7 @@
 # The prompt names the project as well as the cluster, in the words
 # chat-tabular-answer-keeps-its-table uses ("in project {{PROJECT_ID}}";
 # the runner substitutes the placeholder in the prompt, bench/CUSTOM-TASKS.md
-# "Placeholders"). A CI pool project has one seeded-b, but an install whose
+# "3. Write the task"). A CI pool project has one seeded-b, but an install whose
 # scope spans many pool projects has one per project: on such an install
 # (gkedemos, 41 projects) the front door answered an unqualified ask with
 # "which GCP project's seeded-b cluster did you mean?" and filed no card.
@@ -51,6 +52,9 @@
 # and the evidence section under it. Only the first is graded.
 # report_contains normalizes backticks away, so a fenced command and an
 # inline one read the same to the patterns.
+# bench/tests/test_chat_voice_absent_answer_patterns.py pins the scoped
+# patterns against the section the gate really renders, and the heading
+# literal the lookaheads stop at.
 #
 # The worker-scope objective pins the path: the card completed on the
 # seeded-b Cluster Agent, not on `platform` (which has its own absent-target
@@ -97,8 +101,10 @@ verification_spec:
   # run ends, so polling a failed check would only wait out the timeout.
   #
   # The answer says what is absent and where: the namespace by name, the
-  # cluster by its recorded name or its short form, and a negation (the
-  # text is lowercased before the patterns run; `n't` covers "isn't" and
+  # cluster by its recorded name or its short form, and a negation on the
+  # same line as the namespace, in either order, so "I couldn't reach
+  # seeded-b" does not stand in for the finding (the text is lowercased
+  # before the patterns run, line breaks kept; `n't` covers "isn't" and
   # "doesn't", and the apostrophe is normalized to the straight one). No
   # question back about which cluster, or which (GCP) project, is meant: the
   # prompt names both.
@@ -112,7 +118,7 @@ verification_spec:
         - "{cluster:b}"
         - '\bseeded-b\b'
       required_patterns:
-        - '\b(?:no|not|none|absent|missing)\b|n''t\b'
+        - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\b(?:no|not|none|absent|missing)\b|n''t\b)).*$'
       forbidden_patterns:
         - '(?i)\bwhich cluster\b'
         - '(?i)\bwhich (?:gcp )?project\b'
