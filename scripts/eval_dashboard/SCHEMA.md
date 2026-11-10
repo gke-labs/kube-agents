@@ -74,7 +74,7 @@ main-b to main-e periodics, `ci-kube-agents-eval-nightly-main-b` to
 `-main-e`, and when the writers part runs as three thirds the writers-b and
 writers-c periodics, `ci-kube-agents-eval-nightly-writers-b` and
 `-writers-c`, whose runs are `nightly` runs too, told apart by `job`) and the forge lanes: the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
-pull-request build against a GitLab repository, with its today and next nightlies) and the self-managed
+pull-request build against a GitLab repository, with its next-mode nightly) and the self-managed
 GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`,
 each with a next-mode weekly job). All archive the same
 layout and are collected from the moment they start running.
@@ -701,9 +701,10 @@ what the renderer does with them.
   record) is the same note, and any other failure is the refusal line, as
   it is for the presubmit. A listing that hangs past `GCLOUD_TIMEOUT_S` is
   the refusal line either way, as for the nightly.
-- `--gitlab-nightly-prefix [<gs prefix>]` — the GitLab lane's nightly
-  periodic (`ci-kube-agents-eval-nightly-gitlab`, the lane's list once a
-  night), read as `--nightly-prefix` is (the prefix is its index, `pr`
+- `--gitlab-nightly-prefix [<gs prefix>]` — a GitLab nightly periodic's
+  prefix (the lane's retired today-mode `ci-kube-agents-eval-nightly-gitlab`;
+  the workflow no longer passes it, and the next-mode nightly comes in
+  through `--lane-nightly-prefix`), read as `--nightly-prefix` is (the prefix is its index, `pr`
   null, `log_url` set, the nightly's rule on a listing that fails) but
   tagged `tier: "gitlab"`, above that nightly job's own watermark: a
   lane's pull-request job and each of its nightlies are sources of one
@@ -718,8 +719,7 @@ what the renderer does with them.
 - `--lane-nightly-prefix <tier>=<gs prefix>` (repeatable) — a forge lane's
   scheduled job at any cadence (a nightly, or the self-managed lanes' weekly
   jobs), read as `--gitlab-nightly-prefix` is but tagged with `<tier>`; a
-  lane may name several (the GitLab lane's today and next nightlies), each
-  above its own job's watermark.
+  lane may name several, each above its own job's watermark.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a

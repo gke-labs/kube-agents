@@ -1,12 +1,11 @@
 # The GitLab lane's matrix: what pull-kube-agents-smoke-test-gitlab runs on
-# a pull request and ci-kube-agents-eval-nightly-gitlab runs once a night
-# (kube-agents#2394, #2832), and ci-kube-agents-eval-nightly-gitlab-next runs
-# once a night under spec.mode next (EVAL_MODE_NEXT=1, through the inject
-# door). hack/ci-eval-pr.sh reads this file in place of the catalogue
+# a pull request and ci-kube-agents-eval-nightly-gitlab-next runs once a
+# night (kube-agents#2394, #2832), both under spec.mode next (EVAL_MODE_NEXT=1,
+# through the inject door). hack/ci-eval-pr.sh reads this file in place of the catalogue
 # whenever EVAL_FORGE is gitlab or gitlab-ce (a self-managed instance,
 # kube-agents#3682), on either tier: nothing else grades the forge,
 # so the presubmit cases and the other nightly-only cases run on GitHub
-# only. Neither nightly appends to the evidence store.
+# only. The nightly does not append to the evidence store.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. Every entry must be a registered case,
@@ -38,8 +37,8 @@
 # the provider and the forge, and the nightly catches that within a day.
 #
 # WHO APPROVES. The normal approvers (root OWNERS), as for nightly-cases.txt
-# and the inject-lane files: this file changes what one on-demand lane and
-# the two nightlies run, not what can red a pull request.
+# and the inject-lane files: this file changes what the GitLab and GitLab CE
+# lanes run, on demand and on schedule, not what can red a pull request.
 #
 # BUDGET. Three cases, nine units at EVAL_REPETITIONS of 3, every one in the
 # fan-out's second phase (each requests a merge request; unit_phase in the
