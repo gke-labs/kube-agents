@@ -178,7 +178,9 @@ func (s *seenSecrets) addPlain(v string, fromSecret bool, gen uint64) {
 }
 
 // addEncoded tracks a Secret data value: the base64 form as given, and the
-// decoded value when it decodes to text. A value that decodes to fewer
+// decoded value when it decodes to text, trimmed, with that trimmed value's
+// own base64 when trimming changed it (a file's or echo's trailing newline
+// gone, as a re-encoding of the value would have it). A value that decodes to fewer
 // than seenSecretMinBytes is not tracked in either form.
 func (s *seenSecrets) addEncoded(b64 string, gen uint64) {
 	b64 = strings.TrimSpace(b64)
@@ -192,7 +194,11 @@ func (s *seenSecrets) addEncoded(b64 string, gen uint64) {
 	if err != nil || !utf8.Valid(raw) {
 		return
 	}
-	s.addLocked(strings.TrimSpace(string(raw)), true, gen)
+	trimmed := strings.TrimSpace(string(raw))
+	s.addLocked(trimmed, true, gen)
+	if trimmed != string(raw) {
+		s.addLocked(base64.StdEncoding.EncodeToString([]byte(trimmed)), true, gen)
+	}
 }
 
 func seenSecretSized(v string) bool {
@@ -478,7 +484,7 @@ func (c *toolResultCollector) text(t string, depth int) {
 		var v any
 		if json.Unmarshal([]byte(trimmed), &v) == nil {
 			c.value(v, depth+1)
-			c.shapeScan(scan)
+			c.shapeScan(jsonPairingText(v))
 			return
 		}
 		if strings.Contains(trimmed, "Secret") {
@@ -489,6 +495,49 @@ func (c *toolResultCollector) text(t string, depth int) {
 		c.yamlSecrets(scan)
 	}
 	c.shapeScan(scan)
+}
+
+// jsonPairingText is v re-encoded for the shape rules that pair sibling
+// fields (an env entry's name and value, a flag and its value in an args
+// list): a string holding a line break is blanked, since c.value already
+// reads it as text of its own and its escaped \n would run one line's
+// value into the next, and a Secret's data and stringData are left out,
+// read exactly by secretObject.
+func jsonPairingText(v any) string {
+	var strip func(x any) any
+	strip = func(x any) any {
+		switch t := x.(type) {
+		case string:
+			if strings.ContainsAny(t, "\r\n") {
+				return ""
+			}
+			return t
+		case map[string]any:
+			secret := t["kind"] == "Secret"
+			out := make(map[string]any, len(t))
+			for k, e := range t {
+				if secret && (k == "data" || k == "stringData") {
+					continue
+				}
+				out[k] = strip(e)
+			}
+			return out
+		case []any:
+			out := make([]any, len(t))
+			for i, e := range t {
+				out[i] = strip(e)
+			}
+			return out
+		}
+		return x
+	}
+	var sb strings.Builder
+	enc := json.NewEncoder(&sb)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(strip(v)) != nil {
+		return ""
+	}
+	return sb.String()
 }
 
 // shapeScan runs the shape rules over scan, within what is left of the
@@ -544,7 +593,11 @@ func (c *toolResultCollector) trackShape(v string) {
 // read before it was one (kubectl get secrets -o json, cut short); a
 // single Secret cut there, with no kind read at all, is not read. An item
 // of a SecretList's items is a Secret: the API server's list (kubectl get
-// --raw, a curl through the API proxy) leaves kind off its items.
+// --raw, a curl through the API proxy) leaves kind off its items. When
+// the list's own kind comes after its items (keys sorted: jq -S, a
+// re-marshalled map), a kind-less item is held until the list settles. An
+// object cut before its type was read may be a service-account token, so
+// its namespace is not taken.
 func (c *toolResultCollector) jsonSecretScan(t string) {
 	type pair struct {
 		key, value string
@@ -556,19 +609,44 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 		haveKey    bool
 		kind       string
 		saToken    bool
+		typeSeen   bool
 		owner      *frame // a data block's object
 		parent     *frame
 		stringData bool
 		pairs      []pair
 		// an array's items read whole so far: Secrets, and anything else
 		secretItems, otherItems int
+		// kind-less items of this object's items, held until its kind is known
+		deferred []*frame
 	}
 	var stack []*frame
+	take := func(f *frame, cut bool) {
+		saToken := f.saToken || cut && !f.typeSeen
+		for _, p := range f.pairs {
+			switch {
+			case seenSecretKeySkipped(p.key, saToken):
+			case p.stringData:
+				c.addSecret(p.value)
+			default:
+				c.addSecretEncoded(p.value)
+			}
+		}
+	}
 	settle := func(f *frame, cut bool) {
 		if !f.object || f.owner != nil {
 			return
 		}
+		if f.kind == "SecretList" {
+			for _, d := range f.deferred {
+				take(d, false)
+			}
+		}
+		f.deferred = nil
 		kind := f.kind
+		if p := f.parent; !cut && kind == "" && p != nil && !p.object && p.parent != nil && p.parent.key == "items" && p.parent.kind == "" {
+			p.parent.deferred = append(p.parent.deferred, f)
+			return
+		}
 		if p := f.parent; kind == "" && p != nil && !p.object && p.parent != nil && p.parent.kind == "SecretList" && p.parent.key == "items" {
 			kind = "Secret" // the API server's SecretList leaves kind off its items
 		}
@@ -585,15 +663,7 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 		if kind != "Secret" {
 			return
 		}
-		for _, p := range f.pairs {
-			switch {
-			case seenSecretKeySkipped(p.key, f.saToken):
-			case p.stringData:
-				c.addSecret(p.value)
-			default:
-				c.addSecretEncoded(p.value)
-			}
-		}
+		take(f, cut)
 	}
 	valueDone := func() {
 		if n := len(stack); n > 0 {
@@ -658,8 +728,9 @@ func (c *toolResultCollector) jsonSecretScan(t string) {
 					top.owner.pairs = append(top.owner.pairs, pair{top.key, str, top.stringData})
 				case top.key == "kind":
 					top.kind = str
-				case top.key == "type" && str == "kubernetes.io/service-account-token":
-					top.saToken = true
+				case top.key == "type":
+					top.typeSeen = true
+					top.saToken = str == "kubernetes.io/service-account-token"
 				}
 			}
 			top.haveKey = false
@@ -697,7 +768,8 @@ func (c *toolResultCollector) yamlSecrets(t string) {
 			col := m[1] - 1 // the item's own keys start here
 			item := []string{line[col:]}
 			for _, next := range lines[i+1:] {
-				if strings.TrimSpace(next) == "" {
+				// A blank or comment line, at any column, does not end it.
+				if t := strings.TrimSpace(next); t == "" || strings.HasPrefix(t, "#") {
 					item = append(item, "")
 					continue
 				}

@@ -1787,9 +1787,11 @@ func kvSecretSpans(s string, code [][2]int, rec func(lo, hi int, named bool)) {
 var (
 	// envNameValuePattern is a Kubernetes env entry, a name followed by a
 	// literal value sibling, in YAML (- name: X, then value: y on the next
-	// line), JSON or a flow mapping; envValueNamePattern is the same with
-	// the value first (JSON or a flow mapping). valueFrom is not a value.
-	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(?:,[ \t]*(?:\r?\n[ \t]*)?|\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])`)
+	// line, a comment after the name allowed), JSON or a flow mapping;
+	// envValueNamePattern is the same with the value first (JSON or a flow
+	// mapping). valueFrom is not a value. An unquoted value is matched to
+	// the line's end and cut by envUnquotedValue.
+	envNameValuePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?[ \t]*(,[ \t]*(?:\r?\n[ \t]*)?|(?:[ \t]+#[^\r\n]*)?\r?\n[ \t]*)["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^\r\n]*[^\r\n \t])`)
 	envValueNamePattern = regexp.MustCompile(`(?:^|[\s{,\[-])["']?value["']?[ \t]*:[ \t]*("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[^,}\]\r\n]*[^,}\]\r\n \t])[ \t]*,[ \t]*(?:\r?\n[ \t]*)?["']?name["']?[ \t]*:[ \t]*["']?([A-Za-z_][A-Za-z0-9_.-]*)["']?`)
 )
 
@@ -1802,12 +1804,33 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 		return s
 	}
 	var spans [][2]int
-	pair := func(re *regexp.Regexp, nameG, valueG int) {
-		for _, m := range re.FindAllStringSubmatchIndex(s, -1) {
+	pair := func(re *regexp.Regexp, nameG, valueG, sepG int) {
+		// Each scan resumes where the last value ended, not at the end of
+		// its match: an unquoted value is matched to the line's end, and a
+		// flow mapping may hold a later entry on the same line.
+		for pos := 0; pos < len(s); {
+			m := re.FindStringSubmatchIndex(s[pos:])
+			if m == nil {
+				break
+			}
+			for k := range m {
+				if m[k] >= 0 {
+					m[k] += pos
+				}
+			}
+			pos = m[1]
 			name := s[m[2*nameG]:m[2*nameG+1]]
 			lo, hi := m[2*valueG], m[2*valueG+1]
+			var decoded string
 			if hi-lo >= 2 && (s[lo] == '"' || s[lo] == '\'') && s[hi-1] == s[lo] {
+				decoded, _, _ = yamlQuoted(s[lo:hi])
 				lo, hi = lo+1, hi-1
+			} else if sepG > 0 {
+				hi = lo + envUnquotedValue(s[lo:hi], strings.Contains(s[m[2*sepG]:m[2*sepG+1]], ","))
+				pos = max(hi, m[2*valueG]+1)
+				if hi <= lo {
+					continue
+				}
 			}
 			if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(s[lo:hi]); sloc != nil {
 				lo += sloc[1] // the scheme word stays, as under a key
@@ -1819,12 +1842,38 @@ func scrubEnvNameValuePairs(s string, sink secretSink) string {
 			spans = append(spans, [2]int{lo, hi})
 			if keyClearlyNamesSecret(name) {
 				sink.emit(v)
+				// A quoted value is also tracked as its escapes read
+				// (a JSON or YAML "\"" is the value's own quote).
+				if decoded != "" && decoded != s[lo:hi] && lo == m[2*valueG]+1 {
+					sink.emit(decoded)
+				}
 			}
 		}
 	}
-	pair(envNameValuePattern, 1, 2)
-	pair(envValueNamePattern, 2, 1)
+	pair(envNameValuePattern, 1, 3, 2)
+	pair(envValueNamePattern, 2, 1, 0)
 	return redactSpans(s, spans)
+}
+
+// envUnquotedValue is the length of an unquoted env value matched to its
+// line's end: in a flow mapping or JSON (flow) up to a , } or ], in block
+// YAML the whole line, either way with a trailing comment (a # after a
+// blank, or one opening the value) and the blanks before it taken off.
+func envUnquotedValue(v string, flow bool) int {
+	if flow {
+		if i := strings.IndexAny(v, ",}]"); i >= 0 {
+			v = v[:i]
+		}
+	}
+	if strings.HasPrefix(v, "#") {
+		return 0
+	}
+	for _, c := range []string{" #", "\t#"} {
+		if i := strings.Index(v, c); i >= 0 {
+			v = v[:i]
+		}
+	}
+	return len(strings.TrimRight(v, " \t"))
 }
 
 // scrubMarkdownTables redacts the value cells of a markdown table that
@@ -1936,13 +1985,24 @@ func markdownTableCells(s string, lo, hi int) [][2]int {
 	if !strings.HasPrefix(trimmed, "|") || strings.Count(trimmed, "|") < 2 {
 		return nil
 	}
+	// A pipe inside a paired code span is the cell's content: the answer
+	// is published as written, so a value it pushes past is still there.
+	code := markPairedMarkdownRuns(line, 0, len(line), make([]bool, len(line)), nil)
+	inCode := func(i int) bool {
+		for _, c := range code {
+			if i >= c[0] && i < c[1] {
+				return true
+			}
+		}
+		return false
+	}
 	var pipes []int
 	for i := 0; i < len(line); i++ {
 		if line[i] == '\\' {
 			i++
 			continue
 		}
-		if line[i] == '|' {
+		if line[i] == '|' && !inCode(i) {
 			pipes = append(pipes, lo+i)
 		}
 	}
@@ -2084,9 +2144,17 @@ func tableSecretKeyClass(cell string) (secretKeyClass, bool) {
 // normalised away for the test and kept around the marker, or none.
 func tableCellSpans(s string, cell [2]int, class secretKeyClass, named bool, sink secretSink) [][2]int {
 	text := s[cell[0]:cell[1]]
-	n, idx := normalizeMarkdown(text)
+	n, idx, code := normalizeMarkdownSpans(text)
 	lo := len(n) - len(strings.TrimLeft(n, " \t"))
 	hi := len(strings.TrimRight(n, " \t"))
+	// As under a key: an auth-scheme word stays, and a code-spanned value
+	// is bounded by its backticks (a note may follow it in the cell).
+	if sloc := inlineAuthSchemePrefixPattern.FindStringIndex(n[lo:hi]); sloc != nil {
+		lo += sloc[1]
+	}
+	if end, ok := codeSpanEnd(code, lo); ok {
+		hi = end
+	}
 	if hi <= lo || strings.Contains(n, redactedValue) || !classValueRedacted(class, n[lo:hi], false) {
 		return nil
 	}

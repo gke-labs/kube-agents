@@ -879,6 +879,73 @@ func TestSeenSecrets_RawSecretListItemsAreSecrets(t *testing.T) {
 	}
 }
 
+// A raw SecretList whose keys are sorted (jq -S), so its kind comes after
+// its items, still has its items read as Secrets when the text it starts
+// does not parse whole (output after it); a token Secret cut before its type has its
+// namespace left out, since it may be a service-account token's.
+func TestSeenSecrets_JSONKeyOrderDoesNotDecideWhatIsRead(t *testing.T) {
+	sorted := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"data":{"password":%q},"metadata":{"name":"app-db","namespace":"prod"},"type":"Opaque"}],`+
+		`"kind":"SecretList","metadata":{"resourceVersion":"1"}}`, b64(synthSecretPlain))
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, sorted+"\nsecret/app-db listed"))
+	if !s.has(synthSecretPlain) {
+		t.Error("a sorted SecretList's kind-less item was not read as a Secret")
+	}
+
+	list := fmt.Sprintf(`{"apiVersion":"v1","items":[`+
+		`{"apiVersion":"v1","data":{"password":%q},"kind":"Secret","metadata":{"name":"app-db"},"type":"Opaque"},`+
+		`{"apiVersion":"v1","data":{"ca.crt":%q,"namespace":%q,"token":"c3ludGhldGlj`,
+		b64(synthSecretPlain), b64(synthSecretPlain2), b64(synthSANamespace))
+	var c seenSecrets
+	c.collectToolResult(terminalResult(t, list))
+	if !c.has(synthSecretPlain2) {
+		t.Error("the cut item's whole pairs were not read")
+	}
+	if c.has(synthSANamespace) {
+		t.Error("a Secret cut before its type had its namespace tracked")
+	}
+}
+
+// A comment line inside a YAML list item, at any column, does not end the
+// item: its data block after the comment is still read.
+func TestSeenSecrets_ACommentLineDoesNotEndAYAMLListItem(t *testing.T) {
+	doc := "apiVersion: v1\nkind: List\nitems:\n- apiVersion: v1\n  kind: Secret\n# the app's database login\n  metadata:\n    name: app-db\n  data:\n    password: " + b64(synthSecretPlain) + "\n"
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, doc))
+	if !s.has(synthSecretPlain) {
+		t.Error("a comment line ended the list item before its data block")
+	}
+}
+
+// A data value with a trailing newline (a file's, echo's) is tracked as
+// its trimmed value's base64 too: an answer re-encoding the value has it.
+func TestSeenSecrets_ATrimmedDataValuesOwnBase64IsTracked(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", map[string]string{"password": synthSecretPlain + "\n"})))
+	for _, v := range []string{b64(synthSecretPlain + "\n"), synthSecretPlain, b64(synthSecretPlain)} {
+		if !s.has(v) {
+			t.Errorf("%q is not tracked", v)
+		}
+	}
+}
+
+// A JSON tool result's lines are not read as one run of text: a value at
+// a line's end does not run on into the next line, and a key does not take
+// the escape's n, so nothing tracked holds an escaped line break.
+func TestSeenSecrets_RawJSONIsNotReadAsOneLine(t *testing.T) {
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, "status: ok\nsvc1_token: "+synthSecretPlain+"\nregion: us-east4\n"))
+	if !s.has(synthSecretPlain) {
+		t.Fatal("the line's own value is not tracked")
+	}
+	for _, v := range s.values() {
+		if strings.Contains(v, `\n`) || strings.Contains(v, "us-east4") {
+			t.Errorf("tracked a run-on value %q", v)
+		}
+	}
+}
+
 // A quoted stringData value is read with its YAML escapes: a double-quoted
 // one's backslash escapes, a single-quoted one's doubled quotes.
 func TestSeenSecrets_QuotedYAMLStringDataIsUnescaped(t *testing.T) {

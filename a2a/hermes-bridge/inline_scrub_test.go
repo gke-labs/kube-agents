@@ -619,3 +619,48 @@ func TestScrubInlineSecretsListBullets(t *testing.T) {
 		}
 	}
 }
+
+// An env entry's value is read as YAML reads it: a comment after the name
+// or the value is not part of it, a block value keeps its commas and
+// brackets, a flow mapping still ends a value at , } or ], and a quoted
+// value is tracked as written and with its escapes read.
+func TestScrubEnvNameValuePairsReadsTheValueAsYAMLDoes(t *testing.T) {
+	cases := []struct {
+		in, want string
+		tracked  []string
+	}{
+		{"- name: DB_PASSWORD # rotated\n  value: synth-pass-0001\n", "- name: DB_PASSWORD # rotated\n  value: [redacted]\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth-pass-0001 # rotated monthly\n", "- name: DB_PASSWORD\n  value: [redacted] # rotated monthly\n", []string{"synth-pass-0001"}},
+		{"- name: DB_PASSWORD\n  value: synth,pass]0001\n", "- name: DB_PASSWORD\n  value: [redacted]\n", []string{"synth,pass]0001"}},
+		{"env: [{name: A_PASSWORD, value: synth-a-0001}, {name: B_TOKEN, value: synth-b-0001}]", "env: [{name: A_PASSWORD, value: [redacted]}, {name: B_TOKEN, value: [redacted]}]", []string{"synth-a-0001", "synth-b-0001"}},
+		{`{"name": "DB_PASSWORD", "value": "synth\"pass\"0001"}`, `{"name": "DB_PASSWORD", "value": "[redacted]"}`, []string{`synth\"pass\"0001`, `synth"pass"0001`}},
+		{"- name: DB_PASSWORD\n  value: # none\n", "- name: DB_PASSWORD\n  value: # none\n", nil},
+		{"- name: LOG_LEVEL\n  value: debug # verbose\n", "- name: LOG_LEVEL\n  value: debug # verbose\n", nil},
+	}
+	for _, tc := range cases {
+		var got []string
+		if out := scrubEnvNameValuePairs(tc.in, func(v string) { got = append(got, v) }); out != tc.want {
+			t.Errorf("scrubEnvNameValuePairs(%q)\n got %q\nwant %q", tc.in, out, tc.want)
+		}
+		if strings.Join(got, "\x00") != strings.Join(tc.tracked, "\x00") {
+			t.Errorf("%q: tracked %q, want %q", tc.in, got, tc.tracked)
+		}
+	}
+}
+
+// A table's value cell is read as a value under a key is: an auth-scheme
+// word stays, a code-spanned value is bounded by its backticks, and a pipe
+// inside a code span is the cell's content, not a column break.
+func TestScrubInlineSecretsTableCellsSchemeCodeSpanAndPipes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"| Key | Value |\n|---|---|\n| api_token | Bearer `synthtoken0001abcd` |\n", "| Key | Value |\n|---|---|\n| api_token | Bearer `[redacted]` |\n"},
+		{"| Key | Value |\n|---|---|\n| password | `quietpasture` (rotated) |\n", "| Key | Value |\n|---|---|\n| password | `[redacted]` (rotated) |\n"},
+		{"| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | quietpasture |\n", "| User | Command | Password |\n|---|---|---|\n| app | `cat /etc/hosts | head` | [redacted] |\n"},
+		{"| Key | Value | Notes |\n|---|---|---|\n| password | `synth|pass|0001` | rotated |\n", "| Key | Value | Notes |\n|---|---|---|\n| password | `[redacted]` | rotated |\n"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
