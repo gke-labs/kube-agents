@@ -60,7 +60,9 @@ the gate checked, on the card that ran the command. No other card's claims
 count.
 
 The gate copies ``exit_code`` and ``ran_at`` from the recorded call, or from
-the child card's accepted claim; the model does not supply them. Accepted
+the child card's accepted claim, and ``card`` for a relayed one; the model
+does not supply them. Of the three only ``ran_at`` is rendered; ``exit_code``
+and ``card`` are kept for parsers (:data:`CLAIM_TAG`). Accepted
 claims are stored in ``metadata.verified_claims``, which the gate always
 rewrites, so a ``kanban_complete`` call cannot put unchecked claims there.
 Other writers of a completed run's metadata (``hermes kanban edit`` or
@@ -104,7 +106,8 @@ Limits
   rules, not this gate, cover that. A card that quotes a child card's result
   carries that child's real heading, so the heading alone proves nothing.
 - A claim backed by a command that failed is accepted, since "not found" is
-  evidence, and renders with its exit code like any other (:data:`CLAIM_TAG`).
+  evidence, and renders like any other, with the time it ran
+  (:data:`CLAIM_TAG`); its exit code is in the metadata, not the text.
 """
 
 from __future__ import annotations
@@ -173,15 +176,26 @@ QUOTE_CHARS = 80
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 EVIDENCE_HEADING = "**Evidence for verified claims**"
-#: The line above each claim's two fences: the claim, then what the gate
-#: copied from the recorded call. The tag states the exit code and never reads
-#: it: a by-name read of something that is not there (``kubectl get namespace
-#: ledger-archive``) exits 1 with ``NotFound``, and that is the finding, so
-#: "the command failed" beside it told the reader the work had failed. What
-#: backs the claim is the excerpt, which the gate matched against the output;
-#: a claim whose command failed says so itself (:data:`PARAM_DESCRIPTION`).
-#: ``where`` is empty, or ``, on card <id>`` for a claim relayed from a child.
-CLAIM_TAG = "{claim} (exit {exit_code}, {ran_at}{where})"
+#: The line above each claim's two fences: the claim, then the time the
+#: command ran, and :data:`RELAY_NOTE` for a claim relayed from a child. The
+#: tag carries no exit code: ``.agents/rules/chat_ux.md`` ("No plumbing in user
+#: text") names exit codes as plumbing, ``agents/platform/SOUL.md`` §2 item 5
+#: and ``agents/cluster/SOUL.md`` §2 tell the agents never to output them, and
+#: the site (concepts/platform-agent.md, "Behavioral shape") says CLI exit
+#: codes are omitted from every user-facing message, which this tag made
+#: untrue. The number also told the reader nothing they could use: a by-name
+#: read of something that is not there (``kubectl get namespace
+#: ledger-archive``) and a forbidden one both exit 1, and the excerpt fence is
+#: what tells ``NotFound`` from a 403. An earlier form added "the command
+#: failed" to a non-zero exit, which called a correct "does not exist"
+#: finding a failure. What backs the claim is the excerpt, which the gate
+#: matched against the output; the exit code stays in
+#: ``metadata.verified_claims`` for parsers.
+CLAIM_TAG = "{claim} (checked {ran_at}{where})"
+#: What a claim relayed from a card this card created carries after its time.
+#: The card id stays in the stored claim's ``card``; in the text it would be
+#: plumbing under the same rule, which admits an id only in a board read.
+RELAY_NOTE = ", from a specialist's card"
 #: ``slack_moments.NEXT_STEP_LINE``: a line of its own reading ``[next: <label>]``,
 #: the one next step an answer declares, which Slack draws as a button only
 #: when it is the answer's last and only step line.
@@ -204,7 +218,7 @@ PARAM_DESCRIPTION = (
     f"failed. "
     "You may also repeat a verified claim from a card you created, with its "
     "command and excerpt as that card gave them. The tool checks each claim, "
-    "adds the exit code and the time the command ran, and adds the evidence to "
+    "adds the time the command ran, and adds the evidence to "
     "``result`` below your text (a closing ``[next: ...]`` line stays last). A "
     "claim that fails the check is refused, and is dropped on the retry. Do not call anything verified in ``result`` unless it is listed "
     "here."
@@ -427,8 +441,8 @@ def render_evidence(claims: list) -> str:
     """
     parts = [EVIDENCE_HEADING]
     for claim in claims:
-        where = f", on card {claim['card']}" if claim.get("card") else ""
-        parts.append(CLAIM_TAG.format(claim=claim["claim"], exit_code=claim["exit_code"], ran_at=claim["ran_at"], where=where))
+        where = RELAY_NOTE if claim.get("card") else ""
+        parts.append(CLAIM_TAG.format(claim=claim["claim"], ran_at=claim["ran_at"], where=where))
         parts.append(f"{FENCE}\n$ {claim['command']}\n{FENCE}\n{FENCE}\n{claim['excerpt']}\n{FENCE}")
     return "\n\n".join(parts)
 

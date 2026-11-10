@@ -148,7 +148,7 @@ class AcceptTest(GateTestCase):
         record()
         _, result, metadata = run_rules(CARD, [dict(GOOD, claim="node-b\n  is NotReady.")], "r", None)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["claim"], "node-b is NotReady.")
-        self.assertIn("\n\nnode-b is NotReady. (exit 0,", result)
+        self.assertIn("\n\nnode-b is NotReady. (checked ", result)
 
     def test_a_metadata_key_the_model_wrote_is_removed(self):
         forged = {"keep": 1, kvc.METADATA_KEY: [{"claim": "x", "command": "never ran", "excerpt": "y"}]}
@@ -171,26 +171,28 @@ class AcceptTest(GateTestCase):
         _, _, metadata = run_rules(CARD, [GOOD], "r", None)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["ran_at"], "1970-01-01T00:01:00Z")
 
-    def test_a_backed_claim_is_tagged_with_its_exit_code_and_time(self):
+    def test_a_backed_claim_is_tagged_with_its_time(self):
         record(exit_code=0, now=0)
         _, result, _ = run_rules(CARD, [GOOD], "r", None)
-        self.assertIn("\n\nnode-b is NotReady. (exit 0, 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
+        self.assertIn("\n\nnode-b is NotReady. (checked 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
+        self.assertNotIn("exit", result)
 
-    def test_a_failed_command_is_cited_with_its_exit_code_and_no_verdict(self):
+    def test_a_failed_command_is_cited_with_its_time_and_no_verdict(self):
         # A by-name read of something absent exits 1 with NotFound, and that is the
-        # finding: the tag states the exit code and does not call the work failed.
+        # finding: the tag carries the time, no exit code, and no verdict on the work.
         record(command="kubectl get ns ghost", exit_code=1, output='Error from server (NotFound): namespaces "ghost" not found', now=0)
         claim = {"claim": "ghost does not exist.", "command": "kubectl get ns ghost", "excerpt": "(NotFound)"}
         _, result, metadata = run_rules(CARD, [claim], "r", None)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["exit_code"], 1)
-        self.assertIn("\n\nghost does not exist. (exit 1, 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
+        self.assertIn("\n\nghost does not exist. (checked 1970-01-01T00:00:00Z)\n\n```\n$ ", result)
         self.assertNotIn("failed", result)
+        self.assertNotIn("exit", result)
 
     def test_the_section_heading_is_unchanged(self):
         record(now=0)
         _, result, _ = run_rules(CARD, [GOOD], "r", None)
         self.assertEqual(kvc.EVIDENCE_HEADING, "**Evidence for verified claims**")
-        self.assertTrue(result.startswith("r\n\n**Evidence for verified claims**\n\nnode-b is NotReady. (exit 0, "), result)
+        self.assertTrue(result.startswith("r\n\n**Evidence for verified claims**\n\nnode-b is NotReady. (checked "), result)
 
     def test_stored_text_is_redacted(self):
         record()
@@ -391,7 +393,15 @@ class ChildClaimsTest(GateTestCase):
         self.assertIsNone(err)
         [stored] = metadata[kvc.METADATA_KEY]
         self.assertEqual((stored["exit_code"], stored["ran_at"], stored["card"]), (0, "2026-10-20T12:00:00Z", "t_cluster"))
-        self.assertIn("on card t_cluster", result)
+        self.assertIn("node-b is NotReady. (checked 2026-10-20T12:00:00Z, from a specialist's card)\n\n```\n$ ", result)
+
+    def test_a_relayed_claims_note_carries_no_card_id(self):
+        # The card that ran the command is kept in the metadata, not shown: an id in the text is plumbing.
+        connect = self.connect_to([("t_mid", CARD), ("t_cluster", "t_mid")], [("t_cluster", "completed", [CHILD_CLAIM])])
+        _, result, metadata = run_rules(CARD, [dict(GOOD, excerpt="NotReady")], "r", None, connect=connect)
+        self.assertEqual(metadata[kvc.METADATA_KEY][0]["card"], "t_cluster")
+        self.assertNotIn("t_cluster", result)
+        self.assertNotIn("card t_", result)
 
     def test_a_relayed_claim_keeps_the_card_that_ran_the_command(self):
         # t_mid relayed t_cluster's claim; its run row comes first in the table.
@@ -402,7 +412,7 @@ class ChildClaimsTest(GateTestCase):
         )
         _, result, metadata = run_rules(CARD, [GOOD], "r", None, connect=connect)
         self.assertEqual(metadata[kvc.METADATA_KEY][0]["card"], "t_cluster")
-        self.assertNotIn("on card t_mid", result)
+        self.assertNotIn("t_mid", result)
 
     def test_a_claim_that_does_not_match_the_childs_is_refused(self):
         connect = self.connect_to([("t_cluster", CARD)], [("t_cluster", "completed", [CHILD_CLAIM])])
