@@ -22,7 +22,8 @@ type gatewayInFrame struct {
 }
 
 // captureConsoleFrames records every frame published to any console
-// conversation's in subject, beside the fake gateway that answers them.
+// conversation's in subject, beside the fake gateway that answers them, and
+// fails the test on any frame published to a confirm subject.
 func captureConsoleFrames(t *testing.T, url string) func() [][]byte {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
@@ -36,6 +37,13 @@ func captureConsoleFrames(t *testing.T, url string) func() [][]byte {
 		mu.Lock()
 		defer mu.Unlock()
 		frames = append(frames, append([]byte(nil), m.Data...))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing this server sends may land on the confirm subject at all,
+	// whatever its body: a frame there is a confirm by subject alone.
+	if _, err := nc.Subscribe("chat.console.*.confirm", func(m *nats.Msg) {
+		t.Errorf("a frame reached %s: %s", m.Subject, m.Data)
 	}); err != nil {
 		t.Fatal(err)
 	}
