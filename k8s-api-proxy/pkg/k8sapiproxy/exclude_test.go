@@ -145,3 +145,16 @@ func TestAnEditToTheScopeAppliesOnTheNextRequest(t *testing.T) {
 	writeScope(t, path, scopeExcluding())
 	assertForwarded(t, h, upstream, excludedID)
 }
+
+// A refusal for an excluded cluster is counted under its own reason, not
+// "other", so the rejected-requests metric shows the exclusion working.
+func TestAnExcludedClusterRefusalIsCountedUnderItsReason(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scope.json")
+	writeScope(t, path, scopeExcluding("payments-staging/us-central1/scratch"))
+	metrics := NewMetrics()
+	h, upstream := newTestHandler(t, Config{Exclusions: NewExclusions(path, hostID), Metrics: metrics})
+	assertExcluded(t, h, upstream, excludedID, ReasonExcludedCluster)
+	if exposition := scrapeMetricsText(t, metrics); !strings.Contains(exposition, `reason="scope.excluded-cluster"`) {
+		t.Errorf("no rejected-requests sample under reason scope.excluded-cluster:\n%s", exposition)
+	}
+}
