@@ -422,7 +422,7 @@ switch between two forges with a token (GitLab, Bitbucket Cloud, Bitbucket Data 
 keep the recorded token Secret, which holds the old forge's token: the run must give
 `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run or a run with
 no terminal stops, and an interactive run asks for the new token after the apply and stops if none
-is entered. When the run keeps the recorded Secret and gives no read token, the installer removes
+is entered. When the run keeps the recorded Secret without naming it with `--gitops-token-secret`, and gives no read token, the installer removes
 the Secret's `read-token` key, which holds the old forge's read token. A switch to a forge with a
 token drops the recorded `GITOPS_REPO` unless `--gitops-repo` gives it: a non-interactive run then
 stops, and an interactive run asks. The installer records the old forge and its Secret as

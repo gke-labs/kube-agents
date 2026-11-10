@@ -959,6 +959,8 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
     def test_a_switch_to_github_drops_the_recorded_secret(self):
         proc = self._validate_ca(
             {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca",
+             # As install.sh loads them: both from install.env's GITOPS_CA_SECRET.
+             "PARAM_GITOPS_RECORDED_CA_SECRET": "gitlab-forge-ca",
              "PARAM_GITOPS_RECORDED_FORGE": "gitlab"}
         )
         self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)

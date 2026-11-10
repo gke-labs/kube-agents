@@ -228,7 +228,7 @@ before the new token is stored (an empty answer, an interrupt or a failed apply)
 the old forge in `GITOPS_SWITCH_FROM_FORGE` and `GITOPS_SWITCH_FROM_SECRET`, and the next run applies
 the same rules. The installer removes the two keys after it stores the new token.
 
-When the run keeps the recorded Secret and gives no read token, the installer removes the Secret's `read-token` key, which holds the old
+When the run keeps the recorded Secret without naming it, and gives no read token, the installer removes the Secret's `read-token` key, which holds the old
 forge's read token, and says so. Give the new read token with `GITOPS_READ_TOKEN_FILE`.
 
 **No token file.** In a non-interactive run without `--gitops-token-file`, the install completes

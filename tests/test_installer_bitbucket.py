@@ -359,6 +359,90 @@ class BitbucketFlagsTest(unittest.TestCase):
         proc = self._run_install_func('parse_args --gitops-repo=acme/infra; echo "flag=$PARAM_GITOPS_REPO_FROM_FLAG"')
         self.assertIn("flag=true", proc.stdout, proc.stderr)
 
+    # --- Answers given in the interview are this run's choices ---
+    _PROMPTS = (
+        'prompt_read() { case "$1" in '
+        '"Repository path"*|"GitLab project path"*) eval "$2=\\$ANSWER_REPO" ;; '
+        '"GitLab host"*) eval "$2=gitlab.com" ;; '
+        '"Bitbucket Data Center hostname"*) eval "$2=\\$ANSWER_HOST" ;; '
+        '*) eval "$2=\\$3" ;; esac; }; has_controlling_tty() { return 0; }; '
+    )
+
+    def _interview(self, func, assignments, answers):
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in assignments.items())
+        exports = "".join(f"export {k}={shlex.quote(v)}; " for k, v in answers.items())
+        return self._run_install_func(
+            f"{self._PROMPTS}{exports}{body}"
+            "validate_gitops_forge_flags >/dev/null 2>&1; "
+            f'run() {{ local github_repo="$PARAM_GITOPS_REPO"; {func}; echo "repo=[$github_repo] param=[$PARAM_GITOPS_REPO]"; }}; run'
+        )
+
+    def test_an_interview_answer_equal_to_the_recorded_path_is_kept(self):
+        """A switch drops the recorded path, then the interview asks. An answer
+        that equals the old path is this run's choice, not a recorded value."""
+        proc = self._interview("interview_bitbucket_forge", {
+            "PARAM_GITOPS_FORGE": "bitbucket", "PARAM_NON_INTERACTIVE": "false",
+            "PARAM_GITOPS_RECORDED_FORGE": "gitlab", "PARAM_GITOPS_RECORDED_REPO": "acme/infra",
+            "PARAM_GITOPS_REPO": "acme/infra", "PARAM_GITLAB_TOKEN_SECRET": "gitlab-forge-token",
+            "PARAM_GITOPS_RECORDED_TOKEN_SECRET": "gitlab-forge-token", "PARAM_GITHUB_APP_ID": "", "PARAM_GITHUB_PEM_PATH": "",
+        }, {"ANSWER_REPO": "acme/infra"})
+        out = proc.stdout + proc.stderr
+        self.assertIn("repo=[acme/infra] param=[acme/infra]", proc.stdout, out)
+        self.assertEqual(out.count("Dropping the recorded GitLab repository"), 0, out)
+        proc = self._interview("interview_gitlab_forge", {
+            "PARAM_GITOPS_FORGE": "gitlab", "PARAM_NON_INTERACTIVE": "false",
+            "PARAM_GITOPS_RECORDED_FORGE": "bitbucket", "PARAM_GITOPS_RECORDED_REPO": "acme/infra",
+            "PARAM_GITOPS_REPO": "acme/infra", "PARAM_GITLAB_TOKEN_SECRET": "bitbucket-forge-token",
+            "PARAM_GITOPS_RECORDED_TOKEN_SECRET": "bitbucket-forge-token", "PARAM_GITHUB_APP_ID": "", "PARAM_GITHUB_PEM_PATH": "",
+        }, {"ANSWER_REPO": "acme/infra"})
+        out = proc.stdout + proc.stderr
+        self.assertIn("repo=[acme/infra] param=[acme/infra]", proc.stdout, out)
+        self.assertEqual(out.count("Dropping the recorded Bitbucket Cloud repository"), 0, out)
+
+    def test_an_interview_host_equal_to_the_recorded_host_is_kept(self):
+        proc = self._interview("interview_bitbucket_forge", {
+            "PARAM_GITOPS_FORGE": "bitbucket-datacenter", "PARAM_NON_INTERACTIVE": "false",
+            "PARAM_GITOPS_RECORDED_FORGE": "gitlab", "PARAM_GITOPS_RECORDED_HOST": "git.example.com",
+            "PARAM_GITOPS_HOST": "git.example.com", "PARAM_GITOPS_REPO": "",
+            "PARAM_GITLAB_TOKEN_SECRET": "gitlab-forge-token", "PARAM_GITOPS_RECORDED_TOKEN_SECRET": "gitlab-forge-token",
+            "PARAM_GITHUB_APP_ID": "", "PARAM_GITHUB_PEM_PATH": "",
+        }, {"ANSWER_REPO": "INFRA/gitops", "ANSWER_HOST": "git.example.com"})
+        out = proc.stdout + proc.stderr
+        self.assertIn("repo=[INFRA/gitops]", proc.stdout, out)
+        proc2 = self._run_install_func(
+            f"{self._PROMPTS}export ANSWER_REPO=INFRA/gitops ANSWER_HOST=git.example.com; "
+            "PARAM_GITOPS_FORGE=bitbucket-datacenter PARAM_NON_INTERACTIVE=false PARAM_GITOPS_RECORDED_FORGE=gitlab "
+            "PARAM_GITOPS_RECORDED_HOST=git.example.com PARAM_GITOPS_HOST= PARAM_GITOPS_REPO= "
+            "PARAM_GITLAB_TOKEN_SECRET=gitlab-forge-token PARAM_GITOPS_RECORDED_TOKEN_SECRET=gitlab-forge-token; "
+            'run() { local github_repo=""; interview_bitbucket_forge >/dev/null 2>&1; validate_gitops_forge_flags >/dev/null 2>&1; echo "host=[$PARAM_GITOPS_HOST]"; }; run'
+        )
+        self.assertIn("host=[git.example.com]", proc2.stdout, proc2.stderr)
+
+    def test_a_ca_secret_this_run_set_is_not_dropped_as_recorded(self):
+        ca = self._tmp / "ca.pem"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        tok = self._tmp / "tok"
+        tok.write_text("x")
+        proc = self._validate(self._dc(
+            PARAM_GITOPS_RECORDED_FORGE="gitlab", PARAM_GITOPS_RECORDED_CA_SECRET="gitlab-forge-ca",
+            PARAM_GITOPS_CA_SECRET="bitbucket-forge-ca", PARAM_GITOPS_CA_FILE=str(ca), PARAM_GITLAB_TOKEN_FILE=str(tok),
+            PARAM_GITOPS_REPO_FROM_FLAG="true", PARAM_GITOPS_HOST_FROM_FLAG="true"))
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0 ", proc.stdout, out)
+        self.assertNotIn("Dropping the recorded GitLab CA Secret", out)
+
+    def test_an_identity_flag_equal_to_the_recorded_one_is_kept(self):
+        tok = self._tmp / "tok"
+        tok.write_text("x")
+        body = "".join(f"{k}={shlex.quote(v)}; " for k, v in self._dc(
+            PARAM_GITOPS_RECORDED_FORGE="bitbucket", PARAM_GITOPS_RECORDED_IDENTITY="svc-bot",
+            PARAM_GITOPS_IDENTITY="svc-bot", PARAM_GITOPS_IDENTITY_FROM_FLAG="true", PARAM_GITLAB_TOKEN_FILE=str(tok),
+            PARAM_GITOPS_REPO_FROM_FLAG="true").items())
+        proc = self._run_install_func(f'{body}validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc id=[$PARAM_GITOPS_IDENTITY]"')
+        self.assertIn("rc=0 id=[svc-bot]", proc.stdout, proc.stderr + proc.stdout)
+        proc = self._run_install_func('parse_args --gitops-identity=svc-bot; echo "flag=$PARAM_GITOPS_IDENTITY_FROM_FLAG"')
+        self.assertIn("flag=true", proc.stdout, proc.stderr)
+
     def test_parse_args_marks_a_named_secret(self):
         proc = self._run_install_func(
             'parse_args --gitops-token-secret=s1; echo "flag=$PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG"')
@@ -431,6 +515,16 @@ class BitbucketForgeSwitchSecretTest(unittest.TestCase):
             "GITOPS_FORGE=bitbucket GITLAB_TOKEN_SECRET=bb-cloud "
             "PARAM_GITOPS_OLD_TOKEN_SECRET=bitbucket-forge-token PARAM_GITLAB_READ_TOKEN_FILE=; "
             "create_gitlab_read_token_secret agents ctx1"
+        )
+        self.assertNotIn("patch secret", self._log())
+
+    def test_a_named_recorded_secret_keeps_its_read_token_on_a_switch(self):
+        """--gitops-token-secret=<the recorded name>: the administrator stored
+        the new forge's tokens in that Secret first, read token included."""
+        self._run(
+            "GITOPS_FORGE=bitbucket-datacenter GITLAB_TOKEN_SECRET=bitbucket-forge-token "
+            "PARAM_GITOPS_OLD_TOKEN_SECRET=bitbucket-forge-token PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG=true "
+            "PARAM_GITLAB_READ_TOKEN_FILE=; create_gitlab_read_token_secret agents ctx1"
         )
         self.assertNotIn("patch secret", self._log())
 

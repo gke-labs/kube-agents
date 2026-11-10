@@ -566,6 +566,7 @@ PARAM_GITLAB_READ_TOKEN_FILE="${GITLAB_READ_TOKEN_FILE:-${GITOPS_READ_TOKEN_FILE
 # acts as, which the token cannot name itself (an account UUID on Cloud).
 PARAM_GITOPS_IDENTITY="${GITOPS_IDENTITY:-}"
 PARAM_GITOPS_RECORDED_IDENTITY="${GITOPS_IDENTITY:-}"
+PARAM_GITOPS_IDENTITY_FROM_FLAG="false"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
 # the Secret it goes into, which install.env records. The file's path is
 # never recorded. GITOPS_CA_FILE in the environment counts as an interview
@@ -603,6 +604,7 @@ PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
 # validate_gitops_forge_flags runs more than once, and the interview can
 # change both values between the runs.
 PARAM_GITOPS_RECORDED_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
+PARAM_GITOPS_RECORDED_CA_SECRET="${GITOPS_CA_SECRET:-}"
 PARAM_GITOPS_RECORDED_REPO="${GITOPS_REPO:-}"
 # A forge switch that an earlier run started and did not finish: it recorded
 # the new forge, but stopped before it stored the new forge's token. The old
@@ -1283,7 +1285,7 @@ parse_args() {
       --gitops-host=*) PARAM_GITOPS_HOST="${1#*=}"; PARAM_GITOPS_HOST_FROM_FLAG="true"; shift ;;
       --gitlab-token-file=*|--gitops-token-file=*) PARAM_GITLAB_TOKEN_FILE="${1#*=}"; shift ;;
       --gitlab-token-secret=*|--gitops-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"; shift ;;
-      --gitops-identity=*) PARAM_GITOPS_IDENTITY="${1#*=}"; shift ;;
+      --gitops-identity=*) PARAM_GITOPS_IDENTITY="${1#*=}"; PARAM_GITOPS_IDENTITY_FROM_FLAG="true"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
       --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
@@ -5422,6 +5424,78 @@ clear_gitops_pending_switch() {
   PARAM_GITOPS_PENDING_FROM_SECRET=""
 }
 
+# The GitLab and Bitbucket interviews: each asks, in a loop, for what the
+# flags left out, until the validator accepts the answers. They read and set
+# main's local github_repo (bash scopes locals dynamically), so a test can
+# call one from a function that declares its own.
+interview_gitlab_forge() {
+  [[ "$github_repo" == */* ]] || github_repo=""
+  while true; do
+    prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
+    gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
+    # Answers given here are this run's choices, as the flags are: the
+    # validator must not drop them as values install.env recorded.
+    [ -n "$PARAM_GITOPS_HOST" ] && PARAM_GITOPS_HOST_FROM_FLAG="true"
+    prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
+    [ -n "$github_repo" ] && PARAM_GITOPS_REPO_FROM_FLAG="true"
+    local gl_secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
+    prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+    # A name typed here is this run's choice, as --gitops-token-secret is.
+    [ "$PARAM_GITLAB_TOKEN_SECRET" != "$gl_secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
+    # Only a self-managed instance can be behind a private CA.
+    # No default: empty must stay a way to answer "none" on every pass.
+    if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+    fi
+    PARAM_GITOPS_REPO="$github_repo"
+    if [ -n "$github_repo" ] && validate_gitops_forge_flags && [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+      github_repo="$PARAM_GITOPS_REPO"
+      break
+    fi
+    [ -z "$github_repo" ] && print_error "A GitLab install needs the project's full path."
+    # With no terminal every answer is the same default, so asking again
+    # would spin.
+    has_controlling_tty || exit 1
+  done
+  print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+  print_info "It needs the api and write_repository scopes, with Developer access to the project."
+}
+
+interview_bitbucket_forge() {
+  local bb_label
+  bb_label="$(gitops_forge_label "$PARAM_GITOPS_FORGE")"
+  [[ "$github_repo" == */* ]] || github_repo=""
+  while true; do
+    if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ]; then
+      prompt_read "Bitbucket Data Center hostname (served at the root path on port 443)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+      # Answers given here are this run's choices, as the flags are: the
+      # validator must not drop them as values install.env recorded.
+      [ -n "$PARAM_GITOPS_HOST" ] && PARAM_GITOPS_HOST_FROM_FLAG="true"
+      prompt_read "Repository path (PROJECTKEY/repo-slug)" github_repo "${github_repo}"
+    else
+      prompt_read "Repository path (workspace/repo-slug)" github_repo "${github_repo}"
+    fi
+    local secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
+    [ -n "$github_repo" ] && PARAM_GITOPS_REPO_FROM_FLAG="true"
+    prompt_read "Kubernetes Secret to hold the ${bb_label} token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
+    # A name typed here is this run's choice, as --gitops-token-secret is.
+    [ "$PARAM_GITLAB_TOKEN_SECRET" != "$secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
+    if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+    fi
+    PARAM_GITOPS_REPO="$github_repo"
+    if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_HOST:-}" ]; then
+      print_error "A Bitbucket Data Center install needs the instance's hostname."
+    elif [ -n "$github_repo" ] && validate_gitops_forge_flags && [ -n "${PARAM_GITOPS_REPO:-}" ]; then
+      github_repo="$PARAM_GITOPS_REPO"
+      break
+    fi
+    [ -z "$github_repo" ] && print_error "A ${bb_label} install needs the repository's path."
+    has_controlling_tty || exit 1
+  done
+  print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+}
+
 # True for a forge whose credential is an access token the administrator puts
 # in a Kubernetes Secret: every forge but github, which uses the GitHub App.
 gitops_forge_uses_token() {
@@ -5638,12 +5712,15 @@ validate_gitops_forge_flags() {
       print_info "Dropping the recorded ${recorded_label} host '${PARAM_GITOPS_HOST}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_HOST=""
     fi
-    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+    # Only the CA Secret install.env recorded: one that this run's CA file
+    # named (validate_gitops_ca_inputs, on an earlier call) is the new forge's.
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ] && [ "$PARAM_GITOPS_CA_SECRET" = "${PARAM_GITOPS_RECORDED_CA_SECRET:-}" ]; then
       print_info "Dropping the recorded ${recorded_label} CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_CA_SECRET=""
     fi
     # The identity and the default Secret name are the recorded forge's too.
-    if [ -n "${PARAM_GITOPS_IDENTITY:-}" ] && [ "$PARAM_GITOPS_IDENTITY" = "${PARAM_GITOPS_RECORDED_IDENTITY:-}" ]; then
+    if [ -n "${PARAM_GITOPS_IDENTITY:-}" ] && [ "${PARAM_GITOPS_IDENTITY_FROM_FLAG:-false}" != "true" ] &&
+      [ "$PARAM_GITOPS_IDENTITY" = "${PARAM_GITOPS_RECORDED_IDENTITY:-}" ]; then
       print_info "Dropping the recorded ${recorded_label} identity '${PARAM_GITOPS_IDENTITY}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_IDENTITY=""
     fi
@@ -6408,7 +6485,11 @@ create_gitlab_read_token_secret() {
   if [ -z "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
     # A forge switch that keeps the old Secret: its read-token key is the old
     # forge's, and the broker would present it to the new forge's host.
+    # Not for a Secret this run named (--gitops-token-secret, or a name typed
+    # at the interview's prompt): the administrator put the new forge's
+    # tokens there, read token included.
     if [ -n "${PARAM_GITOPS_OLD_TOKEN_SECRET:-}" ] && [ "$name" = "$PARAM_GITOPS_OLD_TOKEN_SECRET" ] &&
+      [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ] &&
       [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
         -o "jsonpath={.data.${GITLAB_READ_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
       if ! kubectl patch secret "$name" -n "$namespace" --context "$context" --type json \
@@ -8268,32 +8349,7 @@ main() {
     if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
       # A single name is the GitHub default (or a GitHub repository) the
       # forge question was asked over; a GitLab project has no default path.
-      [[ "$github_repo" == */* ]] || github_repo=""
-      while true; do
-        prompt_read "GitLab host (gitlab.com, or your self-managed instance's hostname)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-gitlab.com}"
-        gitlab_host_is_self_managed "$PARAM_GITOPS_HOST" || PARAM_GITOPS_HOST=""
-        prompt_read "GitLab project path (group/project or group/subgroup/project)" github_repo "${github_repo}"
-        local gl_secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
-        prompt_read "Kubernetes Secret to hold the GitLab token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
-        # A name typed here is this run's choice, as --gitops-token-secret is.
-        [ "$PARAM_GITLAB_TOKEN_SECRET" != "$gl_secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
-        # Only a self-managed instance can be behind a private CA.
-        # No default: empty must stay a way to answer "none" on every pass.
-        if gitlab_host_is_self_managed "${PARAM_GITOPS_HOST:-}" && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-        fi
-        PARAM_GITOPS_REPO="$github_repo"
-        if [ -n "$github_repo" ] && validate_gitops_forge_flags; then
-          github_repo="$PARAM_GITOPS_REPO"
-          break
-        fi
-        [ -z "$github_repo" ] && print_error "A GitLab install needs the project's full path."
-        # With no terminal every answer is the same default, so asking again
-        # would spin.
-        has_controlling_tty || exit 1
-      done
-      print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
-      print_info "It needs the api and write_repository scopes, with Developer access to the project."
+      interview_gitlab_forge
     else
       validate_gitops_forge_flags || exit 1
       github_repo="$PARAM_GITOPS_REPO"
@@ -8310,32 +8366,7 @@ main() {
     PARAM_GITHUB_APP_ID=""
     PARAM_GITHUB_PEM_PATH=""
     if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
-      [[ "$github_repo" == */* ]] || github_repo=""
-      while true; do
-        if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ]; then
-          prompt_read "Bitbucket Data Center hostname (served at the root path on port 443)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
-          prompt_read "Repository path (PROJECTKEY/repo-slug)" github_repo "${github_repo}"
-        else
-          prompt_read "Repository path (workspace/repo-slug)" github_repo "${github_repo}"
-        fi
-        local secret_before="${PARAM_GITLAB_TOKEN_SECRET}"
-        prompt_read "Kubernetes Secret to hold the ${bb_label} token" PARAM_GITLAB_TOKEN_SECRET "${PARAM_GITLAB_TOKEN_SECRET}"
-        # A name typed here is this run's choice, as --gitops-token-secret is.
-        [ "$PARAM_GITLAB_TOKEN_SECRET" != "$secret_before" ] && PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="true"
-        if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-          prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
-        fi
-        PARAM_GITOPS_REPO="$github_repo"
-        if [ "$PARAM_GITOPS_FORGE" = "bitbucket-datacenter" ] && [ -z "${PARAM_GITOPS_HOST:-}" ]; then
-          print_error "A Bitbucket Data Center install needs the instance's hostname."
-        elif [ -n "$github_repo" ] && validate_gitops_forge_flags; then
-          github_repo="$PARAM_GITOPS_REPO"
-          break
-        fi
-        [ -z "$github_repo" ] && print_error "A ${bb_label} install needs the repository's path."
-        has_controlling_tty || exit 1
-      done
-      print_info "The token is asked for after the cluster is up, and goes straight into Secret '${PARAM_GITLAB_TOKEN_SECRET}'."
+      interview_bitbucket_forge
     else
       validate_gitops_forge_flags || exit 1
       github_repo="$PARAM_GITOPS_REPO"
