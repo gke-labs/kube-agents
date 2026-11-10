@@ -7023,8 +7023,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
     are the requested ones and are left out; the lane sets the field to the
-    number of ``pull_request_opened`` and ``pull_request_diff_contains``
-    leaves the case declares. Anything else this repetition wrote is a
+    largest of the number of ``pull_request_opened`` and
+    ``pull_request_diff_contains`` leaves the case declares, the total the
+    case declares under its top-level ``requested_pull_requests`` key, and
+    the lane file's ``requesting:`` entry. Anything else this repetition wrote is a
     write the case did not ask for.
 
     WHOSE WRITE IT IS (#2611). The fan-out runs cases side by side against

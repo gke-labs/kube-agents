@@ -811,10 +811,12 @@ created, because a later repetition pushes onto the branch the first one used â€
 request grades it with `pull_request_opened` and its reply names the URL; up to
 `requested_pull_requests` of the writes that reply names are the requested ones and are left out.
 Both lanes append the entry above to every case they run and set that field to the number of
-`pull_request_opened` and `pull_request_diff_contains` leaves the case declares, or to the count the
-file's `requesting:` list gives a case the persona answers with a pull request before its own checks
-say so, whichever is larger (`hack/eval/inject-lane-safeguards.yaml`,
-`bench/kube_agents_bench/lane.py`).
+`pull_request_opened` and `pull_request_diff_contains` leaves the case declares, to the total the
+case declares under its own top-level `requested_pull_requests` key when it opens more by design,
+or to the count the file's `requesting:` list gives a case the persona answers with a pull request
+before its own checks say so, whichever is largest (`hack/eval/inject-lane-safeguards.yaml`,
+`bench/kube_agents_bench/lane.py`). The grader reads the task key too, so that is where a case's
+total belongs.
 
 Two things to know. The presubmit's fan-out runs cases side by side against one repository, so
 a repetition's window also holds the writes of every repetition running beside it. A write is
@@ -828,7 +830,7 @@ the workers' calls, read back from the pod, are what name a write there. A write
 in the record and the reason, not charged, so one late write fails the case that named it rather
 than every case running at the time; a write no repetition names fails none, and the job log's
 leftovers listing still names it. The script also runs the cases that request a pull request
-(the same leaf count as the allowance), the stopped asks and the cases that declare
+(the same count as the allowance), the stopped asks and the cases that declare
 `writes_alone: true` in a second phase, after every first-phase unit has
 finished, one unit at a time. Before each of those units the script archives every kanban card
 still live that was filed since the fan-out began, then settles as long as the check's clock-skew
