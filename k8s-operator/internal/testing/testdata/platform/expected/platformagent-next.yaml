@@ -4923,7 +4923,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-508494be
+  name: platformagent-a2a-provision-da0418fb
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5063,18 +5063,25 @@ spec:
               Pull, explicit ack,\n# every message from the start: what the readers ask
               for. A consumer add on a\n# durable that exists updates it to these settings,
               so one an older gateway or\n# bridge made (one filter, the server's max-pending)
-              converges here; a reader\n# refuses to bind one made differently. A durable
-              the server won't update that\n# way is reported and left, and its reader
-              names the difference when it\n# refuses it, rather than this stopping the
-              rest of provisioning.\n$NATS consumer add TASKS gateway-relay --pull \\\n
-              \ --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor' \\\n
-              \ --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n  --max-pending=8192
-              --defaults >/dev/null \\\n  || echo \"WARN: could not make or update TASKS
-              gateway-relay; the gateway will not bind it until it matches\" >&2\n$NATS
-              consumer add TASKS bridge-platform --pull \\\n  --filter='a2a.tasks.platform.*.in'
-              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
-              >/dev/null \\\n  || echo \"WARN: could not make or update TASKS bridge-platform;
-              the bridge will not bind it until it matches\" >&2\n\n# DIRECTORY: last-value
+              converges here.\n#\n# When the add fails, what matters is whether the durable
+              exists. A missing one\n# leaves its reader waiting for it, so the run fails
+              and the Job retries\n# (a timeout, TASKS at max_consumers, a grant gone
+              wrong): a run reported\n# complete would never be retried. One that exists
+              but won't take these\n# settings is left as it is: its reader refuses to
+              bind it and names the\n# difference, which is louder than anything this
+              could report.\nfixed_durable() { # name reader [consumer add flags...]\n
+              \ name=$1\n  reader=$2\n  shift 2\n  $NATS consumer add TASKS \"${name}\"
+              \"$@\" >/dev/null && return 0\n  if ! $NATS consumer info TASKS \"${name}\"
+              >/dev/null 2>&1; then\n    echo \"could not create TASKS ${name}, and it
+              does not exist: the ${reader} waits for it, so this run fails and the Job
+              retries\" >&2\n    exit 1\n  fi\n  echo \"WARN: TASKS ${name} exists but
+              could not be brought to this render's settings; the ${reader} refuses to
+              bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
+              --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
+              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n
+              \ --max-pending=8192 --defaults\nfixed_durable bridge-platform bridge --pull
+              \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
+              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
               — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
               >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
               --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824

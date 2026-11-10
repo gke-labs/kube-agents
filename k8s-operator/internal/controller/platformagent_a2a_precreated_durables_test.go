@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"os"
+	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -19,8 +20,9 @@ type requester interface {
 }
 
 // The TASKS durables the provision Job pre-creates (#4173): the gateway's
-// event relay and the bridge's intake. The Job creates them create-only, their
-// readers bind and create nothing, and every principal that may create
+// event relay and the bridge's intake. The Job makes them, bringing one an
+// older reader made to its settings; their readers bind and create nothing,
+// and every principal that may create
 // consumers on TASKS is refused create, update and delete on those two names.
 
 // a2aProvisionStandInPW is the password of the static stand-in for the
@@ -171,20 +173,18 @@ func TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables(t *testing.T) {
 func TestTheProvisionScriptCreatesTheFixedDurablesAsTheTestsDo(t *testing.T) {
 	script := a2aProvisionScript(a2aTestAgent())
 	for _, cfg := range a2aFixedDurableConfigs() {
-		// Unconditional, so an older reader's durable converges; and
-		// guarded, so a refusal can't stop the rest of provisioning.
-		add := "\n$NATS consumer add TASKS " + cfg.Durable + " --pull"
+		// Unconditional, so an older reader's durable converges, through
+		// fixed_durable, which fails the run when the add fails and the
+		// durable doesn't exist.
+		add := "\nfixed_durable " + cfg.Durable + " "
 		i := strings.Index(script, add)
 		if i < 0 {
-			t.Errorf("the script does not make %s with an unconditional consumer add", cfg.Durable)
+			t.Errorf("the script does not make %s through fixed_durable", cfg.Durable)
 			continue
 		}
 		line := script[i+1:]
-		if end := strings.Index(line, "\n$NATS"); end >= 0 {
+		if end := strings.Index(line, "\nfixed_durable"); end >= 0 {
 			line = line[:end]
-		}
-		if !strings.Contains(line, "|| echo \"WARN: could not make or update TASKS "+cfg.Durable) {
-			t.Errorf("%s: a failed consumer add would stop the script under set -e:\n%s", cfg.Durable, line)
 		}
 		if end := strings.Index(line, "--defaults"); end >= 0 {
 			line = line[:end]
@@ -243,6 +243,46 @@ func TestAnOlderReadersDurableConvergesToTheProvisionedOne(t *testing.T) {
 	}
 	if v := log.publishViolations("provision"); len(v) != 0 {
 		t.Errorf("converging tripped publish violations for provision:\n%s", strings.Join(v, "\n"))
+	}
+}
+
+// TestAFailedDurableAddFailsTheRunOnlyWhenTheDurableIsMissing runs the
+// script's fixed_durable against a stub nats: a missing durable fails the run
+// so the Job retries, and one that exists but won't update only warns.
+func TestAFailedDurableAddFailsTheRunOnlyWhenTheDurableIsMissing(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	start := strings.Index(script, "fixed_durable() {")
+	end := strings.Index(script[start:], "\n}\n")
+	if start < 0 || end < 0 {
+		t.Fatal("no fixed_durable function in the provision script")
+	}
+	fn := script[start : start+end+3]
+	for _, tc := range []struct {
+		name, infoExit string
+		wantExit       int
+		wantErr        string
+	}{
+		{"missing", "1", 1, "could not create TASKS gateway-relay, and it does not exist"},
+		{"exists", "0", 0, "WARN: TASKS gateway-relay exists but could not be brought"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := "nats() { case \"$1 $2\" in \"consumer add\") return 1 ;; \"consumer info\") return " + tc.infoExit + " ;; esac; }\n"
+			body := "set -eu\nNATS=nats\n" + stub + fn + "fixed_durable gateway-relay gateway --pull\necho reached-the-next-step\n"
+			cmd := exec.Command("bash", "-c", body)
+			out, err := cmd.CombinedOutput()
+			exit := 0
+			if ee, ok := err.(*exec.ExitError); ok {
+				exit = ee.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if exit != tc.wantExit || !strings.Contains(string(out), tc.wantErr) {
+				t.Errorf("exit %d (want %d), output:\n%s", exit, tc.wantExit, out)
+			}
+			if reached := strings.Contains(string(out), "reached-the-next-step"); reached != (tc.wantExit == 0) {
+				t.Errorf("provisioning went on: %v, want %v", reached, tc.wantExit == 0)
+			}
+		})
 	}
 }
 

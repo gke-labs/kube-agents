@@ -358,9 +358,10 @@ lands in an unhelpful place. The retired `worker` user's subscribe grant was
 another addressee just worked. `bridge`'s grants name `platform` literally
 (`a2aBridgeAddressee`, which is also `defaultProfile` in the bridge's own `main.go`: one
 value living in two modules that cannot import each other). Override the env now and the
-intake half still works — the consumer is created and pulled over `$JS.API`, where the
-filter subject rides in the request body and no subject grant sees it — so the other
-addressee's task is delivered. It stops there. `accept` publishes `submitted` on
+bridge never starts consuming: the provision Job makes only `bridge-platform`, and a bridge
+binding its intake (`BRIDGE_DURABLE_PRECREATED`, which the operator sets) waits for
+`bridge-<other>`, which nothing creates. A bridge without that flag would create its own and
+have the other addressee's task delivered, and it stops there. `accept` publishes `submitted` on
 `a2a.tasks.<other>.*.events` before it puts anything on the worker queue, and that subject
 is not in the publish list, so the publish is refused, the submission is dropped, and
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is

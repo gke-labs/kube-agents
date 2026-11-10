@@ -1844,8 +1844,8 @@ func a2aSeedJetStreamGrants() []string {
 // discovery needs), every verb on KV_session-state and KV_cap, PURGE / UPDATE /
 // DELETE / MSG.DELETE / RESTORE / SNAPSHOT on every stream, STREAM.CREATE,
 // enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST),
-// account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
-// on the path binds to an existing consumer by name, and on nats.go v1.53.1
+// account INFO (jetstream.New never asks for it), and CONSUMER.INFO beyond its
+// intake's bind (nothing else on the path binds to a consumer by name, and on nats.go v1.53.1
 // no consumer re-verifies itself with it after a reconnect either --
 // TestBridgeConsumersSurviveABusRestart holds that across a server restart).
 //
@@ -3366,19 +3366,32 @@ $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct
 # denied these names (a2aTasksFixedDurableDenyPublish). Pull, explicit ack,
 # every message from the start: what the readers ask for. A consumer add on a
 # durable that exists updates it to these settings, so one an older gateway or
-# bridge made (one filter, the server's max-pending) converges here; a reader
-# refuses to bind one made differently. A durable the server won't update that
-# way is reported and left, and its reader names the difference when it
-# refuses it, rather than this stopping the rest of provisioning.
-$NATS consumer add TASKS ` + a2aGatewayRelayDurable + ` --pull \
+# bridge made (one filter, the server's max-pending) converges here.
+#
+# When the add fails, what matters is whether the durable exists. A missing one
+# leaves its reader waiting for it, so the run fails and the Job retries
+# (a timeout, TASKS at max_consumers, a grant gone wrong): a run reported
+# complete would never be retried. One that exists but won't take these
+# settings is left as it is: its reader refuses to bind it and names the
+# difference, which is louder than anything this could report.
+fixed_durable() { # name reader [consumer add flags...]
+  name=$1
+  reader=$2
+  shift 2
+  $NATS consumer add TASKS "${name}" "$@" >/dev/null && return 0
+  if ! $NATS consumer info TASKS "${name}" >/dev/null 2>&1; then
+    echo "could not create TASKS ${name}, and it does not exist: the ${reader} waits for it, so this run fails and the Job retries" >&2
+    exit 1
+  fi
+  echo "WARN: TASKS ${name} exists but could not be brought to this render's settings; the ${reader} refuses to bind it and names the difference" >&2
+}
+fixed_durable ` + a2aGatewayRelayDurable + ` gateway --pull \
   --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
   --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
-  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults >/dev/null \
-  || echo "WARN: could not make or update TASKS ` + a2aGatewayRelayDurable + `; the gateway will not bind it until it matches" >&2
-$NATS consumer add TASKS ` + a2aBridgeDurable() + ` --pull \
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
   --filter='` + a2aBridgeIntakeFilter() + `' \
-  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults >/dev/null \
-  || echo "WARN: could not make or update TASKS ` + a2aBridgeDurable() + `; the bridge will not bind it until it matches" >&2
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
 
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
