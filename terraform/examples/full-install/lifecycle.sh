@@ -717,6 +717,10 @@ guard_minter_adoption() {
   warn "Refusing to adopt it: this state would then own that install's App key, and a destroy here would schedule its versions for destruction."
   warn "Choose other names (github_minter_kms_keyring and github_minter_kms_key), or, to share this key on purpose,"
   warn "set github_minter_shared_kms_key = \"$keyring/$key\" in terraform.tfvars (MINTER_SHARED_KEY in install.env)."
+  if [[ -z "$owner_cluster" && -z "$owner_namespace" ]]; then
+    warn "If it is this install's own key from before the owner labels, set MINTER_ADOPT_KEY=$keyring/$key in install.env"
+    warn "(github_minter_adopt_unlabelled_kms_key in terraform.tfvars) and run again: the apply adopts it and labels it."
+  fi
   exit 1
 }
 

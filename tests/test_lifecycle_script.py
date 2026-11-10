@@ -1771,6 +1771,9 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("carries no owner labels", proc.stderr)
         self.assertNotIn("import ", log)
+        # The way out for an install's own key from before the labels, on the
+        # paths that never ran the interview (upgrade.sh, the Day-2 menu).
+        self.assertIn("MINTER_ADOPT_KEY=github-token-minter-keyring/github-token-minter-key in install.env", proc.stderr)
 
     def test_this_installs_own_minter_key_is_adopted(self):
         proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=kubeagents-system")

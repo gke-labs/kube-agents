@@ -266,20 +266,11 @@ export MEMORY
 platform_agent_mode_resolve
 
 
-# The token minter's names. An environment has always run on the project-wide
-# names, and the installer now derives per-install names for an install with
-# no minter in its state, which is what a rebuild after an uninstall is (rc,
-# nightly). So an environment with the minter on and no names of its own states
-# the project-wide ones explicitly: the installer adopts an unlabelled key it
-# is named explicitly as this install's own, and the apply labels it.
-if [ -n "${GITHUB_APP_ID:-}" ]; then
-  minter_default() { (. "$(dirname "${BASH_SOURCE[0]}")/../../install.defaults.env"; printf '%s' "${!1}"); }
-  KMS_KEYRING="${KMS_KEYRING:-$(minter_default DEFAULT_KMS_KEYRING)}"
-  KMS_KEY="${KMS_KEY:-$(minter_default DEFAULT_KMS_KEY)}"
-  # Not a GitHub environment setting: always the project-wide name.
-  MINTER_GSA_NAME_RENDERED="$(minter_default DEFAULT_GITHUB_MINTER_GSA_NAME)"
-  export KMS_KEYRING KMS_KEY
-fi
+# The token minter's names, by the same rule as provision_environment.sh's
+# rebuild path (minter_environment_names.sh).
+# shellcheck source=scripts/release/minter_environment_names.sh
+. "$(dirname "${BASH_SOURCE[0]}")/minter_environment_names.sh"
+minter_environment_names
 
 # ---------------------------------------------------------------------------
 # Write it
@@ -314,7 +305,7 @@ done
 # MEMORY is derived above rather than mapped, so it is emitted on its own.
 emit MEMORY "${MEMORY}"
 # So is the minter's GSA name, set above only for an environment with the minter.
-emit GITHUB_MINTER_GSA_NAME "${MINTER_GSA_NAME_RENDERED:-}"
+emit GITHUB_MINTER_GSA_NAME "${MINTER_ENVIRONMENT_GSA_NAME:-}"
 
 chmod 600 "$OUT_PATH"
 

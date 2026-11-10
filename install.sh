@@ -414,6 +414,15 @@ bootstrap_install_env() {
   if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
     INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
   fi
+  # And for the minter's key ring and key, which an install.env written
+  # before per-install names recorded as the project-wide defaults whether or
+  # not the install ever ran a minter (minter_name_given).
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?KMS_KEYRING=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_KMS_KEYRING="true"
+  fi
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?KMS_KEY=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_KMS_KEY="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -490,10 +499,27 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # environment or a flag) before resolve_shared_defaults fills in a default:
 # apply_minter_name_defaults gives a new install per-install names only when
 # nobody did (#3504).
+#
+# One exception. An install.env written before per-install names recorded the
+# project-wide default names whether or not the install ever ran a minter, so
+# a default name the file records counts as given only when the file records a
+# GitHub App too. Otherwise an older install turning the minter on would
+# adopt, as its own, the unlabelled default key another install may hold.
+minter_name_given() {
+  local value=$1 default=$2 file_records=$3
+  [ -n "$value" ] || return 1
+  [ "$value" != "$default" ] && return 0
+  [ "$file_records" != "true" ] && return 0
+  [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ]
+}
 PARAM_KMS_KEYRING_GIVEN="false"
 PARAM_KMS_KEY_GIVEN="false"
-[ -n "$PARAM_KMS_KEYRING" ] && PARAM_KMS_KEYRING_GIVEN="true"
-[ -n "$PARAM_KMS_KEY" ] && PARAM_KMS_KEY_GIVEN="true"
+if minter_name_given "$PARAM_KMS_KEYRING" "${DEFAULT_KMS_KEYRING:-}" "${INSTALL_ENV_RECORDS_KMS_KEYRING:-false}"; then
+  PARAM_KMS_KEYRING_GIVEN="true"
+fi
+if minter_name_given "$PARAM_KMS_KEY" "${DEFAULT_KMS_KEY:-}" "${INSTALL_ENV_RECORDS_KMS_KEY:-false}"; then
+  PARAM_KMS_KEY_GIVEN="true"
+fi
 # The minter's GSA name the same way. This file never calls common.sh's
 # export_identity_names, so the flag is set here, after bootstrap_install_env
 # has read install.env, for apply_minter_name_defaults to read.
@@ -4083,7 +4109,8 @@ print_generate_only_handoff() {
   echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id}"
   echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
   echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
-  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software \\\\"
+  echo -e "      --labels=kube-agents-cluster=${cluster_name},kube-agents-namespace=${NAMESPACE:-$DEFAULT_NAMESPACE} --project=${project_id}"
   echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""

@@ -231,6 +231,32 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             env={"KUBE_AGENTS_INSTALL_ENV": str(rendered)})
         self.assertIn("rc=0 adopt=github-token-minter-keyring/github-token-minter-key", proc.stdout, proc.stderr)
 
+    def _minter_names_given(self, file_text, env=None):
+        install_env = self._empty_install_env.parent / "minter-given.env"
+        install_env.write_text(file_text)
+        return self._run_install_func(
+            'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"',
+            env={"KUBE_AGENTS_INSTALL_ENV": str(install_env), **(env or {})})
+
+    def test_an_old_install_env_s_default_names_are_not_an_explicit_choice(self):
+        """Written before per-install names, with no minter: turning one on must not adopt the shared default key."""
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
+
+    def test_default_names_beside_a_recorded_app_are_explicit(self):
+        proc = self._minter_names_given(
+            "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+
+    def test_names_of_its_own_or_from_the_environment_are_explicit(self):
+        proc = self._minter_names_given("KMS_KEYRING=my-ring\nKMS_KEY=my-key\n")
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # An environment rebuild names the defaults in the environment, not the file.
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\n", env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key"})
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+
     def test_both_interview_arms_check_the_key_owner(self):
         """A -y run takes the non-interactive arm, which must refuse another install's key too."""
         text = _INSTALL_SH.read_text()
@@ -2998,6 +3024,8 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
         self.assertIn("gcloud kms keyrings create github-token-minter-keyring --location=us-central1 --project=test-proj", out)
         self.assertIn("gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring", out)
+        # Labelled for this install, or the handoff's lifecycle.sh apply refuses to adopt it (#3504).
+        self.assertIn("--labels=kube-agents-cluster=test-cluster,kube-agents-namespace=kubeagents-system", out)
         self.assertIn("--purpose=asymmetric-signing", out)
         self.assertIn("--import-only --skip-initial-version-creation", out)
         self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)

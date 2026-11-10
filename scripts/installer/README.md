@@ -422,7 +422,9 @@ that goes on to the apply, or ends with the `--generate-only` handoff, records e
 the file lacks, and replaces one it records
 with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
 up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
-the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The
+minter's names are recorded the same way (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`, and
+`MINTER_SHARED_KEY` when set), since a new install's are derived from its cluster. The PEM
 path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
