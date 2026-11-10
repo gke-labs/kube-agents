@@ -1499,18 +1499,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		// The profile namespace's quota and fence carry no owner reference
-		// (agentprofile_namespace.go) and are not removed here yet: they stay
-		// until the chart's uninstall deletes the namespace. Removing the
-		// quota on deletion, and what a refused delete should do to the
-		// finalizer, is #3827.
+		// (agentprofile_namespace.go). The quota is removed last, below; the
+		// fence stays until the chart's uninstall deletes the namespace.
 		//
 		// The dispatcher's warm pools there go, with their CA bundle copy
 		// (their pods hold bus and broker tokens), and so does its pod-read
 		// binding, for the ClusterRoleBinding's reason above: left behind,
 		// anyone who later creates a ServiceAccount of the dispatcher's name
 		// inherits pod read in that namespace. A failure is logged and never
-		// holds the finalizer, under the profile-namespace rule (#3827
-		// settles what a refused delete should do).
+		// holds the finalizer, under the profile-namespace rule.
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
@@ -1548,6 +1545,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		case client.IgnoreNotFound(err) != nil:
 			return ctrl.Result{}, err
+		}
+
+		// The profile namespace's quota, left behind, caps a successor's
+		// profile pods. Last, so a refused delete held for its bounded retry
+		// (removeProfileQuotaOnDeletion) holds back nothing else, and the
+		// quota still caps the warm pools until they're gone; every step
+		// above is idempotent across the retries.
+		if wait := r.removeProfileQuotaOnDeletion(ctx, agent, time.Now()); wait > 0 {
+			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 
 		// Resource is deleted. Safe to remove finalizer and update.
