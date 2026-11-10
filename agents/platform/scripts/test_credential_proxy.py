@@ -19454,6 +19454,14 @@ class KubeProxyClientTest(unittest.TestCase):
                     "open_broker_request",
                     return_value=contextlib.nullcontext(fake_resp),
                 ),
+                # This argv names its cluster in full, which the shim answers
+                # itself with the kube-api proxy in use (#5447); this test is
+                # the broker answer's path.
+                mock.patch.object(
+                    credential_proxy_client,
+                    "answer_get_credentials_locally",
+                    return_value=None,
+                ),
             ):
                 rc = credential_proxy_client.execute(
                     "http://127.0.0.1:8080",

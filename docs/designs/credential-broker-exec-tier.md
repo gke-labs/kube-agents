@@ -401,7 +401,8 @@ What moves, as #3760 is written [#3760 head]; #4128's wiring step may change it:
   wrapper is gone is open question 7.
 
 What stays on the exec tier: `gcloud` (cluster lists, `describe`, `get-credentials`), and the
-session pods' commands. The Cloud API relay moves there too (§3.1). #4199 already moved the
+session pods' commands. Since #5447, a sandbox `get-credentials` that names its cluster, location
+and project is one relay read and runs no `gcloud`. The Cloud API relay moves there too (§3.1). #4199 already moved the
 reconcile's GKE cluster lists and describes from `gcloud` onto the relay, which turns `gcloud`
 children into relay requests on the same tier. The budget doc measured a
 `gcloud` child at 101 to 102 MiB, and a `kubectl` read at 45 to 48 MiB plus 71 MiB for the GKE auth

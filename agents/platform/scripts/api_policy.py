@@ -214,7 +214,8 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # The Cluster Agent reconcile's two reads (#3703, approved by @bnaylor 10-28 as
     # exactly these two read-only routes): every cluster in a project, and whether one
     # cluster still exists. Both answers are projected to name, location, status and
-    # id; node pools, operations and every write stay refused.
+    # id; node pools, operations and every write stay refused. The get is also the
+    # shim's check before it answers a get-credentials itself (#5447).
     ApiRoute(
         "container.googleapis.com",
         API_READ_METHOD,
