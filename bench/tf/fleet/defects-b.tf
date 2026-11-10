@@ -382,24 +382,29 @@ resource "kubernetes_validating_webhook_configuration_v1" "fail_closed_gate" {
 }
 
 # Defect (upgrade readiness, certification): a fail-closed webhook whose dead
-# backend would refuse the CustomResourceDefinition writes GKE's control plane
-# makes at an upgrade, the capacitybuffers.autoscaling.x-k8s.io install among
-# them, so Cluster Autoscaler initialization hangs (#2567, item 1). The rule
-# names CRD creates and updates, which is the reach the check reads; the
-# clientConfig names a Service that does not exist, which is what makes it
-# fail closed for real; the 2-second timeout bounds the wait of any request
-# that ever reached it.
+# backend would refuse the writes GKE's control plane makes in the
+# autoscaling.x-k8s.io group after a 1.35+ upgrade, where it installs and
+# reconciles capacitybuffers.autoscaling.x-k8s.io and Cluster Autoscaler
+# initialization hangs on a refusal (#2567, item 1). The one rule names
+# CapacityBuffer creates and updates in that group, which is the reach the
+# check reads; the clientConfig names a Service that does not exist, which is
+# what makes it fail closed for real; the 2-second timeout bounds the wait of
+# any request that ever reached it.
 #
-# The objectSelector is the one thing that keeps this gate off GKE's own CRD
-# writes: a CRD is cluster-scoped, so no namespaceSelector applies to it, and
-# the API server calls the gate only for a CRD that carries the fleet label on
-# its new or its old object. GKE's CRDs carry addonmanager labels only, and
-# this stack creates no CRD. A CRD given the fleet label by hand is refused on
-# create and on update, the un-labelling included, until this configuration
-# is deleted (a write in another group, which the rule does not reach). The
-# readiness grader reads rules and not selectors (upgrade_readiness.py, the
-# note on objectSelector above its scope constants), which is why the
-# selector does not hide the gate from the check this fixture waits for.
+# The rule stays off apiextensions.k8s.io on purpose: a rule on CRD writes
+# names the group GKE's addon manager writes on this cluster, and a dropped
+# selector there would refuse every CRD write on every pool project. On the
+# x-k8s.io group the same drop refuses CapacityBuffer creates and updates
+# alone, which nothing on a lab cluster issues (Cluster Autoscaler writes the
+# status subresource, which `capacitybuffers` does not match). The
+# objectSelector is what keeps the gate inert: the API server calls it only
+# for a CapacityBuffer that carries the fleet label on its new or its old
+# object, and the fleet creates none. No namespaceSelector, so the gate carries
+# no namespace exemption a check could read as the system exemption #2567
+# names. The readiness grader reads rules and not selectors
+# (upgrade_readiness.py, the note on objectSelector above its scope
+# constants), which is why the selector does not hide the gate from the
+# check this fixture waits for.
 #
 # Addressed by the readiness-crd-webhook role.
 resource "kubernetes_validating_webhook_configuration_v1" "crd_gate" {
@@ -430,11 +435,11 @@ resource "kubernetes_validating_webhook_configuration_v1" "crd_gate" {
     }
 
     rule {
-      api_groups   = ["apiextensions.k8s.io"]
-      api_versions = ["v1"]
+      api_groups   = ["autoscaling.x-k8s.io"]
+      api_versions = ["*"]
       operations   = ["CREATE", "UPDATE"]
-      resources    = ["customresourcedefinitions"]
-      scope        = "Cluster"
+      resources    = ["capacitybuffers"]
+      scope        = "Namespaced"
     }
   }
 }

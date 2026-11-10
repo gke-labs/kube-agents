@@ -354,7 +354,7 @@ def healthy_world(*projects):
             },
             "pod?app=pinned-batch-runner": _pods(_pod(restarts=0, last_reason=None)),
             "validatingwebhookconfiguration/seeded-fail-closed-gate": {"webhooks": [{"name": "gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 30, "clientConfig": {"service": {"name": "nonexistent-admission-gate"}}}]},
-            "validatingwebhookconfiguration/seeded-crd-gate": {"webhooks": [{"name": "crd-gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 2, "clientConfig": {"service": {"name": "nonexistent-crd-gate"}}, "objectSelector": {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}}, "rules": [{"apiGroups": ["apiextensions.k8s.io"], "resources": ["customresourcedefinitions"]}]}]},
+            "validatingwebhookconfiguration/seeded-crd-gate": {"webhooks": [{"name": "crd-gate.seeded.invalid", "failurePolicy": "Fail", "timeoutSeconds": 2, "clientConfig": {"service": {"name": "nonexistent-crd-gate"}}, "objectSelector": {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}}, "rules": [{"apiGroups": ["autoscaling.x-k8s.io"], "resources": ["capacitybuffers"]}]}]},
             # seeded-d's zonal-skew trio. Each is in the state its role's
             # `state` block asserts: a scheduled pod for the scheduling case,
             # a Bound claim for the volume case, and a Pending pod for the

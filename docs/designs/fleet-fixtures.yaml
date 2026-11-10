@@ -390,11 +390,13 @@ fixtures:
       - validatingwebhookconfiguration/seeded-crd-gate
     defect: >-
       failurePolicy Fail with a 2-second timeout and one rule on
-      CustomResourceDefinition creates and updates, pointing at a Service
-      that does not exist: the fail-closed webhook that refuses the CRD
-      writes GKE's control plane makes at a 1.35+ upgrade. An objectSelector
-      on the fleet label keeps it off every real CRD; no namespaceSelector
-      applies to a cluster-scoped object.
+      CapacityBuffer creates and updates in the autoscaling.x-k8s.io group,
+      pointing at a Service that does not exist: the fail-closed webhook that
+      refuses the writes GKE's control plane makes in that group after a
+      1.35+ upgrade, where it installs capacitybuffers. An objectSelector on
+      the fleet label keeps it off every real object; the rule stays off
+      apiextensions.k8s.io so a dropped selector could never refuse a CRD
+      write.
 
   - role: node-local-state
     slot: a

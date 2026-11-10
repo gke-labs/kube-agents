@@ -465,7 +465,7 @@
       "cluster_slot": "b",
       "namespace": null,
       "probes": ["validatingwebhookconfiguration/seeded-crd-gate"],
-      "fixture": "seeded-crd-gate ValidatingWebhookConfiguration: failurePolicy Fail with a 2-second timeout, one rule on CustomResourceDefinition creates and updates, pointing at a Service that does not exist -- the reach into the CRD writes GKE's control plane makes at a 1.35+ upgrade is the defect the upgrade audit should name -- kept off every real CRD by an objectSelector on the fleet label",
+      "fixture": "seeded-crd-gate ValidatingWebhookConfiguration: failurePolicy Fail with a 2-second timeout, one rule on CapacityBuffer creates and updates in the autoscaling.x-k8s.io group, pointing at a Service that does not exist -- the reach into the group GKE's control plane installs and reconciles capacitybuffers in after a 1.35+ upgrade is the defect the upgrade audit should name -- kept off every real object by an objectSelector on the fleet label",
       "state": [
         {
           "subject": "validatingwebhookconfiguration/seeded-crd-gate",
@@ -486,14 +486,21 @@
           "path": "webhooks[*].objectSelector.matchLabels.managed-by",
           "op": "any_eq",
           "value": "kube-agents-seeded-fleet",
-          "why": "the safety, not the defect: a CRD is cluster-scoped, so this selector is the one thing that keeps the gate off GKE's own CRD writes; without it every CRD create and update on the cluster waits two seconds and is refused"
+          "why": "the safety, not the defect: this selector is the one thing that keeps the gate off a real CapacityBuffer write; without it every CapacityBuffer create and update on the cluster waits two seconds and is refused, which nothing on this fleet issues but a case must never depend on"
+        },
+        {
+          "subject": "validatingwebhookconfiguration/seeded-crd-gate",
+          "path": "webhooks[0].rules[0].apiGroups[0]",
+          "op": "eq",
+          "value": "autoscaling.x-k8s.io",
+          "why": "the reach is what the upgrade audit's check reads: a rule moved off the group GKE installs capacitybuffers in is a dead webhook that blocks no system CRD, which is another scenario's fixture"
         },
         {
           "subject": "validatingwebhookconfiguration/seeded-crd-gate",
           "path": "webhooks[0].rules[0].resources[0]",
           "op": "eq",
-          "value": "customresourcedefinitions",
-          "why": "the reach is what the upgrade audit's check reads: a rule moved off CustomResourceDefinition writes is a dead webhook that blocks no system CRD, which is another scenario's fixture"
+          "value": "capacitybuffers",
+          "why": "the same reach, read at the resource: the rule names CapacityBuffer writes and not the status subresource Cluster Autoscaler writes, so a dropped selector refuses only what nothing on a lab cluster issues"
         }
       ]
     },

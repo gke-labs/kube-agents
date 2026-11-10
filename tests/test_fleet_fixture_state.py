@@ -411,7 +411,7 @@ def _healthy_world() -> dict:
                         "timeoutSeconds": 2,
                         "clientConfig": {"service": {"name": "nonexistent-crd-gate"}},
                         "objectSelector": {"matchLabels": {"managed-by": "kube-agents-seeded-fleet"}},
-                        "rules": [{"apiGroups": ["apiextensions.k8s.io"], "resources": ["customresourcedefinitions"]}],
+                        "rules": [{"apiGroups": ["autoscaling.x-k8s.io"], "resources": ["capacitybuffers"]}],
                     }
                 ]
             },
@@ -1697,6 +1697,7 @@ class ReportTest(_Harness):
                 "rbac-overgrant": "converged",
                 "readiness-drain-blocked": "converged",
                 "readiness-failclosed-webhook": "converged",
+                "readiness-crd-webhook": "converged",
                 "readiness-lb-drain-timeout": "converged",
                 "readiness-pinned-workload": "converged",
                 "readiness-surge-blocked": "converged",
