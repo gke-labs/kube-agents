@@ -187,7 +187,7 @@ the page, not a red. What does red a run of the lane is the same as anywhere: ru
 forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
 `expected_fail: true` that passes every repetition, which says its marker is stale. A case the
 suite declares as a known gap carries that marker and names its gap issue in its task file's
-header comment, beside the capability row it grades. The lane's record is its logs bucket, read by the page per case, release and model: the tier is
+header comment, beside the capability row it grades. The lane's record is its logs bucket, read by the page per case and release: the tier is
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 

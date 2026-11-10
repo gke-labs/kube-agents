@@ -33,10 +33,10 @@ commits no customer installs. This document separates the two.
 - **Roster.** The task files: a scenario is on the lane when its task file carries the bare line
   `suite: certification`, in the section its `certification_part: N` line names (none is part 1),
   with the row it grades in the task file's header comment.
-- **Release window.** All scored repetitions of one scenario on one GA release and one model,
-  across every build of the lane that graded that release. One release, one window; a Rerun on
-  the same release pools into it, never into a neighbouring release's window. A model change
-  starts a new window.
+- **Release window.** All scored repetitions of one scenario on one GA release, across every
+  build of the lane that graded that release. One release, one window; a Rerun on the same
+  release pools into it, never into a neighbouring release's window. A model change mid-release
+  closes the open window and starts a new one; the page does not compare records across models.
 - **Outcome.** Each repetition carries one outcome from the scorer (`RepResult.outcome` in
   `bench/kube_agents_bench/scoring.py`): `pass`, `fail`, `blocked`, `infra` or
   `not_applicable`. The page uses the scorer's outcome, never the raw marker, and shows it in
@@ -168,7 +168,7 @@ item with its cost.
   store or the nightly dashboard.
 - **What the reader consumes.** The release artifact keys every repetition of the build to a
   release. The page will classify each repetition with the scorer's own per-repetition outcome
-  (pass, fail, safety violation, no valid run, infra, not applicable), never with the marker alone, group by release and model,
+  (pass, fail, safety violation, no valid run, infra, not applicable), never with the marker alone, group by release and split at a model change,
   and apply the rule above. It reads the case files; a cut build contributes nothing.
 
 ## The roster and case rules
@@ -181,6 +181,9 @@ names the finding and the object in one finding block (`scope: finding` on
 `ledger_issue_contains`) and a run cannot pass on a finding filed against another workload; and
 namespaced plants share one module, `bench/tf/modules/namespaced-plant`, so a plant or teardown
 defect is fixed once.
+A case author's red-to-green loop follows the `eval-fix-loop` skill
+(`.agents/skills/eval-fix-loop/SKILL.md`); where the skill does not fit a case, the author opens a
+small pull request to the skill with the case as evidence.
 
 ## The page
 
@@ -223,6 +226,7 @@ The page is not checked in; when it is, it shows:
 | A window closes at exactly 60 scored repetitions; a Rerun fills an open window up to 60, never past it                                                                                                 | 2026-11-06 |
 | Lapsed per release: two consecutive release windows that both miss the bar                                                                                                                             | 2026-11-06 |
 | A model change mid-release starts a new window                                                                                                                                                         | 2026-11-06 |
+| The page does not compare records across models; a model change still closes the open window                                                                                                           | 2026-11-09 |
 | No certificate when more than about a third of a window's repetitions are infra; the share is shown                                                                                                    | 2026-11-06 |
 | The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                                         | 2026-11-06 |
 | A failing certification holds the next promotion: no promotion while the newest GA carries a "Not certified" cell from a closed window (a scored miss or a safety violation) without a recorded waiver | 2026-11-06 |
@@ -238,7 +242,7 @@ The page is not checked in; when it is, it shows:
   rule and carries the states above.
 - **The per-release reader cell.** `skill_use.read_build` reads `release-under-test.json` and
   takes each repetition's outcome from the scorer;
-  `skill_rating.rate` windows per release and model and pools Reruns. About 80 lines plus
+  `skill_rating.rate` windows per release, split at a model change, and pools Reruns. About 80 lines plus
   tests, built on the reader's prototype branch (`cs-step-a-skill-view` at 79afbdacb). Both
   prototype branches are local and not on the upstream repository; the check-in is what makes
   the record recomputable by anyone.
