@@ -338,6 +338,30 @@ def clip(text, limit):
     return text[:limit] + " ...[clipped %d chars]" % (len(text) - limit)
 
 
+# A worker call's arguments, clipped. Arguments too long to fit that are a
+# JSON object keep, in their order, the values that fit before the clip; the
+# rest follow shortest first, so a short argument such as a path after a long
+# one closes before the clip, and the long one is the value it cuts. Anything
+# else is clipped as it stands.
+def clip_args(text, limit):
+    if not isinstance(text, str) or len(text) <= limit:
+        return clip(text, limit)
+    try:
+        args = json.loads(text)
+    except (ValueError, RecursionError):
+        return clip(text, limit)
+    if not isinstance(args, dict):
+        return clip(text, limit)
+    items = list(args.items())
+    head = []
+    for item in items:
+        if len(json.dumps(dict(head + [item]), ensure_ascii=False)) > limit:
+            break
+        head.append(item)
+    rest = sorted(items[len(head):], key=lambda item: len(json.dumps(item[1], ensure_ascii=False)))
+    return clip(json.dumps(dict(head + rest), ensure_ascii=False), limit)
+
+
 def decode(content):
     if isinstance(content, str) and content.startswith(JSON_PREFIX):
         try:
@@ -443,7 +467,7 @@ def read_session(conn, card, profile, sid):
                 arguments = fn.get("arguments")
                 entry = {
                     "name": str(fn.get("name") or ""),
-                    "args": clip(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
+                    "args": clip_args(scrub(arguments, CALL_KIND), MAX_ARGS) if arguments is not None else None,
                     "result": None,
                     "failed": None,
                     "agent": profile,
