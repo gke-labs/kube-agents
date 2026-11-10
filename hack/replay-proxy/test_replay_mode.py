@@ -714,6 +714,25 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
 
 
+class RecordContinuationTest(ProxyTestCase):
+    """A record line names its answer, and the next request names the answer it went on from."""
+
+    mode = "record"
+
+    def test_the_next_requests_prior_answer_is_the_recorded_answer_variant(self):
+        self.request("POST", COMPLETIONS, ReplayTest.opening("t_11111111"))
+        first = self.lines(1)[0]
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("prior_answer", first, "an opening holds no answer yet")
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "answer 1 for t_11111111", "Latte"))
+        second = self.lines(2)[1]
+        self.assertEqual(second["prior_answer"], first["answer_variant"])
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "a different answer", "Latte"))
+        third = self.lines(3)[2]
+        self.assertNotEqual(third["prior_answer"], first["answer_variant"],
+                            "a conversation that went on from another answer is not evidence for this one")
+
+
 class RecordBudgetTest(ProxyTestCase):
     """The cache counts against the data budget in record mode: spent, nothing is saved and forwarding goes on."""
 
@@ -1033,6 +1052,20 @@ class ReplayTest(ProxyTestCase):
         _, port, out = self.replay()
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False), port=port)
         self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request")
+
+    def test_a_cache_seeded_after_start_rebuilds_the_miss_index_once_marked(self):
+        # The replay lane seeds the cache into a running proxy (collect_shadow.py).
+        _, port, out = self.replay()
+        extra = ({"role": "user", "content": "first turn"},)
+        self.record(chat("t_11111111", stream=False, extra_messages=extra))
+        changed = ({"role": "user", "content": "first turn, but the pod restarted 3 times"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request", "not marked yet")
+        Path(self.cache_dir, replay_cache.SEED_MARKER).write_text("1")
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        miss = self.lines(2, out)[1]["miss"]
+        self.assertEqual(miss["closest_fingerprint"], self.lines(1, self.record_out)[0]["fingerprint"])
+        self.assertEqual((miss["index"], miss["role"]), (1, "user"))
 
     def test_an_unbound_placeholder_is_a_miss(self):
         self.record(chat("t_11111111", stream=False))
