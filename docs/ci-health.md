@@ -254,8 +254,7 @@ towards a distinct-PR floor, and a nightly collapsing is a case's record on
 `main`, not a gate incident. It carries the forge lanes' runs too, one tier
 each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
 forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
-GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
-running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+GitLab repository, with its next-mode nightly `ci-kube-agents-eval-nightly-gitlab-next` running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
 `pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
 weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
 section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
@@ -533,13 +532,15 @@ rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
-its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+its record is its logs bucket and nothing else reads a failed build of it. A fifth,
+`ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
+and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
 `gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
 identities cannot write the Prow archive), or from the nightlies' bucket
-`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+`gs://kube-agents-evals-nightly-logs` for the certification slice and the replay lane, which are
 decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
@@ -572,7 +573,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -639,8 +640,7 @@ when there are several). Three shapes outside that filter also get one, below:
 a not-evaluated run, a lost pod and a deadline kill.
 
 - a heading, `❌ Smoke gate: failed`, or `· hard failure` when the run failed
-  with no gate case failing all of its repetitions (an absolute check, or a
-  truncated log);
+  with no gate case collapsing (an absolute check, or a truncated log);
 - a health box: during an OUTAGE or DEGRADED state whose signature the run
   carries, that the red is not the author's code and not to retest yet; when
   the gate is healthy and what failed passes on other pull requests' recent
@@ -648,10 +648,10 @@ a not-evaluated run, a lost pod and a deadline kill.
 - the run's wall clock and links: the build log, `run.html#build=<build id>`
   on the dashboard, and the incident brief when there is an incident.
 
-The pull request is public, so the comment names no case and prints no count,
-reason or agent text: which cases failed, how many repetitions, why, and on
-which pool project are on the dashboard's run page behind the link, for a
-project reader. The incident brief link carries no case names either.
+The pull request is public, so the comment names no case and prints no case
+count, repetition count, reason or agent text: which cases failed, how many
+repetitions, why, and on which pool project are on the dashboard's run page
+behind the link, for a project reader. The incident brief link carries no case names either.
 
 An ordinary red that reaches a verdict during a deadline-kill OUTAGE gets the
 outage box with the kills' sentence ("N runs on M PRs were killed at the
@@ -693,8 +693,8 @@ link has the list), and that nothing about the change is implied:
 ```text
 ### ⚪ Smoke gate: run not evaluated
 
-> Some cases lost every repetition to infrastructure before the agent could
-> be graded. The suite could certify nothing, so Prow reports the run red;
+> Some cases could not be graded: infrastructure failed before the agent
+> ran. The suite could certify nothing, so Prow reports the run red;
 > nothing was graded for them and nothing about your change is implied.
 > Retest once the environment is healthy. [Details →](run.html#build=<build id>)
 
@@ -704,10 +704,10 @@ Ran 27 min · build log
 When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
-failed every graded repetition on the same run (the dashboard's roster can be
-newer than the branch's) gets a second sentence, unnamed, pointing at the
-transcripts to read before retesting; the heading stays ⚪, because the suite
-is the verdict's owner.
+went red on the same run (the dashboard's roster can be newer than the
+branch's) gets a second sentence, unnamed and with no per-repetition verdict,
+pointing at the run page; the heading stays ⚪, because the suite is the
+verdict's owner.
 
 The second is a lost pod (the build node went away under the job, #1478), a
 zero-task run:

@@ -4,8 +4,9 @@
     python3 scripts/check_upgrade_table_releases.py
 
 The "Breaking changes in recent releases" table labels each row with the release an operator
-first meets the change in. A pull request writes that label when it merges, naming the release
-its author expects next, and a release cut from an earlier commit leaves the label wrong. Once a
+first meets the change in. A label a pull request writes for the release its author expects next
+is often wrong, because a release can be cut from an earlier commit, so a new row says `pending`
+and is relabelled after its release ships. Once a
 release is tagged, this check finds the commit that added each row labelled with it (the oldest
 commit whose diff adds a release or `pending` row whose change cell is the change text, after the
 last commit that removed such a row) and requires the tag to contain that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
@@ -14,6 +15,13 @@ release tagged before the table itself was added: those rows were written afterw
 releases that had already shipped. A row no commit can be found for is reported, not passed. The
 change text is the row's key: a cell that keeps its text and loses a `#<number>: ` prefix still traces to the row's
 first commit, and a cell reworded after its release traces to the rewording commit.
+
+A `pending` row passes while no release contains it, and fails once one does (its tag contains the
+commit that added the row, or its own copy of the table holds the row), naming the first such release
+to relabel it with. Known limit, which fails open: a `pending` row reworded after its release traces
+to the rewording commit, which no release contains, so it passes; relabel a `pending` row before you
+reword it. A `pending` row no commit can be found for is reported, as any row is. A Release
+cell that is neither a release number nor `pending` fails, so a misspelt label is not skipped.
 
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
 release tag rather than pass with nothing to compare.
@@ -41,17 +49,24 @@ from pathlib import Path
 UPGRADE_PAGE = "docs/site/src/content/docs/install/upgrade.md"
 TABLE_HEADING = "### Breaking changes in recent releases"
 # A table row: `| <release> | <change> | ...`. The change cell is the row's stable name.
-ROW = re.compile(r"^\| (?P<release>\d+\.\d+\.\d+)\s*\| (?P<change>[^|]+?)\s*\|", re.MULTILINE)
+# A row whose change has not shipped yet is labelled `pending`; it fails once a release contains it.
+PENDING = "pending"
+PENDING_REWORD_NOTE = f" Relabel a {PENDING} row before you reword it: a reworded row traces to the rewording commit."
+ROW = re.compile(rf"^\| (?P<release>\d+\.\d+\.\d+|{PENDING})\s*\| (?P<change>[^|]+?)\s*\|", re.MULTILINE)
 # A table line in a diff: `git log -G` lists the commits that add or remove one. A commit counts as
 # adding a row only when one of its added lines is a release row (or one still labelled `pending`)
 # whose change cell is the change text, after an optional `#<number>: ` prefix that later cells
 # dropped. So the same words in prose, in another table or inside a longer cell do not stand in for
 # the row, and a row whose cell later lost the prefix still traces to its start.
 DIFF_TABLE_LINE = r"^\| "
-TABLE_LINE = re.compile(r"^\| (?:pending|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
+TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\| (?:#\d+:\s*)?(?P<change>[^|]+?)\s*\|")
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
+# The table's lines start with this; its first two are the header and the separator. A heading ends it.
+TABLE_CELL_SEPARATOR = "|"
+TABLE_HEADER_LINES = 2
+HEADING_PREFIX = "#"
 EXIT_OK = 0
 EXIT_FAILED = 1
 # The GitHub Actions events this check reads, and the base each one is compared with.
@@ -132,7 +147,55 @@ def row_commit(change: str) -> str | None:
 
 def first_release_containing(commit: str) -> str | None:
     tags = [tag for tag in git("tag", "--contains", commit).split() if RELEASE_TAG.match(tag)]
-    return min(tags, key=lambda tag: tuple(int(part) for part in tag.split("."))) if tags else None
+    return min(tags, key=version_key) if tags else None
+
+
+def version_key(tag: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in tag.split("."))
+
+
+def pending_row_problem(row: Row, tags: set[str]) -> str | None:
+    """Why a `pending` row must be relabelled, or None while no release contains it.
+
+    A release contains the row when its tag contains the commit that added the row, or when its own
+    copy of the table holds the row (a change and its row cherry-picked to the release branch). Every
+    release tag is read, so a `pending` row never passes once any release has shipped it.
+    """
+    commit = row_commit(row.change)
+    where = f"{UPGRADE_PAGE}:{row.line}"
+    for tag in sorted(tags, key=version_key):
+        if commit and git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{tag}"):
+            shipped = f"{commit[:12]}, the commit that added it"
+        elif any(tagged.change == row.change for tagged in rows(page_at(tag))):
+            shipped = "the row in its own copy of the table"
+        else:
+            continue
+        return (f"{where}: the row \"{row.change}\" is labelled {PENDING}, but {tag} contains {shipped}. "
+                f"Relabel it as {tag}." + PENDING_REWORD_NOTE)
+    if commit is None:
+        return f"{where}: no commit in this history adds the row \"{row.change}\", so its {PENDING} label cannot be checked"
+    return None
+
+
+def release_cell_problems() -> list[str]:
+    """The rows of the breaking-changes table whose Release cell is neither a release number nor `pending`."""
+    found = []
+    lines = working_file_lines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == TABLE_HEADING), None)
+    if start is None:
+        return found
+    table = []
+    for number in range(start + 1, len(lines)):
+        if lines[number].startswith(HEADING_PREFIX):
+            break
+        if lines[number].startswith(TABLE_CELL_SEPARATOR):
+            table.append(number)
+    for number in table[TABLE_HEADER_LINES:]:
+        cell = lines[number].split(TABLE_CELL_SEPARATOR)[1].strip()
+        if not (RELEASE_TAG.match(cell) or cell == PENDING):
+            found.append(f"{UPGRADE_PAGE}:{number + 1}: the Release cell \"{cell}\" is neither a release number "
+                         f"nor {PENDING}, so the row cannot be checked")
+    return found
 
 
 def commit_time(commit: str) -> int:
@@ -159,6 +222,11 @@ def clone_problem() -> str | None:
     return None
 
 
+def working_file_lines() -> list[str]:
+    page = Path(git("rev-parse", "--show-toplevel").strip()) / UPGRADE_PAGE
+    return page.read_text(encoding="utf-8").splitlines()
+
+
 def page_rows() -> list[Row]:
     # The page as it is in the working tree, so the check reads an edit before it is committed.
     page = Path(git("rev-parse", "--show-toplevel").strip()) / UPGRADE_PAGE
@@ -171,6 +239,10 @@ def problems() -> list[tuple[Row, str]]:
     table_added = oldest_adding(TABLE_HEADING)
     table_time = commit_time(table_added) if table_added else 0
     for row in page_rows():
+        if row.release == PENDING:
+            if problem := pending_row_problem(row, tags):
+                found.append((row, problem))
+            continue
         if row.release not in tags or tag_time(row.release) < table_time:
             continue
         where = f"{UPGRADE_PAGE}:{row.line}"
@@ -184,7 +256,7 @@ def problems() -> list[tuple[Row, str]]:
         if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
             continue
         first = first_release_containing(commit)
-        label = f"{first}, the first release that contains it" if first else "the next release, which will contain it"
+        label = f"{first}, the first release that contains it" if first else f"{PENDING}: no release contains it yet"
         found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
                            f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}. "
                            "(If that commit only reworded the change cell of a row that shipped earlier, keep "
@@ -217,10 +289,11 @@ def main() -> int:
         print(unusable, file=sys.stderr)
         return EXIT_FAILED
     if not os.environ.get(EVENT_NAME_ENV):
-        untagged = sorted({row.release for row in page_rows()} - release_tags())
+        untagged = sorted({row.release for row in page_rows()} - release_tags() - {PENDING})
         if untagged:
             print(UNTAGGED_NOTE.format(releases=", ".join(untagged)), file=sys.stderr)
     found = problems()
+    cells = release_cell_problems()
     base = comparison_base()
     # The rows the base already had, with the same label and change text: this change did not touch them.
     untouched = {(row.release, row.change) for row in rows(page_at(base))} if base is not None else set()
@@ -230,9 +303,9 @@ def main() -> int:
         print(WARNING_PREFIX + problem, file=sys.stderr)
     if warned:
         print(WARNING_NOTE, file=sys.stderr)
-    for problem in failed:
+    for problem in failed + cells:
         print(problem, file=sys.stderr)
-    return EXIT_FAILED if failed else EXIT_OK
+    return EXIT_FAILED if failed or cells else EXIT_OK
 
 
 if __name__ == "__main__":

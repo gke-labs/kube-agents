@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1345,7 +1346,8 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		return rec.ActiveTask == nil
 	})
-	if plain, err := r.g.probeConversation(ctx, conv, origin.TaskID); err != nil || plain.Usage != nil || plain.ChildUsage != nil {
+	plain, err := r.g.probeConversation(ctx, conv, origin.TaskID)
+	if err != nil || plain.Usage != nil || plain.ChildUsage != nil {
 		t.Fatalf("a probe that did not ask carries usage %+v / %+v (err %v); want none", plain.Usage, plain.ChildUsage, err)
 	}
 	st, err := r.g.probeConversation(withChainUsage(ctx), conv, origin.TaskID)
@@ -1361,6 +1363,40 @@ func TestTheProbesUsageIsTheFrontDoorsTurnsOverTheChain(t *testing.T) {
 	if st.ChildUsage == nil || *st.ChildUsage != wantChildren || st.UsagePartial {
 		t.Fatalf("child usage = %+v (partial %v), want %+v: both children, apart from the front door",
 			st.ChildUsage, st.UsagePartial, wantChildren)
+	}
+	// Both children went to platform: named once, on any read.
+	if want := []string{targetPlatform}; !slices.Equal(st.ChildAddressees, want) || !slices.Equal(plain.ChildAddressees, want) {
+		t.Fatalf("child addressees = %v / %v, want %v on both reads", st.ChildAddressees, plain.ChildAddressees, want)
+	}
+}
+
+// chainChildAddressees names each child of the read's chain once, in the
+// order delegated, as the addressee it was minted for; a child of another
+// chain on the same record isn't this chain's.
+func TestChainChildAddresseesNameTheChainsChildrenOnce(t *testing.T) {
+	rec := &SessionRecord{Tasks: []TaskRef{
+		{ID: "root", Addressee: "chat-otter"},
+		{ID: "c1", Addressee: "tse", Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root"},
+		{ID: "w1", Addressee: "chat-otter", Role: taskRoleWake, RootTaskID: "root"},
+		{ID: "c2", Addressee: targetPlatform, Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "c3", Addressee: "tse", Role: taskRoleChild, ParentTaskID: "w1", RootTaskID: "root"},
+		{ID: "other", Addressee: "chat-otter"},
+		{ID: "c4", Addressee: "elsewhere", Role: taskRoleChild, ParentTaskID: "other", RootTaskID: "other"},
+	}}
+	want := []string{"tse", targetPlatform}
+	for _, read := range []string{"root", "w1", "c3"} {
+		if got := chainChildAddressees(rec, read); !slices.Equal(got, want) {
+			t.Errorf("read on %s: %v, want %v", read, got, want)
+		}
+	}
+	if got := chainChildAddressees(rec, "other"); !slices.Equal(got, []string{"elsewhere"}) {
+		t.Errorf("the other chain: %v", got)
+	}
+	if got := chainChildAddressees(rec, "missing"); got != nil {
+		t.Errorf("an unknown task: %v, want nil", got)
+	}
+	if got := chainChildAddressees(&SessionRecord{Tasks: []TaskRef{{ID: "solo"}}}, "solo"); got == nil || len(got) != 0 {
+		t.Errorf("no delegation: %#v, want an empty, non-nil list", got)
 	}
 }
 

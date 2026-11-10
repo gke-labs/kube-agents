@@ -435,6 +435,30 @@ class RunNameTest(AnalyzeCase):
                 self.assertIsNotNone(hit)
                 self.assertEqual(hit[0]["content"], said.format(replayed, replayed))
 
+    def test_the_next_request_holding_the_served_answer_still_matches(self):
+        # The answer names the value outside the shape that bound it, so only the
+        # whole-token swap finds it; turn 2 sends each run's own text back.
+        for shown, recorded, replayed, said in (
+            ("searched gke-agentic/kube-agents-evals-3-infra@{}", "c99b1ab", "4f1e414", "git -C repo checkout {}"),
+            ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q", "mv clone-{} done"),
+        ):
+            with self.subTest(said=said):
+                self.setUp()
+                first = self.body(shown.format(recorded))
+                answer = {"role": "assistant", "content": said.format(recorded)}
+                self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+                first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+                self.recorded(first, {"role": "assistant", "content": "Done."})
+
+                replay = self.proxy()
+                echoed = self.body(shown.format(replayed))
+                hit, _ = replay.lookup(echoed, time.time())
+                self.assertEqual(hit[0]["content"], said.format(replayed))
+                echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+                hit, refused = replay.lookup(echoed, time.time())
+                self.assertIsNone(refused)
+                self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
     def test_the_project_in_tool_arguments_is_served_with_this_runs_value(self):
         def answer(project):
             return {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
