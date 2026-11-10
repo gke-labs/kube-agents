@@ -23,7 +23,10 @@
 #
 # Limits: the window opens at each lineage's first call with a non-empty
 # result, so a cut on that first call is not read (no recorded worker opens
-# with a sleep); only terminal and execute_code calls are visible; a result
+# with a sleep). On an inject record the capture carries no card edges, so
+# every Cluster Agent card is a lineage of its own and its first call, the
+# preflight, is not graded there: a preflight cut at 60 s fails the case on
+# the api lane only; only terminal and execute_code calls are visible; a result
 # clipped in the pod before the timeout text is not read.
 #
 # Domain: chat-and-routing. Isolation class: read-only. Eligible tier:

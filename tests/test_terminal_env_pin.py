@@ -106,10 +106,10 @@ class EnvRewriteTest(unittest.TestCase):
         )
 
     def test_a_terminal_setting_the_managed_block_does_not_own_stays(self):
-        # `hermes config set terminal.timeout 600` mirrors into .env like this.
-        self.write("TERMINAL_TIMEOUT=600\nTERMINAL_ENV=local\n")
+        # `hermes config set terminal.persistent_shell true` mirrors into .env like this.
+        self.write("TERMINAL_PERSISTENT_SHELL=true\nTERMINAL_ENV=local\n")
         self.rewrite()
-        self.assertIn("TERMINAL_TIMEOUT=600\n", self.env.read_text())
+        self.assertIn("TERMINAL_PERSISTENT_SHELL=true\n", self.env.read_text())
         self.assertNotIn("TERMINAL_ENV=local", self.env.read_text())
 
     def test_commented_out_managed_lines_are_left_alone(self):

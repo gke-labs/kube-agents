@@ -15,7 +15,7 @@ not an option: save_config strips managed leaves from it. For the same reason, a
 profile's config.yaml that outranks the copy is deleted.
 
 Only the variables the managed block maps to are replaced. Any other TERMINAL_* line is a
-setting of the profile's own (`hermes config set terminal.timeout` writes one) and stays.
+setting of the profile's own (`hermes config set terminal.persistent_shell` writes one) and stays.
 
 A failure is fatal to the caller: a profile whose scheduled runs would not use the
 managed terminal is not one to start or scaffold. The start-up sweep makes one exception, below.
@@ -91,9 +91,10 @@ BUILD_CHECK_PROFILE_CONFIG = BUILD_CHECK_KEPT_LINE + "terminal:\n  backend: loca
 # other build step touches, and a pod whose sweep cannot import them does not start.
 BUILD_CHECK_PROFILE_NAME = "check"
 # The Cluster Agent preflight (cluster_preflight.sh) budgets its brokered calls
-# under the terminal tool's default call timeout, which is Hermes' and out of
-# that script's reach; it carries a mirror, and the build check below reads
-# the default out of the Hermes this image ships and holds the mirror to it.
+# under the terminal tool's default call timeout, which the operator publishes as
+# terminal.timeout at Hermes' own default; the script carries a mirror, and the
+# build check below reads the default out of the Hermes this image ships and
+# holds the mirror to it.
 # Beside this module in the image, under agents/platform/scripts in a checkout.
 PREFLIGHT_SCRIPT_NAME = "cluster_preflight.sh"
 PREFLIGHT_SCRIPT_DIRS = (
@@ -453,7 +454,10 @@ def terminal_default_mismatch(root: pathlib.Path | None = None) -> str | None:
     return (
         f"the terminal tool's default call timeout is {hermes}s on this Hermes, but "
         f"{PREFLIGHT_SCRIPT_NAME} mirrors it as {mirror}s (TERMINAL_TOOL_TIMEOUT_SECONDS); "
-        "move the mirror, and the budget it derives, with the Hermes bump"
+        "the operator pins the old value (shellSandboxTerminalTimeoutSeconds in platformagent_manifests.go, "
+        "mirrored by BUILD_CHECK_TERMINAL and the operator goldens), so either move the pin, the mirror "
+        "and the budgets derived from it together, or keep the pin and the mirror and hold this "
+        "comparison to the pin instead"
     )
 
 

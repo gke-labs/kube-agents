@@ -2143,9 +2143,10 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // `timeout=` argument. Hermes' code default is 180s, but the image's first boot
 // seeds $HERMES_HOME/.env from Hermes' .env.example, which sets
 // TERMINAL_TIMEOUT=60, and .env beats the code default. So without this key every
-// install ran at 60s, while the persona's polling `sleep 60` and the scripts that
-// budget against 180s (cluster_preflight.sh) assumed otherwise. A seeded .env is
-// never reseeded, so only a key that outranks it reaches an existing install;
+// install ran at 60s: a polling `sleep 60` with no `timeout=` raced it, and the
+// scripts that budget against 180s (cluster_preflight.sh) were cut short. A
+// seeded .env is never reseeded, so only a key that outranks it reaches an
+// existing install;
 // deploy/shared/terminal_env_pin.py copies it into each profile's .env.
 //
 // `workspace_root` is the eighth and is NOT Hermes'. Hermes ignores it; the reader
