@@ -313,11 +313,12 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
     deny = next((v for k, v in automerge.value if k.value == "deny"), None)
     deny_key = next((k for k, v in automerge.value if k.value == "deny"), None)
     flow_item = f"{{fix: {fix_q}, environments: [{env_q}]}}"
+    nl = "\r\n" if "\r\n" in text else "\n"
     comment = f"# {' '.join(note.split())}" if note else ""
 
     def block_item(pad: str) -> str:
-        head = f"{pad}{comment}\n" if comment else ""
-        return f"{head}{pad}- fix: {fix_q}\n{pad}  environments: [{env_q}]\n"
+        head = f"{pad}{comment}{nl}" if comment else ""
+        return f"{head}{pad}- fix: {fix_q}{nl}{pad}  environments: [{env_q}]{nl}"
 
     if isinstance(deny, yaml.SequenceNode) and deny.flow_style:
         close = deny.end_mark.index - 1
@@ -341,7 +342,7 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         out = _insert_after_line(text, deny_key.end_mark.index, block_item(pad))
     else:
         pad = " " * automerge.value[0][0].start_mark.column
-        out = _insert_after_line(text, _exact_end(automerge), f"{pad}deny:\n" + block_item(pad + "  "))
+        out = _insert_after_line(text, _exact_end(automerge), f"{pad}deny:{nl}" + block_item(pad + "  "))
     edited = parse(out)
     if edited.status != LOADED or decide(edited, fix_type, environment).allowed:
         raise RulesError(f"could not add a deny rule to this layout of {RULES_FILE}")
@@ -361,7 +362,7 @@ def _exact_end(node: Any) -> int:
 def _insert_after_line(text: str, index: int, lines: str) -> str:
     end = text.find("\n", index)
     if end < 0:
-        return text + "\n" + lines
+        return text + ("\r\n" if lines.endswith("\r\n") else "\n") + lines
     return text[: end + 1] + lines + text[end + 1 :]
 
 

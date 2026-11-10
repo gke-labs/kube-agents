@@ -21,16 +21,19 @@ automerge:
 
 
 class FakeForge:
-    def __init__(self, *, state="merged", labels=(ar.AUTOMERGE_LABEL,), comments=(), existing=None, commits=1):
+    def __init__(self, *, state="merged", labels=(ar.AUTOMERGE_LABEL,), comments=(), existing=None,
+                 viewer="kube-agents-app[bot]", truncated=False):
         self.calls = []
         self.state, self.labels, self.comments = state, list(labels), list(comments)
         self.existing = existing or {}
-        self.commits = commits
+        self.viewer, self.truncated = viewer, truncated
 
     def __call__(self, verb, payload):
         self.calls.append((verb, payload))
         if verb == "proposal-view" and payload.get("comments"):
-            return {"proposal": {}, "comments": self.comments}
+            return {"proposal": {}, "comments": self.comments, "commentsTruncated": self.truncated}
+        if verb == "proposal-view" and payload.get("diff"):
+            return {"proposal": {}, "diff": "diff --git a/pdb.yaml b/pdb.yaml\n"}
         if verb == "proposal-view":
             return {"proposal": {
                 "number": 7, "title": "fix(pdb): add a budget for api", "state": self.state,
@@ -38,12 +41,10 @@ class FakeForge:
                 "target": "main", "mergeCommit": "abc123" if self.state == "merged" else None,
             }}
         if verb == "identity":
-            return {"identity": {"login": "kube-agents-app[bot]"}}
+            return {"identity": {"login": self.viewer}}
         if verb == "proposal-list":
             found = self.existing.get(payload["source"])
             return {"proposals": [{"url": found}] if found else []}
-        if verb == "proposal-commits":
-            return {"commits": [{}] * self.commits}
         if verb == "proposal-comment":
             return {"comment": {"url": "https://github.com/acme/gitops/pull/7#c1"}}
         raise AssertionError(f"unexpected verb {verb}")
@@ -105,6 +106,16 @@ class TestGates(unittest.TestCase):
         self.assertEqual(result["reason"], "already stepped down")
         self.assertEqual(opener.opened, [])
 
+    def test_unknown_viewer_waits(self):
+        forge = FakeForge(viewer="")
+        self.assertEqual(run(forge)["action"], "retry")
+        self.assertNotIn("proposal-comment", forge.verbs())
+
+    def test_truncated_comments_do_not_risk_a_second_comment(self):
+        forge, opener = FakeForge(truncated=True), FakeOpen()
+        self.assertEqual(run(forge, opener)["action"], "none")
+        self.assertEqual(opener.opened, [])
+
     def test_marker_from_someone_else_does_not_count(self):
         forge = FakeForge(comments=[{"author": "mallory", "body": pms.MARKER, "url": "u"}])
         self.assertEqual(run(forge)["action"], "stepped-down")
@@ -117,7 +128,7 @@ class TestStepDown(unittest.TestCase):
         self.assertEqual(result["action"], "stepped-down")
         self.assertEqual(
             [(b, base) for b, base, _ in opener.opened],
-            [("kube-agents/revert-7", "main"), ("kube-agents/automerge-step-down-7", "main")],
+            [("platform-agent/revert-7", "main"), ("platform-agent/automerge-step-down-7", "main")],
         )
         comments = [p for v, p in forge.calls if v == "proposal-comment"]
         self.assertEqual(len(comments), 1)
@@ -131,7 +142,7 @@ class TestStepDown(unittest.TestCase):
             self.assertNotIn(verb, forge.verbs())
 
     def test_existing_pull_requests_are_reused(self):
-        forge = FakeForge(existing={"kube-agents/revert-7": "R", "kube-agents/automerge-step-down-7": "S"})
+        forge = FakeForge(existing={"platform-agent/revert-7": "R", "platform-agent/automerge-step-down-7": "S"})
         opener = FakeOpen()
         result = run(forge, opener)
         self.assertEqual(opener.opened, [])
@@ -140,25 +151,25 @@ class TestStepDown(unittest.TestCase):
 
     def test_a_refusal_is_said_and_the_other_still_opens(self):
         forge = FakeForge()
-        result = run(forge, FakeOpen(fail={"kube-agents/revert-7"}))
+        result = run(forge, FakeOpen(fail={"platform-agent/revert-7"}))
         self.assertEqual(result["action"], "stepped-down")
         self.assertNotIn("revert", result)
         self.assertTrue(result["stepDown"])
-        self.assertEqual(result["refused"], {"revert": "kube-agents/revert-7 broke"})
+        self.assertEqual(result["refused"], {"revert": "platform-agent/revert-7 broke"})
         body = next(p for v, p in forge.calls if v == "proposal-comment")["body"]
         self.assertTrue(body.startswith("Still broken after merge, so I opened a pull request to stop"))
-        self.assertIn("I did not open a revert: kube-agents/revert-7 broke.", body)
+        self.assertIn("I did not open a revert: platform-agent/revert-7 broke.", body)
 
     def test_both_refused_still_comments_once(self):
         forge = FakeForge()
-        run(forge, FakeOpen(fail={"kube-agents/revert-7", "kube-agents/automerge-step-down-7"}))
+        run(forge, FakeOpen(fail={"platform-agent/revert-7", "platform-agent/automerge-step-down-7"}))
         body = next(p for v, p in forge.calls if v == "proposal-comment")["body"]
         self.assertTrue(body.startswith("Still broken after merge. I did not open a revert"))
 
     def test_a_transient_failure_waits_for_the_next_run(self):
         class Flaky(FakeOpen):
             def __call__(self, forge, repo, branch, *rest):
-                if branch == "kube-agents/revert-7":
+                if branch == "platform-agent/revert-7":
                     raise OSError("broker did not answer")
                 return super().__call__(forge, repo, branch, *rest)
 
@@ -207,45 +218,54 @@ class TestWriters(unittest.TestCase):
         self.tree = _repo()
         self.vcs = FakeVcsClient()
         self.vcs.tree = self.tree
+        self.fix = {"title": "fix", "url": "https://x/pull/7", "mergeCommit": "abc"}
 
     def _fix_branch(self, commits=1):
         _git(self.tree, "switch", "-q", "-c", "fix")
         for i in range(commits):
             (self.tree / f"pdb-{i}.yaml").write_text("kind: PodDisruptionBudget\n")
+            (self.tree / "app.yaml").write_text(f"kind: Deployment\nrev: {i}\n")
             _git(self.tree, "add", "-A")
             _git(self.tree, "commit", "-q", "-m", f"fix {i}")
         _git(self.tree, "switch", "-q", "main")
+        return _git(self.tree, "diff", "main...fix") + "\n"
 
-    def test_revert_of_a_merge_commit(self):
-        self._fix_branch(commits=2)
-        _git(self.tree, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
-        merge = _git(self.tree, "rev-parse", "HEAD")
-        _git(self.tree, "switch", "-q", "-c", "kube-agents/revert-7")
-        pms._revert_writer({"title": "fix"}, 7, merge, 2)(self.tree, self.vcs, REPO, "kube-agents/revert-7")
+    def _undone(self):
         self.assertFalse((self.tree / "pdb-0.yaml").exists())
         self.assertFalse((self.tree / "pdb-1.yaml").exists())
-        self.assertIn(f"This reverts {merge}.", _git(self.tree, "log", "-1", "--format=%B"))
-        self.assertEqual(self.vcs.committed[2:], (REPO, "kube-agents/revert-7"))
+        self.assertEqual((self.tree / "app.yaml").read_text(), "kind: Deployment\n")
 
-    def test_revert_of_a_squash(self):
-        self._fix_branch(commits=1)
+    def test_merge_commit(self):
+        diff = self._fix_branch(commits=2)
+        _git(self.tree, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
+        pms._revert_writer(self.fix, 7, diff)(self.tree, self.vcs, REPO, "platform-agent/revert-7")
+        self._undone()
+        self.assertIn("This undoes the changes of https://x/pull/7", _git(self.tree, "log", "-1", "--format=%B"))
+        self.assertEqual(self.vcs.committed[2:], (REPO, "platform-agent/revert-7"))
+
+    def test_squash_of_several_commits(self):
+        diff = self._fix_branch(commits=2)
         _git(self.tree, "merge", "-q", "--squash", "fix")
         _git(self.tree, "commit", "-q", "-m", "squashed")
-        merge = _git(self.tree, "rev-parse", "HEAD")
-        pms._revert_writer({"title": "fix"}, 7, merge, 1)(self.tree, self.vcs, REPO, "b")
-        self.assertFalse((self.tree / "pdb-0.yaml").exists())
+        pms._revert_writer(self.fix, 7, diff)(self.tree, self.vcs, REPO, "b")
+        self._undone()
 
-    def test_one_parent_and_several_commits_is_refused(self):
-        self._fix_branch(commits=2)
+    def test_rebase_of_several_commits_is_undone_whole(self):
+        diff = self._fix_branch(commits=2)
         _git(self.tree, "merge", "-q", "--ff-only", "fix")
-        merge = _git(self.tree, "rev-parse", "HEAD")
-        with self.assertRaises(pms.StepDownError):
-            pms._revert_writer({}, 7, merge, 2)(self.tree, self.vcs, REPO, "b")
-        self.assertTrue((self.tree / "pdb-0.yaml").exists())
+        pms._revert_writer(self.fix, 7, diff)(self.tree, self.vcs, REPO, "b")
+        self._undone()
 
-    def test_unknown_merge_commit_is_refused(self):
+    def test_already_reverted_is_refused(self):
+        diff = self._fix_branch(commits=1)
+        _git(self.tree, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
+        _git(self.tree, "revert", "--no-edit", "-m", "1", "HEAD")
         with self.assertRaises(pms.StepDownError):
-            pms._revert_writer({}, 7, "0" * 40, 1)(self.tree, self.vcs, REPO, "b")
+            pms._revert_writer(self.fix, 7, diff)(self.tree, self.vcs, REPO, "b")
+
+    def test_empty_diff_is_refused(self):
+        with self.assertRaises(pms.StepDownError):
+            pms._revert_writer(self.fix, 7, "  \n")(self.tree, self.vcs, REPO, "b")
 
     def test_step_down_adds_a_deny_rule(self):
         pms._step_down_writer("no-pdb", "dev", "https://x/pull/7")(self.tree, self.vcs, REPO, "b")
@@ -254,6 +274,14 @@ class TestWriters(unittest.TestCase):
         self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
         self.assertIn("https://x/pull/7 was still broken", (self.tree / ar.RULES_FILE).read_text())
         self.assertEqual(self.vcs.committed[1], [ar.RULES_FILE])
+
+    def test_step_down_keeps_crlf(self):
+        (self.tree / ar.RULES_FILE).write_bytes(RULES.replace("\n", "\r\n").encode())
+        pms._step_down_writer("no-pdb", "dev", "u")(self.tree, self.vcs, REPO, "b")
+        raw = (self.tree / ar.RULES_FILE).read_bytes()
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        self.assertTrue(raw.startswith(RULES.replace("\n", "\r\n").encode()))
+        self.assertFalse(ar.decide(ar.load(self.tree), "no-pdb", "dev").allowed)
 
     def test_step_down_without_a_rules_file_is_refused(self):
         (self.tree / ar.RULES_FILE).unlink()
@@ -273,7 +301,7 @@ class TestOpen(unittest.TestCase):
 
         fake = types.ModuleType("vcs_client")
         with unittest.mock.patch.dict("sys.modules", {"vcs_client": fake}):
-            url = pms._open(forge, REPO, "kube-agents/revert-7", "main", "t", "b", lambda *a: None)
+            url = pms._open(forge, REPO, "platform-agent/revert-7", "main", "t", "b", lambda *a: None)
         self.assertEqual(url, "P")
         self.assertEqual(calls, ["branch-view", "proposal-create"])
 

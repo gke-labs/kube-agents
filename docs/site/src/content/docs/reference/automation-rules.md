@@ -80,22 +80,26 @@ cannot leave the allow rules beside it in force:
 
 ## When an auto-merged fix is still broken
 
-With the switch `on`, a fix your pipeline merged on its own carries the `kube-agents:auto-merge`
-label. When kube-agents checks that fix after merge and finds the problem still there, it opens two
-pull requests against the branch the fix merged into, and comments once on the fix to link them:
+With the switch `on`, kube-agents marks a fix your pipeline may merge on its own with the
+`kube-agents:auto-merge` label. When such a fix has merged and kube-agents' after-merge check finds
+the problem still there, it opens two pull requests against the branch the fix merged into, and
+comments once on the fix to link them:
 
-- `kube-agents/revert-<number>` reverts the fix's merge commit.
-- `kube-agents/automerge-step-down-<number>` adds a deny rule for that kind of fix in that
-  environment to this file, with a comment naming the fix. It edits the file in place and keeps
-  everything else you wrote. Delete the rule later to allow those fixes again.
+- `platform-agent/revert-<number>` undoes the fix's changes, whether it merged as a merge commit, a
+  squash or a rebase.
+- `platform-agent/automerge-step-down-<number>` adds a deny rule for that kind of fix in that
+  environment to this file. It edits the file in place and keeps everything else you wrote; in a
+  block-style file a comment above the rule names the fix. Delete the rule later to allow those
+  fixes again.
 
 Both go through your normal review; kube-agents merges neither. Until the second one merges, fixes of
 that kind can still merge on their own. With the switch `off` or `practice`, nothing merged
 unattended, so the after-merge report is the only response.
 
-kube-agents does not revert on its own when a fix merged as several commits onto one parent: a
-rebase merge leaves only the last of them in the merge commit. It says so in the comment, and the
-deny rule is still proposed.
+When one of the two cannot be made, the comment says why and the other still opens. The revert is
+skipped when the fix's changes no longer undo cleanly, for example because someone already reverted
+it. The rules change is skipped when the file is absent or refused on that branch, or is laid out in
+a way kube-agents cannot add a rule to.
 
 ## Check a file
 

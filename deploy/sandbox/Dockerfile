@@ -605,7 +605,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          the checkouts being here; imports kubeagents_switches
 #   post_merge_stepdown.py opens the revert and the rules-file pull request for an
 #                          auto-merged fix still broken after merge; imports
-#                          automation_rules and vcs_client
+#                          automation_rules, kubeagents_switches and vcs_client
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
