@@ -79,6 +79,8 @@ GENERIC_NAMES = {"README.md", "OWNERS", "LICENSE", "common.sh", "__init__.py", "
 DOCKERFILE_RE = re.compile(r"[\w./$-]*Dockerfile[\w.$-]*")
 COPY_RE = re.compile(r"^\s*(?:COPY|ADD)\s+(.*)$", re.IGNORECASE)
 PATH_TOKEN_RE = re.compile(r"(?:\$\{?SCRIPT_DIR\}?/)?(?:\.\./)*[\w.-]+(?:/[\w.-]+)*")
+#: shellcheck's statement of what a `source` line resolves to, for paths built at run time.
+SHELLCHECK_SOURCE_RE = re.compile(r"^\s*#\s*shellcheck\s+source=(\S+)", re.MULTILINE)
 SOURCE_RE = re.compile(r"^\s*(?:source|\.)\s")
 IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))")
 IGNORE_FILE_RE = re.compile(r"(^|/)(\.dockerignore|\.gcloudignore|[^/]*\.dockerignore)$")
@@ -123,6 +125,12 @@ def job_closure(files):
         current = queue.pop()
         base = os.path.dirname(current)
         whole = current.startswith("hack/")
+        directives = SHELLCHECK_SOURCE_RE.findall((ROOT / current).read_text(errors="replace"))
+        for path in {os.path.normpath(p) for p in directives} - named.keys():
+            if path in files and not NOT_NAMED_RE.search(path):
+                named[path] = current
+                if not under(path, NOT_READ):
+                    queue.append(path)
         for line in code_lines(current):
             candidates = set()
             tokens = PATH_TOKEN_RE.findall(line) if whole or SOURCE_RE.match(line) else []
@@ -270,6 +278,7 @@ class SkipListTest(unittest.TestCase):
             "hack/boskos_pool.py",
             "tags.env",
             "scripts/verify_ci_pool_project.py",
+            "scripts/installer/gke_dns_endpoint.sh",
             "deploy/docker/patches/patchlib.py",
             "agents/platform/SOUL.md",
             "a2a/web/package.json",
