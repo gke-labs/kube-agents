@@ -755,3 +755,66 @@ exit 1`))
 		})
 	}
 }
+
+// A value the shape pool holds that a later result shows in a Secret ends
+// up in exactly one pool: when earlier results fill the Secret pool, it
+// stays in the shape pool and is still redacted. A value no own entry can
+// make room for is refused without first evicting the entries its result
+// already added.
+func TestSeenSecrets_AMoveToAFullSecretPoolKeepsTheValue(t *testing.T) {
+	var s seenSecrets
+	for i := 0; i < seenSecretPoolEntries/2; i++ {
+		s.add(fmt.Sprintf("synthetic-fill-%06d", i)) // each its own result, two forms each
+	}
+	if n := len(s.secret.entries); n != seenSecretPoolEntries {
+		t.Fatalf("Secret pool holds %d, want its reserve %d", n, seenSecretPoolEntries)
+	}
+	s.addShape(synthCardToken)
+	s.add(synthCardToken)
+	if !s.has(synthCardToken) || !s.has(b64(synthCardToken)) {
+		t.Fatal("a value moving to a full Secret pool was dropped from both pools")
+	}
+	if got := scrubAnswerText("It is "+synthCardToken+".", &s); got != "It is [redacted]." {
+		t.Errorf("answer = %q, want the value still redacted", got)
+	}
+	s.mu.Lock()
+	inShape := 0
+	for _, e := range s.shape.entries {
+		if e.v == synthCardToken {
+			inShape++
+		}
+	}
+	for _, e := range s.secret.entries {
+		if e.v == synthCardToken {
+			t.Error("the value is in the Secret pool too")
+		}
+	}
+	s.mu.Unlock()
+	if inShape != 1 {
+		t.Errorf("shape pool holds the value %d times, want 1", inShape)
+	}
+
+	// Bytes: earlier results leave less room than a large value needs even
+	// with the current result's own small entry gone; that entry stays.
+	var b seenSecrets
+	for i := 0; i < seenSecretPoolBytes/seenSecretMaxValueBytes-1; i++ {
+		b.mu.Lock()
+		b.addLocked(fmt.Sprintf("%06d", i)+strings.Repeat("f", seenSecretMaxValueBytes-6), true, uint64(i+100))
+		b.mu.Unlock()
+	}
+	b.mu.Lock()
+	b.addLocked(strings.Repeat("g", 100), true, 5000)
+	b.mu.Unlock()
+	gen := b.newGen() // 1: no earlier result's generation
+	const small = "synthetic-small-0005"
+	b.mu.Lock()
+	b.addLocked(small, true, gen)
+	b.addLocked(strings.Repeat("h", seenSecretMaxValueBytes), true, gen)
+	b.mu.Unlock()
+	if !b.has(small) {
+		t.Error("a refused value evicted its own result's earlier entry for nothing")
+	}
+	if b.has(strings.Repeat("h", seenSecretMaxValueBytes)) {
+		t.Error("a value over the room left was tracked")
+	}
+}

@@ -111,7 +111,8 @@ func seenSecretKeySkipped(key string, saToken bool) bool {
 // number only). So neither pool can flush the other, and no result, a
 // forged or huge one included, can flush what earlier results carried; a
 // task whose results hold more values than the pools keep tracks the
-// earliest ones. A value both pools would hold is kept in the Secret pool.
+// earliest ones. A value both pools would hold is kept in the Secret pool
+// when it can take the value, else in the shape pool: in exactly one.
 type seenSecrets struct {
 	mu      sync.Mutex
 	set     map[string]bool // value -> held in the Secret pool
@@ -206,15 +207,27 @@ func (s *seenSecrets) addLocked(v string, fromSecret bool, gen uint64) {
 		s.set = make(map[string]bool)
 		s.charge = make(map[seenCharge]seenUse)
 	}
-	if inSecret, ok := s.set[v]; ok {
-		if !fromSecret || inSecret {
-			return
-		}
-		// A shape-caught value a Secret also holds moves to the Secret pool.
-		s.removeLocked(&s.shape, false, func(e seenEntry) bool { return e.v == v })
+	inSecret, held := s.set[v]
+	if held && (!fromSecret || inSecret) {
+		return
 	}
 	p, maxEntries, maxBytes, allowEntries, allowBytes := s.pool(fromSecret)
 	key := seenCharge{gen, fromSecret}
+	// Whether p can take v at all, reclaiming only gen's own entries, is
+	// known before anything changes: a value p refuses evicts nothing, and
+	// one the shape pool holds stays there.
+	own := s.charge[key]
+	if allowEntries < 1 || len(v) > allowBytes {
+		return
+	}
+	if len(p.entries)-own.entries+1 > maxEntries || p.bytes-own.bytes+len(v) > maxBytes {
+		s.refused++
+		return
+	}
+	if held {
+		// A shape-caught value a Secret also holds moves to the Secret pool.
+		s.removeLocked(&s.shape, false, func(e seenEntry) bool { return e.v == v })
+	}
 	for u := s.charge[key]; u.entries+1 > allowEntries || u.bytes+len(v) > allowBytes; u = s.charge[key] {
 		if !s.removeLocked(p, fromSecret, func(e seenEntry) bool { return e.gen == gen }) {
 			return // nothing of its own left to replace: refused
