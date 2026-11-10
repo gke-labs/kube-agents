@@ -813,6 +813,106 @@ def test_arguments_are_scrubbed_too(data_root: Path) -> None:
     assert first["args"]["command"].endswith(REDACTED)
 
 
+def _plant_call(root: Path, name: str, arguments: str) -> None:
+    """Make the platform worker's first call ``name`` with ``arguments`` as hermes stored them."""
+    with sqlite3.connect(root / "profiles" / "platform" / "state.db") as conn:
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?"
+            " WHERE role = 'assistant' AND tool_calls LIKE '%get pods%'",
+            (json.dumps([{"name": name, "arguments": arguments}]),),
+        )
+
+
+def _pod_args(root: Path) -> str:
+    """The first worker call's arguments as the pod wrote them, before the harness parses them."""
+    return next(c for c in _payload(_run_script(root, [FRONT]))["calls"] if c["task"] == FRONT)["args"]
+
+
+# The objective of obtainability-pdb-kustomize-overlay that errored on the
+# nightly of 2026-11-09: a worker's write_file put a 21,000-character content
+# before its path, and the pod's clip cut the path off.
+BUDGET_PATH = "/tmp/gitops/clusters/seeded-a/seeded-reliability/pdb.yaml"
+BUDGET_FILE_PATTERN = r".*clusters/[^/]*seeded-a/seeded-reliability/pdb\.yaml"
+
+
+def _wrote_the_budget_file(path_pattern: str = BUDGET_FILE_PATTERN) -> ToolCalledVerifier:
+    return ToolCalledVerifier(
+        type="tool_called",
+        scope="workers",
+        tool_names=["write_file", "patch"],
+        arguments={"path": path_pattern},
+    )
+
+
+def test_a_short_argument_survives_a_long_one_written_before_it(data_root: Path) -> None:
+    """The pod puts the shortest values first, so the clip cuts the long content, not the path."""
+    content = "import json\n" + "print(json.dumps({}))\n" * 1000
+    arguments = json.dumps({"content": content, "path": BUDGET_PATH})
+    assert len(arguments) > 20000
+
+    # The record as one clipped string, the clip landing inside the content:
+    # the path is cut off, and the check cannot decide the call.
+    recorded = {
+        "name": "write_file",
+        "args": {"raw": arguments[:2000] + " ...[clipped %d chars]" % (len(arguments) - 2000)},
+        "result": "{}",
+        "status": "completed",
+        "agent": "platform",
+        "task": FRONT,
+        "session": PLATFORM_SESSION,
+        "at": 1.0,
+    }
+    transcript.set("answer", [recorded])
+    assert _wrote_the_budget_file().verify(5.0).status == "error"
+
+    _plant_call(data_root, "write_file", arguments)
+    captured = worker_trajectory.capture(lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0)
+    assert captured is not None
+    first = captured.entries[0]
+    raw = first["args"]["raw"]
+    assert raw.startswith(json.dumps({"path": BUDGET_PATH})[:-1] + ', "content": "import json')
+    assert re.search(r" \.\.\.\[clipped \d+ chars\]$", raw)
+    transcript.set("answer", captured.entries)
+    assert _wrote_the_budget_file().verify(5.0).status == "pass"
+    assert _wrote_the_budget_file(r".*/other\.yaml").verify(5.0).status == "fail"
+
+
+def test_arguments_that_fit_keep_their_order(data_root: Path) -> None:
+    """Arguments that fit keep their order, a long value before a short one included."""
+    arguments = json.dumps({"content": "x" * 500, "path": BUDGET_PATH})
+    _plant_call(data_root, "write_file", arguments)
+    assert _pod_args(data_root) == arguments
+
+
+def test_a_value_that_fit_before_the_clip_still_does(data_root: Path) -> None:
+    """The values that closed before the clip keep their place; only the rest are reordered."""
+    arguments = json.dumps({"body": "b" * 1500, "title": "t" * 400, "notes": "n" * 1000, "log": "l" * 3000})
+    _plant_call(data_root, "kanban_create", arguments)
+    args = _pod_args(data_root)
+    assert args.startswith(json.dumps({"body": "b" * 1500, "title": "t" * 400})[:-1] + ', "notes": "nnn')
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ["not json " + "y" * 3000, json.dumps(["y" * 3000, "short"]), "[" * 20000 + "]" * 20000],
+    ids=["text", "array", "nested-past-the-recursion-limit"],
+)
+def test_arguments_that_are_not_a_json_object_are_clipped_as_they_stand(
+    data_root: Path, arguments: str
+) -> None:
+    _plant_call(data_root, "write_file", arguments)
+    assert _pod_args(data_root) == arguments[:2000] + " ...[clipped %d chars]" % (len(arguments) - 2000)
+
+
+def test_a_scrubbed_argument_stays_scrubbed_when_it_moves_first(data_root: Path) -> None:
+    """The reorder parses the scrubbed text, so what it moves to the front is already blanked."""
+    arguments = json.dumps({"content": "Z" * 3000, "command": f"gh auth login --with-token <<< {TOKEN}"})
+    _plant_call(data_root, "terminal", arguments)
+    args = _pod_args(data_root)
+    assert TOKEN not in args
+    assert args.startswith('{"command": "gh auth login --with-token <<< ' + REDACTED + '", "content": "ZZZ')
+
+
 def test_a_manifest_inside_an_argument_is_scrubbed_with_its_newlines(data_root: Path) -> None:
     """The arguments are a JSON string; the YAML inside is seen as YAML, not as ``\\n`` text."""
     manifest = (
@@ -1207,6 +1307,8 @@ def test_settle_appends_worker_calls_after_the_routers_and_before_the_purge(
 
     def shell(script: str, timeout: float) -> str:
         scripts.append(script)
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            return "purged\n"
         return reply if worker_trajectory.CAPTURE_PRESENT in script else ""
 
     monkeypatch.setattr(harness, "_agent_shell", shell)
@@ -1229,7 +1331,7 @@ def test_settle_appends_worker_calls_after_the_routers_and_before_the_purge(
     ]
     assert {e["agent"] for e in result.trajectory[1:]} == {"platform", "cluster-abc"}
     assert result.metadata["worker_trajectory"]["calls"] == 3
-    assert "rm -rf" in scripts[-1]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in scripts[-1]
     assert worker_trajectory.CAPTURE_PRESENT in scripts[-2]
 
 
@@ -1239,7 +1341,8 @@ def test_settle_records_none_when_the_read_did_not_run(no_cluster_exec: list[str
     harness.KubeAgentsHarness._settle(result, [], [FRONT])
     assert result.metadata["worker_trajectory"] is None
     assert result.tokens["workers"] is None
-    assert result.trajectory == []
+    # devops-bench drops metadata, so the gap is on the trajectory too.
+    assert result.trajectory == [worker_trajectory.gap_entry([worker_trajectory.UNREAD_CAPTURE_GAP])]
     assert any(worker_trajectory.CAPTURE_PRESENT in s for s in no_cluster_exec)
 
 

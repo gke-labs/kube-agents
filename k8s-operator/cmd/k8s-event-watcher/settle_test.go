@@ -60,18 +60,142 @@ func TestSettleAppliesToTheTransientFamiliesOnly(t *testing.T) {
 	for reason, want := range map[string]bool{
 		"CrashLoopBackOff": true, "FailedMount": true, "Unhealthy": true,
 		"NodeNotReady": false, "OOMKilled": false, "Evicted": false, "ImagePullBackOff": false, "FailedScheduling": false, "FailedToDrainNode": false,
+		// Config Connector's two transient-by-design reasons settle; its
+		// verdicts fire at once, and its normal states are on no list.
+		"DependencyNotReady": true, "Unmanaged": true,
+		"UpdateFailed": false, "DeleteFailed": false, "DependencyNotFound": false, "DependencyInvalid": false,
+		"ManagementConflict": false, "PreActuationTransformFailed": false, "PostActuationTransformFailed": false,
+		"Updating": false, "UpToDate": false,
 	} {
-		if got := settleApplies(reason); got != want {
+		if got := settleApplies(reason, ""); got != want {
 			t.Errorf("settleApplies(%q) = %t; want %t", reason, got, want)
 		}
 	}
 	// The wire reason is BackOff for both halves of kubelet's back-off; the
 	// family is read on the canonical one.
-	if !settleApplies(canonicalizeReason("BackOff", "Back-off restarting failed container app in pod api")) {
+	if !settleApplies(canonicalizeReason("BackOff", "Back-off restarting failed container app in pod api"), "") {
 		t.Error("a crash-loop BackOff is not in the settle family")
 	}
-	if settleApplies(canonicalizeReason("BackOff", "Back-off pulling image \"x:latest\"")) {
+	if settleApplies(canonicalizeReason("BackOff", "Back-off pulling image \"x:latest\""), "") {
 		t.Error("an image-pull BackOff is in the settle family")
+	}
+}
+
+// settleFailed is kubelet's Failed for one pod with the given message, sighted
+// count times, first at t0 and last at t0+lasted.
+func settleFailed(t0 time.Time, message string, lasted time.Duration, count int) TriageEvent {
+	ev := settleBackoff(t0, lasted, count)
+	ev.Key.Reason = reasonFailed
+	ev.Message = message
+	return ev
+}
+
+const (
+	hostIPUnknownEvent = "Error: host IP unknown; known addresses: [{Hostname gk3-wolfram-std-02-pool-1-cc370783-lgp8}]"
+	startErrorEvent    = `Error: failed to create containerd task: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: exec: "migrate": executable file not found in $PATH: unknown`
+)
+
+// TestSettleAppliesToFailedOnlyForARetriedConfigError: a plain Failed is in
+// the family only when its message is a config error kubelet retries whatever
+// the restartPolicy; a start error and any message not on the list stay out.
+func TestSettleAppliesToFailedOnlyForARetriedConfigError(t *testing.T) {
+	for _, tc := range []struct {
+		message string
+		want    bool
+	}{
+		{hostIPUnknownEvent, true},
+		{startErrorEvent, false},
+		{`Error: secret "db-creds" not found`, false},
+		{"Error: ErrImagePull", false},
+		{"", false},
+		{"pod quoted it: Error: host IP unknown; known addresses: []", false},
+	} {
+		if got := settleApplies(canonicalizeReason(reasonFailed, tc.message), tc.message); got != tc.want {
+			t.Errorf("settleApplies(Failed, %q) = %t; want %t", tc.message, got, tc.want)
+		}
+	}
+	if settleApplies("CrashLoopBackOff", hostIPUnknownEvent) != true || settleApplies("OOMKilled", hostIPUnknownEvent) {
+		t.Error("the message changed the family of a reason other than Failed")
+	}
+}
+
+// failedDispatcher is a counting dispatcher whose --reason list carries
+// Failed, as the entrypoint's does; the shipped default list does not.
+func failedDispatcher(t *testing.T, now *time.Time) (*dispatcher, *metrics, *int) {
+	t.Helper()
+	th := filterThresholds{settle: 2 * time.Minute}
+	disp, m, injectCount, _ := newCountingDispatcher(t, th)
+	disp.filter = newFilter(newFilterConfig([]string{reasonFailed}, nil, nil, th))
+	disp.settles = newSettleMemo(0, 0)
+	disp.now = func() time.Time { return *now }
+	return disp, m, injectCount
+}
+
+// TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown is the alert
+// that prompted it: a DaemonSet pod on a node the autoscaler was deleting
+// gets one Failed "host IP unknown" and is gone. It is held and counted
+// self_resolved; the same message repeating past the period (a node that
+// really has no IP) is forwarded; and a one-shot start error, which kubelet
+// does not retry under restartPolicy Never, still fires on its first sighting.
+func TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown(t *testing.T) {
+	t0 := time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC)
+	ctx := context.Background()
+
+	now := t0
+	disp, m, injectCount := failedDispatcher(t, &now)
+	disp.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, 0, 1))
+	if *injectCount != 0 {
+		t.Fatalf("a one-shot host IP unknown fired %d injects; want 0", *injectCount)
+	}
+	if got := testutil.ToFloat64(m.eventsFiltered.WithLabelValues("test-cluster", "", "", string(gateSettle))); got != 1 {
+		t.Errorf("events_filtered_total{gate=settle} = %v; want 1", got)
+	}
+	now = t0.Add(2*time.Minute + settleQuietSlack)
+	disp.Sweep(ctx)
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
+	}
+
+	now = t0
+	lasting, _, lastingCount := failedDispatcher(t, &now)
+	for i, lasted := range []time.Duration{0, 30 * time.Second, 90 * time.Second, 130 * time.Second} {
+		now = t0.Add(lasted)
+		lasting.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, lasted, i+1))
+	}
+	if *lastingCount != 1 {
+		t.Errorf("a host IP unknown lasting past the period fired %d injects; want 1", *lastingCount)
+	}
+
+	now = t0
+	start, _, startCount := failedDispatcher(t, &now)
+	start.Dispatch(ctx, settleFailed(t0, startErrorEvent, 0, 1))
+	if *startCount != 1 {
+		t.Errorf("a one-shot start error fired %d injects; want 1 on its first sighting", *startCount)
+	}
+}
+
+// TestDispatcherSettleKeepsAHostIPUnknownHoldPastAnotherFailed: every Failed
+// on a pod shares one memo key, so a start error on a sibling container,
+// accepted on its first sighting, must not release the held host IP unknown
+// and count it forwarded; the hold still expires as self_resolved.
+func TestDispatcherSettleKeepsAHostIPUnknownHoldPastAnotherFailed(t *testing.T) {
+	t0 := time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC)
+	ctx := context.Background()
+	now := t0
+	disp, m, injectCount := failedDispatcher(t, &now)
+	disp.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, 0, 1))
+	now = t0.Add(5 * time.Second)
+	disp.Dispatch(ctx, settleFailed(now, startErrorEvent, 0, 1))
+	if *injectCount != 1 {
+		t.Fatalf("injects = %d; want 1, the start error", *injectCount)
+	}
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeForwarded)); got != 0 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=forwarded} = %v; want 0 (the hold was never forwarded)", got)
+	}
+	now = t0.Add(2*time.Minute + settleQuietSlack)
+	disp.Sweep(ctx)
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
 	}
 }
 

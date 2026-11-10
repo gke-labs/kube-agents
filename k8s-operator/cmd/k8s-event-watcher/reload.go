@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,7 +34,10 @@ import (
 type clusterRun struct {
 	cluster targetCluster
 	cache   *dedupCache
-	cancel  context.CancelFunc
+	// excluded is the dispatcher's alert-exclude recorder, flushed when the
+	// cluster stops; nil in a dry run.
+	excluded *excludedRecorder
+	cancel   context.CancelFunc
 	// done is closed once the cluster's watcher goroutine has returned.
 	done chan struct{}
 }
@@ -101,8 +105,9 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	}
 	disp := newDispatcher(s.f, s.filter, cache, s.inj, s.m)
 	disp.cluster = tc
+	disp.owners = newOwnerResolver(tc.Client)
 	cctx, cancel := context.WithCancel(ctx)
-	run := &clusterRun{cluster: tc, cache: cache, cancel: cancel, done: make(chan struct{})}
+	run := &clusterRun{cluster: tc, cache: cache, excluded: disp.excluded, cancel: cancel, done: make(chan struct{})}
 	// done closes once the watcher and both loops have returned, so a stop
 	// that waits on it deletes the cluster's gauge series after the last
 	// goroutine that could write one. Local to this start, so the group is
@@ -155,6 +160,12 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 		}
 		w := newWatcher(tc.Client, delivery, tc)
 		w.gate = s.gate
+		// A relist after the sync is the loop a slow batch can fall into (a
+		// watch the API server would not resume, a watch-list stream that
+		// failed); the counter makes it visible beside cluster_up.
+		w.onRelist = func() {
+			s.m.relists.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Inc()
+		}
 		log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 			tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 		// The gauge follows every transition the watcher reports: 1 on the
@@ -227,6 +238,7 @@ func (s *clusterSet) stop(profile string) {
 	if err := run.cache.Snapshot(); err != nil {
 		log.Printf("k8s-event-watcher: [%s] dedup snapshot on removal: %v", run.cluster.Name, err)
 	}
+	run.flushExcluded()
 	s.m.deleteClusterGauges(run.cluster.Name, run.cluster.ProjectID, run.cluster.Location)
 }
 
@@ -265,7 +277,20 @@ func (s *clusterSet) snapshotAll() {
 		if err := run.cache.Snapshot(); err != nil {
 			log.Printf("dedup snapshot on shutdown: %v", err)
 		}
+		run.flushExcluded()
 	}
+}
+
+// flushExcluded sends the cluster's pending alert-exclude sightings, with a
+// fresh context bounded by excludedFinalFlushTimeout: the cluster's own has
+// ended by now, and the memo goes with it.
+func (run *clusterRun) flushExcluded() {
+	if run.excluded == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), excludedFinalFlushTimeout)
+	defer cancel()
+	run.excluded.Flush(ctx)
 }
 
 // count is how many clusters are running.
@@ -282,6 +307,24 @@ func (s *clusterSet) profiles() []string {
 	out := make([]string, 0, len(s.running))
 	for p := range s.running {
 		out = append(out, p)
+	}
+	return out
+}
+
+// clusters is the running set as a slice, in profile order, for the
+// fleet-shape probe: a copy, so the probe reads the clusters as they stood
+// when it began and holds no lock while it reads them.
+func (s *clusterSet) clusters() []targetCluster {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profiles := make([]string, 0, len(s.running))
+	for p := range s.running {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	out := make([]targetCluster, 0, len(profiles))
+	for _, p := range profiles {
+		out = append(out, s.running[p].cluster)
 	}
 	return out
 }

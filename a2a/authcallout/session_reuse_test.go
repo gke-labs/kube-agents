@@ -143,7 +143,10 @@ func TestAReusedSessionPodTakesItsNextTaskUnderItsOwnGrants(t *testing.T) {
 // still take the next turn, and run one through.
 func TestAReusedSessionPodTakesTurnsAcrossItsGrantExpiry(t *testing.T) {
 	var reviews atomic.Int64
-	h := startHarness(t, sessionMap, sessionTokens(), withGrantTTL(reuseGrantTTL),
+	// The re-authentications are counted as the TokenReviews they cause,
+	// and the validator would otherwise answer a second presentation of
+	// the pod's token inside 30s from memory, uncounted.
+	h := startHarness(t, sessionMap, sessionTokens(), withGrantTTL(reuseGrantTTL), withoutReviewCache(),
 		watchingTokenReviews(func(token string) func() {
 			if token == tokenPodA {
 				reviews.Add(1)

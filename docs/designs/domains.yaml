@@ -58,7 +58,7 @@
 # only a roster line counts as coverage.
 # consistency is the exception since 2026-10-26: its seat is the full drift
 # audit, consistency-drift-outlier, which runs at about 200s a repetition on
-# the claude-opus-5-5 agent model.
+# the agent model of 2026-10-19.
 
 # Not a domain, and no case claims it: who a nightly eval failure caused by
 # infrastructure (pool projects, seeded fleet, CI, Prow) is filed to. Area
@@ -146,6 +146,9 @@ domains:
     owner: bradhoekstra
     backup: jayantid
     meaning: Checks that metrics, traces and alerts are wired up and readable.
+    # Covered since 2026-11-02 by monitoring-alert-policy-read, whose own tofu
+    # stack plants one disabled alert policy per repetition; no seeded-fleet
+    # role and no probe.
     journey: A question about scraping, trace latency or an alert policy is answered from the live configuration, or written to the observability skill's guidance
   - slug: source-control
     name: Source control (forge and version-control work)
@@ -174,6 +177,12 @@ domains:
 # when incident-triage-oom-event-probe took a roster seat (#1023).
 # source-control came off on 2026-10-23, when vcs-spent-branch-reuse took a
 # roster seat on its nightly record.
+# observability sat here from the day its row was added (#3437; dated
+# 2026-10-19; tracked by #3980, then #4095) until 2026-11-02, when
+# monitoring-alert-policy-read took a roster seat on its nightly record. Its
+# seat is not a seeded-fleet probe: a tofu stack plants one disabled alert
+# policy in the leased project per repetition, and the case grades that the
+# agent reads it from Cloud Monitoring through the broker.
 #
 # An entry goes back on here only alongside a scenario that stopped running,
 # or arrives with a new row whose cases have no roster line yet. A roster
@@ -209,15 +218,10 @@ allowlist:
   # canary took its roster line on 2026-11-02 (#2013 step 4, #4094).
   # incident-triage sat here from 2026-09-03 to 2026-09-22 for the same
   # shape of reason.
-  # observability: every case claiming it has been a nightly case since the
-  # row was added (#3437), so it has never had a roster case. Delete this
-  # record in the pull request that gives the domain a roster line.
+  # observability sat here from 2026-10-19 (#3437 added the row with every
+  # case a nightly case; #3980, then #4095) until monitoring-alert-policy-read
+  # took its roster line on 2026-11-02.
   # source-control sat here beside it until vcs-spent-branch-reuse took its
   # roster line on 2026-10-23, and consistency from its probe's demotion on
   # 2026-10-21 (#3598) until consistency-drift-outlier took its roster line on
   # 2026-10-26.
-  - slug: observability
-    since: 2026-10-19
-    issue: 3980
-    expires: 2026-11-09
-    why: "Uncovered before records expired; the first dated expiry, set on 2026-10-26, is 14 days from that day, and no observability case is near the admission bar yet, so #3980 asks for a fixed or new case."

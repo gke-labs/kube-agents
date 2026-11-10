@@ -89,6 +89,32 @@ The gateway supplies the value as a fallback default when a request omits `max_t
 
 On non-adaptive Anthropic Claude models, LiteLLM maps `fallback.reasoningEffort` (`low`, `medium`, `high`) to `thinking.budget_tokens` (`1024`, `2048`, `4096`), and Anthropic requires `max_tokens > thinking.budget_tokens`. When setting `litellm.maxTokens` alongside `fallback.reasoningEffort` on a Claude model, set `maxTokens` strictly above that effort budget (for example, `> 4096` for `high`).
 
+### Setting a spend ceiling
+
+`LITELLM_BUDGET_USD` is the most the gateway spends, in US dollars as LiteLLM's cost map prices each response, in every window of `LITELLM_BUDGET_PERIOD` (a LiteLLM duration: a whole number and `s`, `m`, `h`, `d`, `w` or `mo`; the default is `1d`). Set both in `install.env` (there is no flag) and re-run `upgrade.sh`; they reach the Terraform example as `litellm_budget` and the chart as `litellm.budget.usd` and `litellm.budget.period`. On a direct Helm install set them through a values file or `--set-json litellm.budget.usd=25`: `--set` passes a decimal as a string, which the schema refuses.
+
+At the default of `0` nothing is rendered and the gateway config is what it was. On, the amount is at least `0.01`: the installer, the Terraform example and the chart's schema all refuse less, before any apply, because a smaller amount splits into per-replica shares the chart cannot render.
+
+The chart renders the ceiling as LiteLLM's provider budget for the one provider every alias routes to, with the amount split evenly across `litellm.replicaCount`. With `MODEL_PROVIDER=vertex_ai`, `LITELLM_BUDGET_USD=10` and the default two replicas the config reads:
+
+```yaml
+router_settings:
+  provider_budget_config:
+    vertex_ai:
+      budget_limit: 5.0000
+      time_period: "1d"
+```
+
+LiteLLM counts spend per gateway process, in memory, and the chart runs no Redis to share the count, so each replica holds one share. Uneven traffic can make one replica refuse before the install has spent the whole amount. The ceiling is a bound on a runaway, not a ledger. LiteLLM checks the share before a call and charges the call's cost after the call completes. Every call in flight when a share is crossed therefore completes and is charged, so a replica can end a window over its share by the cost of those calls. The Platform Agent runs several workers, and a streamed turn lasts minutes.
+
+A rolling update adds a third pod with a share of its own while it lasts, and a gateway restart or rollout starts that pod's count over.
+
+A replica whose share is spent refuses every model call until its window ends. The first window of a gateway process starts when the pod starts, not at its first spend; once a window has expired, the next spend opens the next one. The caller gets HTTP 429 with `No deployments available - crossed budget: Exceeded budget for provider vertex_ai: <spend> >= <limit>`, and the gateway logs the same line. The agent's turn fails as it does on a rate limit; nothing on the `PlatformAgent` reports the state yet.
+
+Each gateway pod exports the remaining share as `litellm_provider_remaining_budget_metric{api_provider="vertex_ai"}` on its `/metrics`, which the chart's `PodMonitoring` collects. The series appears at the pod's first routing decision and is set on every one: the share less the spend charged so far, at or below `0` while the replica refuses, negative by the in-flight overshoot. `sum` it over the gateway pods for the install's remaining budget. The per-key and per-team budget series keep reading `inf`: they describe LiteLLM virtual keys, which this install does not use.
+
+A model that LiteLLM's cost map does not price costs `0` on every call, so `litellm_spend_metric` does not move and the ceiling is never reached. Check that the series moves on your model before you rely on the ceiling. A ceiling whose per-replica share would round to `0.0000` fails the render, because LiteLLM reads a `budget_limit` of `0` as no limit; raise the amount or lower `litellm.replicaCount`. Why the ceiling is split rather than shared, and what is still to come on the `PlatformAgent`: [`docs/designs/gateway-spend-cap.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/gateway-spend-cap.md).
+
 ### Fallback alias and parameter dropping
 
 Two chart blocks, both off by default, add a fallback alias and router retry limits when a primary call fails. At their defaults nothing is rendered, so the gateway config and its rollout checksum are what they were.
@@ -180,6 +206,14 @@ Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into
 The chart reads the same provider and model name as the sampling-key drop above, with one difference: a Claude model behind `sap` gets the drop and no breakpoints. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
 
 A caller can also bring its own markers. Claude Code marks its prompt-cache breakpoints itself, and the A2A worker adapter points it at the gateway without telling it which model is behind `model-default`. On a Gemini model LiteLLM would turn those markers into the same explicit-caching create, and `gemini-4-argon`, which has no explicit caching, answers every such request 400. The chart loads a pre-call hook that removes a caller's `cache_control` markers from a request bound for a Gemini model and leaves a request to any other model as sent. The gateway log records each request it changed, as `kube_agents.litellm_cache_control_strip INFO cache markers: dropped N cache_control marker(s) bound for a Gemini model`. The kustomize dev copy does not load it.
+
+Implicit caching lives on the Vertex replica that served the request. Without a `session_id`, Vertex picks the replica from the system prompt and the first message. A conversation's later turns read its own earlier ones, but the first turn of a new conversation lands somewhere new. It pays full price for a system prompt and tool list that another conversation sent moments before.
+
+Setting `litellm.vertex.sessionAffinity.enabled=true` on a `vertex_ai` install adds a pre-call hook that sends each Gemini conversation a `session_id`. The id is the same on every turn and on every gateway replica, and conversations with the same prompt share it. A new conversation therefore lands on a replica that another used in the last few minutes, while it is still warm. `slots` (default 2) is how many ids one prompt is spread across; 1 puts every concurrent conversation of a profile on one replica, which queues.
+
+Vertex honours `session_id` only on a project with session routing enabled (its `LLM_SESSION_ID` label), and elsewhere accepts the field and ignores it. A `session_id` the caller sets in `extra_body` is kept. The hook runs after redaction, so the id never comes from text redaction removed; with redaction on, set `SESSION_KV_SALT` so its pseudonyms, and the ids, match across gateway replicas. The gateway log says `session affinity: sending session_id` on the first request it stamps, and `session affinity: new conversation` on each conversation's first request, with short digests of the prompt and tool list the id came from and never their text. The value is chart-only: the kustomize dev copy has no equivalent, and `terraform/examples/full-install` reaches it through `extra_helm_values`.
+
+The `LLM_SESSION_ID` label is granted per project on request, with no documented customer process, and the gateway logs the same lines whether or not a project has it. The value is unsupported: it carries no compatibility promise and may change meaning, change default or be removed between releases, so an install that sets it re-checks it at every upgrade.
 
 ### Gemini's thoughts
 

@@ -106,6 +106,7 @@ ENABLE_GKE_BACKUP_PLAN:ENABLE_GKE_BACKUP_PLAN
 ENABLE_PUBSUB_PLATFORM:ENABLE_PUBSUB_PLATFORM
 ENABLE_STOCKOUT_INVESTIGATOR:ENABLE_STOCKOUT_INVESTIGATOR
 ENABLE_DRIFT_DETECTOR:ENABLE_DRIFT_DETECTOR
+HELM_UPGRADE_INSTALL:HELM_UPGRADE_INSTALL
 REGISTRY_PREFIX:REGISTRY_PREFIX
 THIRD_PARTY_REGISTRY_PREFIX:THIRD_PARTY_REGISTRY_PREFIX
 NAMESPACE:NAMESPACE
@@ -265,6 +266,12 @@ export MEMORY
 platform_agent_mode_resolve
 
 
+# The token minter's names, by the same rule as provision_environment.sh's
+# rebuild path (minter_environment_names.sh).
+# shellcheck source=scripts/release/minter_environment_names.sh
+. "$(dirname "${BASH_SOURCE[0]}")/minter_environment_names.sh"
+minter_environment_names
+
 # ---------------------------------------------------------------------------
 # Write it
 # ---------------------------------------------------------------------------
@@ -297,6 +304,8 @@ done
 
 # MEMORY is derived above rather than mapped, so it is emitted on its own.
 emit MEMORY "${MEMORY}"
+# So is the minter's GSA name, set above only for an environment with the minter.
+emit GITHUB_MINTER_GSA_NAME "${MINTER_ENVIRONMENT_GSA_NAME:-}"
 
 chmod 600 "$OUT_PATH"
 

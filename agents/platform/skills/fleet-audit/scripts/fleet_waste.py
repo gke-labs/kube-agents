@@ -9,7 +9,8 @@ governance/fleet_wide_cost_analysis_sop.md.
 
 This stream's own collector: its targets are both GKE clusters (the fifteen
 `kubectl` object kinds in `CLUSTER_DUMP_KINDS`, a Cloud
-Monitoring usage read, `gcloud container node-pools list`, and §3.7's
+Monitoring usage read, the node pools (the discovery `clusters list` item's
+`nodePools`, else `gcloud container node-pools list`), and §3.7's
 `gcloud container operations list` for `CREATE_NODE_POOL`, which dates each
 pool; a pool with no such operation is dated from the cluster's `createTime`,
 and only a failed operations read falls back to node age, with a limitation)
@@ -78,8 +79,11 @@ from typing import Any, Callable, NamedTuple
 MANIFEST_VERSION = 1
 # The manifest's `audit` field: the stream this collector feeds.
 AUDIT_NAME = "fleet-wide-cost-analysis"
-# The one `kubectl get` each collected cluster costs. The SOP quotes this list
-# to tell the model which kinds not to read again.
+# The kinds each collected cluster is read for, one paged `kubectl get --raw`
+# read per kind (collector_run.paged_dump) rather than one `-A -o json` dump,
+# which a cluster of a few hundred nodes takes past the credential proxy's
+# output cap. The SOP quotes this list to tell the model which kinds not to
+# read again.
 CLUSTER_DUMP_KINDS = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
 # A digest of this file, published as `checks_revision`. The manifest contract
@@ -104,7 +108,7 @@ DEFAULT_TIMEOUT_S = 60
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
 # reads -- so the width is the one every other collector in the stream uses,
 # broker_admission.sweep_width(), resolved in collect_fleet (collect.py's
-# comment above its own collect_fleet has the reasoning). Six at the default
+# comment above its own collect_fleet has the reasoning). Five at the default
 # broker, inside urllib3's default connection pool of ten for the shared
 # Monitoring session; a broker configured past twelve slots makes urllib3 warn
 # that the pool is full and open the extra connections anyway.
@@ -872,7 +876,11 @@ def log(msg: str) -> None:
 
 
 Run = collector_run.Run
+listing_fields = collector_run.listing_fields
+listed_node_pools = collector_run.listed_node_pools
 run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
@@ -1108,9 +1116,14 @@ def _describing_once(run: RunFn) -> RunFn:
 
 
 def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[dict]]:
-    result = run(
-        ["gcloud", "container", "clusters", "list", "--project", project, "--format", "json(name,location,status,autopilot.enabled,createTime)"]
-    )
+    # `nodePools` so the Standard clusters' idle-nodepool read can take them
+    # from here (`collector_run.listed_node_pools`); the projection gains that
+    # sub-object and nothing else.
+    listing_argv = [
+        "gcloud", "container", "clusters", "list", "--project", project,
+        "--format", "json(name,location,status,autopilot.enabled,createTime,nodePools)",
+    ]
+    result = run(listing_argv)
     if result.rc != 0:
         # Discovery lists no project, so this is where a project whose
         # Kubernetes Engine API is off first answers: with no cluster.
@@ -1140,6 +1153,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
             "project": project,
             "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
             "create_time": c.get("createTime") or "",
+            **listing_fields(c, listing_argv),
         }
         for c in clusters
         if c.get("status") in AUDITABLE_STATUSES
@@ -4603,16 +4617,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", CLUSTER_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(dump_argv, run=run, env=env)
+    # Any kind's page failing fails the whole cluster closed: read as empty,
+    # it would be a cluster with no Services or volumes -- which 3.4 and 3.6
+    # then take as proof a project's disks and rules are nobody's.
+    dump_kinds = CLUSTER_DUMP_KINDS.split(",")
+    parsed, result = paged_dump(dump_kinds, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
-        # Read as empty, it would be a cluster with no Services or volumes --
-        # which 3.4 and 3.6 then take as proof a project's disks and rules are
-        # nobody's.
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}, empty_facts
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
+    dump_record = _record(paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
     release_index = _releases_by_object(parsed, releases, name)
@@ -4682,10 +4694,20 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         # were checked and were fine. An answer that parses to anything but a
         # list of objects (an error object, a stray string) is as unread: one
         # key read as a sole pool, and more crashed the cluster on a string.
-        parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+        #
+        # Taken from the discovery listing when it carried the pools, and
+        # recorded against that listing's command, the read that returned them.
+        pools_result, unlisted = listed_node_pools(cluster)
+        if pools_result is not None:
+            parsed_pools = json.loads(pools_result.stdout)
+            pools_command = shlex.join(pools_result.argv)
+        else:
+            log(f"{project}/{location}/{name}: {unlisted}; reading node-pools list")
+            parsed_pools, pools_result = run_and_gate(node_pools_argv, run=run)
+            pools_command = shlex.join(node_pools_argv)
         pools_readable = isinstance(parsed_pools, list) and all(isinstance(p, dict) for p in parsed_pools)
         node_pools = parsed_pools if pools_readable else []
-        pools_record = _record(shlex.join(node_pools_argv), pools_result)
+        pools_record = _record(pools_command, pools_result)
         if not pools_readable:
             pools_failure = (
                 "returned output that is not a JSON list of node pools (rc=0)"

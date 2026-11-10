@@ -1670,10 +1670,7 @@ class NearDeadline(unittest.TestCase):
             "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 2 runs)",
             result["evidence"],
         )
-        post = post_health.render_near_deadline(result)
-        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout.", post)
-        self.assertNotIn("killed at the deadline", post)
-        self.assertNotIn("Not a break", post)
+        self.assertEqual(post_health.near_deadline_digest_line(result["near_deadline"]), "slowest run 360 min, at the timeout")
 
 
 # --------------------------------------------------------------------------- #
@@ -1813,7 +1810,7 @@ class PeriodicNote(unittest.TestCase):
         # A previous health.json without counts yet (the first tick after the
         # counts ship); a tick with none at all is the test below.
         first = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(minutes=5), passed=False, build="100", artifact=fail)}, prev={})
-        self.assertEqual(first["periodics"], {}, "one failed ten-minute run is not news")
+        self.assertEqual(first["periodics"], {}, "one failed sweep run is not news")
         self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
         second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
         self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
@@ -1832,7 +1829,7 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(blind["periodics_streaks"][self.SWEEP]["runs"], 1)
 
     def test_an_overdue_job_is_stale_and_no_readings_is_no_note(self):
-        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=2))})
+        stale = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 - timedelta(hours=3))})
         self.assertEqual(stale["periodics"][self.SWEEP]["verdict"], "STALE")
         blind = self.judge(None)
         self.assertEqual((blind["periodics"], blind["periodics_read"]), ({}, []))
@@ -1866,6 +1863,28 @@ class PeriodicNote(unittest.TestCase):
 
 
 class PoolNote(unittest.TestCase):
+    def test_the_cap_messages_worst_wait_is_the_breached_days_not_the_windows(self):
+        # A single long wait on a quiet day moves no percentile and breaches
+        # nothing; the note quotes the longest wait among the days that did.
+        artifact = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        artifact["trend"]["worst_minutes"] = 300.0
+        note = health.pool_note(artifact, T0, None)
+        self.assertEqual((note["worst_s"], note["breached_days"]), (int(175.2 * 60), ["2026-09-06"]))
+        # Another job's output: a day row whose worst is not a number neither
+        # wins nor blocks the fallback to the window's.
+        bad = pressure(verdict="BREACH", cause="CONCURRENCY_CAP", free=4)
+        bad["trend"]["worst_minutes"] = 300.0
+        for row in bad["trend"]["days"]:
+            if row.get("breached"):
+                row["worst_minutes"] = True
+        self.assertEqual(health.pool_note(bad, T0, None)["worst_s"], 300 * 60)
+        # A `breached_days` that is not a list is no days, not a crashed tick
+        # and not a day per character.
+        for wrong in (True, 1, "2026-09-06", {"2026-09-06": 1}):
+            with self.subTest(breached_days=wrong):
+                bad["trend"]["breached_days"] = wrong
+                self.assertEqual(health.pool_note(bad, T0, None)["breached_days"], [])
+
     def test_a_breach_quotes_the_day_it_breached_on_not_the_window(self):
         # The #1069 incident's shape. The seven-day window keeps its quiet
         # default of 0.4/0.5 min throughout: the periodic breaches on a day's
@@ -1898,6 +1917,11 @@ class PoolNote(unittest.TestCase):
                 "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
+                # The cap message's facts: the breached day, its longest wait,
+                # and how many are queued now (the fixture's queue.waiting).
+                "breached_days": ["2026-09-06"],
+                "worst_s": int(175.2 * 60),
+                "waiting": 0,
             },
         )
         self.assertIn(

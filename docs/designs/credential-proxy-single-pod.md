@@ -41,19 +41,19 @@ keep state in the process or in the pod's emptyDir:
   lookup. A probe that reaches another pod finds an empty window and is refused, so the
   publisher's run fails closed.
 
-- The content workspace. Handles live under `<state-dir>/workspace` in the pod's own
-  emptyDir; `CREDENTIAL_PROXY_WORKSPACE_ROOT` is deliberately unset, because the sandbox's data
-  claim is `ReadWriteOnce` and a separate pod cannot mount it. An `open` on one pod followed by
-  a `commit` on another fails with `NoSuchHandle`.
 - The Google Chat relay. A pull keeps its `receipt → ack_id` map in the process that pulled.
 - The Slack relay. Each pod opens its own Socket Mode connection, and Slack spreads events
   across the connections. The relay acknowledges an event to Slack when it arrives and holds it
   in an in-process queue, and a pull keeps its `receipt → event` map in the process that pulled.
   A settle that reaches the other pod fails, so a requeue after a failed turn loses the event.
 
+The content workspace was on this list until it was retired (#4243). Its handles lived in the
+pod's emptyDir, so an `open` on one pod followed by a `commit` on another failed with
+`NoSuchHandle`.
+
 The drift detector is not in this list: it runs in the gateway pod, and the broker's watcher route
 only forwards its calls and caches the endpoints. The event watcher's dedup snapshots would use the
-same workspace root, but the watcher does not run in the broker role.
+broker's workspace root, `<state-dir>/workspace` in the pod's own emptyDir, but the watcher does not run in the broker role.
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) ("One replica") gave the Slack relay as
 the first reason for one replica; this document owns the decision now.
 
@@ -64,7 +64,13 @@ What one pod costs is a gap on every eviction, drain and rollout, and the gap is
 than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
 seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
 back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
-replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
+replacement. The standalone broker also drains: it keeps the health probe, the event pulls, the
+settle routes and the Chat reply routes open for the whole drain, answers every other new request `503` with the `draining`
+bound, stops taking Slack events, and gives the requests in flight up to 30 s to finish.
+It then ends the commands still running, which answer exit 143 with a line that says why, waits a
+few seconds for those answers, and stops. Its pod's `terminationGracePeriodSeconds` of 45 s holds
+the drain and the entrypoint's stop of Envoy after it. The drain is bounded because `Recreate`
+leaves no other broker serving while it runs. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
 AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
 protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
 `PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
@@ -83,10 +89,11 @@ two replicas, with the operator scaled to zero so it would not restore `Replicas
   reached the pod that did not pull about half the time and got `404 {"settled": false}`. Each
   turn still completed once in the run, but two missed acks in a row would pass the
   subscription's 60-second ack deadline, and the turn would run twice.
-- Content workspace: breaks by construction (§2). Not run live: the install had no forge.
+- Content workspace: broke by construction (§2). Not run live: the install had no forge. It is
+  now retired (#4243).
 
 A bare replica count is therefore not shippable: it brings the ack failures to every install
-with chat enabled and the workspace break to every install with a forge.
+with chat enabled.
 
 ## 4. The load this is sized against
 
@@ -94,8 +101,8 @@ The question came from a 143-cluster install where the single pod sat at its CPU
 fleet sweeps and was OOM-killed. Since then:
 
 - The child memory budget stops the OOM. On Standard the default limit is 2Gi: the budget
-  admits nine requests, and the slot cap holds it to eight. On Autopilot without bursting the limit
-  is clamped to the 2Gi Autopilot request, so the budget admits the same nine there.
+  admits ten requests, and the slot cap holds it to eight. On Autopilot without bursting the limit
+  is clamped to the 2Gi Autopilot request, so the budget admits the same ten there.
 - The Controller Stall Watch reuses kubeconfigs across ticks, which removed about 290
   `get-credentials` calls per tick; each cluster's credentials are now fetched about once a day.
 - The reconciler's and the stall watch's listing pools are four wide, sized to the four requests
@@ -109,16 +116,15 @@ proxy's memory request was raised to 1Gi had no waits in 783 commands.
 ## 5. Shapes considered
 
 1. Split the exec route into its own tier. The exec route behind its own Deployment and
-   Service, with a replica count on the CR, while the relays and the content workspace stay on
+   Service, with a replica count on the CR, while the relays stay on
    one pod. (A variant keeps one Deployment and has Envoy route the stateful verbs to one stable
    pod.) The load is all on the exec route, and that route already works
    across pods (§3) for every role but `scope`, which stays on the stateful pod with its member
    window (§2). The cost is a second footprint entry, a second NetworkPolicy target, and
    the shim learning a second address. This is the shape to build if the question reopens (§6).
-2. Sticky routing by workspace or receipt. One Deployment with N replicas and the calls
+2. Sticky routing by receipt. One Deployment with N replicas and the calls
    that need state routed to the same pod. Rejected: neither the shim nor the gateway's chat
-   client has stickiness today, a pod restart still loses the workspaces it held, and the vcs
-   verbs that name no workspace still need an answer.
+   client has stickiness today, and a pod restart still loses the state it held.
 3. A bare replica count. Rejected by the measurement in §3.
 4. Stay on one pod and reduce the load. Chosen (§1, §4).
 

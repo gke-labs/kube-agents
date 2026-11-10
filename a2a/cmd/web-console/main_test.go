@@ -1670,6 +1670,25 @@ console.log(JSON.stringify([
 	}
 }
 
+// A provider select with no option for a repository's provider shows GitHub,
+// and the next save moves the repository onto a GitHub forge.
+func TestPageProviderSelectsListEveryAllowedProvider(t *testing.T) {
+	for _, start := range []string{
+		`id="repo-split-infra-provider"`,
+		`id="repo-split-iam-provider"`,
+		`id="repo-split-workloads-provider"`,
+		`id="repo-mono-provider"`,
+		`class="input-box custom-repo-provider"`,
+	} {
+		sel := pageSnippet(t, start, "</select>")
+		for provider := range allowedForgeProviders {
+			if !strings.Contains(sel, `<option value="`+provider+`"`) {
+				t.Errorf("select %s has no option for provider %q", start, provider)
+			}
+		}
+	}
+}
+
 func TestPageStreamedRepliesDoNotPileUpArtifacts(t *testing.T) {
 	script := `const SKILL_BY_NAME = {}; const skillUsage = new Map();
 ` + pageJS(t, "escapeHtml", "skillInfo", "renderInline", "artifactSeq", "artifactStore", "artifactIdByKey", "registerArtifact", "renderMarkdown") + "\n" +

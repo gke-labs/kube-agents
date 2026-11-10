@@ -795,6 +795,22 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
     def _run_recording(self, overrides):
         return self._run(overrides, install_body=f'echo "install: $*" >> "{MOCK_CALLS_LOG}"\n')
 
+    def test_a_rebuild_with_the_minter_names_the_project_wide_key(self):
+        """After the teardown the state holds no minter, so unnamed the install would derive names with no key (#3504)."""
+        body = f'echo "minter: $KMS_KEYRING|$KMS_KEY|${{GITHUB_MINTER_GSA_NAME:-}}" >> "{MOCK_CALLS_LOG}"\n'
+        proc, tmp_dir = self._run(
+            {"GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "12345"}, install_body=body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("minter: github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa",
+                      self._install_call(tmp_dir))
+        # An environment's own names win, and one without the minter gets none.
+        proc, tmp_dir = self._run(
+            {"GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "12345", "KMS_KEYRING": "env-ring",
+             "KMS_KEY": "env-key"}, install_body=body)
+        self.assertIn("minter: env-ring|env-key|", self._install_call(tmp_dir))
+        proc, tmp_dir = self._run({}, install_body=body)
+        self.assertIn("minter: ||", self._install_call(tmp_dir))
+
     def test_a_truthy_spelling_reaches_the_flag_as_true(self):
         for name, flag in self._TOGGLES.items():
             for spelling in TRUTHY_BOOLEAN_INPUTS:
@@ -842,6 +858,24 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
                     (tmp_dir / MOCK_CALLS_LOG).exists(),
                     "the guard must fire before install.sh is invoked",
                 )
+
+    def test_a_misspelt_helm_upgrade_install_is_refused_before_the_teardown(self):
+        """HELM_UPGRADE_INSTALL is no flag, but its generator refuses a typo too.
+
+        That refusal comes from install.sh's tfvars generator, after the
+        teardown, so the same guard runs first. Recognised spellings pass.
+        """
+        proc, tmp_dir = self._run_recording({"HELM_UPGRADE_INSTALL": "ture"})
+        self.assertNotEqual(proc.returncode, 0, "a non-boolean spelling must not provision")
+        combined = proc.stdout + proc.stderr
+        self.assertIn("HELM_UPGRADE_INSTALL", combined)
+        self.assertIn("::error", combined)
+        self.assertNotIn("Tearing down the existing environment", combined)
+        self.assertFalse((tmp_dir / MOCK_CALLS_LOG).exists())
+        for spelling in ("true", "True", "false", "off"):
+            with self.subTest(spelling=spelling):
+                proc, _ = self._run_recording({"HELM_UPGRADE_INSTALL": spelling})
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_a_whitespace_only_value_is_refused_rather_than_read_as_false(self):
         """A space is not an answer, and `false` is the dangerous guess.

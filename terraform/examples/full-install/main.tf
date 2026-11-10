@@ -450,6 +450,16 @@ module "gke_cluster" {
   enable_backup_agent        = var.enable_backup_agent
   enable_gvisor_node_pool    = var.enable_gvisor_node_pool
   gvisor_pool_name           = var.gvisor_pool_name
+  sizing_profile             = var.sizing_profile
+  standard_machine_type      = var.standard_machine_type
+  standard_node_count        = var.standard_node_count
+  standard_disk_size_gb      = var.standard_disk_size_gb
+  standard_disk_type         = var.standard_disk_type
+  gvisor_machine_type        = var.gvisor_machine_type
+  gvisor_min_node_count      = var.gvisor_min_node_count
+  gvisor_max_node_count      = var.gvisor_max_node_count
+  gvisor_disk_size_gb        = var.gvisor_disk_size_gb
+  gvisor_disk_type           = var.gvisor_disk_type
 
   resource_labels = {
     "kube-agents-host" = "true"
@@ -743,8 +753,23 @@ module "github_minter" {
   service_account_id = var.github_minter_service_account_id
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
+  # The owning install, which lifecycle.sh's adoption step checks before it
+  # imports a key ring or key this state doesn't hold (#3504). None on a key
+  # this install shares on purpose: the labels stay its owner's. `labels` on
+  # the crypto key is non-authoritative (provider 5.x), so an empty map leaves
+  # the owner's labels where they are rather than removing them.
+  owner_labels = var.github_minter_shared_kms_key == "${var.github_minter_kms_keyring}/${var.github_minter_kms_key}" ? {} : {
+    "kube-agents-cluster"   = var.cluster_name
+    "kube-agents-namespace" = var.namespace
+  }
+  owner_description = "kube-agents GitHub token minter for install ${var.cluster_name}/${var.namespace}"
 
-  depends_on = [google_project_service.required]
+  # module.gke_cluster for the reason module.kube_agents_iam's depends_on
+  # states in full: the module's workload_identity binding names the pool as
+  # an interpolated string, so Terraform sees no edge to the cluster whose
+  # creation brings the pool into existence, and on a first install into a new
+  # project the binding fails with "Identity Pool does not exist".
+  depends_on = [google_project_service.required, module.gke_cluster]
 }
 
 # Stockout Investigator Pub/Sub Infrastructure (Topic, Subscription, Logging Sink, IAM).
@@ -901,6 +926,26 @@ resource "helm_release" "kube_agents" {
   wait    = true
   timeout = 600
 
+  # Opt-in (HELM_UPGRADE_INSTALL in install.env). The helm provider can drop a
+  # live release from state when a refresh lookup errors
+  # (hashicorp/terraform-provider-helm#1669), and the next apply then plans a
+  # create that fails with "cannot re-use a name that is still in use" (#4108).
+  # With this on, that create runs as `helm upgrade --install` and adopts the
+  # release. It adopts any release of this name in the namespace, including one
+  # another Terraform state or a manual `helm install` owns, so it is only for
+  # long-lived environments whose own state owns the release. Off, a conflicting
+  # first install fails loudly.
+  upgrade_install = var.helm_upgrade_install
+
+  # The chart's own version, stated so the provider never infers it. With
+  # upgrade_install on and version unset, the provider's plan asks the cluster
+  # for the installed release's version: that fails before the cluster exists,
+  # so a from-nothing install could not plan, and it plans the installed
+  # version, so the apply after any chart version change fails with
+  # "Provider produced inconsistent result". This is the value the provider
+  # computes from the chart anyway, so it changes no existing plan.
+  version = yamldecode(file("${path.module}/../../../charts/kube-agents/Chart.yaml")).version
+
   values = [yamlencode({
     # Reaches every image this release pulls, including the two the chart
     # does not render itself — the agent Deployment and the shell sandbox
@@ -989,6 +1034,14 @@ resource "helm_release" "kube_agents" {
             allowCidrs = var.litellm_redaction.allow_cidrs
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
+        }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
         }
       } : {}
     )

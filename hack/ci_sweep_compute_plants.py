@@ -8,8 +8,9 @@ and internal addresses. A run killed hard between `tofu apply` and
 resources behind.
 
 Why nothing in-job reaches them:
-- `hack/ci-teardown.sh` is Kubernetes-only (Helm uninstall, CRD deletes, and
-  label-sweeping in-cluster resources).
+- `hack/ci-teardown.sh` reaches the host cluster alone (Helm uninstall, CRD
+  deletes, label sweeps of in-cluster resources, and the host's node pools
+  through hack/ci_sweep_bench_plants.sh).
 - `reap_orphans` in `bench/tf/modules/cluster/gke/main.tf` only lists and
   reaps GKE clusters with `resourceLabels.managed-by=kube-agents-bench`; it
   does not run for stacks that create no cluster.

@@ -150,6 +150,11 @@ type flags struct {
 	reasons           string
 	namespaces        string
 	excludeNamespaces string
+	// alertExclude is the --alert-exclude JSON; see alertexclude.go.
+	alertExclude string
+	// alertExcludeFile names a file holding the same JSON, read again every
+	// --profiles-rescan so a change applies without a restart.
+	alertExcludeFile  string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -193,6 +198,10 @@ type flags struct {
 	snapshotInterval       time.Duration
 	gatewayURL             string
 	gatewayWait            time.Duration
+	// fleetShapeInterval is how often the fleet's shape (nodes, controllers,
+	// pods) is measured and published as the fleet gauges (fleetshape.go);
+	// 0 measures nothing and leaves the gauges at 0.
+	fleetShapeInterval time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -213,6 +222,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.reasons, "reason", "", "Comma-separated allow-list of Event.Reason values. Empty = shipped default set.")
 	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
+	fs.StringVar(&f.alertExclude, "alert-exclude", "", `JSON list of alert-exclude rules. An event any rule matches opens no incident; its cluster stays in scope for reads. Each rule sets one or more of cluster ({"projectId","location","clusterName"}, clusterName required), namespace, reason (the event's or its canonical reason), kind, and name (a trailing "*" is a prefix match); a rule matches when every part it sets matches. Empty = none.`)
+	fs.StringVar(&f.alertExcludeFile, "alert-exclude-file", "", "File holding the --alert-exclude JSON, read at startup and again every --profiles-rescan; a change applies to the events decided after it is read, and a malformed or unreadable change leaves the rules in force. Not set with --alert-exclude. Empty = no file.")
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -223,7 +234,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1, with --failedscheduling-min-span=0, = fire on the first event.")
 	fs.DurationVar(&f.failedSchedulingMinSpan, "failedscheduling-min-span", defaultFailedSchedulingMinSpan, "How long a FailedScheduling with no cluster-autoscaler verdict has to have lasted, by the event's own first and last sighting, before it fires, on top of --failedscheduling-min-count. Holds the burst a node scale-down drives the count through for a pod placed seconds later. 0 = off.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
-	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
+	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy, a Failed saying \"host IP unknown\"; the reasons kubelet re-emits while they last; and Config Connector's DependencyNotReady and Unmanaged) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread and onto its card (the card alone where no thread is routed). Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
@@ -231,8 +242,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
-	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. 0 = read the directory once, at startup.")
-	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list, or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
+	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. --alert-exclude-file is read again on the same interval. 0 = read the directory once, at startup.")
+	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list (every page of it, on a control plane without watch-list), or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -243,6 +254,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
 	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
 	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
+	fs.DurationVar(&f.fleetShapeInterval, "fleet-shape-interval", defaultFleetShapeInterval, "How often the fleet's shape is measured and published as the k8s_event_watcher_fleet_* gauges: every watched cluster's node count from its GKE description, and its pods, Deployments, StatefulSets, DaemonSets and CronJobs counted as one-item metadata-only lists (limit=1, Accept PartialObjectMetadataList) plus the server's remainingItemCount. Eight clusters at a time, 5s per call. 0 = off (the gauges stay at 0).")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -349,8 +361,14 @@ func (f *flags) validate() error {
 	if f.profilesRescan < 0 {
 		return errors.New("--profiles-rescan must be >= 0 (0 = read the directory once)")
 	}
+	if f.alertExclude != "" && f.alertExcludeFile != "" {
+		return errors.New("set --alert-exclude or --alert-exclude-file, not both")
+	}
 	if f.initialListConcurrency < 0 {
 		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
+	}
+	if f.fleetShapeInterval < 0 {
+		return errors.New("--fleet-shape-interval must be >= 0 (0 = off)")
 	}
 	if strings.HasSuffix(f.gatewayURL, "/") {
 		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
@@ -457,12 +475,28 @@ func preferProtobuf(cfg *rest.Config) {
 // newClusterClient builds the clientset every watched cluster is read with,
 // from a config preferring protobuf (see preferProtobuf).
 func newClusterClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	client, _, err := newClusterClients(cfg)
+	return client, err
+}
+
+// newClusterClients is newClusterClient plus the client the Events watch is
+// opened with, whose connections are never reused (see watchConfig). Where cfg
+// doesn't qualify for that, the second is the first.
+func newClusterClients(cfg *rest.Config) (client, watchClient kubernetes.Interface, err error) {
 	preferProtobuf(cfg)
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err = kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes client: %w", err)
+		return nil, nil, fmt.Errorf("kubernetes client: %w", err)
 	}
-	return client, nil
+	watchCfg, separate := watchConfig(cfg)
+	if !separate {
+		return client, client, nil
+	}
+	watchClient, err = kubernetes.NewForConfig(watchCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("kubernetes watch client: %w", err)
+	}
+	return client, watchClient, nil
 }
 
 // targetCluster is one cluster the watcher should monitor, discovered from a
@@ -487,6 +521,11 @@ type targetCluster struct {
 	// order, which boot need not have chosen (a refused describe skips it).
 	Source string
 	Client kubernetes.Interface
+	// WatchClient is the client the Events watch is opened with: Client's
+	// twin with no pooled connections where Client shares the process's
+	// default transport (see watchConfig), else Client itself. Nil means
+	// Client, which is what a test's fake and the direct cluster leave.
+	WatchClient kubernetes.Interface
 	// Autopilot says this is a GKE Autopilot cluster, read off the describe
 	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
 	// FailedScheduling gate is the only reader: an Autopilot cluster with no
@@ -576,17 +615,18 @@ func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics,
 		if c.Profile == directProfile {
 			return targetCluster{}, fmt.Errorf("the profile directory name %q is reserved for the directly reached cluster; rename the profile", directProfile)
 		}
-		client, err := newClusterClient(c.Config)
+		client, watchClient, err := newClusterClients(c.Config)
 		if err != nil {
 			return targetCluster{}, err
 		}
 		return targetCluster{
-			Name:      c.Identity.Cluster,
-			ProjectID: c.Identity.Project,
-			Location:  c.Identity.Location,
-			Profile:   c.Profile,
-			Client:    client,
-			Autopilot: c.Autopilot,
+			Name:        c.Identity.Cluster,
+			ProjectID:   c.Identity.Project,
+			Location:    c.Identity.Location,
+			Profile:     c.Profile,
+			Client:      client,
+			WatchClient: watchClient,
+			Autopilot:   c.Autopilot,
 		}, nil
 	})
 	if err != nil {
@@ -628,8 +668,11 @@ type dispatcher struct {
 	// scaleUps carries cluster-autoscaler's verdict on a pod from the event that
 	// records it to the FailedScheduling events it qualifies. Per-cluster for
 	// the same reason; pod UIDs are unique across clusters regardless.
-	scaleUps  *scaleUpMemo
-	settles   *settleMemo
+	scaleUps *scaleUpMemo
+	settles  *settleMemo
+	// owners fills an admitted Pod event's controller_ref from the Pod's
+	// owner (ownerResolver); nil sends the field empty, as before.
+	owners    *ownerResolver
 	injector  *injector
 	metrics   *metrics
 	mode      string // "per-incident" or "shared"
@@ -662,6 +705,10 @@ type dispatcher struct {
 	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
 	// per change of answer.
 	noFollowupLogged atomic.Bool
+
+	// excluded sends the events alert-exclude rules hold back to the daemon,
+	// for the daily recap's count; nil in a dry run.
+	excluded *excludedRecorder
 }
 
 func (d *dispatcher) clock() time.Time {
@@ -681,7 +728,12 @@ func (d *dispatcher) clock() time.Time {
 // filter's config rather than the flag so the default applies when the flag
 // was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
+	var excluded *excludedRecorder
+	if inj != nil && !f.dryRun {
+		excluded = newExcludedRecorder((&excludedPoster{inj: inj}).Post)
+	}
 	return &dispatcher{
+		excluded:    excluded,
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
@@ -821,8 +873,8 @@ var podTemplateHashPodPattern = regexp.MustCompile(`^(.*?)-[4-9bcdf]{8,10}-[a-z0
 // named workloads held, whoever creates objects on the watched cluster. The
 // daemon keys every non-Pod object by its exact name because its row is a
 // database row, not a series; the label departs from it there and nowhere
-// else. The watcher sets no controller reference on its events (watcher.go),
-// so the name is what there is to fold.
+// else. The label is set before the owner lookup (ownerResolver), so it
+// folds by name only.
 func workloadOf(ev TriageEvent) string {
 	if !strings.EqualFold(ev.KindOfObject, kindPod) {
 		if _, ok := namedWorkloadKinds[strings.ToLower(ev.KindOfObject)]; ok {
@@ -878,7 +930,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	// A repeat blip on an event object kubelet kept from an earlier one
 	// carries that one's first sighting; the memo knows where this blip
 	// began, and the gate measures the span from there (settleMemo.BlipStart).
-	if settleApplies(canonical) {
+	if settleApplies(canonical, ev.Message) {
 		if start, ok := d.settles.BlipStart(ev, canonical, d.clock()); ok && start.After(ev.FirstSeen) {
 			ev.FirstSeen = start
 		}
@@ -893,7 +945,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// has to remember too: one that clears at two sightings and repeats
 		// inside the event's TTL would otherwise arrive at count three with
 		// the object's old first sighting and no tombstone to measure from.
-		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical, ev.Message) {
 			d.settles.Hold(ev, canonical, d.clock())
 		}
 		if gate == gateScaleUpMark {
@@ -906,13 +958,19 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		if gate == gateAlertExcluded && d.excluded != nil {
+			d.excluded.Note(ev)
+		}
 		// A sighting a gate stopped is still a sighting: an alerted object
 		// the scale-up hold keeps from Observe is not quiet.
 		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
-	if d.settles.Release(ev, canonical) {
+	// Only a sighting in the family releases a hold: every Failed on a pod
+	// shares one key, and a start error accepted on its first sighting is
+	// not the held "host IP unknown" lasting the period.
+	if settleApplies(canonical, ev.Message) && d.settles.Release(ev, canonical) {
 		d.metrics.settleOutcomes.WithLabelValues(ev.Cluster, ev.Project, ev.Location, canonical, settleOutcomeForwarded).Inc()
 		log.Printf("settled %s pod=%s/%s (count=%d, lasted %s); forwarding",
 			ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second))
@@ -969,6 +1027,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
+	}
+	// Looked up only for an event the filter and dedup admitted, so a
+	// cluster's event stream costs one Pod read per incident, not per event.
+	if ev.ControllerRef == "" && ev.KindOfObject == kindPod {
+		ev.ControllerRef = d.owners.ControllerRef(ctx, ev.Namespace, ev.Name, ev.Key.UID)
 	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
@@ -1076,11 +1139,17 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // the alert's thread and onto its card, the card alone where no thread is
 // routed (session_kv_server, _inject_followup). What the watcher
 // knows is silence, and the payload says so: the object was not read back,
-// since the broker's watcher route serves no pods, and a deleted pod and a
-// recovered one both go quiet. One per incident, held on the dedup entry so
+// since the broker's watcher route serves of a pod only its owner, never its
+// state, and a deleted pod and a recovered one both go quiet. One per incident, held on the dedup entry so
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
+	// Last, after the settle expiry and the follow-ups, whichever way the
+	// rest returns: they are what a reader sees, and the excluded records
+	// only feed the daily recap.
+	if d.excluded != nil {
+		defer d.excluded.Sweep(ctx)
+	}
 	now := d.clock()
 	quiet := d.filter.cfg.settle + settleQuietSlack
 	for _, h := range d.settles.Expire(now, quiet) {
@@ -1240,9 +1309,11 @@ func realMain(argv []string) error {
 
 	// Build components.
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
+	m := newMetrics()
+	// A malformed list fails open; see loadAlertExclude.
+	filterCfg.alertExclude = loadAlertExclude(f.alertExclude, m)
 	filter := newFilter(filterCfg)
 
-	m := newMetrics()
 	if f.dataVolume != "" {
 		m.registry.MustRegister(newDataVolumeCollector(f.dataVolume, dataVolumeStatfs))
 	}
@@ -1292,6 +1363,13 @@ func realMain(argv []string) error {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
+
+	// The rules file, read now, before any cluster starts, and again every
+	// --profiles-rescan: the operator's way to change the rules without a
+	// restart.
+	if f.alertExcludeFile != "" {
+		startAlertExcludeFile(ctx, f.alertExcludeFile, f.profilesRescan, filter, m)
+	}
 
 	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {
@@ -1362,6 +1440,17 @@ func realMain(argv []string) error {
 	if f.profilesDir != "" && f.profilesRescan > 0 {
 		log.Printf("k8s-event-watcher: re-reading %s every %s for profiles added, retried or removed (--profiles-rescan)", f.profilesDir, f.profilesRescan)
 		go runProfileReload(ctx, set, f.profilesDir, f.profilesRescan)
+	}
+
+	// The fleet's shape, measured now and every --fleet-shape-interval over
+	// the running set, so a cluster a rescan adds or removes is in or out of
+	// the next reading (see fleetshape.go). After the clusters are started
+	// and not before the gateway wait: the gauges are a reading of the fleet,
+	// not of the watcher's readiness, and a standby's reading is as true as
+	// the leader's.
+	if f.fleetShapeInterval > 0 {
+		log.Printf("k8s-event-watcher: measuring the fleet's shape now and every %s (--fleet-shape-interval)", f.fleetShapeInterval)
+		go runFleetShapeLoop(ctx, newFleetShapeProbe(set.clusters, m), f.fleetShapeInterval)
 	}
 
 	// Refuse to sit there watching nothing. Individual informers deliberately

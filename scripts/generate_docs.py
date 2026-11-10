@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib
 import json
 import os
 import re
@@ -111,6 +112,20 @@ SKILLS_CONCEPT_PAGE = REPO / "docs/site/src/content/docs/concepts/skills.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 IMAGES_PAGE = REPO / "docs/site/src/content/docs/deploy/docker-images.md"
 README = REPO / "README.md"
+# The replay baseline report's metric definitions, read from the script that
+# computes them (METRICS and CASE_METRICS).
+REPLAY_PROXY_DIR = REPO / "hack/replay-proxy"
+REPLAY_BASELINE_MODULE = "baseline_report"
+REPLAY_PROXY_README = REPLAY_PROXY_DIR / "README.md"
+REPLAY_METRICS_HEADER = (
+    "| Metric | Unit | Headline | Definition |",
+    "| ------ | ---- | -------- | ---------- |",
+)
+REPLAY_CASE_METRICS_HEADER = (
+    "| Case metric | Unit | Definition |",
+    "| ----------- | ---- | ---------- |",
+)
+HEADLINE_MARK = "yes"
 # A governance audit is a Platform Agent job that carries the fleet-audit skill;
 # that skill's tests hold this set equal to its audit catalogue. The prompt names
 # the audit's SOP by a path relative to the profile home.
@@ -326,6 +341,7 @@ CRON_CADENCE = {
     "50 8 * * *": "Daily 08:50",
     "45 7 * * *": "Daily 07:45",
     "0 8 * * *": "Daily 08:00",
+    "30 8 * * *": "Daily 08:30",
     "10 10 * * *": "Daily 10:10",
     "0 9 * * *": "Daily 09:00",
     "20 9 * * *": "Daily 09:20",
@@ -781,6 +797,30 @@ def gen_container_images() -> str:
     return "\n".join(out).rstrip()
 
 
+def load_replay_baseline_module():
+    """Import baseline_report.py from its own directory, where its sibling modules are."""
+    sys.path.insert(0, str(REPLAY_PROXY_DIR))
+    try:
+        return importlib.import_module(REPLAY_BASELINE_MODULE)
+    finally:
+        sys.path.remove(str(REPLAY_PROXY_DIR))
+
+
+def gen_replay_baseline_metrics() -> str:
+    module = load_replay_baseline_module()
+    out = list(REPLAY_METRICS_HEADER)
+    for metric in module.METRICS:
+        out.append(
+            f"| `{metric.name}` | {metric.unit} | {HEADLINE_MARK if metric.headline else ''} |"
+            f" {escape_cell(metric.definition)} |"
+        )
+    out.append("")
+    out.extend(REPLAY_CASE_METRICS_HEADER)
+    for metric in module.CASE_METRICS:
+        out.append(f"| `{metric.name}` | {metric.unit} | {escape_cell(metric.definition)} |")
+    return "\n".join(out)
+
+
 def run_crd_generator(api_dir: Path, kinds: tuple[str, ...]) -> dict:
     """Run ``gen_crd_docs.go`` over ``api_dir`` and return its JSON model.
 
@@ -892,6 +932,7 @@ BLOCKS: dict[str, tuple[tuple[Path, ...], Callable[[], str]]] = {
     "skill-catalog": ((SKILLS_PAGE,), gen_skill_catalog),
     "container-images": ((IMAGES_PAGE,), gen_container_images),
     "capabilities": ((README,), gen_capabilities),
+    "replay-baseline-metrics": ((REPLAY_PROXY_README,), gen_replay_baseline_metrics),
     **{
         f"{CRD_BLOCK_PREFIX}{kind.lower()}": ((page,), functools.partial(gen_crd_fields, kind))
         for kind, page in CRD_KINDS.items()

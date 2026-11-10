@@ -21,10 +21,11 @@ says "the worker ran the helper" holds only if its pattern tells a run from
 a read. This module runs the case's own ``forbidden_patterns`` against the
 ways a worker writes a token fetch or a bearer header, against the helper
 invocation the case wants, and against the plain grep for a forbidden word
-that a worker reading the skill runs, whose grep the case's ``exempt_patterns``
-remove through its pattern argument, so that a fetch sharing the line is
-graded, and which stops being exempt the moment a second
-command or a redirection shares the line; and it runs the route check's
+that a worker reading the skill runs, whose pattern argument the case's
+``exempt_grep_patterns`` removes, so that a fetch joined onto the line is
+graded, and which stops being exempt the moment a second command or a
+redirection other than ``>`` to /dev/null shares the line; and it runs the
+route check's
 ``required_patterns`` against the ways a worker runs the helper and the ways
 it reads the file without running it.
 A spelling named here that the case's list misses fails this suite rather
@@ -524,9 +525,11 @@ def test_each_route_pin_earns_the_verdict_the_case_header_states(rendered, typed
 
 
 @pytest.mark.parametrize("rendered, typed", CHAINED_RUNS)
-def test_the_rendering_alone_misses_a_chained_run(rendered, typed):
+def test_the_default_read_also_reaches_a_chained_run(rendered, typed):
+    # The rendered row names no helper. Without the switch the required check
+    # still reads the logged card's typed call beside its row (#4620).
     without = {k: v for k, v in _route_check().items() if k != "after_result_pattern"}
-    assert _route_status(without, [(rendered, typed)]) == "fail", "the rendered row names no helper; the switch is what reads the typed call"
+    assert _route_status(without, [(rendered, typed)]) == "pass", "the required check reads the logged card's typed call"
 
 
 @pytest.mark.parametrize("command", RUNS_THE_HELPER)

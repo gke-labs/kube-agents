@@ -1,8 +1,9 @@
-# FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
-# FIXTURE_NOT_READY (#2228), in no roster file under hack/eval/ until its
-# fixture exists in the pool. Red on main and green on the branch that lets
-# the fleet-audit sweep open `no-pdb` and two other checks at `major`
-# (MAJOR_SWEEP_CHECKS), on a dev install that carries the fixture below.
+# NIGHTLY (hack/eval/nightly-cases.txt). Every pool repository holds the
+# fixture below: scripts/provision_ci_pool_project.sh seeds it and
+# scripts/verify_ci_pool_project.py checks it (#2228). Red on main and
+# green on the branch that lets the fleet-audit sweep open `no-pdb` and two
+# other checks at `major` (MAJOR_SWEEP_CHECKS), on a dev install that
+# carries the fixture below.
 #
 # WHAT THIS GRADES THAT obtainability-planted-pdb DOES NOT. That case grades
 # the ledger: a finding filed on the planted workload. This one grades what
@@ -66,6 +67,9 @@ infrastructure:
 validated: false
 
 domain: reliability
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
 
 fixtures:
   - no-pdb-workload

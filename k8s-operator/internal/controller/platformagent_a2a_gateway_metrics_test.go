@@ -46,7 +46,8 @@ import (
 // ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector and the
 // operator, on the metrics port, and nobody else": the suite cannot run Go, and no golden
-// renders mode next, so this file is the contract between the two.
+// renders mode next with both doors armed (the next-mode golden is the example
+// CR, which arms neither), so this file is the contract between the two.
 //
 // Compared as parsed YAML, as the goldens are, because the file is kept in
 // prettier's style for CI's prettier check and the marshaller's is not.
@@ -155,6 +156,34 @@ func TestTheA2AGatewayDeclaresItsMetricsListener(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The gateway is not ready until its event relay binds (a2a/gateway's
+// ReadyzPath on the metrics listener), so the Deployment shows a gateway
+// waiting for the provision Job's TASKS stream instead of a crash loop. The
+// probe is served by the gateway's own listener on its named port, and
+// Recreate is what keeps it from opening a gap in a roll.
+func TestTheA2AGatewayIsReadyOnlyOnceItsRelayBinds(t *testing.T) {
+	dep := buildA2AGatewayDeployment(a2aTestAgent())
+	c := dep.Spec.Template.Spec.Containers[0]
+	if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet == nil {
+		t.Fatalf("the gateway container has no HTTP readinessProbe: %+v", c.ReadinessProbe)
+	}
+	get := c.ReadinessProbe.HTTPGet
+	if get.Path != "/readyz" || get.Port.String() != a2aGatewayMetricsPortName {
+		t.Errorf("readinessProbe GET %s on %s, want /readyz on %s", get.Path, get.Port.String(), a2aGatewayMetricsPortName)
+	}
+	if c.LivenessProbe != nil {
+		t.Errorf("a liveness probe would restart a gateway that is only waiting for TASKS: %+v", c.LivenessProbe)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("strategy %s: the probe was argued safe under Recreate", dep.Spec.Strategy.Type)
+	}
+	// A wait for TASKS past the 600s default would read ProgressDeadlineExceeded
+	// and end every `kubectl rollout status` early.
+	if pd := dep.Spec.ProgressDeadlineSeconds; pd == nil || *pd < 1800 {
+		t.Errorf("progressDeadlineSeconds %v: a gateway waiting on a slow provision Job outlives the 600s default", pd)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
@@ -59,11 +60,21 @@ const (
 )
 
 // gchatCommonEvent is commonEventObject of the add-on event object (and
-// `common` of the legacy one): the function a clicked button named and its
-// parameters.
+// `common` of the legacy one): the function a clicked button named, its
+// parameters, and the values of the card's inputs.
 type gchatCommonEvent struct {
 	InvokedFunction string            `json:"invokedFunction"`
 	Parameters      map[string]string `json:"parameters"`
+	// FormInputs is nil when the event carries no formInputs object, and
+	// empty when it carries one with no values.
+	FormInputs map[string]gchatFormInput `json:"formInputs"`
+}
+
+// gchatFormInput is one card input's value in formInputs.
+type gchatFormInput struct {
+	StringInputs struct {
+		Value []string `json:"value"`
+	} `json:"stringInputs"`
 }
 
 // gchatLegacyAction is `action` of the legacy CARD_CLICKED event: the
@@ -87,7 +98,11 @@ type gchatAccessoryWidget struct {
 }
 
 type gchatButton struct {
-	Text    string `json:"text"`
+	Text string `json:"text"`
+	// Type is FILLED on an emphasised button and empty otherwise; AltText
+	// is a rating button's accessible label.
+	Type    string `json:"type"`
+	AltText string `json:"altText"`
 	OnClick struct {
 		OpenLink struct {
 			URL string `json:"url"`
@@ -110,20 +125,29 @@ type gchatClick struct {
 	Function   string
 	Parameters map[string]string
 	EventTime  string
+	FormInputs map[string]gchatFormInput
+}
+
+// formValue is the value of the card input name, and whether the click
+// carried the card's inputs at all.
+func (c *gchatClick) formValue(name string) (value string, present bool) {
+	if c.FormInputs == nil {
+		return "", false
+	}
+	if v := c.FormInputs[name].StringInputs.Value; len(v) > 0 {
+		value = v[0]
+	}
+	return value, true
 }
 
 // gchatQuestion is a posted message with choice buttons, remembered so its
 // answer can rewrite it.
 type gchatQuestion struct {
 	conversation string
-	// thread is the thread the post landed in (createLaidOut's landed,
-	// EditNotifyMessage's thread; "" for an edit that names its
-	// conversation), read for a home post, whose conversation is empty.
-	thread  string
-	asks    bool
-	layout  gchatChatLayout
-	choices []string
-	links   []chatmsg.Link
+	asks         bool
+	layout       gchatChatLayout
+	choices      []string
+	links        []chatmsg.Link
 }
 
 // gchatPendingClick is a click handed to the gateway and not yet verified:
@@ -138,6 +162,9 @@ type gchatPendingClick struct {
 	// click is set for a click, which claims the question while it waits
 	// (waiting); a typed reply claims nothing and releases nothing.
 	click bool
+	// rating is the rating buttons the message carries as the click saw
+	// it: the adapter's record, or the event's copy after a restart.
+	rating gchatRating
 }
 
 // gchatUX is the click state, held under the adapter's lock. Each ring holds
@@ -157,15 +184,58 @@ type gchatUX struct {
 	waiting map[string]bool
 	// answered marks a question whose answer has been taken, and lines
 	// holds the line an answered message shows, which a later edit keeps.
-	answered     map[string]bool
-	lines        map[string]string
+	answered map[string]bool
+	lines    map[string]string
+	// shown is the layout the answered rewrite put on the message, set
+	// with lines, so a rating tap redraws the record rather than the
+	// event's copy (gchat_feedback.go, ratedLayout).
+	shown        map[string]gchatChatLayout
 	answeredRing []string
+	// rated is the rating buttons each rated answer carries, by message
+	// name (gchat_feedback.go), and ratedOrder its ring.
+	rated      map[string]gchatRating
+	ratedOrder []string
+	// tapped is the newest event time of a rating tap taken from each rater
+	// on each message (gchatTapKey), set when the tap is taken, before it
+	// is recorded, and tappedOrder its ring (gchat_feedback.go).
+	tapped      map[string]string
+	tappedOrder []string
+	// rewriting is the lock each message's rewrite holds from computing
+	// its layout to patching it (lockRewrite), by message name, held only
+	// while a rewrite holds or waits on it, so it needs no ring.
+	rewriting map[string]*gchatRewriteLock
+	// board is the layout each message whose rows carry Retry and Drop was
+	// last sent with, by message name; boardTaps the rows being tapped or
+	// settled, by message and row, each holding the tap that claimed it;
+	// and boardMoved the messages laid out again without such rows while
+	// they were remembered, which a tap in flight must not draw on
+	// (gchat_board.go). boardOrder, boardTapsOrder and boardMovedOrder are
+	// their rings.
+	board           map[string]gchatChatLayout
+	boardOrder      []string
+	boardTaps       map[string]string
+	boardTapsOrder  []string
+	boardMoved      map[string]bool
+	boardMovedOrder []string
+}
+
+// gchatRewriteLock orders the patches of one message: a rating tap, an
+// answered rewrite and an edit each compute their layout and patch it under
+// it, so each reads the state the previous patch left and none lands over a
+// later one. holders counts the rewrites holding or waiting on it, under the
+// adapter's lock.
+type gchatRewriteLock struct {
+	mu      sync.Mutex
+	holders int
 }
 
 func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 	if a.ux == nil {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
-			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{}}
+			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
+			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
+			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{},
+			board: map[string]gchatChatLayout{}, boardTaps: map[string]string{}, boardMoved: map[string]bool{}}
 	}
 	return a.ux
 }
@@ -173,15 +243,14 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 // trackQuestion remembers a laid-out message with choices, keyed by its
 // name and bound to conversation, so a click or a typed reply can rewrite
 // it. A home post has no conversation here (its space's kind is not known
-// without a read) but keeps its thread, so its click is bound to that thread
-// in the kind the event names (classifyClick), and a typed reply in its
-// thread does not answer it. Laying
+// without a read), so its click binds to the event's surface (classifyClick),
+// and a typed reply in its thread does not answer it. Laying
 // choices out on a message opens it, even one answered before: a card
 // asking again on its update key is a fresh question, so the earlier answer
 // and its line are forgotten. Laying a message out again without choices
 // closes it, so a late click on buttons a client still shows does not write
 // the old question back.
-func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *chatmsg.Message, layout gchatChatLayout) {
+func (a *GoogleChatAdapter) trackQuestion(name, conversation string, m *chatmsg.Message, layout gchatChatLayout) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
@@ -190,6 +259,12 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *
 		// before a restart is not), would patch its stale snapshot of the
 		// text over this layout once verified.
 		ux.forgetClicksLocked(name)
+		if ux.answered[name] {
+			// The edit kept the answered line (answeredLayout); this is
+			// what the message shows now, less its rating buttons, which a
+			// tap redraws (ratedLayout).
+			ux.shown[name] = gchatWithoutRating(layout)
+		}
 		if _, ok := ux.questions[name]; ok {
 			ux.dropQuestionLocked(name)
 			forget(&ux.questionsOrder, name)
@@ -200,7 +275,7 @@ func (a *GoogleChatAdapter) trackQuestion(name, conversation, thread string, m *
 	for i, c := range m.Choices {
 		labels[i] = c.Text
 	}
-	q := gchatQuestion{conversation: conversation, thread: thread, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
+	q := gchatQuestion{conversation: conversation, asks: asksQuestion(m.Choices), layout: layout, choices: labels, links: m.Links}
 	ux.questions[name] = q
 	remember(&ux.questionsOrder, name, func(k string) { ux.dropQuestionLocked(k) })
 	switch {
@@ -225,6 +300,7 @@ func (a *GoogleChatAdapter) forgetAnswer(name string) {
 func (ux *gchatUX) forgetAnswerLocked(name string) {
 	delete(ux.answered, name)
 	delete(ux.lines, name)
+	delete(ux.shown, name)
 	forget(&ux.answeredRing, name)
 }
 
@@ -284,7 +360,20 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if click == nil {
 		return InboundMessage{}, "a click event with no click"
 	}
-	if click.Function != gchatChatFunction {
+	switch click.Function {
+	case gchatStopFunction:
+		return a.classifyStop(ev)
+	case gchatFeedbackFunction:
+		// A rating tap is never a turn (gchat_feedback.go).
+		return InboundMessage{}, a.feedbackClick(ev)
+	case gchatFeedbackNoteFunction:
+		// Nor is a click on the note card a 👎 asks for.
+		return InboundMessage{}, a.feedbackNoteClick(ev)
+	case gchatBoardFunction:
+		// Nor is a board-health row's Retry or Drop (gchat_board.go).
+		return InboundMessage{}, a.boardClick(ev)
+	case gchatChatFunction:
+	default:
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"
 	}
 	reply := strings.TrimSpace(click.Parameters[gchatChatParamReply])
@@ -297,7 +386,7 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if ev.Space.Name == "" || ev.Message.Name == "" {
 		return InboundMessage{}, "click names no space or no message"
 	}
-	kind, thread := gchatSurface(ev)
+	kind, _ := gchatSurface(ev)
 	index, err := strconv.Atoi(click.Parameters[gchatChatParamChoice])
 	if err != nil {
 		index = gchatChoiceUnknown
@@ -324,21 +413,10 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if p.clicker == "" {
 		p.clicker = namelessClicker
 	}
-	bound := ""
+	bound := a.clickConversationLocked(ev)
 	if q, ok := ux.questions[ev.Message.Name]; ok {
-		// A remembered question binds its click to the conversation it was
-		// posted in; the event's surface is read only for one it does not
-		// remember (a home post, or one from before a restart).
-		bound = q.conversation
-		if bound == "" && q.thread != "" && (thread != "" || kind == sessionKindDM) {
-			// A home post is bound to no conversation but to its thread: a
-			// click on the head of a thread in a DM home space (the alert,
-			// edited into its triage) carries no threadReply, which would
-			// bind it to the DM's root, where a typed reply in the thread
-			// does not go.
-			bound = gchatConversationID(ev.Space.Name, q.thread, kind)
-		}
 		p.text, p.links = q.layout.Text, q.links
+		p.rating = ux.rated[ev.Message.Name]
 		if index >= 0 && index < len(q.choices) {
 			p.label = q.choices[index]
 		}
@@ -346,13 +424,7 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		// Posted before a restart: the message the event carries is what
 		// Chat shows, text and buttons.
 		p.text = ev.Message.Text
-		p.links, p.label = gchatMessageButtons(ev.Message, index, p.label)
-		if click.Parameters[gchatChatParamHome] != "" && ev.Message.Thread.Name != "" && (thread != "" || kind == sessionKindDM) {
-			// A home card says so on its buttons (gchatHomeButtons), so its
-			// click binds to the thread the event names, as a remembered
-			// one's does, rather than to a DM's root.
-			bound = gchatConversationID(ev.Space.Name, ev.Message.Thread.Name, kind)
-		}
+		p.links, p.label, p.rating = gchatMessageButtons(ev.Message, index, p.label)
 	}
 	ux.pending[id] = p
 	ux.waiting[ev.Message.Name] = true
@@ -360,9 +432,6 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	// email from here, as after a typed message.
 	a.rememberUserLocked(click.User)
 	a.mu.Unlock()
-	if bound == "" {
-		bound = gchatConversationID(ev.Space.Name, thread, kind)
-	}
 	return InboundMessage{
 		Conversation: bound,
 		Kind:         kind,
@@ -371,6 +440,18 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		Text:         reply,
 		Click:        true,
 	}, ""
+}
+
+// clickConversationLocked is the conversation a click on ev's message binds
+// to: a remembered question binds it to the conversation it was posted in,
+// and the event's surface binds any other click (a home post, which has no
+// conversation, or one from before a restart). Called under a.mu.
+func (a *GoogleChatAdapter) clickConversationLocked(ev *gchatEvent) string {
+	if q, ok := a.uxLocked().questions[ev.Message.Name]; ok && q.conversation != "" {
+		return q.conversation
+	}
+	kind, thread := gchatSurface(ev)
+	return gchatConversationID(ev.Space.Name, thread, kind)
 }
 
 // gchatClickID names one click for the audit chain and the pending map: the
@@ -385,28 +466,53 @@ func gchatClickID(message, eventTime string) string {
 	return message + gchatClickIDSep + eventTime
 }
 
-// gchatMessageButtons reads a clicked message's own buttons: the link
-// buttons it shows, as links, and the label of the choice at index, or
-// fallback when no button carries that index (or the index is unknown).
-func gchatMessageButtons(m gchatMessage, index int, fallback string) (links []chatmsg.Link, label string) {
+// gchatClickMessage is the message a click id names (gchatClickID): the
+// message a stale Stop press is answered on (chatStopStale).
+func gchatClickMessage(id string) string {
+	message, _, _ := strings.Cut(id, gchatClickIDSep)
+	return message
+}
+
+// gchatMessageButtons reads a clicked message's own buttons, told apart by
+// their function (classifyGchatButton): the link buttons it shows, as
+// links; the label of the choice at index, or fallback when no button
+// carries that index (or the index is unknown); and its rating buttons, the
+// task they rate and the one drawn filled.
+func gchatMessageButtons(m gchatMessage, index int, fallback string) (links []chatmsg.Link, label string, rating gchatRating) {
 	label = fallback
 	for _, w := range m.AccessoryWidgets {
 		for _, b := range w.ButtonList.Buttons {
-			if b.OnClick.OpenLink.URL != "" {
+			switch classifyGchatButton(b) {
+			case gchatButtonLink:
 				links = append(links, chatmsg.Link{Text: b.Text, URL: b.OnClick.OpenLink.URL})
-				continue
-			}
-			if b.OnClick.Action.Function != gchatChatFunction || index == gchatChoiceUnknown {
-				continue
-			}
-			for _, param := range b.OnClick.Action.Parameters {
-				if param.Key == gchatChatParamChoice && param.Value == strconv.Itoa(index) && b.Text != "" {
+			case gchatButtonRating:
+				params := buttonParameters(b)
+				if task := params[gchatFeedbackParamTask]; task != "" {
+					rating.task = task
+				}
+				if b.Type == gchatChatButtonFilled {
+					rating.chosen = params[gchatFeedbackParamRating]
+				}
+			case gchatButtonChoice:
+				if index == gchatChoiceUnknown {
+					continue
+				}
+				if params := buttonParameters(b); params[gchatChatParamChoice] == strconv.Itoa(index) && b.Text != "" {
 					label = b.Text
 				}
 			}
 		}
 	}
-	return links, label
+	return links, label, rating
+}
+
+// buttonParameters is a decoded button's action parameters by key.
+func buttonParameters(b gchatButton) map[string]string {
+	out := make(map[string]string, len(b.OnClick.Action.Parameters))
+	for _, p := range b.OnClick.Action.Parameters {
+		out[p.Key] = p.Value
+	}
+	return out
 }
 
 // InboundVerified learns whether a click, or a typed reply to an open
@@ -435,12 +541,20 @@ func (a *GoogleChatAdapter) InboundVerified(conversation, messageID string, veri
 	}
 	ux.answered[p.message] = true
 	line := defangGchatControls(fmt.Sprintf(answeredLine, p.clicker, p.label))
-	remember(&ux.answeredRing, p.message, func(k string) { delete(ux.answered, k); delete(ux.lines, k) })
+	remember(&ux.answeredRing, p.message, func(k string) { delete(ux.answered, k); delete(ux.lines, k); delete(ux.shown, k) })
 	ux.dropQuestionLocked(p.message)
 	forget(&ux.questionsOrder, p.message)
 	a.mu.Unlock()
-	layout := gchatAnsweredLayout(gchatChatLayout{Text: p.text}, p.links, line)
-	a.goRewrite(func() { a.rewriteAnswered(conversation, p.message, layout, line) })
+	a.goRewrite(func() {
+		defer a.lockRewrite(p.message)()
+		// The adapter's record wins: a tap since the click filled its
+		// button. A message it does not remember (posted before a restart)
+		// keeps the buttons the click's event showed, on record from here,
+		// so a later edit keeps them as drawn (answeredLayout).
+		rating := a.rememberRatingIfAbsent(p.message, p.rating)
+		layout := gchatAnsweredLayout(gchatChatLayout{Text: p.text}, p.links, rating, line)
+		a.rewriteAnswered(conversation, p.message, layout, line)
+	})
 }
 
 // rewriteAnswered patches an answered question to layout, and, when the
@@ -460,6 +574,8 @@ func (a *GoogleChatAdapter) rewriteAnswered(conversation, messageID string, layo
 		a.mu.Lock()
 		if ux := a.uxLocked(); ux.answered[messageID] {
 			ux.lines[messageID] = line
+			// Without its rating buttons: a tap redraws them (ratedLayout).
+			ux.shown[messageID] = gchatWithoutRating(layout)
 		}
 		a.mu.Unlock()
 		return
@@ -470,29 +586,58 @@ func (a *GoogleChatAdapter) rewriteAnswered(conversation, messageID string, layo
 	}
 }
 
+// lockRewrite takes message's rewrite lock and returns its release. The
+// adapter's lock is held only to find or drop the entry, never while waiting
+// or patching; the entry goes once no rewrite holds or waits on it.
+func (a *GoogleChatAdapter) lockRewrite(message string) (unlock func()) {
+	a.mu.Lock()
+	ux := a.uxLocked()
+	l := ux.rewriting[message]
+	if l == nil {
+		l = &gchatRewriteLock{}
+		ux.rewriting[message] = l
+	}
+	l.holders++
+	a.mu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		a.mu.Lock()
+		if l.holders--; l.holders == 0 {
+			delete(ux.rewriting, message)
+		}
+		a.mu.Unlock()
+	}
+}
+
 // goRewrite runs a rewrite off the inbox worker, or inline under test.
 func (a *GoogleChatAdapter) goRewrite(f func()) {
 	if a.syncRewrites {
 		f()
 		return
 	}
-	go f()
+	a.rewrites.Add(1)
+	go func() {
+		defer a.rewrites.Done()
+		f()
+	}()
 }
 
 // gchatAnsweredLayout is a question's layout with its choice buttons gone,
-// its links kept, and line under its text.
-func gchatAnsweredLayout(layout gchatChatLayout, links []chatmsg.Link, line string) gchatChatLayout {
+// its links kept and rating's buttons after them, and line under its text.
+func gchatAnsweredLayout(layout gchatChatLayout, links []chatmsg.Link, rating gchatRating, line string) gchatChatLayout {
 	text := strings.TrimRight(layout.Text, "\n")
 	if text != "" {
 		text += gchatChatSectionGap
 	}
-	return gchatChatLayout{Text: text + line, Widgets: gchatChatWidgets(nil, links)}
+	return gchatChatLayout{Text: text + line, Widgets: gchatWithRating(gchatChatWidgets(nil, links), rating)}
 }
 
 // answeredLayout keeps an answered question's line through a later edit of
 // the message that lays out no choices (the card settling it on the notify
-// route, laid out or as text): the line stays under the new text. An edit
-// that lays choices out asks anew and is left as laid out (trackQuestion
+// route, laid out or as text): the line stays under the new text, and a
+// rated message keeps its rating buttons, as last rated. An edit that lays
+// choices out asks anew and is left as laid out (trackQuestion
 // then forgets the answer).
 func (a *GoogleChatAdapter) answeredLayout(messageID string, m OutMessage, layout gchatChatLayout) gchatChatLayout {
 	a.mu.Lock()
@@ -505,7 +650,7 @@ func (a *GoogleChatAdapter) answeredLayout(messageID string, m OutMessage, layou
 	if m.Chat != nil {
 		links = m.Chat.Links
 	}
-	return gchatAnsweredLayout(layout, links, line)
+	return gchatAnsweredLayout(layout, links, a.ratingOf(messageID), line)
 }
 
 // gchatSurface binds an event to its conversation's kind and thread: a DM
@@ -513,11 +658,10 @@ func (a *GoogleChatAdapter) answeredLayout(messageID string, m OutMessage, layou
 // thread in it to one session; no thread in a space whose threading state
 // does not support replies or in a group chat, where every message has its
 // own thread resource and binding those would fragment the chat into one
-// session per ask; and in a DM, which Chat threads too, only a message
-// typed inside an existing thread (threadReply) has one, so top-level DMs
-// share the space's one conversation and are answered top-level, the
-// default-mode Hermes Google Chat rule read from Chat's own flag
-// (spec-chatops-gateway.md, "The Google Chat adapter").
+// session per ask; and a DM message keys on the thread Chat attached to it,
+// top-level or reply, as a Slack DM keys on its thread timestamp, so each
+// top-level ask is its own conversation and a reply typed in its thread
+// joins it (spec-chatops-gateway.md, "The Google Chat adapter").
 func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	kind = sessionKindGroup
 	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
@@ -525,9 +669,6 @@ func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	}
 	thread = ev.Message.Thread.Name
 	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
-		thread = ""
-	}
-	if kind == sessionKindDM && !ev.Message.ThreadReply {
 		thread = ""
 	}
 	return kind, thread
@@ -542,7 +683,7 @@ func decodeGchatClick(payload, user, eventTime json.RawMessage, common gchatComm
 	if err := json.Unmarshal(payload, &mp); err != nil {
 		return nil, fmt.Errorf("chat.%s: %w", gchatAddonClickKey, err)
 	}
-	click := &gchatClick{Function: common.InvokedFunction, Parameters: common.Parameters}
+	click := &gchatClick{Function: common.InvokedFunction, Parameters: common.Parameters, FormInputs: common.FormInputs}
 	if len(user) > 0 {
 		_ = json.Unmarshal(user, &click.User)
 	}
@@ -562,7 +703,8 @@ func decodeGchatClick(payload, user, eventTime json.RawMessage, common gchatComm
 // same as one on the add-on layout.
 func decodeGchatLegacyClick(wire *gchatWireEvent) *gchatEvent {
 	click := &gchatClick{User: wire.User, EventTime: wire.EventTime,
-		Function: wire.LegacyCommon.InvokedFunction, Parameters: wire.LegacyCommon.Parameters}
+		Function: wire.LegacyCommon.InvokedFunction, Parameters: wire.LegacyCommon.Parameters,
+		FormInputs: wire.LegacyCommon.FormInputs}
 	if click.Function == "" {
 		click.Function = wire.Action.ActionMethodName
 	}

@@ -3,6 +3,8 @@
 Run: cd agents/chat/defaults/plugins && python3 -m pytest chat_metrics/test_metrics.py -q
 """
 
+import http.client
+import json
 import os
 import re
 import sqlite3
@@ -12,6 +14,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -23,6 +26,20 @@ from chat_metrics import plugin  # noqa: E402
 
 _SERIES_LINE = re.compile(r'^kubeagents_chat_messages_inbound_total\{platform="([a-z]+)"\} (\d+)$', re.M)
 _SESSIONS_LINE = re.compile(r'^kubeagents_chat_sessions_total\{platform="([a-z]+)"\} (\d+)$', re.M)
+
+
+_LEDGER_KEY_PATCH = mock.patch.dict(os.environ)
+
+
+def setUpModule():
+    # A registry built with no gauge injected reads the ledger over loopback when
+    # the Session KV key is in the environment; the suite never wants that read.
+    _LEDGER_KEY_PATCH.start()
+    os.environ.pop(metrics.SESSION_KV_KEY_ENV, None)
+
+
+def tearDownModule():
+    _LEDGER_KEY_PATCH.stop()
 
 
 def _event(platform="google_chat", text="hi"):
@@ -71,6 +88,9 @@ class RegistryTest(unittest.TestCase):
         text = self.registry.render()
         self.assertIn("# TYPE kubeagents_chat_messages_inbound_total counter", text)
         self.assertIn("# TYPE kubeagents_chat_sessions_total counter", text)
+        # No Session KV key in this suite: the ledger was never read, so the
+        # family is absent rather than nine zeros.
+        self.assertNotIn("kubeagents_proposals_opened", text)
         self.assertEqual(1, text.count("# TYPE process_start_time_seconds gauge"))
         self.assertRegex(text, r"(?m)^process_start_time_seconds \d+\.\d+$")
         self.assertEqual(text, self.registry.render(), "two renders of an idle registry differ")
@@ -98,6 +118,72 @@ class TurnErrorTest(unittest.TestCase):
         exposition = metrics.ChatMetrics().render()
         self.assertIn("# TYPE kubeagents_chat_turns_errored_total counter", exposition)
         self.assertEqual([], _ERRORED_LINE.findall(exposition))
+
+
+_DISPATCH_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failed_ticks\{board="((?:[^"\\]|\\.)*)",error="([^"]*)"\} (\d+)$', re.M)
+
+
+class DispatcherFailedTicksTest(unittest.TestCase):
+    """The dispatcher's failed-tick streak, by board: a failure adds one, a good
+    tick drops the board's series."""
+
+    def test_failures_add_up_and_carry_the_last_class(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "DatabaseError")
+        registry.record_dispatch_tick("ops", "OperationalError")
+        exposition = registry.render()
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
+        self.assertEqual([("default", "DatabaseError", "2"), ("ops", "OperationalError", "1")], _DISPATCH_LINE.findall(exposition))
+
+    def test_a_good_tick_drops_the_boards_series_and_the_next_failure_starts_at_one(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "OperationalError")
+        registry.record_dispatch_tick("default", "")
+        self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_board_slug_is_escaped_in_its_label(self):
+        registry = metrics.ChatMetrics()
+        registry.record_dispatch_tick('a"b\\c', "OSError")
+        self.assertEqual([('a\\"b\\\\c', "OSError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_board_the_dispatcher_stopped_ticking_is_dropped(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick("archived", "OperationalError")
+        registry.record_dispatch_tick("live", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS
+        registry.record_dispatch_tick("live", "OperationalError")
+        self.assertEqual(2, len(_DISPATCH_LINE.findall(registry.render())))
+        now[0] += 1
+        self.assertEqual([("live", "OperationalError", "2")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_failures_a_busy_timeout_apart_keep_counting(self):
+        # A locked board: each failed tick waits Hermes' 120 s busy timeout, then the 5 s interval.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(60):
+            registry.record_dispatch_tick("default", "OperationalError")
+            registry.render()
+            now[0] += 125
+        self.assertEqual([("default", "OperationalError", "60")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_a_stale_streak_restarts_even_when_no_render_ran_in_between(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(70):
+            registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_an_idle_registry_renders_the_family_with_no_series(self):
+        exposition = metrics.ChatMetrics().render()
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
+        self.assertEqual([], _DISPATCH_LINE.findall(exposition))
 
 
 _GAVE_UP_LINE = re.compile(r"^kubeagents_kanban_tasks_gave_up_total (\d+)$", re.M)
@@ -226,6 +312,291 @@ class KanbanGaveUpTest(unittest.TestCase):
     def test_the_board_path_is_the_agent_homes_board_outside_the_gateway_venv(self):
         with mock.patch.dict(os.environ, {"PLATFORM_AGENT_HOME": self.temp.name}, clear=False):
             self.assertEqual(self.db, metrics.board_path())
+
+
+_PROPOSALS_LINE = re.compile(r'^kubeagents_proposals_opened\{origin="([a-z]*)",platform="([a-z]*)"\} (\d+)$', re.M)
+_SESSION_KV_KEY = "test-session-kv-key"
+
+
+class _Ledger:
+    """A fake Session KV server: answers GET /v1/proposals/opened/counts with
+    `body` (a dict serialised as JSON, or bytes as is) and `status`, and
+    records the Authorization header of each request."""
+
+    def __init__(self):
+        self.body = {}
+        self.status = 200
+        self.auth = []
+        ledger = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                ledger.auth.append(self.headers.get("Authorization"))
+                body = ledger.body if isinstance(ledger.body, bytes) else json.dumps(ledger.body).encode()
+                self.send_response(ledger.status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/v1/proposals/opened/counts"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _served(origins=None, **rows):
+    """The server's answer: every origin, those not in `rows` as {"": 0}."""
+    answer = {origin: {"": 0} for origin in (origins or metrics.ORIGINS)}
+    answer.update(rows)
+    return answer
+
+
+class ProposalsOpenedTest(unittest.TestCase):
+    """The proposals ledger, read over loopback from Session KV at scrape time
+    and served as kubeagents_proposals_opened{origin,platform}: one series per
+    origin at least, the last counts kept on a read error, no state of its own."""
+
+    def setUp(self):
+        self.ledger = _Ledger()
+        self.addCleanup(self.ledger.close)
+        env = mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": _SESSION_KV_KEY})
+        env.start()
+        self.addCleanup(env.stop)
+        self.gauge = metrics.ProposalsOpenedGauge(url=self.ledger.url)
+
+    def series(self, gauge=None):
+        registry = metrics.ChatMetrics(proposals=gauge or self.gauge)
+        return {(o, p): int(n) for o, p, n in _PROPOSALS_LINE.findall(registry.render())}
+
+    def test_every_origin_is_served_zero_filled(self):
+        # A successful read of an empty ledger serves every origin at 0 under
+        # platform="".
+        self.ledger.body = {}
+        self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
+        self.assertEqual([f"Bearer {_SESSION_KV_KEY}"], self.ledger.auth)
+        self.ledger.body = _served()
+        self.assertEqual({(o, ""): 0 for o in metrics.ORIGINS}, self.series())
+        # An answer that omits an origin still serves it, zero-filled.
+        self.ledger.body = {"audit": {"": 2}}
+        got = self.series()
+        self.assertEqual(2, got[("audit", "")])
+        self.assertEqual({o for o in metrics.ORIGINS}, {o for o, _ in got})
+        self.assertEqual(0, got[("drift", "")])
+
+    def test_no_family_is_served_before_the_first_successful_read(self):
+        # The operator reads nine resolved origins as a reading; before a
+        # successful read there is no count to serve, so the family is absent.
+        self.ledger.body = _served(chat={"slack": 3})
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}):
+                self.assertIsNone(self.gauge.counts())
+                self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=self.gauge).render())
+            self.assertEqual([], self.ledger.auth, "no request without the key")
+            self.ledger.status = 503
+            self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=self.gauge).render())
+            closed = metrics.ProposalsOpenedGauge(url="http://127.0.0.1:1/v1/proposals/opened/counts")
+            self.assertNotIn("kubeagents_proposals_opened", metrics.ChatMetrics(proposals=closed).render())
+        # The first good read serves the family, and a later failure keeps it.
+        self.ledger.status = 200
+        self.assertEqual(3, self.series()[("chat", "slack")])
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.assertEqual(3, self.series()[("chat", "slack")])
+
+    def test_chat_rows_carry_the_platform(self):
+        self.ledger.body = _served(chat={"slack": 3, "googlechat": 1}, audit={"": 2})
+        exposition = metrics.ChatMetrics(proposals=self.gauge).render()
+        self.assertIn("# TYPE kubeagents_proposals_opened gauge", exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="chat",platform="googlechat"} 1\n', exposition)
+        self.assertIn('kubeagents_proposals_opened{origin="audit",platform=""} 2\n', exposition)
+        self.assertNotIn(("chat", ""), self.gauge.counts(), "a chat origin with rows has no empty-platform series")
+        lines = [l for l in exposition.splitlines() if l.startswith("kubeagents_proposals_opened{")]
+        self.assertEqual(sorted(lines), lines, "series render in sorted (origin, platform) order")
+        self.assertEqual(len(metrics.ORIGINS) + 1, len(lines))
+        # A later answer replaces the earlier one; nothing accumulates.
+        self.ledger.body = _served(chat={"slack": 4})
+        got = self.series()
+        self.assertEqual(4, got[("chat", "slack")])
+        self.assertNotIn(("chat", "googlechat"), got)
+        self.assertEqual(0, got[("audit", "")])
+
+    def test_a_read_error_keeps_the_last_count(self):
+        self.ledger.body = _served(chat={"slack": 3}, issue={"": 1})
+        last = self.gauge.counts()
+        self.assertEqual(3, last[("chat", "slack")])
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
+            self.ledger.status = 500
+            self.assertEqual(last, self.gauge.counts())
+            self.ledger.status = 200
+            for body in (b"not json", b"[]", json.dumps({"chat": {"slack": "3"}}).encode(), json.dumps({"chat": [1]}).encode()):
+                self.ledger.body = body
+                self.assertEqual(last, self.gauge.counts())
+            with mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": ""}):
+                self.assertEqual(last, self.gauge.counts())
+            closed = metrics.ProposalsOpenedGauge(url="http://127.0.0.1:1/v1/proposals/opened/counts")
+            self.assertIsNone(closed.counts(), "a gauge that never read has no last count")
+        # One line per failure streak per gauge, naming the exception type and
+        # never the key.
+        self.assertEqual(2, len(logs.output), logs.output)
+        self.assertNotIn(_SESSION_KV_KEY, "\n".join(logs.output))
+        # A good read ends the streak; the next failure logs again.
+        self.ledger.body = _served(chat={"slack": 5})
+        self.assertEqual(5, self.gauge.counts()[("chat", "slack")])
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as again:
+            self.ledger.status = 503
+            self.assertEqual(5, self.gauge.counts()[("chat", "slack")])
+        self.assertEqual(1, len(again.output))
+
+    def test_a_truncated_or_malformed_http_answer_keeps_the_last_count(self):
+        # Session KV restarting mid-answer, or something non-HTTP on its port:
+        # the scrape keeps every family, and the streak logs once.
+        self.ledger.body = _served(chat={"slack": 3})
+        last = self.gauge.counts()
+        failures = (http.client.IncompleteRead(b"{", 10), http.client.BadStatusLine("garbage"))
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
+            for failure in failures:
+                with mock.patch.object(metrics.urllib.request, "urlopen", side_effect=failure):
+                    self.assertEqual(last, self.gauge.counts())
+                    exposition = metrics.ChatMetrics(proposals=self.gauge).render()
+                self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+        ledger_lines = [line for line in logs.output if "proposals ledger" in line]
+        self.assertEqual(1, len(ledger_lines), logs.output)
+        self.assertIn("IncompleteRead", ledger_lines[0])
+
+    def test_a_restart_of_the_process_serves_the_ledger_unchanged(self):
+        # The ledger is durable on the pod's volume; the gauge holds nothing of
+        # its own, so a fresh gauge against the same server answers the same.
+        self.ledger.body = _served(chat={"slack": 3}, drift={"": 7})
+        before = self.series()
+        restarted = metrics.ProposalsOpenedGauge(url=self.ledger.url)
+        self.assertEqual(before, self.series(restarted))
+        # A restart while the ledger is unreachable serves no family, not zeros.
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.assertEqual({}, self.series(metrics.ProposalsOpenedGauge(url=self.ledger.url)))
+        self.assertEqual(7, before[("drift", "")])
+
+    def test_the_origins_are_the_session_kv_servers(self):
+        # session_kv_server imports FastAPI, which this plugin's tests do not
+        # carry, so the pin reads its source text.
+        server = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "session_kv_server.py"
+        match = re.search(r"^ORIGINS = \(([^)]*)\)$", server.read_text(), re.M)
+        self.assertIsNotNone(match, "session_kv_server's ORIGINS moved; update this reader")
+        self.assertEqual(tuple(re.findall(r'"([a-z]+)"', match.group(1))), metrics.ORIGINS)
+
+
+class _FakeClock:
+    """A monotonic clock a test advances by hand."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+_READ_AGE_LINE = re.compile(r"^kubeagents_proposals_opened_read_age_seconds ([0-9.]+)$", re.M)
+
+
+class ProposalsReadAgeTest(unittest.TestCase):
+    """kubeagents_proposals_opened_read_age_seconds: the seconds since the
+    last successful ledger read, served beside the counts and only with them,
+    so a scraper can tell the last counts kept on a failed read from fresh."""
+
+    def setUp(self):
+        self.ledger = _Ledger()
+        self.addCleanup(self.ledger.close)
+        env = mock.patch.dict(os.environ, {"SESSION_KV_API_KEY": _SESSION_KV_KEY})
+        env.start()
+        self.addCleanup(env.stop)
+        self.clock = _FakeClock()
+        self.gauge = metrics.ProposalsOpenedGauge(url=self.ledger.url, clock=self.clock)
+        self.ledger.body = _served(chat={"slack": 3})
+
+    def render(self):
+        return metrics.ChatMetrics(proposals=self.gauge).render()
+
+    def age(self, exposition):
+        found = _READ_AGE_LINE.findall(exposition)
+        return None if not found else [float(n) for n in found]
+
+    def test_the_family_name_and_its_help_and_type_lines(self):
+        self.assertEqual("kubeagents_proposals_opened_read_age_seconds", metrics.PROPOSALS_READ_AGE_METRIC)
+        exposition = self.render()
+        self.assertIn(f"# HELP kubeagents_proposals_opened_read_age_seconds {metrics.PROPOSALS_READ_AGE_HELP}\n", exposition)
+        self.assertIn("# TYPE kubeagents_proposals_opened_read_age_seconds gauge\n", exposition)
+        # One unlabelled sample, rendered right after the counts family.
+        self.assertEqual([0.0], self.age(exposition))
+        lines = exposition.splitlines()
+        last_count = max(i for i, l in enumerate(lines) if l.startswith("kubeagents_proposals_opened{"))
+        self.assertTrue(lines[last_count + 1].startswith("# HELP kubeagents_proposals_opened_read_age_seconds "))
+
+    def test_no_age_is_served_before_the_first_successful_read(self):
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            exposition = self.render()
+            self.clock.now += 30
+            exposition += self.render()
+        self.assertNotIn("kubeagents_proposals_opened_read_age_seconds", exposition)
+        self.assertNotIn("kubeagents_proposals_opened{", exposition, "the counts are absent with the age")
+
+    def test_the_age_renders_exactly_when_the_counts_do(self):
+        # Before the first read neither renders; after it both do, through failed reads too.
+        for step in ("before", "read", "failed", "failed again", "read again"):
+            self.ledger.status = 200 if step.startswith("read") else 503
+            with self.subTest(step=step):
+                exposition = self.render()
+                has_counts = "kubeagents_proposals_opened{" in exposition
+                self.assertEqual(bool(self.age(exposition)), has_counts)
+                self.assertEqual(has_counts, step != "before")
+
+    def test_the_default_clock_is_the_monotonic_one(self):
+        gauge = metrics.ProposalsOpenedGauge(url=self.gauge._url)
+        self.assertIs(gauge._clock, metrics.time.monotonic, "the default clock is monotonic, so a wall-clock step cannot move the age")
+        exposition = metrics.ChatMetrics(proposals=gauge).render()
+        self.assertEqual([0.0], self.age(exposition), "a fresh successful read on the real clock reads zero")
+
+    def test_the_age_is_zero_right_after_a_successful_read(self):
+        self.assertEqual([0.0], self.age(self.render()))
+        self.clock.now += 45
+        self.assertEqual([0.0], self.age(self.render()), "each successful read restarts the age")
+
+    def test_the_age_grows_across_failed_reads_while_the_last_counts_render(self):
+        self.render()
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING") as logs:
+            self.clock.now += 15
+            exposition = self.render()
+            self.assertEqual([15.0], self.age(exposition))
+            self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+            for elapsed in (75, 600, 3600.5):
+                self.clock.now = 1000.0 + elapsed
+                exposition = self.render()
+                self.assertEqual([elapsed], self.age(exposition))
+                self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 3\n', exposition)
+        ledger_lines = [line for line in logs.output if "proposals ledger" in line]
+        self.assertEqual(1, len(ledger_lines), "the streak still logs once")
+
+    def test_the_age_resets_on_the_next_successful_read(self):
+        self.render()
+        self.ledger.status = 503
+        with self.assertLogs("hermes.plugin.chat_metrics", level="WARNING"):
+            self.clock.now += 120
+            self.assertEqual([120.0], self.age(self.render()))
+        self.ledger.status = 200
+        self.ledger.body = _served(chat={"slack": 4})
+        self.clock.now += 5
+        exposition = self.render()
+        self.assertEqual([0.0], self.age(exposition))
+        self.assertIn('kubeagents_proposals_opened{origin="chat",platform="slack"} 4\n', exposition)
 
 
 class HookTest(unittest.TestCase):

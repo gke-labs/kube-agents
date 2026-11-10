@@ -220,7 +220,8 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
     router-scope ``tool_called`` grades once the record carries the
     ``a2a.activity`` marker; it carries no card ids and no worker's entries,
     so ``worker_commands``, ``worker_agents`` and a ``tool_called`` in the
-    ``workers`` or ``all`` scope stay blind on every inject record. A
+    ``workers`` or ``all`` scope are blind on an inject record that does not
+    carry the workers' tagged entries (#5236). A
     compound mixing a router leaf with a worker leaf lands on the worker
     side, since its worker leaf would still error with the trace shown."""
     path = write_task(
@@ -524,3 +525,32 @@ def test_every_shipped_blind_check_is_named(path):
         )
     }
     assert load_case(path).transport_blind_checks == all_blind
+
+
+def test_requested_pull_requests_counts_the_cases_requesting_checks(write_task):
+    """CaseSpec carries the count the inject lane's write safeguard gates on."""
+    requesting = load_case(
+        write_task(
+            "pr-case",
+            {
+                "id": "pr-case",
+                "name": "x",
+                "verification_spec": [
+                    {"name": "opens-a-pr", "role": "objective", "mode": "assert", "check": {"type": "pull_request_opened"}}
+                ],
+            },
+        )
+    )
+    assert requesting.requested_pull_requests == 1
+
+    none = load_case(
+        write_task(
+            "no-pr-case",
+            {
+                "id": "no-pr-case",
+                "name": "x",
+                "verification_spec": [{"check": {"type": "report_contains", "phrases": ["x"]}}],
+            },
+        )
+    )
+    assert none.requested_pull_requests == 0

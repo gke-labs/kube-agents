@@ -159,6 +159,39 @@ class StaleConditions(unittest.TestCase):
         dep["status"]["conditions"] = [condition("Progressing", "True", 2, "ReplicaSetUpdated"), condition("Available", "False", 2)]
         self.assertEqual(analyze([dep]), [])
 
+    def test_config_connector_in_progress_states_are_not_stalls(self):
+        for reason in ("Updating", "Deleting"):
+            with self.subTest(reason=reason):
+                sql = obj("SQLInstance", "orders-db", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, reason)]})
+                self.assertEqual(analyze([sql]), [])
+                # A create in progress lags its generation too; not a row either.
+                sql["metadata"]["generation"] = 2
+                sql["metadata"]["managedFields"] = [managed(40)]
+                self.assertEqual(analyze([sql]), [])
+        failed = obj("SQLInstance", "orders-db", status={"conditions": [condition("Ready", "False", 20, "UpdateFailed")]})
+        rows = analyze([failed])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False UpdateFailed"])
+
+    def test_dependency_not_ready_waits_an_hour(self):
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool]), [])
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        rows = analyze([pool])
+        self.assertEqual([r["detail"] for r in rows], ["Ready=False DependencyNotReady"])
+        self.assertEqual(rows[0]["stalled_for"], "1h10m")
+        # A run-wide threshold above the hour applies to it as to every kind.
+        pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
+        self.assertEqual(analyze([pool], override=120), [])
+        # Its generation lag waits the same hour, so a spec edit while it
+        # waits on its parent is not a row sooner than the condition.
+        pool = obj("ContainerNodePool", "pool-a", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        pool["metadata"]["generation"] = 2
+        pool["metadata"]["managedFields"] = [managed(40)]
+        self.assertEqual(analyze([pool]), [])
+        pool["metadata"]["managedFields"] = [managed(70)]
+        pool["status"]["conditions"] = [condition("Ready", "False", 70, "DependencyNotReady")]
+        self.assertEqual(sorted(r["heuristic"] for r in analyze([pool])), ["generation-lag", "stale-condition"])
+
     def test_unrelated_condition_types_are_ignored(self):
         hpa = obj("HorizontalPodAutoscaler", "web", status={"conditions": [condition("ScalingLimited", "False", 500)]})
         self.assertEqual(analyze([hpa]), [])
@@ -689,9 +722,30 @@ class Main(unittest.TestCase):
         self.assertEqual([o["kind"] for o in objects], ["deployments", "gateways"])
         self.assertEqual(events, [{"kind": "events"}])
 
+    def test_a_listing_the_shim_cut_with_exit_74_is_a_warning_the_same_way(self):
+        """The credential-proxy shim exits 74 on a cut reply (the counts after
+        its marker); the cut kind is still skipped with a warning and the
+        other kinds still count."""
+        cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
+
+        def fake_kubectl(args):
+            if args[1] == "pods":
+                return 74, cut, "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n"
+            if args[1] == "events":
+                return 0, '{"items":[]}', ""
+            return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"web"}}]}', ""
+
+        with patch.object(stall_report, "run_kubectl", side_effect=fake_kubectl):
+            with redirect_stderr(io.StringIO()) as err:
+                objects, events = stall_report.collect(NAMESPACE, "deployments,pods,replicasets")
+        self.assertEqual([o["metadata"]["name"] for o in objects], ["web", "web"])
+        self.assertIn("warning: credential proxy output truncated at 8388608 bytes", err.getvalue())
+        self.assertIn(f"warning: pods in {NAMESPACE} not scanned; its objects are missing from the count", err.getvalue())
+
     def test_collect_keeps_the_other_kinds_when_one_listing_is_cut(self):
-        """The sandbox's kubectl is the credential-proxy shim, which returns the
-        prefix of an over-cap reply with exit 0 and a stderr note."""
+        """The sandbox's kubectl is the credential-proxy shim, which returned
+        the prefix of an over-cap reply with exit 0 and a stderr note; it now
+        exits 74, and this is the older shim's shape."""
         cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
 
         def fake_kubectl(args):

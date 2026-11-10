@@ -1,7 +1,9 @@
 """The chart renders `platformAgent.deployment.alertDailyLimits` into the CR's env.
 
 Each key that is set becomes one `ALERT_DAILY_LIMIT_<KEY>` entry in
-`spec.deployment.env`, with a string value. A default render has no env. An entry
+`spec.deployment.env`, with a string value. With the workload fold window nulled (its
+default renders an entry of its own, tested in test_chart_incident_workload_dedup.py),
+a default render has no env. An entry
 with the same name in `platformAgent.deployment.env` wins, so the name occurs one
 time only: the CRD keys env on name, and the API server refuses a duplicate. A
 `valueFrom` entry for a name whose key is set fails the render, because the operator
@@ -30,8 +32,11 @@ _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
     "--set", "platformAgent.harness.location=us-central1",
     "--set", "platformAgent.harness.projectId=ci-project",
+    # The fold window defaults to an entry of its own; nulled so these renders
+    # show the ceilings alone.
+    "--set", "platformAgent.deployment.incidentWorkloadDedupSeconds=null",
 ]
-# The four `--set-string` flags that hack/ci-deploy.sh passes for the eval install.
+# The first four `--set-string` flags that hack/ci-deploy.sh passes for the eval install.
 _CI_DEPLOY_FLAGS = [
     "--set-string", "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING",
     "--set-string", "platformAgent.deployment.env[0].value=0",

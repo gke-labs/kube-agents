@@ -76,6 +76,10 @@ readonly NATS_ORDINAL_SUFFIX="-0"
 readonly CALLOUT_NAME_SUFFIX="-a2a-callout"
 readonly CALLOUT_KEYS_SUFFIX="-keys"
 readonly A2A_GATEWAY_SUFFIX="-a2a-gateway"
+# A Service's selector as a label selector, with a trailing comma to trim.
+# shellcheck disable=SC2016 # a go-template, not a shell expansion
+readonly SELECTOR_TEMPLATE='{{range $k, $v := .spec.selector}}{{$k}}={{$v}},{{end}}'
+
 readonly A2A_VERIFIER_SUFFIX="-a2a-verifier"
 readonly INJECT_NAME_SUFFIX="-a2a-inject"
 readonly AGENT_DEPLOYMENT_SUFFIX="-gateway"
@@ -805,14 +809,14 @@ print(json.dumps({"spec": {"deployment": {"sidecars": ((cr.get("spec") or {}).ge
 # a wrapper and leaves the tunnel bound, and every later attempt's probe is
 # answered by the first, possibly dead, tunnel.
 start_port_forward() {
-  local service="$1" local_port="$2" remote_port="$3" waited=0
+  local target="$1" local_port="$2" remote_port="$3" waited=0
   local -a pf=(kubectl)
   stop_port_forward
   [ -n "${PF_LOG}" ] || PF_LOG="$(mktemp)"
   if [ -n "${ROLLBACK_KUBE_CONTEXT:-}" ]; then
     pf+=(--context "${ROLLBACK_KUBE_CONTEXT}")
   fi
-  pf+=(-n "${NAMESPACE}" port-forward "svc/${service}" "${local_port}:${remote_port}")
+  pf+=(-n "${NAMESPACE}" port-forward "${target}" "${local_port}:${remote_port}")
   "${pf[@]}" >>"${PF_LOG}" 2>&1 &
   PF_PID=$!
   while [ "${waited}" -lt "${PORT_FORWARD_WAIT}" ]; do
@@ -822,8 +826,59 @@ start_port_forward() {
     sleep 1
     waited=$((waited + 1))
   done
-  note "port-forward to svc/${service} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
+  note "port-forward to ${target} did not listen on ${local_port}; its log: $(tail -n "${PF_LOG_TAIL_LINES}" "${PF_LOG}" 2>/dev/null | tr '\n' ' ')"
   return 1
+}
+
+# The inject door's port-forward target: the pod holding the gateway's Lease,
+# which is the one replica serving the door once the gateway runs more than
+# one (a standby answers 503), or the door's Service when no Lease names one.
+# Read again on every attempt, so a retry after a handover finds the new
+# holder.
+#
+# The holder is taken only if it is one of the pods the inject Service
+# selects: the tunnel carries the door's token, and a Lease's holder is a
+# string anyone who can write the Lease sets. A Lease read that fails for a
+# reason other than a missing Lease is said, since the Service it falls back
+# to can land on the standby. Everything said goes to stderr: stdout is the
+# target this function returns.
+inject_target() {
+  local holder selector err rc=0
+  err="$(mktemp)"
+  holder="$(k get lease "${A2A_GATEWAY_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>"${err}")" || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    if ! grep -q NotFound "${err}"; then
+      note "reading lease ${A2A_GATEWAY_NAME} failed; forwarding to svc/${INJECT_NAME}: $(tr '\n' ' ' <"${err}")" >&2
+    fi
+    holder=""
+  fi
+  rm -f "${err}"
+  if [ -n "${holder}" ]; then
+    local pods
+    # A pod's name and nothing else: the holder is a free string, and one
+    # with a newline would pass grep -F below as two patterns.
+    case "${holder}" in
+      *[!a-z0-9.-]*)
+        note "lease ${A2A_GATEWAY_NAME} names a holder that isn't a pod name; forwarding to svc/${INJECT_NAME}" >&2
+        echo "svc/${INJECT_NAME}"
+        return 0
+        ;;
+    esac
+    if ! selector="$(k_read get svc "${INJECT_NAME}" -o "go-template=${SELECTOR_TEMPLATE}")"; then
+      note "reading svc/${INJECT_NAME}'s selector failed; forwarding to the service" >&2
+    elif [ -z "${selector}" ]; then
+      # An empty selector would list every pod in the namespace.
+      note "svc/${INJECT_NAME} has no selector; forwarding to the service" >&2
+    elif ! pods="$(k_read get pods -l "${selector%,}" -o name)"; then
+      note "listing the pods svc/${INJECT_NAME} selects failed; forwarding to the service" >&2
+    elif grep -qxF "pod/${holder}" <<<"${pods}"; then
+      echo "pod/${holder}"
+      return 0
+    else
+      note "lease ${A2A_GATEWAY_NAME} names ${holder}, which is not a pod svc/${INJECT_NAME} selects; forwarding to the service" >&2
+    fi
+  fi
+  echo "svc/${INJECT_NAME}"
 }
 
 stop_port_forward() {
@@ -842,7 +897,7 @@ assert_today_turn() {
   for ((attempt = 1; attempt <= TURN_ATTEMPTS; attempt++)); do
     url="${AGENT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
+      if ! start_port_forward "svc/${CR_NAME}" "${AGENT_LOCAL_PORT}" "${AGENT_API_PORT}"; then
         detail="the port-forward to svc/${CR_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
@@ -912,7 +967,7 @@ done = exchange.outcome in (it.OUTCOME_TERMINAL, it.OUTCOME_STREAM_TERMINAL) and
 sys.exit(0 if done else 1)
 '
 assert_bus_task() {
-  local name="$1" token attempt url line rc conversation err
+  local name="$1" token attempt url line rc conversation err target
   token="$(secret_value "${INJECT_NAME}" "${INJECT_TOKEN_FIELD}")" || fail "${name}" "secret/${INJECT_NAME} could not be read"
   [ -n "${token}" ] || fail "${name}" "secret/${INJECT_NAME} has no ${INJECT_TOKEN_FIELD}: the install has no inject door (A2A_INJECT_BACKEND=true on the operator)"
   conversation="${BUS_TASK_CONVERSATION_PREFIX}/${name}/$(date -u +%s)"
@@ -920,8 +975,9 @@ assert_bus_task() {
   for ((attempt = 1; attempt <= BUS_TASK_ATTEMPTS; attempt++)); do
     url="${INJECT_URL}"
     if [ -z "${url}" ]; then
-      if ! start_port_forward "${INJECT_NAME}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
-        line="the port-forward to svc/${INJECT_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+      target="$(inject_target)"
+      if ! start_port_forward "${target}" "${INJECT_LOCAL_PORT}" "${INJECT_PORT}"; then
+        line="the port-forward to ${target} did not listen within ${PORT_FORWARD_WAIT}s"
         continue
       fi
       url="http://127.0.0.1:${INJECT_LOCAL_PORT}"
@@ -953,7 +1009,7 @@ wait_bridges_consuming() {
   while :; do
     missing=""
     for sidecar in ${BUS_SIDECARS}; do
-      if ! k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null | grep -qF "${BRIDGE_CONSUMING_LOG_MSG}"; then
+      if ! grep -qF "${BRIDGE_CONSUMING_LOG_MSG}" <<<"$(k logs "deployment/${AGENT_DEPLOYMENT}" -c "${sidecar}" --tail="${BRIDGE_LOG_TAIL_LINES}" 2>/dev/null)"; then
         missing="${missing} ${sidecar}"
       fi
     done

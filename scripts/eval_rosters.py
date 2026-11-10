@@ -1,6 +1,6 @@
 """The eval rosters under hack/eval/, read the way hack/ci-eval-pr.sh reads them.
 
-Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
+The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
@@ -9,7 +9,11 @@ Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
-  ``BOOTSTRAP_ADMITTED``.
+  ``BOOTSTRAP_ADMITTED``;
+- ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
+  runs on its own, in ``# part N`` sections, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -48,6 +52,14 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
 # same rules as the GitLab lane's.
 GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
+# The certification suite's file: what EVAL_TIER=certification runs alone,
+# never a presubmit or nightly case. `# part N` lines split it into the
+# sections the ci-kube-agents-certification periodics run one each.
+CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
+CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -71,6 +83,11 @@ CASE_ENTRY_RE = re.compile(r"^\./tasks/([A-Za-z0-9_-]+)/task\.yaml$")
 # A case path anywhere on a line, comment or not: how the validator finds a
 # commented-out registration, the parking state that is retired.
 CASE_PATH_ANYWHERE_RE = re.compile(r"tasks/([A-Za-z0-9_-]+)/task\.yaml")
+# A `# part N` section marker in the certification file: the line on its
+# own, N from 1, the twin of the awk pattern in the script's
+# certification_part_entries(). `#part 2`, an indented marker and `# part 0`
+# are comments to both.
+PART_MARKER_RE = re.compile(r"^#\s+part\s+([1-9]\d*)\s*$")
 # The old script's default line, for text from before the split.
 SCRIPT_ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
 # bench-gate accepts comma- or whitespace-separated ids in the variable.
@@ -163,6 +180,37 @@ def gitlab_cases(path: pathlib.Path = GITLAB_CASES_FILE) -> list[str]:
 
 def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
+
+
+def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def parse_certification_parts(text: str) -> dict[int, list[str]]:
+    """Case ids of the certification file by ``# part N`` section, in file order.
+
+    An entry above the first marker is part 1, as in the script; a section
+    that names nothing is left out, since the script refuses to run it. The
+    marker is matched on the raw line, as the script's awk does.
+    """
+    parts: dict[int, list[str]] = {}
+    part = 1
+    for raw in text.splitlines():
+        marker = PART_MARKER_RE.match(raw)
+        if marker:
+            part = int(marker.group(1))
+            continue
+        for name in case_names(raw):
+            parts.setdefault(part, []).append(name)
+    return parts
+
+
+def certification_parts(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> dict[int, list[str]]:
+    return parse_certification_parts(path.read_text(encoding="utf-8"))
 
 
 def parse_lane_exclusions(text: str) -> dict[str, str]:
@@ -405,11 +453,14 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
         "api lane exclusions": len(api_lane_exclusions()),
+        "certification cases": len(certification_cases()),
+        "certification parts": len(certification_parts()),
     }
 
 

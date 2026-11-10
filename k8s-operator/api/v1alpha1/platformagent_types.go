@@ -291,6 +291,14 @@ type GoogleChatSpec struct {
 	// +kubebuilder:default:="default"
 	// +optional
 	Mode string `json:"mode,omitempty"`
+
+	// AnswerFeedback draws thumbs-up and thumbs-down buttons under each
+	// final answer on Google Chat under spec.mode next, and keeps each rating
+	// with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+	// False hides the buttons and keeps nothing.
+	// +kubebuilder:default=true
+	// +optional
+	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 }
 
 // SlackSpec contains the configuration for the Slack integration.
@@ -312,7 +320,11 @@ type SlackSpec struct {
 	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
 	// A plain ID (U...) is a member of the install's own workspace. Under mode next, an entry
 	// T...:U... (a workspace ID, a colon, a member ID) admits that member of another workspace
-	// in a Slack Connect channel; nothing else admits one, an absent list included.
+	// in a Slack Connect channel; nothing else admits one, an absent list included. With the
+	// list absent, every member of the install's own workspace is allowed, guest accounts
+	// included. Under mode next the same list decides who may move the home channel from the
+	// app's Home tab, except that a guest account of the workspace never moves it, listed or
+	// not.
 	// +listType=set
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`

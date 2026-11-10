@@ -83,8 +83,7 @@ func (e *PolicyError) Error() string {
 	return e.Message
 }
 
-// InClusterID names the cluster the proxy runs in. A path with no /clusters/{id} prefix and
-// no configured default targets it.
+// InClusterID names the cluster the proxy runs in, as /clusters/in-cluster/... addresses it.
 const InClusterID = "in-cluster"
 
 const (
@@ -167,7 +166,7 @@ const (
 )
 
 var discoveryPaths = sets.New(
-	"/api", "/apis", "/version", "/openapi/v2", "/openapi/v3", "/healthz", "/livez", "/readyz",
+	"/api", "/apis", "/version", "/openapi/v2", "/openapi/v3", "/healthz", "/livez", "/readyz", "/metrics",
 )
 
 var readVerbs = sets.New(verbGet, verbList, verbWatch)
@@ -179,6 +178,10 @@ var readWriteVerbs = sets.New(verbGet, verbList, verbWatch, verbCreate, verbUpda
 
 // upgradeSubresources stream over a protocol upgrade, or reach a pod, node or service directly.
 var upgradeSubresources = sets.New("exec", "attach", "portforward", "proxy")
+
+// longRunningSubresources are the subresources kube-apiserver also counts as long-running
+// and leaves out of its own max-in-flight limit.
+var longRunningSubresources = upgradeSubresources.Union(sets.New(subLog))
 
 // mintingSubresources mint credentials, change who a pod runs as or where it runs, or approve
 // a certificate. Refused in every mode.
@@ -208,12 +211,16 @@ func NewRequestInfoFactory() *request.RequestInfoFactory {
 	}
 }
 
-// SplitClusterPath validates u's path and splits off an optional /clusters/{id} prefix,
-// returning the target cluster and the API server path. A path without the prefix targets
-// defaultClusterID, or InClusterID when that is empty. Encoded separators, dot segments,
-// empty segments, backslashes and control characters are refused rather than cleaned, so
-// the path the policy classifies is the path the API server receives.
-func SplitClusterPath(u *url.URL, defaultClusterID string) (clusterID, apiPath string, err *PolicyError) {
+// SplitClusterPath validates u's path and splits off its /clusters/{id} prefix, returning
+// the target cluster and the API server path. A path without the prefix is refused, with
+// no default cluster to fall back to: every kubeconfig the sandbox builds names
+// /clusters/<context>, so a request without one comes from a server URL configured
+// without it or a client that dropped it (kubectl before 1.34 does on `get --raw`,
+// #4739), and serving it from a default cluster answered a fleet read with the host's
+// data. Encoded separators, dot segments, empty segments, backslashes and control
+// characters are refused rather than cleaned, so the path the policy classifies is the
+// path the API server receives.
+func SplitClusterPath(u *url.URL) (clusterID, apiPath string, err *PolicyError) {
 	if u == nil || !strings.HasPrefix(u.Path, "/") {
 		return "", "", invalidRoute("path must start with '/'")
 	}
@@ -247,11 +254,7 @@ func SplitClusterPath(u *url.URL, defaultClusterID string) (clusterID, apiPath s
 		return segments[1], "/" + strings.Join(segments[2:], "/"), nil
 	}
 
-	clusterID = strings.TrimSpace(defaultClusterID)
-	if clusterID == "" {
-		clusterID = InClusterID
-	}
-	return clusterID, u.Path, nil
+	return "", "", invalidRoute("name a cluster: /clusters/<context>/... (this request's path has no /clusters/ prefix: either the server URL was configured without one, or the client dropped it, as kubectl before 1.34 does on `get --raw`)")
 }
 
 // Policy decides which requests reach the API server.
@@ -372,14 +375,14 @@ func evaluateNonResource(r *http.Request, info *request.RequestInfo) *PolicyErro
 	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return forbidden(ReasonDiscoveryPathBlocked, fmt.Sprintf(
-			"%sHTTP method %q on non-resource path %q: only GET and HEAD are permitted on discovery paths.%s",
+			"%sHTTP method %q on non-resource path %q: only GET and HEAD are permitted on discovery, health, and metrics paths.%s",
 			policyPrefix, r.Method, info.Path, boundaryNotice))
 	}
 	if isDiscoveryPath(info.Path) {
 		return nil
 	}
 	return forbidden(ReasonDiscoveryPathBlocked, fmt.Sprintf(
-		"%snon-resource path %q: only Kubernetes discovery and health paths are permitted.%s",
+		"%snon-resource path %q: only Kubernetes discovery, health, and metrics paths are permitted.%s",
 		policyPrefix, info.Path, boundaryNotice))
 }
 

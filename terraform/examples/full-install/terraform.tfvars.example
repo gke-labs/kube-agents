@@ -49,6 +49,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_gvisor_node_pool  = true
 # gvisor_pool_name         = "gvisor-pool"
 
+# Standard node-pool sizing: "small" (default, today's shape), "medium" or
+# "fleet"; the gke-cluster module's README ("Sizing the node pools") has each
+# profile's machine types and disks. An explicit standard_machine_type,
+# standard_disk_size_gb, gvisor_machine_type or gvisor_disk_size_gb wins over
+# the profile; gvisor_min_node_count and gvisor_max_node_count bound the
+# gVisor pool's autoscaling per zone.
+# sizing_profile = "fleet"
+
 # Sandboxing on Autopilot, which has the gvisor RuntimeClass built in and no
 # node pool to provision. enable_gvisor_node_pool must stay false there.
 # agent_runtime_class = "gvisor"
@@ -83,6 +91,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # outside the VPC, for a cluster a Platform Agent running elsewhere has to
 # reach. Off by default; see the README before turning it on.
 # allow_external_dns_traffic = true
+#
+# Create the kube-agents release with `helm upgrade --install`, so an apply
+# whose state lost a live release (#4108) adopts it rather than failing with
+# "cannot re-use a name that is still in use". Off by default: it also takes
+# over a release another state or a manual `helm install` owns in the
+# namespace. Only for a long-lived install whose own state owns the release.
+# helm_upgrade_install = true
 
 # The PlatformAgent's spec.mode: "today" (the default, which renders no mode
 # field) or "next", which puts the NATS bus and the A2A gateway in front of
@@ -124,6 +139,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   ip_action   = "pseudonym"
 #   allow_cidrs = ["127.0.0.0/8"]
 #   rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]
+# }
+
+# The gateway's spend ceiling, in US dollars per period (a LiteLLM duration);
+# usd 0 is no ceiling, on it is at least 0.01. See variables.tf.
+# litellm_budget = {
+#   usd    = 0
+#   period = "1d"
 # }
 
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.

@@ -77,6 +77,9 @@ type slackClickPayload struct {
 		ID string `json:"id"`
 	} `json:"channel"`
 	Container struct {
+		// Type is "message" for a click on a message and "view" for one
+		// on the Home tab (slack_home_pick.go).
+		Type     string `json:"type"`
 		ThreadTS string `json:"thread_ts"`
 	} `json:"container"`
 	Message struct {
@@ -99,6 +102,9 @@ type slackClickPayload struct {
 		Text     struct {
 			Text string `json:"text"`
 		} `json:"text"`
+		// SelectedConversation is a conversations_select's pick: the Home
+		// tab's channel picker (slack_home_pick.go).
+		SelectedConversation string `json:"selected_conversation"`
 	} `json:"actions"`
 	ActionTS string `json:"action_ts"`
 	// TriggerID opens a modal for the clicker (a 👎's note,
@@ -371,7 +377,9 @@ func (s *SlackAdapter) noteHomeCandidate(msg InboundMessage, m *slackevents.Mess
 // our own member, the part after the workspace for an admitted guest's
 // "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
 // feeds, the answered line's display name and the Home tab's asker, are Slack
-// API calls that take a member id.
+// API calls that take a member id. A shortcut's keeps the author id, for the
+// private notice that names a refused guest's entry, and cuts it here for the
+// Home tab.
 func slackMemberOf(author string) string {
 	if _, member, found := strings.Cut(author, slackGuestSep); found {
 		return member
@@ -438,6 +446,11 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if strings.HasPrefix(action.ActionID, slackBoardActionPrefix) {
 		// A board-health row's Retry or Drop: never a turn (slack_board.go).
 		s.boardClick(p, action.ActionID, action.BlockID, action.Value)
+		return InboundMessage{}, false
+	}
+	if action.ActionID == slackHomePickAction {
+		// The Home tab's channel picker: never a turn (slack_home_pick.go).
+		s.homePick(p, action.SelectedConversation)
 		return InboundMessage{}, false
 	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
@@ -556,8 +569,10 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
 			// The clicker asked, so a question the task posts waits on them
-			// (the Home tab's "waiting on you"), as for a typed ask.
-			s.noteAsker(conversation, p.author)
+			// (the Home tab's "waiting on you"), as for a typed ask. The tab
+			// looks the asker up by member id, so a guest's "T…:U…" is cut
+			// to theirs.
+			s.noteAsker(conversation, slackMemberOf(p.author))
 			return
 		}
 		s.mu.Unlock()

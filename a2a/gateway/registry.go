@@ -63,6 +63,14 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineClosed marks a live message a Google Chat stop closed, a Stop
+	// press or a typed stop (chat_stop_press.go): it reads "cancel sent"
+	// with no Stop control, and the relay leaves it so until the terminal
+	// edit (updateRollingLine, showBusy). False for every other stop: one
+	// typed on another backend, or on Google Chat on a task with no line
+	// or when the armed card stop answers it (cardStopWanted); such a line
+	// keeps moving until the terminal.
+	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
 	// and the revision the mint returned. Every envelope the gateway sends
 	// toward this task carries it, and it is on the record rather than in
@@ -281,6 +289,11 @@ type TaskRef struct {
 	// render. A redelivered event found here was rendered by a gateway that
 	// stopped or died before its ack landed, and is not rendered again.
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
+	// Tier is the tier a task addressed to an AgentProfile runs at; empty
+	// for a task addressed to platform or a session. A profile task's child
+	// runs at its tier, and the child's end reaches it as a childResult on
+	// its .in rather than as a wake (deliverChildResult).
+	Tier string `json:"tier,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -298,9 +311,10 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
-	// QuietCancel marks a cancel the Slack Stop button sent
-	// (cancelTaskVoiced): the stop answers with one reply of its own, so the
-	// relay posts no "canceled" line for the task's terminal.
+	// QuietCancel marks a cancel that answers for itself (cancelTaskVoiced):
+	// Slack's Stop button with one reply of its own, Google Chat's button
+	// and typed stop on the task's line (chat_stop_press.go), so the relay
+	// posts no "canceled" line for the task's terminal.
 	QuietCancel bool `json:"quietCancel,omitempty"`
 	// TerminalObserved marks that observeTaskTerminal has already been called
 	// for this task (e.g. by healActiveTask when recovering a stale terminal
@@ -414,9 +428,12 @@ type TaskRef struct {
 // that minted a child ends quietly as the chain's parent (observedAs).
 // relayTerminal, the heal and the read route all decide through it, after
 // settleHandOff has written what the stream shows.
+//
+// Not for a task submitted to an AgentProfile (Tier set): a refused
+// delegation doesn't end it, and its `completed` is a real result of its own.
 func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
 	ref, ok := rec.TaskRefFor(taskID)
-	if !ok || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
+	if !ok || ref.Tier != "" || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
 		return state, "", false
 	}
 	return lib.StateFailed, ref.DelegationEnd, true
@@ -506,8 +523,9 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	}
 }
 
-// markQuietCancel records that taskID's cancel came from the Slack Stop
-// button (TaskRef.QuietCancel).
+// markQuietCancel records that taskID's cancel answers for itself: a Stop
+// button on Slack or Google Chat, or a stop typed on Google Chat
+// (TaskRef.QuietCancel).
 func (rec *SessionRecord) markQuietCancel(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
@@ -544,14 +562,16 @@ func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
 // one task to them, its root (TaskRef.RootTaskID): a child is never named,
 // and neither is a turn that delegated, whose end is not the chain's. Every
 // other turn's end is its root's - a human turn is its own root, and a
-// wake that did not delegate ends the chain it continues. An id the record
-// does not hold is passed through as it is.
+// wake that did not delegate ends the chain it continues. A turn addressed
+// to an AgentProfile ends its chain even when it delegated: it waits open
+// for its children and ends after them. An id the record does not hold is
+// passed through as it is.
 func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 	ref, ok := rec.TaskRefFor(taskID)
 	if !ok {
 		return taskID, true
 	}
-	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
+	return ref.rootID(), ref.Role != taskRoleChild && (len(ref.Children) == 0 || ref.Tier != "")
 }
 
 // delegationHandled reports whether the task's history entry shows a
@@ -660,6 +680,27 @@ type Registry struct {
 	// afterTermRead, when set, runs between a fenced write's counter read
 	// and its record read (tests).
 	afterTermRead func()
+	// onFenced, when set, runs each time a write is refused because a newer
+	// term has started; SetOnFenced says which refusals don't run it.
+	onFenced atomic.Pointer[func()]
+}
+
+// SetOnFenced sets what runs each time a write is refused because a newer
+// term has started, before the error goes back to the writer. The election
+// steps down there: this gateway has been deposed, whether or not it has
+// noticed the lease move yet. A write refused by a counter reset below the
+// records (by hand) doesn't run it: no newer term exists, and stepping down
+// would only hand the same refusal to the next replica.
+func (r *Registry) SetOnFenced(f func()) {
+	r.onFenced.Store(&f)
+}
+
+// fenced runs the onFenced hook and returns err, an ErrFenced.
+func (r *Registry) fenced(err error) error {
+	if f := r.onFenced.Load(); f != nil {
+		(*f)()
+	}
+	return err
 }
 
 // ErrFenced reports a write refused because the term marker or the stored
@@ -767,7 +808,7 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 		return 0, err
 	}
 	if term > mine {
-		return 0, fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", sessionKey, termKey, term, mine, ErrFenced)
+		return 0, r.fenced(fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", sessionKey, termKey, term, mine, ErrFenced))
 	}
 	if r.afterTermRead != nil {
 		r.afterTermRead()
@@ -791,12 +832,22 @@ func (r *Registry) fencedRecord(ctx context.Context, kv jetstream.KeyValue, sess
 			// term that began in between. Read the counter again: only a
 			// record above the counter as it stands now means the counter
 			// went backwards, by hand.
-			if now, _, rerr := readTerm(ctx, kv); rerr == nil && stored.Epoch > now {
+			now, _, rerr := readTerm(ctx, kv)
+			if rerr != nil {
+				// Unsettled: a new term or a reset. Not a step-down, since a
+				// reset would hand the same refusal to the next replica.
+				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s read a moment ago at %d, and reading the counter again failed (%v): %w",
+					sessionKey, stored.Epoch, termKey, term, rerr, ErrFenced)
+			}
+			if stored.Epoch > now {
+				// Not a newer term, so not a step-down: every replica would
+				// start a term under this record, be refused, and step down
+				// in turn. The write fails, naming the counter to fix.
 				return 0, fmt.Errorf("session %s carries term %d, above the term counter %s at %d (the counter was reset): %w",
 					sessionKey, stored.Epoch, termKey, now, ErrFenced)
 			}
 		}
-		return 0, fmt.Errorf("session %s: %w", sessionKey, ErrFenced)
+		return 0, r.fenced(fmt.Errorf("session %s: %w", sessionKey, ErrFenced))
 	}
 	return entry.Revision(), nil
 }
@@ -849,10 +900,15 @@ func (r *Registry) Get(ctx context.Context, sessionKey string) (*SessionRecord, 
 	}
 	var rec SessionRecord
 	if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-		return nil, fmt.Errorf("session %s: %w", sessionKey, err)
+		return nil, fmt.Errorf("session %s: %w: %w", sessionKey, errRecordUndecodable, err)
 	}
 	return &rec, nil
 }
+
+// errRecordUndecodable marks a session record that exists and doesn't decode:
+// a fault in one key, unlike an unreachable bucket or a timeout, which no
+// retry fixes.
+var errRecordUndecodable = errors.New("session record doesn't decode")
 
 // ErrSessionExists reports a Create that lost the first-contact race: a
 // record for the key already exists, and the caller adopts it.
@@ -876,7 +932,7 @@ func (r *Registry) Create(ctx context.Context, rec *SessionRecord) error {
 			return err
 		}
 		if term > mine {
-			return fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", rec.Key, termKey, term, mine, ErrFenced)
+			return r.fenced(fmt.Errorf("session %s: term counter %s at %d is past this gateway's term %d: %w", rec.Key, termKey, term, mine, ErrFenced))
 		}
 	}
 	rec.Epoch = mine

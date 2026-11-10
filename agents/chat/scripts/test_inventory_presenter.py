@@ -267,9 +267,10 @@ class PresentTest(unittest.TestCase):
         # 5), so the time is compared with a shorter posture's on the same machine.
         def seconds(repeats):
             report = "# Scan\n\nI scanned 3 clusters; " + "skipped: " * repeats + "\n\n1. **A.** b\n2. **B.** c\n"
-            start = time.monotonic()
+            # CPU time: wall-clock time also counts the time the process waits for a CPU while other test files run.
+            start = time.process_time()
             inventory_presenter.present(report)
-            return time.monotonic() - start
+            return time.process_time() - start
 
         short = seconds(GAP_PARTS_REPEATS // GAP_PARTS_SCALE)
         self.assertLess(seconds(GAP_PARTS_REPEATS), short * GAP_PARTS_RATIO_MAX)

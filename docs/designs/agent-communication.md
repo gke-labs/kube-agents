@@ -13,7 +13,7 @@
 The platform is a **decoupled, persona-based** system:
 
 - **Platform Agent** — one Hermes profile (the `platform` profile). Fleet-wide synthesis. It is not the chat front door: the `default` profile is the Chat Agent, which owns chat ingress and delegates to this one (§6.1).
-- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, and processes delegated tasks.
+- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. It processes delegated tasks and ships no `cron/jobs.json` (`profile_cron_tick.py` skips any profile directory without a `cron/jobs.json`; see [`scheduling-on-profiles.md`](scheduling-on-profiles.md)).
 
 Two communication channels, with different shapes and different reliability requirements:
 
@@ -258,9 +258,9 @@ The MVP starts with `health` and `utilization`; the others are added as their CU
 ### 2.7 Concurrency, atomicity, retention
 
 - **Atomic writes** (same-directory temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `save_job_output` recipe).
-- **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer (history lives in cron output / logs if needed).
-- **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to their scan cadence (e.g. a 5-minute health scan → `ttl ≈ 15m`).
-- **Concurrent writers within a profile** — the persistent cron context and any transient worker share the profile; if both could write the same handover file, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
+- **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer.
+- **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to the expected refresh cadence (e.g. a 5-minute refresh → `ttl ≈ 15m`).
+- **Concurrent writers within a profile** — if two workers for the same profile (or a future scheduled writer) could write the same handover file concurrently, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
 
 ### 2.8 No generic interface now; the write helper is the migration seam
 
@@ -428,4 +428,4 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 | 2    | ~~Surface structured `{project, cluster, location}` per agent in `list_agents`.~~ **Done** — on each Cluster Agent's roster line. | `_identity_note()` in `agents/chat/scripts/agent_roster.py` reads the `cluster_identity` block with a fail-soft line scan of `config.yaml` instead of importing `read_cluster_identity()`, so the module stays stdlib-only and never raises.                                                                                                                                                                                                                                                                   |
 | 3    | ~~A narrow per-user default-cluster preference.~~ **Done** — via general per-user memory rather than a scoped router tool.        | `kube_agents_memory` on the `default` profile, scoped by a tag derived from the gateway `user_id`. One sub-question resolved the hard way: in a **shared thread** `user_id` is whoever opened the session, because `build_session_key()` omits the participant id there unless `thread_sessions_per_user` is set — so a thread's participants would share one identity. The provider detects that case and disables personal memory rather than crossing users, which makes per-user memory DM-only by design. |
 
-Beyond step 2, the roster also carries a **Host Cluster Identity** line built from the pod's `GKE_*` environment, naming the host's Cluster Agent when one exists, so "this cluster" resolves at the cold start without a round trip, and a **GCP Projects in Scope** line read through `fleet_scope_targets.declared_scope_targets()`. The router's `env:` block in `agents/chat/config.yaml` passes the same variables, so `list_agents` renders the same lines as the injected block.
+Beyond step 2, the roster also carries a **Host Cluster Identity** line built from the pod's `GKE_*` environment, naming the host's Cluster Agent when one exists, so "this cluster" resolves at the cold start without a round trip, and a **GCP Projects in Scope** line read through `fleet_scope_targets.declared_scope_targets()`. The router's `env:` block in `agents/chat/config.yaml` passes the same variables, so `list_agents` renders the same lines as the injected block. Above `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD` Cluster Agents (20 unless set) the shared-role group is counted by project and location rather than listed, and step 2's per-agent line moves to the answer of `list_agents(filter=<cluster>)`, which the front door calls before routing to a named cluster; the rendered roster is cached per process on the profiles tree's mtimes, never on time.

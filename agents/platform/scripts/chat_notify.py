@@ -80,9 +80,14 @@ HERMES_CLI = "hermes"
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
 # The exit status `a2a notify` uses when the route is not there right now: no
-# gateway subscribed (a roll, or its bind retry) or the bus unreachable. Nothing
-# was posted, and waiting may help where retrying a refusal would not.
+# gateway subscribed (a roll, or its bind retry), the bus unreachable, or a
+# refusal the gateway marks retry (stopping, a record it couldn't read in time).
+# Nothing was posted, and waiting may help where retrying a refusal would not.
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# `a2a notify`'s exit when the gateway refused a home post for want of a home
+# channel and kept it for the digest it posts once one is set: nothing posted
+# now, nothing lost, so a sender that re-sends on failure treats it as handled.
+NOTIFY_KEPT = 5
 # The waits before each retry of a send that found the route unavailable, for
 # a caller with one shot at the post. They sum past the gateway's longest wait
 # between attempts to bind the route (a2a/gateway/notify.go,
@@ -142,10 +147,12 @@ def home_file_value() -> str:
 def routed_platform() -> str:
     """The platform whose posts go through the gateway, or "" when none does.
 
-    The rendered env names it when the CR sets the home channel. A learned
-    channel is never rendered into the pod, so with the env empty the answer
-    is derived: the gateway holds Slack (``A2A_NOTIFY_CONVERSATIONS``) and the
-    projected file names a home channel.
+    The rendered env names it when the CR sets the home channel, and when the
+    gateway's backend is the install's only chat platform with no home channel
+    set: the gateway then refuses each post and keeps it for the digest it
+    posts once one is. A learned channel is never rendered into the pod, so
+    with the env empty the answer is derived: the gateway holds Slack
+    (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
     """
     routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
     if routed:
@@ -299,6 +306,11 @@ def outcome_unknown(returncode: int) -> bool:
 def route_unavailable(returncode: int) -> bool:
     """Whether a failed send found no route (nothing posted; waiting may help)."""
     return returncode == NOTIFY_ROUTE_UNAVAILABLE
+
+
+def kept(returncode: int) -> bool:
+    """Whether a failed send was kept by the gateway for its digest (nothing posted now; do not re-send)."""
+    return returncode == NOTIFY_KEPT
 
 
 def thread_from_response(platform: str, response: dict) -> str:

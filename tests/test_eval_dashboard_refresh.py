@@ -30,9 +30,20 @@ SKIP = "eval-dashboard refresh skipped:"
 _SCRUB = (
     "EVAL_DASHBOARD_TARGET",
     "EVAL_DASHBOARD_PR_GLOB",
+    "EVAL_DASHBOARD_PR_GLOB_PREVIOUS",
+    "EVAL_DASHBOARD_GITLAB_PR_GLOB",
+    "EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS",
+    "EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX",
+    "EVAL_DASHBOARD_LANE_PR_GLOBS",
+    "EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES",
     "EVAL_DASHBOARD_NIGHTLY_PREFIX",
     "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX",
     "EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX",
+    "EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX",
     "EVAL_DASHBOARD_SINCE_DAYS",
     "EVAL_DASHBOARD_TIMEOUT",
     "EVAL_DASHBOARD_FROM_DIR",
@@ -162,6 +173,8 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertNotIn("--nightly-prefix", argv)
         self.assertNotIn("--nightly-writers-prefix", argv)
         self.assertNotIn("--nightly-main-b-prefix", argv)
+        for flag in ("--nightly-main-c-prefix", "--nightly-main-d-prefix", "--nightly-main-e-prefix", "--nightly-writers-b-prefix", "--nightly-writers-c-prefix"):
+            self.assertNotIn(flag, argv)
         self.assertNotIn("<base href", (self.target / "index.html").read_text())
 
     def test_bucket_target_emits_derived_base_href(self):
@@ -277,6 +290,87 @@ class RefreshScriptTest(unittest.TestCase):
         log = artifacts / "eval-dashboard-refresh.log"
         self.assertIn("refusing to publish an empty dashboard", log.read_text())
 
+    def test_the_previous_archive_rides_as_a_second_pr_glob_until_disabled(self):
+        """The smoke lanes moved buckets; the old archives' runs stay in the
+        window, so both globs of each lane reach collect.py by default, and
+        an empty *_PREVIOUS knob drops the old one."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        write_stub(stubs, "gcloud", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
+        run_script(env={"EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/", "JOB_TYPE": "periodic"}, path_prepend=str(stubs))
+        argv = collect_argv(argv_log)
+        globs = [argv[i + 1] for i, a in enumerate(argv) if a == "--pr-glob"]
+        self.assertEqual(
+            globs,
+            [
+                "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*",
+                "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*",
+            ],
+        )
+        lane_globs = [argv[i + 1] for i, a in enumerate(argv) if a == "--gitlab-pr-glob"]
+        self.assertEqual(
+            lane_globs,
+            [
+                "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*",
+                "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*",
+            ],
+        )
+        argv_log.unlink()
+        run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
+                "JOB_TYPE": "periodic",
+                "EVAL_DASHBOARD_PR_GLOB_PREVIOUS": "",
+                "EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS": "",
+            },
+            path_prepend=str(stubs),
+        )
+        argv = collect_argv(argv_log)
+        self.assertEqual(argv.count("--pr-glob"), 1)
+        self.assertEqual(argv.count("--gitlab-pr-glob"), 1)
+
+    def test_the_forge_lanes_ride_as_lane_flags_in_order_until_disabled(self):
+        """The GHES and GitLab CE lanes (their weekly jobs) and the GitLab next nightly reach
+        collect.py as repeated --lane-pr-glob / --lane-nightly-prefix values,
+        in order and with their globs unexpanded; an empty knob drops them."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        write_stub(stubs, "gcloud", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
+        run_script(env={"EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/", "JOB_TYPE": "periodic"}, path_prepend=str(stubs))
+        argv = collect_argv(argv_log)
+        self.assertEqual(
+            [argv[i + 1] for i, a in enumerate(argv) if a == "--lane-pr-glob"],
+            [
+                "ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/*",
+                "gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*",
+            ],
+        )
+        self.assertEqual(
+            [argv[i + 1] for i, a in enumerate(argv) if a == "--lane-nightly-prefix"],
+            [
+                "gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/",
+                "ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/",
+                "gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/",
+            ],
+        )
+        argv_log.unlink()
+        run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
+                "JOB_TYPE": "periodic",
+                "EVAL_DASHBOARD_LANE_PR_GLOBS": "",
+                "EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES": "",
+            },
+            path_prepend=str(stubs),
+        )
+        argv = collect_argv(argv_log)
+        self.assertNotIn("--lane-pr-glob", argv)
+        self.assertNotIn("--lane-nightly-prefix", argv)
+
     def test_a_failing_gcloud_storage_source_hits_the_floor_not_the_bucket(self):
         """gs:// end to end with a gcloud that always fails: the prior
         download degrades to the first-run message, the sweep collects
@@ -303,10 +397,12 @@ class RefreshScriptTest(unittest.TestCase):
             "gcloud storage ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
         # The bucket path hands collect.py both sources, the nightly one with
-        # its default prefix and the nightly's writers and main-b periodics
-        # with their own; an empty EVAL_DASHBOARD_NIGHTLY_PREFIX,
-        # EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX or
-        # EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX drops that one.
+        # its default prefix and the nightly's writers, main-b, writers-b and
+        # writers-c periodics with their own; an empty
+        # EVAL_DASHBOARD_NIGHTLY_PREFIX, EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX,
+        # EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX,
+        # EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX or
+        # EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX drops that one.
         argv = collect_argv(argv_log)
         self.assertIn("--pr-glob", argv)
         self.assertIn("--nightly-prefix", argv)
@@ -322,6 +418,8 @@ class RefreshScriptTest(unittest.TestCase):
             argv[argv.index("--nightly-main-b-prefix") + 1],
             "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/",
         )
+        for flag, job in (("--nightly-main-c-prefix", "main-c"), ("--nightly-main-d-prefix", "main-d"), ("--nightly-main-e-prefix", "main-e"), ("--nightly-writers-b-prefix", "writers-b"), ("--nightly-writers-c-prefix", "writers-c")):
+            self.assertEqual(argv[argv.index(flag) + 1], f"gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-{job}/")
         argv_log.unlink()
         run_script(
             env={
@@ -330,6 +428,11 @@ class RefreshScriptTest(unittest.TestCase):
                 "EVAL_DASHBOARD_NIGHTLY_PREFIX": "",
                 "EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX": "",
                 "EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_C_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_D_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_MAIN_E_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_WRITERS_B_PREFIX": "",
+                "EVAL_DASHBOARD_NIGHTLY_WRITERS_C_PREFIX": "",
             },
             path_prepend=str(stubs),
         )
@@ -338,6 +441,8 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertNotIn("--nightly-prefix", argv)
         self.assertNotIn("--nightly-writers-prefix", argv)
         self.assertNotIn("--nightly-main-b-prefix", argv)
+        for flag in ("--nightly-main-c-prefix", "--nightly-main-d-prefix", "--nightly-main-e-prefix", "--nightly-writers-b-prefix", "--nightly-writers-c-prefix"):
+            self.assertNotIn(flag, argv)
 
     @unittest.skipUnless(shutil.which("timeout"), "needs coreutils timeout")
     def test_a_hung_pipeline_times_out_red(self):

@@ -2037,6 +2037,10 @@ class ScanGateTest(unittest.TestCase):
         step2 = self._step_2(bootstrap_scan_gate._task_body())
         prefix = bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX
         agents = {a["name"]: a for a in bootstrap_scan_gate.cluster_agents()}
+        # The hand-off predicts a past-cap cluster's collector file from this.
+        for agent in agents.values():
+            self.assertEqual(sorted(agent["identity"]), ["cluster", "location", "project"])
+            self.assertIn(agent["identity"]["cluster"], agent["cluster_label"])
         self.assertEqual(sorted(agents), sorted([short, hashed]))
         self.assertEqual(agents[short]["key"], f"{prefix}{short}")
         self.assertEqual(agents[hashed]["key"], f"{prefix}{hashed}")
@@ -2391,6 +2395,75 @@ class ScanGateTest(unittest.TestCase):
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
         self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
 
+    def test_a_reconcile_that_deferred_creates_defers_the_sweep_and_ends_the_failure_streak(self):
+        # EXIT_CREATES_DEFERRED: the run created its cap's worth and left the rest for
+        # the next tick. Progress, not failure: the sweep waits, the streak of failed
+        # ticks before it is over, as on exit 0, and the counts the reconcile logged
+        # are repeated for the gate's reader.
+        import cluster_agent_reconcile as rec
+        self.assertEqual(bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED)
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, "",
+                "[CLUSTER-RECONCILE] Done: created=100 failed=0 deferred=150 pruned=0 kept=0 no_identity=0 unknown=0.\n")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+        self.assertIsNone(bootstrap_scan_gate._reconcile_since(self.d))
+        self.assertIn("deferred the rest to the next tick", err.getvalue())
+        self.assertIn("created=100 failed=0 deferred=150", err.getvalue())
+
+    def test_a_failure_streak_before_the_first_batch_does_not_give_up_mid_fleet(self):
+        # A fresh install fails its first ticks while IAM propagates, then the fleet
+        # starts arriving in batches that run past the give-up window those failures
+        # opened. The first batch ended the streak, so the clock has nothing to fire
+        # on: every deferred tick waits, and the finishing one files the sweep.
+        t0 = 1_700_000_000.0
+        clock = [t0 + 60.0]
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS, t0)
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        err = io.StringIO()
+        ticks = []
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(bootstrap_scan_gate.time, "time", lambda: clock[0]), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            clock[0] = t0 + bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS + 60.0
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(ticks, [False, False, True])
+        self.assertNotIn("filing the sweep anyway", err.getvalue())
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
+    def test_a_fleet_of_three_batches_files_the_sweep_on_the_third_tick(self):
+        # 250 clusters at the default cap: two ticks that defer, then the one that
+        # finishes; no attempt is spent along the way, so the ceiling never fires.
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ticks = [bootstrap_scan_gate.ensure_cluster_agents(self.d) for _ in range(3)]
+        self.assertEqual(ticks, [False, False, True])
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.
 
@@ -2436,6 +2509,26 @@ class ScanGateTest(unittest.TestCase):
         # table's K8s version, node pool and Workload Identity columns unsourced on
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
+
+    def test_step_3_names_the_collector_once_per_cluster(self):
+        # Three by-hand SOP walks do not fit the platform worker's turn budget
+        # (#4115): the sweep completed with one past-cap cluster recorded, or ran
+        # past the hand-off's wait. Step 3 is one command per cluster, and the
+        # by-hand walk is the fallback for a cluster the script cannot reach.
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH, body)
+        self.assertIn("--project <project> --location <location> --cluster <cluster>", body)
+        self.assertIn(bootstrap_scan_gate.SWEEP_DIR + "/<project>__<location>__<cluster>.json", body)
+        self.assertIn("Do not copy the object anywhere: the gate takes it from the file", body)
+        self.assertIn("one `{project, location, cluster, gaps}` entry per cluster Step 3 audited", body)
+        self.assertIn("only where the script itself cannot run", body)
+        # The constant is the sandbox path of a file this repository ships: the
+        # staged root /opt/data/profiles/platform/ maps onto agents/platform/.
+        staged_root = "/opt/data/profiles/platform/"
+        self.assertTrue(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH.startswith(staged_root))
+        relative = bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH[len(staged_root):]
+        self.assertTrue((Path(__file__).resolve().parents[2] / "platform" / relative).is_file(), relative)
+        self.assertIn("`timeout` set to 600", body)
 
     def test_cluster_cards_are_keyed_by_profile_name(self):
         # The gate re-files a missing card every tick until the hand-off; the

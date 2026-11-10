@@ -5,6 +5,8 @@ package render
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/persona"
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/claudecode"
@@ -32,6 +34,39 @@ func CheckOutput(out persona.Output) error {
 	for _, f := range out.Files {
 		if !persona.LocalPath(f.Path) {
 			return fmt.Errorf("adapter output path %q leaves the config directory", f.Path)
+		}
+	}
+	return nil
+}
+
+// File modes for WriteFiles.
+const (
+	writeDirMode  = 0o755
+	writeFileMode = 0o644
+	writeExecMode = 0o755
+)
+
+// WriteFiles puts a rendering's files under dir, which must be empty or
+// absent: a stale file from an earlier rendering would load as part of this
+// one. cmd/persona and the profile worker both write through it.
+func WriteFiles(dir string, files []persona.File) error {
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+		return fmt.Errorf("%s is not empty", dir)
+	}
+	if err := os.MkdirAll(dir, writeDirMode); err != nil {
+		return err
+	}
+	for _, f := range files {
+		full := filepath.Join(dir, filepath.FromSlash(f.Path))
+		if err := os.MkdirAll(filepath.Dir(full), writeDirMode); err != nil {
+			return err
+		}
+		mode := os.FileMode(writeFileMode)
+		if f.Executable {
+			mode = writeExecMode
+		}
+		if err := os.WriteFile(full, f.Data, mode); err != nil {
+			return err
 		}
 	}
 	return nil

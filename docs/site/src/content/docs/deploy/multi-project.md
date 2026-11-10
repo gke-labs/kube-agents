@@ -222,6 +222,9 @@ on the project's clusters are not reported.
 
 You can also exclude specific project globs or individual clusters under
 `spec.scope.exclude`; see [`spec.scope` in the `PlatformAgent` CRD reference](/kube-agents/operator/platformagent-crd/#specscope).
+An install that declares no project, folder or selector still adopts every cluster in its
+own project; the `PlatformAgent`'s `ScopeUndeclared` condition names the ones beyond the
+host cluster, and clears once you name the project in `spec.scope.projects` or exclude them.
 
 #### Option B: Onboard individual clusters on demand in chat
 
@@ -267,7 +270,9 @@ kubectl exec -i deployment/platform-agent-gateway -n kubeagents-system \
 did not write. Exit 4 means the hourly reconcile or the bootstrap gate holds the
 lock: retry in a minute. Exit 3 means the run could not list the host project's
 clusters, every create failed, or the run aborted; the log line above it names
-which.
+which. Exit 5 means the run created its cap's worth of profiles (100 by default)
+and left the rest for the next run: run it again. The snapshot was written on
+that exit; the chain just did not print it.
 
 ## Removing a project
 
