@@ -1578,8 +1578,6 @@ def publish(
             "with `--advance`."
         )
 
-    _check_decision_memory(session, base, override_decision)
-
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
     bundle_file = Path(name)
     os.close(handle)
@@ -1596,18 +1594,18 @@ def publish(
                 f"the change is {len(blob)} bytes, over the "
                 f"{MAX_BUNDLE_BYTES}-byte ceiling for one publish"
             )
-        answer = call(
-            "publish",
-            {
-                "repository": session["spec"],
-                "branch": branch,
-                "target": target,
-                "baseRevision": base,
-                "clonedFrom": session["branch"],
-                "advance": advance,
-                "bundleBase64": base64.b64encode(blob).decode("ascii"),
-            },
-        )
+        publish_payload = {
+            "repository": session["spec"],
+            "branch": branch,
+            "target": target,
+            "baseRevision": base,
+            "clonedFrom": session["branch"],
+            "advance": advance,
+            "bundleBase64": base64.b64encode(blob).decode("ascii"),
+        }
+        if override_decision:
+            publish_payload["overrideDecision"] = override_decision
+        answer = call("publish", publish_payload)
     finally:
         bundle_file.unlink(missing_ok=True)
 
@@ -1616,6 +1614,8 @@ def publish(
     # against something the remote demonstrably has.
     session.setdefault("published", {})[answer["branch"]] = answer["revision"]
     session["publishedBranch"] = answer["branch"]
+    if answer.get("decisionMemoryMarkdown"):
+        session["decisionMemoryMarkdown"] = str(answer["decisionMemoryMarkdown"])
     save_session(session)
     answer["revisions"] = count
     return answer

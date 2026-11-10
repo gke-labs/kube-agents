@@ -134,6 +134,9 @@ class Record:
     meta: Dict[str, Any]
     body: str
 
+    def __post_init__(self) -> None:
+        _normalize_declares_into_meta(self.meta)
+
     @property
     def id(self) -> str:
         return str(self.meta.get("id", ""))
@@ -219,6 +222,53 @@ class Record:
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.S)
 
 
+def _normalize_declares_into_meta(meta: Dict[str, Any]) -> None:
+    declares = meta.get("declares")
+    if not isinstance(declares, list) or not declares:
+        return
+    scope = dict(meta.get("scope") or {})
+    paths = [str(x) for x in (scope.get("paths") or [])]
+    resources = [str(x) for x in (scope.get("resources") or [])]
+    clusters = [str(x) for x in (scope.get("clusters") or [])]
+    checks = [str(x) for x in (scope.get("checks") or [])]
+    for item in declares:
+        if not isinstance(item, dict):
+            continue
+        chk = str(item.get("check") or "").strip()
+        if chk and chk not in checks:
+            checks.append(chk)
+        cl = str(item.get("cluster") or "").strip()
+        if cl and cl not in clusters:
+            clusters.append(cl)
+        fl = str(item.get("file") or "").strip()
+        if fl and fl not in paths:
+            paths.append(fl)
+        obj = str(item.get("object") or "").strip()
+        if obj:
+            ns = str(item.get("namespace") or "").strip()
+            if obj.count("/") == 1 and ns:
+                kind, name = obj.split("/", 1)
+                obj = f"{kind}/{ns}/{name}"
+            if obj not in resources:
+                resources.append(obj)
+        if fl and item.get("path") and item.get("op") and not meta.get("guard"):
+            meta["guard"] = {
+                "rule": str(item.get("rule") or "").strip(),
+                "severity": str(item.get("severity") or "block").strip() or "block",
+                "expect": {
+                    "file": fl,
+                    "path": str(item["path"]).strip(),
+                    "op": str(item["op"]).strip(),
+                    "value": item.get("value"),
+                },
+            }
+    scope["paths"] = paths
+    scope["resources"] = resources
+    scope["clusters"] = clusters
+    scope["checks"] = checks
+    meta["scope"] = scope
+
+
 def parse_record(text: str, path: str) -> Record:
     m = FRONTMATTER.match(text)
     if not m:
@@ -226,6 +276,7 @@ def parse_record(text: str, path: str) -> Record:
     meta = yaml.safe_load(m.group(1)) or {}
     if not isinstance(meta, dict):
         raise ValueError(f"{path}: frontmatter is not a mapping")
+    _normalize_declares_into_meta(meta)
     return Record(path=path, meta=meta, body=m.group(2))
 
 
@@ -271,9 +322,29 @@ def validate_record(rec: Record) -> List[str]:
     return errs
 
 
+def _intent_record_dirs(repo: Path) -> List[str]:
+    dirs = list(RECORD_DIRS)
+    intent_file = repo / ".kube-agents" / "intent.yaml"
+    if intent_file.is_file():
+        try:
+            loaded = yaml.safe_load(intent_file.read_text())
+            if isinstance(loaded, dict) and isinstance(loaded.get("paths"), list):
+                for raw_p in loaded["paths"]:
+                    clean = str(raw_p or "").strip().strip("/")
+                    if clean:
+                        for leaf in ("decisions", "lessons"):
+                            cand = f"{clean}/{leaf}"
+                            if cand not in dirs:
+                                dirs.append(cand)
+        except Exception:
+            pass
+    return dirs
+
+
 def load_records(repo: Path) -> List[Record]:
     out = []
-    for d in RECORD_DIRS:
+    seen = set()
+    for d in _intent_record_dirs(repo):
         base = repo / d
         if not base.is_dir():
             continue
@@ -281,6 +352,9 @@ def load_records(repo: Path) -> List[Record]:
             if p.name.lower() in ("index.md", "readme.md", "template.md"):
                 continue
             rel = str(p.relative_to(repo))
+            if rel in seen:
+                continue
+            seen.add(rel)
             try:
                 out.append(parse_record(p.read_text(), rel))
             except (ValueError, yaml.YAMLError) as exc:
@@ -817,9 +891,6 @@ def match_change(
     active_candidates = [r for r in rec_list if r.status in ("active", "proposed")]
     effective_records = _select_precedence_winners(active_candidates, changed.keys())
     findings = []
-    boundary_finding = _evaluate_repo_boundary(changed, boundary)
-    if boundary_finding:
-        findings.append(boundary_finding)
     new_resources = {p: _resources_in(c) for p, c in changed.items() if c}
     for rec in effective_records:
         s = rec.scope

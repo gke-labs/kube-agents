@@ -781,14 +781,6 @@ def handle_submit(args) -> int:
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=copy_key)
 
-    dm_out = _check_decision_memory(
-        session, base, getattr(args, "override_decision", None), repo=repo, copy_key=copy_key
-    )
-    if dm_out and dm_out.get("findings") and not args.keep_description:
-        md_section = dm_out.get("markdown", "")
-        if md_section and DECISION_MEMORY_HEADING not in body:
-            body = body.rstrip() + "\n\n" + md_section + "\n"
-
     if vcs_client.already_published(session, branch):
         # The state a retry has to be able to walk back into: the publish landed
         # and the forge call after it did not — a rate limit, a 5xx, a body the
@@ -841,13 +833,17 @@ def handle_submit(args) -> int:
         # of the base — the second round on an open proposal. `publish` refuses
         # to write to the branch a copy came down on otherwise, and that refusal
         # is the one that caught a worker fast-forwarding a branch it had cloned.
-        vcs_client.publish(
+        pub_ans = vcs_client.publish(
             repo,
             target=base,
             advance=session["branch"] == branch,
             key=copy_key,
             override_decision=getattr(args, "override_decision", None),
         )
+        if isinstance(pub_ans, dict) and pub_ans.get("decisionMemoryMarkdown") and not args.keep_description:
+            md_section = str(pub_ans["decisionMemoryMarkdown"])
+            if md_section and DECISION_MEMORY_HEADING not in body:
+                body = body.rstrip() + "\n\n" + md_section + "\n"
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {url}")

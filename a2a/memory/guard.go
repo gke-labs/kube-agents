@@ -678,9 +678,6 @@ func CheckChangedFilesWithBoundary(records []Record, changed map[string]*string,
 	}
 
 	var findings []CheckFinding
-	if bf := evaluateRepoBoundaryFinding(changed, boundary); bf != nil {
-		findings = append(findings, *bf)
-	}
 	for _, rec := range effective {
 		hitSet := map[string]bool{}
 		for _, p := range changedPaths {
@@ -830,15 +827,18 @@ func renderCheckMarkdown(findings []CheckFinding) string {
 	return strings.Join(lines, "\n")
 }
 
-// DetectCrossClusterRecurrences finds active LES-* records that share the same
-// check ID or guarded YAML path across >= threshold distinct clusters.
+// DetectCrossClusterRecurrences finds LES-* records (active or verified-soak proposed)
+// that share the same check ID or guarded YAML path across >= threshold distinct clusters.
 func DetectCrossClusterRecurrences(records []Record, threshold int) []RecurrenceCandidate {
 	if threshold < 2 {
 		threshold = 2
 	}
 	byKey := map[string][]Record{}
 	for _, r := range records {
-		if r.Meta.Type != RecordTypeLesson || r.Meta.Status != StatusActive {
+		if r.Meta.Type != RecordTypeLesson {
+			continue
+		}
+		if r.Meta.Status != StatusActive && !(r.Meta.Status == StatusProposed && r.Meta.Evidence.Outcome == string(OutcomeResolvedMerged)) {
 			continue
 		}
 		if len(r.Meta.Scope.Clusters) == 0 || isFleetWideClusterScope(r.Meta.Scope.Clusters) {

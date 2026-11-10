@@ -1014,6 +1014,37 @@ class LLMSynthesisTests(unittest.TestCase):
         self.assertEqual(findings[0]["verdict"], "violates")
         self.assertEqual(findings[0]["severity"], "warn")
 
+        # 4. Unified declares: manifest assertions and .kube-agents/intent.yaml paths
+        declares_rec = dm.Record(
+            path="knowledge/lessons/LES-2026-020.md",
+            meta={
+                "type": "lesson",
+                "id": "LES-2026-020",
+                "title": "Unified declares lesson",
+                "status": "active",
+                "declares": [
+                    {
+                        "check": "oom-kill",
+                        "namespace": "payments",
+                        "object": "Deployment/checkout",
+                        "cluster": "prod-eu",
+                        "file": "clusters/prod-eu/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "256Mi",
+                        "severity": "block",
+                        "rule": "Keep checkout memory request >= 256Mi.",
+                    }
+                ],
+                "evidence": {"pull_request": "#31"},
+            },
+            body="",
+        )
+        self.assertEqual(dm.validate_record(declares_rec), [])
+        dec_findings = dm.match_change([declares_rec], {"clusters/prod-eu/payments/checkout.yaml": DEPLOY.format(mem="64Mi")})
+        self.assertEqual(len(dec_findings), 1)
+        self.assertEqual((dec_findings[0]["id"], dec_findings[0]["verdict"], dec_findings[0]["severity"]), ("LES-2026-020", "violates", "block"))
+
 
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")
 class LiveHindsightTests(unittest.TestCase):

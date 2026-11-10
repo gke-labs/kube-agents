@@ -654,32 +654,69 @@ func TestExternalDocRecordsAndRepoBoundary(t *testing.T) {
 		t.Fatalf("unexpected BP-0001 record: %+v", byID["BP-0001"])
 	}
 
-	kDir := filepath.Join(repoDir, "knowledge")
-	if err := os.MkdirAll(kDir, 0o755); err != nil {
+	badDeclaresYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\n  namespace: payments\nspec:\n  template:\n    spec:\n      containers:\n        - name: app\n          resources:\n            requests:\n              memory: 128Mi\n"
+	decDir := filepath.Join(repoDir, "knowledge", "lessons")
+	if err := os.MkdirAll(decDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sob := "---\nrepo: acme/infra\nmanaged_namespaces:\n  - checkout\n  - payments\nunmanaged_namespaces:\n  - legacy-billing\nenforce_namespace_boundary: true\n---\n\n# State of Being\n"
-	if err := os.WriteFile(filepath.Join(kDir, "STATE_OF_BEING.md"), []byte(sob), 0o644); err != nil {
+	lesDeclares := "---\ntype: lesson\nid: LES-2026-015\ntitle: checkout OOM below 256Mi\nstatus: active\ndeclares:\n  - check: oom-kill\n    namespace: payments\n    object: Deployment/checkout\n    cluster: prod-eu\n    file: apps/payments/checkout.yaml\n    path: spec.template.spec.containers[name=app].resources.requests.memory\n    op: \">=\"\n    value: 256Mi\n    severity: block\n    rule: Keep checkout memory request at or above 256Mi.\nevidence:\n  pull_request: \"#31\"\n---\n\nKeep memory >= 256Mi.\n"
+	if err := os.WriteFile(filepath.Join(decDir, "LES-2026-015-checkout-oom.md"), []byte(lesDeclares), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	boundary := LoadRepoBoundary(repoDir)
-	if !boundary.EnforceNamespaceBoundary || len(boundary.ManagedNamespaces) != 2 {
-		t.Fatalf("unexpected boundary: %+v", boundary)
+	loadedRecs, err := LoadRecords(repoDir)
+	if err != nil || len(loadedRecs) != 1 {
+		t.Fatalf("expected 1 loaded record from declares:, got %v (%+v)", err, loadedRecs)
+	}
+	repBlock := CheckChangedFiles(loadedRecs, map[string]*string{
+		"apps/payments/checkout.yaml": &badDeclaresYAML,
+	})
+	if repBlock.Verdict != "block" || len(repBlock.Findings) != 1 || repBlock.Findings[0].ID != "LES-2026-015" {
+		t.Fatalf("expected LES-2026-015 block finding from declares:, got %+v", repBlock)
 	}
 
-	badYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: billing-worker\n  namespace: legacy-billing\n"
-	okYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout-api\n  namespace: checkout\n"
-	repBlock := CheckChangedFilesWithBoundary(nil, map[string]*string{
-		"apps/legacy-billing/deployment.yaml": &badYAML,
-	}, boundary)
-	if repBlock.Verdict != "block" || len(repBlock.Findings) != 1 || repBlock.Findings[0].ID != RepoBoundaryID {
-		t.Fatalf("expected REPO-BOUNDARY block finding, got %+v", repBlock)
+	// Verify custom .kube-agents/intent.yaml paths and DECISION_MEMORY_GITOPS_PRS=false proposed status.
+	customRepo := t.TempDir()
+	intentDir := filepath.Join(customRepo, ".kube-agents")
+	if err := os.MkdirAll(intentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(intentDir, "intent.yaml"), []byte("paths:\n  - ops-intent/decisions\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	customDecDir := filepath.Join(customRepo, "ops-intent", "decisions")
+	if err := os.MkdirAll(customDecDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDecDir, "DEC-2026-099-test.md"), []byte(lesDeclares), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	customLoaded, err := LoadRecords(customRepo)
+	if err != nil || len(customLoaded) != 1 {
+		t.Fatalf("expected 1 record from custom .kube-agents/intent.yaml paths, got %v (%+v)", err, customLoaded)
 	}
 
-	repOK := CheckChangedFilesWithBoundary(nil, map[string]*string{
-		"apps/checkout/deployment.yaml": &okYAML,
-	}, boundary)
-	if repOK.Verdict != "ok" || len(repOK.Findings) != 0 {
-		t.Fatalf("expected ok verdict for managed namespace, got %+v", repOK)
+	t.Setenv("DECISION_MEMORY_GITOPS_PRS", "false")
+	curOptOut, err := NewCurator(CuratorConfig{
+		RepoDir: customRepo,
+		RepoID:  "acme/infra",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resOptOut, err := curOptOut.ProcessOutcome(context.Background(), OutcomeEvent{
+		Schema:     OutcomeSchema,
+		Kind:       OutcomeResolvedMerged,
+		RecordID:   "LES-2026-088",
+		RecordType: RecordTypeLesson,
+		Repo:       "acme/infra",
+		Title:      "Checkout OOM below 256Mi",
+		Summary:    "Checkout OOM-kills below 256Mi.",
+		Rule:       "Keep checkout memory request >= 256Mi.",
+	}, "")
+	if err != nil {
+		t.Fatalf("ProcessOutcome with DECISION_MEMORY_GITOPS_PRS=false: %v", err)
+	}
+	if resOptOut.Status != StatusProposed {
+		t.Fatalf("expected status=proposed when DECISION_MEMORY_GITOPS_PRS=false, got %s", resOptOut.Status)
 	}
 }

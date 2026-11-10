@@ -132,6 +132,9 @@ _SHORT_REF_PREFIXES = ("refs/heads/", "heads/")
 # `refs/heads/` so nothing here can be confused with a branch, and so a publish
 # of a leftover ref cannot happen by naming a plausible branch.
 _INCOMING = "refs/vcs/incoming"
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+CURATOR_BIN_PATHS = ("/usr/local/bin/curator", "/opt/defaults/bin/curator")
 
 # What `git ls-remote --exit-code` exits with when the remote answered and holds
 # no matching ref; any other failure is a remote it could not ask.
@@ -1544,11 +1547,200 @@ class VcsBroker:
                     status=409,
                     code="BRANCH_DIVERGED",
                 )
+            dm_markdown = self._check_decision_memory_on_publish(
+                git,
+                root,
+                remote_target,
+                tip,
+                override_decision=payload.get("overrideDecision"),
+                overseer=bool(payload.get("overseer", True)),
+            )
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
             self._discard_scratch(root)
-        return bound.stamp({"branch": branch, "revision": tip})
+        result: dict[str, Any] = {"branch": branch, "revision": tip}
+        if dm_markdown:
+            result["decisionMemoryMarkdown"] = dm_markdown
+        return bound.stamp(result)
+
+    def _resolve_curator_bin(self) -> str | None:
+        env_bin = os.environ.get("CURATOR_BIN", "").strip()
+        if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+            return env_bin
+        for p in CURATOR_BIN_PATHS:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+
+    def _check_decision_memory_on_publish(
+        self,
+        git: Callable,
+        root: Path,
+        remote_target: str,
+        tip: str,
+        *,
+        override_decision: object = None,
+        overseer: bool = True,
+    ) -> str:
+        """Run the out-of-sandbox Curator Overseer check against base-branch `knowledge/`.
+
+        Reads `knowledge/` and `.kube-agents/intent.yaml` strictly from `remote_target`
+        (the target base branch on `origin`) via `git ls-tree` and `git show` without
+        checking out the repository, so a worker commit that modifies or deletes a
+        guard file alongside a violating manifest change cannot bypass the guard.
+        """
+        tree_ls = git(
+            root, "ls-tree", "-r", "--name-only", remote_target, "--",
+            "knowledge", ".kube-agents/intent.yaml", check=False,
+        )
+        base_knowledge_files = [
+            line.strip() for line in (tree_ls.stdout or "").splitlines() if line.strip()
+        ]
+        if not base_knowledge_files:
+            return ""
+
+        diff_ns = git(
+            root, "diff", "--name-status", f"{remote_target}...{tip}", check=False,
+        )
+        changed_paths: list[tuple[str, str]] = []
+        for line in (diff_ns.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                changed_paths.append((parts[0].strip(), parts[-1].strip()))
+        if not changed_paths:
+            return ""
+
+        check_dir = self._scratch("dmcheck")
+        try:
+            k_root = check_dir / "base"
+            w_root = check_dir / "head"
+            k_root.mkdir(parents=True, exist_ok=True)
+            w_root.mkdir(parents=True, exist_ok=True)
+
+            # Materialize base-branch knowledge/ and .kube-agents/intent.yaml into k_root
+            for rel in base_knowledge_files:
+                shown = git(root, "show", f"{remote_target}:{rel}", check=False)
+                if shown.returncode == 0:
+                    dest = k_root / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_text(shown.stdout or "", encoding="utf-8")
+
+            # Also check if any additional intent roots were declared in .kube-agents/intent.yaml
+            intent_file = k_root / ".kube-agents" / "intent.yaml"
+            if intent_file.is_file():
+                for m_line in intent_file.read_text(encoding="utf-8").splitlines():
+                    cleaned = m_line.strip().lstrip("-").strip().strip("/")
+                    if cleaned and not cleaned.startswith("#") and not cleaned.startswith("paths:"):
+                        extra_ls = git(
+                            root, "ls-tree", "-r", "--name-only", remote_target, "--",
+                            cleaned, check=False,
+                        )
+                        for erel in (extra_ls.stdout or "").splitlines():
+                            erel = erel.strip()
+                            if erel:
+                                eshown = git(root, "show", f"{remote_target}:{erel}", check=False)
+                                if eshown.returncode == 0:
+                                    edest = k_root / erel
+                                    edest.parent.mkdir(parents=True, exist_ok=True)
+                                    edest.write_text(eshown.stdout or "", encoding="utf-8")
+
+            # Materialize only the changed files at `tip` into w_root (deleted files stay absent)
+            rel_args: list[str] = []
+            for status, rel in changed_paths:
+                rel_args.append(rel)
+                if not status.startswith("D"):
+                    shown = git(root, "show", f"{tip}:{rel}", check=False)
+                    if shown.returncode == 0:
+                        dest = w_root / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_text(shown.stdout or "", encoding="utf-8")
+
+            diff_file = check_dir / "proposed.diff"
+            if overseer:
+                full_diff = git(root, "diff", f"{remote_target}...{tip}", check=False)
+                diff_file.write_text(full_diff.stdout or "", encoding="utf-8")
+
+            curator_bin = self._resolve_curator_bin()
+            if curator_bin:
+                cmd = [
+                    curator_bin,
+                    "check",
+                    "--repo",
+                    str(w_root),
+                    "--knowledge-repo",
+                    str(k_root),
+                ]
+                if overseer and diff_file.is_file():
+                    cmd.extend(["--overseer", "--diff-file", str(diff_file)])
+                cmd.extend(rel_args)
+            else:
+                dm_script = Path(__file__).resolve().parent.parent / "skills" / "decision-memory" / "scripts" / "decision_memory.py"
+                if not dm_script.is_file():
+                    dm_script = Path("/opt/defaults/skills/decision-memory/scripts/decision_memory.py")
+                if not dm_script.is_file():
+                    raise WorkspaceError(
+                        "Decision Memory checker binary (curator) is missing in credential-proxy.",
+                        status=500,
+                        code="DECISION_MEMORY_CHECK_FAILED",
+                    )
+                cmd = [
+                    "python3",
+                    str(dm_script),
+                    "--repo",
+                    str(w_root),
+                    "check",
+                    "--knowledge-repo",
+                    str(k_root),
+                    "--files",
+                    *rel_args,
+                ]
+
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            if res.returncode not in (0, 2) or not (res.stdout or "").strip():
+                detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+                raise WorkspaceError(
+                    f"Decision Memory Overseer check failed against base branch: {detail}",
+                    status=409,
+                    code="DECISION_MEMORY_CHECK_FAILED",
+                )
+            import json as _json
+            try:
+                out = _json.loads(res.stdout)
+            except ValueError as exc:
+                raise WorkspaceError(
+                    f"Decision Memory Overseer returned invalid JSON: {exc}",
+                    status=500,
+                    code="DECISION_MEMORY_CHECK_FAILED",
+                ) from exc
+
+            markdown = str(out.get("markdown") or "") if out.get("findings") else ""
+            if out.get("verdict") == "block":
+                blocking_ids = [
+                    str(f.get("id") or "")
+                    for f in (out.get("findings") or [])
+                    if f.get("severity") == "block" and f.get("id")
+                ]
+                overrides = {
+                    s.strip() for s in str(override_decision or "").split(",") if s.strip()
+                }
+                if not blocking_ids or not set(blocking_ids).issubset(overrides):
+                    msg = (
+                        "DECISION MEMORY OVERSEER BLOCKED THIS CHANGE:\n\n"
+                        f"{markdown}\n\n"
+                        "Do NOT open this Pull Request. In your final response, quote the "
+                        "record IDs (DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), "
+                        "Revert/Fix PR (#...), and the technical root-cause details verbatim."
+                    )
+                    raise WorkspaceError(
+                        msg,
+                        status=409,
+                        code=DECISION_MEMORY_BLOCKED,
+                        detail=markdown,
+                    )
+            return markdown
+        finally:
+            self._discard_scratch(check_dir)
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Whether `branch` exists on the remote, and at which revision.

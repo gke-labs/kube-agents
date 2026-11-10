@@ -212,3 +212,105 @@ func (cfg LLMConfig) Synthesize(ctx context.Context, rtype RecordType, payload a
 	}
 	return synth
 }
+
+// OverseerFinding represents a semantic policy violation identified by the LLM Overseer.
+type OverseerFinding struct {
+	ID       string `json:"id"`
+	Severity string `json:"severity"`
+	Rule     string `json:"rule"`
+	Reason   string `json:"reason"`
+}
+
+// JudgeDiff evaluates a proposed Git diff against active natural-language OKF records
+// that do not already have a deterministic guard.expect assertion. Returns nil when the
+// LLM endpoint is unconfigured or when all records are satisfied.
+func (cfg LLMConfig) JudgeDiff(ctx context.Context, records []Record, diffText string) []OverseerFinding {
+	if cfg.BaseURL == "" || strings.TrimSpace(diffText) == "" {
+		return nil
+	}
+	var proseRecords []map[string]any
+	for _, r := range records {
+		if r.Meta.Status != StatusActive {
+			continue
+		}
+		if r.Meta.Guard != nil && r.Meta.Guard.Expect != nil {
+			continue
+		}
+		proseRecords = append(proseRecords, map[string]any{
+			"id":    r.Meta.ID,
+			"type":  r.Meta.Type,
+			"title": r.Meta.Title,
+			"body":  r.Body,
+		})
+	}
+	if len(proseRecords) == 0 {
+		return nil
+	}
+	client := cfg.Client
+	if client == nil {
+		client = &http.Client{Timeout: defaultLLMTimeout}
+	}
+	recJSON, _ := json.MarshalIndent(proseRecords, "", "  ")
+	if len(diffText) > 12000 {
+		diffText = diffText[:12000]
+	}
+	prompt := fmt.Sprintf(
+		"You are the pre-push Overseer for a Kubernetes GitOps repository.\n"+
+			"Evaluate whether the proposed git diff violates any of the following active architectural decisions or lessons.\n"+
+			"Return ONLY a JSON object of the form {\"violations\": [{\"id\": \"<DEC-or-LES-ID>\", \"severity\": \"block\", \"rule\": \"<violated rule>\", \"reason\": \"<specific explanation>\"}]}.\n"+
+			"If no active policy is violated, return {\"violations\": []}.\n\nActive records:\n%s\n\nProposed diff:\n%s",
+		string(recJSON), diffText,
+	)
+	reqPayload := map[string]any{
+		"model": cfg.Model,
+		"messages": []map[string]string{
+			{"role": "system", "content": "Respond with a single JSON object only."},
+			{"role": "user", "content": prompt},
+		},
+	}
+	rawReq, err := json.Marshal(reqPayload)
+	if err != nil {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.BaseURL+"/chat/completions", bytes.NewReader(rawReq))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil
+	}
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil
+	}
+	var chatResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rawResp, &chatResp); err != nil || len(chatResp.Choices) == 0 {
+		return nil
+	}
+	text := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	if m := reJSONCodeFence.FindStringSubmatch(text); m != nil {
+		text = m[1]
+	} else if start, end := strings.Index(text, "{"), strings.LastIndex(text, "}"); start >= 0 && end > start {
+		text = text[start : end+1]
+	}
+	var parsed struct {
+		Violations []OverseerFinding `json:"violations"`
+	}
+	if json.Unmarshal([]byte(text), &parsed) != nil {
+		return nil
+	}
+	return parsed.Violations
+}

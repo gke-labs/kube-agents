@@ -493,23 +493,6 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         context = str(args.get("context") or "").strip()
         if context:
             item["context"] = context
-        if scope == "shared" and kind != "handoff":
-            decision = client.emit_shared_decision(content, context)
-            if decision and decision.get("record_id"):
-                rec_id = decision["record_id"]
-                rel_path = decision.get("path") or f"knowledge/decisions/{rec_id}.md"
-                branch = decision.get("branch") or f"platform-agent/memory/{rec_id}"
-                return json.dumps({
-                    "result": (
-                        f"Stored in shared memory as proposed decision {rec_id} "
-                        f"({rel_path} on branch {branch}) and queued a pull request "
-                        "for team review."
-                    ),
-                    "record_id": rec_id,
-                    "status": "proposed",
-                    "path": rel_path,
-                    "branch": branch,
-                })
         try:
             client.retain(self._hindsight, item)
         except Exception as e:

@@ -172,6 +172,22 @@ type RecordEvidence struct {
 	RejectedProposals []string `json:"rejected_proposals,omitempty" yaml:"rejected_proposals,omitempty"`
 }
 
+// DeclareItem represents one entry in an OKF record's unified `declares:` list (06 §5).
+// It combines fleet-audit declared posture (Check, Namespace, Object, Cluster) with optional
+// manifest assertion fields (File, Path, Op, Value, Severity, Rule).
+type DeclareItem struct {
+	Check     string `json:"check,omitempty" yaml:"check,omitempty"`
+	Namespace string `json:"namespace,omitempty" yaml:"namespace,omitempty"`
+	Object    string `json:"object,omitempty" yaml:"object,omitempty"`
+	Cluster   string `json:"cluster,omitempty" yaml:"cluster,omitempty"`
+	File      string `json:"file,omitempty" yaml:"file,omitempty"`
+	Path      string `json:"path,omitempty" yaml:"path,omitempty"`
+	Op        string `json:"op,omitempty" yaml:"op,omitempty"`
+	Value     any    `json:"value,omitempty" yaml:"value,omitempty"`
+	Severity  string `json:"severity,omitempty" yaml:"severity,omitempty"`
+	Rule      string `json:"rule,omitempty" yaml:"rule,omitempty"`
+}
+
 // RecordMeta is the YAML frontmatter of an OKF Markdown file.
 type RecordMeta struct {
 	Type         RecordType     `json:"type" yaml:"type"`
@@ -179,7 +195,8 @@ type RecordMeta struct {
 	Title        string         `json:"title" yaml:"title"`
 	Status       RecordStatus   `json:"status" yaml:"status"`
 	Date         string         `json:"date,omitempty" yaml:"date,omitempty"`
-	Scope        RecordScope    `json:"scope" yaml:"scope"`
+	Declares     []DeclareItem  `json:"declares,omitempty" yaml:"declares,omitempty"`
+	Scope        RecordScope    `json:"scope,omitempty" yaml:"scope,omitempty"`
 	Guard        *RecordGuard   `json:"guard,omitempty" yaml:"guard,omitempty"`
 	Evidence     RecordEvidence `json:"evidence,omitempty" yaml:"evidence,omitempty"`
 	Supersedes   []string       `json:"supersedes,omitempty" yaml:"supersedes,omitempty"`
@@ -431,11 +448,66 @@ func ParseRecord(text, relPath string) (Record, error) {
 	if meta.Status == "" {
 		meta.Status = StatusActive
 	}
+	normalizeDeclaresIntoMeta(&meta)
 	return Record{
 		Path: relPath,
 		Meta: meta,
 		Body: strings.TrimSpace(body),
 	}, nil
+}
+
+func appendUniqueStr(slice []string, val string) []string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return slice
+	}
+	for _, s := range slice {
+		if s == val {
+			return slice
+		}
+	}
+	return append(slice, val)
+}
+
+func normalizeDeclaresIntoMeta(meta *RecordMeta) {
+	if meta == nil || len(meta.Declares) == 0 {
+		return
+	}
+	for _, d := range meta.Declares {
+		if d.Check != "" {
+			meta.Scope.Checks = appendUniqueStr(meta.Scope.Checks, d.Check)
+		}
+		if d.Cluster != "" {
+			meta.Scope.Clusters = appendUniqueStr(meta.Scope.Clusters, d.Cluster)
+		}
+		if d.File != "" {
+			meta.Scope.Paths = appendUniqueStr(meta.Scope.Paths, d.File)
+		}
+		if d.Object != "" {
+			res := strings.TrimSpace(d.Object)
+			if strings.Count(res, "/") == 1 && d.Namespace != "" {
+				parts := strings.SplitN(res, "/", 2)
+				res = fmt.Sprintf("%s/%s/%s", parts[0], strings.TrimSpace(d.Namespace), parts[1])
+			}
+			meta.Scope.Resources = appendUniqueStr(meta.Scope.Resources, res)
+		}
+		if d.File != "" && d.Path != "" && d.Op != "" && meta.Guard == nil {
+			sev := strings.TrimSpace(d.Severity)
+			if sev == "" {
+				sev = "block"
+			}
+			meta.Guard = &RecordGuard{
+				Rule:     strings.TrimSpace(d.Rule),
+				Severity: sev,
+				Expect: &GuardExpect{
+					File:  strings.TrimSpace(d.File),
+					Path:  strings.TrimSpace(d.Path),
+					Op:    strings.TrimSpace(d.Op),
+					Value: d.Value,
+				},
+			}
+		}
+	}
 }
 
 // RenderRecord serializes a Record back to Markdown with YAML frontmatter.
@@ -528,11 +600,44 @@ func ValidateRecord(r Record) []string {
 	return errs
 }
 
-// LoadRecords reads all OKF records from knowledge/decisions and knowledge/lessons under repoDir.
+// intentRoots returns the OKF knowledge roots configured in .kube-agents/intent.yaml (defaulting to ["knowledge"]).
+func intentRoots(repoDir string) []string {
+	roots := []string{"knowledge"}
+	intentPath := filepath.Join(repoDir, ".kube-agents", "intent.yaml")
+	raw, err := os.ReadFile(intentPath)
+	if err != nil {
+		return roots
+	}
+	var parsed struct {
+		Paths []string `yaml:"paths"`
+	}
+	if yaml.Unmarshal(raw, &parsed) != nil {
+		return roots
+	}
+	seen := map[string]bool{"knowledge": true}
+	for _, p := range parsed.Paths {
+		clean := strings.Trim(filepath.ToSlash(strings.TrimSpace(p)), "/")
+		if clean != "" && !seen[clean] {
+			seen[clean] = true
+			roots = append(roots, clean)
+		}
+	}
+	return roots
+}
+
+// LoadRecords reads all OKF decision and lesson records from knowledge/ (and any paths in .kube-agents/intent.yaml) under repoDir.
 func LoadRecords(repoDir string) ([]Record, error) {
 	var out []Record
-	for _, sub := range []string{"knowledge/decisions", "knowledge/lessons"} {
-		dir := filepath.Join(repoDir, sub)
+	seenPaths := map[string]bool{}
+	var subDirs []string
+	for _, root := range intentRoots(repoDir) {
+		subDirs = append(subDirs, root)
+		for _, leaf := range []string{"decisions", "lessons"} {
+			subDirs = append(subDirs, filepath.ToSlash(filepath.Join(root, leaf)))
+		}
+	}
+	for _, sub := range subDirs {
+		dir := filepath.Join(repoDir, filepath.FromSlash(sub))
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -545,15 +650,19 @@ func LoadRecords(repoDir string) ([]Record, error) {
 				continue
 			}
 			lower := strings.ToLower(e.Name())
-			if lower == "index.md" || lower == "readme.md" {
+			if lower == "index.md" || lower == "readme.md" || lower == "state_of_being.md" {
 				continue
 			}
+			rel := filepath.ToSlash(filepath.Join(sub, e.Name()))
+			if seenPaths[rel] {
+				continue
+			}
+			seenPaths[rel] = true
 			full := filepath.Join(dir, e.Name())
 			raw, err := os.ReadFile(full)
 			if err != nil {
 				return nil, err
 			}
-			rel := filepath.ToSlash(filepath.Join(sub, e.Name()))
 			rec, err := ParseRecord(string(raw), rel)
 			if err != nil {
 				continue

@@ -696,9 +696,17 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 	title := firstNonEmpty(ev.Title, synthTitle(synth), existing.Meta.Title, ev.Summary, "Verified fix "+rid)
 	scope := mergeScope(existing.Meta.Scope, ev)
 	guard := mergeGuard(c.cfg.RepoDir, existing.Meta.Guard, ev, synth, scope.Resources)
-	if guard != nil && (guard.Severity == "" || guard.Severity == "warn") {
+	status := StatusActive
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS")), "false") {
+		status = StatusProposed
+	}
+	if guard != nil {
 		g := *guard
-		g.Severity = "block"
+		if status == StatusProposed {
+			g.Severity = "warn"
+		} else if g.Severity == "" || g.Severity == "warn" {
+			g.Severity = "block"
+		}
 		guard = &g
 	}
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest, "#0")
@@ -707,7 +715,7 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 		Type:   rtype,
 		ID:     rid,
 		Title:  title,
-		Status: StatusActive,
+		Status: status,
 		Date:   dateStr,
 		Scope:  scope,
 		Guard:  guard,
@@ -722,7 +730,7 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 		},
 		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
 	}
-	body := buildRecordBody(rtype, ev, synth, existing.Body, StatusActive, "")
+	body := buildRecordBody(rtype, ev, synth, existing.Body, status, "")
 	return Record{
 		Path: existing.Path,
 		Meta: meta,
@@ -742,11 +750,15 @@ func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest, "#0")
 	reason := firstNonEmpty(ev.ReviewerReason, ev.Verification, ev.Summary, "Finding persisted after the pull request merged.")
 
+	status := StatusActive
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS")), "false") {
+		status = StatusProposed
+	}
 	meta := RecordMeta{
 		Type:   RecordTypeLesson,
 		ID:     rid,
 		Title:  title,
-		Status: StatusActive,
+		Status: status,
 		Date:   dateStr,
 		Scope:  scope,
 		Evidence: RecordEvidence{
@@ -761,7 +773,7 @@ func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID
 			RejectedProposals: appendUnique(existing.Meta.Evidence.RejectedProposals, prRef),
 		},
 	}
-	body := buildRecordBody(RecordTypeLesson, ev, synth, existing.Body, StatusActive, reason)
+	body := buildRecordBody(RecordTypeLesson, ev, synth, existing.Body, status, reason)
 	return Record{
 		Path: existing.Path,
 		Meta: meta,
@@ -897,11 +909,33 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 		if cand.CheckID != "" {
 			checks = []string{cand.CheckID}
 		}
+		decStatus := StatusProposed
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("DECISION_MEMORY_GITOPS_PRS")), "false") {
+			decStatus = StatusProposed
+		} else {
+			// When graduated from verified lessons in a GitOps-managed store, open a proposal
+			// or mark active if all source lessons are already active.
+			allActive := true
+			for _, lid := range cand.Lessons {
+				if l, ok := byID[lid]; !ok || l.Meta.Status != StatusActive {
+					allActive = false
+					break
+				}
+			}
+			if allActive {
+				decStatus = StatusActive
+			}
+		}
+		if guard != nil && decStatus == StatusProposed {
+			g := *guard
+			g.Severity = "warn"
+			guard = &g
+		}
 		decMeta := RecordMeta{
 			Type:   RecordTypeDecision,
 			ID:     decID,
 			Title:  title,
-			Status: StatusActive,
+			Status: decStatus,
 			Date:   dateStr,
 			Scope: RecordScope{
 				Paths:     cand.Paths,

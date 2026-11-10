@@ -429,16 +429,25 @@ func runCheck(args []string) error {
 	repoDir := fs.String("repo", ".", "target repository directory")
 	knowledgeRepo := fs.String("knowledge-repo", defaultRepoDir(), "directory holding knowledge/ records")
 	markdownOnly := fs.Bool("markdown", false, "print only markdown output")
+	overseer := fs.Bool("overseer", false, "run LLM Overseer judgment on natural-language active records against --diff-file")
+	diffFile := fs.String("diff-file", "", "optional file containing git diff text for --overseer judgment")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	kDir := *knowledgeRepo
 	if _, err := os.Stat(filepath.Join(*repoDir, "knowledge")); err == nil {
 		kDir = *repoDir
+	} else if _, err := os.Stat(filepath.Join(*repoDir, ".kube-agents", "intent.yaml")); err == nil {
+		kDir = *repoDir
 	}
 	records, err := memory.LoadRecords(kDir)
 	if err != nil {
 		return err
+	}
+	for _, r := range records {
+		if errs := memory.ValidateRecord(r); len(errs) > 0 && r.Meta.Status == memory.StatusActive {
+			return fmt.Errorf("invalid active record %s (%s): %s", r.Meta.ID, r.Path, strings.Join(errs, "; "))
+		}
 	}
 	changed := map[string]*string{}
 	for _, rel := range fs.Args() {
@@ -450,8 +459,37 @@ func runCheck(args []string) error {
 			changed[filepath.ToSlash(rel)] = nil
 		}
 	}
-	boundary := memory.LoadRepoBoundary(kDir)
-	report := memory.CheckChangedFilesWithBoundary(records, changed, boundary)
+	report := memory.CheckChangedFiles(records, changed)
+	if *overseer && *diffFile != "" {
+		if diffRaw, err := os.ReadFile(*diffFile); err == nil && len(diffRaw) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			llmCfg := memory.ResolveLLMConfig()
+			for _, v := range llmCfg.JudgeDiff(ctx, records, string(diffRaw)) {
+				sev := v.Severity
+				if sev == "" {
+					sev = "block"
+				}
+				report.Findings = append(report.Findings, memory.CheckFinding{
+					ID:       v.ID,
+					Type:     memory.RecordTypeDecision,
+					Status:   memory.StatusActive,
+					Title:    v.Rule,
+					Verdict:  "violates",
+					Severity: sev,
+					Guard: &memory.RecordGuard{
+						Rule:     v.Rule,
+						Severity: sev,
+					},
+					Body: v.Reason,
+				})
+				if sev == "block" {
+					report.Verdict = "block"
+					report.Status = "found"
+				}
+			}
+		}
+	}
 	if *markdownOnly {
 		fmt.Println(report.Markdown)
 	} else {
