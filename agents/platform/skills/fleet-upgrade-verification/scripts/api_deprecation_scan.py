@@ -148,8 +148,9 @@ ENTRY_UNNAMED = "unnamed"
 # A batch the broker refuses as a whole with PATH_NOT_FOUND (the branch moved
 # and one of its paths is gone), or as too large with no entries to continue
 # from, is asked for again in two halves, each a snapshot inside
-# NARROW_SNAPSHOT_CAP. The halves wait behind the batches not yet asked for,
-# so one bad name costs the cap's last snapshots and not the rest of the tree.
+# NARROW_SNAPSHOT_CAP. The halves wait until no other batch or listed subtree
+# is left to ask for, so one bad name costs the cap's last snapshots and not
+# the rest of the tree.
 # A refused entry that stands alone is listed with its own refusal, and what
 # the cap leaves is listed as past it. Any other refusal (authentication, an
 # unavailable broker, a timeout) is not about one entry, and the batch is
@@ -502,7 +503,11 @@ def read_repo_in_parts(
     limit = min(ceiling, vcs_client.SNAPSHOT_MAX_UNPACKED_BYTES)
     pending = [entry for entry in entries if _holds_manifests(entry)]
     total_bytes = 0
-    while pending and not read.stopped:
+    # Halves of a refused batch, asked for only in a pass that has nothing
+    # else to ask for, so every batch and every subtree a refusal lists is
+    # read first.
+    halves: list[list[dict]] = []
+    while (pending or halves) and not read.stopped:
         for entry in list(pending):
             reason = entry.get(ENTRY_UNNAMED) or _name_refusal(entry["path"])
             if reason is None and (isinstance(entry.get("bytes"), bool) or not isinstance(entry.get("bytes"), int)):
@@ -520,6 +525,8 @@ def read_repo_in_parts(
                 read.unread.append(
                     {"path": entry["path"], "reason": UNREAD_OVER_CEILING.format(limit=limit, env=CEILING_ENV)}
                 )
+        if not requests:
+            requests, halves = halves, []
         while requests:
             batch = requests.pop(0)
             # Checked before the next clone, not only inside `read_tree` after it.
@@ -544,9 +551,8 @@ def read_repo_in_parts(
                     # (a part can grow past the ceiling when the branch moves).
                     pending.extend(entry for entry in refused.entries if _holds_manifests(entry))
                 elif len(batch) > 1 and refused.code in (PATH_NOT_FOUND, vcs_client.SNAPSHOT_TOO_LARGE):
-                    # After the batches not yet asked for, which are read first.
                     half = len(batch) // 2
-                    requests.extend([batch[:half], batch[half:]])
+                    halves.extend([batch[:half], batch[half:]])
                 elif refused.code == vcs_client.SNAPSHOT_TOO_LARGE and len(batch) == 1:
                     read.unread.append(
                         {"path": batch[0]["path"], "reason": UNREAD_NO_LISTING.format(refusal=refused)}
