@@ -250,6 +250,12 @@ type Config struct {
 	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
 	// workspace's member is still refused.
 	SlackAllowAllUsers bool
+	// RelayPrecreated binds the event relay to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// A2A_GATEWAY_RELAY_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, as in tests and a hand-run
+	// gateway, the relay creates its own durable as before.
+	RelayPrecreated bool
 
 	// TargetAllowedUsers is the per-target, per-backend trusted-human
 	// allowlist a session's delegation is checked against: target ->
@@ -539,9 +545,12 @@ type Config struct {
 	// audience, the broker's URL, and Bash in the worker. Rendered by the
 	// operator under its A2A_SESSION_CLUSTER_VIEW flag; off, the pod is
 	// exactly the inert one. CredentialProxyURL is where the shim dials;
-	// New refuses the view without it.
-	SessionClusterView bool
-	CredentialProxyURL string
+	// New refuses the view without it. CredentialProxyExecURL is the
+	// broker's exec tier, empty while the operator renders none; the shim
+	// sends its commands there and falls back to CredentialProxyURL.
+	SessionClusterView     bool
+	CredentialProxyURL     string
+	CredentialProxyExecURL string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -711,15 +720,16 @@ func FromEnv() (*Config, error) {
 		Namespace:        envOr("POD_NAMESPACE", "kubeagents-system"),
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", defaultWorkerRepository+":"+defaultWorkerTag),
 
-		SessionServiceAccount: os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
-		StrictEventsWriter:    os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
-		SessionClusterView:    os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
-		CredentialProxyURL:    os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
-		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
-		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
-		CapabilityOptional:    capability.OptionalFromEnv(),
-		ScopeFile:             envOr("A2A_SCOPE_FILE", defaultScopeFile),
-		ManagementProject:     os.Getenv("A2A_MANAGEMENT_PROJECT"),
+		SessionServiceAccount:  os.Getenv("A2A_SESSION_SERVICE_ACCOUNT"),
+		StrictEventsWriter:     os.Getenv("A2A_STRICT_EVENTS_WRITER") == "true",
+		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
+		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
+		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
+		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
+		CapabilityOptional:     capability.OptionalFromEnv(),
+		ScopeFile:              envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:      os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -764,6 +774,7 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
+	cfg.RelayPrecreated = os.Getenv("A2A_GATEWAY_RELAY_PRECREATED") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

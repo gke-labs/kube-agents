@@ -109,7 +109,9 @@ exhausting sweep listed (a sweep that fit without one of them, because its listi
 identity could not be read, says nothing about the fit and posts nothing, for up to three
 consecutive ticks, after which the missing project counts as a standing fault and the fit
 stands); the ledger's budget entry carries the same coverage on every tick that falls short,
-and says when and why the flag is held. A new stall's notice is the alert the Session KV server
+and says when and why the flag is held, and its `cluster_timings` and `tick_timing` entries
+record what each cluster and the last sweeping tick cost to read
+(`docs/designs/stall-watch-inject.md` §3.9). A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
@@ -950,8 +952,9 @@ The Planning Agent is the `default` profile, which is not scaffolded: it lives
 at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
-`AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` and `plugins/bootstrap_onboarding/` — and since the
+`AGENTS.md`, `CAPABILITIES.md`, `hindsight/config.json` and the onboarding prompts, step 2b covers
+`scripts/` and every plugin directory under `/opt/defaults/plugins`
+except `hermes_otel` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 

@@ -1001,6 +1001,12 @@ def test_parse_reads_a_block_replay() -> None:
     assert card_wake.parse(PROMPT).answered
 
 
+@pytest.mark.parametrize("kind", card_wake.BLOCK_KINDS)
+def test_parse_accepts_every_documented_block_kind(kind: str) -> None:
+    prompt = BLOCK_PROMPT.replace("kind: transient", f"kind: {kind}")
+    assert card_wake.parse(prompt).kind == kind
+
+
 @pytest.mark.parametrize("field", ["title", "kind", "reason"])
 def test_a_block_replay_missing_a_field_is_an_authoring_error(field: str) -> None:
     prompt = "\n".join(line for line in BLOCK_PROMPT.splitlines() if not line.startswith(f"{field}:"))

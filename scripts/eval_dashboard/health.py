@@ -1996,11 +1996,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:

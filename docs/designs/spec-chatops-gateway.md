@@ -703,10 +703,11 @@ addressed to platform or a session gets none. The stream and the dispatcher's re
 built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
 queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
-`DIRECTORY` is forgotten. The delegate tool
-the worker adapter serves still offers no `parameters`, so a session can delegate to a pinned
-profile or one that takes no target; offering the field is text the model reads and lands with
-its own eval case.
+`DIRECTORY` is forgotten. Each turn the gateway submits to a session pod carries the agents its
+requester may delegate to (the `delegateTargets` part, `spec-a2a-payloads.md`), built from those
+cards, for the delegate tool the worker adapter serves to name in its addressee description.
+The tool still offers no `parameters`, so a session can delegate to a pinned profile or one that
+takes no target; offering the field is text the model reads and lands with its own eval case.
 
 ## Session lifecycle
 
@@ -1219,7 +1220,7 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
+  and the progress artifact's latest line (`progress`), whom the chain delegated to (`childAddressees`, each child task's addressee once in the order delegated, the profile its address resolved to or `platform`, from the record: `[]` when nothing was delegated and `null` when the read had no task to look at; the inject door's alone), and, on a read that asks for it (`usage=chain`), the chain's cost (`childUsage`, the chain's
   child tasks' usage artifacts summed; `usagePartial` when a link's stream could not be read, so
   the sums are short of it; and `usage`, the usage
   artifact's parts summed over the task and, for a delegation chain's root, every wake that
@@ -1859,18 +1860,25 @@ buttons" under the Slack adapter) gets its Retry and Drop in the same button lis
 choices and links. The list sits under the whole message rather than under each row, so when any
 row carries buttons the renderer numbers every row in the bullet's place ("1. ", "2. ") and labels
 each row's buttons with its number ("Retry 1", "Drop 1"); the button's `kage.board` action carries
-the action, the row's number and the row's ids. A tap is never a turn: it is admitted by the rule
-an inbound message is (`resolvePrincipal`; Chat has no Home tab), then sent over the board route
-as a `lib.BoardAction` like a Slack tap, and the row's line is edited in place, "✓ Retrying.
-<name>, <time>", "Dropped. <name>, <time>" or "No longer stuck. <name>, <time>" set after its text
-on the same line, the time in UTC since Chat has no date token, and the row's two buttons gone; a
-tap that did not land keeps them under a line saying so, so a second tap asks again, and so does
-one whose patch Chat refused. One tap per row at a time, and the edits of one message in turn under
-its rewrite lock, each from the layout the adapter last sent it; a message posted before a restart
-is edited from the event's copy of it, text and buttons (`gchat_board.go`). The report caps its
-rows at `MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on
-buttons in one list is not documented in a form this spec can cite and has not been measured, and
-a layout Chat refuses falls back to the text as any does.
+the action, the row's number, the row's ids and the row's line in the text (its index, as the Stop
+button carries its task). A tap edits by line on every path: the line the card the gateway last
+sent carries on its own button for the row, when it remembers the card (a re-layout in the tap's
+round trip that kept the row but shifted it is drawn where the row is now); the tap's own line when
+it does not (after a restart); so a numbered list in the detail or the fold is never taken for the
+rows, and a tap whose row's line no longer starts with the row's number is dropped as stale. A tap is
+never a turn: it is admitted by the rule an inbound message is (`resolvePrincipal`; Chat has no
+Home tab), then sent over the board route as a `lib.BoardAction` like a Slack tap, and the row's
+line is edited in place, "✓ Retrying. <name>, <time>", "Dropped. <name>, <time>" or "No longer
+stuck. <name>, <time>" set after its text on the same line, the time in UTC since Chat has no date
+token, and the row's two buttons gone; a tap that did not land keeps them under a line saying so,
+so a second tap asks again, and so does one whose patch Chat refused. One tap per row at a time,
+and the edits of one message in turn under its rewrite lock, each from the layout the adapter last
+sent it; a message posted before a restart is edited from the event's copy of it, text and buttons
+(`gchat_board.go`); a button drawn before the line parameter existed carries none, and its row is
+found through the text's rows block instead, for one release (#5235). The report caps its rows at
+`MAX_STUCK_ROWS` (15), so the list holds at most 30 such buttons; Chat's own ceiling on buttons in
+one list is not documented in a form this spec can cite and has not been measured, and a layout
+Chat refuses falls back to the text as any does.
 
 A click on a choice button arrives on the same subscription as a message, as a
 `CARD_CLICKED` interaction, in either wire layout: the add-on one (`chat.buttonClickedPayload`
@@ -2163,7 +2171,7 @@ empty list, admits none. When a refused message addressed the
 bot (a DM or a mention), the refusal is logged with the sender's member id, and the sender
 gets one reply in that message's thread, once per workspace and member, saying the bot
 answers only its own workspace and naming the `T…:U…` entry that would admit them. A click on one of the bot's buttons by such a member is
-refused the same way, and shares that once-per-sender notice, in the question's thread. Without a team id from `auth.test` it refuses any
+refused the same way, and shares that once-per-sender notice, in the question's thread. The message shortcut admits a listed guest the same way, with `T…:U…` as the author; it drops an unlisted one with only the log line and no reply. Without a team id from `auth.test` it refuses any
 message that names a workspace, except a guest the list names, and warns once at start. A message that names no workspace
 in either field is taken as our own member's, which rests on Slack setting them on a
 shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
@@ -2644,7 +2652,7 @@ task that handed work to kanban cards and left them unsettled at turn end (the b
 artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
 `waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
 via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; on console and MCP origins only
+true`, so a client waits for the cards' notify frames; on console, MCP and A2A door origins only
 (`waitsForCardsInTurn`), the bridge's `api` executor instead
 holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
 turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`

@@ -1092,6 +1092,9 @@ FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
 FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
 # The periodic that runs the main part's second half, under its live job name.
 FAKE_MAIN_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+FAKE_MAIN_C_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_C_JOB}/"
+FAKE_WRITERS_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_B_JOB}/"
+FAKE_WRITERS_C_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_C_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
@@ -1403,6 +1406,103 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_JOB, nightly.NIGHTLY_MAIN_B_JOB, "the collector and the report name one job")
         self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/")
         self.assertNotIn("--nightly-main-b-prefix", stderr)
+
+    def test_the_main_c_prefix_is_collected_beside_the_others(self):
+        """The main part as five jobs (#4238): the main-c prefix is listed
+        after the main-b one, its build files as the main-c part, and the
+        main-c, main-d and main-e constants agree with the report's."""
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_MAIN_C_PREFIX)
+        data, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            nightly_main_c_prefix=FAKE_MAIN_C_PREFIX, gcloud=gcloud, since_days=10000,
+        )
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual(by_id[BUILD_998_FULL]["job"], "ci-kube-agents-eval-nightly-main-c")
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_MAIN_C)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_MAIN_C_PREFIX)])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_C_JOB, nightly.NIGHTLY_MAIN_C_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_C_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-c/")
+        for letter in "de":
+            self.assertEqual(getattr(collect, f"DEFAULT_NIGHTLY_MAIN_{letter.upper()}_JOB"), getattr(nightly, f"NIGHTLY_MAIN_{letter.upper()}_JOB"))
+            self.assertEqual(getattr(collect, f"DEFAULT_NIGHTLY_MAIN_{letter.upper()}_PREFIX"), f"gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-{letter}/")
+            self.assertEqual(nightly.night_part({"job": f"ci-kube-agents-eval-nightly-main-{letter}"}), f"main-{letter}")
+            self.assertIn(f"main-{letter}", nightly.MAIN_PARTS)
+        # Each shard resumes above its own watermark, and its note says so.
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [{"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-d", "pr": None, "tasks": []}]
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_c_prefix=FAKE_MAIN_C_PREFIX,
+            nightly_main_d_prefix=f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_D_JOB}/",
+            nightly_main_e_prefix=f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_E_JOB}/",
+            merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
+        )
+        self.assertIn("main-c scan resumed above build None, 1 new", stderr)
+        self.assertIn("main-d scan resumed above build 2093050000000000000, 0 new", stderr)
+        self.assertIn("main-e scan resumed above build None, 0 new", stderr)
+
+    def test_the_writers_thirds_prefixes_are_collected_beside_the_others(self):
+        """A night whose writers part runs as three jobs (#4238): the
+        writers-b and writers-c prefixes are listed after the main-b one,
+        each build is a nightly run with its own job and link, each files as
+        its own part, and each resumes above its own watermark."""
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_B_PREFIX)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_WRITERS_C_PREFIX)
+        data, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            nightly_main_b_prefix=FAKE_MAIN_B_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
+            nightly_writers_c_prefix=FAKE_WRITERS_C_PREFIX, gcloud=gcloud, since_days=10000,
+        )
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_956_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers-b"),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-writers-c"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-writers-c/{BUILD_998_FULL}")
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_INFRA]), nightly.PART_WRITERS_B)
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_WRITERS_C)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {p}" for p in (FAKE_NIGHTLY_PREFIX, FAKE_WRITERS_PREFIX, FAKE_MAIN_B_PREFIX, FAKE_WRITERS_B_PREFIX, FAKE_WRITERS_C_PREFIX)])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_B_JOB, nightly.NIGHTLY_WRITERS_B_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_C_JOB, nightly.NIGHTLY_WRITERS_C_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_B_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-b/")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_WRITERS_C_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers-c/")
+        self.assertNotIn("--nightly-writers-b-prefix", stderr)
+        self.assertNotIn("--nightly-writers-c-prefix", stderr)
+        # Each third resumes above its own watermark: a writers-c build on
+        # record does not lift writers-b's over a build the listing has not
+        # named yet, nor the other way round.
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093050000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers-c", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_b_prefix=FAKE_WRITERS_B_PREFIX,
+            nightly_writers_c_prefix=FAKE_WRITERS_C_PREFIX, merge_with=self.write_prior(prior_data), gcloud=gcloud, since_days=10000,
+        )
+        self.assertIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "above the writers-b watermark, which the writers-c id does not set")
+        self.assertIn("writers-b scan resumed above build None, 1 new", stderr)
+        self.assertIn("writers-c scan resumed above build 2093050000000000000, 1 new", stderr)
+
+    def test_a_writers_third_prefix_naming_a_listed_job_is_listed_once(self):
+        gcloud, log = self.fake_gcloud([])
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_MAIN_B_PREFIX)
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            nightly_writers_b_prefix=FAKE_MAIN_B_PREFIX, gcloud=gcloud,
+        )
+        self.assertIn(f"--nightly-writers-b-prefix {FAKE_MAIN_B_PREFIX} names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, not ci-kube-agents-eval-nightly-writers-b; the report files its runs as the main-b part", stderr)
+        self.assertIn(f"--nightly-writers-b-prefix names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, as --nightly-main-b-prefix does; listing it once", stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_MAIN_B_PREFIX}"])
 
     def test_a_main_b_prefix_naming_another_job_is_warned_about(self):
         gcloud, _ = self.fake_gcloud([])

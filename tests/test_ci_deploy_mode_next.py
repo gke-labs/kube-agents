@@ -100,14 +100,19 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
-# nightly's three parts, the forge lanes' next-mode nightlies and weekly
+# nightly's eight parts, the forge lanes' next-mode nightlies and weekly
 # jobs, and the certification lane's first slice; the today-mode GitLab nightly and a
 # made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
     "ci-kube-agents-eval-nightly-main-b",
+    "ci-kube-agents-eval-nightly-main-c",
+    "ci-kube-agents-eval-nightly-main-d",
+    "ci-kube-agents-eval-nightly-main-e",
     "ci-kube-agents-eval-nightly-writers",
+    "ci-kube-agents-eval-nightly-writers-b",
+    "ci-kube-agents-eval-nightly-writers-c",
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
     "ci-kube-agents-eval-nightly-gitlab-ce-next",
@@ -116,6 +121,8 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
+    # The replay lane: a periodic replaying the next-mode nightlies' recordings.
+    "ci-kube-agents-eval-replay-lane",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"

@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -92,9 +93,10 @@ type filterConfig struct {
 	// excludedNamespaces suppresses events from these namespaces.
 	// Exclude rules take precedence over allowedNamespaces rules.
 	excludedNamespaces map[string]struct{}
-	// alertExclude holds the --alert-exclude rules: an event any of them
-	// matches opens no incident (gateAlertExcluded). Set after
-	// newFilterConfig, from parseAlertExclude.
+	// alertExclude holds the alert-exclude rules in force at start: an event
+	// any of them matches opens no incident (gateAlertExcluded). Set after
+	// newFilterConfig, from parseAlertExclude. The filter holds its own copy,
+	// which --alert-exclude-file replaces (see filter.alertExclude).
 	alertExclude []alertExcludeRule
 	// unhealthyMinCount specifies the minimum repeat threshold count for "Unhealthy"
 	// events before they pass. This prevents transient probe failures from triggering alerts.
@@ -454,10 +456,26 @@ type filter struct {
 	fsLogMu     sync.Mutex
 	fsLogged    boundedEntries[filterGate]
 	fsLastSweep time.Time
+	// alertExclude is the alert-exclude rules in force: cfg.alertExclude at
+	// start, replaced whole when --alert-exclude-file changes (see
+	// reloadAlertExcludeFile). Read from every cluster's delivery goroutine.
+	alertExclude atomic.Pointer[[]alertExcludeRule]
 }
 
 func newFilter(cfg filterConfig) *filter {
-	return &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f := &filter{cfg: cfg, fsLogged: newBoundedEntries[filterGate](failedSchedulingLogEvery, maxFailedSchedulingLogEntries)}
+	f.setAlertExclude(cfg.alertExclude)
+	return f
+}
+
+// alertExcludeRules is the alert-exclude rules in force.
+func (f *filter) alertExcludeRules() []alertExcludeRule {
+	return *f.alertExclude.Load()
+}
+
+// setAlertExclude puts rules in force for every event decided after it.
+func (f *filter) setAlertExclude(rules []alertExcludeRule) {
+	f.alertExclude.Store(&rules)
 }
 
 func (f *filter) clock() time.Time {
@@ -562,7 +580,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 			return gateNamespaceNotAllowed
 		}
 	}
-	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.cfg.alertExclude, ev) {
+	if scaleUpVerdictFor(ev.Key.Reason) == scaleUpNone && alertExcluded(f.alertExcludeRules(), ev) {
 		return gateAlertExcluded
 	}
 	if ev.Key.Reason == "Unhealthy" && belowMinCount(ev.Count, f.cfg.unhealthyMinCount) {

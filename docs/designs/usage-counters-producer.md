@@ -12,7 +12,7 @@ event or tool call. All of those now have an in-cluster source, the watcher's pe
 serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 `kubeagents_broker_execution_failures_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` and `k8s_event_watcher_triage_sessions_total` on the gateway
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
-`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
+`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total`, the `kubeagents_kanban_dispatcher_failed_ticks` gauge and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
 managed-Prometheus collector. The poller reads the `kubeagents_proposals_opened` gauge into the nine
 `proposalsFrom<Origin>` readings and gates them on its read age, which
 [`proposal-origin.md`](proposal-origin.md) owns (§2.3 there).
@@ -21,8 +21,8 @@ This document settles how the operator turns the other series into the status fi
 that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
 rule that admits the operator's pods and nothing else new, accumulates per-pod deltas into
 totals it keeps beside their baseline in a ConfigMap, so the counters stay monotonic across pod,
-process and operator restarts, and patches the status at most once per interval, only when the
-status is behind. `toolExecutionsTotal`, `toolExecutionsBlockedTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`,
+process and operator restarts, and patches the status at most once per interval per projection
+(the counters, the data volume, the scope condition), each only when the status is behind. `toolExecutionsTotal`, `toolExecutionsBlockedTotal`, `eventsIngestedTotal`, `remediationsProposedTotal`,
 `chatMessagesInboundTotal`, `sessionsTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`, `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `lastActiveTime` and `lastHumanActiveTime` land this way, the proposals counter from the
 broker's version-control series, and `clustersRegistered` and `clustersMonitored` ride the same
 poll as gauges: the watcher's `k8s_event_watcher_cluster_up` series counted and projected as the
@@ -164,6 +164,20 @@ free space wins, since they share the volume. That projection is a second status
 conflict waits for the next poll. The byte fields are rewritten only when free space moves by a
 hundredth of the volume, so a working agent does not wake the reconciler every poll, and they have
 a pruning record of their own for a CRD that predates them.
+
+The `cluster_up` series' labels, the triple each registered cluster's profile names, are read
+beside the gauges into the `ScopeUndeclared` condition (`usage_scope.go`): True, naming the
+management project's clusters other than `spec.harness`'s, while `spec.scope` names no project,
+folder, organisation or selector; removed otherwise, and on the data volume reading's terms when
+there is no reading. A series in another project is a profile somebody made by hand, or one a
+dropped declaration still carries, so it is not counted; a harness that names its project by
+number is matched through the host's own series, whose label carries the ID the reconcile
+resolved, and the operator says nothing until that series exists and exactly one project carries
+one of the host's name and location (two clusters may share both). The
+union across replicas, each triple once, sorted, so an unchanged fleet rewrites nothing. A third
+status patch, on the same terms as the second. The reconcile that adopted the clusters cannot
+write the CR, which is why the operator surfaces it from the watcher's reading
+(`docs/designs/multi-project-scope.md` §7).
 
 The same body also carries the fleet's shape, which no status field projects yet: gauges with
 no cluster label, `k8s_event_watcher_fleet_nodes`, `_fleet_max_cluster_nodes`,
