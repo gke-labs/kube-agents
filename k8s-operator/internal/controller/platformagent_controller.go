@@ -954,25 +954,35 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// below), so the bus a newer CRD rendered is still standing; clearing the
 	// condition would report it gone, and rewriting it would claim this binary
 	// knows what it describes. Both are worse than leaving it.
+	//
+	// DispatcherJobMode is written on the way out for the same reasons, from
+	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
+	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
+	var dispatcherJobMode *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
-		defer func() {
-			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
-				if retErr == nil {
-					retErr = err
-					return
-				}
-				// The reconcile is already failing and will requeue. If the
-				// failure is already a PlatformAgent conflict being requeued cleanly,
-				// a subsequent conflict writing BusCredentialsReady is the same race
-				// and should not log an Error with a stack trace.
-				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
-					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
-				} else {
-					log.Error(err, "could not write BusCredentialsReady")
-				}
+		exitWrite := func(condition string, err error) {
+			if err == nil {
+				return
 			}
+			if retErr == nil {
+				retErr = err
+				return
+			}
+			// The reconcile is already failing and will requeue. If the
+			// failure is already a PlatformAgent conflict being requeued cleanly,
+			// a subsequent conflict writing the condition is the same race
+			// and should not log an Error with a stack trace.
+			if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+				log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
+			} else {
+				log.Error(err, "could not write "+condition)
+			}
+		}
+		defer func() {
+			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
 
@@ -1255,17 +1265,28 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
+		a2aState, err = r.reconcileA2A(ctx, instance, homeRec)
+		// For the deferred write at 2d, failed pass or not: a step after
+		// the dispatcher's failing doesn't undo what it did to Job mode.
+		dispatcherJobMode = a2aState.dispatcherJobMode
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
-		if err := r.cleanupA2A(ctx, instance); err != nil {
+		tornDown, err := r.cleanupA2AWithJobMode(ctx, instance)
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 		// No bus, no server count. Telling the writers what the CR carried
 		// lets them write the cleared field once, and then find it current.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
 		instance.Status.BusReplicas = 0
+		// The dispatcher and its Job mode went with the stack, unless their
+		// profile-namespace teardown failed: then the Jobs Role and templates
+		// are still live and the condition stays as it was.
+		if tornDown {
+			dispatcherJobMode = jobModeTornDown
+		}
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed

@@ -17,6 +17,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -29,7 +30,25 @@ MESSAGES_DIR = "messages"
 SLOTS_DIR = "slots"
 VARIANTS_DIR = "variants"
 JSON_SUFFIX = ".json"
+# Every name the cache writes, relative to its directory: one key per file, a
+# variant one directory deeper. The one definition of the layout, which the
+# collector, the publisher and the lane's download check names against.
+# CACHE_LAYOUT_PATTERN holds VARIANT_JOINER where a variant's context and
+# answer meet: "/" on disk (CACHE_REL_RE); the publisher flattens a variant to
+# one object name with its own separator (publish_cache.OBJECT_NAME_RE).
+CACHE_HEX = r"[0-9a-f]{16,64}"
+VARIANT_JOINER = "<variant-joiner>"
+CACHE_LAYOUT_PATTERN = (
+    rf"^(?:(?:{re.escape(ANSWERS_DIR)}|{re.escape(SLOTS_DIR)}|{re.escape(MESSAGES_DIR)})/{CACHE_HEX}{re.escape(JSON_SUFFIX)}"
+    rf"|{re.escape(VARIANTS_DIR)}/{CACHE_HEX}{VARIANT_JOINER}{CACHE_HEX}{re.escape(JSON_SUFFIX)})$"
+)
+DISK_VARIANT_JOINER = "/"
+CACHE_REL_RE = re.compile(CACHE_LAYOUT_PATTERN.replace(VARIANT_JOINER, re.escape(DISK_VARIANT_JOINER)))
 TMP_SUFFIX = ".tmp"
+# Written last by whatever seeds a replay cache from outside the pod
+# (hack/replay-proxy/collect_shadow.py, in the replay lane): a replay proxy
+# rebuilds the index its miss report searches whenever this file changes.
+SEED_MARKER = ".seeded"
 TEXT_ENCODING = "utf-8"
 TOOL_CALLS_KEY = "tool_calls"
 # The model's reasoning text in an answer, never stored (stored_answer).

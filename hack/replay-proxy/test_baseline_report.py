@@ -745,7 +745,7 @@ class NightlyUntrusted(unittest.TestCase):
 
     def test_the_kinds_are_analyze_shadows(self):
         self.assertIs(br.JOB_KINDS, br.analyze_shadow.JOB_KINDS)
-        self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit"))
+        self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit", "replay-lane"))
         self.assertEqual(br.SCOPES, ("total",) + br.JOB_KINDS)
 
 

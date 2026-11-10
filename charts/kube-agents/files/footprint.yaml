@@ -9,7 +9,7 @@ operatorRendered:
     base:
       requests:
         cpu: 1250m
-        memory: 2560Mi
+        memory: 4608Mi
         ephemeral-storage: 3Gi
       limits:
         cpu: 4500m
@@ -17,7 +17,7 @@ operatorRendered:
         ephemeral-storage: 3Gi
       cpuMillisRequest: 1250
       cpuMillisLimit: 4500
-      memoryBytesRequest: 2684354560
+      memoryBytesRequest: 4831838208
       memoryBytesLimit: 11005853696
       ephemeralStorageBytesRequest: 3221225472
       ephemeralStorageBytesLimit: 3221225472
@@ -114,7 +114,7 @@ nextMode:
     hermesBridgeCli:
       requests:
         cpu: "1"
-        memory: 2Gi
+        memory: 4Gi
         ephemeral-storage: "0"
       limits:
         cpu: "3"
@@ -122,7 +122,7 @@ nextMode:
         ephemeral-storage: "0"
       cpuMillisRequest: 1000
       cpuMillisLimit: 3000
-      memoryBytesRequest: 2147483648
+      memoryBytesRequest: 4294967296
       memoryBytesLimit: 8589934592
       ephemeralStorageBytesRequest: 0
       ephemeralStorageBytesLimit: 0
