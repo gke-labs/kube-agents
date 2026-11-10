@@ -63,13 +63,15 @@ import math
 import pathlib
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
     import fixture_state
     import periodics
     import pool_state
@@ -220,6 +222,56 @@ PR_CAUSED_REPEATED = "repeated"
 STORM_WINDOW = timedelta(hours=2)
 STORM_MIN_REPS = 15
 STORM_MIN_PRS = 3
+# The storm's evidence line and Chat sentence end with the repetitions' own
+# words for how they died (2026-10-30: 26 reps said `hermes-rate-limited`
+# and the line said "infra deaths"). Two fixed wrappers are peeled first:
+# the scorer's (bench/kube_agents_bench/scoring.py, "the harness recorded an
+# infrastructure condition ... no answer in it to grade (<detail>)") and,
+# inside it, the harness's "task <id> ended <terminal>: " prefix
+# (bench/kube_agents_bench/harness.py; the terminal is failed, canceled or
+# rejected). What is left is the detail, cut before the harness's "(reason:"
+# echo, scrubbed like the periodics' quoted log line, and cut at a word
+# boundary at a length a Chat line can carry. Nothing maps the words to a
+# meaning: the reader does. test_eval_dashboard_health.py pins the wrapper
+# phrases against the two sources.
+SCORER_INFRA_WRAPPER_RE = re.compile(
+    r"^(?:the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
+    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade(?: \(|$))?"
+    r"|KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade \("
+    r"|KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is"
+    r" .*? because the empty report could not name them \()",
+    re.S,
+)
+# The scorer closes the detail it opened with ")"; the detail keeps its own
+# parentheses, so the wrapper's is the one unmatched close at the end.
+SCORER_WRAPPER_OPEN, SCORER_WRAPPER_CLOSE = "(", ")"
+HARNESS_TERMINAL_PREFIX_RE = re.compile(r"^task \S+ ended (?:failed|canceled|rejected): ")
+# The harness's other task phrasings keep the task id mid-sentence ("task
+# <id> on <conversation> sat queued", "no executor took task <id> on"); the id
+# is the repetition's, so it gives way to a placeholder like the run id.
+HARNESS_TASK_ID_RE = re.compile(r"\btask \S+(?= (?:on|was|did|ended) )")
+HARNESS_TASK_ID_FORM = "task [id]"
+# The board's card ids ("still waiting on: t_3f67a81e"), hermes's "t_" + 8
+# hex, are the repetition's as well.
+KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+KANBAN_CARD_ID_FORM = "[card]"
+# The agent API's session id, "a2a-" + the conversation's contextId
+# (bench/kube_agents_bench/board.py API_SESSION_PREFIX), per repetition too;
+# only where the harness writes it ("the session store for <id>"), since
+# "-a2a-" is also inside the inject Service's and Secret's names.
+HERMES_SESSION_ID_RE = re.compile(r"(?<=the session store for )a2a-[A-Za-z0-9_.:-]+")
+HERMES_SESSION_ID_FORM = "[session]"
+# The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
+# (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
+# its own phrasing on every repetition, so the run id and the repetition
+# number give way to placeholders and the case stays.
+HARNESS_CONVERSATION_KEY_RE = re.compile(r"\bdevops-bench-[0-9a-f]+/([A-Za-z0-9._-]+)/\d+\b")
+HARNESS_CONVERSATION_KEY_FORM = r"[run]/\1/[rep]"
+SCORER_NO_DETAIL = "no reason given"
+STORM_CAUSE_STOP = " (reason"
+STORM_CAUSE_MAX_CHARS = 80
+STORM_CAUSE_ELLIPSIS = "…"
+STORM_CAUSES_SHOWN = 2
 STORM_REASON_RE = re.compile(
     r"KUBE_AGENTS_INFRA_FAILURE"
     r"|no agent ever ran"
@@ -805,12 +857,65 @@ def rep_kind(rep: dict) -> str:
     return REP_FAIL
 
 
+def storm_cause(rep: dict) -> str:
+    """A storm repetition's own words for how it died: the reason with the
+    scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
+    peeled, the task, card and session ids and the conversation key reduced to
+    placeholders, cut
+    before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
+    STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
+    (no reason, or the scorer's "no reason given")."""
+    reason = str(rep.get("reason") or "")
+    wrapper = SCORER_INFRA_WRAPPER_RE.match(reason)
+    detail = reason[wrapper.end() :] if wrapper else reason
+    text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
+    text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
+    text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
+    text = HERMES_SESSION_ID_RE.sub(HERMES_SESSION_ID_FORM, text)
+    text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
+    whole = STORM_CAUSE_STOP not in text
+    text = text.split(STORM_CAUSE_STOP, 1)[0]
+    # The collector's 300-character cut can land inside the echo: a trailing
+    # " (rea" is the echo's head, not words.
+    tail = text.rfind(STORM_CAUSE_STOP[:2])
+    if tail != -1 and ")" not in text[tail:] and STORM_CAUSE_STOP[2:].startswith(text[tail + 2 :]):
+        text = text[:tail]
+        whole = False
+    text = text.strip()
+    if text.rstrip(")") == SCORER_NO_DETAIL:
+        return ""
+    # The wrapper's own close, when the wrapper opened one and the collector's
+    # cut did not take it: the one ")" more than the detail opened.
+    wrapper_closed = bool(
+        wrapper
+        and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
+        and text.endswith(SCORER_WRAPPER_CLOSE)
+        and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
+    )
+    if wrapper_closed:
+        text = text[: -len(SCORER_WRAPPER_CLOSE)]
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still carries the wrapper's close is whole.
+    cut_by_collector = len(reason) >= collect.REP_REASON_MAX_CHARS and whole and bool(text) and not wrapper_closed
+    text = periodics.quotable(text)
+    if len(text) > STORM_CAUSE_MAX_CHARS:
+        head = text[:STORM_CAUSE_MAX_CHARS]
+        text = (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CAUSE_ELLIPSIS
+    elif cut_by_collector:
+        text = (text[: text.rfind(" ")] if " " in text else text).rstrip() + STORM_CAUSE_ELLIPSIS
+    return text
+
+
 class Task:
-    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
         self.passes = self.fails = self.storms = self.ceilings = self.fixtures = 0
+        # Each storm repetition's own words, counted (storm_cause).
+        self.storm_causes: Counter = Counter()
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -822,6 +927,9 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+                cause = storm_cause(rep)
+                if cause:
+                    self.storm_causes[cause] += 1
             elif kind == REP_CEILING:
                 self.ceilings += 1
             elif kind == REP_FIXTURE:
@@ -897,6 +1005,13 @@ class Run:
     @property
     def storm_reps(self) -> int:
         return sum(task.storms for task in self.tasks)
+
+    def storm_causes(self) -> Counter:
+        """The run's storm repetitions' own words, counted across its cases."""
+        causes: Counter = Counter()
+        for task in self.tasks:
+            causes.update(task.storm_causes)
+        return causes
 
     @property
     def ceiling_reps(self) -> int:
@@ -1220,9 +1335,18 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
     rate = vertex_429_rate(vertex, now, start, end)
     confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
     fires = reps_fire and (confirmed or not rate["read"])
+    causes: Counter = Counter()
+    for run in hit:
+        causes.update(run.storm_causes())
     evidence = []
     if hit:
         line = f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
+        # The repetitions' own words, commonest first, before any judgement.
+        shown = causes.most_common(STORM_CAUSES_SHOWN)
+        if shown:
+            line += "; the reps say: " + ", ".join(f"{cause} ×{n}" for cause, n in shown)
+            if len(causes) > len(shown):
+                line += f", and {len(causes) - len(shown)} other phrasing(s)"
         if reps_fire and rate["read"]:
             share = f"{rate['peak'] * 100:.1f} % of {rate['requests']} Vertex calls in the hour to {hhmm(rate['hour_end'])} UTC"
             line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
@@ -1240,6 +1364,9 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
         "rate": rate,
+        # Every phrasing with its count, commonest first, for the incident
+        # the Chat sentence reads (it names each one, short).
+        "causes": [[cause, n] for cause, n in causes.most_common()],
     }
 
 
@@ -2004,11 +2131,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:
@@ -2417,7 +2558,7 @@ def assess(
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
-        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"]}
     elif condition == DELEGATION_CEILING:
         # `reps` beside the storm's keys: the message says how many
         # repetitions ended at the wait, not only how many runs held one.

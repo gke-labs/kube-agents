@@ -144,6 +144,16 @@ class EstimateTest(unittest.TestCase):
         r, _ = report(lines)
         self.assertEqual(r["estimates"]["low"]["hits"], 1)
 
+    def test_schema_2_and_schema_3_lines_read_together(self):
+        # Schema 2 named the LiteLLM config checksum model_behaviour_checksum.
+        # Its fingerprints never equal schema 3's (the normalizer version
+        # changed with it), but its lines must still read rather than skip.
+        lines = [dict(line("n1", 1, "nightly", "b0", "fp2", ["m"]), schema=2, model_behaviour_checksum="c2"),
+                 dict(presubmit("p1", 10, "7", "b1", "fp3", ["m"]), schema=3, litellm_config_checksum="c3")]
+        r, skipped = report(lines)
+        self.assertEqual(sum(skipped.values()), 0)
+        self.assertEqual(r["estimates"]["low"]["hits"], 0)
+
     def test_presubmit_lines_without_a_pr_are_counted(self):
         rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
                          line("n1", 3, "nightly", "n", "A", ["a"])])
@@ -200,6 +210,17 @@ class EstimateTest(unittest.TestCase):
                 self.assertEqual((rep["nightly_requests"], rep["nightly_untrusted_requests"]), (0, 1))
                 self.assertEqual(rep["health"]["lines_by_kind"]["nightly-untrusted"], 1)
                 self.assertEqual(skipped["untagged"], 0)
+
+    def test_a_replay_lane_line_is_counted_and_never_a_source_or_a_request(self):
+        lines = [line("r1", 1, "replay-lane", "r", "A", ["a", "b"]),
+                 presubmit("p1", 2, "10", "b1", "A", ["a", "b"])]
+        rep, skipped = report(lines, merged={"10": 1.5})
+        for estimate in analyze_shadow.ESTIMATES:
+            self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+        self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+        self.assertEqual((rep["presubmit_requests"], rep["replay_lane_requests"]), (1, 1))
+        self.assertEqual(rep["health"]["lines_by_kind"]["replay-lane"], 1)
+        self.assertEqual(skipped["untagged"], 0)
 
     def test_cross_project_share(self):
         rep, _ = report([
@@ -937,7 +958,7 @@ class HealthTest(unittest.TestCase):
         ]))
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
-        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4})
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4, "replay-lane": 0})
         self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
         self.assertEqual(h["analysis_dropped"], 1)

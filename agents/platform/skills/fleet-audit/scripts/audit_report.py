@@ -422,6 +422,19 @@ AUDITS: dict[str, AuditSpec] = {
             ),
             ("project", ("quota-exhaustion-risk", "reservation-mismatch-risk")),
         ),
+        # §4a of the SOP: the one check that judges a shape an owner chooses,
+        # a node pool kept in one zone on a cluster that is single-zone by
+        # design (3.9's zone-locked arm), and so the only one a repository
+        # declaration may keep off the ledger. The slug's other arm, a pool at
+        # its autoscaling ceiling, is the pool's live headroom and stays a
+        # finding; the join tells the arms apart by the collector's excerpt
+        # (`ZONE_LOCKED_ARM_MARK` opening it, `CEILING_ARM_MARK` absent), the
+        # validator cannot, and the SOP's step carries that distinction. The
+        # other eleven are capacity faults no
+        # declaration excuses: a quota near its limit, a ComputeClass with no
+        # fallback, a Spot shape that gets preempted, an autoscaler that
+        # already failed to add a node.
+        declarable=("single-zone-nodepool",),
     ),
     "gcp-networking-fabric-audit": AuditSpec(
         "GCP Networking Fabric & VPC IPAM Audit",
@@ -1950,6 +1963,23 @@ NAMESPACE_SHAPE_KIND = "Namespace"
 # The allow-all fault names the policy; the withhold publishes only that spelling
 # and holds every other, so an object it cannot classify errs toward holding.
 ALLOW_ALL_SHAPE_KIND = "NetworkPolicy"
+# Stockout 3.9 `single-zone-nodepool` names two arms under one slug and one
+# object kind: the zone-locked arm is the posture a declaration may move (a
+# pool kept in one zone on purpose), and the at-ceiling arm is the pool's live
+# headroom, which no declaration excuses. Neither the slug nor the object
+# tells them apart; the collector's excerpt does, and each arm's clause opens
+# with its prefix (`ZONE_LOCKED_ARM_PREFIX` and `CEILING_ARM_PREFIX` in
+# fleet_stockout.py, which `check_single_zone_nodepool` writes and
+# `adopt_collector_evidence` copies onto the finding; a test pins these two
+# copies to those). A declaration moves a finding whose excerpt carries the
+# zone-locked prefix and not the ceiling one: a pool matching both arms stays
+# a finding, and so does a hand-written excerpt that carries neither, since
+# nothing then says which arm the worker saw. The withhold holds both arms, as
+# it holds both `hpa-cannot-scale` shapes: it errs toward holding a finding
+# back, the join toward not silencing one.
+ZONE_ARM_CHECK = "single-zone-nodepool"
+ZONE_LOCKED_ARM_MARK = "single-zone ("
+CEILING_ARM_MARK = "at its autoscaling ceiling:"
 # A roll-up names the scope it covers, not an object: the cost SOP's §5
 # collapse gives one `Cluster/<name>` or `Namespace/<name>`, and its 3.5
 # ten-address roll-up `Project/<id>`. The cost stream refuses them the way
@@ -1978,6 +2008,20 @@ COST_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
     "idle-namespace": frozenset({"namespace"}),
     "registry-no-cleanup": frozenset({"artifactregistryrepository"}),
 }
+# The stockout stream's one declarable check names a node pool and nothing
+# else: a `Cluster/` or a workload covers no pool's zone span. Folded as
+# `_object_kind_segment` folds kinds, like the cost table above.
+STOCKOUT_DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    ZONE_ARM_CHECK: frozenset({"nodepool"}),
+}
+# Every declarable check with fixed object kinds, across streams, for the one
+# lookup (`_rollup_scope_reason`) the validator, the join and the manifest
+# route share. The cost table stays its own name because `_is_cost_declarable`
+# reads it for the measured-size title, which a stockout row does not carry.
+DECLARABLE_OBJECT_KINDS: dict[str, frozenset[str]] = {
+    **COST_DECLARABLE_OBJECT_KINDS,
+    **STOCKOUT_DECLARABLE_OBJECT_KINDS,
+}
 # A cost declaration names the object and not its size, and every cost
 # finding is about a size, so the Declared intent row for one carries what
 # the collector measured and the grade it gave, `MAJOR` spelled out: a
@@ -1991,10 +2035,14 @@ COST_DECLARED_MINOR = "minor"
 # given a namespace may write it into the field, which would give the same
 # object a second identity, so the validator empties it on these checks before
 # the id is derived and the parser reads it as empty on a note item. Per check
-# and not per object kind: 3.9 files its pile as `Namespace/<ns>` with the
-# namespace set, and compliance 2.6 does too. Every slug here is the cost
-# stream's alone, so no stream test is needed where it is consulted.
-UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup"})
+# and not per object kind: the cost stream's 3.9 files its pile as
+# `Namespace/<ns>` with the namespace set, and compliance 2.6 does too. The
+# stockout pool check (`ZONE_ARM_CHECK`) joins the five for the same reason:
+# its collector files `NodePool/<pool>` with no namespace, and a worker's
+# namespace on the finding would give the pool an identity no declaration and
+# no candidate matches. Every slug here belongs to one stream, so no stream
+# test is needed where it is consulted.
+UNNAMESPACED_CHECKS = frozenset({"idle-namespace", "idle-nodepool", "unattached-disk", "idle-address", "registry-no-cleanup", ZONE_ARM_CHECK})
 # 2.7 `default-sa-automount` is declared per workload and fixed per namespace
 # (one `default` ServiceAccount). A fix that merges for an undeclared sibling
 # would take the declared workload's token too, so a namespace holding a
@@ -5311,6 +5359,14 @@ def previous_filed_ids(
     filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
     if filed is not None:
         return set(filed[0])
+    return body_filed_ids(previous_body)
+
+
+def body_filed_ids(previous_body: str) -> set[str]:
+    """The ids in a body's `audit-findings-all` block: every finding a body that cut rows for space filed.
+
+    Empty for a body that cut nothing, or whose block cannot be read.
+    """
     complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
     try:
         return set(json.loads(complete[-1])) if complete else set()
@@ -8470,8 +8526,9 @@ def withhold_unsearched_postures(data: dict, record: dict | None) -> list[dict]:
     record names. A partial list is no search, per the SOP.
 
     What goes: every finding whose check is declarable, the dangling-target
-    `hpa-cannot-scale` fault included, because it shares its slug with the
-    `min == max` posture and this side cannot tell them apart; the allow-all
+    `hpa-cannot-scale` fault and the at-ceiling `single-zone-nodepool` arm
+    included, because each shares its slug with a posture and this side
+    does not read the excerpt to tell them apart; the allow-all
     `NetworkPolicy/` fault of `netpol-missing` stays, because its object does
     tell it apart (`_is_namespace_object`). What stays: the
     faults, and every `declared[]` entry, each of which cites the file it
@@ -8554,6 +8611,11 @@ def _declared_intent_gap(data: dict) -> str | None:
         tail = (
             f"; a dangling-target {DUAL_SHAPE_CHECK} shares its slug with the "
             "min == max posture and is held back with the postures"
+        )
+    if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+        tail += (
+            f"; a {ZONE_ARM_CHECK} at its autoscaling ceiling shares its slug with the "
+            "zone-locked posture and is held back with the postures"
         )
     return f"declared intent: {what} — {where}{tail}"
 
@@ -9128,12 +9190,79 @@ def _declaration_lookup(declarations: list[dict]) -> tuple[dict, dict]:
     return scoped, fleet_wide
 
 
+def _item_excerpt(item: dict) -> str:
+    """The collector's excerpt on a finding (`evidence.excerpt`, either stored shape) or a candidate (`excerpt`)."""
+    return _evidence_excerpt(item) or str(item.get("excerpt") or "")
+
+
+def _is_ceiling_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate carries 3.9's at-ceiling arm.
+
+    Read off the excerpt the collector wrote (`CEILING_ARM_MARK`), the one field
+    that names the arm: a pool matching both arms carries the mark too and is
+    judged a fault, since the headroom it reports is live whatever the zone
+    span was chosen for.
+    """
+    return CEILING_ARM_MARK in _item_excerpt(item)
+
+
+def _is_zone_locked_arm(item: dict) -> bool:
+    """Whether a `single-zone-nodepool` finding or candidate is the zone-locked posture alone.
+
+    The excerpt opens with `ZONE_LOCKED_ARM_MARK` (the collector writes the
+    zone-locked clause first) and carries no at-ceiling clause anywhere. An
+    excerpt that opens any other way — a worker's own wording on a cluster
+    the collector could not read, even one that mentions a single zone later
+    on — names no arm, and a declaration moves nothing it cannot place: the
+    finding publishes.
+    """
+    return _item_excerpt(item).startswith(ZONE_LOCKED_ARM_MARK) and not _is_ceiling_arm(item)
+
+
+def reject_declared_ceiling_pools(data: dict, manifest: dict | None) -> None:
+    """Exit 2 on a worker-written `declared[]` entry for a pool the collector reports at its ceiling.
+
+    The validator holds a `declared[]` entry to the slug and the object kind
+    and no further: the entry carries no excerpt, so nothing on it says which
+    arm of 3.9 the worker moved. The manifest does. A candidate for the same
+    identity whose excerpt carries the at-ceiling clause is the fault, and a
+    declared fault exits 2 and publishes nothing (SOP §5) — the same door
+    `apply_declarations` shuts on a finding, held here for the entry the worker
+    wrote by hand, which would otherwise take the candidate's identity into
+    `known` and keep it off the ledger. Run with the manifest before the join,
+    by `finish` and `remediate` alike; without a manifest there is nothing to
+    hold the entry to, as for every other manifest cross-check.
+    """
+    if manifest is None:
+        return
+    declared_pools = {
+        derive_finding_id(entry): entry
+        for entry in data.get("declared") or []
+        if isinstance(entry, dict) and str(entry.get("check", "")) == ZONE_ARM_CHECK
+    }
+    if not declared_pools:
+        return
+    for entry, candidate in _candidates(manifest):
+        if str(candidate.get("check", "")) != ZONE_ARM_CHECK or not _is_ceiling_arm(candidate):
+            continue
+        own = declared_pools.get(_candidate_identity(entry, candidate))
+        if own is None:
+            continue
+        raise ValidationError(
+            f"declared[]: {own.get('object', '')} on {own.get('cluster', '')} is at its autoscaling "
+            f"ceiling in the collector's manifest (`{CEILING_ARM_MARK}` in its excerpt), and that arm "
+            f"of {ZONE_ARM_CHECK} is a fault no declaration excuses (SOP §4a); a declaration covers the "
+            "zone-locked arm alone. Write the pool under `findings` and let `finish` judge the note."
+        )
+
+
 def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) -> dict | None:
     """The declaration that justifies `item` (a finding or a collector candidate), or None.
 
     The dual-shape rules of `apply_declarations`, without its stderr lines: a
-    declaration moves only the `min == max` shape of `hpa-cannot-scale` and
-    only the `Namespace/` shape of `netpol-missing`.
+    declaration moves only the `min == max` shape of `hpa-cannot-scale`,
+    only the `Namespace/` shape of `netpol-missing`, and only the zone-locked
+    arm of `single-zone-nodepool`.
     """
     check = str(item.get("check", ""))
     if check not in declarable:
@@ -9146,6 +9275,8 @@ def _declaration_covers(item: dict, scoped: dict, fleet_wide: dict, declarable) 
     if check == DUAL_SHAPE_CHECK and str(item.get("severity", "")) != DUAL_SHAPE_POSTURE_SEVERITY:
         return None
     if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(item.get("object", ""))):
+        return None
+    if check == ZONE_ARM_CHECK and not _is_zone_locked_arm(item):
         return None
     if _rollup_scope_reason(check, str(item.get("object", "")), str(item.get("namespace") or "")):
         return None
@@ -9253,12 +9384,13 @@ def fold_unnamespaced_check(entry: dict) -> None:
 def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | None:
     """Why `obj` is not an object `check` names — a roll-up's scope, or a kind the check never files — or None.
 
-    A cost check with fixed object kinds accepts only those
-    (`COST_DECLARABLE_OBJECT_KINDS`). The two controller checks file whatever
+    A check with fixed object kinds accepts only those
+    (`DECLARABLE_OBJECT_KINDS`: the cost checks and the stockout pool check).
+    The two controller checks file whatever
     kind owns the pod, so they refuse a namespace spelling always and a
     `Cluster/` or `Project/` only with an empty namespace, the roll-up's
     shape: a controller carries its namespace, a §5 collapse or the 3.5
-    roll-up does not. Another stream's check is not judged here.
+    roll-up does not. A check in neither table is not judged here.
     """
     kind = _object_kind_segment(obj)
     if check in COST_CONTROLLER_CHECKS:
@@ -9267,7 +9399,7 @@ def _rollup_scope_reason(check: str, obj: str, namespace: str = "") -> str | Non
         if kind in UNNAMESPACED_SCOPE_SPELLINGS and not str(namespace or "").strip():
             return f"names a roll-up's scope (`{kind}/` with no namespace), not a controller a {check} finding names"
         return None
-    allowed = COST_DECLARABLE_OBJECT_KINDS.get(check)
+    allowed = DECLARABLE_OBJECT_KINDS.get(check)
     if allowed is not None and kind not in allowed:
         return f"names a `{kind}/`, not one of the kinds a {check} finding names ({', '.join(sorted(allowed))})"
     return None
@@ -9377,6 +9509,26 @@ def apply_declarations(
                 f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
                 f"{finding.get('object', '')} is the allow-all fault (SOP §2.6), which no "
                 f"declaration excuses; the posture names `{NAMESPACE_SHAPE_KIND}/<ns>`. "
+                f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
+            )
+            match = None
+        if match is not None and check == ZONE_ARM_CHECK and not _is_zone_locked_arm(finding):
+            # The slug names a posture (a pool kept in one zone) and a fault (a
+            # pool at its autoscaling ceiling), told apart by the collector's
+            # excerpt; a declaration justifies only the posture, a pool
+            # matching both arms keeps the fault, and an excerpt that names
+            # neither arm — a worker's own wording — moves nothing.
+            why = (
+                f"carries the `{CEILING_ARM_MARK}` arm (SOP §3.9), the pool's live headroom, which no "
+                "declaration excuses; the posture is the zone-locked arm alone"
+                if _is_ceiling_arm(finding)
+                else f"has an excerpt that opens neither 3.9 arm (`{ZONE_LOCKED_ARM_MARK}` or "
+                f"`{CEILING_ARM_MARK}`, as the collector writes them), so nothing says it is the "
+                "zone-locked posture"
+            )
+            log(
+                f"DECLARATION NOT APPLIED: {finding.get('id', '')} — {check} on "
+                f"{finding.get('object', '')} {why}. "
                 f"{match.get('repo', '')}:{match.get('path', '')} stands and the finding publishes."
             )
             match = None
@@ -12927,6 +13079,13 @@ def _render_declared_intent_search(data: dict) -> list[str]:
                     "shares its slug with the `min == max` posture and is held back "
                     "with the postures._",
                 ]
+            if any(str(f.get("check", "")) == ZONE_ARM_CHECK and _is_ceiling_arm(f) for f in findings):
+                out += [
+                    "",
+                    f"_A `{ZONE_ARM_CHECK}` at its autoscaling ceiling is a fault, but it "
+                    "shares its slug with the zone-locked posture and is held back "
+                    "with the postures._",
+                ]
         return out
     searched = [
         entry
@@ -14204,16 +14363,33 @@ def render_clean_comment(
             "",
         ]
     else:
+        retired = list(retired or [])
+        if retired:
+            # The lead must not claim what the note below it takes back: a
+            # finding retired unread is not gone, nobody looked for it (#5229).
+            retired_noun = "finding" if len(retired) == 1 else "findings"
+            verb = "is" if len(retired) == 1 else "are"
+            lead = (
+                "Every finding previously reported here on a cluster this run listed "
+                f"is gone, so this ledger is being closed as completed. {len(retired)} "
+                f"{retired_noun} on a cluster this run listed nowhere {verb} not confirmed "
+                "fixed; the note below names them. The next run that finds anything "
+                "opens a fresh one."
+            )
+        else:
+            lead = (
+                "Every finding previously reported here is gone, so this ledger is being "
+                "closed as completed. The next run that finds anything opens a fresh one."
+            )
         out = [
             f"### `{audit_id}` is now clean — closing",
             "",
             f"The {audit_name(audit_id)} run on {stamp} found **0 findings** across "
             f"{scope_phrase(audit_id, clusters, 'audited')}: {names}.",
             "",
-            "Every finding previously reported here is gone, so this ledger is being "
-            "closed as completed. The next run that finds anything opens a fresh one.",
+            lead,
         ]
-        out += _comment_retired(list(retired or []))
+        out += _comment_retired(retired)
 
     if gaps:
         out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
@@ -14272,6 +14448,8 @@ def _comment_retired(retired: list[dict]) -> list[str]:
     ]
     for cluster in sorted(by_cluster)[:MAX_SCOPE_ROWS]:
         ids = ", ".join(f"`{_cell(fid)}`" for fid in sorted(by_cluster[cluster])[:MAX_DELTA_ROWS])
+        if len(by_cluster[cluster]) > MAX_DELTA_ROWS:
+            ids += f", _…and {len(by_cluster[cluster]) - MAX_DELTA_ROWS} more_"
         out.append(f"- `{_cell(cluster)}`: {ids}")
     if len(by_cluster) > MAX_SCOPE_ROWS:
         out.append(f"- _…and {len(by_cluster) - MAX_SCOPE_ROWS} more cluster(s)_")
@@ -16242,7 +16420,12 @@ def refresh_coverage_ledger(
 
 
 def clean_close_banner(
-    audit_id: str, generated_at: datetime, *, had_findings: bool = True
+    audit_id: str,
+    generated_at: datetime,
+    *,
+    had_findings: bool = True,
+    retired_ids: Iterable[str] = (),
+    named: bool = True,
 ) -> str:
     """The paragraph at the top of a ledger that a clean run closes.
 
@@ -16259,6 +16442,14 @@ def clean_close_banner(
     ledger that a coverage gap opened. Its banner talks about the gap, because
     there are no findings below it.
 
+    `retired_ids` are the findings the close retires unread
+    (`unlisted_previous_findings`): on a cluster the run listed nowhere, so
+    nobody looked for them. The banner names them as not confirmed fixed
+    rather than saying every finding below is resolved, which the closing
+    comment's note already takes back (#5229). With `named` False the banner
+    counts them and leaves the ids to the closing comment: the caller's
+    fallback for a body the named list would push past the forge's limit.
+
     The banner does not say that a later run reopens this issue. A later run
     with findings finds no open ledger (`find_existing_issue` lists open
     issues only), so it opens a new one.
@@ -16272,19 +16463,40 @@ def clean_close_banner(
             "gap. The closing comment lists the clusters that this run "
             "checked. If a finding comes back, the next run opens a new ledger issue."
         )
+    retired = sorted({str(fid) for fid in retired_ids})
+    if retired:
+        ids = ", ".join(f"`{fid}`" for fid in retired[:MAX_DELTA_ROWS])
+        if len(retired) > MAX_DELTA_ROWS:
+            ids += f", and {len(retired) - MAX_DELTA_ROWS} more"
+        verb = "is" if len(retired) == 1 else "are"
+        lead = (
+            "found none of the findings below on the clusters it listed, so those "
+            f"are resolved. {len(retired)} of them {verb} not confirmed fixed"
+            + (f": {ids}. " if named else ", and the closing comment names them. ")
+            + "This run listed their cluster in neither `scope.clusters` nor "
+            "`scope.skipped`, so nobody looked for them; they are retired with the "
+            "ledger, and the closing comment names their clusters."
+        )
+    else:
+        lead = "found none of the findings below, so all of them are resolved."
     return (
         f"{CLEAN_CLOSE_MARKER}\n"
         f"> **Closed as clean on {stamp}.** The `{audit_id}` audit ran again and "
-        "found none of the findings below, so all of them are resolved. The rows "
-        "below still show the state from the last run that had findings. They "
-        "stay as the record of what the audit found. The closing comment lists "
-        "the clusters that this run checked. If a finding comes back, the next "
-        "run opens a new ledger issue."
+        f"{lead} The rows below still show the state from the last run that had "
+        "findings. They stay as the record of what the audit found. The closing "
+        "comment lists the clusters that this run checked. If a finding comes "
+        "back, the next run opens a new ledger issue."
     )
 
 
 def close_ledger_reads_clean(
-    repo: str, number: int, audit_id: str, live_body: str | None, now: datetime
+    repo: str,
+    number: int,
+    audit_id: str,
+    live_body: str | None,
+    now: datetime,
+    *,
+    retired_ids: Iterable[str] = (),
 ) -> bool:
     """Give a ledger a `0 findings` title and the clean-close banner.
 
@@ -16296,19 +16508,26 @@ def close_ledger_reads_clean(
 
     `live_body` is the body that `find_existing_issue` read, so this needs no
     read of its own. When it is None, or when the banner would make the body
-    too long for the forge, only the title changes.
+    too long for the forge, only the title changes. `retired_ids` are the
+    findings the close retired unread, for `clean_close_banner`; when the
+    banner that names them does not fit, the one that counts them is tried
+    before the body is left as it was.
     """
     payload: dict = {"number": number, "title": issue_title(audit_id, [])}
+    # Read twice below, so never a generator.
+    retired_ids = list(retired_ids)
     if live_body is not None:
-        body = (
-            live_body
-            if CLEAN_CLOSE_MARKER in live_body
-            else (
-                f"{clean_close_banner(audit_id, now, had_findings=bool(parse_delta_block(live_body)))}"
+        if CLEAN_CLOSE_MARKER in live_body:
+            candidates = [live_body]
+        else:
+            had_findings = bool(parse_delta_block(live_body))
+            candidates = [
+                f"{clean_close_banner(audit_id, now, had_findings=had_findings, retired_ids=retired_ids, named=named)}"
                 f"\n\n{live_body}"
-            )
-        )
-        if len(body) <= MAX_BODY_CHARS:
+                for named in ((True, False) if retired_ids else (True,))
+            ]
+        body = next((b for b in candidates if len(b) <= MAX_BODY_CHARS), None)
+        if body is not None:
             payload["body"] = body
     return try_forge("issue-update", repo, payload) is not None
 
@@ -17408,8 +17627,28 @@ def close_stale_remediation_prs(
     shielded_namespaces: set[tuple[str, str]] | None = None,
     finding_places: dict[str, tuple[str, str, str]] | None = None,
     sweep_off: bool = False,
+    previous_ids: Iterable[str] | None = None,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
+
+    `previous_ids` are the ids the ledger carried before this run: the last
+    body's hidden block and the stored record behind it. On a scoped install,
+    on a forge with labels, they decide whether an open pull request with no
+    scope label is this install's at all. Such a pull request is from before
+    scopes, and in a mixed-version window every install that shares the
+    repository reads it as its own; one whose covered ids were never on this
+    install's ledger and are not among `current_ids` is another install's fix
+    for findings this run never looked for, so neither the finding rule nor
+    the branch rule touches it (#5229). The shield's close still does: a
+    namespace this install declared is this install's. Left as None, the
+    caller has no ledger to judge by and every listed pull request is read as
+    before; an empty list is a ledger that listed nothing, a lost memory
+    included, and reads the same as any other list. A fix of this install's
+    whose ids the shared pre-scope ledger happened not to carry is skipped
+    too, and logged: left open for a person, not closed over another
+    install's fleet. On a forge with no labels no pull request carries a
+    scope label and the listing proved each one this install's, so nothing
+    is skipped there.
 
     A third reason, `shielded_ids`: a pull request whose only persisting
     findings `shield_declared_account_siblings` demoted this run proposes the
@@ -17489,6 +17728,12 @@ def close_stale_remediation_prs(
             for key_cluster, key_namespace in shielded_namespaces
         )
     live_branches = set(branch_by_finding.values())
+    # Whose an unlabelled pull request is can only be asked on a forge with
+    # labels: without them no pull request carries a scope label, and the
+    # listing already proved each one this install's (`_proposal_is_own`).
+    labelled_forge = forge_has_labels(repo)
+    scope = ledger_scope() if labelled_forge else None
+    known = None if previous_ids is None else set(previous_ids) | set(current_ids)
     for pr in prs:
         if str(pr.get("state", "")).upper() != "OPEN":
             continue
@@ -17529,6 +17774,36 @@ def close_stale_remediation_prs(
             shielded_only or bool(persisting) or any(fid in shielded_ids for fid in shield_persisting)
         )
         if shielded_only and not only_shielded:
+            continue
+        # A pull request with no scope label on a scoped install is from
+        # before scopes, and in a mixed-version window every install that
+        # shares the repository reads it as its own (#5229). It is this
+        # install's when one of the ids it covers was on this install's
+        # ledger or is one this run sees, or when the shield matched it to a
+        # namespace this install declared; otherwise it is another install's
+        # fix for findings nobody here looked for, and neither rule below
+        # may close it.
+        if (
+            known is not None
+            and scope is not None
+            and not only_shielded
+            and scope_label_of(pr.get("labels")) is None
+            and not set(covered) & known
+        ):
+            # An old-scheme body names ids this ledger cannot be joined
+            # against, so "never listed" is not known of it; it is left open
+            # all the same, since the branch rule cannot say whose it is.
+            why = (
+                "they are written under another id scheme, which this install's ledger "
+                "cannot be joined against"
+                if covered and not joinable
+                else "this install's ledger never listed any of them"
+            )
+            log(
+                f"PR #{number} carries no scope label and covers "
+                f"{', '.join(covered) or 'no readable finding id'}; {why}, so it is "
+                "left to the install that opened it."
+            )
             continue
         if not orphaned:
             if not covered or not joinable or (persisting and not only_shielded):
@@ -17596,7 +17871,6 @@ def close_stale_remediation_prs(
         # reads as a considered rejection and retires the finding permanently.
         # A labelled pull request that is still open, by contrast, costs one
         # line of noise and is fixed on the next run.
-        labelled_forge = forge_has_labels(repo)
         if not labelled_forge:
             # No labels here: the description records the close instead,
             # under the same rule -- written first, and no close without it.
@@ -22515,6 +22789,13 @@ def handle_remediate(args: argparse.Namespace) -> None:
             "wrote; an empty path is not the same as running without one."
         )
     manifest = load_manifest(manifest_file, audit_id) if manifest_file is not None else None
+    if manifest is not None:
+        # The same order as `finish`: the join reads the excerpt for 3.9's arm,
+        # so it must read the collector's wording, not the worker's, and a
+        # hand-written `declared[]` entry for a pool at its ceiling is refused
+        # here as it is there.
+        adopt_collector_evidence(data["findings"], manifest)
+        reject_declared_ceiling_pools(data, manifest)
     declared_ids = set(join_harness_declarations(data, record, audit_id, repo_hint, manifest=manifest)[0])
     withheld_ids = set(finding_ids(withhold_unsearched_postures(data, record)))
     findings = list(data["findings"])
@@ -23992,6 +24273,7 @@ def _finish_store_ledger(
             shielded_namespaces=shielded_namespaces,
             finding_places=finding_places,
             shielded_only=hold_closes,
+            previous_ids=previous_ids,
         )
 
     prs_opened = _open_promoted_prs(
@@ -24725,6 +25007,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 f"evidence: adopted the collector's command and excerpt for "
                 f"{len(adopted)} of {len(data['findings'])} finding(s) — {shown}"
             )
+        # Before the join: a hand-written `declared[]` entry for a pool the
+        # collector reports at its ceiling is a declared fault, and exits 2.
+        reject_declared_ceiling_pools(data, manifest)
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
@@ -25116,6 +25401,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             "a rename as a fix."
         )
     filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
+    # Every id the ledger carried, for the stale close's reading of an
+    # unlabelled pull request: the body's block, the stored document behind
+    # it, and the complete block of a body that cut findings for space. The
+    # block is read off the body itself, not only through `filed_cut`: a
+    # memory seeded from the issue, or the empty document a held-open run
+    # stored over that seed, has no document that names the cut ids.
+    ledger_ids_known = sorted(
+        set(previous_ids) | set(_stored_finding_places(memory)) | filed_cut | body_filed_ids(previous_body)
+    )
     # Where the last scheduled run's ids are read from (see `scheduled_ids`
     # below). Read here, so the run's first `finish` saves what it read with
     # the baseline.
@@ -25497,6 +25791,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
                 shielded_only=bool(gaps or unaccounted),
                 noun=noun,
                 sweep_off=not sweep_on,
+                previous_ids=ledger_ids_known,
             )
         )
         conversation_unread = False
@@ -25758,7 +26053,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             # with it. Without this, the closed issue still counts the findings
             # in its title and shows each one as `open`. After and not before:
             # if the close fails, an open ledger must not show an all-clear.
-            if not close_ledger_reads_clean(repo, existing_issue, audit_id, existing_body, now):
+            if not close_ledger_reads_clean(
+                repo, existing_issue, audit_id, existing_body, now, retired_ids=retired_ids
+            ):
                 log(
                     f"WARNING: issue #{existing_issue} is closed, but its title and body "
                     "could not be changed; it still shows its findings as open. The "
@@ -26290,6 +26587,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             shielded_namespaces=shielded_namespaces,
             finding_places=finding_places,
             shielded_only=bool(gaps),
+            previous_ids=ledger_ids_known,
         )
 
     prs_opened = _open_promoted_prs(

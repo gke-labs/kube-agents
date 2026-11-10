@@ -27,6 +27,13 @@ const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+
+	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
+	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
+	// kubectl reads, a forwarded list held about 9.5 MiB in flight and the proxy was
+	// OOMKilled at 43 to 48 in flight.
+	defaultMaxInFlight = 24
 
 	// otelShutdownTimeout bounds the flush of buffered spans on exit.
 	otelShutdownTimeout = 5 * time.Second
@@ -155,6 +162,7 @@ func main() {
 		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
 		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
+		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
 	flag.Parse()
 
@@ -252,6 +260,7 @@ func main() {
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,
+		MaxInFlight:    *maxInFlight,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)

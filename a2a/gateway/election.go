@@ -37,9 +37,9 @@ const (
 	// relayStopDrainTimeout, sized to the pod's grace period.
 	lostLeaseRelayDrain = 5 * time.Second
 
-	// relayAckWait is the relay durable's AckWait. The relay creates or
-	// updates its durable with none on every bind, so it's always the
-	// server's default.
+	// relayAckWait is the relay durable's AckWait. Nothing sets one: the
+	// provision Job makes the durable without it (and a gateway run without
+	// the operator creates it the same way), so it's the server's default.
 	relayAckWait = 30 * time.Second
 
 	// releasedLeaseSeconds is the duration a released lease records, as

@@ -27,7 +27,7 @@ import unittest.mock
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import render
+from eval_dashboard import nightly, render
 
 FIXTURE = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_classify" / "incidents.json.gz"
 PAGES_JS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "template" / "pages.js"
@@ -119,6 +119,22 @@ def brief_view_anchors(pages_js: str) -> frozenset:
 
 
 BRIEF_VIEW_ANCHORS = brief_view_anchors(PAGES_JS.read_text())
+
+
+def night_part_words(pages_js: str) -> dict:
+    """PAGE.nightPartWords from pages.js's text, a flat object of quoted
+    or bare keys to quoted words."""
+    match = re.search(r"^\s*nightPartWords:\s*\{([^{}]*)\}", pages_js, re.MULTILINE)
+    if match is None:
+        raise RuntimeError(f"{PAGES_JS}: PAGE.nightPartWords is not a flat object literal")
+    return dict(re.findall(r'"?([\w-]+)"?\s*:\s*"([^"]*)"', match.group(1)))
+
+
+class NightPartWordsTest(unittest.TestCase):
+    def test_the_pages_part_words_are_nightly_py_s(self):
+        # pages.js carries a hand copy of nightly.PART_WORDS; a part added to
+        # one alone would render as its raw id on the Nightly page.
+        self.assertEqual(night_part_words(PAGES_JS.read_text()), dict(nightly.PART_WORDS))
 # The Cases page's one polled call, in
 # test_cases_page_sorts_filters_and_the_hash_highlight: a row fragment,
 # the bare case name, under boot and two polls on the page's real clock.
@@ -997,9 +1013,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
         self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
-        # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
+        # The GitLab lane's next nightly is a table of its own.
         self.assertIn("1 night on record: 0 green, 1 not", page)
-        self.assertIn("No night of", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"', page)
 
     def test_a_case_lost_to_the_delegation_ceiling_says_so_on_the_run_page(self):

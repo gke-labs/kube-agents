@@ -39,6 +39,51 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// The exec pods' readiness probe, tighter than the stateful broker's (10s
+// period, 5s timeout, 3 failures). A draining exec pod answers /healthz with
+// 503 (HEALTHZ_DRAINING_PAYLOAD in credential_proxy.py), at once, so three
+// failures 3s apart take it out of its Service in about 9s: at one replica a
+// caller's connect then fails over to the stateful broker instead of reading
+// `draining` until the replacement is Ready. Three failures, not one, so a
+// single slow probe on a healthy pod does not eject it: at one replica an
+// ApiSession whose connect fails stays on the stateful broker for the rest of
+// the session (credential_proxy_client.py), and CredentialProxyExecReady would
+// flip on each miss. The 2s timeout is ample for a handler that returns a
+// constant. The stateful broker keeps its own probe: it rolls with Recreate,
+// so no other pod could take its traffic.
+const (
+	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
+	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
+	credentialProxyExecTierReadinessFailureThreshold int32 = 3
+)
+
+// How long an exec pod may take to stop (credential-broker-exec-tier.md §9
+// step 0). RollingUpdate keeps another replica serving while one rolls, so the
+// exec role drains for as long as the longest command it admits
+// (EXEC_SHUTDOWN_DRAIN_SECONDS, 360s, in credential_proxy.py), not for the
+// broker's bounded drain. tests/test_credential_proxy_drain_budget.py holds
+// these against the runtime's and the entrypoint's figures.
+const (
+	// The longest a command may run: credential_proxy.py's --timeout-seconds
+	// default, which no install can change, because the operator reserves
+	// CREDENTIAL_PROXY_TIMEOUT_SECONDS.
+	credentialProxyCommandTimeoutSeconds int64 = 300
+	// How long a request may wait for a command slot (credential_proxy.py's
+	// COMMAND_SLOT_WAIT_SECONDS). The drain does not refuse a request already
+	// waiting, so one queued at SIGTERM can be admitted and run for the whole
+	// timeout.
+	credentialProxyCommandSlotWaitSeconds int64 = 60
+	// What the stop does after the drain: the runtime's 5s end wait for the
+	// commands it ended, the entrypoint's poll, and its kill of Envoy
+	// (EXEC_RUNTIME_DRAIN_SECONDS, 370s, in deploy/shared/start-services.sh).
+	credentialProxyExecTierStopMarginSeconds int64 = 20
+	// The kubelet's wait between SIGTERM and SIGKILL for an exec pod: the
+	// timeout, the slot wait and the margin. A literal, so the drain-budget
+	// test reads the value that ships; TestTheExecTierHoldsItsLongestCommand
+	// holds it to the sum. An idle exec pod still exits after its 3s settle.
+	credentialProxyExecTierTerminationGraceSeconds int64 = 380
+)
+
 // The exec tier (docs/designs/credential-broker-exec-tier.md §3.3, names in
 // §12): stateless broker replicas beside the stateful broker, serving /v1/exec
 // and /v1/gcp/ only. Every name the tier renders is derived here.
@@ -184,16 +229,21 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
 // stateful broker's, as rendered for this reconcile, so the image, the policy,
-// the caller authentication, the profile identities and the grace period stay
-// the same on both. The exec role drains on SIGTERM as the broker does, inside
-// that grace period (a command longer than the drain is #4780). What differs:
+// the caller authentication and the profile identities stay the same on both.
+// What differs:
 //   - its own name, selector and labels, without has-credential-proxy, which
 //     opens the github-token-minter to a pod;
 //   - the replica count and RollingUpdate with maxUnavailable 1 and maxSurge
 //     0: no exec call keeps state across calls, a second replica serves while
-//     one rolls, and a rollout needs no surge Pod, so a namespace quota with no
-//     headroom cannot stall it (at one replica the callers fall back to the stateful
-//     broker for the gap);
+//     one rolls, and a rollout needs no surge Pod. A stopping pod keeps its cpu
+//     and quota until it exits, so a step whose replacement has no room waits
+//     for it. A stopping pod fails its readiness probe and leaves the Service
+//     in about 9s (credentialProxyExecTierReadinessPeriodSeconds and the
+//     threshold), so at one replica callers fall back to the stateful broker
+//     until the replacement is Ready;
+//   - the grace period (credentialProxyExecTierTerminationGraceSeconds): the
+//     exec role drains on SIGTERM for as long as the longest command it
+//     admits, not for the broker's bounded drain;
 //   - CREDENTIAL_PROXY_ROLE=exec, and the replica count mounted from the
 //     ConfigMap;
 //   - cpu and memory fixed at the tier's figures (other keys as the broker's);
@@ -204,6 +254,7 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 //   - no github-token-minter token, which is projected rather than a Secret.
 func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, broker *appsv1.Deployment) *appsv1.Deployment {
 	dep := broker.DeepCopy()
+	dep.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(credentialProxyExecTierTerminationGraceSeconds)
 	name := credentialProxyExecTierName(agent)
 	selector := credentialProxyExecTierSelector(agent)
 	dep.ObjectMeta = metav1.ObjectMeta{Name: name, Namespace: agent.Namespace}
@@ -263,6 +314,11 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 		c := &spec.Containers[i]
 		if c.Name != credentialProxyContainerName {
 			continue
+		}
+		if c.ReadinessProbe != nil {
+			c.ReadinessProbe.PeriodSeconds = credentialProxyExecTierReadinessPeriodSeconds
+			c.ReadinessProbe.TimeoutSeconds = credentialProxyExecTierReadinessTimeoutSeconds
+			c.ReadinessProbe.FailureThreshold = credentialProxyExecTierReadinessFailureThreshold
 		}
 		env := c.Env[:0]
 		for _, e := range c.Env {

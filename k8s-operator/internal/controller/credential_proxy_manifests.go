@@ -1074,8 +1074,9 @@ func credentialProxyEmptyDirSizeLimit(defaultSize, defaultLimit string, ephemera
 	return &size
 }
 
-// buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume
-// the watcher reads is not here: the gateway pod already declares it.
+// buildAgentAPIAuthVolumes is the gateway pod's remaining share, and the
+// watcher's alert-exclude rules (buildEventWatcherAlertExcludeConfigMap). The
+// data volume the watcher reads is not here: the gateway pod already declares it.
 //
 // The /tmp emptyDir is widened to the sidecar's own merged ephemeral-storage
 // limit, as buildCredentialProxyRuntimeVolumes widens the broker's state: the sidecar
@@ -1093,7 +1094,9 @@ func buildAgentAPIAuthVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volum
 			volumes[i].EmptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, agentAPIAuthEphemeralStorageLimit, ephemeralLimit)
 		}
 	}
-	return volumes
+	return append(volumes, corev1.Volume{Name: eventWatcherAlertExcludeVolume, VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+		LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+	}}})
 }
 
 func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volume {

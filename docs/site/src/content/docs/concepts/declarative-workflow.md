@@ -171,6 +171,8 @@ The fix keeps its kind, and a `manifest` fix can still open a pull request, whic
 
 For these fixes, the audit looks for the object's declaration in the `.yaml`, `.yml` and `.json` files of the GitOps repository. When exactly one file declares it, the paragraph names that file. Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and says that more than one file declares the object, or that the audit names no declaration file. It never says that no file declares the object, because the search skips a file that it cannot parse, for example a template.
 
+The search reads one snapshot of the repository from the credential broker, 32 MiB at most by default. When the repository is larger, the paragraph names no declaration file and the `finish` log has a warning. To raise the limit, set `CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` to a number of bytes in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages. A higher limit helps only up to 64 MiB of files, because the audit does not unpack a larger snapshot.
+
 The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount`. When the reason is `DependencyNotReady`, the paragraph also names the unready object at the root of the chain.
 
 To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, and the reconciler note is never cut. When there is still no room, the paragraph becomes shorter, and the copy of the file in a Kustomize note can become shorter by whole lines. When even the shortest paragraph does not fit, it goes after the other text, past the cap, and the `finish` log has a warning. The next run after the stall clears shows the fix's whole text again.
@@ -261,7 +263,7 @@ Minty is a small in-cluster service that brokers GitHub App installation tokens 
 ### How it works
 
 1. A GitHub App is created (once, by you) with the needed permissions (`contents:write`, `pull_requests:write`, `issues:write` — `fleet-audit` publishes its ledger as an issue) and installed on the target repo.
-2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `github-token-minter-keyring`, key `github-token-minter-key`, created by the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter)) — the raw key material never lives outside KMS.
+2. The App's private key is imported into a **GCP KMS asymmetric signing key** (keyring `<cluster>-minter-keyring`, key `<cluster>-minter-key` on a new install, created by the [`github-minter` Terraform module](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter)) — the raw key material never lives outside KMS.
 3. When `submit-suggestion` needs a token, the credential broker calls Minty (default endpoint `http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token`) using the agent's Workload Identity.
 4. Minty asks KMS to sign a JWT with the imported private key.
 5. Minty exchanges the JWT with GitHub for a **short-lived installation token scoped to the target repository**.

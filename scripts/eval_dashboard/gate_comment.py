@@ -50,8 +50,8 @@ A run the suite itself could not evaluate (`runs[].eval_outcome`,
 SCHEMA.md: an admitted case, or every case, lost every repetition to
 infrastructure, so the job exited 2) is not a red either, whatever Prow's
 FAILURE and the final line's `Failed` word say: `is_red` is false for it,
-and it gets the same one-line shape: that some cases lost every repetition
-to infrastructure, that nothing was graded for them, that nothing about the
+and it gets the same one-line shape: that some cases could not be graded
+because infrastructure failed before the agent ran, that nothing about the
 change is implied, and to retest once the environment is healthy:
 
     ### ⚪ Smoke gate: run not evaluated
@@ -150,6 +150,14 @@ BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
 # post_health.cause_sentence names the failing cases for a shared break (the
 # Chat space reads that); the public comment gets this sentence instead.
 SHARED_BREAK_CAUSE = "the same cases fail on every PR since {since} ({prs} PRs so far). Shared test fixture, not your code."
+# post_health.cause_sentence counts the repetitions that ended at the
+# delegation ceiling (the Chat space reads that); the public comment gets the
+# same sentence without the count, built from the same incident fields.
+CEILING_PUBLIC_CAUSE = "runs on {prs} PRs ended with the worker still running {window}; nothing was graded and nothing counts against a case."
+CEILING_WINDOW_SINCE = "since {since}"
+# health.json incident field the storm sentence quotes (the reps' words and
+# counts); dropped before the sentence is rendered here.
+STORM_CAUSES_KEY = "causes"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your failures are exactly the gate's, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
 SOME_THEIRS = "**Some of your failures are the gate's; {yours_text}.** Fix those; don't retest for the rest until the gate is healthy."
@@ -161,7 +169,7 @@ LOOKS_YOURS = "**This looks specific to your PR.**"
 SHARED_NO_INCIDENT = "Part of what failed here is also failing on other PRs right now, so it may not be your code; no outage is declared yet."
 UNEXPLAINED = "Part of what failed here matches nothing on other PRs yet; read the transcript."
 HARD_FAILURE = (
-    "🔴 **The run failed without a gate case failing all of its repetitions.** An absolute check tripped"
+    "🔴 **The run failed without a gate case collapsing.** An absolute check tripped"
     " (a forbidden cluster change, a verifier that errored; the run's artifacts/eval-grading.log has the reason) or the log was cut short (the build log says where)."
 )
 HELD_OUT_NOTE = " Held-out cases also failed; held-out cases do not block."
@@ -214,22 +222,23 @@ CONDITION_LOST_PODS = health.LOST_PODS
 # command itself.
 HEADING_NOT_EVALUATED = "### ⚪ Smoke gate: run not evaluated"
 BOX_NOT_EVALUATED = (
-    "Some cases lost every repetition to infrastructure before the agent could be graded{storm}."
+    "Some cases could not be graded: infrastructure failed before the agent ran{storm}."
     " The suite could certify nothing, so Prow reports the run red; nothing was graded for them"
     " and nothing about your change is implied. Retest once the environment is healthy."
 )
 BOX_NOT_EVALUATED_EVERY = (
-    "Every case lost every repetition to infrastructure before the agent could be graded{storm}."
+    "No case could be graded: infrastructure failed before the agent ran{storm}."
     " The suite evaluated nothing, so Prow reports the run red; nothing about your change is implied."
     " Retest once the environment is healthy."
 )
 # While health.json's condition is storm: the same line post_health.py
 # draws, so the comment and the brief agree on what the weather is.
 BOX_NOT_EVALUATED_STORM = " — a quota storm is declared on the gate right now"
-# A gate case that failed every graded repetition on the same run. The suite
-# did not count it (its roster is the branch's; the dashboard's can be
-# newer), so the heading stays ⚪, but the author is told before retesting.
-BOX_NOT_EVALUATED_COLLAPSED = " Other cases also failed every graded repetition here; read their transcripts before retesting."
+# A gate case that went red on the same run. The suite did not count it (its
+# roster is the branch's; the dashboard's can be newer), so the heading stays
+# ⚪, but the author is pointed at the run page before retesting. The outcome
+# and the pointer only: no per-repetition verdict reaches the public comment.
+BOX_NOT_EVALUATED_COLLAPSED = " Other cases also went red on this run; the run page has them."
 FOOTER_NOT_EVALUATED = "Ran {minutes} min · [build log]({url})"
 CONDITION_STORM = health.STORM
 FOOTER = "Run {minutes} min · [build log]({url})"
@@ -329,10 +338,20 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
 
 
 def cause_text(health_doc: dict) -> str:
-    """post_health.cause_sentence, except that a shared break names no case."""
+    """post_health.cause_sentence, except that a shared break names no case,
+    a delegation ceiling counts no repetitions, and a storm prints no
+    repetition count or reason: the incident's `causes` are the reps' own
+    words, which this comment keeps off the public record."""
+    incident = health_doc.get("incident") or {}
+    since = post_health.clock(post_health.parse_iso(health_doc.get("since")))
     if health_doc.get("condition") == health.SHARED_BREAK:
-        incident = health_doc.get("incident") or {}
-        return SHARED_BREAK_CAUSE.format(since=post_health.clock(post_health.parse_iso(health_doc.get("since"))), prs=len(incident.get("prs") or []))
+        return SHARED_BREAK_CAUSE.format(since=since, prs=len(incident.get("prs") or []))
+    if health_doc.get("condition") == health.DELEGATION_CEILING:
+        start, end = post_health.parse_iso(incident.get("window_start")), post_health.parse_iso(incident.get("window_end"))
+        window = post_health.clock_range(start, end) if start and end else CEILING_WINDOW_SINCE.format(since=since)
+        return CEILING_PUBLIC_CAUSE.format(prs=len(incident.get("prs") or []), window=window)
+    if health_doc.get("condition") == health.STORM:
+        return post_health.cause_sentence(dict(health_doc, incident={k: v for k, v in incident.items() if k != STORM_CAUSES_KEY}))
     return post_health.cause_sentence(health_doc)
 
 

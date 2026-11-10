@@ -102,7 +102,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2313,6 +2313,13 @@ _EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 _PR_FILE_GONE_STATUSES = frozenset({"removed"})
 # Offending documents a failed content assertion names before counting the rest.
 _PR_CONTENT_MAX_NAMED = 5
+# The kind `admits_disruption` grades, at the one version a cluster serves.
+_PDB_KIND = "PodDisruptionBudget"
+_PDB_API_VERSION = "policy/v1"
+# An IntOrString percentage, ASCII digits only (int() would take fullwidth
+# ones), and the most a budget's percentage may be.
+_PDB_PERCENT_RE = re.compile(r"([0-9]+)%")
+_PDB_MAX_PERCENT = 100
 
 _NO_PR_RUN_CLOCK_REASON = (
     "the run's transcript carries no start time (TranscriptSnapshot.started_at "
@@ -2787,6 +2794,22 @@ class WorkerCommandsVerifier(BaseVerifier):
     more. A collapsed chain (a line ending `` + N command(s)``) hides what
     followed, so an exemption refuses it and the first command's own words
     are graded.
+    ``exempt_grep_patterns: true`` is that grep exemption by structure, read
+    before ``exempt_patterns``: the row is split into shell words as
+    ``required_runs`` splits it (:func:`kube_agents_bench.shell_words._without_grep_patterns`),
+    and when it is one ``grep``, ``egrep`` or ``fgrep`` named bare and nothing
+    else (no control operator, no redirect but ``>`` to ``/dev/null``, no
+    comment, no substitution anywhere, not a collapsed chain), only its pattern
+    argument comes off (the first positional word, or each ``-e`` or
+    ``--regexp=`` value ahead of it). The row is then graded as its words joined by
+    spaces, quotes off: the options, the file operands and any text the
+    rendering joined on stay. A row with anything else on it is graded whole.
+    A grep behind a path, a wrapper, a reserved word or a ``cd`` is not one,
+    and a long option with a separate value is read as a flag, so its value is
+    taken as the pattern and the real one is graded. A card log row that joined
+    a second typed line onto a grep is one row to it, so a line that reads the
+    removed word back (``$_``) is read as a file operand, as it was by the
+    regex exemptions this replaces.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2886,6 +2909,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     required_patterns: list[str] = Field(default_factory=list)
     forbidden_patterns: list[str] = Field(default_factory=list)
     exempt_patterns: list[str] = Field(default_factory=list)
+    exempt_grep_patterns: bool = False
     required_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_runs: list[WorkerRun] = Field(default_factory=list)
     forbidden_result_patterns: list[str] = Field(default_factory=list)
@@ -2912,6 +2936,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         return self
 
     def _without_exempt_text(self, command: str) -> str:
+        if self.exempt_grep_patterns:
+            command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
             command = re.sub(pattern, "", command)
         return command
@@ -3220,6 +3246,92 @@ class WorkerAgentsVerifier(BaseVerifier):
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
 
+
+
+_NO_CHILD_ADDRESSEES_REASON = (
+    "the run did not report whom its chain delegated to: the record came through a "
+    "transport other than the inject door, or a door older than its childAddressees "
+    "field, so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("delegated_to")
+class DelegatedToVerifier(BaseVerifier):
+    """Checks whom the delegating turn's chain delegated to.
+
+    The inject door's read route names each child task's addressee once, in
+    the order delegated (``childAddressees``): an AgentProfile's name, or
+    ``platform``. The harness keeps that on the transcript
+    (``TranscriptSnapshot.child_addressees``). This reads it and nothing
+    else, so a case can grade which agent a session chose, which neither the
+    answer nor the trajectory says.
+
+    ``required_addressees``: Python regular expressions, each of which must
+    ``re.fullmatch`` at least one addressee.
+    ``forbidden_addressees``: Python regular expressions, none of which may
+    ``re.fullmatch`` any addressee. At least one of the two lists is set.
+
+    Fails closed: a run that could not say (the api transport, or a door
+    older than the field) is ``status="error"``, never a pass or a fail. A
+    case that relies on this check belongs in
+    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    """
+
+    type: Literal["delegated_to"]
+    required_addressees: list[str] = Field(default_factory=list)
+    forbidden_addressees: list[str] = Field(default_factory=list)
+
+    @field_validator("required_addressees", "forbidden_addressees")
+    @classmethod
+    def _addressee_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            if re.compile(pattern).fullmatch(""):
+                raise ValueError(f"addressee pattern {pattern!r} matches the empty string")
+        return patterns
+
+    @model_validator(mode="after")
+    def _one_list_set(self) -> "DelegatedToVerifier":
+        if not self.required_addressees and not self.forbidden_addressees:
+            raise ValueError("delegated_to needs required_addressees, forbidden_addressees, or both")
+        return self
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.child_addressees is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_CHILD_ADDRESSEES_REASON,
+            )
+        addressees = list(snap.child_addressees)
+        missing = [p for p in self.required_addressees if not any(re.fullmatch(p, a) for a in addressees)]
+        forbidden = [a for a in addressees if any(re.fullmatch(p, a) for p in self.forbidden_addressees)]
+        seen = addressees or "nobody"
+        if missing or forbidden:
+            parts = []
+            if missing:
+                parts.append(f"no delegation went to an addressee matching {missing}")
+            if forbidden:
+                parts.append(f"the chain delegated to forbidden addressee(s) {forbidden}")
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"{'; '.join(parts)}; the chain delegated to {seen}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"the chain delegated to {seen}",
+        )
 
 
 # The dispatcher's record of a worker that ran out of its turn budget: the
@@ -5252,6 +5364,13 @@ class PullRequestContentCheck(BaseModel):
       file that does not parse fails it when ``kind`` or ``field`` is set,
       since the object may be in it.
 
+    - ``admits_disruption``: the ``PodDisruptionBudget`` selects the pods
+      ``pod_labels`` describes and, against a workload of ``replicas`` healthy
+      pods, lets at least one and never all of them be evicted -- the
+      arithmetic the disruption controller does (see :func:`_pdb_rejection`).
+      No field match says this: ``minAvailable: 1`` is right for two replicas
+      and blocks every drain for one, and a percentage rounds up.
+
     Every op but ``absent`` needs at least one kept document, so a pull request
     that never wrote the object fails rather than passing vacuously, and
     ``quantifier`` says whether ``all`` kept documents (the default) or ``any``
@@ -5263,12 +5382,32 @@ class PullRequestContentCheck(BaseModel):
     paths: list[str] = Field(min_length=1)
     kind: str = ""
     field: str = ""
-    op: Literal["exists", "contains", "matches", "not_matches", "absent"]
+    op: Literal["exists", "contains", "matches", "not_matches", "absent", "admits_disruption"]
     value: str = ""
     quantifier: Literal["all", "any"] = "all"
+    # `admits_disruption` only: the workload the budget protects, as the case
+    # planted it. Given rather than read, because the workload's manifest is a
+    # file the pull request does not add, and reading it would need
+    # `contents: read`, which the grading mint does not grant.
+    replicas: int | None = Field(default=None, ge=2)
+    pod_labels: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _value_fits_op(self):
+        if self.op == "admits_disruption":
+            if self.kind != _PDB_KIND:
+                raise ValueError(f"`admits_disruption` grades a budget, so it needs `kind: {_PDB_KIND}`")
+            if self.field or self.value:
+                raise ValueError("`admits_disruption` reads the whole budget, so it takes no `field` or `value`")
+            if self.replicas is None or not self.pod_labels:
+                raise ValueError(
+                    "`admits_disruption` needs the workload the budget protects: `replicas` "
+                    "(2 or more: against one replica no budget both keeps a pod up and lets "
+                    "a node drain) and `pod_labels`"
+                )
+            return self
+        if self.replicas is not None or self.pod_labels:
+            raise ValueError("`replicas` and `pod_labels` are read only by `admits_disruption`")
         if self.op in ("contains", "matches", "not_matches") and not self.value:
             raise ValueError(f"`{self.op}` needs a `value`")
         if self.op in ("exists", "absent") and self.value:
@@ -5286,6 +5425,12 @@ class PullRequestContentCheck(BaseModel):
 
     def label(self) -> str:
         what = self.kind or "document"
+        if self.op == "admits_disruption":
+            labels = ",".join(f"{k}={v}" for k, v in sorted(self.pod_labels.items()))
+            return (
+                f"{what} admits_disruption over {self.replicas} replicas labelled {labels} "
+                f"in {', '.join(self.paths)}"
+            )
         at = f".{self.field}" if self.field else ""
         tail = f" {self.value!r}" if self.value else ""
         return f"{what}{at} {self.op}{tail} in {', '.join(self.paths)}"
@@ -5492,11 +5637,136 @@ def _added_file_text(entry: dict) -> str | None:
     return "\n".join(lines) + "\n"
 
 
+def _is_null(value: Any) -> bool:
+    """Whether a text-loaded value is missing or a spelling of null."""
+    return value is None or (isinstance(value, str) and value.strip() in _YAML_NULL_SPELLINGS)
+
+
+def _selector_rejection(
+    selector: Any, pod_labels: dict[str, str], *, empty_selects: bool = False
+) -> str | None:
+    """Why a policy/v1 label selector does not select pods carrying
+    ``pod_labels``, or None when it does.
+
+    An absent or null selector selects no pods in policy/v1, and an empty one
+    selects every pod in the namespace: a budget over the whole namespace
+    counts other workloads' pods against this one's replicas, so neither is
+    the workload's budget. ``empty_selects`` asks only whether the pods are
+    selected, which an empty selector does.
+    """
+    shown = ",".join(f"{k}={v}" for k, v in sorted(pod_labels.items()))
+    if _is_null(selector):
+        return "it has no selector, which in policy/v1 selects no pods"
+    if not isinstance(selector, dict):
+        return "its selector is not a label selector"
+    match_labels = {} if _is_null(selector.get("matchLabels")) else selector.get("matchLabels")
+    expressions = [] if _is_null(selector.get("matchExpressions")) else selector.get("matchExpressions")
+    if not isinstance(match_labels, dict) or not isinstance(expressions, list):
+        return "its selector is not a label selector"
+    if not match_labels and not expressions:
+        if empty_selects:
+            return None
+        return "its selector is empty, which selects every pod in the namespace rather than the workload's"
+    for key, value in match_labels.items():
+        if pod_labels.get(key) != value:
+            return f"its selector's matchLabels {key}={value} does not select the workload's pods ({shown})"
+    for expression in expressions:
+        if not isinstance(expression, dict):
+            return "its selector's matchExpressions is not a list of requirements"
+        key, operator = expression.get("key"), expression.get("operator")
+        values = [] if _is_null(expression.get("values")) else expression.get("values")
+        if not isinstance(values, list):
+            return f"its selector's matchExpressions values for {key!r} is not a list"
+        # A label key and its values are strings; "" and "null" are values, so
+        # they are not read as null here.
+        if not isinstance(key, str) or _is_null(key):
+            return "a matchExpressions requirement names no key, which the API server refuses"
+        if not all(isinstance(item, str) for item in values):
+            return f"its selector's matchExpressions values for {key!r} are not all strings"
+        if operator not in (_SELECTOR_IN, _SELECTOR_NOT_IN, _SELECTOR_EXISTS, _SELECTOR_DOES_NOT_EXIST):
+            return f"its selector's matchExpressions operator {operator!r} is not a Kubernetes one"
+        if (operator in (_SELECTOR_IN, _SELECTOR_NOT_IN)) != bool(values):
+            return (
+                f"its requirement {key} {operator} {values} is one the API server refuses: In and "
+                "NotIn need values, Exists and DoesNotExist take none"
+            )
+        present = key in pod_labels
+        if operator == _SELECTOR_IN:
+            selected = present and pod_labels[key] in values
+        elif operator == _SELECTOR_NOT_IN:
+            selected = not present or pod_labels[key] not in values
+        elif operator == _SELECTOR_EXISTS:
+            selected = present
+        else:
+            selected = not present
+        if not selected:
+            return f"its selector's requirement {key} {operator} {values} does not select the workload's pods ({shown})"
+    return None
+
+
+def _scaled_count(value: Any, replicas: int) -> int | None:
+    """An IntOrString budget value as a pod count over ``replicas``, or None
+    when the API server would refuse it. A percentage rounds up, as the
+    disruption controller scales both minAvailable and maxUnavailable."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _DIGITS_RE.fullmatch(text):
+        return int(text)
+    match = _PDB_PERCENT_RE.fullmatch(text)
+    if match and int(match[1]) <= _PDB_MAX_PERCENT:
+        return -(-int(match[1]) * replicas // _PDB_MAX_PERCENT)
+    return None
+
+
+def _pdb_rejection(doc: dict, replicas: int, pod_labels: dict[str, str]) -> str | None:
+    """Why a PodDisruptionBudget does not protect a workload of ``replicas``
+    healthy pods labelled ``pod_labels`` while letting a node drain, or None.
+
+    It must be ``policy/v1``, select those pods, set exactly one of minAvailable and
+    maxUnavailable, and allow between one and ``replicas - 1`` disruptions
+    with every pod healthy, which is ``replicas - minAvailable`` or
+    ``maxUnavailable``. Zero blocks every voluntary eviction, so no node
+    holding one of the pods can drain; ``replicas`` or more bounds nothing.
+    """
+    if doc.get("apiVersion") != _PDB_API_VERSION:
+        return (
+            f"its apiVersion is {_scalar_text(doc.get('apiVersion'))!r}, not {_PDB_API_VERSION}, the only "
+            "version a current cluster serves (policy/v1beta1 went in Kubernetes 1.25)"
+        )
+    spec = doc.get("spec")
+    if not isinstance(spec, dict):
+        return "it has no spec"
+    unselected = _selector_rejection(spec.get("selector"), pod_labels)
+    if unselected:
+        return unselected
+    set_keys = [key for key in ("minAvailable", "maxUnavailable") if not _is_null(spec.get(key))]
+    if len(set_keys) == 2:
+        return "it sets both minAvailable and maxUnavailable, which the API server refuses"
+    if not set_keys:
+        return "it sets neither minAvailable nor maxUnavailable, so it bounds nothing"
+    key = set_keys[0]
+    raw = spec[key]
+    count = _scaled_count(raw, replicas)
+    if count is None:
+        return f"its {key} {_scalar_text(raw)!r} is neither a whole number nor a percentage up to 100%"
+    allowed = max(0, replicas - count) if key == "minAvailable" else min(count, replicas)
+    if allowed < 1:
+        return (
+            f"{key} {raw} over {replicas} replicas allows 0 disruptions, so no node "
+            "running one of its pods can drain"
+        )
+    if allowed >= replicas:
+        return f"{key} {raw} over {replicas} replicas lets every pod be evicted at once, so it protects nothing"
+    return None
+
+
 def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) -> str | None:
     """Why ``files`` (path -> text at the head) fail ``check``, or None."""
     matched = {p: t for p, t in files.items() if any(fnmatch.fnmatchcase(p, g) for g in check.paths)}
     kept = []
     unparsed = []
+    objects: dict[str, Any] = {}
     for path, text in sorted(matched.items()):
         docs, parsed = _documents(path, text)
         if not parsed:
@@ -5504,6 +5774,7 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         for label, doc, doc_text in docs:
             if check.kind and (not isinstance(doc, dict) or doc.get("kind") != check.kind):
                 continue
+            objects[label] = doc
             if check.field:
                 values = _resolve_field(doc, check.field) if isinstance(doc, dict) else []
             else:
@@ -5539,7 +5810,29 @@ def _content_rejection(check: PullRequestContentCheck, files: dict[str, str]) ->
         # the check forbids.
         return hit if check.op == "matches" else (bool(filled) and not hit)
 
-    failing = [label for label, values in kept if not holds(values)]
+    if check.op == "admits_disruption":
+        # The eviction API refuses to evict a pod more than one budget selects,
+        # so two budgets over the workload block every drain however each
+        # reads alone, whatever the quantifier.
+        selecting = [
+            label for label, _ in kept
+            if isinstance(objects[label].get("spec"), dict)
+            and _selector_rejection(
+                objects[label]["spec"].get("selector"), check.pod_labels, empty_selects=True
+            ) is None
+        ]
+        if len(selecting) > 1:
+            return (
+                f"{check.label()}: {', '.join(selecting[:_PR_CONTENT_MAX_NAMED])} all select the workload's "
+                "pods, and the eviction API refuses to evict a pod more than one budget selects"
+            )
+        failing = []
+        for label, _ in kept:
+            why = _pdb_rejection(objects[label], check.replicas or 0, check.pod_labels)
+            if why:
+                failing.append(f"{label} ({why})")
+    else:
+        failing = [label for label, values in kept if not holds(values)]
     if check.quantifier == "any" and len(failing) < len(kept):
         return None
     if check.quantifier == "all" and not failing:
@@ -6856,8 +7149,10 @@ class GitHubWritesVerifier(BaseVerifier):
     with ``pull_request_opened``, and its reply names the URL. Up to
     ``requested_pull_requests`` of the writes whose number that reply names
     are the requested ones and are left out; the lane sets the field to the
-    number of ``pull_request_opened`` and ``pull_request_diff_contains``
-    leaves the case declares. Anything else this repetition wrote is a
+    largest of the number of ``pull_request_opened`` and
+    ``pull_request_diff_contains`` leaves the case declares, the total the
+    case declares under its top-level ``requested_pull_requests`` key, and
+    the lane file's ``requesting:`` entry. Anything else this repetition wrote is a
     write the case did not ask for.
 
     WHOSE WRITE IT IS (#2611). The fan-out runs cases side by side against
@@ -8546,7 +8841,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     reason names the state of each row not in ``state``. With ``not_state``
     instead, passes when no row is in it, for a property a single state cannot
     say: "not dismissed" holds while the install's own nudge moves a queued
-    row to surfaced. Exactly one of the two is set.
+    row to surfaced. Exactly one of the two is set. ``unless_shown``, with
+    ``not_state`` only, also passes a row in ``not_state`` that has a
+    ``first_shown_at``: a paced publisher's message (the nudge's) named it
+    before it was decided, so a decision that reached it is by design. Only a
+    paced publisher sets that field, and only on an undecided row, so a mark
+    the model makes (which raises ``surface_count`` on any row) cannot pass a
+    row. "No row that no message named was dismissed."
 
     A listed row the queue does not hold is ``status="error"``: the case's plant
     is missing, so there is nothing to grade. An unreadable pod or a queue that
@@ -8558,11 +8859,14 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
     finding_ids: list[str] = Field(min_length=1)
     state: FindingState | None = None
     not_state: FindingState | None = None
+    unless_shown: bool = False
 
     @model_validator(mode="after")
     def _one_state(self) -> "FindingsItemStateVerifier":
         if (self.state is None) == (self.not_state is None):
             raise ValueError("set exactly one of state and not_state")
+        if self.unless_shown and self.not_state is None:
+            raise ValueError("unless_shown goes with not_state")
         return self
 
     @field_validator("finding_ids")
@@ -8592,6 +8896,13 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
             )
         if self.not_state is not None:
             hit = {finding_id: states[finding_id] for finding_id in self.finding_ids if states[finding_id] == self.not_state}
+            named: list[str] = []
+            if self.unless_shown:
+                # A row without the field (an older read) counts as never named.
+                shown = {str(row.get("id")): row.get("first_shown_at") for row in read["findings"]}
+                raw["first_shown_at"] = {finding_id: shown.get(finding_id) for finding_id in self.finding_ids}
+                named = [finding_id for finding_id in hit if shown.get(finding_id)]
+                hit = {finding_id: state for finding_id, state in hit.items() if finding_id not in named}
             if hit:
                 return (
                     "fail",
@@ -8600,7 +8911,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
                 )
             return (
                 "pass",
-                f"none of {len(self.finding_ids)} row(s) are {self.not_state}; "
+                f"none of {len(self.finding_ids)} row(s) are {self.not_state}"
+                + (f" but for {len(named)} a message had named" if named else "")
+                + "; "
                 + ", ".join(f"{finding_id} is {state}" for finding_id, state in raw["states"].items()),
                 raw,
             )

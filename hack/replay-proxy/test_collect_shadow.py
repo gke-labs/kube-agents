@@ -49,6 +49,10 @@ class FakeCluster:
         # Copy this many files of the next upload, then fail it.
         self.upload_partial = None
         self.list_pods_fail = False
+        # Pods being deleted: listed with a deletionTimestamp, still running (the preStop drain).
+        self.draining = set()
+        # Pods whose exec fails as a pod deleted mid-copy does.
+        self.gone = set()
         self.calls = []
 
     def add_pod(self, name):
@@ -71,9 +75,12 @@ class FakeCluster:
                     out[os.path.relpath(full, self.bucket)] = handle.read()
         return out
 
-    def __call__(self, cmd, input=None, remaining=None, env=None):
+    def __call__(self, cmd, input=None, remaining=None, env=None, stdin_path=None):
         cmd = list(cmd)
         self.calls.append(cmd)
+        if stdin_path is not None:
+            with open(stdin_path, "rb") as handle:
+                input = handle.read()
         if cmd[0] == "kubectl":
             return self.kubectl(cmd, input)
         if cmd[0] == "gcloud":
@@ -85,12 +92,16 @@ class FakeCluster:
         if "get" in cmd:
             if self.list_pods_fail:
                 return subprocess.CompletedProcess(cmd, 1, b"", b"Unable to connect to the server: dial tcp: i/o timeout")
-            items = [{"metadata": {"name": name}, "status": {"phase": "Running", "containerStatuses": [
-                {"name": CONTAINER, "state": {"running": {}}}]}} for name in sorted(self.pods)]
+            items = [{"metadata": {"name": name, **({"deletionTimestamp": "2026-11-10T06:00:00Z"}
+                                                    if name in self.draining else {})},
+                      "status": {"phase": "Running", "containerStatuses": [
+                          {"name": CONTAINER, "state": {"running": {}}}]}} for name in sorted(self.pods)]
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"items": items}).encode(), b"")
         assert "exec" in cmd, cmd
         pod = cmd[cmd.index("exec") + 1 + (1 if cmd[cmd.index("exec") + 1] == "-i" else 0)]
         assert cmd[cmd.index("-c") + 1] == CONTAINER
+        if pod in self.gone:
+            return subprocess.CompletedProcess(cmd, 1, b"", f'Error from server (NotFound): pods "{pod}" not found'.encode())
         script_args = cmd[cmd.index("--") + 1:]
         assert script_args[:2] == ["python3", "-c"], script_args
         script, args = script_args[2], script_args[3:]
@@ -190,6 +201,16 @@ class OnlyCompleteFilesTest(CollectorTestCase):
         self.collector.collect_pass()
         self.assertEqual(len([c for c in self.cluster.calls if c[0] == "gcloud"]), gcloud_before)
         self.assertEqual(self.size(f"store/blobs/{HEX}.json", pod=other), 0)
+
+    def test_a_draining_pod_is_still_listed_and_emptied(self):
+        other = self.cluster.add_pod("proxy-b")
+        self.cluster.draining.add("proxy-b")
+        self.put("logs/p-2-000001.jsonl", b"last\n", pod=other)
+        self.assertEqual(self.collector.pods(), [C.ProxyPod("proxy-a", False), C.ProxyPod("proxy-b", True)])
+        stats = self.collector.collect_pass()
+        self.assertEqual(stats["pods"], 2)
+        self.assertEqual(self.cluster.objects(), {self.key("logs/p-2-000001.jsonl"): b"last\n"})
+        self.assertEqual(self.size("logs/p-2-000001.jsonl", pod=other), 0)
 
 
 class TruncateOnlyAfterUploadTest(CollectorTestCase):
@@ -464,6 +485,9 @@ FAKE_KUBECTL = """\
 import json, os, subprocess, sys
 args = sys.argv[1:]
 pod_dir = os.environ["FAKE_POD_DIR"]
+if "get" in args and os.environ.get("FAKE_NO_PODS"):
+    print(json.dumps({{"items": []}}))
+    sys.exit(0)
 if "get" in args:
     print(json.dumps({{"items": [{{"metadata": {{"name": "proxy-a"}}, "status": {{"phase": "Running",
         "containerStatuses": [{{"name": "{container}", "state": {{"running": {{}}}}}}]}}}}]}}))
@@ -495,6 +519,277 @@ else:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copyfile(args[-2], dst)
 """
+
+
+POD_NAME = "proxy-a"
+CACHE = C.DEFAULT_CACHE_SUBDIR
+
+
+def fp(n):
+    return f"{n:064x}"
+
+
+class RecordModeTest(CollectorTestCase):
+    """Record mode copies saved answers to the kept copy, empties them in the pod, never uploads them."""
+
+    def setUp(self):
+        super().setUp()
+        self.keep = os.path.join(self.root, "keep")
+        self.publishes = []
+        self.collector.mode = C.MODE_RECORD
+        self.collector.keep_dir = self.keep
+        self.collector.publisher = self
+        self.collector.publish_interval = 300
+        self.collector.publish_in_background = False
+
+    def publish(self, final=False):
+        self.publishes.append((self.now, final))
+
+    def cache(self, rel, data):
+        path = os.path.join(self.pod, CACHE, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def kept(self, rel):
+        return os.path.join(self.keep, "pods", POD_NAME, "cache", rel)
+
+    def test_answers_are_kept_on_this_machine_and_emptied_in_the_pod(self):
+        answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
+        variant = self.cache(f"variants/{fp(2)}/{'a' * 16}.json", b"")
+        self.collector.collect_pass()
+        with open(self.kept(f"answers/{fp(1)}.json"), "rb") as handle:
+            self.assertEqual(handle.read(), b'{"answer": 1}')
+        self.assertTrue(os.path.isfile(self.kept(f"variants/{fp(2)}/{'a' * 16}.json")), "an empty variant is kept")
+        self.assertEqual(os.path.getsize(answer), 0, "emptied, so its name still says the key was written")
+        self.assertTrue(os.path.exists(variant))
+        self.assertFalse(any(CACHE in name or "answers" in name for name in self.cluster.objects()),
+                         "the cache never goes to the shadow bucket")
+        fetches = sum(1 for c in self.cluster.calls if "exec" in c and C.TAR_SCRIPT in c)
+        self.collector.collect_pass()
+        self.assertEqual(sum(1 for c in self.cluster.calls if "exec" in c and C.TAR_SCRIPT in c), fetches,
+                         "a kept file is not fetched again")
+
+    def test_lines_and_stored_requests_are_kept_beside_their_upload(self):
+        self.put("logs/seg-1.jsonl", b'{"line": 1}\n')
+        self.put(f"store/requests/{HEX}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(self.keep, "pods", POD_NAME, "logs", "seg-1.jsonl")))
+        self.assertTrue(os.path.isfile(os.path.join(self.keep, "store", "requests", f"{HEX}.json")))
+        self.assertIn(self.key("logs/seg-1.jsonl"), self.cluster.objects())
+
+    def test_a_name_outside_the_cache_layout_is_neither_copied_nor_emptied(self):
+        odd = self.cache("answers/not-a-key.json", b"x")
+        self.collector.collect_pass()
+        self.assertEqual(os.path.getsize(odd), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.keep, "pods", POD_NAME, "cache", "answers", "not-a-key.json")))
+
+    def test_publishes_on_its_interval_and_always_in_the_last_pass(self):
+        self.collector.collect_pass()
+        self.now = 100.0
+        self.collector.collect_pass()
+        self.now = 301.0
+        self.collector.collect_pass()
+        self.now = 302.0
+        self.collector.deadline = 1000.0
+        self.collector.collect_pass(final=True)
+        self.assertEqual(self.publishes, [(0.0, False), (301.0, False), (302.0, True)])
+
+    def test_an_ordinary_publish_runs_beside_collection_and_the_last_waits_for_it(self):
+        import threading
+        release, started, finished, order = threading.Event(), threading.Event(), threading.Event(), []
+
+        class Slow:
+            def publish(inner, final=False):
+                order.append(("publish", final))
+                if not final:
+                    started.set()
+                    release.wait(10)
+                    finished.set()
+
+        self.collector.publisher = Slow()
+        self.collector.publish_in_background = True
+        answer = self.cache(f"answers/{fp(1)}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertFalse(finished.is_set(), "the pass returned while the publish still ran")
+        self.assertTrue(started.wait(5))
+        self.assertEqual(os.path.getsize(answer), 0, "the pod was emptied while the publish still ran")
+        self.collector.deadline = 1000.0
+        threading.Timer(0.2, release.set).start()
+        self.collector.collect_pass(final=True)
+        self.assertEqual(order, [("publish", False), ("publish", True)])
+
+    def test_a_publish_still_running_at_the_deadline_skips_the_last_one_and_never_hangs(self):
+        import threading
+        release, started, order = threading.Event(), threading.Event(), []
+        self.addCleanup(release.set)
+
+        class Stuck:
+            def publish(inner, final=False):
+                order.append(final)
+                if not final:
+                    started.set()
+                    release.wait(30)
+
+        self.collector.publisher = Stuck()
+        self.collector.publish_in_background = True
+        self.collector.collect_pass()
+        self.assertTrue(started.wait(5))
+        self.collector.deadline = self.now + 0.3
+        began = time.monotonic()
+        self.collector.collect_pass(final=True)
+        self.assertLess(time.monotonic() - began, 10, "the last pass waits no longer than the deadline")
+        self.assertEqual(order, [False], "no last publish beside one still running")
+        self.assertEqual(self.collector.totals.errors.get("publish_overran"), 1)
+        self.assertIn("publish_overran", self.out.getvalue())
+
+    def test_keep_writes_never_leave_a_partial_file_under_its_name(self):
+        answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
+        self.put("logs/seg-1.jsonl", b'{"line": 1}\n')
+        written = []
+        original = C.shutil.copyfile
+        C.shutil.copyfile = lambda src, dst, *a, **k: written.append(dst) or original(src, dst, *a, **k)
+        self.addCleanup(setattr, C.shutil, "copyfile", original)
+        self.collector.collect_pass()
+        kept = [d for d in written if d.startswith(self.keep)]
+        self.assertTrue(kept)
+        self.assertTrue(all(d.endswith(".tmp") for d in kept), "a reader never sees a kept file half written")
+        cache = os.path.join(self.keep, "pods", POD_NAME, "cache", "answers")
+        self.assertEqual(os.listdir(cache), [f"{fp(1)}.json"], "no temporary file left beside it")
+
+    def test_shadow_mode_copies_no_answers(self):
+        self.collector.mode = C.MODE_SHADOW
+        answer = self.cache(f"answers/{fp(1)}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertEqual(os.path.getsize(answer), 2)
+        self.assertFalse(os.path.exists(self.keep + "/pods"))
+
+
+class ReplayModeTest(CollectorTestCase):
+    """Replay mode seeds every pod that has not got the cache, and the last pass writes the lane's report."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed_dir = os.path.join(self.root, "seed")
+        for rel, data in ((f"answers/{fp(1)}.json", b'{"a": 1}'), (f"variants/{fp(2)}/{'b' * 16}.json", b""),
+                          ("answers/stray.txt", b"no")):
+            path = os.path.join(self.seed_dir, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        self.collector.mode = C.MODE_REPLAY
+        self.collector.keep_dir = os.path.join(self.root, "keep")
+        self.collector.seed_dir = self.seed_dir
+
+    def seeds(self):
+        return sum(1 for c in self.cluster.calls if "exec" in c and C.SEED_SCRIPT in c)
+
+    def test_an_unseeded_pod_is_seeded_once_with_only_the_cache_layout(self):
+        self.collector.collect_pass()
+        base = os.path.join(self.pod, CACHE)
+        with open(os.path.join(base, "answers", f"{fp(1)}.json"), "rb") as handle:
+            self.assertEqual(handle.read(), b'{"a": 1}')
+        self.assertTrue(os.path.isfile(os.path.join(base, "variants", fp(2), f"{'b' * 16}.json")))
+        self.assertFalse(os.path.exists(os.path.join(base, "answers", "stray.txt")))
+        with open(os.path.join(base, C.CACHE_SEED_MARKER)) as handle:
+            self.assertEqual(handle.read(), "2")
+        self.collector.collect_pass()
+        self.assertEqual(self.seeds(), 1, "a seeded pod is not seeded again")
+
+    def test_a_pod_that_replaced_one_is_seeded_too(self):
+        self.collector.collect_pass()
+        other = self.cluster.add_pod("proxy-b")
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(other, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.seeds(), 2)
+
+    def test_seed_script_writes_no_member_outside_the_layout(self):
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as tar:
+            for name in ("../escape.json", f"answers/{fp(1)}.json", f"answers/../../{fp(1)}.json"):
+                info = tarfile.TarInfo(name)
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+        proc = subprocess.run([sys.executable, "-c", C.SEED_SCRIPT, self.pod, CACHE, C.CACHE_SEED_MARKER,
+                               C.CACHE_REL_RE.pattern], input=stream.getvalue(), capture_output=True)
+        self.assertEqual(proc.stdout.strip(), b"1")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "escape.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "pods", f"{fp(1)}.json")))
+
+    def test_seed_all_reports_how_many_pods_took_it(self):
+        self.cluster.add_pod("proxy-b")
+        self.assertEqual(self.collector.seed_all(), (2, 2))
+
+    def test_seed_once_skips_a_draining_pod_and_counts_only_live_ones(self):
+        # The old pod of a rollout: listed while it drains, gone before its copy ends.
+        old = self.cluster.add_pod("proxy-old")
+        self.cluster.draining.add("proxy-old")
+        self.cluster.gone.add("proxy-old")
+        self.assertEqual(self.collector.seed_all(), (1, 1))
+        self.assertFalse(os.path.exists(os.path.join(old, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.collector.totals.errors, {})
+        self.assertIn('"event": "seed_skipped_draining", "pods": 1', self.out.getvalue())
+
+    def test_a_pod_deleted_during_its_seed_leaves_both_counts(self):
+        # Live when listed, evicted while its copy ran: gone, not a refusal.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        seed = self.collector.seed
+
+        def seed_then_delete(pod):
+            took = seed(pod)
+            if not took:
+                del self.cluster.pods[pod]
+            return took
+
+        self.collector.seed = seed_then_delete
+        self.assertEqual(self.collector.seed_all(), (1, 1))
+        self.assertIn('"event": "seed_skipped_vanished", "pods": 1', self.out.getvalue())
+
+    def test_a_failed_relisting_counts_every_failed_seed_as_a_refusal(self):
+        # The API server stops answering after proxy-a took the cache: proxy-b's
+        # seed fails and so does the listing that would show whether it went.
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        seed = self.collector.seed
+
+        def seed_then_lose_the_api(pod):
+            took = seed(pod)
+            self.cluster.list_pods_fail = not took
+            return took
+
+        self.collector.seed = seed_then_lose_the_api
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
+
+    def test_a_live_pod_that_refused_its_seed_still_counts(self):
+        self.cluster.add_pod("proxy-b")
+        self.cluster.gone.add("proxy-b")
+        self.assertEqual(self.collector.seed_all(), (2, 1))
+        self.assertNotIn("seed_skipped_vanished", self.out.getvalue())
+
+    def test_a_pass_seeds_no_draining_pod_but_collects_its_lines(self):
+        old = self.cluster.add_pod("proxy-old")
+        self.cluster.draining.add("proxy-old")
+        self.put("logs/p-2-000001.jsonl", b"last\n", pod=old)
+        self.collector.collect_pass()
+        self.assertFalse(os.path.exists(os.path.join(old, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertTrue(os.path.isfile(os.path.join(self.pod, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.seeds(), 1)
+        self.assertIn(self.key("logs/p-2-000001.jsonl"), self.cluster.objects())
+
+    def test_the_last_pass_uploads_the_lane_report_under_report(self):
+        def report(out_dir):
+            with open(os.path.join(out_dir, "verdicts.json"), "w") as handle:
+                handle.write("{}")
+            return "case-a: lane 3/3"
+
+        self.collector.lane_report = report
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertIn(self.key("report/verdicts.json"), self.cluster.objects())
+        self.assertIn("case-a: lane 3/3", self.out.getvalue())
 
 
 class ProcessTest(unittest.TestCase):
@@ -591,6 +886,19 @@ class ProcessTest(unittest.TestCase):
         parent.wait()
         out, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 0, err)
+
+    def test_seed_once_fails_on_bad_arguments_and_without_pods(self):
+        bad = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--seed-once"],
+                             env=self.env, capture_output=True, timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(bad.returncode, 1)
+        seed = os.path.join(self.root, "seed")
+        os.makedirs(seed)
+        none = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--namespace", NAMESPACE,
+                               "--selector", SELECTOR, "--container", CONTAINER, "--bucket", BUCKET, "--kind",
+                               "replay-lane", "--build", "123", "--mode", "replay", "--keep-dir", self.root,
+                               "--seed-dir", seed, "--seed-once"],
+                              env=dict(self.env, FAKE_NO_PODS="1"), capture_output=True, timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(none.returncode, 1, none.stdout)
 
     def test_a_build_or_bucket_that_could_make_a_dot_segment_is_refused(self):
         base = ["--namespace", NAMESPACE, "--selector", SELECTOR, "--container", CONTAINER, "--kind", "presubmit"]

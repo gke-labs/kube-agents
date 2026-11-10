@@ -657,9 +657,12 @@ type EventWatcherSpec struct {
 	// The watcher counts what the rules hold back in
 	// k8s_event_watcher_events_filtered_total{gate="alert_excluded"}, and the
 	// end-of-day recap states how many events and workloads they held back and
-	// names the noisiest workloads. A change rolls the gateway pod. When
-	// this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
-	// spec.deployment.env.
+	// names the noisiest workloads. A change is in force within about two
+	// minutes, without a pod restart: the operator writes the list to a
+	// ConfigMap that the watcher reads again every minute. If the agent image
+	// is older than the operator, a change applies at the next pod restart.
+	// When this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
+	// spec.deployment.env; a move between the two rolls the pod once.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=64
 	// +optional
@@ -924,6 +927,23 @@ type TuningSpec struct {
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
 
+	// Admission is the memory admission the kanban dispatcher applies to its own
+	// workers, board-wide like MaxInProgress: the pod memory budget it classifies
+	// pressure against, the resident-memory cap one running worker may reach, how
+	// long a ready card may wait on memory or a full board before it is refused, and
+	// what a tick does when it cannot read memory at all. Past the budget the
+	// dispatcher refuses rather than spawns: the card is blocked with kind
+	// "capacity" and a reason that names the figures, so the thread that filed it is
+	// told it is throttled instead of losing the worker to an eviction. Unset, every
+	// field takes the operator's default, and the budget is the agent container's
+	// memory request (spec.deployment.resources, 4Gi unless set).
+	//
+	// The block is rendered into the managed scope whatever this field says, so the
+	// dispatcher never runs without one: an install that sets nothing runs the
+	// defaults, and removing a field here puts its default back.
+	// +optional
+	Admission *AdmissionSpec `json:"admission,omitempty"`
+
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
 	// It only means something under mode: next - a today install renders neither
 	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
@@ -1107,6 +1127,101 @@ const (
 	DefaultProfileAcceptTimeoutSeconds   = 10
 	DefaultProfileMaxTaskDeadlineSeconds = 21600
 )
+
+// AdmissionSpec is the memory admission the kanban dispatcher applies to its own
+// workers. The operator renders the four values as kanban.admission.* in the
+// managed scope, defaults applied, on every install.
+//
+// It exists because the pod's own limits do not protect it. The agent container
+// runs under GKE Sandbox, where the kernel the container sees reports the
+// sandbox's virtual memory rather than the cgroup's, so Hermes' upstream
+// memory guard, which reads /proc/meminfo, never fires there. And the kubelet
+// evicts a pod under node pressure once its usage passes its memory REQUEST,
+// long before the limit would stop it: the gateway pod was evicted three times
+// at 3.1 to 3.5 GiB against the 2Gi request it had then. The dispatcher therefore reads the
+// container's working set and counts it against a budget sized from the
+// request, which is what makes its guard fire before the eviction does.
+type AdmissionSpec struct {
+	// MemoryBudgetMiB is the pod memory budget, in MiB, the dispatcher
+	// classifies memory pressure against before it spawns a worker: on every
+	// tick it reads the container's working set (its cgroup memory usage less
+	// the inactive file cache, the figure the kubelet evicts on) and counts it
+	// against this figure. Absent means the agent container's resolved memory request
+	// in MiB (4096 at the operator's default resources), so a CR that raises
+	// the request raises the budget with it.
+	//
+	// Two bounds act on the budget. Each tick admits one new worker per
+	// 512 MiB of headroom under it, so with the container's working set at W
+	// the tick spawns at most (budget - W) / 512 workers and none once the
+	// headroom is under 512 MiB; and Hermes' own classification
+	// (gateway/memory_status.py) permits at most one worker with less than
+	// 15% of the budget, or 128 MiB, left and none with less than 5%, or
+	// 64 MiB. At the default budget the headroom bound acts first. A budget
+	// under the container's idle working set plus 512 MiB therefore admits
+	// no worker and refuses every card after QueueBoundSeconds; the schema's
+	// minimum of 512 is left there for a test install that wants exactly
+	// that, and a derived budget under it is clamped to it. A card the tick
+	// cannot spawn waits, and is refused after QueueBoundSeconds. Set the
+	// budget below the request to keep headroom for the gateway's own growth,
+	// or above it, up to the limit, on a node pool where eviction is not the
+	// risk; past the limit the OOM killer, not this budget, is what stops a
+	// worker.
+	// +kubebuilder:validation:Minimum=512
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	MemoryBudgetMiB *int32 `json:"memoryBudgetMiB,omitempty"`
+
+	// WorkerRssCapMiB is the most resident memory, in MiB, one running
+	// worker's process tree may hold: the worker and every descendant, its MCP
+	// proxies included. A worker past it is stopped (SIGTERM, a grace period,
+	// then SIGKILL) and its card is blocked with kind "capacity" and a reason
+	// that names the figure and the cap, so the thread that filed it is told.
+	// Absent means 1536.
+	//
+	// The default is three and a half times the 430 MiB a worker measured on
+	// a live install: a fleet-wide audit that holds a large listing fits, and
+	// one worker cannot take the whole of the default budget by itself. A
+	// worker stopped here has done nothing a retry would fix; the reason it
+	// leaves on the card offers a smaller scope instead.
+	// +kubebuilder:validation:Minimum=256
+	// +kubebuilder:validation:Maximum=65536
+	// +optional
+	WorkerRssCapMiB *int32 `json:"workerRssCapMiB,omitempty"`
+
+	// QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
+	// that could not spawn it because of memory pressure or an exhausted slot
+	// budget, before it is blocked with kind "capacity" instead of left in the
+	// queue. A card that waits for another reason is not touched: one that is
+	// unassigned, not spawnable, held by the respawn guard, by a per-profile
+	// cap or by the per-class slot reservation stays ready, and so does a child
+	// of a request already running (a fan-out's per-cluster cards), whose wait
+	// belongs to the coordinator the thread is subscribed to. Absent means 600.
+	//
+	// Ten minutes is 120 ticks at the 5s dispatch interval. On a board busy
+	// with other work a card waits minutes for a slot in ordinary operation:
+	// the presubmit install showed two to four while memory was healthy, and a
+	// two-minute bound refused eighteen ordinary cards in one run. The thread
+	// has read the queued line since the first wait; ten minutes is past any
+	// answer it was still waiting for, and a strategy change serves it better.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	QueueBoundSeconds *int32 `json:"queueBoundSeconds,omitempty"`
+
+	// FailClosed is what a tick does when it cannot read the memory counters
+	// at all: true spawns nothing on that tick and logs why; false keeps
+	// Hermes' upstream behaviour, where an unreadable sample imposes no
+	// restriction. Absent means true.
+	//
+	// Closed is the default because the counters go unreadable on exactly the
+	// installs the budget exists for: a sandbox runtime that hides the cgroup
+	// files is also the one that hides the pressure, and an open tick there
+	// spawns into the eviction the budget was meant to prevent. Set it false
+	// only to diagnose a dispatcher that spawns nothing and logs the read
+	// failure.
+	// +optional
+	FailClosed *bool `json:"failClosed,omitempty"`
+}
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the
@@ -1306,6 +1421,8 @@ type DeploymentSpec struct {
 	Availability *AvailabilitySpec `json:"availability,omitempty"`
 
 	// Resources specifies resource requests and limits for the main container.
+	// The memory request is also the dispatcher's default admission budget
+	// (spec.harness.tuning.admission.memoryBudgetMiB).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
@@ -1440,7 +1557,13 @@ type CredentialProxyExecSpec struct {
 	// positive count the shell sandbox, the profile workers and the session
 	// pods under the cluster view are given the tier's address for /v1/exec
 	// and /v1/gcp/. Each replica requests and is limited to 2 CPU and 2Gi of
-	// memory, with no override. A change between 0 and a positive value
+	// memory, with no override, so each one needs a node with that much free,
+	// and the pods that turning the tier on restarts (below) need room to start
+	// again. A replica that cannot be scheduled shows in the
+	// CredentialProxyExecReady condition (reason Unschedulable, with the
+	// scheduler's message), and callers that cannot reach the tier fall back to
+	// the stateful broker.
+	// A change between 0 and a positive value
 	// restarts the shell sandbox, the profile warm pools, and under the
 	// cluster view the A2A gateway, which read the tier's address when they
 	// start; a change between two positive values rewrites the count the pods
@@ -1773,6 +1896,18 @@ type SecuritySpec struct {
 	// Ignored for any other egressPolicy value.
 	// +optional
 	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+
+	// DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+	// reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+	//
+	// True omits `secrets` from the ClusterRole.
+	// False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+	// strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+	// Absent (nil) grants `secrets` on a new install where the ClusterRole does
+	// not exist yet (when the operator holds `list` and `watch` on `secrets`).
+	// On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+	// +optional
+	DisallowSecretsRead *bool `json:"disallowSecretsRead,omitempty"`
 }
 
 // WorkloadIdentityFederationSpec names the pool the proxy federates through and

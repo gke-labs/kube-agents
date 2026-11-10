@@ -370,6 +370,10 @@ type Gateway struct {
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
+	// relayPrecreated is Config.RelayPrecreated, for the default durable
+	// only: a live test's own durable (Options.RelayDurable) isn't one the
+	// provision Job made, so that relay still creates it.
+	relayPrecreated bool
 	// relayBound is set once the event relay has bound; Readiness answers
 	// from it. relayHeldBack is set while a start after a crash holds the
 	// bind back (RunOptions.RelayBindDelay), so Readiness names that wait
@@ -609,6 +613,7 @@ func New(o Options) (*Gateway, error) {
 		a2aGoogleAllowed: a2aGoogleAllowed,
 		droppedNotices:   map[string]bool{},
 		relayDurable:     o.RelayDurable,
+		relayPrecreated:  o.Config.RelayPrecreated && o.RelayDurable == relayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -719,11 +724,12 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 	// Both task-event subjects, one durable: the executors' events and the
 	// terminals this gateway synthesizes as supervisor, which it relays to
 	// the requester and retires the task on exactly like an executor's own.
-	// Two filter subjects put the filter in the request body, which the
-	// gateway's unscoped consumer-create grant permits and a session's
-	// pinned grant would not; the durable already exists on every install
-	// with the single filter, and rebinding it to the pair is an update the
-	// server accepts (lib's rebind test).
+	// On a deployed install the provision Job creates this durable with
+	// both filters, and the gateway binds it with Precreated and never
+	// creates it (#4173). A live test's own durable, and a gateway run
+	// without the operator, still creates it: two filter subjects put the
+	// filter in the request body, and rebinding a single-filter durable to
+	// the pair is an update the server accepts (lib's rebind test).
 	agreement := SupervisorAgreement(g.cfg)
 	// WaitForStream: the provision Job creates TASKS, and on a three-server
 	// bus that can trail the gateway's start by more than lib's bind window.
@@ -738,6 +744,7 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 		Agreement:     &agreement,
 		MaxAckPending: relayMaxAckPending,
 		WaitForStream: true,
+		Precreated:    g.relayPrecreated,
 	}
 }
 
@@ -1298,7 +1305,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// Post-flip, every conversation is a session already, so
 		// "/session <text>" is <text>: the ordinary turn it would have been
 		// without the prefix, not a confirmation that drops the ask.
-		msg.Text, sessionCmd = sessionRest, false
+		msg, sessionCmd = wordsAfter(msg, sessionRest), false
 	}
 	// The bare "/feedback" and "/feedback summary" are answered in place
 	// whatever the conversation's route or task state; any other text after
@@ -1507,7 +1514,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
-			msg.Text = rest
+			msg = wordsAfter(msg, rest)
 		} else if rec.SessionRouted {
 			// A new task on the session route goes to the conversation's
 			// live pod when it can take it, and to a fresh incarnation
@@ -1560,6 +1567,53 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+	}
+}
+
+// agentText is the text a turn puts to an agent: the quoted ask the adapter
+// composed beside the member's words, when the message quoted one
+// (InboundMessage.Quoted), and the words otherwise. It is read at the two
+// sinks a turn's text leaves through, startTask and steerTask, and nowhere
+// before: every matcher routeTurn and sessionCommand run on the way there
+// reads Text, the words as typed, so a quote-reply "stop" on a running task
+// stops it, a quote-reply status ask is answered as one where routeTurn
+// answers a status ask at all (a running task; a DM's top level with none),
+// and a bare "delegate" stays the one word IsDelegate refuses; whatever
+// those matchers hand to an agent carries the quote, the same words
+// elsewhere ("status" in a space with nothing running) included. A bare
+// quote has empty Text and a Quoted ask, and no matcher reads "" as its
+// command, so it reaches an agent whole.
+func agentText(msg InboundMessage) string {
+	if msg.Quoted != "" {
+		return msg.Quoted
+	}
+	return msg.Text
+}
+
+// wordsAfter is the turn with rest, what a matcher left of the member's
+// words after taking its command word off them ("/session <text>" is
+// <text>, "delegate <task>" is <task>), in Text's place. A quoted ask opens
+// with the words as typed (InboundMessage.Quoted, "the member's words
+// followed by the message they quoted"), so the command word comes off its
+// head the same way and an agent reads the task and the quote, not the
+// command. A turn with no quote is the rest alone.
+func wordsAfter(msg InboundMessage, rest string) InboundMessage {
+	if msg.Quoted != "" && strings.HasPrefix(msg.Quoted, msg.Text) {
+		msg.Quoted = rest + strings.TrimPrefix(msg.Quoted, msg.Text)
+	}
+	msg.Text = rest
+	return msg
+}
+
+// noteUnreadQuote posts the one line a member is owed when the message they
+// quoted could not be read (InboundMessage.QuotedUnread), in the
+// conversation, ahead of the turn that now reads their words alone. It runs
+// at the two sinks that hand words to an agent, startTask and steerTask,
+// and nowhere else: a "stop" or a status ask the router answers itself never
+// needed the quote, so no line says it was not read.
+func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
+	if msg.QuotedUnread {
+		g.post(conversation, gchatQuotedUnreadWords)
 	}
 }
 
@@ -2144,6 +2198,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 		}
 		state.Usage, state.ChildUsage, state.UsagePartial = g.chainUsage(ctx, rec, taskID, read, readTask)
 	}
+	state.ChildAddressees = chainChildAddressees(rec, taskID)
 	// A session turn whose request minted no child: its own completed is
 	// the hand-off line, and the observers were told the root failed with
 	// the reason (observeEnded). Report the same, by the same rule, on a
@@ -2221,6 +2276,28 @@ func (g *Gateway) chainUsage(ctx context.Context, rec *SessionRecord, taskID, re
 		}
 	}
 	return usageSum(frontTurns), usageSum(childTurns), partial
+}
+
+// chainChildAddressees is whom the delegation chain rooted at taskID's root
+// delegated to: the addressee each child task was minted for (the profile the
+// delegation resolved to, which for a cluster target may be a pinned
+// profile's own name, or platform), once each, in the record's order, which is the order
+// they were delegated. Empty, not nil, when the chain delegated nothing, so
+// the wire tells "none" from "unknown"; nil only when taskID is unknown.
+func chainChildAddressees(rec *SessionRecord, taskID string) []string {
+	ref, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return nil
+	}
+	root := ref.rootID()
+	out := []string{}
+	for _, t := range rec.Tasks {
+		if t.Role != taskRoleChild || t.rootID() != root || t.Addressee == "" || slices.Contains(out, t.Addressee) {
+			continue
+		}
+		out = append(out, t.Addressee)
+	}
+	return out
 }
 
 // usageSum is turns folded by lib.UsageTotal, or nil when there are none.
@@ -2381,14 +2458,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
 		// a plain message would have been, a steer into that task.
-		msg.Text = rest
+		msg = wordsAfter(msg, rest)
 		g.steerTask(ctx, rec, msg, backend, authority)
 		return true
 	case running:
 		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
 		return true
 	}
-	msg.Text = rest
+	msg = wordsAfter(msg, rest)
 	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
@@ -2884,9 +2961,10 @@ type taskStart struct {
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
+	g.noteUnreadQuote(rec.Key, msg)
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
-		Text:      msg.Text,
+		Text:      agentText(msg),
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
@@ -3220,7 +3298,8 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
-	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
+	g.noteUnreadQuote(rec.Key, msg)
+	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
 		return

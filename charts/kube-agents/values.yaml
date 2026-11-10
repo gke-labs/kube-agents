@@ -419,6 +419,30 @@ litellm:
     # the caller drops the stream and never sees the 429. The render refuses a
     # pair whose hold plus 60s for the first chunk crosses that bound.
     retryAfterSeconds: 0
+  # A spend ceiling at the gateway, off by default. budget.usd is the most the
+  # gateway spends, in US dollars as LiteLLM's cost map prices each response,
+  # in every window of budget.period (LiteLLM's duration syntax: a whole
+  # number and s, m, h, d, w or mo). On, at least 0.01: a smaller amount splits
+  # into shares the render refuses, so the schema, the installer and the
+  # Terraform example refuse it first. Above 0 it renders
+  # router_settings.provider_budget_config for the model's provider, with the
+  # ceiling split evenly across replicaCount: LiteLLM counts spend per gateway
+  # process (the chart runs no Redis), so each replica holds one share. A
+  # replica whose share is spent refuses every model call until its window
+  # ends ("No deployments available - crossed budget"), and its
+  # litellm_provider_remaining_budget_metric gauge (the share less the spend)
+  # reads at or below 0. The bound is loose by the calls in flight when a
+  # share is crossed, which complete and are charged, and by the surge pod of
+  # a rolling update; a gateway restart or rollout starts that pod's count
+  # over, and a process's first window starts when the pod starts. A model
+  # LiteLLM's cost map does not price costs 0
+  # and never reaches the ceiling. 0 leaves the key out, so the rendered
+  # config and its rollout checksum are what they were. What the agent sees,
+  # and how to read the gauge: the site's inference-gateway page, "Setting a
+  # spend ceiling". Chart-only; the kustomize dev base carries no such key.
+  budget:
+    usd: 0
+    period: "1d"
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity by default (or a service-account key Secret when
@@ -702,10 +726,22 @@ litellm:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
+    # What the proxy does with answers (hack/replay-proxy/README.md, "Modes").
+    # shadow, the default, saves and serves nothing. record also saves each
+    # answer under cacheDir, for a trusted nightly (job.kind nightly) to
+    # publish. replay serves saved answers instead of calling the model, for
+    # the replay lane (job.kind replay-lane) only, and needs allowServe: true
+    # as well; the schema refuses either of those two without the other, so
+    # one value set by mistake can't serve an answer. hack/ci-env.sh decides
+    # the mode (resolve_replay_shadow). cacheDir is one directory in the data
+    # volume, beside the proxy's logs/ and store/.
+    mode: shadow
+    cacheDir: /data/replay-cache
+    allowServe: false
     # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
-    # nightly-untrusted or presubmit (hack/ci-env.sh, resolve_replay_shadow),
-    # and is required when the proxy is on: an untagged line counts in no
-    # estimate.
+    # nightly-untrusted, presubmit or replay-lane (hack/ci-env.sh,
+    # resolve_replay_shadow), and is required when the proxy is on: an
+    # untagged line counts in no estimate.
     job:
       kind: ""
       project: ""
@@ -1095,11 +1131,13 @@ platformAgent:
     # clusterName required), namespace, reason, kind and name (a trailing *
     # is a prefix), and matches when every part it sets matches; an event is
     # excluded when any rule matches. At most 64 rules. Empty omits the block.
-    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
-    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
-    # removes the CR's whole eventWatcher block, so an enabled: false set there
-    # with kubectl patch is lost too; set it again afterwards. The watcher's
-    # tuning settings are under platformAgent.deployment.eventWatcher.
+    # A change is in force within about two minutes, without a pod restart
+    # (at the next pod restart if the agent image is older than the operator).
+    # See spec.harness.eventWatcher in the PlatformAgent CRD reference.
+    # Removing the last rule through helm upgrade removes the CR's whole
+    # eventWatcher block, so an enabled: false set there with kubectl patch is
+    # lost too; set it again afterwards. The watcher's tuning settings are
+    # under platformAgent.deployment.eventWatcher.
     eventWatcher:
       alertExclude: []
         # - namespace: payments
@@ -1206,6 +1244,18 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # admission is the memory admission the kanban dispatcher applies to its
+      # own workers, board-wide: past the budget it refuses a card rather than
+      # spawn a worker, blocking the card with kind "capacity" and telling its
+      # thread. memoryBudgetMiB defaults to the agent container's memory request
+      # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
+      # queueBoundSeconds to 600 and failClosed to true; the operator renders
+      # the block with those defaults when nothing is set here.
+      # admission:
+      #   memoryBudgetMiB: 3072
+      #   workerRssCapMiB: 1536
+      #   queueBoundSeconds: 600
+      #   failClosed: true
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,
       # 6 unless set), childReserve the share of it kept for child tasks (default
@@ -1580,6 +1630,15 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+    # Omit core `secrets` (`get`, `list`, `watch`) from the reader ClusterRole
+    # (`kubeagents:minimal:<ns>:<name>`).
+    # - `null` (unset): new installs grant `secrets` read access (`<name>-kube-proxy`
+    #   strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+    #   Existing installs keep the `secrets` permission their ClusterRole already holds.
+    # - `true`: omit `secrets` from the reader ClusterRole.
+    # - `false`: grant `secrets` on the reader ClusterRole, including on upgraded
+    #   existing installs.
+    disallowSecretsRead: null
   # The GCP projects, folders, organisations, Shared VPC hosts and Metrics
   # Scopes, beyond the project the agent runs in, whose GKE clusters the hourly
   # Cluster Agent reconcile enumerates, and what it leaves unmanaged: rendered
@@ -1631,6 +1690,11 @@ platformAgent:
   #         - projectId: payments-staging
   #           location: us-central1
   #           clusterName: scratch-cluster
+  # An excluded cluster is left out of what the agents look at, but that is not
+  # yet enforced: the agent's read roles still reach it, so a worker that
+  # fetches its credentials itself can read it. Only a project where the agent
+  # holds no roles, bound there or through a folder or organization, keeps it
+  # off a cluster; the management project always holds them.
   scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the

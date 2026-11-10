@@ -590,7 +590,7 @@ def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None, olde
 
 def infra_issue_part(issue: dict) -> str:
     """The part an open kept-case issue names: the part of the job its body
-    names (main-b or writers), else main."""
+    names (one of ``nightly.PART_JOBS``), else main."""
     body = issue.get("body") or ""
     return next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body), nightly.PART_MAIN)
 
