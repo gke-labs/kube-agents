@@ -1080,15 +1080,15 @@ class Normalizer:
         """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so).
 
         In an assistant message (in_answer), the values bound so far are first
-        swapped as Mapping.apply_to_answer swaps them beyond the identifier
-        patterns: a bound commit as a bare run of hex, and a bound value as a
-        whole token outside its pattern (`clone-<tmpname>`). A served answer
-        comes back in the next request's history with this run's values where
-        the recording had its own, so both must key the same. Before the
-        identifier patterns, which would bind part of such a token afresh (the
-        uuid of `old_<operation>`); after the age columns, which read positions.
-        It binds nothing, and a value it swaps in a pattern's shape is the
-        placeholder that pattern would have given it.
+        swapped as Mapping.apply_to_answer swaps them, in its order: identifiers
+        already bound, then a bound commit as a bare run of hex, then a bound
+        value as a whole token outside its pattern (`clone-<tmpname>`). A served
+        answer comes back in the next request's history with this run's values
+        where the recording had its own, so both must key the same. Before the
+        binding identifier pass, which would bind part of such a token afresh
+        (the uuid of `old_<operation>`); after the age columns, which read
+        positions. It binds nothing; a value it swaps is the placeholder the
+        binding pass would have given it.
         """
         text = warnings_last(text)
         nested = self.nested_json(text)
@@ -1099,6 +1099,11 @@ class Normalizer:
             text = strip_recent_work(text)
         text = self.age_columns(text)
         if self.in_answer:
+            # Mapping.apply_to_answer's order: identifiers already bound first
+            # (looked up, never bound here), then the bare-commit and whole-token
+            # swaps, so a commit equal to one segment of a bound uuid never splits it.
+            for cls, pattern, group in ID_CLASSES:
+                text = self.sub_group(pattern, group, lambda v: self.mapping.bound(v) or v, text)
             text = self.mapping.swap_whole_tokens(self.mapping.swap_bare_commits(text))
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)

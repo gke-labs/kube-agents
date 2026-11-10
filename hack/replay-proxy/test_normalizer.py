@@ -1049,6 +1049,14 @@ class HistorySwapTest(unittest.TestCase):
         self.assert_keys_alike("cloned acme/app@{}", "git -C app checkout {}", ("c99b1ab",), ("4f1e414",),
                                "git -C app checkout ⟦COMMIT_1⟧")
 
+    def test_a_commit_equal_to_a_bound_uuids_segment_never_splits_it(self):
+        # apply_to_answer's order: the bound uuid is looked up before the
+        # bare-commit swap, so the commit equal to its first segment stays inside it.
+        self.assert_keys_alike("cloned acme/app@{0} uid {1}", "uid {1}",
+                               ("11b21f18", "11b21f18-4eef-47ea-8ce1-fbd3c40047b3"),
+                               ("5482a62f", "5482a62f-d7e3-4c54-bb09-236983a9dfb7"),
+                               "uid ⟦UID_1⟧")
+
     def test_a_bound_suffix_token_outside_its_pattern_keys_the_same(self):
         self.assert_keys_alike("cloned into /opt/data/scratch/declared-intent-{}; newest operation-{}",
                                "mv clone-{} old_{}", ("j77z8q6q", self.OP_RECORDED), ("a2_elobt", self.OP_REPLAYED),
