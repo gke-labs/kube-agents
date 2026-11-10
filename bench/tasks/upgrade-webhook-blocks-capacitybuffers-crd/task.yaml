@@ -20,17 +20,22 @@
 # objectSelector is an exemption, the one thing that keeps it inert. The
 # readiness grader reads rules and not selectors (`upgrade_readiness.py`, the
 # note on objectSelector above its scope constants), so a check built the
-# same way names the gate. Two flip conditions, both stated here: a finding
-# of this audit whose Where: object is the gate, from a check that reads each
-# fail-closed webhook's rules for reach into `apiextensions.k8s.io` CRD
-# writes or an `*.x-k8s.io` group together with its backend, on every
-# collected cluster at 1.35 or later, flips this case; a check that treats
-# the objectSelector as a system exemption never reads this fixture, and a
-# landing through the readiness grade and 3.11 alone does not flip it
-# either, since 3.11's object is the cluster and on slot b the planted
-# budget's block absorbs the webhook grade (#2988). The compliance audit's
-# check of #5335 writes another ledger and is not this case's objective. The
-# id keeps the scenario's name.
+# same way names the gate. Two flip conditions, both stated here. Flips this
+# case: a finding of this audit from a check that reads each fail-closed
+# webhook's rules for reach into `apiextensions.k8s.io` CRD writes or an
+# `*.x-k8s.io` group together with its backend, on every collected cluster
+# at 1.35 or later, whose Where: object is the gate. This audit's house style
+# files every object as `Cluster/<name>` or `NodePool/<name>` with the item
+# in the excerpt (`patch_readiness.py`, the candidates' `object` fields), and
+# the per-finding scope below reads the Where: object alone, so a check that
+# lands in that style, a new slug on `Cluster/<name>` naming the gate in its
+# excerpt, or the `upgrade-blocked` cause join of #2988 once the readiness
+# lists carry CRD rows, is the same pass for the customer and edits this
+# objective in the same diff (the object and the phrase it reads), as it
+# would edit the slug list. Does not flip it: a check that treats the
+# objectSelector as a system exemption, which never reads this fixture; the
+# compliance audit's check of #5335, which writes another ledger. The id
+# keeps the scenario's name.
 #
 # Planted defect required: on slot b, the ValidatingWebhookConfiguration
 # seeded-crd-gate, webhook crd-gate.seeded.invalid, failurePolicy Fail, a
@@ -76,8 +81,9 @@ verification_spec:
   # `ValidatingWebhookConfiguration/seeded-crd-gate` and the reporter's
   # `seeded-crd-gate/crd-gate.seeded.invalid` both satisfy it; the scope binds
   # it to the Where: line. The first slug is the one #2567 proposes; a fixing
-  # pull request that spells its slug otherwise edits this list in the same
-  # diff.
+  # pull request that spells its slug otherwise, or files the finding on
+  # `Cluster/<name>` with the gate in its excerpt (the header says why that
+  # is this audit's shape), edits this check in the same diff.
   - name: ledger-names-the-crd-webhook-check-on-the-planted-gate
     role: objective
     mode: assert
