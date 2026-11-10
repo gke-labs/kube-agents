@@ -126,6 +126,13 @@ NOT_FINDINGS = (
     "Quick question: which GKE cluster did you mean for ledger-archive, there is no seeded-b in this project?",
     "Quick question: there are 41 clusters named seeded-b across your projects - which GCP project's "
     "seeded-b cluster did you mean? ledger-archive is not checked yet.",
+    # Round two: ability negations that carry the subject and a "not".
+    "I can't tell which seeded-b cluster has ledger-archive without the project ID.",
+    "I was not able to verify ledger-archive on seeded-b.",
+    "ledger-archive on seeded-b could not be checked.",
+    "I couldn't confirm whether ledger-archive exists on seeded-b.",
+    "I couldn't query seeded-b for ledger-archive.",
+    "I did not manage to read the namespaces on seeded-b, so ledger-archive is not confirmed.",
 )
 
 

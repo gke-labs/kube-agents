@@ -101,15 +101,18 @@ verification_spec:
   # run ends, so polling a failed check would only wait out the timeout.
   #
   # The answer says what is absent and where: the namespace by name, the
-  # cluster by its recorded name or its short form, and a negation on the
-  # same line as the namespace, in either order, so "I couldn't reach
-  # seeded-b" does not stand in for the finding (the text is lowercased
-  # before the patterns run, line breaks kept; `n't` covers "isn't" and
-  # "doesn't", and the apostrophe is normalized to the straight one). No
-  # question back, whatever it asks about (the prompt names the cluster and
-  # the project), and no failure to check dressed in the prompt's words:
-  # the inject lane sets check 3 aside, so without these a run that never
-  # reached the cluster would grade green on the answer alone.
+  # cluster by its recorded name or its short form, and an absence shape on
+  # the same line as the namespace, in either order. The absence clause is
+  # tied to the subject ("no namespace", "not on", "not among", "is not",
+  # "does not exist", "none", "absent", "missing"), not any negation: an
+  # ability negation ("couldn't confirm", "was not able to verify", "can't
+  # tell which") repeats the prompt's terms and a "not" and would otherwise
+  # grade as the finding, and a blocklist of failure phrasings cannot be
+  # complete. The text is lowercased before the patterns run, line breaks
+  # kept, and the apostrophe is normalized to the straight one. No question
+  # back, whatever it asks about (the prompt names the cluster and the
+  # project): the inject lane sets check 3 aside, so without these a run
+  # that never reached the cluster would grade green on the answer alone.
   - name: the-answer-names-the-missing-namespace-and-the-cluster
     role: objective
     mode: assert
@@ -120,20 +123,20 @@ verification_spec:
         - "{cluster:b}"
         - '\bseeded-b\b'
       required_patterns:
-        - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\b(?:no|not|none|absent|missing)\b|n''t\b)).*$'
+        - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\bno (?:namespace|such)\b|\bnot (?:on|in|among|present|found|there)\b|\b(?:isn''t|is not|doesn''t exist|does not exist|not exist|none|absent|missing)\b)).*$'
       forbidden_patterns:
-        # A question back, in any wording: a line that asks (contains
-        # "which" and ends on a question mark) or says "did you mean". A
-        # correct finding asks nothing, and "none of which exist on the
-        # cluster." ends on a stop, so it is not a question.
-        - '(?im)^.*\bwhich\b.*\?\s*$'
+        # A question back, in any wording: a presence finding asks nothing,
+        # so no line ends on a question mark, and none says "did you mean".
+        - '(?m)^.*\?\s*$'
         - '(?im)^.*\bdid you mean\b.*$'
-        # A failure to check, which repeats the user's terms and a negation
-        # and would otherwise satisfy the clauses above: "I couldn't check
-        # whether ledger-archive is on seeded-b", "wasn't able to verify".
-        # Apostrophes are straight after normalization.
-        - '(?i)\b(?:couldn''?t|could not|wasn''?t able|unable|can''?t|cannot|failed) to\b'
-        - '(?i)\b(?:couldn''?t|could not|cannot|can''?t|unable to) (?:check|verify|reach|read|access|connect|look)\b'
+        # A failure to check: a modal or ability negation, then within three
+        # words a checking verb ("couldn't confirm", "was not able to
+        # verify", "can't tell which"), or its passive ("could not be
+        # checked"). Apostrophes are straight after normalization. The
+        # required pattern above is the main guard (an ability negation is
+        # not an absence shape); this names the failure for the record.
+        - '(?i)\b(?:can''?t|cannot|could not|couldn''?t|was not able|wasn''?t able|unable|failed|didn''?t|did not)\b(?: \S+){0,3} (?:to )?(?:tell|check|verify|confirm|reach|read|access|connect|look|query|determine)\b'
+        - '(?i)\bcould not be (?:checked|verified|read|reached|confirmed|queried)\b'
       fixture_roles:
         - version-laggard
   # The defect: a command in the worker's own finding. `kubectl` is the one
