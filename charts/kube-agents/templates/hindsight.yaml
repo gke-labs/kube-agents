@@ -361,7 +361,7 @@ hindsight-api's egress half renders when litellm.enabled, or when
 hindsight.api.networkPolicy.additionalEgress names the peers a bring-your-own
 gateway install reaches instead; the rules it names are appended after the
 in-cluster gateway rule. The comment on the policy below is part of the
-rendered manifest and describes the default shape; keep it as it is.
+rendered manifest; keep it true of every shape the values can render.
 */}}
 {{- $hindsightNetworkPolicy := .Values.hindsight.networkPolicy }}
 {{- $apiNetworkPolicy := and $hindsightNetworkPolicy .Values.hindsight.api.networkPolicy.enabled }}
@@ -376,11 +376,13 @@ rendered manifest and describes the default shape; keep it as it is.
 # and the in-cluster inference gateway (LiteLLM or standalone-replay) on TCP
 # 80, 4000, and 8080. Models are baked into the image (HF_HUB_OFFLINE=1,
 # TRANSFORMERS_OFFLINE=1) and the pod holds no cloud identity, so neither
-# external HTTPS nor the metadata server's credential ports are permitted.
-# The egress half is gated on litellm.enabled so a bring-your-own gateway
-# install (litellm.enabled=false) still gets the ingress confinement and the
-# hindsight-postgresql guard below without having its custom inference-gateway
-# egress dropped (#4946).
+# external HTTPS nor the metadata server's credential ports are permitted
+# unless hindsight.api.networkPolicy.additionalEgress names an external peer;
+# the metadata ranges it refuses. The egress half renders when
+# litellm.enabled, or when additionalEgress names the peers a bring-your-own
+# gateway install (litellm.enabled=false) reaches; with neither, the policy is
+# Ingress-only, so the custom gateway's egress is confined rather than
+# dropped. hindsight-postgresql's policy renders under its own switch.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

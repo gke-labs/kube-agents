@@ -429,12 +429,17 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not on PATH")
     def test_the_schema_refuses_an_additional_egress_rule_the_crd_would(self):
-        """Helm refuses the shapes the operator refuses, naming the key.
+        """Helm refuses the shapes the CRD refuses at admission, and the render
+        refuses the peers the operator drops after it.
 
-        Helm 3 prints the path dotted and Helm 4 as a JSON pointer; both carry
-        the leaf, which is what is asserted.
+        The schema half: Helm 3 prints the path dotted and Helm 4 as a JSON
+        pointer; both carry the leaf, which is what is asserted. The render
+        half is the helper's `fail`, which names the peer: an IPv4-mapped IPv6
+        block (the whole internet to a dataplane that unmaps it), a peer in a
+        link-local range or in fd20:ce::/48 (the metadata server), with or
+        without a prefix.
         """
-        refusals = {
+        schema_refusals = {
             "a whole-internet peer": (
                 [f"{_ADDITIONAL_EGRESS}[0].to[0].cidr=0.0.0.0/0"],
                 "cidr",
@@ -458,14 +463,29 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
             "a misspelt toggle": (["hindsight.api.networkPolicy.enable=false"], "enable"),
             "a misspelt postgres toggle": (["hindsight.postgresql.networkPolicy.enable=false"], "enable"),
         }
-        for what, (sets, leaf) in refusals.items():
+        render_refusals = {
+            "the metadata server": ("169.254.169.254/32", "link-local"),
+            "the metadata server as a bare address": ("169.254.169.254", "link-local"),
+            "the whole link-local range": ("169.254.0.0/16", "link-local"),
+            "an IPv4-mapped IPv6 block": ("::ffff:0:0/96", "IPv4-mapped"),
+            "the metadata server's IPv6 address": ("fd20:ce::254", "fd20:ce::/48"),
+            "an IPv6 link-local peer": ("fe80::1/128", "fe80::/10"),
+        }
+        refusals = {what: (sets, leaf, "schema") for what, (sets, leaf) in schema_refusals.items()}
+        refusals.update(
+            {
+                what: ([f"{_ADDITIONAL_EGRESS}[0].to[0].cidr={cidr}"], reason, f"peer \"{cidr}\"")
+                for what, (cidr, reason) in render_refusals.items()
+            }
+        )
+        for what, (sets, leaf, origin) in refusals.items():
             with self.subTest(what=what):
                 args = []
                 for item in sets:
                     args += ["--set", item]
                 proc = _helm("template", "test-release", *args)
                 self.assertNotEqual(0, proc.returncode, f"{what} rendered: {proc.stdout[:200]}")
-                self.assertIn("schema", proc.stderr)
+                self.assertIn(origin, proc.stderr)
                 self.assertIn(leaf, proc.stderr)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not on PATH")

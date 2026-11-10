@@ -248,15 +248,30 @@ on the PlatformAgent CR -- to[].cidr with an optional to[].except, and
 ports[].protocol / ports[].port -- so an install that already names a peer for
 the agent's gateway policy writes the same thing here. Peers are CIDR blocks
 only, as the CR's are, and values.schema.json bounds them the way the CRD
-does; a rule without ports opens every port to its peers, which is the
-NetworkPolicy API's own reading of it.
+does. The schema cannot see what the operator's resolver drops after
+admission, so each peer also goes through openaiCompatibleCIDRRefusal, the
+check the gateway's egressCIDRs take: an IPv4-mapped IPv6 block, a peer in a
+link-local range (the metadata server) or in fd20:ce::/48 fails the render
+rather than rendering as the whole internet or a credential path. A bare
+address means a /32 or /128, as it does on the CR. A rule without ports opens
+every port to its peers, which is the NetworkPolicy API's own reading of it.
 */}}
 {{- define "kube-agents.hindsightAdditionalEgress" -}}
+{{- $ipv4HostPrefix := 32 -}}
+{{- $ipv6HostPrefix := 128 -}}
 {{- $rules := list -}}
 {{- range . -}}
 {{- $peers := list -}}
 {{- range .to -}}
-{{- $block := dict "cidr" .cidr -}}
+{{- $cidr := toString .cidr | trim -}}
+{{- $probe := $cidr -}}
+{{- if not (contains "/" $cidr) -}}
+{{- $probe = printf "%s/%d" $cidr (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $cidr)) -}}
+{{- end -}}
+{{- with include "kube-agents.openaiCompatibleCIDRRefusal" $probe -}}
+{{- fail (printf "hindsight.api.networkPolicy.additionalEgress peer %q %s." $cidr .) -}}
+{{- end -}}
+{{- $block := dict "cidr" $cidr -}}
 {{- with .except -}}
 {{- $_ := set $block "except" . -}}
 {{- end -}}

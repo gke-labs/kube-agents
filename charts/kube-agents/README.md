@@ -530,15 +530,20 @@ and `hindsight.postgresql.networkPolicy.enabled`, so an install can drop
 `hindsight-api`'s policy and keep `hindsight-postgresql`'s, the only guard on a
 database that takes no password. Leave the Postgres switch on; the install
 notes warn when the store renders without it.
+
 `hindsight.api.networkPolicy.additionalEgress` appends egress rules to
 `hindsight-api`'s policy in the shape of the `PlatformAgent` CR's
 `spec.networkPolicy.additionalEgress` (`to[].cidr` with an optional `except`,
 `ports[].protocol` and `port`), bounded as the CRD bounds them: 32 rules, 16
 peers and 16 ports each, a `/12` (IPv4) or `/48` (IPv6) prefix floor, and an
 `except` that must lie inside its peer or the API server rejects the policy.
-Peers are CIDR blocks, so a gateway in another namespace is named by its Pod
-range. A non-empty list also turns the egress half on under
-`litellm.enabled=false`, after the DNS, Postgres and in-cluster gateway rules:
+The render also refuses what the operator drops after admission and
+`litellm.openaiCompatible.egressCIDRs` refuses: an IPv4-mapped IPv6 block, and
+a peer in a link-local range (`169.254.0.0/16`, `fe80::/10`) or `fd20:ce::/48`,
+which hold the metadata server. Peers are CIDR blocks, so a gateway in another
+namespace is named by its Pod range. A non-empty list also turns the egress
+half on under `litellm.enabled=false`, after the DNS, Postgres and in-cluster
+gateway rules:
 
 ```yaml
 hindsight:

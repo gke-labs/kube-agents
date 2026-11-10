@@ -828,7 +828,11 @@ hindsight:
       # to those peers is open). The schema bounds them as the CRD does: 32
       # rules, 16 peers and 16 ports each, a /12 (IPv4) or /48 (IPv6) prefix
       # floor; an except must sit inside its peer or the API server rejects
-      # the policy. A non-empty list also turns the egress half on under
+      # the policy. The render refuses what the operator drops after
+      # admission and litellm.openaiCompatible.egressCIDRs refuses: an
+      # IPv4-mapped IPv6 block, and a peer in a link-local range
+      # (169.254.0.0/16, fe80::/10) or fd20:ce::/48, which hold the metadata
+      # server. A non-empty list also turns the egress half on under
       # litellm.enabled=false, which otherwise renders the policy
       # Ingress-only, so a bring-your-own gateway is named here rather than
       # by dropping the policy.
