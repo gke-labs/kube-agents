@@ -993,3 +993,19 @@ func TestSeenSecrets_AStateWordUnderACredentialJSONKeyIsNotTracked(t *testing.T)
 		t.Errorf("answer = %q, want it unchanged", got)
 	}
 }
+
+// A credential under a JSON key is tracked exactly as decoded: trailing
+// punctuation in it is part of it, not a sentence's.
+func TestSeenSecrets_AnExactJSONValueKeepsItsTrailingPunctuation(t *testing.T) {
+	const bang, short = "Synth2026!", "p@ss!12!"
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, `{"password": "`+bang+`", "db_password": "`+short+`"}`))
+	for _, v := range []string{bang, b64(bang), short, b64(short)} {
+		if !s.has(v) {
+			t.Errorf("the set does not track %q", v)
+		}
+	}
+	if got := scrubAnswerText("Encoded it is "+b64(bang)+" and plain "+bang+" works", &s); got != "Encoded it is [redacted] and plain [redacted] works" {
+		t.Errorf("answer = %q, want both forms redacted whole", got)
+	}
+}

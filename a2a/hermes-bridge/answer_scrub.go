@@ -414,7 +414,7 @@ func (c *toolResultCollector) value(v any, depth int) {
 			// A state word or placeholder (password: disabled) is not a
 			// value, as the shape rules say (valueNotASecret).
 			if sv, ok := x.(string); ok && keyClearlyNamesSecret(k) && !valueNotASecret(trimValueEdges(sv)) {
-				c.shapeCaught(sv)
+				c.exactCaught(sv)
 			}
 			c.value(x, depth)
 		}
@@ -480,12 +480,20 @@ func (c *toolResultCollector) text(t string, depth int) {
 	scrubInlineSecretsTo(scan, c.shapeCaught)
 }
 
-// shapeCaught tracks a value secretSink hands on, its quotes and trailing
-// punctuation taken off, in the shape-caught pool, unless it holds a space
-// (a phrase, "14 bytes" or "denied for user ...", is not a credential to
+// shapeCaught tracks a value secretSink hands on, cut from free text, its
+// quotes and trailing punctuation taken off (trimValueEdges), in the
+// shape-caught pool (trackShape).
+func (c *toolResultCollector) shapeCaught(v string) { c.trackShape(trimValueEdges(v)) }
+
+// exactCaught tracks a value whose edges are already exact, a decoded JSON
+// string, as it is: trailing punctuation in it is its own, not a
+// sentence's (trackShape).
+func (c *toolResultCollector) exactCaught(v string) { c.trackShape(v) }
+
+// trackShape adds v to the shape-caught pool unless it holds a space (a
+// phrase, "14 bytes" or "denied for user ...", is not a credential to
 // match everywhere).
-func (c *toolResultCollector) shapeCaught(v string) {
-	v = trimValueEdges(v)
+func (c *toolResultCollector) trackShape(v string) {
 	if strings.ContainsAny(v, " \t\r\n") {
 		return
 	}
