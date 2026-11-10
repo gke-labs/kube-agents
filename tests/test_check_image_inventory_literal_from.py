@@ -41,6 +41,7 @@ _CALL_SITES = (
     "check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/",
     # A persona image: the persona directory is the context, the payload /files/.
     "check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/",
+    "check_literal_from busybox a2a/Dockerfile.persona-tse . /files/",
 )
 
 # The sweep after the call sites: a plugin Dockerfile the fence never saw is

@@ -306,7 +306,7 @@ class HelmProfilesTemplatingTest(unittest.TestCase):
         self.assertIn("kind: AgentProfile", proc.stdout)
         self.assertIn('name: "tse"', proc.stdout)
         self.assertIn(
-            'image: "us-docker.pkg.dev/my-proj/my-mirror/platform-agent:v2026.10.20"',
+            'image: "us-docker.pkg.dev/my-proj/my-mirror/persona-tse:v2026.10.20"',
             proc.stdout,
         )
         self.assertIn(
@@ -365,8 +365,30 @@ class HelmProfilesTemplatingTest(unittest.TestCase):
         self.assertIn("a2a-worker:2026", proc.stdout)
         self.assertNotIn("%!s(", proc.stdout)
 
+    @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+    def test_tse_parameters_are_the_personas(self):
+        # As for the cluster profile: the chart's fixed list is the persona's
+        # own, in its order, and without it the gateway refuses a task that
+        # names a cluster for tse.
+        persona = yaml.safe_load(_TSE_PERSONA.read_text(encoding="utf-8"))
+        want = [(p["name"], bool(p.get("required", False))) for p in persona["parameters"]]
+        self.assertTrue(want, "the tse persona declares no parameters")
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_CHART_CLUSTER_SETS, "--set", "profiles.tse.enabled=true"],
+            capture_output=True, text=True, check=True,
+        )
+        found = [
+            doc
+            for doc in yaml.safe_load_all(proc.stdout)
+            if doc and doc.get("kind") == "AgentProfile" and doc["metadata"]["name"] == "tse"
+        ]
+        self.assertEqual(len(found), 1, "expected exactly one AgentProfile/tse")
+        got = [(p["name"], bool(p.get("required", False))) for p in found[0]["spec"]["parameters"]]
+        self.assertEqual(got, want)
+
 
 _CLUSTER_PERSONA = _REPO_ROOT / "agents" / "cluster" / "persona" / "persona.yaml"
+_TSE_PERSONA = _REPO_ROOT / "agents" / "tse" / "persona" / "persona.yaml"
 _CHART_CLUSTER_SETS = [
     "--set",
     "platformAgent.harness.clusterName=ci-cluster",

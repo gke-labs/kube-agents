@@ -1,6 +1,10 @@
 # This template renders the built-in optional `tse` (GKE Support Agent)
 # AgentProfile custom resource for `spec.mode: next` installations when both
 # `.Values.platformAgent.enabled` and `.Values.profiles.tse.enabled` are true.
+# Its persona is agents/tse/persona, published as the persona-tse image. The
+# parameters are the persona's own (agents/tse/persona/persona.yaml), in its
+# order, for the same reason as the cluster profile's below; the gateway routes
+# a task that names a cluster only to a profile that declares all three.
 {{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.tse .Values.profiles.tse.enabled }}
 {{- $tse := .Values.profiles.tse -}}
 {{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
@@ -34,6 +38,13 @@ spec:
       {{- toYaml . | nindent 6 }}
     {{- end }}
   identity: {}
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
   lifecycle:
     activeDeadlineSeconds: {{ $tse.lifecycle.activeDeadlineSeconds }}
     ttlSecondsAfterFinished: {{ $tse.lifecycle.ttlSecondsAfterFinished }}

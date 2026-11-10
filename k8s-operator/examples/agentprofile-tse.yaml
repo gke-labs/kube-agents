@@ -22,7 +22,7 @@ spec:
     GitOps fix or a redacted Google Cloud Support Escalation Bundle.
 
   persona:
-    # SOUL.md, AGENTS.md, CAPABILITIES.md, TSE support skills, persona config.
+    # agents/tse/persona: manifest, instructions, MCP servers and the TSE skill.
     image: <registry>/kube-agents/persona-tse:2026.08
 
   harness:

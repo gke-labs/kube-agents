@@ -1455,9 +1455,14 @@ limit. A cluster with bursting admits the manifest as rendered.
 (GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
 (`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
 `profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
-controlling its `AgentProfile` spec. When bound, the operator passes
+controlling its `AgentProfile` spec. Its persona is the `persona-tse` image,
+built from `agents/tse/persona`, which a profile worker pod mounts at
+`/persona`; like the cluster profile below, it takes its target per task through
+the `project`, `location` and `cluster` parameters, fixed in the persona's
+order. When bound, the operator also passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
-scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+scaffolds the Hermes profile `/opt/data/profiles/tse` from `/opt/tse-template`
+on startup; that profile does not use the persona image.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the

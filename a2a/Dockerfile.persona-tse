@@ -1,0 +1,16 @@
+# persona-tse: the GKE Support Agent's persona (agents/tse/persona) as a
+# persona image, for the chart's tse AgentProfile.
+#
+# The operator mounts an image's /files at /persona in the profile's worker
+# pod (k8s-operator/internal/profilepod). Where the cluster can't mount image
+# volumes, a staging init container copies /files with the image's own /bin/sh
+# and cp, which is why the base is busybox and not scratch.
+#
+# Build with the persona directory as the context:
+#   docker build -f a2a/Dockerfile.persona-tse -t <registry>/persona-tse:<tag> agents/tse/persona
+#
+# The base is the busybox pin in images.json, spelled out because the
+# inventory check (hack/check-image-inventory.sh) compares this exact two-line
+# shape to it, the same as a2a/Dockerfile.persona-cluster.
+FROM busybox:musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8
+COPY . /files/

@@ -2014,11 +2014,13 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema;
-      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
-      # platform-agent image until the per-profile Job dispatcher lands.
+      # The GKE Support Agent's persona (agents/tse/persona), which a profile
+      # worker pod mounts at /persona. The Hermes `tse` profile the gateway
+      # scaffolds from `/opt/tse-template` does not use it. Under the
+      # dispatcher a tse task takes a cluster target (project, location and
+      # cluster, all required); project-wide questions wait on #5424.
       image:
-        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        repository: ghcr.io/gke-labs/kube-agents/persona-tse
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
     harness:
       image:

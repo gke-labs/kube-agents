@@ -237,6 +237,7 @@ check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile fil
 # A persona image has the same two-line shape, with the persona directory as
 # its build context and the payload under /files, where profilepod mounts it.
 check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
+check_literal_from busybox a2a/Dockerfile.persona-tse . /files/
 
 # The calls above name their files, so a third plugin copied from the pair
 # (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
