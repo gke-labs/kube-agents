@@ -747,10 +747,11 @@ type PlatformAgentReconciler struct {
 // as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
 // watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
-// Escalation prevention for `nodes`, `namespaces`, `persistentvolumes` and `pods/log`, which
-// buildMinimalPlatformRole grants to the agent audit ClusterRole. Operator reads: `limitranges`
-// (the sizing profile reads the agent namespace's LimitRange), `endpoints` (the control-plane
-// endpoint for the egress policy) and `events` (the Recorder).
+// Escalation prevention for `nodes`, `namespaces`, `events`, `persistentvolumes` and `pods/log`,
+// which buildMinimalPlatformRole grants to the agent audit ClusterRole (the operator never reads
+// an Event; the Recorder's writes are the next marker). Operator reads: `limitranges` (the sizing
+// profile reads the agent namespace's LimitRange) and `endpoints` (the control-plane endpoint for
+// the egress policy).
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
 // events create;patch: the Recorder's writes (see the field); patch is what
 // the recorder uses to bump the count on a repeat of the same Event.

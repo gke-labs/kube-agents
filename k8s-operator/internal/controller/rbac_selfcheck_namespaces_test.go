@@ -190,6 +190,12 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 			t.Errorf("condition message %q does not name %q", degraded.Message, want)
 		}
 	}
+	// Every denial is team-a's, so the cause is the missing Role and
+	// RoleBinding alone: the skew sentence would send the operator to
+	// re-apply manifests that install nothing in team-a.
+	if strings.Contains(degraded.Message, RBACIncompleteCause) {
+		t.Errorf("condition message %q blames image skew for a denial that is only the agent's namespace", degraded.Message)
+	}
 
 	// Deleting the agent forgets its namespace: the denial must not stand
 	// against whatever reconciles next, and the namespace is not probed again.

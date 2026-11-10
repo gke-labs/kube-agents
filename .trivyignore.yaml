@@ -61,9 +61,10 @@ misconfigurations:
   # Ignore KSV-0041: callers need Secret verbs on the manager role, and trivy
   # cannot scope an exemption to one rule -- `paths` globs are its whole
   # vocabulary -- so exempting either exempts the whole rbac directory. The
-  # read verbs are on the ClusterRole; the write verbs are the namespaced Role
+  # read verbs stay on the ClusterRole, and KSV-0041 flags a ClusterRole that
+  # names secrets with any of them. The write verbs are the namespaced Role
   # document in role.yaml (the marker carries `namespace=`), bound in the
-  # install namespace, and trivy flags a Role for the verbs just the same.
+  # install namespace; a Role is KSV-0113 (MEDIUM), under the scan's threshold.
   #
   #   - `get`: checkShellSandboxKeys asks whether the sandbox's authorized-keys
   #     Secret exists, so the CR can report a missing one instead of leaving the

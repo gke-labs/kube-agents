@@ -2735,9 +2735,9 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         """The operator writes Secrets in its install namespace and nowhere else.
 
         The operator is the most privileged identity an install puts on a
-        cluster, and the Secret write verbs on its ClusterRole were the rule
-        that made it cluster-admin in effect: `create`, `update`, `patch` and
-        `delete` on every Secret in every namespace is every ServiceAccount
+        cluster, and the Secret write verbs on its ClusterRole were one of the
+        rules that made it cluster-admin in effect: `create`, `update`, `patch`
+        and `delete` on every Secret in every namespace is every ServiceAccount
         token and every credential on the cluster. Every Secret the operator
         writes is in the namespace of the PlatformAgent it reconciles, so the
         write verbs are a Role there. The reads stay cluster-wide, because the

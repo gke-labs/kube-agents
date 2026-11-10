@@ -89,9 +89,10 @@ const (
 		"re-apply k8s-operator/config (make deploy) or run helm upgrade so RBAC and image ship together"
 	// rbacAgentNamespaceCause follows RBACIncompleteCause on a condition whose
 	// denials include a PlatformAgent's own namespace: that one is not skew but
-	// a RoleBinding nobody installs by default.
-	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no RoleBinding to the " +
-		"operator's namespaced Role; bind it there"
+	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
+	// a Role in its own namespace only, so the Role is copied, not referenced.
+	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
+		"operator's namespaced Role and no RoleBinding to it; create both there"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -608,16 +609,27 @@ func (c *RBACChecker) Start(ctx context.Context) error {
 // identity, so every replica runs it, leader or not.
 func (c *RBACChecker) NeedLeaderElection() bool { return false }
 
-// rbacIncompleteMessage is the condition message for a set of denials.
+// rbacIncompleteMessage is the condition message for a set of denials. The
+// cause follows the denials: skew (RBACIncompleteCause) when any denial is
+// cluster-wide or in the operator's namespace, the missing Role and
+// RoleBinding (rbacAgentNamespaceCause) when every denial is in the agent's
+// own namespace, and both when the two mix. An agent outside the install
+// namespace must not be told to re-apply manifests that would change nothing.
 func rbacIncompleteMessage(denied []string) string {
-	message := rbacIncompleteMessagePrefix + strings.Join(denied, ", ") + "; " + RBACIncompleteCause
+	agentNamespaceDenials := 0
 	for _, label := range denied {
 		if strings.Contains(label, rbacAgentNamespaceLabelMark) {
-			message += "; " + rbacAgentNamespaceCause
-			break
+			agentNamespaceDenials++
 		}
 	}
-	return message + "."
+	cause := RBACIncompleteCause
+	switch {
+	case len(denied) > 0 && agentNamespaceDenials == len(denied):
+		cause = rbacAgentNamespaceCause
+	case agentNamespaceDenials > 0:
+		cause = RBACIncompleteCause + "; " + rbacAgentNamespaceCause
+	}
+	return rbacIncompleteMessagePrefix + strings.Join(denied, ", ") + "; " + cause + "."
 }
 
 // reportRBACSkew writes or clears the Degraded/RBACIncomplete condition on
