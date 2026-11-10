@@ -574,7 +574,10 @@ e2-standard-2, so a project carrying the whole stack costs roughly $540 per mont
 not the nodes, is the larger part of the increase. No separate rollout stands between a merge
 and that cost: a new cluster or pool plans as a create, which `hack/fleet_reconcile.py`
 applies, so the postsubmit on that merge creates both in every pool project within hours
-([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). `seeded-b`'s default
+pool runs a second e2-small so that GKE's own `kube-system` pods have room beside the tainted
+no-surge node, which adds about $14 per month (the node and its 20 GB balanced disk), for
+roughly $554; the reconcile applies that resize in place. Four of the first
 seven nodes are e2-small; `seeded-a`'s default pool is three e2-standard-2s. The pool moved
 from e2-medium to e2-standard-2 because GKE's system pods claim 700-860m of an e2-medium's
 940m allocatable CPU and the planted fixtures' pods went Pending, first on a single node and

@@ -628,11 +628,38 @@ resource "google_container_cluster" "seeded_b" {
 }
 
 resource "google_container_node_pool" "seeded_b_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_b.name
-  node_count = 1
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_b.name
+  # Two nodes, so GKE's own kube-system pods have room. seeded-b has a second
+  # node (no-surge-pool, defects-b.tf) that only pinned-batch-runner
+  # tolerates, so kube-dns's autoscaler asks for two replicas and a system
+  # Deployment's rolling update needs surge room; one e2-small at about 92%
+  # requested left kube-dns's second replica and event-exporter Pending,
+  # which workload_triage.py reports as `system unhealthy` and the fleet
+  # health triage case cannot call a healthy cluster. A node_count change is
+  # an in-place resize. No planted fixture reads this pool's node count: the
+  # surge and drain fixtures live on no-surge-pool, and the LB drain fixture
+  # reads the pool's instance group, which keeps its URL.
+  node_count = 2
   version    = local.lagging_version
+
+  # Each node's step waits out the LB drain fixture's 720 seconds
+  # (defects-b.tf), about 18 minutes. GKE's default surge of 1 would roll
+  # the two nodes one after the other, about 36 minutes, which beside a
+  # master update in the same apply can pass the reconcile's one-hour
+  # ceiling. Surging both at once keeps the roll one step. This is not a
+  # node-first pool, so the readiness surge-capacity rule names only
+  # no-surge-pool.
+  upgrade_settings {
+    max_surge       = 2
+    max_unavailable = 0
+  }
+
+  # Headroom over the one-step roll for the provider's 30-minute default.
+  timeouts {
+    update = "45m"
+  }
 
   # The pool takes the SAME derived pin as the master, and is deliberately
   # not ignore_changes'd: min_master_version moves the control plane at a
