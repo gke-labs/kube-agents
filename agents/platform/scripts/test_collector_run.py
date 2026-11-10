@@ -573,6 +573,36 @@ class ShimDeadlineTest(unittest.TestCase):
                 self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=deadline), "the gate's shortest wait fits")
 
 
+class ListedNodePoolsTest(unittest.TestCase):
+    """A cluster's node pools come from the listing that discovered it, or the
+    caller runs the per-cluster read (#4081)."""
+
+    ARGV = ["gcloud", "container", "clusters", "list", "--project", "p", "--format", "json"]
+
+    def test_listing_fields_keeps_absent_distinct_from_empty(self):
+        self.assertNotIn(cr.LISTED_NODE_POOLS_KEY, cr.listing_fields({"name": "c"}, self.ARGV))
+        self.assertEqual(cr.listing_fields({"name": "c", "nodePools": []}, self.ARGV)[cr.LISTED_NODE_POOLS_KEY], [])
+
+    def test_listed_pools_read_as_a_successful_call_naming_the_listing(self):
+        pools = [{"name": "b", "config": {"machineType": "e2"}}, {"name": "a"}]
+        cluster = {"name": "c", **cr.listing_fields({"nodePools": pools}, self.ARGV)}
+        result, why = cr.listed_node_pools(cluster)
+        self.assertEqual(why, "")
+        self.assertEqual((result.argv, result.rc, result.stderr), (self.ARGV, 0, ""))
+        self.assertEqual(json.loads(result.stdout), pools)
+        self.assertEqual(result.stdout, json.dumps(pools, sort_keys=True))
+
+    def test_absent_or_non_list_pools_leave_the_read_to_the_caller(self):
+        for cluster, why in (
+            ({"name": "c", **cr.listing_fields({}, self.ARGV)}, "absent"),
+            ({"name": "c", **cr.listing_fields({"nodePools": {"x": 1}}, self.ARGV)}, "dict, not a list"),
+        ):
+            with self.subTest(why=why):
+                result, reason = cr.listed_node_pools(cluster)
+                self.assertIsNone(result)
+                self.assertIn(why, reason)
+
+
 class RunAndGateTest(unittest.TestCase):
     def run_of(self, rc, stdout="", stderr=""):
         return cr.Run(["gcloud"], rc, stdout, stderr, 0.0)

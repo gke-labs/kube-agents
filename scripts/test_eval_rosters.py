@@ -925,6 +925,27 @@ class ApiLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
         self.assertIn("chat-reply-under-pushed-report", found)
 
+    def test_every_registered_case_grading_delegated_to_is_excluded(self):
+        # delegated_to reads the inject read route's childAddressees, which
+        # the api transport has no chain to report, so the check errors
+        # there; a case that uses it anywhere in its spec runs on the inject
+        # lane only.
+        import yaml
+
+        def uses_delegated_to(node) -> bool:
+            if isinstance(node, dict):
+                return node.get("type") == "delegated_to" or any(uses_delegated_to(v) for v in node.values())
+            if isinstance(node, list):
+                return any(uses_delegated_to(v) for v in node)
+            return False
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if uses_delegated_to(doc.get("verification_spec")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} grades delegated_to but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the

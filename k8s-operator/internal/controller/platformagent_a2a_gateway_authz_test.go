@@ -31,14 +31,9 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// The gateway's own names on the bus, as its code spells them: the event
-// relay's durable (a2a/gateway/gateway.go, relayDurable) and the two filter
-// subjects it binds together since the supervisor split.
-const (
-	a2aGatewayRelayDurable     = "gateway-relay"
-	a2aGatewayEventsFilter     = "a2a.tasks.*.*.events"
-	a2aGatewaySupervisorFilter = "a2a.tasks.*.*.supervisor"
-)
+// The gateway's own names on the bus (a2aGatewayRelayDurable and its two
+// filters) are in platformagent_a2a_identities.go, where the provision Job's
+// pre-created durable (#4173) and the deny on its name read them too.
 
 // TestGatewayJetStreamGrantOnARealServer is the refusal proof for the
 // gateway's JetStream API grant, measured the way gke-labs/kube-agents#1666
@@ -74,14 +69,15 @@ const (
 // reproduced on this server.
 //
 // The observer is `web`, not `seed` and not `gateway`. Reading a consumer back
-// is CONSUMER.INFO, which this change takes off the gateway and which #1306
+// is CONSUMER.INFO, which this change takes off the gateway (all but the bind
+// on its own relay, #4173) and which #1306
 // took off seed along with everything but STREAM.CREATE and STREAM.INFO; web
 // holds STREAM.INFO and CONSUMER.INFO on TASKS by enumeration and is the one
 // principal that can answer. Asking as a principal without the grant does not
 // fail, it hangs: a refused request is not an error nats.go reports.
 func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	gatewayPW := string(creds.Data["gateway-password"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
@@ -89,6 +85,7 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 
 	s, log := a2aStartRenderedServer(t, conf)
 	a2aProvisionLikeTheScript(t, s.ClientURL(), seedPW)
+	a2aPreCreateLikeTheProvisionJob(t, s.ClientURL(), log)
 	gateway, js := a2aConnectAs(t, s.ClientURL(), "gateway", gatewayPW)
 	_, web := a2aConnectAs(t, s.ClientURL(), "web", webPW)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -113,31 +110,11 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		t.Logf("%-72s allowed", op)
 	}
 
-	// The relay: two filter subjects, so nats.go puts the filter in the
-	// request BODY and the API subject ends at the durable name.
-	relay, err := js.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
-		Durable:        a2aGatewayRelayDurable,
-		FilterSubjects: []string{a2aGatewayEventsFilter, a2aGatewaySupervisorFilter},
-		AckPolicy:      jetstream.AckExplicitPolicy,
-	})
-	allowed("CONSUMER.CREATE TASKS durable gateway-relay, two filters (gateway.Run)", err)
-
-	// The same durable with ONE filter subject: the shape every install
-	// already carries on disk, and the shape a rebind goes through. nats.go
-	// appends the filter to the API subject here, so this is the row that
-	// needs CONSUMER.CREATE.TASKS.> rather than a grant naming the durable.
-	_, err = js.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
-		Durable:       a2aGatewayRelayDurable,
-		FilterSubject: a2aGatewayEventsFilter,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-	})
-	allowed("CONSUMER.CREATE TASKS gateway-relay, single filter in the API subject (rebind)", err)
-	relay, err = js.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
-		Durable:        a2aGatewayRelayDurable,
-		FilterSubjects: []string{a2aGatewayEventsFilter, a2aGatewaySupervisorFilter},
-		AckPolicy:      jetstream.AckExplicitPolicy,
-	})
-	allowed("CONSUMER.CREATE TASKS gateway-relay, back to the pair (the update lib does)", err)
+	// The relay: the provision Job created it (#4173), and the gateway binds
+	// it, which is CONSUMER.INFO on that one name. Creating, updating or
+	// deleting it is refused (TestTheFixedTasksDurablesOnARealServer).
+	relay, err := js.Consumer(ctx, a2aTasksStream, a2aGatewayRelayDurable)
+	allowed("CONSUMER.INFO TASKS gateway-relay, the bind (gateway.Run, Precreated)", err)
 
 	// Submission, then an executor's event for the relay to deliver. The
 	// executor is the bridge, which is the principal that may write events
@@ -160,8 +137,8 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		t.Fatalf("the relay pull delivered nothing: %v", batch.Error())
 	}
 	allowed("$JS.ACK TASKS gateway-relay (msg.Ack)", delivered.Ack())
-	// The ack landed, read from web's side because the gateway holds no
-	// CONSUMER.INFO.
+	// The ack landed, read from web's side, the observer for every consumer
+	// in this test.
 	relayView, err := web.Consumer(ctx, a2aTasksStream, a2aGatewayRelayDurable)
 	if err != nil {
 		t.Fatal(err)
@@ -313,7 +290,9 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		// it (table 3); deleting it does not.
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + ".bridge-platform", ""},
 		{"$JS.API.CONSUMER.DELETE." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
-		{"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable, ""},
+		// INFO on its own relay is the bind; on any other consumer it is not
+		// granted.
+		{"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".bridge-platform", ""},
 		// The directory: the identity plane. Subscribing alone misses cards
 		// published before the gateway started, so it reads them too, by
 		// DIRECT.GET on card subjects only (table 1). Nothing past that: no
@@ -386,16 +365,18 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	// claim in a2aGatewayJetStreamGrants is a measurement.
 	t.Run("the routes the grant narrows and does not close", func(t *testing.T) {
 		// 1. CONSUMER.CREATE is create-or-update by name, and the server
-		// has no ownership concept for a consumer name. The bridge's
-		// durable is another principal's; the gateway can retune it
-		// without ever naming CONSUMER.DELETE.
+		// has no ownership concept for a consumer name. The two durables
+		// the provision Job pre-creates are denied by name (#4173); any
+		// other consumer on TASKS -- here a per-task durable the bridge
+		// made -- the gateway can retune without ever naming
+		// CONSUMER.DELETE.
 		if _, err := bridgeJS.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
-			Durable: "bridge-platform", FilterSubject: "a2a.tasks.platform.*.in", AckPolicy: jetstream.AckExplicitPolicy,
+			Durable: "task-t9", FilterSubject: "a2a.tasks.platform.t9.in", AckPolicy: jetstream.AckExplicitPolicy,
 		}); err != nil {
-			t.Fatalf("the bridge's own durable: %v", err)
+			t.Fatalf("a per-task durable as bridge: %v", err)
 		}
-		const bridgeCreate = "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".bridge-platform"
-		body := []byte(`{"stream_name":"TASKS","config":{"durable_name":"bridge-platform","name":"bridge-platform",` +
+		const bridgeCreate = "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".task-t9"
+		body := []byte(`{"stream_name":"TASKS","config":{"durable_name":"task-t9","name":"task-t9",` +
 			`"ack_policy":"explicit","deliver_policy":"all","replay_policy":"instant","filter_subject":"a2a.tasks.none"}}`)
 		msg, err := gateway.Request(bridgeCreate, body, 5*time.Second)
 		if err != nil {
@@ -412,12 +393,12 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 		if err := json.Unmarshal(msg.Data, &resp); err != nil || resp.Error != nil {
 			t.Fatalf("create-as-update on another principal's durable: %v %+v", err, resp.Error)
 		}
-		view, err := web.Consumer(ctx, a2aTasksStream, "bridge-platform")
+		view, err := web.Consumer(ctx, a2aTasksStream, "task-t9")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if got := view.CachedInfo().Config.FilterSubject; got != "a2a.tasks.none" {
-			t.Errorf("bridge-platform's filter subject is %q; the gateway's create-as-update did not take. "+
+			t.Errorf("task-t9's filter subject is %q; the gateway's create-as-update did not take. "+
 				"If the server has gained an ownership check, a2aGatewayJetStreamGrants can stop recording this residue", got)
 		} else {
 			t.Log("residue 1: the gateway retuned another principal's durable through CONSUMER.CREATE, with no violation logged")
@@ -500,8 +481,9 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 // TestGatewayConsumersSurviveABusRestart is the reconnect canary, and it is
 // what holds the CONSUMER.INFO decision up.
 //
-// a2aGatewayJetStreamGrants withholds CONSUMER.INFO on the argument that
-// nothing on the gateway path binds a consumer by name and that on nats.go
+// a2aGatewayJetStreamGrants withholds CONSUMER.INFO, except on the relay's own
+// durable, which the gateway binds by name since the provision Job creates it
+// (#4173). The rest rests on the argument that on nats.go
 // v1.53.1 neither Consume nor an ordered iterator re-verifies its consumer
 // with Info() after a reconnect. That is a reading of a pinned library, and
 // the failure it would cause -- a relay that goes quiet after the bus bounces,
@@ -513,7 +495,7 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 // the subject named.
 func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := a2aWithProvisionStandIn(t, string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t), nil).Data["nats.conf"]))
 	gatewayPW := string(creds.Data["gateway-password"])
 	bridgePW := string(creds.Data["bridge-password"])
 	seedPW := string(creds.Data["seed-password"])
@@ -530,6 +512,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 
 	first, firstLog := a2aStartRenderedServerAt(t, conf, port, store)
 	a2aProvisionLikeTheScript(t, url, seedPW)
+	a2aPreCreateLikeTheProvisionJob(t, url, firstLog)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
@@ -550,11 +533,8 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	relay, err := js.CreateOrUpdateConsumer(ctx, a2aTasksStream, jetstream.ConsumerConfig{
-		Durable:        a2aGatewayRelayDurable,
-		FilterSubjects: []string{a2aGatewayEventsFilter, a2aGatewaySupervisorFilter},
-		AckPolicy:      jetstream.AckExplicitPolicy,
-	})
+	// The relay binds the durable the provision Job created (#4173).
+	relay, err := js.Consumer(ctx, a2aTasksStream, a2aGatewayRelayDurable)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +649,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 		for _, line := range log.publishViolations("gateway") {
 			switch {
 			case strings.Contains(line, "$JS.API.CONSUMER.INFO."):
-				t.Errorf("%s: the gateway emitted CONSUMER.INFO, which a2aGatewayJetStreamGrants withholds: %s", name, line)
+				t.Errorf("%s: the gateway emitted CONSUMER.INFO beyond its relay's bind, which a2aGatewayJetStreamGrants withholds: %s", name, line)
 			case strings.Contains(line, "$JS.API.CONSUMER.DELETE."+a2aTasksStream):
 				t.Logf("%s: the ordered consumer's best-effort reset delete, refused and ignored (expected): %s", name, line)
 			default:

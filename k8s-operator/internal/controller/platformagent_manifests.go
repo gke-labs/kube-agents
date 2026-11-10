@@ -277,8 +277,19 @@ const (
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
 	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
-	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude when
+	// watcherAlertExcludeFileEnv is unset.
 	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
+	// watcherAlertExcludeFileEnv names the mounted file that holds the same
+	// JSON; start-services.sh passes it as --alert-exclude-file.
+	watcherAlertExcludeFileEnv = "WATCHER_ALERT_EXCLUDE_FILE"
+	// eventWatcherAlertExcludeSuffix names the ConfigMap that holds the
+	// rules, after the agent's name; eventWatcherAlertExcludeKey is its one
+	// key, and the file's name in eventWatcherAlertExcludeMountPath.
+	eventWatcherAlertExcludeSuffix    = "-event-watcher-alert-exclude"
+	eventWatcherAlertExcludeKey       = "rules.json"
+	eventWatcherAlertExcludeVolume    = "event-watcher-alert-exclude"
+	eventWatcherAlertExcludeMountPath = "/etc/kube-agents/event-watcher"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -1230,12 +1241,47 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // (deploy/docker/patches/kanban_priority.py), and the four between are shared. A worker
 // measured about 430 MiB, so six are about 2.6 GiB over the 1.8 GiB idle set, under the
 // gateway's 8Gi limit (resolveResources), with room for waiting coordinators, which stay
-// resident without holding a slot. The credential proxy's 2Gi default admits nine
+// resident without holding a slot. The credential proxy's 2Gi default admits ten
 // brokered commands at once (credentialProxyAdmittedRequests; the slot cap holds it to
 // eight, shared with the listing pools).
 // TestCredentialProxyBudgetArithmeticAtTheDefaults fails if the proxy's default stops
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
+
+// The defaults for spec.harness.tuning.admission, the memory admission the kanban
+// dispatcher applies to its own workers. resolveKanbanAdmission renders the block
+// into the managed scope on every install, so the dispatcher never runs without
+// one. The budget has no constant: unset, it is the agent container's resolved
+// memory request in MiB (agentMemoryRequestMiB), the figure the kubelet evicts the
+// pod against under node pressure, so a CR that raises the request raises the
+// budget with it.
+//
+// The worker cap is three and a half times the 430 MiB a worker measured on a live
+// install (resolveResources): a fleet-wide audit that holds a large listing fits,
+// and one worker cannot take the whole of the default 2048 MiB budget by itself.
+// The queue bound is 24 ticks at kanbanDispatchIntervalSeconds: long enough for a
+// worker that is finishing to give its slot back, short enough that the thread
+// that filed the card is told it is throttled before it gives up waiting. Closed is
+// the default for an unreadable memory sample because the counters go unreadable
+// on the installs the budget exists for: a sandbox runtime that hides the cgroup
+// files also hides the pressure, and an open tick there spawns into the eviction
+// the budget was meant to prevent.
+const (
+	defaultAdmissionWorkerRssCapMiB   = 1536
+	defaultAdmissionQueueBoundSeconds = 600
+	defaultAdmissionFailClosed        = true
+	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
+	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
+	// figure too. A request the operator cannot read as a budget (a bare "2", a
+	// 256Mi, an explicit 0) would otherwise render 0, which the dispatcher reads
+	// as no budget and answers with upstream's meminfo guard, silently. At the
+	// floor the dispatcher still admits nothing on any measured container (the
+	// idle working set is above 512 MiB) and refuses every card after the queue
+	// bound; what the clamp buys is a refusal that names its figures in the log
+	// and in every reply, instead of a silent fallback. The CR is the place to
+	// fix the request.
+	admissionMemoryBudgetFloorMiB = 512
+)
 
 // defaultSessionRetentionDays is how long an ended session is kept when
 // spec.harness.retention.sessionDays says nothing: Hermes' own default
@@ -1253,6 +1299,18 @@ const defaultSessionRetentionDays = 90
 type managedSessionsConfig struct {
 	AutoPrune     bool `json:"auto_prune"`
 	RetentionDays int  `json:"retention_days"`
+}
+
+// managedKanbanAdmission is the `kanban.admission` block in the managed scope,
+// read by the dispatcher's spawn tick. Every key is rendered, defaults applied, so
+// the dispatcher reads one number per setting and never has to guess a default of
+// its own. No omitempty on fail_closed for the same reason: a false would drop the
+// key and read as whatever the reader falls back to.
+type managedKanbanAdmission struct {
+	MemoryBudgetMiB   int  `json:"memory_budget_mib"`
+	WorkerRssCapMiB   int  `json:"worker_rss_cap_mib"`
+	QueueBoundSeconds int  `json:"queue_bound_seconds"`
+	FailClosed        bool `json:"fail_closed"`
 }
 
 // resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
@@ -1494,6 +1552,83 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxInProgress
 	}
 	return defaultKanbanMaxInProgress
+}
+
+// resolveKanbanAdmission is the live kanban.admission block: each field is the CR's
+// spec.harness.tuning.admission value where it sets one, else the operator's
+// default. The budget's default is derived from the agent container's resolved
+// memory request (agentMemoryRequestMiB); the others are the constants beside
+// defaultKanbanMaxInProgress. renderConfigYAML pins the block in the managed scope
+// next to max_in_progress, so it reaches every dispatch entry point the way the cap
+// does.
+func resolveKanbanAdmission(agent *agentv1alpha1.PlatformAgent) managedKanbanAdmission {
+	resolved := managedKanbanAdmission{
+		MemoryBudgetMiB:   agentMemoryRequestMiB(agent),
+		WorkerRssCapMiB:   defaultAdmissionWorkerRssCapMiB,
+		QueueBoundSeconds: defaultAdmissionQueueBoundSeconds,
+		FailClosed:        defaultAdmissionFailClosed,
+	}
+	tuning := agentTuning(agent)
+	if tuning == nil || tuning.Admission == nil {
+		return resolved
+	}
+	admission := tuning.Admission
+	if admission.MemoryBudgetMiB != nil {
+		resolved.MemoryBudgetMiB = int(*admission.MemoryBudgetMiB)
+	}
+	if admission.WorkerRssCapMiB != nil {
+		resolved.WorkerRssCapMiB = int(*admission.WorkerRssCapMiB)
+	}
+	if admission.QueueBoundSeconds != nil {
+		resolved.QueueBoundSeconds = int(*admission.QueueBoundSeconds)
+	}
+	if admission.FailClosed != nil {
+		resolved.FailClosed = *admission.FailClosed
+	}
+	return resolved
+}
+
+// agentMemoryRequestMiB is the agent container's memory request in whole MiB, as
+// the kubelet sees it: the CR's spec.deployment.resources request, else its limit
+// (a container that declares only a limit is given a request equal to it), else
+// the operator's default request (resolveResources). It is the default memory
+// budget for the dispatcher's admission because the kubelet evicts the pod under
+// node pressure once its usage passes this figure, whatever the limit says.
+func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
+	var deployment *agentv1alpha1.DeploymentSpec
+	if agent != nil {
+		deployment = agent.Spec.Deployment
+	}
+	resources := resolveResources(deployment)
+	mib, ok := memoryMiB(resources.Requests)
+	if !ok {
+		mib, ok = memoryMiB(resources.Limits)
+	}
+	if !ok {
+		mib, _ = memoryMiB(resolveResources(nil).Requests)
+	}
+	if mib < admissionMemoryBudgetFloorMiB {
+		name := ""
+		if agent != nil {
+			name = agent.Name
+		}
+		manifestsLog.Info("admission memory budget clamped to the floor: the agent container's memory request is below it",
+			"platformagent", name, "requestMiB", mib, "budgetMiB", admissionMemoryBudgetFloorMiB)
+		return admissionMemoryBudgetFloorMiB
+	}
+	return mib
+}
+
+// memoryMiB is the list's memory quantity in whole MiB, rounded down, and whether
+// the list carries one. An explicit zero is carried: the API defaults a request to
+// the limit only when the request is unset, so "0" is a request of zero, which the
+// floor clamp answers, not a missing one that the limit stands in for.
+func memoryMiB(list corev1.ResourceList) (int, bool) {
+	quantity, ok := list[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	return int(quantity.Value() / bytesPerMiB), true
 }
 
 // frontDoorKanban renders the `kanban` subtree for the platform profile when the gateway
@@ -2114,9 +2249,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// declared (a2aActivityHook); absent otherwise, so a today
 		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
-		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		// The board-wide kanban worker cap and the dispatcher's memory admission.
+		// Always rendered; see where they are set.
 		Kanban struct {
-			MaxInProgress int `json:"max_in_progress"`
+			MaxInProgress int                    `json:"max_in_progress"`
+			Admission     managedKanbanAdmission `json:"admission"`
 		} `json:"kanban"`
 		// Session retention, read by Hermes' own state.db auto-maintenance in every
 		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
@@ -2195,6 +2332,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	// The dispatcher's memory admission, beside the cap and pinned for the same
+	// reasons: the board is shared, every dispatch entry point reads its settings
+	// from whichever profile it runs as, and the failure it prevents (a pod evicted
+	// for passing its memory request under node pressure, workers and all) is one
+	// the agent cannot see coming. The budget follows the agent container's memory
+	// request, so a CR that raises the request raises the budget on the same
+	// reconcile.
+	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
 	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
@@ -4457,6 +4602,9 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			// The watchers' broker token. Here and in no other container of this
 			// Pod: the watcher role is what reaches the fleet through the broker.
 			{Name: watcherTokenVolume, MountPath: watcherTokenMountPath, ReadOnly: true},
+			// The alert-exclude rules. No subPath: a subPath mount never sees
+			// a change to the ConfigMap.
+			{Name: eventWatcherAlertExcludeVolume, MountPath: eventWatcherAlertExcludeMountPath, ReadOnly: true},
 		},
 		SecurityContext: securityContext,
 	}
@@ -4491,16 +4639,57 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
-	// Managed, so reserved by the merge below, only when the list is set: an
-	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
-	// spec.deployment.env, which the watcher read before this field existed.
-	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
-		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	// The rules reach the watcher as a file from a ConfigMap, which the
+	// watcher reads again every minute, so a change to the list applies
+	// without rolling the pod (buildEventWatcherAlertExcludeConfigMap). The
+	// env takes the same key for an image whose entrypoint predates the file.
+	// Both are written whether or not the list is set, so setting the first
+	// rule or removing the last one changes no pod template either. Managed,
+	// so reserved by the merge below, except when the list is empty and
+	// spec.deployment.env sets WATCHER_ALERT_EXCLUDE: that entry, which the
+	// watcher read before this field existed, then applies as it did.
+	if eventWatcherAlertExclude(agent) != "" || !deploymentEnvSets(agent, watcherAlertExcludeEnv) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: watcherAlertExcludeEnv, ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + eventWatcherAlertExcludeSuffix},
+				Key:                  eventWatcherAlertExcludeKey,
+			}}},
+			corev1.EnvVar{Name: watcherAlertExcludeFileEnv, Value: eventWatcherAlertExcludeMountPath + "/" + eventWatcherAlertExcludeKey},
+		)
 	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// deploymentEnvSets reports whether spec.deployment.env has an entry named name.
+func deploymentEnvSets(agent *agentv1alpha1.PlatformAgent, name string) bool {
+	if agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// buildEventWatcherAlertExcludeConfigMap holds the alert-exclude rules for the
+// agent-api-auth container, as eventWatcherAlertExclude renders them, or ""
+// for none. It is mounted without subPath and is in no pod-template hash, so
+// the kubelet updates the file in place, usually within a minute, and the
+// watcher puts the change in force on its next read of the file.
+func buildEventWatcherAlertExcludeConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + eventWatcherAlertExcludeSuffix,
+			Namespace: agent.Namespace,
+		},
+		Data: map[string]string{eventWatcherAlertExcludeKey: eventWatcherAlertExclude(agent)},
+	}
 }
 
 // eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
@@ -5240,6 +5429,16 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// destination or credential.
 		"CRON_IDLE_HIBERNATE_DAYS": {},
 		"CRON_IDLE_THROTTLE_DAYS":  {},
+
+		// The catch-up policy's step, in minutes
+		// (agents/chat/scripts/cron_catch_up_policy.py): after a pause the
+		// dispatcher skips a model-run cron job's catch-up when it is a whole
+		// period late and releases the rest this far apart. Parsed as a whole
+		// number; `0` turns the policy off and anything else means the
+		// default. Like the two above it changes only when jobs already on
+		// the roster run, by moving their next_run_at in the profile's own
+		// store, and adds no job, path, destination or credential.
+		"CRON_CATCH_UP_STAGGER_MINUTES": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

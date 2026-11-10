@@ -438,10 +438,9 @@ resource "null_resource" "incident" {
       # given regex since the plant? The same read as step 3's poll, for the
       # follow-up wait in 3b; the regex names this namespace's pods.
       watcher_logged() {
-        kubectl logs "deployment/${var.agent_deployment}" \
+        grep -qE "$1" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
             -n "${var.agent_namespace}" -c "${var.agent_container}" \
-            --since-time="$started_at" --tail=-1 2>/dev/null \
-          | grep -qE "$1"
+            --since-time="$started_at" --tail=-1 2>/dev/null)"
       }
       # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
@@ -468,10 +467,9 @@ resource "null_resource" "incident" {
       # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
       # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
-      until kubectl logs "deployment/${var.agent_deployment}" \
+      until grep -qE "${local.watcher_handled} .*pod=${local.ns}/" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
-              --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
+              --since-time="$started_at" --tail=-1 2>/dev/null)"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
@@ -555,10 +553,9 @@ resource "null_resource" "incident" {
         recur_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         ${local.kubectl} delete pod -l app=${local.workload} --wait=false
         elapsed=0
-        until kubectl logs "deployment/${var.agent_deployment}" \
+        until grep -qE "(fire|folded) .*pod=${local.ns}/" <<<"$(kubectl logs "deployment/${var.agent_deployment}" \
                 -n "${var.agent_namespace}" -c "${var.agent_container}" \
-                --since-time="$recur_at" --tail=-1 2>/dev/null \
-              | grep -qE "(fire|folded) .*pod=${local.ns}/"; do
+                --since-time="$recur_at" --tail=-1 2>/dev/null)"; do
           if [ "$elapsed" -ge 600 ]; then
             echo "ERROR: the replaced pod crash-looped, but k8s-event-watcher logged no 'fire' or 'folded' for it within $${elapsed}s, so the recurrence never reached the daemon." >&2
             exit 1

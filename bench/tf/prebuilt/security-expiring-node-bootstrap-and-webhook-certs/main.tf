@@ -24,9 +24,9 @@
 # agent's read role reaches no Secret, so a fixture there could never flip.
 #
 # Isolation class: one cluster-scoped object, removed by this stack's destroy.
-# The teardown sweep selects webhook configurations by the chart's own label,
-# not this one, so a leftover from a killed run is removed by the next plant
-# (which deletes its own name first) or by hand.
+# A leftover from a killed run is removed by the teardown's bench plant sweep
+# at the next lease (hack/ci_sweep_bench_plants.sh keys on the managed-by
+# label below) or by the next plant, which deletes its own name first.
 
 terraform {
   required_version = ">= 1.5.0"

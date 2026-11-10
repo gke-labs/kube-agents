@@ -2373,7 +2373,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:                 true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",

@@ -377,6 +377,11 @@ data:
         timeout: 10
         url: http://127.0.0.1:8651/hermes/tool-events
     kanban:
+      admission:
+        fail_closed: true
+        memory_budget_mib: 4096
+        queue_bound_seconds: 600
+        worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:
       api_key: none
@@ -613,6 +618,26 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+data:
+  rules.json: ""
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-event-watcher-alert-exclude
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -762,6 +787,8 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
+            - name: GOMEMLIMIT
+              value: "912680550"
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
@@ -1824,7 +1851,7 @@ spec:
               memory: 8Gi
             requests:
               cpu: "1"
-              memory: 2Gi
+              memory: 4Gi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -2080,6 +2107,8 @@ spec:
                   name: platformagent-a2a-nats-creds
             - name: BRIDGE_CONCURRENCY
               value: "10"
+            - name: BRIDGE_DURABLE_PRECREATED
+              value: "true"
             - name: A2A_ACTIVITY_SECRET
               valueFrom:
                 secretKeyRef:
@@ -2254,6 +2283,13 @@ spec:
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
             - name: WATCHER_BROKER_TOKEN_FILE
               value: /var/run/secrets/kubeagents/watcher-proxy/token
+            - name: WATCHER_ALERT_EXCLUDE
+              valueFrom:
+                configMapKeyRef:
+                  key: rules.json
+                  name: platformagent-event-watcher-alert-exclude
+            - name: WATCHER_ALERT_EXCLUDE_FILE
+              value: /etc/kube-agents/event-watcher/rules.json
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -2314,6 +2350,9 @@ spec:
               name: platform-agent-data-vol
             - mountPath: /var/run/secrets/kubeagents/watcher-proxy
               name: watcher-credential-proxy-token
+              readOnly: true
+            - mountPath: /etc/kube-agents/event-watcher
+              name: event-watcher-alert-exclude
               readOnly: true
       securityContext:
         fsGroup: 10000
@@ -2392,6 +2431,9 @@ spec:
                         apiVersion: v1
                         fieldPath: metadata.namespace
                       path: namespace
+        - configMap:
+            name: platformagent-event-watcher-alert-exclude
+          name: event-watcher-alert-exclude
         - name: agent-credential-proxy-token
           projected:
             defaultMode: 256
@@ -2821,7 +2863,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "4b0b34d2bf914fb8",
+      "version": "97c8c35dd2e8d6af",
       "shard": 0,
       "shards": 1,
       "identities": [
@@ -2862,6 +2904,12 @@ data:
               "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
               "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
               "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+              "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+              "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+              "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+              "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
               "_INBOX.provision.>"
             ],
             "subscribe": [
@@ -2931,7 +2979,7 @@ metadata:
   annotations:
     kubeagents.x-k8s.io/a2a-authmap-shard: "0"
     kubeagents.x-k8s.io/a2a-authmap-shards: "1"
-    kubeagents.x-k8s.io/a2a-authmap-version: 4b0b34d2bf914fb8
+    kubeagents.x-k8s.io/a2a-authmap-version: 97c8c35dd2e8d6af
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -3428,7 +3476,11 @@ stringData:
         exports [
           { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
-          { service: "$JS.API.CONSUMER.CREATE.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.DIRECTORY.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TASKS.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>", accounts: [ APP, CONSOLE ] }
+          { service: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
           { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
           { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
@@ -3501,6 +3553,7 @@ stringData:
                   "chat.board",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.gateway-relay",
                   "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
                   "$JS.API.DIRECT.GET.TASKS.>",
                   "$JS.API.STREAM.INFO.KV_session-state",
@@ -3525,7 +3578,15 @@ stringData:
                   "$JS.API.*.*.KV_cap",
                   "$JS.API.*.*.KV_cap.>",
                   "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3625,7 +3686,11 @@ stringData:
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
           { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
@@ -3668,6 +3733,16 @@ stringData:
                   "chat.console.*.in",
                   "chat.console.*.confirm",
                   "_INBOX.console.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3713,6 +3788,16 @@ stringData:
                   "chat.console.*.in",
                   "_INBOX.console-mcp.>"
                 ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
+                ]
               }
               subscribe {
                 allow = [
@@ -3744,7 +3829,11 @@ stringData:
         imports [
           { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
           { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
-          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.DIRECTORY.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.KV_runtime-state.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TASKS.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>" } }
+          { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
           { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
@@ -3785,6 +3874,7 @@ stringData:
                   "$KV.runtime-state.>",
                   "$JS.API.STREAM.INFO.TASKS",
                   "$JS.API.CONSUMER.CREATE.TASKS.>",
+                  "$JS.API.CONSUMER.INFO.TASKS.bridge-platform",
                   "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
                   "$JS.API.DIRECT.GET.TASKS.>",
                   "$JS.API.STREAM.INFO.KV_runtime-state",
@@ -3800,7 +3890,15 @@ stringData:
                   "$JS.API.*.*.KV_cap",
                   "$JS.API.*.*.KV_cap.>",
                   "$JS.API.*.*.*.KV_cap",
-                  "$JS.API.*.*.*.KV_cap.>"
+                  "$JS.API.*.*.*.KV_cap.>",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -3846,6 +3944,16 @@ stringData:
                   "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
                   "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
                   "_INBOX.web.>"
+                ]
+                deny = [
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.gateway-relay.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.CREATE.TASKS.bridge-platform.>",
+                  "$JS.API.CONSUMER.DURABLE.CREATE.TASKS.bridge-platform",
+                  "$JS.API.CONSUMER.DELETE.TASKS.bridge-platform"
                 ]
               }
               subscribe {
@@ -4854,7 +4962,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-da9e6400
+  name: platformagent-a2a-provision-0e62f5d7
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -4987,10 +5095,35 @@ spec:
               2>&1 || $NATS stream add TASKS --allow-direct \\\n  --subjects='a2a.tasks.>'
               --storage=file --retention=limits \\\n  --max-age=72h --max-bytes=21474836480
               --discard=old --replicas=1 \\\n  --max-msgs-per-subject=4096 \\\n  --max-consumers=110
-              --defaults\n\n# DIRECTORY: last-value — the tombstone replaces the card.
-              1GiB cap.\n$NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add
-              DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>' --storage=file
-              --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
+              --defaults\n\n# The TASKS durables whose name and filter are fixed (#4173):
+              the gateway's\n# event relay and the bridge's intake. Made here, so their
+              readers bind to them\n# and create nothing, and every principal that may
+              create consumers on TASKS is\n# denied these names (a2aTasksFixedDurableDenyPublish).
+              Pull, explicit ack,\n# every message from the start: what the readers ask
+              for. A consumer add on a\n# durable that exists updates it to these settings,
+              so one an older gateway or\n# bridge made (one filter, the server's max-pending)
+              converges here.\n#\n# When the add fails, what matters is whether the durable
+              exists. A missing one\n# leaves its reader waiting for it, so the run fails
+              and the Job retries\n# (a timeout, TASKS at max_consumers, a grant gone
+              wrong): a run reported\n# complete would never be retried. One that exists
+              but won't take these\n# settings is left as it is: its reader refuses to
+              bind it and names the\n# difference, which is louder than anything this
+              could report.\nfixed_durable() { # name reader [consumer add flags...]\n
+              \ name=$1\n  reader=$2\n  shift 2\n  $NATS consumer add TASKS \"${name}\"
+              \"$@\" >/dev/null && return 0\n  if ! $NATS consumer info TASKS \"${name}\"
+              >/dev/null 2>&1; then\n    echo \"could not create TASKS ${name}, and it
+              does not exist: the ${reader} waits for it, so this run fails and the Job
+              retries\" >&2\n    exit 1\n  fi\n  echo \"WARN: TASKS ${name} exists but
+              could not be brought to this render's settings; the ${reader} refuses to
+              bind it and names the difference\" >&2\n}\nfixed_durable gateway-relay gateway
+              --pull \\\n  --filter='a2a.tasks.*.*.events' --filter='a2a.tasks.*.*.supervisor'
+              \\\n  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \\\n
+              \ --max-pending=8192 --defaults\nfixed_durable bridge-platform bridge --pull
+              \\\n  --filter='a2a.tasks.platform.*.in' \\\n  --ack=explicit --deliver=all
+              --replay=instant --max-deliver=-1 --defaults\n\n# DIRECTORY: last-value
+              — the tombstone replaces the card. 1GiB cap.\n$NATS stream info DIRECTORY
+              >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \\\n  --subjects='a2a.agents.>'
+              --storage=file --retention=limits \\\n  --max-msgs-per-subject=1 --max-bytes=1073741824
               --discard=old --replicas=1 --max-consumers=64 --defaults\n\n# TOPICS-STATE:
               current answer plus short history, no age limit. 1GiB cap.\n# State-class
               topics (provisioned registry): upgrade-readiness, topology-skew, blueprint,
@@ -5260,20 +5393,23 @@ spec:
               delegations and spawning session pods while relaying no events, the\" >&2\n
               \ echo \"     bridge dispatches nothing, and the CR reads Ready over both.
               Session pods\" >&2\n  echo \"     recover by themselves, which hides it
-              rather than helping.\" >&2\n  echo \"     Restarting before TASKS is back
-              only fails the subscribe, so the order holds.\" >&2\n  # Exit 2, and the
-              convention it establishes: 2 means \"this will fail the\n  # same way next
-              time\", anything else is worth retrying. The Job's\n  # podFailurePolicy
-              matches on 2 and fails the Job from the first pod\n  # (buildA2AProvisionJob),
-              so a refusal nothing about a re-run can change\n  # does not spend the backoffLimit
-              before it is heard. This refusal is in\n  # that class: the budget's two
-              inputs, maxSessions and the bridge's worker\n  # count, and the stream's
-              max_consumers are all fixed until an operator\n  # lowers maxSessions, declares
-              the bridge sidecar with fewer workers where\n  # it declared more than the
-              default, or recreates the stream, and\n  # provisioning does none of those.
-              Note that\n  # set -euo pipefail exits with the failing command's own status,
-              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
-              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
+              rather than helping.\" >&2\n  echo \"     The gateway, restarted early,
+              waits for TASKS and its durable and binds once this\" >&2\n  echo \"     Job
+              has made them. The bridge can restart in a loop until TASKS is back, so
+              restart\" >&2\n  echo \"     its workload after the stream is back.\" >&2\n
+              \ # Exit 2, and the convention it establishes: 2 means \"this will fail
+              the\n  # same way next time\", anything else is worth retrying. The Job's\n
+              \ # podFailurePolicy matches on 2 and fails the Job from the first pod\n
+              \ # (buildA2AProvisionJob), so a refusal nothing about a re-run can change\n
+              \ # does not spend the backoffLimit before it is heard. This refusal is
+              in\n  # that class: the budget's two inputs, maxSessions and the bridge's
+              worker\n  # count, and the stream's max_consumers are all fixed until an
+              operator\n  # lowers maxSessions, declares the bridge sidecar with fewer
+              workers where\n  # it declared more than the default, or recreates the stream,
+              and\n  # provisioning does none of those. Note that\n  # set -euo pipefail
+              exits with the failing command's own status, which is\n  # not 2, so an
+              unexpected failure stays on the retry budget.\n  exit 2\nfi\n\necho \"a2a
+              provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
@@ -5433,6 +5569,8 @@ spec:
               value: "true"
             - name: A2A_MAX_SESSIONS
               value: "10"
+            - name: A2A_GATEWAY_RELAY_PRECREATED
+              value: "true"
             - name: A2A_BUSY_NOTICE_AT
               value: "10"
             - name: A2A_METRICS_PORT

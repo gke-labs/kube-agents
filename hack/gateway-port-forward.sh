@@ -102,7 +102,7 @@ target_for() {
     say "svc/${DOOR_SERVICE} has no selector; using the service"
   elif ! pods="$(k get pods -l "${selector%,}" -o name 2>"${err}")"; then
     say "listing the pods svc/${DOOR_SERVICE} selects failed; using the service: $(tr '\n' ' ' <"${err}")"
-  elif printf '%s\n' "${pods}" | grep -qxF "pod/${holder}"; then
+  elif grep -qxF "pod/${holder}" <<<"${pods}"; then
     rm -f "${err}"
     echo "pod/${holder}"
     return 0
